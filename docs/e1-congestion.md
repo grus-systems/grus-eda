@@ -169,8 +169,9 @@ Initialize `h_demand` and `v_demand` to `0.0`. For each `SteinerSegment { p1, p2
     - Vertical legs at $x = x_{\min}$ and $x = x_{\max}$ for $y \in [y_{\min}, y_{\max})$ get `+0.5`.
 
 #### Pass 2: Congestion-Aware L/Z Pattern Routing
-Using the initial demand from Pass 1, define edge cost:
-$$\text{cost}(d, c) = 1.0 + \frac{10.0}{1.0 + \exp\bigl(-2.0 \cdot (d - c)\bigr)}$$
+Using the initial demand from Pass 1, define the edge cost for routing `+1.0` demand across an edge with current demand $d$ and capacity $c$:
+$$\text{cost}(d, c) = 1.0 + \frac{10.0}{1.0 + \exp\bigl(-2.0 \cdot (d + 1.0 - c)\bigr)} + 50.0 \cdot \max(0.0,\; d + 1.0 - c)$$
+Here the logistic term penalizes edges approaching saturation ($d + 1 \approx c$) while the linear overflow term ($50.0 \cdot \max(0, d + 1 - c)$) prevents sigmoid saturation when $d - c \gg 1$ and strongly prefers detouring into free neighboring channels over creating overflow.
 
 Iterate over all non-degenerate 2D `SteinerSegment`s `(p1, p2)`:
 1. Subtract the segment's Pass 1 `0.5` contribution from the two bounding-box L-paths (rip-up).
@@ -178,7 +179,19 @@ Iterate over all non-degenerate 2D `SteinerSegment`s `(p1, p2)`:
    - $L_{\text{HV}}$: horizontal along $y = p_1.y$ from $p_1.x$ to $p_2.x$, then vertical along $x = p_2.x$ from $p_1.y$ to $p_2.y$.
    - $L_{\text{VH}}$: vertical along $x = p_1.x$ from $p_1.y$ to $p_2.y$, then horizontal along $y = p_2.y$ from $p_1.x$ to $p_2.x$.
 3. If both $L_{\text{HV}}$ and $L_{\text{VH}}$ traverse at least one edge with $d + 1.0 > c$, also evaluate **Z-shape** routes (horizontal-vertical-horizontal via intermediate column $x_{\text{mid}} \in (x_{\min}, x_{\max})$, and vertical-horizontal-vertical via intermediate row $y_{\text{mid}} \in (y_{\min}, y_{\max})$) in $O(\Delta x + \Delta y)$ time using prefix sums along the bounding box.
-4. Commit `+1.0` demand along the minimum-cost route.
+4. Commit `+1.0` demand along the minimum-cost route and record the segment's committed edge list. (For flat horizontal or flat vertical segments from Pass 1, record their straight-line edge list.)
+
+#### Pass 3: Bounded-Box Maze Rip-Up and Reroute (FastRoute Expanding Box)
+Because RSMT Steiner point insertion decomposes many multi-pin nets into flat horizontal or vertical segments (`x1 == x2` or `y1 == y2`) and L/Z pattern routing is strictly confined to a segment's bounding box $[x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}]$, congested segments cannot utilize free tracks in adjacent GCell rows or columns without box expansion.
+
+Run 3 rip-up-and-reroute iterations with expanding bounding-box margins $M \in [2, 3, 4]$:
+- In each iteration, visit every segment $s_i = (p_1, p_2)$ whose currently committed path contains at least one overflowing edge (`demand > cap`):
+  1. **Rip-up**: subtract `1.0` demand from each edge in $s_i$'s current path.
+  2. **Bounded-Box Dijkstra**: define the search window:
+     $$X_{\text{lo}} = \max(0, x_{\min} - M), \quad X_{\text{hi}} = \min(nx - 1, x_{\max} + M)$$
+     $$Y_{\text{lo}} = \max(0, y_{\min} - M), \quad Y_{\text{hi}} = \min(ny - 1, y_{\max} + M)$$
+     Run Dijkstra's shortest-path algorithm from `p1` to `p2` on the grid subgraph $[X_{\text{lo}}, X_{\text{hi}}] \times [Y_{\text{lo}}, Y_{\text{hi}}]$ using edge weight $\text{cost}(d, c)$.
+  3. **Commit**: add `1.0` demand along the shortest path and replace $s_i$'s committed path.
 
 #### Congestion Report Aggregation
 After routing all nets:
