@@ -272,9 +272,78 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Place(args) => {
+            println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
+            let mut interner = grus_core::interner::StringInterner::new();
+            let t_load = std::time::Instant::now();
+            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let mut design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
+            let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
             println!(
-                "grus-eda place: def={:?}, out_def={:?}, target_density={}",
-                args.def, args.out_def, args.target_density
+                "Loaded design {}: {} cells ({} movable), {} nets, {} rows, elapsed={:.2}ms",
+                design_db.design_name,
+                design_db.num_cells(),
+                design_db
+                    .cell_status
+                    .iter()
+                    .filter(|&&s| s == grus_core::design_db::PlacementStatus::Unplaced
+                        || s == grus_core::design_db::PlacementStatus::Placed)
+                    .count(),
+                design_db.num_nets(),
+                design_db.num_rows(),
+                elapsed_load
+            );
+
+            // Global Placement (Nesterov Accelerated Gradient)
+            println!(
+                "Running global placement (target density: {:.2})...",
+                args.target_density
+            );
+            let config = grus_core::placement::NesterovConfig {
+                target_density: args.target_density,
+                ..Default::default()
+            };
+            let t_gp = std::time::Instant::now();
+            let gp_res = grus_core::placement::run_nesterov_placement(&design_db, &tech_db, &config);
+            let elapsed_gp = t_gp.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "Global placement: converged in {} iters, final_overflow={:.4}, final_hpwl={:.1}um, elapsed={:.2}ms ({:.1}us/iter)",
+                gp_res.iterations,
+                gp_res.final_overflow,
+                gp_res.final_hpwl_um,
+                elapsed_gp,
+                (elapsed_gp * 1000.0) / gp_res.iterations.max(1) as f64
+            );
+
+            // Detailed Placement (Abacus Legalization + Local Refinement)
+            println!("Running legalization and detailed placement refinement...");
+            let t_leg = std::time::Instant::now();
+            let leg_res = grus_core::placement::legalize_placement(
+                &mut design_db,
+                &tech_db,
+                &gp_res.cell_x_um,
+                &gp_res.cell_y_um,
+            )?;
+            let elapsed_leg = t_leg.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "Legalization: pre_legal_hpwl={} dbu, post_abacus_hpwl={} dbu, final_hpwl={} dbu ({:.1}um), avg_disp={:.2}um, max_disp={:.2}um, elapsed={:.2}ms",
+                leg_res.pre_legal_hpwl_dbu,
+                leg_res.post_abacus_hpwl_dbu,
+                leg_res.final_hpwl_dbu,
+                leg_res.final_hpwl_dbu as f64 / tech_db.dbu_per_micron as f64,
+                leg_res.avg_displacement_um,
+                leg_res.max_displacement_um,
+                elapsed_leg
+            );
+
+            // Write placed DEF
+            println!("Writing placed DEF to {:?}", args.out_def);
+            let t_write = std::time::Instant::now();
+            grus_core::readers::write_def(&design_db, &tech_db, &args.def, &args.out_def)?;
+            let elapsed_write = t_write.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "Wrote placed DEF successfully in {:.2}ms (total placement runtime: {:.2}ms)",
+                elapsed_write,
+                elapsed_gp + elapsed_leg
             );
         }
         Commands::Sta(args) => {

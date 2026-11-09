@@ -262,28 +262,39 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - Electrostatic repulsive forces: 100% of cells located to the left of the cluster center experience negative horizontal force $F_x < 0$, and 100% of cells located to the right experience positive force $F_x > 0$, driving cells to disperse away from congested density peaks.
   - Runtime: A complete evaluation of cell density overlap, 2D spectral Poisson solve, electric field generation, repulsive force gathering, and potential energy calculation executes in **347.7 µs** on Apple Silicon.
 
-### 2026-11-09 — E2.3 — `gcd` (Nesterov Accelerated Global Placer)
-- **Reference Command**: OpenROAD `global_placement -density 0.60` inside `ghcr.io/librelane/librelane:3.0.16` on `gcd.floorplan.def` (`GPL-0028` bin count 16x16, convergence criteria $\tau \le 0.10$ in $< 300$ iterations).
-- **Our Command**: `cargo test --release -p grus-core test_gcd_nesterov_global_placement`
-- **Our Runtime**: Full global placement run (15 iterations star-model barycenter relaxation + 178 Nesterov iterations): **11.4 ms** on Apple Silicon (Release build; single Nesterov iteration: **64.0 µs**).
+### 2026-11-09 — E2.4 — `gcd` (Abacus Legalizer, Local Detailed Placement Refinement & `grus-eda place` CLI)
+- **Reference Command**: OpenROAD `check_placement -verbose` and `detailed_placement` inside `ghcr.io/librelane/librelane:3.0.16` on `target/gcd_grus_placed.def` against `gcd.placed.def` reference HPWL (`4,529,224 DBU`).
+- **Our Command**: `cargo test --release -p grus-core test_gcd_place_and_legalize` and `grus-eda place --tlef ... --lef ... --def ... --out-def ... --target-density 0.60`.
+- **Our Runtime**: Full placement pipeline (global placement + Abacus legalization + 4-round local refinement + DEF generation): **17.29 ms** on Apple Silicon (`run_nesterov_placement`: 11.30 ms, `legalize_placement`: 5.99 ms, DEF write: 1.06 ms).
 
 | Metric | Reference (`OpenROAD`) | Ours (`grus-core`) | Diff (Abs / %) | Pass? |
 |---|---|---|---|---|
-| Bin Grid Sizing ($M$) | 16 (`GPL-0028`) | 16 (default candidate) | 0 | PASS (exact) |
-| Initial Overflow ($\tau_{\text{init}}$) | $> 0.50$ | 0.8088 (80.9%) | — | PASS |
-| Final Overflow ($\tau_{\text{final}}$) | $\le 0.10$ | 0.0986 (9.86%) | — | PASS ($\le 0.10$) |
-| Total Nesterov Iterations | $< 300$ | 178 | — | PASS (< 300) |
-| Initial HPWL (after relaxation) | — | 4,141.41 um | — | PASS |
-| Final Global Placement HPWL | — | 4,109.20 um | — | PASS (< 5000 um) |
-| Fixed Cell Coordinates Shift | 0.0 | 0.0 | 0.0 um | PASS (exact 151/151) |
-| Movable Cells In-Bounds | 100% | 100% (233 / 233) | 0 violators | PASS (100%) |
-| Full Global Placement Runtime | — | 11.40 ms | — | PASS (< 100 ms) |
+| Placed HPWL (`placed_hpwl_dbu`) | 4,529,224 DBU (4,529.2 um) | 4,401,009 DBU (4,401.0 um) | -128,215 DBU (-2.83%) | PASS (< 5.0%) |
+| Pre-Legal HPWL (Global Placement) | — | 4,109,198 DBU (4,109.2 um) | — | PASS |
+| Post-Abacus HPWL (before refinement) | — | 4,433,624 DBU (4,433.6 um) | — | PASS |
+| Refinement HPWL Reduction | — | -32,615 DBU (-0.74%) | — | PASS |
+| OpenROAD `check_placement -verbose` Violations | 0 violations | 0 violations | 0 | PASS (exact) |
+| OpenROAD `detailed_placement` Total Displacement | 0.0 u | 0.0 u | 0.0 u | PASS (exact) |
+| OpenROAD `detailed_placement` Average Displacement | 0.0 u | 0.0 u | 0.0 u | PASS (exact) |
+| OpenROAD `detailed_placement` Max Displacement | 0.0 u | 0.0 u | 0.0 u | PASS (exact) |
+| OpenROAD `detailed_placement` Delta HPWL | 0 % | 0 % | 0 % | PASS (exact) |
+| Legalized Movable Cell Count | 233 | 233 | 0 (0.0%) | PASS (exact) |
+| Fixed Tapcell / Endcap Drift | 0.0 DBU | 0.0 DBU | 0.0 DBU | PASS (exact 151/151) |
+| Cell Site Snapping & Bounds | 100% | 100% (233 / 233) | 0 violators | PASS (100%) |
+| Row Orientation Agreement (`N` / `FS`) | 100% | 100% (233 / 233) | 0 violators | PASS (100%) |
+| Row Overlaps across all 29 rows | 0 overlaps | 0 overlaps | 0 | PASS (exact) |
+| Average Displacement from GP | — | 1.61 um | — | PASS |
+| Maximum Displacement from GP | — | 7.29 um | — | PASS |
+| Written DEF Re-parse HPWL Match | 4,401,009 DBU | 4,401,009 DBU | 0 DBU | PASS (exact) |
+| Full Placement Runtime (GP + Leg + Refine) | — | 17.29 ms | — | PASS (< 50 ms) |
 
 - **Notes / Observations**:
-  - Implemented 15-iteration star-model barycenter relaxation pulling movable cells from the core center toward connected fixed I/O pins and fixed cells, establishing an initial placement with $\tau_{\text{init}} = 0.8088$ and HPWL = $4141.41\,\mu\text{m}$.
-  - Added $M = 16$ to the default candidate set in `DensitySolver::new`, choosing a $16 \times 16$ bin grid ($w_b = 5.03\,\mu\text{m}, h_b = 4.93\,\mu\text{m} = 1.81 \times h_{\text{site}}$) on `gcd`, exactly matching OpenROAD's `GPL-0028` binning.
-  - Implemented the ePlace diagonal preconditioner $D_c = \max(1.0, \text{pin\_count}[c] + \lambda_k a_c)$ preventing high-pin/high-area cells from oscillating, along with Barzilai-Borwein dynamic step sizing bounded to $\le 0.5$ bin widths per iteration.
-  - Implemented RePlAce Eq. 11 adaptive penalty schedule $\mu_k = \text{clamp}(1.05^{\,1.0 - \Delta\text{HPWL} / \Delta\text{HPWL}_{\text{ref}}},\, 0.95,\, 1.05)$, smoothly coordinating electrostatic repulsion and wirelength contraction.
-  - Converged monotonically to $\tau = 0.0986 \le 0.10$ in 178 iterations in **11.4 ms** (64.0 µs per iteration), with all 233 movable cells strictly inside core boundaries and all 151 fixed cells unchanged.
+  - Implemented `SubRow` extraction across all 29 placement rows, snapping 151 fixed tapcells and endcaps outward to site grid boundaries, merging overlapping obstacle intervals, and isolating complementary free placement intervals.
+  - Implemented single-row Abacus dynamic programming clustering with quadratic displacement cost minimization and cluster collapse loop ($O(1)$ amortized merge).
+  - Implemented 4-round local detailed placement refinement: equal-width cell swaps across neighboring rows and horizontal spans, adjacent cell swaps within sub-rows, and single-cell site sliding/gap relocation.
+  - Verification discipline (AGENTS.md Rule 7): Intentionally verified that test goes RED when assertions or coordinates are corrupted (confirmed panic on overlap and strict HPWL tolerance), then restored.
+  - External reference tool confirmation: Invoked OpenROAD `check_placement -verbose` and `detailed_placement` on the generated DEF inside the canonical LibreLane container (`ghcr.io/librelane/librelane:3.0.16`). OpenROAD reported 0 placement violations and performed **0.0 u displacement** (0% delta HPWL), confirming that our legalized placement is 100% compliant with standard cell design rules.
+  - End-to-end performance: The entire placement pipeline (`grus-eda place`) finishes in **17.29 ms** (11.30 ms global placement, 5.99 ms legalization and refinement, 1.06 ms DEF serialization), achieving a final HPWL of 4,401.0 um (-2.83% compared to OpenROAD's 4,529.2 um).
+
 
 
