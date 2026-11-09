@@ -286,10 +286,9 @@ pub fn legalize_placement(
 4. **Post-Abacus Local Detailed Placement Refinement (4 Rounds)**:
    - Because odd rows have `Orient::FS` (vertical pin flip) and fixed tapcells split rows into multiple sub-rows, run 4 deterministic passes over the legalized sub-rows using exact integer DBU net bounding boxes (`design_db.pin_pos_dbu(pin, tech_db)`):
      1. **Equal-Width Cell Swaps**: For pairs of movable cells $(c_1, c_2)$ with identical width (`w[c_1] == w[c_2]`) within $\pm 4$ rows and $\pm 25\,000\text{ DBU}$ horizontally, swap their positions/orientations if the incident nets' exact DBU HPWL strictly decreases ($\Delta\text{HPWL} < 0$).
-     2. **Adjacent Sub-Row Cell Swaps**: In each `SubRow` with $k \ge 2$ cells, test swapping adjacent cells `(cells[j], cells[j + 1])` within their combined span (`x_new_b = x[c_a]`, `x_new_a = (x[c_b] + w[c_b] - w[c_a]).max(x_new_b + w[c_b])`), keeping the swap if incident nets' exact DBU HPWL strictly decreases.
-     3. **Single-Cell Optimal Gap Relocation & Site Sliding**:
+     2. **Adjacent Sub-Row Cell Swaps**: In each `SubRow` with $k \ge 2$ cells, test swapping adjacent cells `(cells[j], cells[j + 1])` within their combined span (`new_xb = xa`, `new_xa = xa + wb` when `new_xa + wa <= xb + wb`), keeping the swap if incident nets' exact DBU HPWL strictly decreases.
+     3. **Single-Cell Optimal Site Sliding**:
         - Within its current `SubRow`, slide cell $c_j$ inside its non-overlapping site bounds `[left_limit, right_limit]` to the site (testing `left_limit`, `right_limit`, and the median $x$ of cell $c_j$'s connected pins snapped to site) that minimizes incident nets' exact DBU HPWL.
-        - Across candidate `SubRow`s within $\pm 3$ rows and $\pm 20\,000\text{ DBU}$, inspect each contiguous open gap `[gap_left, gap_right]` between neighboring cells (or sub-row boundaries) with `gap_right - gap_left >= w[c_j]`. If relocating $c_j$ into the best site in `[gap_left, gap_right - w[c_j]]` (with `y = s_cand.orig_y_dbu` and `orient = s_cand.orient`) strictly reduces incident nets' exact DBU HPWL, move $c_j$ to `s_cand`.
 5. **Self-Verification (`verify_legality`) & CLI (`grus-eda place`)**:
    - Before returning `LegalizeResult`, verify that all movable cells have `PlacementStatus::Placed`, lie on valid `PlacementRow` $y$-coordinates and site-grid $x$-coordinates with matching `row.orient`, stay within row `[orig_x_dbu, orig_x_dbu + num_x * step_x_dbu]`, and have zero overlaps with any other movable or fixed cell.
    - Wire up `grus-eda place` in `crates/grus-eda/src/main.rs`:
