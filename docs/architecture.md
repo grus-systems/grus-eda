@@ -258,8 +258,8 @@ pub struct NldmTable {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LibTimingArc {
-    pub related_pin: LibPinId,
-    pub target_pin: LibPinId,
+    pub related_pin: LibPinId, // Global index into LibDb::pins
+    pub target_pin: LibPinId,  // Global index into LibDb::pins
     pub timing_sense: TimingSense,
     pub timing_type: TimingType,
     pub cell_rise: Option<NldmTable>,

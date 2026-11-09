@@ -83,6 +83,7 @@ Implement a zero-copy byte-slice lexer (`&[u8]`) yielding tokens:
    - Parse `clock : true;`, `max_capacitance`, `max_transition`.
 4. **`timing()` inside `pin(target_pin)`**:
    - Parse `related_pin : "<pin_name>"` (note: if `related_pin` contains space-separated multiple pins, create one `LibTimingArc` per related pin).
+   - **Deferred `related_pin` resolution (Forward-Reference Invariant)**: Inside a `cell(...)`, pins are often listed alphabetically (e.g., `pin(D)` appears before `pin(GATE)` or `pin(SCD)`). Therefore, do **not** resolve `related_pin` names to `LibPinId` until **all** `pin(...)` blocks in the `cell(...)` have been parsed. Furthermore, `LibPinId(u16)` is the **global index into `LibDb::pins`** (`pin_offset..pin_offset + pin_count`), so `lib_db.pins[lib_pin_id.0 as usize]` is a direct $O(1)$ lookup without adding `pin_offset`.
    - Parse `timing_sense` (`positive_unate`, `negative_unate`, `non_unate`).
    - Parse `timing_type` (defaulting to `Combinational` if omitted).
    - For child groups `cell_rise(tpl)`, `cell_fall(tpl)`, `rise_transition(tpl)`, `fall_transition(tpl)`, `rise_constraint(tpl)`, `fall_constraint(tpl)`:
