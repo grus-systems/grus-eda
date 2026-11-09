@@ -348,7 +348,7 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 | Metric | OpenSTA | Ours | Diff | Pass? |
 |---|---|---|---|---|
 | Endpoints compared | 53 | 53 | 0 missing | PASS |
-| Setup WNS | 1.664236 ns | within 1% | see test | PASS |
+| Setup / hold WNS | 1.664236 / 0.480908 ns | 1.656731 / 0.481704 ns | -0.45% / +0.17% | PASS |
 | Max relative diff, arrival (max / min) | — | — | 0.46% / 0.45% | PASS (limit max(5 ps, 1%)) |
 | Max relative diff, required (max / min) | — | — | 0.008% / 0.53% | PASS |
 | Max relative diff, slack (max / min) | — | — | 0.49% / 0.30% | PASS |

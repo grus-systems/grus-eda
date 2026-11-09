@@ -374,7 +374,8 @@ fn main() -> anyhow::Result<()> {
             };
             let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
             println!(
-                "STA (zero wire): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms",
+                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms",
+                if use_placement_rc { "placement RC" } else { "zero wire" },
                 report.endpoints.len(),
                 report.wns_max_ns,
                 report.tns_max_ns,
