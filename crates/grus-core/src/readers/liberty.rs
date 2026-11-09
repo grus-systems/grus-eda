@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh3::xxh3_64;
 
-const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB1";
+const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -21,7 +21,7 @@ struct CacheFile {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum Token<'a> {
+pub(crate) enum Token<'a> {
     Ident(&'a str),
     Str(&'a str),
     LParen,
@@ -72,7 +72,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn next_token(&mut self) -> Option<Token<'a>> {
+    pub(crate) fn next_token(&mut self) -> Option<Token<'a>> {
         self.skip_whitespace_and_comments();
         if self.pos >= self.src.len() {
             return None;
@@ -429,8 +429,9 @@ fn parse_cell_body(
     let mut is_sequential = false;
     let mut is_latch = false;
 
-    // Track cell-local pins
+    // Track cell-local pins mapping SymbolId to global LibPinId
     let mut local_pin_names: HashMap<SymbolId, LibPinId> = HashMap::new();
+    let mut pending_arcs = Vec::new();
 
     while let Some(tok) = lexer.next_token() {
         match tok {
@@ -459,8 +460,8 @@ fn parse_cell_body(
                     for var in vars {
                         let sym = db.strings.intern(&var);
                         if let std::collections::hash_map::Entry::Vacant(e) = local_pin_names.entry(sym) {
-                            let local_id = LibPinId((db.pins.len() as u32 - pin_offset) as u16);
-                            e.insert(local_id);
+                            let global_id = LibPinId(db.pins.len() as u16);
+                            e.insert(global_id);
                             db.pins.push(LibPin {
                                 name: sym,
                                 dir: PinDir::Internal,
@@ -492,8 +493,8 @@ fn parse_cell_body(
                     for var in vars {
                         let sym = db.strings.intern(&var);
                         if let std::collections::hash_map::Entry::Vacant(e) = local_pin_names.entry(sym) {
-                            let local_id = LibPinId((db.pins.len() as u32 - pin_offset) as u16);
-                            e.insert(local_id);
+                            let global_id = LibPinId(db.pins.len() as u16);
+                            e.insert(global_id);
                             db.pins.push(LibPin {
                                 name: sym,
                                 dir: PinDir::Internal,
@@ -514,16 +515,15 @@ fn parse_cell_body(
                         let pin_sym = db.strings.intern(pin_name);
                         let _ = lexer.next_token(); // RParen
                         if let Some(Token::LBrace) = lexer.next_token() {
-                            let local_id = LibPinId((db.pins.len() as u32 - pin_offset) as u16);
-                            local_pin_names.insert(pin_sym, local_id);
+                            let global_id = LibPinId(db.pins.len() as u16);
+                            local_pin_names.insert(pin_sym, global_id);
                             parse_pin_body(
                                 lexer,
                                 db,
                                 pin_sym,
-                                local_id,
-                                pin_offset,
-                                &local_pin_names,
+                                global_id,
                                 templates,
+                                &mut pending_arcs,
                             )?;
                         }
                     }
@@ -540,6 +540,23 @@ fn parse_cell_body(
             }
             _ => {}
         }
+    }
+
+    // Deferred resolution of related_pin SymbolIds to global LibPinId
+    for (target_pin_id, rel_sym, sense, ttype, rise, fall, r_trans, f_trans, r_const, f_const) in pending_arcs {
+        let rel_pin_id = local_pin_names.get(&rel_sym).copied().unwrap_or(target_pin_id);
+        db.arcs.push(LibTimingArc {
+            related_pin: rel_pin_id,
+            target_pin: target_pin_id,
+            timing_sense: sense,
+            timing_type: ttype,
+            cell_rise: rise,
+            cell_fall: fall,
+            rise_transition: r_trans,
+            fall_transition: f_trans,
+            rise_constraint: r_const,
+            fall_constraint: f_const,
+        });
     }
 
     let pin_count = (db.pins.len() as u32 - pin_offset) as u16;
@@ -559,14 +576,25 @@ fn parse_cell_body(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_pin_body(
     lexer: &mut Lexer,
     db: &mut LibDb,
     pin_name: SymbolId,
     target_pin_id: LibPinId,
-    pin_offset: u32,
-    local_pins: &HashMap<SymbolId, LibPinId>,
     templates: &HashMap<String, TemplateDef>,
+    pending_arcs: &mut Vec<(
+        LibPinId,
+        SymbolId,
+        TimingSense,
+        TimingType,
+        Option<NldmTable>,
+        Option<NldmTable>,
+        Option<NldmTable>,
+        Option<NldmTable>,
+        Option<NldmTable>,
+        Option<NldmTable>,
+    )>,
 ) -> Result<()> {
     let mut dir = PinDir::Input;
     let mut cap = 0.0f32;
@@ -664,34 +692,19 @@ fn parse_pin_body(
         max_transition,
     });
 
-    // Now resolve related_pin SymbolIds into LibPinIds and push arcs
     for (rel_sym, sense, ttype, rise, fall, r_trans, f_trans, r_const, f_const) in pin_arcs {
-        let rel_pin_id = if let Some(&id) = local_pins.get(&rel_sym) {
-            id
-        } else {
-            // If related pin was defined later or not yet seen, look for it in db.pins
-            let mut found = None;
-            for (idx, p) in db.pins[pin_offset as usize..].iter().enumerate() {
-                if p.name == rel_sym {
-                    found = Some(LibPinId(idx as u16));
-                    break;
-                }
-            }
-            found.unwrap_or(LibPinId(0))
-        };
-
-        db.arcs.push(LibTimingArc {
-            related_pin: rel_pin_id,
-            target_pin: target_pin_id,
-            timing_sense: sense,
-            timing_type: ttype,
-            cell_rise: rise,
-            cell_fall: fall,
-            rise_transition: r_trans,
-            fall_transition: f_trans,
-            rise_constraint: r_const,
-            fall_constraint: f_const,
-        });
+        pending_arcs.push((
+            target_pin_id,
+            rel_sym,
+            sense,
+            ttype,
+            rise,
+            fall,
+            r_trans,
+            f_trans,
+            r_const,
+            f_const,
+        ));
     }
 
     Ok(())
@@ -1222,6 +1235,64 @@ library (test_lib) {
         let fa_id = db.cell_by_name.get(&fa_sym).expect("fa_1 cell not found");
         let fa_cell = &db.cells[fa_id.0 as usize];
         assert_eq!(fa_cell.pin_count, 5); // A, B, CIN, COUT, SUM
+
+        // Spot-check dlxtp_1 (D declared before GATE forward reference check)
+        let dlx_sym = db.strings.get("sky130_fd_sc_hd__dlxtp_1").expect("dlxtp_1 symbol not found");
+        let dlx_id = db.cell_by_name.get(&dlx_sym).expect("dlxtp_1 cell not found");
+        let dlx_cell = &db.cells[dlx_id.0 as usize];
+        let dlx_arcs = db.cell_arcs(dlx_cell);
+        let gate_sym = db.strings.get("GATE").expect("GATE pin not found");
+        // Verify that D's timing arc has related_pin == GATE (not IQ)
+        let d_sym = db.strings.get("D").expect("D pin not found");
+        let d_arc = dlx_arcs.iter().find(|a| db.pins[a.target_pin.0 as usize].name == d_sym)
+            .expect("timing arc for D not found");
+        assert_eq!(db.pins[d_arc.related_pin.0 as usize].name, gate_sym);
+    }
+
+    #[test]
+    fn test_forward_referenced_related_pin() {
+        let lib_text = r#"
+library(test_fwd) {
+  cell(latch_fwd) {
+    pin(D) {
+      direction : input;
+      timing() {
+        related_pin : "GATE";
+        timing_type : "setup_rising";
+      }
+    }
+    pin(GATE) {
+      direction : input;
+    }
+    pin(Q) {
+      direction : output;
+      timing() {
+        related_pin : "GATE";
+        timing_type : "combinational";
+      }
+    }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(lib_text.as_bytes()).unwrap();
+        assert_eq!(db.cells.len(), 1);
+        let cell = &db.cells[0];
+        assert_eq!(cell.pin_count, 3);
+        assert_eq!(cell.arc_count, 2);
+        let arcs = db.cell_arcs(cell);
+        let gate_sym = db.strings.get("GATE").unwrap();
+        let d_sym = db.strings.get("D").unwrap();
+        let q_sym = db.strings.get("Q").unwrap();
+        // D arc should have related_pin == GATE (global LibPinId(1))
+        let d_arc = &arcs[0];
+        assert_eq!(db.pins[d_arc.target_pin.0 as usize].name, d_sym);
+        assert_eq!(db.pins[d_arc.related_pin.0 as usize].name, gate_sym);
+        assert_eq!(d_arc.related_pin, LibPinId(1));
+        // Q arc should have related_pin == GATE (global LibPinId(1))
+        let q_arc = &arcs[1];
+        assert_eq!(db.pins[q_arc.target_pin.0 as usize].name, q_sym);
+        assert_eq!(db.pins[q_arc.related_pin.0 as usize].name, gate_sym);
+        assert_eq!(q_arc.related_pin, LibPinId(1));
     }
 
     fn dirs_home() -> PathBuf {

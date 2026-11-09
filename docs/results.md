@@ -36,3 +36,27 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - OpenSTA ignores `test_cell ()` views, yielding exactly 45 unique flip-flop cells with `IQ` pins and 18 unique latch cells with `IQ` pins = 63 sequential cells total.
   - `grus-core` Liberty reader matches OpenSTA's semantic interpretation exactly: 428 cells, 1,897 pins, and 63 sequential cells (with 87 syntax groups in source text).
 
+### 2026-11-09 — E0.4 — `sky130_fd_sc_hd` (Technology & Standard Cell LEF Reader)
+- **Reference Command**: `openroad -no_init -no_splash` (running `read_lef`, `getTech getLayers`, `getLibs getMasters` inside `ghcr.io/librelane/librelane:3.0.16`)
+- **Our Command**: `cargo run --release -p grus-eda -- check-e0 --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef --lef ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef`
+- **Our Runtime**: `4.95 ms` (CLI) / `4.97 ms` (test) (18 KB tlef + 1.3 MB lef)
+
+| Metric | Reference (`OpenROAD`) | Ours (`grus-eda`) | Diff (Abs / %) | Pass? |
+|---|---|---|---|---|
+| Database Units per Micron (DBU/um) | 1,000 | 1,000 | 0 (0.0%) | PASS |
+| Core Site (`unithd`) Width | 460 DBU (0.46 um) | 460 DBU (0.46 um) | 0 (0.0%) | PASS |
+| Core Site (`unithd`) Height | 2,720 DBU (2.72 um) | 2,720 DBU (2.72 um) | 0 (0.0%) | PASS |
+| Routing Layer Count | 6 (`li1`..`met5`) | 6 (`li1`..`met5`) | 0 (0.0%) | PASS |
+| Total Library Macros | 437 | 437 | 0 (0.0%) | PASS |
+| Total Macro Pins | 3,526 | 3,526 | 0 (0.0%) | PASS |
+| `met1` Pitch / Width / Offset | 340 / 140 / 170 DBU | 340 / 140 / 170 DBU | 0 (0.0%) | PASS |
+| `met1` Resistance RPERSQ | 0.125 Ohms | 0.125 Ohms | 0 (0.0%) | PASS |
+| `met1` Capacitance CPERSQDIST | 25.7784e-6 pF/um^2 | 25.7784e-6 pF/um^2 | 0 (0.0%) | PASS |
+| `met1` Edge Capacitance | 40.567e-6 pF/um | 40.567e-6 pF/um | 0 (0.0%) | PASS |
+| `inv_1` Dimensions (WxH) | 1,380 x 2,720 DBU | 1,380 x 2,720 DBU | 0 (0.0%) | PASS |
+| `inv_1` Pin Count | 6 (`A`, `VGND`, `VNB`, `VPB`, `VPWR`, `Y`) | 6 | 0 (0.0%) | PASS |
+| `inv_1` Pin `A` Center Offset | (485, 1195) DBU | (485, 1195) DBU | 0 (0.0%) | PASS |
+| `inv_1` Pin `Y` Center Offset | (885, 1360) DBU | (885, 1360) DBU | 0 (0.0%) | PASS |
+| `inv_1` Obstruction Rectangles | 4 (`li1`) | 4 (`li1`) | 0 (0.0%) | PASS |
+
+

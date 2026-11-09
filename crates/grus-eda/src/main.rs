@@ -147,6 +147,26 @@ fn main() -> anyhow::Result<()> {
                 lib_db.arcs.len(),
                 elapsed_ms
             );
+
+            if let (Some(tlef_path), Some(lef_path)) = (&args.tlef, &args.lef) {
+                println!("Loading LEF from {:?} and {:?}", tlef_path, lef_path);
+                let t_lef = std::time::Instant::now();
+                let mut interner = grus_core::interner::StringInterner::new();
+                let tech_db =
+                    grus_core::readers::load_tech_db(tlef_path, lef_path, &mut interner)?;
+                let elapsed_lef_ms = t_lef.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "Loaded LEF: dbu/um={}, site={} ({}x{} dbu), routing_layers={}, macros={}, macro_pins={}, elapsed={:.2}ms",
+                    tech_db.dbu_per_micron,
+                    tech_db.site_name,
+                    tech_db.site_width_dbu,
+                    tech_db.site_height_dbu,
+                    tech_db.routing_layers.len(),
+                    tech_db.macros.len(),
+                    tech_db.macro_pins.len(),
+                    elapsed_lef_ms
+                );
+            }
         }
         Commands::Congestion(args) => {
             println!(
