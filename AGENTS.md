@@ -1,65 +1,53 @@
-# grus-eda — AI エージェント向けの作業ガイド
+# grus-eda — AI Agent Guide
 
-AI エージェントがこの repo で作業するためのもの。
-**このファイルだけで完結する**。他の場所の指示ファイルは読まなくてよい。
+Instructions for AI coding agents working in this repository.
+**This file is self-contained.** Do not read instruction files outside this repository.
 
-## 0. 開く範囲
+## 1. Hard Rules
 
-- エージェントでは **この repo のフォルダ（`grus-eda/`）だけを開く**。
-  親フォルダ（`~/dev/github.com/grus-systems/`）は開かない。
-- この repo の外のファイルを読みに行かない。隣のフォルダにある repo は、この作業とは関係のない機密を含む。
+- **Only public designs and code written in this repository may enter this repository.**
+  - Test designs: OpenROAD-flow-scripts `sky130hd` designs (`gcd`, `aes`, `ibex`, etc.) and `picorv32`.
+    Before adding a design, verify its open-source license and document its provenance in `tests/designs/README.md`.
+  - PDK: SkyWater sky130 (`sky130_fd_sc_hd`).
+  - Even if the user hands you a design file or netlist, confirm it is public before adding it; if unsure, ask first.
+- Never use `--force`, `--no-verify`, `reset --hard`, `branch -D`, or `push --force` without explicit permission from the user.
+- Ask before installing new system tools or running any billable operation. Adding Rust crates via `Cargo.toml` does not require asking first (explain the reason in the commit message).
 
-## 1. 絶対に守ること
+## 2. Verification Discipline (Most Important Rule)
 
-- **この repo に入れてよいのは、公開されている設計とこの repo で書いたコードだけ**。
-  - テスト設計: OpenROAD-flow-scripts の sky130hd 向け設計（`gcd`・`aes`・`ibex` など）と picorv32。
-    追加するときはライセンスを確認し、出どころを `tests/designs/README.md` に書く。
-  - PDK: SkyWater sky130（`sky130_fd_sc_hd`）。
-  - 本人から設計ファイルやネットリストを渡されても、公開物だと確認できなければ入れずに聞く。
-- `--force`・`--no-verify`・`reset --hard`・`branch -D`・`push --force` は本人の明示の許可なしに使わない。
-- 新しいツールのインストール、課金が発生する操作は先に聞く。Rust の crate を足すのは聞かなくてよい
-  （ただし理由をコミットメッセージに書く）。
+- Every stage (`E0` through `E3` in `README.md`) has a **reference tool**. **Passing your own unit tests does not mean a stage is done.** A stage is done only when run on the exact same inputs as the reference tool and its numbers meet the "done when" criteria in `README.md`.
+- Record every comparison in `docs/results.md`: date, design, reference tool value, our value, difference, and our runtime.
+  Keep failed or divergent runs in the log as well, along with the root cause identified.
+- Commit reference tool output files (golden files) only when they are small (< 1 MB). For larger outputs, commit the exact reproduction script/command instead.
+- Reference tools come from the cached LibreLane container image (`ghcr.io/librelane/librelane:3.0.16`).
+  Start Docker via Colima:
+  `mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8`
+  Invoke OpenSTA and OpenROAD inside the container as `sta` and `openroad`.
+- Speed optimizations (parallelism via `rayon`, SIMD, `Accelerate`, Metal GPU) come **only after** a stage's simple CPU version agrees with the reference tool. Lock in equivalence between the fast path and the simple baseline with regression tests.
+- Always state explicitly what you actually ran vs. what is untested. Never claim something "should work" based on guesswork.
 
-## 2. 検証の規律（この repo で一番大事なこと）
+## 4. Working Style & Communication
 
-- 各段（README の E0〜E3）には**比べる相手のツール**がある。**自分で書いたテストが通っただけで
-  「できた」と言わない**。相手のツールと同じ入力で比べ、数値が README の「done when」に入ったときだけ完了。
-- 比べた結果は `docs/results.md` に追記する: 日付、設計、相手のツールの値、こちらの値、差、こちらの実行時間。
-  合わなかったものも消さずに残し、分かった原因を書く。
-- 相手のツールの出力（正解ファイル）は小さいものだけコミットする（目安 1 MB 未満）。
-  大きいものは作り方（コマンド）だけ残す。
-- 相手のツールは LibreLane のコンテナに入っている（`ghcr.io/librelane/librelane:3.0.16`、手元にキャッシュ済み）。
-  Docker は Colima で動かす: `mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8`。
-  OpenSTA・OpenROAD はコンテナの中で `sta`・`openroad` として呼ぶ。
-- 速くする工夫（並列化・SIMD・GPU）は、その段の単純な CPU 版が相手のツールと合ってから。
-  速い版は単純な版と同じ結果を出すことをテストで固定する。
-- 試したか・試していないかを明示する。推測で「動くはず」と書かない。
+- **Chat responses to the user must be in concise Japanese.**
+- **All repository text—code comments, identifiers, commit messages, `README.md`, `AGENTS.md`, and `docs/`—must be in English.**
+- Keep technical terms in their standard form; add brief parenthetical notes in chat responses when helpful.
+- Ask early when requirements are ambiguous. Make minor technical choices yourself and record the decision and rationale in the commit message or `docs/`.
+- Keep changes small and focused; do not mix unrelated concerns in a single commit.
+- Write code comments only to explain *why*, not *what*. Handle errors at system boundaries (file I/O, CLI parsing), not inside hot loops.
+- Leave no half-baked backward-compatibility shims or unused `_var` bindings.
 
-## 3. 作業の進め方（本人の好み）
+## 5. Git & Commits
 
-- 応答は日本語、簡潔に。コード内のコメント・識別子・コミットメッセージ・README は英語。
-- 専門用語は平易な語に置き換えず、括弧で注釈を添える。
-- 不明点は早めに聞く。軽微な選択は自分で決め、決めたことと理由をコミットか `docs/` に残す。
-- 変更は小さく刻み、関心事を混ぜない。
-- コメントは「なぜ」が要るときだけ。エラー処理は境界（ファイルの読み込み・CLI の入力）だけ。
-- 後方互換の半端なシムや、未使用変数の `_var` 化を残さない。
+- **Commit proactively**: As soon as a logical unit of work (a doc update, a module, a parser sub-step, or a verification run) is complete and passes checks, commit it immediately without waiting to be asked.
+- Work on `dev` or a feature branch cut from `dev` and merge via PR into `dev` (`dev` $\rightarrow$ `main` is decided by the user).
+- Use Conventional Commits in English (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `refactor:`, with `!` for breaking changes).
+- Keep the configured git author identity (`Yuto Ohashi <yuto@grus.systems>`) unchanged.
+- Multiple agents may work concurrently. When working on a branch other than `dev`, create a separate worktree via `git worktree add ../grus-eda-<topic> <branch>`. Never run `git add -A`; always stage explicit file paths.
+- Versioning: Once the Cargo workspace exists, bump `[workspace.package] version` in the root `Cargo.toml` in the same commit as any functional change. While in `0.x`, features and bug fixes bump `patch`; breaking changes bump `minor`.
+- Append your agent trailer to every commit message and PR description (e.g., `Co-Authored-By: <Agent Name> <email>`).
 
-## 4. Git
+## 6. First Steps (E0)
 
-- 作業は `dev` から切った feature branch で行い、PR で `dev` へ入れる（`dev` → `main` は本人が判断）。
-- コミットは Conventional Commits・英語（`feat:` `fix:` `docs:` `test:` `chore:` `refactor:`、破壊的変更は `!`）。
-  1 つの変更がまとまった時点で、その場でコミットする。
-- 会社の identity（`Yuto Ohashi <yuto@grus.systems>`）は自動で設定される。変えない。
-- 同時に複数のエージェントが作業しうる。`dev` 以外のブランチは `git worktree add ../grus-eda-<topic> <branch>`
-  で別フォルダに切る。`git add -A` は使わず、パスを指定して add する。
-- バージョン: Cargo workspace を作ったら、ルートの `Cargo.toml` の `[workspace.package] version` を
-  機能変更と同じコミットで上げる。0.x の間は機能追加・バグ修正 = patch、破壊的変更 = minor。
-- コミットと PR の末尾に、作ったエージェントの署名を入れる（例: `Co-Authored-By: <エージェント名> <アドレス>`）。
-
-## 5. 最初の一歩（E0）
-
-1. Cargo workspace を作る（CLI 1 本 + ライブラリ crate。名前は本人に聞かなくてよい）。
-2. `tests/designs/` に `gcd`（OpenROAD-flow-scripts の sky130hd）を置き、yosys のネットリストと
-   OpenROAD の配置後 DEF を相手のツールで作る手順を `tests/designs/README.md` に書く。
-3. Liberty の読み込みから始め、セルの数・ピン・NLDM 表の寸法を、同じ Liberty を読んだ OpenSTA
-   （`get_lib_cells` の数、`report_lib_cell` の出力）と比べる。
+1. Create the Cargo workspace (`grus-eda` CLI binary + `grus-core` library crate, following `docs/architecture.md`).
+2. Add `gcd` (`sky130hd` from OpenROAD-flow-scripts) under `tests/designs/gcd/` and document how to generate the Yosys netlist (`.json` and `.v`) and OpenROAD placed `.def` using the LibreLane container in `tests/designs/README.md`.
+3. Implement the Liberty reader and binary cache first (`docs/e0-readers.md`), and compare cell count, pin count, and NLDM table dimensions against OpenSTA (`get_lib_cells`, `report_lib_cell`) on the same `.lib` file.

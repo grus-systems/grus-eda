@@ -21,20 +21,25 @@ hands over to the established tools for everything after.
 
 1. **Seconds, not minutes**: timing, placement and congestion estimates in seconds
    for designs up to about 100k cells on a laptop.
-2. **One Rust binary**: no container and no Tcl. It reads the standard files
-   (Liberty, LEF, DEF, gate-level Verilog) and writes DEF, so OpenROAD can take
-   over from any stage. Rust for memory safety without a garbage collector, easy
-   data parallelism (rayon) and a single static binary.
+2. **One Rust binary, decoupled stages**: no container and no Tcl. It reads the
+   standard files (Liberty, LEF, DEF, and Yosys JSON or gate-level Verilog) and
+   writes DEF. Every stage can also consume OpenROAD's intermediate files (such
+   as a placed DEF) directly, so any stage can run standalone or hand over to
+   OpenROAD at any boundary. Rust for memory safety without a garbage collector,
+   easy data parallelism (rayon) and a single static binary.
 3. **Data-oriented design**: flat arrays per attribute (structure of arrays),
-   graphs as index arrays (CSR) instead of pointers, no allocation per object.
-   The timing graph is levelized so that every level is one parallel pass.
+   graphs as index arrays (CSR) instead of pointers, no allocation per object,
+   and `f32` arithmetic across CPU and GPU. The timing graph is levelized so
+   that every level is one parallel pass.
 4. **Known fast algorithms, not new ones**:
-   - timing: levelized propagation with NLDM table lookup, as OpenSTA computes it;
+   - congestion: RSMT (Steiner tree) decomposition followed by pattern
+     (L/Z-shape) and probabilistic routing on a GCell grid;
    - placement: analytical placement with an electrostatic density term solved by
-     FFT (ePlace, DREAMPlace);
-   - congestion: pattern and probabilistic routing on a grid of routing cells.
-5. **Apple Silicon first**: all cores through rayon, then Metal for the kernels
-   that pay for it (the density FFT, the wirelength gradient).
+     FFT (ePlace, DREAMPlace), plus a lightweight greedy legalizer;
+   - timing: levelized propagation with NLDM table lookup, as OpenSTA computes it.
+5. **Apple Silicon first**: all cores through rayon and NEON SIMD, then
+   Accelerate / Metal for the kernels that pay for it (the density FFT, the
+   wirelength gradient).
 6. **Agreement before speed**: a stage gets faster only after it agrees with the
    reference tool, and the fast version must give the same answer as the simple one.
 
@@ -44,16 +49,25 @@ Not goals: sign-off, detailed routing, or beating OpenROAD on result quality.
 
 | stage | what | checked against | done when |
 |---|---|---|---|
-| E0 | readers: Liberty (NLDM tables), LEF (technology and cells), DEF, gate-level Verilog (yosys output) | OpenROAD's reports on the same files | cell, net, pin and row counts match on every test design |
-| E1 | static timing: arrival, slew, setup and hold, first without wires, then with SPEF | OpenSTA | worst slack and every endpoint's arrival within 1% or 5 ps |
-| E2 | global placement (wirelength plus a density penalty) | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% |
-| E3 | global-routing congestion estimate (overflow per routing cell) | OpenROAD `global_route` | overflow ranks the test variants in the same order |
+| E0 | readers: Liberty (NLDM tables), LEF (technology and cells), DEF, Yosys JSON (preferred) and gate-level Verilog | OpenROAD and OpenSTA reports on the same files | cell, net, pin and row counts match on every test design |
+| E1 | global-routing congestion estimate (overflow per GCell, from placed DEF) | OpenROAD `global_route` | overflow ranks the test variants in the same order |
+| E2 | global placement (wirelength plus a density penalty) and greedy legalization | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% |
+| E3 | static timing (edge-triggered DFFs first): arrival, slew, setup and hold — first without wires, then with placement-based RC estimation (HPWL/Steiner) and SPEF | OpenSTA | worst slack and every endpoint's arrival within 1% or 5 ps |
 
-Out of scope: detailed routing, GDS output, DRC and LVS. These stay with
-OpenROAD, Magic and KLayout.
+Out of scope: detailed routing, GDS output, DRC, LVS, and (initially) transparent
+latch time borrowing. These stay with OpenROAD, OpenSTA, Magic and KLayout.
 
 A GPU path (Metal) may come after a stage's CPU version agrees with the reference
 tool. The GPU result must then equal the CPU result.
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — Data-oriented design (SoA/CSR), decoupled pipeline, `f32` numeric model, and Apple Silicon strategy
+- [`docs/e0-readers.md`](docs/e0-readers.md) — E0: File formats, Yosys JSON vs. Verilog, and Liberty binary caching
+- [`docs/e1-congestion.md`](docs/e1-congestion.md) — E1: GCell grid, RSMT (FLUTE/Steiner) decomposition, and pattern/probabilistic routing
+- [`docs/e2-placement.md`](docs/e2-placement.md) — E2: ePlace electrostatic placement, 2D DCT/FFT, and greedy legalization
+- [`docs/e3-sta.md`](docs/e3-sta.md) — E3: Levelized STA, unateness, NLDM extrapolation, and placement-based RC / SPEF
+- [`docs/results.md`](docs/results.md) — Verification log against OpenROAD and OpenSTA
 
 ## Dependencies
 
