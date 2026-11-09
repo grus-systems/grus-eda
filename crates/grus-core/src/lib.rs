@@ -4,6 +4,7 @@ pub mod interner;
 pub mod lib_db;
 pub mod placement;
 pub mod readers;
+pub mod sta;
 pub mod tech_db;
 
 pub use congestion::*;

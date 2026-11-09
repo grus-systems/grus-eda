@@ -9,7 +9,7 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 | **E0** (Readers) | OpenROAD / OpenSTA | Cell, net, pin, and row counts match exactly on every test design | PASS |
 | **E1** (Congestion) | OpenROAD `global_route` | Overflow ranks the test variants in the same order | PASS |
 | **E2** (Placement) | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% | PASS (gcd, E2.4) |
-| **E3** (STA) | OpenSTA (`sta`) | Worst slack and every endpoint's arrival within 1% or 5 ps | Pending |
+| **E3** (STA) | OpenSTA (`sta`) | Worst slack and every endpoint's arrival within 1% or 5 ps | E3.1 PASS (gcd, zero wire); E3.2/E3.3 pending |
 
 ---
 
@@ -320,5 +320,23 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - External reference tool confirmation: Invoked OpenROAD `check_placement -verbose` and `detailed_placement` on the generated DEF inside the canonical LibreLane container (`ghcr.io/librelane/librelane:3.0.16`). OpenROAD reported 0 placement violations and performed **0.0 u displacement** (0% delta HPWL), confirming that our legalized placement is 100% compliant with standard cell design rules.
   - End-to-end performance: The entire placement pipeline (`grus-eda place`) finishes in **17.29 ms** (11.30 ms global placement, 5.99 ms legalization and refinement, 1.06 ms DEF serialization), achieving a final HPWL of 4,401.0 um (-2.83% compared to OpenROAD's 4,529.2 um).
 
+### 2026-11-10 — E3.1 — `gcd` (Zero-Wire STA vs OpenSTA)
+- **Reference**: `tests/designs/gcd/gcd.sta.reference.json` (`zero_wire`), emitted by `generate_ref.sh` step 9 from OpenSTA in `ghcr.io/librelane/librelane:3.0.16`. I did not rerun the script this session; the committed golden file was used as is.
+- **Our Command**: `cargo test --release -p grus-core test_gcd_zero_wire` and `grus-eda sta --lib sky130_fd_sc_hd__tt_025C_1v80.lib --tlef ... --lef ... --def gcd.placed.def --sdc gcd.sdc --parasitics none`.
+- **Inputs**: `gcd.placed.def`, `gcd.sdc`, tt_025C_1v80 Liberty (same files as the reference run).
 
+| Metric | OpenSTA | Ours | Diff | Pass? |
+|---|---|---|---|---|
+| Setup WNS | 1.757771 ns | 1.757771 ns | < 1e-6 | PASS |
+| Hold WNS | 0.470473 ns | 0.470473 ns | < 1e-6 | PASS |
+| Setup / hold TNS | 0 | 0 | 0 | PASS |
+| Endpoints compared | 53 | 53 | 0 missing | PASS |
+| Max abs diff over all 53 endpoints, any field (arr, req, slack, slew; max and min) | — | — | 6.0e-7 ns | PASS (limit: max(5 ps, 1%)) |
+| STA runtime (graph build + propagation + report) | — | 0.24 ms | — | — |
 
+- **Notes / Observations**:
+  - First run failed: 71 mismatches and NaN required times. Root cause: the net-copy step copied the unreached state of the clock *port* over the seeded `CLK` pins of the registers. Fix: a driver with no reached transition does not overwrite its sinks.
+  - Verification discipline (AGENTS.md Rule 7): mutating the fall-load to use `cap_rise` turned the test red (71 mismatches); restored afterwards.
+  - **Coverage limit (Rule 4)**: mutating the NLDM *extrapolation* (clamping below or above the table) did **not** turn the gcd test red. gcd stays inside the table at the top end, and the bottom-end extrapolation (slew 0 vs `index_1[0] = 0.01`) moves a delay by far less than 5 ps. Extrapolation is therefore covered only by the unit tests in `sta/nldm.rs`, not by OpenSTA agreement. A design with a heavier load (picorv32, once added) is needed before claiming it against OpenSTA.
+  - Latch cells are skipped with a warning; the clock-uncertainty command is parsed and applied to register checks only, not to output ports (gcd has none, so this is untested against OpenSTA).
+  - Only `gcd` is covered; `picorv32` is not in `tests/designs/` yet.

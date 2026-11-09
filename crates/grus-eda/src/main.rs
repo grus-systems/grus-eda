@@ -347,7 +347,31 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Commands::Sta(args) => {
-            println!("grus-eda sta: lib={:?}", args.lib);
+            match args.parasitics.as_deref() {
+                None | Some("none") => {}
+                Some(other) => anyhow::bail!("--parasitics {other} is not implemented yet (E3.2/E3.3)"),
+            }
+            let (Some(tlef), Some(lef), Some(def), Some(sdc_path)) =
+                (&args.tlef, &args.lef, &args.def, &args.sdc)
+            else {
+                anyhow::bail!("sta requires --tlef, --lef, --def and --sdc");
+            };
+            let lib_db = grus_core::readers::load_liberty(&args.lib)?;
+            let mut interner = grus_core::interner::StringInterner::new();
+            let tech_db = grus_core::readers::load_tech_db(tlef, lef, &mut interner)?;
+            let design = grus_core::readers::parse_def(def, &tech_db, Some(&lib_db))?;
+            let sdc = grus_core::sta::load_sdc(sdc_path)?;
+            let t0 = std::time::Instant::now();
+            let report = grus_core::sta::run_zero_wire_sta(&design, &lib_db, &sdc)?;
+            println!(
+                "STA (zero wire): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms",
+                report.endpoints.len(),
+                report.wns_max_ns,
+                report.tns_max_ns,
+                report.wns_min_ns,
+                report.tns_min_ns,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
     }
     Ok(())

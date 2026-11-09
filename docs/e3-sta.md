@@ -18,58 +18,26 @@ This document breaks E3 into three progressive implementation steps (`E3.1`–`E
 
 ## 2. Concrete Data Structures (`crates/grus-core/src/sta/`)
 
-```rust
-use crate::interner::{CellId, LibCellId, NetId, PinId};
-use crate::lib_db::{NldmTable, TimingSense, TimingType};
+Files: `nldm.rs` (table lookup), `sdc.rs` (SDC subset), `analysis.rs` (graph, propagation, endpoint report).
+The first implementation is the simple CPU baseline (AGENTS.md Section 2): adjacency is `Vec<Vec<u32>>`, not CSR.
 
+```rust
 pub const RISE: usize = 0;
 pub const FALL: usize = 1;
 
-#[derive(Clone, Debug)]
-pub struct TimingArcEdge {
-    pub src_pin: PinId,
-    pub dst_pin: PinId,
-    pub cell_id: CellId,
-    pub sense: TimingSense,
-    pub timing_type: TimingType,
-    pub lib_arc_idx: u32, // index into LibDb::arcs
-}
+struct ArcEdge { dst: PinId, lib_arc: u32 }          // combinational arc; edges_from[src_pin] lists them
+struct LaunchArc { clk: PinId, q: PinId, lib_arc: u32 } // RisingEdge CLK -> Q
+struct RegisterCheck { clk: Option<PinId>, setup_arc: Option<u32>, hold_arc: Option<u32> } // keyed by D pin
 
-#[derive(Clone, Debug)]
-pub struct TimingCheck {
-    pub data_pin: PinId,
-    pub clk_pin: PinId,
-    pub cell_id: CellId,
-    pub is_setup: bool,
-    pub is_rising_clk: bool,
-    pub lib_arc_idx: u32,
-}
-
-#[derive(Clone, Debug)]
-pub struct TimingGraph {
-    /// Topological levels of nets/cells: level `l` contains nets `level_net_ids[level_offsets[l]..level_offsets[l+1]]`
-    pub level_offsets: Vec<u32>,
-    pub level_net_ids: Vec<NetId>,
-
-    /// Outgoing cell timing arcs from each input PinId (CSR indexed by PinId)
-    pub pin_arc_offsets: Vec<u32>,
-    pub pin_arcs: Vec<TimingArcEdge>,
-
-    /// Sequential setup/hold checks at endpoints
-    pub checks: Vec<TimingCheck>,
-    pub primary_outputs: Vec<PinId>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PinTimingState {
-    pub arrival_max: [f32; 2],  // [RISE, FALL] in ns (initialized to f32::NEG_INFINITY)
-    pub arrival_min: [f32; 2],  // [RISE, FALL] in ns (initialized to f32::INFINITY)
-    pub slew_max: [f32; 2],     // [RISE, FALL] in ns
-    pub slew_min: [f32; 2],     // [RISE, FALL] in ns
-    pub required_max: [f32; 2], // [RISE, FALL] in ns (initialized to f32::INFINITY)
-    pub required_min: [f32; 2], // [RISE, FALL] in ns (initialized to f32::NEG_INFINITY)
+struct PinTimingState {
+    arrival_max: [f32; 2], arrival_min: [f32; 2], // [RISE, FALL], ns; UNREACHED = -inf / +inf
+    slew_max: [f32; 2],    slew_min: [f32; 2],
 }
 ```
+
+`required_*` are **not** stored per pin: zero-wire reporting needs them only at endpoints, so they are
+computed there. A full backward pass is added when a feature needs required times at internal pins.
+Endpoints are sorted by name; `PinId` has no `Ord`, so the check map is keyed by the raw `u32`.
 
 ---
 
@@ -217,7 +185,7 @@ To ensure `grus-eda sta` and OpenSTA evaluate the exact same boundary conditions
            state[y].slew_max[dst_pol]    = state[y].slew_max[dst_pol].max(cand_slew_max);
            state[y].slew_min[dst_pol]    = state[y].slew_min[dst_pol].min(cand_slew_min);
            ```
-3. **Setup & Hold Endpoint Checks and Backward Pass**:
+3. **Setup & Hold Endpoint Checks**:
    - At each `TimingCheck` on flip-flop data pin $D$ with rising clock pin $CLK$:
      - **Setup (Max Path)** for data polarity $\text{pol} \in \{\text{RISE}, \text{FALL}\}$:
        $$t_{\text{setup}}(\text{pol}) = \text{eval\_nldm\_constraint}\bigl(\text{constraint\_table}(\text{pol}),\; \text{slew}_{\max}(D, \text{pol}),\; \text{slew}_{\max}(CLK, \text{RISE})\bigr)$$
@@ -227,9 +195,9 @@ To ensure `grus-eda sta` and OpenSTA evaluate the exact same boundary conditions
        $$t_{\text{hold}}(\text{pol}) = \text{eval\_nldm\_constraint}\bigl(\text{constraint\_table}(\text{pol}),\; \text{slew}_{\min}(D, \text{pol}),\; \text{slew}_{\max}(CLK, \text{RISE})\bigr)$$
        $$\text{req}_{\min}(D, \text{pol}) = \text{arr}_{\max}(CLK, \text{RISE}) + t_{\text{hold}}(\text{pol}) + t_{\text{uncertainty}}$$
        $$\text{slack}_{\text{hold}}(D, \text{pol}) = \text{arr}_{\min}(D, \text{pol}) - \text{req}_{\min}(D, \text{pol})$$
-   - Propagate `required_max` (taking `min` across fanout) and `required_min` (taking `max` across fanout) backward from level $L_K$ down to $L_0$.
+   - (Not implemented in E3.1: required times at internal pins. See Section 2.)
 
-#### E3.1 Reference Semantics (measured with OpenSTA on `gcd`, 2026-11-10)
+#### E3.1 Reference Semantics (measured with OpenSTA on `gcd`, 2026-11-10; implemented 2026-11-10)
 
 Every rule below was checked against `report_checks -fields {slew cap input_pins} -digits 6` on
 `gcd.placed.def` + `gcd.sdc` in `ghcr.io/librelane/librelane:3.0.16`. Where this section and the
