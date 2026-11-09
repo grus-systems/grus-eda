@@ -42,8 +42,28 @@ $$\frac{\partial W_x(e)}{\partial x_p} = \frac{a_p^+}{\gamma \, (A_e^+)^2} \Bigl
 
 (Identical formulas apply independently to $y_p$.)
 To accumulate cell gradients without atomic operations:
-1. Compute pin gradients `pin_grad_x[p]` and `pin_grad_y[p]` in parallel across nets `e` (since each pin belongs to at most one net).
-2. Gather into `cell_grad_x[c]` and `cell_grad_y[c]` in parallel across movable cells `c` by summing over `cell_pin_ids[cell_pin_offsets[c] .. cell_pin_offsets[c+1]]`.
+1. Compute pin gradients `pin_grad_x[p]` and `pin_grad_y[p]` across nets `e` (since each pin belongs to at most one net).
+2. Gather into `cell_grad_x[c]` and `cell_grad_y[c]` across movable cells `c` by summing over `cell_pin_ids[cell_pin_offsets[c] .. cell_pin_offsets[c+1]]` (setting `0.0` for `Fixed`/`Cover`/`CoreSpacer` cells).
+
+#### Concrete Structs & Signatures (`crates/grus-core/src/placement/wirelength.rs`)
+```rust
+#[derive(Clone, Debug)]
+pub struct WaWirelengthPrecomp {
+    pub dbu_per_um: f32,
+    pub pin_dx_um: Vec<f32>, // length num_pins: offset from cell lower-left (or absolute I/O x_um)
+    pub pin_dy_um: Vec<f32>, // length num_pins: offset from cell lower-left (or absolute I/O y_um)
+    pub movable_cell_mask: Vec<bool>, // length num_cells: true if movable Core/CoreTie cell
+}
+```
+- `WaWirelengthPrecomp::new(design_db: &DesignDb, tech_db: &TechDb) -> Self`:
+  - For each pin `p`: if `design_db.pin_cells[p] == Some(c)`, compute `(px_dbu, py_dbu) = design_db.pin_pos_dbu(PinId(p as u32), tech_db)` and set `pin_dx_um[p] = (px_dbu - design_db.cell_x_dbu[c]) as f32 / dbu_per_um` (if `cell_status[c] == Unplaced`, use `design_db.pin_offset_x_dbu[p] as f32 / dbu_per_um`). If `design_db.pin_cells[p] == None` (primary I/O), set `pin_dx_um[p] = design_db.pin_offset_x_dbu[p] as f32 / dbu_per_um`.
+  - A cell `c` has `movable_cell_mask[c] = true` iff `cell_status[c]` is `Placed` or `Unplaced` and its macro class is `MacroClass::Core` or `MacroClass::CoreTie`.
+- `pub fn compute_wa_wirelength_and_grad(design_db: &DesignDb, precomp: &WaWirelengthPrecomp, cell_x_um: &[f32], cell_y_um: &[f32], gamma: f32, pin_grad_x: &mut [f32], pin_grad_y: &mut [f32], cell_grad_x: &mut [f32], cell_grad_y: &mut [f32]) -> f64`
+- `pub fn compute_hpwl_um(design_db: &DesignDb, precomp: &WaWirelengthPrecomp, cell_x_um: &[f32], cell_y_um: &[f32]) -> f64`
+- **Verification on `gcd.placed.def`**:
+  - Verify `compute_hpwl_um` at placed coordinates equals `placed_hpwl_um` (`4529.224 um`) from `gcd.reference.json`.
+  - Verify that as $\gamma$ decreases (`10.0 -> 1.0 -> 0.1 -> 0.001 um`), `compute_wa_wirelength_and_grad` increases monotonically and converges to `4529.224 um` within `< 0.01 um` at $\gamma = 0.001\,\mu\text{m}$.
+  - Verify analytical gradients `(cell_grad_x[c], cell_grad_y[c])` against central finite differences across all 233 movable logic cells on `gcd.placed.def` at $\gamma = 5.0\,\mu\text{m}$ using an exact dyadic step $h = 2^{-6} = 0.015625\,\mu\text{m}$ (so `x_plus - x_minus == 2.0 * h` is exact in `f32`), asserting relative error `< 1e-4` on every cell with $\|\nabla_c W\| > 10^{-3}$.
 
 ---
 
