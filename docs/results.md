@@ -9,7 +9,7 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 | **E0** (Readers) | OpenROAD / OpenSTA | Cell, net, pin, and row counts match exactly on every test design | PASS |
 | **E1** (Congestion) | OpenROAD `global_route` | Overflow ranks the test variants in the same order | PASS |
 | **E2** (Placement) | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% | PASS (gcd, E2.4) |
-| **E3** (STA) | OpenSTA (`sta`) | Worst slack and every endpoint's arrival within 1% or 5 ps | E3.1 PASS (gcd, zero wire); E3.2 PASS on arrival/required/slack, slew within 3% (gcd); E3.3 pending |
+| **E3** (STA) | OpenSTA (`sta`) | Worst slack and every endpoint's arrival within 1% or 5 ps | E3.1 PASS (gcd, zero wire); E3.2 and E3.3 (SPEF) PASS on arrival/required/slack, slew within 3% (gcd); DMP Ceff pending |
 
 ---
 
@@ -361,3 +361,20 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - Steiner trees: two- and three-pin nets match OpenROAD's length exactly (159 and 46 nets). For four or more pins OpenROAD uses FLUTE; our greedy MST + L-flip is longer on the nets inspected (`reset`, `req_rdy`). On `gcd` this does not break the endpoint tolerance, but it is not verified per net.
   - Verification discipline (Rule 7), each turned the test red and was restored: dropping wire capacitance (244 mismatches), zeroing wire delay (3 mismatches), `r0` x 50 (222 mismatches).
   - Refactor: the E1 Steiner core is now `build_rsmt_points` over integer points; the E1 tests (8) still pass.
+
+### 2026-11-10 — E3.3 — `gcd` (SPEF Reader & RC-Tree Elmore STA vs OpenSTA `read_spef`)
+- **Reference**: `tests/designs/gcd/gcd.sta.reference.json` (`placed_spef`) and `gcd.routed.spef` (OpenSTA reads this file; committed, not regenerated).
+- **Our Command**: `cargo test --release -p grus-core test_gcd_placed_spef` and `grus-eda sta ... --spef gcd.routed.spef`.
+
+| Metric | OpenSTA | Ours | Diff | Pass? |
+|---|---|---|---|---|
+| Endpoints compared | 53 | 53 | 0 missing | PASS |
+| Max relative diff, arrival (max / min) | — | — | 0.46% / 0.45% | PASS (limit max(5 ps, 1%)) |
+| Max relative diff, required (max / min) | — | — | 0.008% / 0.53% | PASS |
+| Max relative diff, slack (max / min) | — | — | 0.40% / 0.26% | PASS |
+| Max relative diff, slew (max / min) | — | — | 2.7% / 3.3% | PASS at 3% (DMP gap, see E3.2) |
+
+- **Notes / Observations**:
+  - Because `gcd.routed.spef` is the placement estimate (see E3.2), this run exercises the SPEF reader and the tree builder, but not the routed-parasitic cases that matter most: coupling capacitors, resistor loops, `*NAME_MAP`. The reader handles them (unit tests cover units and `*NAME_MAP`), but they are **untested against OpenSTA**.
+  - SPEF results differ from the placement-estimate results by < 0.01% of any field, which shows the two tree builders agree on the same wire.
+  - Only Elmore (Stage 1 of the E3.3 spec) is implemented. The pi-model / `Ceff` Stage 2 is still open.

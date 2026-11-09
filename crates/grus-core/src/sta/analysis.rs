@@ -1,5 +1,5 @@
 use super::nldm::{eval_nldm_constraint, eval_nldm_delay_or_slew};
-use super::parasitics::PlacementParasitics;
+use super::parasitics::NetParasitics;
 use super::sdc::Sdc;
 use crate::design_db::DesignDb;
 use crate::interner::{CellId, NetId, PinDir, PinId};
@@ -91,7 +91,7 @@ struct Context<'a> {
     design: &'a DesignDb,
     lib: &'a LibDb,
     sdc: &'a Sdc,
-    parasitics: Option<&'a PlacementParasitics>,
+    parasitics: Option<&'a NetParasitics>,
 }
 
 impl Context<'_> {
@@ -278,7 +278,7 @@ fn constraint_table(arc: &crate::lib_db::LibTimingArc, pol: usize) -> Option<&Nl
 }
 
 /// Zero-wire STA when `parasitics` is `None`; otherwise wire capacitance and Elmore wire delay are added.
-pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&PlacementParasitics>) -> Result<StaReport> {
+pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&NetParasitics>) -> Result<StaReport> {
     let cx = Context { design, lib, sdc, parasitics };
     let graph = build_graph(&cx);
     let order = topological_order(&cx, &graph)?;
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_gcd_zero_wire_matches_opensta() {
-        compare_gcd_with_opensta("zero_wire", false, 0.01);
+        compare_gcd_with_opensta("zero_wire", Rc::None, 0.01);
     }
 
     #[test]
@@ -503,10 +503,21 @@ mod tests {
         // Arrival, required time and slack must agree within 1% or 5 ps. Slews get 3%: OpenSTA's
         // DMP calculator derives the driver slew from a waveform model that differs from the plain
         // table lookup by about 1% (`report_dcalc`: 0.278732 vs 0.282240); see docs/results.md.
-        compare_gcd_with_opensta("placement_rc", true, 0.03);
+        compare_gcd_with_opensta("placement_rc", Rc::Placement, 0.03);
     }
 
-    fn compare_gcd_with_opensta(golden_key: &str, placement_rc: bool, slew_rel_tol: f64) {
+    #[test]
+    fn test_gcd_placed_spef_matches_opensta() {
+        compare_gcd_with_opensta("placed_spef", Rc::Spef, 0.03);
+    }
+
+    enum Rc {
+        None,
+        Placement,
+        Spef,
+    }
+
+    fn compare_gcd_with_opensta(golden_key: &str, rc_mode: Rc, slew_rel_tol: f64) {
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let pdk = std::env::var("PDK_ROOT")
             .map(PathBuf::from)
@@ -524,10 +535,17 @@ mod tests {
         .expect("LEF");
         let design = parse_def(&gcd.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&gcd.join("gcd.sdc")).expect("SDC");
-        let parasitics = placement_rc.then(|| {
-            let rc = crate::sta::WireRc::from_layer(&tech, "met2").expect("met2 RC");
-            crate::sta::estimate_placement_parasitics(&design, &tech, rc)
-        });
+        let parasitics = match rc_mode {
+            Rc::None => None,
+            Rc::Placement => {
+                let rc = crate::sta::WireRc::from_layer(&tech, "met2").expect("met2 RC");
+                Some(crate::sta::estimate_placement_parasitics(&design, &tech, rc))
+            }
+            Rc::Spef => {
+                let spef = crate::readers::load_spef(&gcd.join("gcd.routed.spef")).expect("SPEF");
+                Some(crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics"))
+            }
+        };
         let report = run_sta(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
 
         let reference: serde_json::Value =

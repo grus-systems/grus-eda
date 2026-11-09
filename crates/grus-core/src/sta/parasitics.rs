@@ -1,5 +1,6 @@
 use crate::congestion::rsmt::{Pt, build_rsmt_points};
 use crate::design_db::DesignDb;
+use crate::readers::spef::{Spef, SpefNet, unescape_spef_name};
 use crate::interner::{NetId, PinId};
 use crate::tech_db::TechDb;
 use anyhow::{Result, bail};
@@ -63,24 +64,24 @@ impl NetRcTree {
     }
 }
 
-/// Placement-based parasitic estimate: one RC tree per net, `None` for nets without a driver
-/// or with a single pin.
+/// One RC tree per net (from placement or from a SPEF), `None` for nets without a driver,
+/// with a single pin, or absent from the SPEF.
 #[derive(Clone, Debug)]
-pub struct PlacementParasitics {
+pub struct NetParasitics {
     nets: Vec<Option<NetRcTree>>,
 }
 
-impl PlacementParasitics {
+impl NetParasitics {
     pub fn net(&self, net: NetId) -> Option<&NetRcTree> {
         self.nets[net.0 as usize].as_ref()
     }
 }
 
-pub fn estimate_placement_parasitics(design: &DesignDb, tech: &TechDb, rc: WireRc) -> PlacementParasitics {
+pub fn estimate_placement_parasitics(design: &DesignDb, tech: &TechDb, rc: WireRc) -> NetParasitics {
     let nets = (0..design.num_nets())
         .map(|n| build_net_tree(design, tech, rc, NetId(n as u32)))
         .collect();
-    PlacementParasitics { nets }
+    NetParasitics { nets }
 }
 
 fn build_net_tree(design: &DesignDb, tech: &TechDb, rc: WireRc, net: NetId) -> Option<NetRcTree> {
@@ -150,4 +151,99 @@ fn build_net_tree(design: &DesignDb, tech: &TechDb, rc: WireRc, net: NetId) -> O
     }
     let pin_node = pin_point.iter().map(|&p| node_of[p]).collect();
     Some(NetRcTree { parent, edge_r_kohm: edge_r, wire_cap_pf: wire_cap, pin_node, total_wire_cap_pf: total_cap })
+}
+
+/// Builds the RC trees from an extracted SPEF. SPEF capacitance is wire-only (`PIN_CAP NONE`), so
+/// sink pin capacitance is added later, exactly as for the placement estimate. Resistor loops are
+/// broken by a BFS spanning tree from the driver; self-loops and parallel resistors are dropped.
+pub fn spef_parasitics(design: &DesignDb, spef: &Spef) -> Result<NetParasitics> {
+    let mut nets = Vec::with_capacity(design.num_nets());
+    for n in 0..design.num_nets() {
+        let net = NetId(n as u32);
+        let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
+        let usable = design.net_driver(net).is_some() && design.net_pins(net).len() >= 2;
+        let tree = match (usable, spef.nets.get(&name)) {
+            (true, Some(spef_net)) => Some(spef_net_tree(design, net, &name, spef_net)?),
+            _ => None,
+        };
+        nets.push(tree);
+    }
+    Ok(NetParasitics { nets })
+}
+
+fn spef_pin_node_name(design: &DesignDb, pin: PinId) -> String {
+    let p = pin.0 as usize;
+    let pin_name = design.strings.resolve(design.pin_names[p]);
+    match design.pin_cells[p] {
+        Some(cell) => {
+            let cell_name = design.strings.resolve(design.cell_names[cell.0 as usize]);
+            unescape_spef_name(&format!("{cell_name}:{pin_name}"))
+        }
+        None => unescape_spef_name(pin_name),
+    }
+}
+
+fn spef_net_tree(design: &DesignDb, net: NetId, net_name: &str, spef_net: &SpefNet) -> Result<NetRcTree> {
+    let pins = design.net_pins(net);
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut intern = |name: &str| -> usize {
+        let next = index.len();
+        *index.entry(name.to_string()).or_insert(next)
+    };
+    let resistor_ends: Vec<(usize, usize, f32)> =
+        spef_net.resistors.iter().map(|(a, b, r)| (intern(a), intern(b), *r)).collect();
+    let cap_nodes: Vec<(usize, f32)> = spef_net.caps.iter().map(|(n, c)| (intern(n), *c)).collect();
+    let node_count = index.len();
+    let mut adjacency: Vec<Vec<(usize, f32)>> = vec![Vec::new(); node_count];
+    for &(a, b, r) in &resistor_ends {
+        if a != b {
+            adjacency[a].push((b, r));
+            adjacency[b].push((a, r));
+        }
+    }
+    let mut node_cap = vec![0.0f32; node_count];
+    for &(i, cap) in &cap_nodes {
+        node_cap[i] += cap;
+    }
+    let pin_names: Vec<String> = pins.iter().map(|&p| spef_pin_node_name(design, p)).collect();
+    let mut pin_point = Vec::with_capacity(pins.len());
+    for name in &pin_names {
+        let Some(&i) = index.get(name) else {
+            bail!("SPEF net {net_name} has no node for pin {name}");
+        };
+        pin_point.push(i);
+    }
+
+    let root = pin_point[0];
+    let mut node_of = vec![u32::MAX; adjacency.len()];
+    let mut order = vec![root];
+    node_of[root] = 0;
+    let mut parent = vec![0u32];
+    let mut edge_r = vec![0.0f32];
+    let mut wire_cap = vec![node_cap[root]];
+    let mut head = 0;
+    while head < order.len() {
+        let u = order[head];
+        let u_node = head;
+        head += 1;
+        for &(v, r) in &adjacency[u] {
+            if node_of[v] != u32::MAX {
+                continue;
+            }
+            node_of[v] = order.len() as u32;
+            order.push(v);
+            parent.push(u_node as u32);
+            edge_r.push(r);
+            wire_cap.push(node_cap[v]);
+        }
+    }
+    let mut pin_node = Vec::with_capacity(pins.len());
+    for (&p, name) in pin_point.iter().zip(&pin_names) {
+        if node_of[p] == u32::MAX {
+            bail!("SPEF net {net_name}: pin {name} is not connected to the driver by resistors");
+        }
+        pin_node.push(node_of[p]);
+    }
+    let total = wire_cap.iter().sum();
+    Ok(NetRcTree { parent, edge_r_kohm: edge_r, wire_cap_pf: wire_cap, pin_node, total_wire_cap_pf: total })
 }

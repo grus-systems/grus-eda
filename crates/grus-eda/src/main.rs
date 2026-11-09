@@ -112,7 +112,7 @@ struct StaArgs {
     #[arg(long, help = "Path to standard cell LEF (.lef) file")]
     lef: Option<PathBuf>,
 
-    #[arg(long, help = "Parasitic interconnect model (none, placement)")]
+    #[arg(long, help = "Parasitic interconnect model (none, placement, spef)")]
     parasitics: Option<String>,
 
     #[arg(long, default_value = "met2", help = "Routing layer whose RC is used for --parasitics placement")]
@@ -350,10 +350,11 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Commands::Sta(args) => {
-            let use_placement_rc = match args.parasitics.as_deref() {
-                None | Some("none") => false,
-                Some("placement") => true,
-                Some(other) => anyhow::bail!("--parasitics {other} is not implemented yet (E3.3)"),
+            let mode = match (args.parasitics.as_deref(), &args.spef) {
+                (None | Some("none"), None) => "zero wire",
+                (Some("placement"), None) => "placement RC",
+                (None | Some("spef"), Some(_)) => "SPEF",
+                (other, spef) => anyhow::bail!("unsupported --parasitics {:?} with --spef {:?}", other, spef),
             };
             let (Some(tlef), Some(lef), Some(def), Some(sdc_path)) =
                 (&args.tlef, &args.lef, &args.def, &args.sdc)
@@ -366,16 +367,21 @@ fn main() -> anyhow::Result<()> {
             let design = grus_core::readers::parse_def(def, &tech_db, Some(&lib_db))?;
             let sdc = grus_core::sta::load_sdc(sdc_path)?;
             let t0 = std::time::Instant::now();
-            let parasitics = if use_placement_rc {
-                let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
-                Some(grus_core::sta::estimate_placement_parasitics(&design, &tech_db, rc))
-            } else {
-                None
+            let parasitics = match (mode, &args.spef) {
+                ("placement RC", _) => {
+                    let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                    Some(grus_core::sta::estimate_placement_parasitics(&design, &tech_db, rc))
+                }
+                (_, Some(spef_path)) => {
+                    let spef = grus_core::readers::load_spef(spef_path)?;
+                    Some(grus_core::sta::spef_parasitics(&design, &spef)?)
+                }
+                _ => None,
             };
             let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
             println!(
                 "STA ({}): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms",
-                if use_placement_rc { "placement RC" } else { "zero wire" },
+                mode,
                 report.endpoints.len(),
                 report.wns_max_ns,
                 report.tns_max_ns,
