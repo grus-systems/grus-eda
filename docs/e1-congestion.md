@@ -124,9 +124,9 @@ pub struct CongestionReport {
        - For each row $y \in [gy_1, gy_2]$ and horizontal edge column $x \in [gx_1, \min(\max(gx_1, gx_2 - 1), nx - 2)]$, clip the obstacle's Y-span to row $y$: $[s, e] = [\max(yl, Y_y), \min(yh, Y_{y+1})]$. If $e > s$, record interval $(s, e)$ on edge $(x, y)$.
        - On each horizontal edge $(x, y)$, sort and merge overlapping/touching 1D intervals $(s_i, e_i)$, and compute blocked tracks:
          $$\text{blocked}(l, x, y) = \sum_{i} \frac{e_i - s_i + P_l - 1}{P_l}$$
-       - Compute original (unadjusted) and derated edge track capacity (matching OpenROAD's `FastRoute` integer truncation and minimum-1 clamp when $\text{orig} > 0$ and $\alpha_l < 1.0$):
+       - Compute original (unadjusted) and derated edge track capacity (matching OpenROAD's `FastRoute` integer truncation and minimum-1 clamp when $\text{orig} > 0$ and $\alpha_l < 1.0$, adding `1e-6` before `.floor()` to avoid IEEE 754 `f32 -> f64` representation loss such as `15.0 * (1.0 - 0.20f32 as f64) = 11.999999955`):
          $$\text{orig}(l, x, y) = \max\bigl(0,\; \text{raw\_tracks\_y}[y] - \text{blocked}(l, x, y)\bigr)$$
-         $$\text{derated}(l, x, y) = \begin{cases} 0 & \text{if } \text{orig}(l, x, y) == 0 \text{ or } \alpha_l \ge 1.0, \\ \max\bigl(1,\; \lfloor \text{orig}(l, x, y) \cdot (1.0 - \alpha_l) \rfloor\bigr) & \text{otherwise.} \end{cases}$$
+         $$\text{derated}(l, x, y) = \begin{cases} 0 & \text{if } \text{orig}(l, x, y) == 0 \text{ or } \alpha_l \ge 1.0, \\ \max\bigl(1,\; \lfloor \text{orig}(l, x, y) \cdot (1.0 - \alpha_l) + 10^{-6} \rfloor\bigr) & \text{otherwise.} \end{cases}$$
        - Accumulate `orig` into `layer_orig_edge_tracks[l]`, `derated` into `layer_derated_edge_tracks[l]`, and add `derated as f32` to `h_cap[y * (nx - 1) + x]`.
      - If layer $l$ is `Vertical`:
        - Symmetric: for each column $x \in [gx_1, gx_2]$ and vertical edge row $y \in [gy_1, \min(\max(gy_1, gy_2 - 1), ny - 2)]$, clip the obstacle's X-span to $[X_x, X_{x+1})$, sort and merge 1D intervals on edge $(x, y)$, sum $\lceil (e_i - s_i) / P_l \rceil$, compute `orig` and `derated`, and add `derated as f32` to `v_cap[y * nx + x]`.
