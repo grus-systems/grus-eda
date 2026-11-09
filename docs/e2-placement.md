@@ -185,7 +185,7 @@ pub fn l2_dist_f64(ax: &[f32], ay: &[f32], bx: &[f32], by: &[f32]) -> f32 {
      $$g_k[c] = \frac{\nabla_c W(v_k) - \lambda_k \, F_c(v_k)}{\max\bigl(1.0,\; \text{pin\_count}[c] + \lambda_k \, a_c\bigr)}$$
    - Compute Barzilai-Borwein step size $\alpha_k$:
      $$\alpha_{\text{raw}} = \begin{cases} \dfrac{0.05 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_0\|_{\infty})} & \text{if } k == 0, \\[8pt] \dfrac{\|v_k - v_{k-1}\|_2}{\|g_k - g_{k-1}\|_2} & \text{if } k \ge 1, \end{cases}$$
-     and clamp $\alpha_k$ to $\bigl[0.001 \cdot (w_b + h_b),\; \frac{0.5 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_k\|_{\infty})}\bigr]$ so no cell jumps more than half a bin width in a single iteration.
+     and clamp $\alpha_k$ to $\bigl[\frac{0.001 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_k\|_{\infty})},\; \frac{0.5 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_k\|_{\infty})}\bigr]$ so no cell jumps more than half a bin width in a single iteration.
    - Update solution and Nesterov lookahead:
      $$u_{k+1} = \text{clamp}_{\text{core}}\bigl(v_k - \alpha_k \, g_k\bigr)$$
      $$t_{k+1} = \frac{1 + \sqrt{1 + 4 t_k^2}}{2}, \quad v_{k+1} = \text{clamp}_{\text{core}}\!\left(u_{k+1} + \frac{t_k - 1}{t_{k+1}}\bigl(u_{k+1} - u_k\bigr)\right)$$
@@ -223,9 +223,9 @@ pub fn run_nesterov_placement(
 
 ---
 
-### Step E2.4: Greedy Tetris / Abacus Legalizer (`legalize.rs`)
+### Step E2.4: Greedy Tetris / Abacus Legalizer & Local Refinement (`legalize.rs`)
 
-After Nesterov finishes, snap every movable standard cell to a valid, non-overlapping `PlacementRow` site in `i32` DBU:
+After Nesterov finishes, snap every movable standard cell to a valid, non-overlapping `PlacementRow` site in `i32` DBU, avoiding all `Fixed` cells (such as tapcells and endcap decaps), and refine local cell ordering to minimize exact DBU HPWL:
 
 ```rust
 #[derive(Clone, Debug)]
@@ -236,17 +236,37 @@ struct AbacusCluster {
     q_sum: f32,         // q_c = sum of w_i * (x_i_gp - offset_i)
     cells: Vec<CellId>, // cells in left-to-right order
 }
+
+#[derive(Clone, Debug)]
+pub struct LegalizeResult {
+    pub avg_displacement_um: f64,
+    pub max_displacement_um: f64,
+    pub pre_legal_hpwl_dbu: i64,
+    pub post_abacus_hpwl_dbu: i64,
+    pub final_hpwl_dbu: i64,
+}
+
+pub fn legalize_placement(
+    design_db: &mut DesignDb,
+    tech_db: &TechDb,
+    gp_x_um: &[f32],
+    gp_y_um: &[f32],
+) -> anyhow::Result<LegalizeResult>
 ```
 
-#### Algorithm (Abacus Single-Row Dynamic Clustering)
-1. **Row Sub-Segments**:
-   - For each `PlacementRow`, create sub-row segments `[x_min_dbu, x_max_dbu]` by splitting around any `Fixed` macros or placement blockages overlapping that row's $y$-interval $[y_{\text{row}}, y_{\text{row}} + h_{\text{site}})$.
-   - Track remaining capacity `free_width = (x_max_dbu - x_min_dbu) - used_width` per sub-row.
+#### Algorithm (Abacus Single-Row Dynamic Clustering + Local Detailed Placement Refinement)
+1. **Row Sub-Segments (`SubRow`)**:
+   - Sort `PlacementRow` indices by `orig_y_dbu` ascending.
+   - For each `PlacementRow` $r$ (`[row_xl, row_xh] = [r.orig_x_dbu, r.orig_x_dbu + r.num_x * r.step_x_dbu]`, $y \in [r.\text{orig\_y\_dbu},\; r.\text{orig\_y\_dbu} + h_{\text{site}})$):
+     - Collect all non-movable (`Fixed` or `Cover`) cells $f$ whose vertical span `[cell_y_dbu[f], cell_y_dbu[f] + h_f)` overlaps $[r.\text{orig\_y\_dbu},\; r.\text{orig\_y\_dbu} + h_{\text{site}})$.
+     - Snap each obstacle's horizontal span `[cell_x_dbu[f], cell_x_dbu[f] + w_f]` outward to $r$'s site grid (`r.orig_x_dbu + k * r.step_x_dbu`), clip to `[row_xl, row_xh]`, sort and merge overlapping obstacle intervals, and extract the complementary free `SubRow` intervals `[x_min_dbu, x_max_dbu]` with `x_max_dbu > x_min_dbu`.
+     - Track remaining capacity `free_width = (x_max_dbu - x_min_dbu) - used_width` per sub-row.
 2. **Sort Movable Cells**:
-   - Sort all movable cells by their global-placed left-edge coordinate $x_i^{\text{gp}}$ ascending.
-3. **Trial Row Placement**:
-   - For cell $i$, search sub-rows within $\pm 10$ row heights of $y_i^{\text{gp}}$ that have `free_width >= cell_width[i]`.
-   - For each candidate sub-row, simulate appending cell $i$ as a singleton cluster `(x = x_i_gp, width = w_i, e = 1.0, q = x_i_gp)`:
+   - Convert global placement coordinates to DBU: `x_gp_dbu[i] = (gp_x_um[i] * dbu_per_um).round() as i32`, `y_gp_dbu[i] = (gp_y_um[i] * dbu_per_um).round() as i32`.
+   - Sort all movable cells (`PlacementStatus::Placed` or `PlacementStatus::Unplaced` with `MacroClass::Core` or `MacroClass::CoreTie`) by `(x_gp_dbu[i], y_gp_dbu[i], i)` ascending.
+3. **Trial Row Placement (Abacus)**:
+   - For cell $i$, search sub-rows within $\pm 10$ row heights of $y_i^{\text{gp}}$ that have `free_width >= cell_width[i]` (falling back to all sub-rows with `free_width >= cell_width[i]` if none exist within $\pm 10$ rows).
+   - For each candidate sub-row, simulate appending cell $i$ as a singleton cluster `(x = snap_to_site(x_i_gp, ...), width = w_i, e = 1.0, q = x_i_gp as f32)`:
      - **Collapse Loop**: While the last cluster `c_last` overlaps the preceding cluster `c_prev` (`c_prev.x_dbu + c_prev.width_dbu > c_last.x_dbu`):
        - Merge `c_last` into `c_prev`:
          ```rust
@@ -261,6 +281,24 @@ struct AbacusCluster {
              sub_row.x_max_dbu - c_prev.width_dbu,
          );
          ```
-   - Commit cell $i$ to the candidate sub-row that yields the minimum total displacement cost $\Delta = (x_i^{\text{legal}} - x_i^{\text{gp}})^2 + (y_{\text{row}} - y_i^{\text{gp}})^2$.
-4. **Final Commit & Orientation**:
-   - Unpack clusters in each sub-row left-to-right, setting `cell_x_dbu[c]`, `cell_y_dbu[c] = row.orig_y_dbu`, `cell_orient[c] = row.orient`, and `cell_status[c] = PlacementStatus::Placed`.
+   - Commit cell $i$ to the candidate sub-row that yields the minimum quadratic displacement cost $\Delta = (x_i^{\text{legal}} - x_i^{\text{gp}})^2 + (y_{\text{row}} - y_i^{\text{gp}})^2$ (where $x_i^{\text{legal}} = c_{\text{last}}.\text{x\_dbu} + c_{\text{last}}.\text{width\_dbu} - w_i$).
+   - Unpack clusters in each sub-row left-to-right, setting `cell_x_dbu[c]`, `cell_y_dbu[c] = sub_row.orig_y_dbu`, `cell_orient[c] = sub_row.orient`, and `cell_status[c] = PlacementStatus::Placed`.
+4. **Post-Abacus Local Detailed Placement Refinement (4 Rounds)**:
+   - Because odd rows have `Orient::FS` (vertical pin flip) and fixed tapcells split rows into multiple sub-rows, run 4 deterministic passes over the legalized sub-rows using exact integer DBU net bounding boxes (`design_db.pin_pos_dbu(pin, tech_db)`):
+     1. **Equal-Width Cell Swaps**: For pairs of movable cells $(c_1, c_2)$ with identical width (`w[c_1] == w[c_2]`) within $\pm 4$ rows and $\pm 25\,000\text{ DBU}$ horizontally, swap their positions/orientations if the incident nets' exact DBU HPWL strictly decreases ($\Delta\text{HPWL} < 0$).
+     2. **Adjacent Sub-Row Cell Swaps**: In each `SubRow` with $k \ge 2$ cells, test swapping adjacent cells `(cells[j], cells[j + 1])` within their combined span (`x_new_b = x[c_a]`, `x_new_a = (x[c_b] + w[c_b] - w[c_a]).max(x_new_b + w[c_b])`), keeping the swap if incident nets' exact DBU HPWL strictly decreases.
+     3. **Single-Cell Optimal Gap Relocation & Site Sliding**:
+        - Within its current `SubRow`, slide cell $c_j$ inside its non-overlapping site bounds `[left_limit, right_limit]` to the site (testing `left_limit`, `right_limit`, and the median $x$ of cell $c_j$'s connected pins snapped to site) that minimizes incident nets' exact DBU HPWL.
+        - Across candidate `SubRow`s within $\pm 3$ rows and $\pm 20\,000\text{ DBU}$, inspect each contiguous open gap `[gap_left, gap_right]` between neighboring cells (or sub-row boundaries) with `gap_right - gap_left >= w[c_j]`. If relocating $c_j$ into the best site in `[gap_left, gap_right - w[c_j]]` (with `y = s_cand.orig_y_dbu` and `orient = s_cand.orient`) strictly reduces incident nets' exact DBU HPWL, move $c_j$ to `s_cand`.
+5. **Self-Verification (`verify_legality`) & CLI (`grus-eda place`)**:
+   - Before returning `LegalizeResult`, verify that all movable cells have `PlacementStatus::Placed`, lie on valid `PlacementRow` $y$-coordinates and site-grid $x$-coordinates with matching `row.orient`, stay within row `[orig_x_dbu, orig_x_dbu + num_x * step_x_dbu]`, and have zero overlaps with any other movable or fixed cell.
+   - Wire up `grus-eda place` in `crates/grus-eda/src/main.rs`:
+     ```bash
+     grus-eda place \
+       --tlef <path.tlef> \
+       --lef <path.lef> \
+       --def <floorplan.def> \
+       --out-def <placed.def> \
+       [--target-density 0.60]
+     ```
+     which runs `run_nesterov_placement`, `legalize_placement`, and `write_def(&design_db, &tech_db, &def_path, &out_def_path)`.
