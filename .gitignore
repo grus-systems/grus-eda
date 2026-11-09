@@ -1,5 +1,7 @@
 /target
-/out/
+/out
 *.odb
 *.vcd
 .DS_Store
+tests/designs/pdk
+tests/designs/gcd/runs
