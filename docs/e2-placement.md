@@ -74,7 +74,7 @@ pub struct WaWirelengthPrecomp {
   - `MacroClass::CoreSpacer` (`sky130_fd_sc_hd__fill_*`, post-placement decap fillers): excluded from E2 (if present in an input DEF, strip them on load).
   - `PlacementStatus::Fixed` cells (`tapvpwrvgnd`, endcap `decap`, block macros): stationary. Their area is added to the fixed background bin density $\rho_{\text{fixed}}(u, v)$ scaled by $\rho_{\text{target}}$, and they act as fixed obstacles splitting rows in Step E2.4.
   - `PlacementStatus::Placed` / `Unplaced` standard cells (`MacroClass::Core` / `CoreTie`): movable optimization variables.
-- Choose grid dimension $M = 2^k \in \{64, 128, 256, 512\}$ such that bin width $w_b = W_{\text{core}} / M$ and bin height $h_b = H_{\text{core}} / M$ are approximately $1\text{--}4\times$ standard cell height.
+- Choose grid dimension $M = 2^k \in \{16, 32, 64, 128, 256, 512\}$ as the smallest power of 2 such that bin height $h_b = H_{\text{core}} / M \le 2.0 \cdot h_{\text{site}}$ (for `gcd`, $H_{\text{core}} = 78.88\,\mu\text{m}$ and $h_{\text{site}} = 2.72\,\mu\text{m}$ gives $M = 16$, $w_b = 5.03\,\mu\text{m}$, $h_b = 4.93\,\mu\text{m} = 1.81 \times h_{\text{site}}$, matching OpenROAD `GPL-0028`).
 - Local density stretching (ePlace rule): if movable cell $c$ has width $w_c < \sqrt{2} w_b$, stretch its density footprint width to $w'_c = \sqrt{2} w_b$ and scale its density weight by $s_c = \frac{w_c h_c}{w'_c h'_c}$ so total cell area (charge) is conserved while making the overlap function piecewise smooth across bins.
 - Accumulate cell area overlap with each bin $(u, v) \in [0, M)^2$ into $\rho(u, v)$, and subtract the DC mean $\bar{\rho} = \frac{1}{M^2}\sum_{u, v} \rho(u, v)$ so net total charge is zero.
 
@@ -171,25 +171,55 @@ pub fn l2_dist_f64(ax: &[f32], ay: &[f32], bx: &[f32], by: &[f32]) -> f32 {
 ```
 
 1. **Initialization ($k = 0$)**:
-   - Place movable cells near the core center (or via 5–10 iterations of bound-to-bound quadratic CG pulling toward fixed I/O pins) with small deterministic perturbation ($\pm 0.01\,w_b$) so cells do not start on identical coordinates.
-   - Initialize wirelength smoothing $\gamma_0 = 4.0 \cdot (w_b + h_b)$.
-   - Evaluate initial wirelength gradient $\nabla W(x_0)$ and electric field force $\xi(x_0) = -E(x_0)$, and set initial penalty multiplier:
-     $$\lambda_0 = \frac{\|\nabla W(x_0)\|_1}{\|\xi(x_0)\|_1}$$
-   - Set Nesterov parameter $t_0 = 1.0$ and reference point $v_0 = x_0$.
-2. **Iteration Step ($k \ge 1$)**:
-   - Evaluate total gradient at reference point $v_k$:
-     $$g_k = \nabla W(v_k) - \lambda_k \, E(v_k)$$
+   - Start all movable cells at the core center $(x_{\text{center}} - 0.5 w_c,\; y_{\text{center}} - 0.5 h_c)$, and run 15 iterations of **star-model barycenter relaxation** pulling movable cells toward fixed I/O pins and fixed cells:
+     - In each iteration, compute each net $e$'s pin centroid $(\bar{x}_e, \bar{y}_e) = \frac{1}{|e|}\sum_{p \in e}(x_p, y_p)$, then update each movable cell $c$ toward the weighted average of $(\bar{x}_{e(p)} - \Delta x_p,\; \bar{y}_{e(p)} - \Delta y_p)$ across its incident nets (with damping `0.5 * old + 0.5 * target`), clamped to `[core_xl, core_xh - w_c] x [core_yl, core_yh - h_c]`.
+     - Add a small deterministic perturbation $\delta x_c = (((c \cdot 73) \bmod 29) as f32 - 14.0) \cdot 0.005 \cdot w_b$, $\delta y_c = (((c \cdot 37) \bmod 29) as f32 - 14.0) \cdot 0.005 \cdot h_b$ (clamped to core bounds) so no two cells start on identical coordinates.
+   - Set base wirelength smoothing $\gamma_{\text{base}} = 0.25 \cdot (w_b + h_b)$ and schedule $\gamma(\tau_k) = \gamma_{\text{base}} \cdot 10^{2.0 \cdot (\tau_k - 0.10)}$.
+   - Evaluate initial wirelength gradient $\nabla W(x_0)$ and repulsive electric force $F(x_0)$, and set initial penalty multiplier:
+     $$\lambda_0 = 0.05 \cdot \frac{\|\nabla W(x_0)\|_1}{\|F(x_0)\|_1}$$
+   - Set $\Delta\text{HPWL}_{\text{ref}} = \max\bigl(50.0,\; 0.015 \cdot \text{HPWL}(x_0)\bigr)$, Nesterov parameter $t_0 = 1.0$, solution $u_0 = x_0$, and reference point $v_0 = x_0$.
+2. **Iteration Step ($k = 0, \dots, \text{max\_iters} - 1$)**:
+   - Evaluate density overflow $\tau_k$ and repulsive force $F(v_k)$ via `DensitySolver::compute_density_and_forces`, and evaluate $\nabla W(v_k)$ at $\gamma_k = \gamma(\tau_k)$.
+   - If $\tau_k \le \tau_{\text{stop}}$ (default `0.10`), commit $v_k$ (clamped to core bounds) and terminate.
+   - Compute the ePlace diagonally preconditioned gradient at reference point $v_k$:
+     $$g_k[c] = \frac{\nabla_c W(v_k) - \lambda_k \, F_c(v_k)}{\max\bigl(1.0,\; \text{pin\_count}[c] + \lambda_k \, a_c\bigr)}$$
    - Compute Barzilai-Borwein step size $\alpha_k$:
-     $$\alpha_k = \frac{\|v_k - v_{k-1}\|_2}{\|g_k - g_{k-1}\|_2}$$
-     (With 1–2 backtracking checks if $\alpha_k > \frac{\|v_k - u_k\|_2}{\|g(v_k) - g(u_k)\|_2}$).
+     $$\alpha_{\text{raw}} = \begin{cases} \dfrac{0.05 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_0\|_{\infty})} & \text{if } k == 0, \\[8pt] \dfrac{\|v_k - v_{k-1}\|_2}{\|g_k - g_{k-1}\|_2} & \text{if } k \ge 1, \end{cases}$$
+     and clamp $\alpha_k$ to $\bigl[0.001 \cdot (w_b + h_b),\; \frac{0.5 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_k\|_{\infty})}\bigr]$ so no cell jumps more than half a bin width in a single iteration.
    - Update solution and Nesterov lookahead:
      $$u_{k+1} = \text{clamp}_{\text{core}}\bigl(v_k - \alpha_k \, g_k\bigr)$$
-     $$t_{k+1} = \frac{1 + \sqrt{1 + 4 t_k^2}}{2}, \quad v_{k+1} = u_{k+1} + \frac{t_k - 1}{t_{k+1}}\bigl(u_{k+1} - u_k\bigr)$$
-   - Update $\lambda_{k+1}$ using HPWL ratio $\Delta \text{HPWL} = \text{HPWL}(u_{k+1}) - \text{HPWL}(u_k)$:
-     $$\mu_k = \text{clamp}\!\left(1.1^{-\Delta\text{HPWL} / \text{HPWL}_{\text{ref}}},\; 0.95,\; 1.05\right), \quad \lambda_{k+1} = \mu_k \, \lambda_k$$
-   - Update smoothing $\gamma_{k+1}$ as overflow $\tau_k$ decreases:
-     $$\gamma_{k+1} = \text{base\_gamma} \cdot 10^{2.0 \cdot (\tau_k - 0.1) + 0.0}$$
+     $$t_{k+1} = \frac{1 + \sqrt{1 + 4 t_k^2}}{2}, \quad v_{k+1} = \text{clamp}_{\text{core}}\!\left(u_{k+1} + \frac{t_k - 1}{t_{k+1}}\bigl(u_{k+1} - u_k\bigr)\right)$$
+   - Update $\lambda_{k+1}$ using RePlAce Eq. 11 with $\Delta \text{HPWL} = \text{HPWL}(u_{k+1}) - \text{HPWL}(u_k)$:
+     $$\mu_k = \text{clamp}\!\left(1.05^{\,1.0 - \Delta\text{HPWL} / \Delta\text{HPWL}_{\text{ref}}},\; 0.95,\; 1.05\right), \quad \lambda_{k+1} = \mu_k \, \lambda_k$$
    - Stop when overflow $\tau_k \le 0.10$ (or at `max_iters = 300`).
+
+#### Concrete Structs & Signatures (`crates/grus-core/src/placement/nesterov.rs`)
+```rust
+#[derive(Clone, Debug)]
+pub struct NesterovConfig {
+    pub target_density: f32,
+    pub stop_overflow: f32,
+    pub max_iters: usize,
+    pub grid_m_override: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NesterovResult {
+    pub cell_x_um: Vec<f32>,
+    pub cell_y_um: Vec<f32>,
+    pub iterations: usize,
+    pub initial_overflow: f32,
+    pub final_overflow: f32,
+    pub initial_hpwl_um: f64,
+    pub final_hpwl_um: f64,
+}
+
+pub fn run_nesterov_placement(
+    design_db: &DesignDb,
+    tech_db: &TechDb,
+    config: &NesterovConfig,
+) -> NesterovResult
+```
 
 ---
 
