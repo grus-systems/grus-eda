@@ -67,6 +67,9 @@ struct CongestionArgs {
     #[arg(long, default_value_t = 15, help = "GCell grid track supply")]
     gcell_tracks: u32,
 
+    #[arg(long, help = "Uniform layer adjustment factor (0.0 to 1.0)")]
+    layer_adjust: Option<f32>,
+
     #[arg(long, help = "Print ASCII routing congestion heatmap")]
     heatmap: bool,
 }
@@ -219,10 +222,54 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Congestion(args) => {
-            println!(
-                "grus-eda congestion: def={:?}, gcell_tracks={}",
-                args.def, args.gcell_tracks
+            println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
+            let mut interner = grus_core::interner::StringInterner::new();
+            let t_load = std::time::Instant::now();
+            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
+            let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
+
+            let layer_adjustments = args.layer_adjust.map(|alpha| {
+                vec![0.0f32, alpha, alpha, alpha, alpha, alpha]
+            });
+            let gcell_tracks_override = if args.gcell_tracks != 15 {
+                Some(args.gcell_tracks as i32)
+            } else {
+                None
+            };
+
+            let t_route = std::time::Instant::now();
+            let (grid, report) = grus_core::congestion::estimate_congestion(
+                &design_db,
+                &tech_db,
+                layer_adjustments.as_deref(),
+                gcell_tracks_override,
             );
+            let elapsed_route = t_route.elapsed().as_secs_f64() * 1000.0;
+
+            let total_cap: f32 = grid.h_cap.iter().sum::<f32>() + grid.v_cap.iter().sum::<f32>();
+            let total_demand: f32 = grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
+
+            println!(
+                "Congestion Estimation: design={}, grid={}x{}, tile_w={} dbu, tile_h={} dbu",
+                design_db.design_name, grid.nx, grid.ny, grid.gcell_w_dbu, grid.gcell_h_dbu
+            );
+            println!(
+                "Routing Resources: total_capacity={:.0}, total_demand={:.0}, total_overflow={:.1}",
+                total_cap, total_demand, report.total_overflow
+            );
+            println!(
+                "Congestion Metrics: max_edge_overflow={:.1}, top_05pct_overflow={:.2}, overflow_gcells={}/{}",
+                report.max_edge_overflow, report.top_05pct_overflow, report.overflow_gcells, grid.nx * grid.ny
+            );
+            println!(
+                "Runtime: load={:.2}ms, estimation={:.2}ms",
+                elapsed_load, elapsed_route
+            );
+
+            if args.heatmap {
+                print_heatmap(grid.nx, grid.ny, &report.gcell_usage_ratio);
+            }
         }
         Commands::Place(args) => {
             println!(
@@ -235,4 +282,33 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_heatmap(grid_w: usize, grid_h: usize, ratios: &[f32]) {
+    println!("Routing Congestion Heatmap ({}x{}):", grid_w, grid_h);
+    println!("Legend: '.' < 50%, '-' < 80%, '+' < 100%, '*' 100-120%, '#' > 120%");
+    for y in (0..grid_h).rev() {
+        print!("{:2} | ", y);
+        for x in 0..grid_w {
+            let r = ratios[y * grid_w + x];
+            let ch = if r < 0.50 {
+                '.'
+            } else if r < 0.80 {
+                '-'
+            } else if r <= 1.00 {
+                '+'
+            } else if r <= 1.20 {
+                '*'
+            } else {
+                '#'
+            };
+            print!("{}", ch);
+        }
+        println!();
+    }
+    print!("     ");
+    for x in 0..grid_w {
+        print!("{}", x % 10);
+    }
+    println!();
 }

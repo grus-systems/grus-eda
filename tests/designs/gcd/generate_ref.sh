@@ -319,6 +319,192 @@ close $fp
 exit
 EOF
 
+# 7d. Variant Set A: Uniform layer adjustment sweep on gcd.placed.def
+openroad -no_init -no_splash << 'EOF'
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+
+set db [ord::get_db]
+set tech [$db getTech]
+set block [ord::get_db_block]
+
+set grt_layers {met1 met2 met3 met4 met5}
+set alphas {0.50 0.70 0.80 0.85 0.90}
+set set_a_ovfs {}
+
+foreach a $alphas {
+    set_routing_layers -signal met1-met5
+    set_global_routing_layer_adjustment met1-met5 $a
+    global_route -verbose -allow_congestion
+    set ggrid [$block getGCellGrid]
+    set gx_list [$ggrid getGridX]
+    set gy_list [$ggrid getGridY]
+    set gcell_nx [llength $gx_list]
+    set gcell_ny [llength $gy_list]
+    set total_ovf 0
+    foreach lname $grt_layers {
+        set lyr [$tech findLayer $lname]
+        set is_h [expr {[$lyr getDirection] eq "HORIZONTAL"}]
+        if {$is_h} {
+            for {set y 0} {$y < $gcell_ny} {incr y} {
+                for {set x 0} {$x < [expr {$gcell_nx - 1}]} {incr x} {
+                    set c [$ggrid getCapacity $lyr $x $y]
+                    set u [$ggrid getUsage $lyr $x $y]
+                    if {$u > $c} {
+                        set total_ovf [expr {$total_ovf + ($u - $c)}]
+                    }
+                }
+            }
+        } else {
+            for {set x 0} {$x < $gcell_nx} {incr x} {
+                for {set y 0} {$y < [expr {$gcell_ny - 1}]} {incr y} {
+                    set c [$ggrid getCapacity $lyr $x $y]
+                    set u [$ggrid getUsage $lyr $x $y]
+                    if {$u > $c} {
+                        set total_ovf [expr {$total_ovf + ($u - $c)}]
+                    }
+                }
+            }
+        }
+    }
+    lappend set_a_ovfs [expr {int($total_ovf)}]
+}
+
+set fp [open "/work/tests/designs/gcd/runs/canonical/gcell_counts.tcl" "a"]
+puts $fp "set grt_layer_adj_sweep_alpha {\[[join $alphas {, }]\]}"
+puts $fp "set grt_layer_adj_sweep_overflow {\[[join $set_a_ovfs {, }]\]}"
+close $fp
+exit
+EOF
+
+# 7e. Variant Set B: Core-utilization placement sweep on gcd.synth.v
+cat << 'EOF' > "${RUN_DIR}/place_variant.tcl"
+set util $env(UTIL)
+set dens $env(DENS)
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_verilog /work/tests/designs/gcd/gcd.synth.v
+link_design gcd
+initialize_floorplan -utilization $util -aspect_ratio 1.0 -core_space 5.52 -site unithd
+make_tracks
+place_pins -hor_layers met3 -ver_layers met2
+global_placement -density $dens
+detailed_placement
+write_def /work/tests/designs/gcd/gcd.util${util}.def
+exit
+EOF
+
+cat << 'EOF' > "${RUN_DIR}/route_variant.tcl"
+set util $env(UTIL)
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.util${util}.def
+
+set db [ord::get_db]
+set tech [$db getTech]
+set block [ord::get_db_block]
+set grt_layers {met1 met2 met3 met4 met5}
+
+# Route 0.75
+set_routing_layers -signal met1-met5
+set_global_routing_layer_adjustment met1-met5 0.75
+global_route -verbose -allow_congestion
+set ggrid [$block getGCellGrid]
+set gx_list [$ggrid getGridX]
+set gy_list [$ggrid getGridY]
+set gcell_nx [llength $gx_list]
+set gcell_ny [llength $gy_list]
+set total_ovf_75 0
+foreach lname $grt_layers {
+    set lyr [$tech findLayer $lname]
+    set is_h [expr {[$lyr getDirection] eq "HORIZONTAL"}]
+    if {$is_h} {
+        for {set y 0} {$y < $gcell_ny} {incr y} {
+            for {set x 0} {$x < [expr {$gcell_nx - 1}]} {incr x} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                if {$u > $c} {
+                    set total_ovf_75 [expr {$total_ovf_75 + ($u - $c)}]
+                }
+            }
+        }
+    } else {
+        for {set x 0} {$x < $gcell_nx} {incr x} {
+            for {set y 0} {$y < [expr {$gcell_ny - 1}]} {incr y} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                if {$u > $c} {
+                    set total_ovf_75 [expr {$total_ovf_75 + ($u - $c)}]
+                }
+            }
+        }
+    }
+}
+
+# Route 0.80
+set_routing_layers -signal met1-met5
+set_global_routing_layer_adjustment met1-met5 0.80
+global_route -verbose -allow_congestion
+set total_ovf_80 0
+foreach lname $grt_layers {
+    set lyr [$tech findLayer $lname]
+    set is_h [expr {[$lyr getDirection] eq "HORIZONTAL"}]
+    if {$is_h} {
+        for {set y 0} {$y < $gcell_ny} {incr y} {
+            for {set x 0} {$x < [expr {$gcell_nx - 1}]} {incr x} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                if {$u > $c} {
+                    set total_ovf_80 [expr {$total_ovf_80 + ($u - $c)}]
+                }
+            }
+        }
+    } else {
+        for {set x 0} {$x < $gcell_nx} {incr x} {
+            for {set y 0} {$y < [expr {$gcell_ny - 1}]} {incr y} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                if {$u > $c} {
+                    set total_ovf_80 [expr {$total_ovf_80 + ($u - $c)}]
+                }
+            }
+        }
+    }
+}
+
+set fp [open "/work/tests/designs/gcd/runs/canonical/set_b_${util}.tcl" "w"]
+puts $fp "set ovf_75 [expr {int($total_ovf_75)}]"
+puts $fp "set ovf_80 [expr {int($total_ovf_80)}]"
+close $fp
+exit
+EOF
+
+for util_info in "25 0.33" "45 0.53" "65 0.73" "78 0.86"; do
+    set -- $util_info
+    UTIL="$1" DENS="$2" openroad -no_init -no_splash "${RUN_DIR}/place_variant.tcl"
+    UTIL="$1" openroad -no_init -no_splash "${RUN_DIR}/route_variant.tcl"
+done
+
+# Collect Variant Set B results into gcell_counts.tcl
+openroad -no_init -no_splash << 'EOF'
+set utils {25 45 65 78}
+set ovfs_75 {}
+set ovfs_80 {}
+foreach u $utils {
+    source "/work/tests/designs/gcd/runs/canonical/set_b_${u}.tcl"
+    lappend ovfs_75 $ovf_75
+    lappend ovfs_80 $ovf_80
+}
+
+set fp [open "/work/tests/designs/gcd/runs/canonical/gcell_counts.tcl" "a"]
+puts $fp "set grt_util_sweep_utils {\[[join $utils {, }]\]}"
+puts $fp "set grt_util_sweep_overflow_075 {\[[join $ovfs_75 {, }]\]}"
+puts $fp "set grt_util_sweep_overflow_080 {\[[join $ovfs_80 {, }]\]}"
+close $fp
+exit
+EOF
+
 # 8. Generate gcd.reference.json via live OpenROAD and OpenSTA API queries
 openroad -no_init -no_splash << 'EOF'
 source /work/tests/designs/gcd/runs/canonical/verilog_counts.tcl
@@ -473,7 +659,12 @@ puts $fp "  \"gcell_tile_size_dbu\": $gcell_tile_size_dbu,"
 puts $fp "  \"gcell_raw_edge_tracks\": $gcell_raw_edge_tracks,"
 puts $fp "  \"gcell_orig_edge_tracks\": $gcell_orig_edge_tracks,"
 puts $fp "  \"gcell_derated_edge_tracks\": $gcell_derated_edge_tracks,"
-puts $fp "  \"grt_total_edge_demand\": $grt_total_edge_demand"
+puts $fp "  \"grt_total_edge_demand\": $grt_total_edge_demand,"
+puts $fp "  \"grt_layer_adj_sweep_alpha\": $grt_layer_adj_sweep_alpha,"
+puts $fp "  \"grt_layer_adj_sweep_overflow\": $grt_layer_adj_sweep_overflow,"
+puts $fp "  \"grt_util_sweep_utils\": $grt_util_sweep_utils,"
+puts $fp "  \"grt_util_sweep_overflow_075\": $grt_util_sweep_overflow_075,"
+puts $fp "  \"grt_util_sweep_overflow_080\": $grt_util_sweep_overflow_080"
 puts $fp "}"
 close $fp
 puts "Generated gcd.reference.json via live OpenROAD/OpenSTA queries"

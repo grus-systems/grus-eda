@@ -41,5 +41,10 @@
   "gcell_raw_edge_tracks": [3624, 2600, 1812, 1300, 360],
   "gcell_orig_edge_tracks": [2705, 2504, 1781, 1252, 324],
   "gcell_derated_edge_tracks": [1815, 1996, 1399, 926, 180],
-  "grt_total_edge_demand": 812
+  "grt_total_edge_demand": 812,
+  "grt_layer_adj_sweep_alpha": [0.50, 0.70, 0.80, 0.85, 0.90],
+  "grt_layer_adj_sweep_overflow": [0, 0, 31, 69, 204],
+  "grt_util_sweep_utils": [25, 45, 65, 78],
+  "grt_util_sweep_overflow_075": [6, 77, 116, 168],
+  "grt_util_sweep_overflow_080": [154, 314, 312, 350]
 }
