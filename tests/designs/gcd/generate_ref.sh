@@ -671,4 +671,115 @@ puts "Generated gcd.reference.json via live OpenROAD/OpenSTA queries"
 exit
 EOF
 
+# 9. Generate gcd.sta.reference.json with per-endpoint OpenSTA values for E3 (zero_wire, placement_rc, placed_spef)
+#    Units: PathEnd/Vertex methods return SI seconds, so they go through sta::time_sta_ui (-> ns).
+#    sta::worst_slack / sta::total_negative_slack already return user units (ns); do not convert them.
+#    Endpoints are collected max-first: calling find_timing_paths -min before iterating the -max
+#    PathEnds invalidates them and segfaults OpenROAD 2026-02-17.
+cat << 'EOF' > "${RUN_DIR}/dump_sta_ref.tcl"
+proc collect_endpoints_json {} {
+    array set max_arr {}
+    array set max_req {}
+    array set max_slack {}
+    array set max_slew {}
+    set pins {}
+
+    set paths_max [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 1000]
+    foreach pe $paths_max {
+        set name [get_full_name [$pe pin]]
+        set v [$pe vertex]
+        lappend pins $name
+        set max_arr($name) [format "%.6f" [sta::time_sta_ui [$pe data_arrival_time]]]
+        set max_req($name) [format "%.6f" [sta::time_sta_ui [$pe data_required_time]]]
+        set max_slack($name) [format "%.6f" [sta::time_sta_ui [$pe slack]]]
+        set max_slew($name) [format "%.6f" [sta::time_sta_ui [$v slew [$pe end_transition] max]]]
+    }
+
+    array set min_arr {}
+    array set min_req {}
+    array set min_slack {}
+    array set min_slew {}
+
+    set paths_min [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 1000]
+    foreach pe $paths_min {
+        set name [get_full_name [$pe pin]]
+        set v [$pe vertex]
+        set min_arr($name) [format "%.6f" [sta::time_sta_ui [$pe data_arrival_time]]]
+        set min_req($name) [format "%.6f" [sta::time_sta_ui [$pe data_required_time]]]
+        set min_slack($name) [format "%.6f" [sta::time_sta_ui [$pe slack]]]
+        set min_slew($name) [format "%.6f" [sta::time_sta_ui [$v slew [$pe end_transition] min]]]
+    }
+
+    set sorted_pins [lsort -dictionary $pins]
+    set entries {}
+    foreach name $sorted_pins {
+        lappend entries "      {\"pin\": \"$name\", \"max_arr_ns\": $max_arr($name), \"max_req_ns\": $max_req($name), \"max_slack_ns\": $max_slack($name), \"max_slew_ns\": $max_slew($name), \"min_arr_ns\": $min_arr($name), \"min_req_ns\": $min_req($name), \"min_slack_ns\": $min_slack($name), \"min_slew_ns\": $min_slew($name)}"
+    }
+    return [join $entries ",\n"]
+}
+
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+
+set zw_wns_max [format "%.6f" [sta::worst_slack -max]]
+set zw_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set zw_wns_min [format "%.6f" [sta::worst_slack -min]]
+set zw_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set zw_endpoints [collect_endpoints_json]
+
+set_wire_rc -layer met2
+estimate_parasitics -placement
+set prc_wns_max [format "%.6f" [sta::worst_slack -max]]
+set prc_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set prc_wns_min [format "%.6f" [sta::worst_slack -min]]
+set prc_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set prc_endpoints [collect_endpoints_json]
+
+read_spef /work/tests/designs/gcd/gcd.routed.spef
+set spef_wns_max [format "%.6f" [sta::worst_slack -max]]
+set spef_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set spef_wns_min [format "%.6f" [sta::worst_slack -min]]
+set spef_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set spef_endpoints [collect_endpoints_json]
+
+set fp [open "/work/tests/designs/gcd/gcd.sta.reference.json" "w"]
+puts $fp "{"
+puts $fp "  \"design\": \"gcd\","
+puts $fp "  \"zero_wire\": {"
+puts $fp "    \"wns_max_ns\": $zw_wns_max,"
+puts $fp "    \"tns_max_ns\": $zw_tns_max,"
+puts $fp "    \"wns_min_ns\": $zw_wns_min,"
+puts $fp "    \"tns_min_ns\": $zw_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $zw_endpoints
+puts $fp "    \]"
+puts $fp "  },"
+puts $fp "  \"placement_rc\": {"
+puts $fp "    \"wns_max_ns\": $prc_wns_max,"
+puts $fp "    \"tns_max_ns\": $prc_tns_max,"
+puts $fp "    \"wns_min_ns\": $prc_wns_min,"
+puts $fp "    \"tns_min_ns\": $prc_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $prc_endpoints
+puts $fp "    \]"
+puts $fp "  },"
+puts $fp "  \"placed_spef\": {"
+puts $fp "    \"wns_max_ns\": $spef_wns_max,"
+puts $fp "    \"tns_max_ns\": $spef_tns_max,"
+puts $fp "    \"wns_min_ns\": $spef_wns_min,"
+puts $fp "    \"tns_min_ns\": $spef_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $spef_endpoints
+puts $fp "    \]"
+puts $fp "  }"
+puts $fp "}"
+close $fp
+puts "Generated gcd.sta.reference.json via live OpenROAD/OpenSTA queries"
+exit
+EOF
+openroad -no_init -no_splash "${RUN_DIR}/dump_sta_ref.tcl"
+
 echo "==> Successfully generated all gcd reference artifacts!"
