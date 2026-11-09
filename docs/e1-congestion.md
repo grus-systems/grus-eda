@@ -68,10 +68,18 @@ pub struct CongestionReport {
 ### Step E1.1: GCell Grid Construction & Track Supply (`gcell.rs`)
 
 1. **Grid Dimensions**:
-   - Follow FastRoute's default: `gcell_w_dbu = 15 * min_routing_pitch_x`, `gcell_h_dbu = 15 * min_routing_pitch_y` (in `sky130hd`, `li1`/`met1` pitch is $0.46\text{--}0.48\,\mu\text{m} = 460\text{--}480\text{ DBU}$, giving $W_{\text{gcell}} \approx 6900\text{ DBU}$).
-   - Set `origin_x_dbu = die_area.xl`, `origin_y_dbu = die_area.yl`.
-   - `nx = ((die_area.xh - die_area.xl + gcell_w_dbu - 1) / gcell_w_dbu).max(1) as usize`
-   - `ny = ((die_area.yh - die_area.yl + gcell_h_dbu - 1) / gcell_h_dbu).max(1) as usize`
+   - In `sky130_fd_sc_hd` (`1000 DBU = 1 um`), the routing layer pitches in `.tlef` are:
+     - `li1` (V/local): `0.46 um` (`460 DBU`)
+     - `met1` (H): `0.34 um` (`340 DBU`)
+     - `met2` (V): `0.46 um` (`460 DBU`)
+     - `met3` (H): `0.68 um` (`680 DBU`)
+     - `met4` (V): `0.92 um` (`920 DBU`)
+     - `met5` (H): `3.40 um` (`3400 DBU`)
+   - If the input DEF already contains `GCELLGRID` statements (`DesignDb::gcell_grids`), adopt its exact `(origin_x_dbu, origin_y_dbu, gcell_w_dbu, gcell_h_dbu, nx, ny)`.
+   - Otherwise, follow OpenROAD/FastRoute's default tile size: `gcell_w_dbu = 15 * met2_pitch_dbu` (`15 * 460 = 6900 DBU` when `met2` pitch is `460 DBU`, or `15 * met1_pitch_dbu = 5100 DBU` if uniform 15-track `met1` grid is selected via CLI), with:
+     - `origin_x_dbu = die_area.xl`, `origin_y_dbu = die_area.yl`
+     - `nx = ((die_area.xh - die_area.xl + gcell_w_dbu - 1) / gcell_w_dbu).max(1) as usize`
+     - `ny = ((die_area.yh - die_area.yl + gcell_h_dbu - 1) / gcell_h_dbu).max(1) as usize`
 2. **Track Supply Calculation**:
    - For each routing layer $l \in \{\text{met1}, \text{met2}, \text{met3}, \text{met4}, \text{met5}\}$ (skip `li1` for inter-GCell routing, matching OpenROAD `sky130hd` `set_routing_layers -signal met1-met5`):
      - Apply layer adjustment factor $1 - \alpha_l$ (default `sky130hd` OpenROAD adjustments: `met1: 0.30`, `met2: 0.20`, `met3: 0.20`, `met4: 0.20`, `met5: 0.20`, configurable via CLI).
@@ -81,8 +89,10 @@ pub struct CongestionReport {
      - If layer $l$ is `Vertical`:
        - For each GCell column $x \in [0, nx)$, count tracks from `DEF TRACKS X` falling inside $[x_0 + x \cdot W, x_0 + (x + 1) \cdot W)$.
        - Add `tracks_in_col * (1.0 - alpha_l)` to `v_cap[y * nx + x]` for all $y \in [0, ny - 1)$.
-3. **Obstruction Deduction**:
-   - For every `Fixed` or `Placed` macro instance with `obs_rects` on routing layers (`met1`..`met5`), transform the obstacle rectangle into DBU coordinates According to the cell's origin and `Orient`, intersect it with overlapping GCell boundaries, and subtract the blocked track count from `h_cap` / `v_cap` (clamped at `0.0`).
+3. **Obstruction & `SPECIALNETS` (PDN) Deduction**:
+   - **Macro Obstructions (`OBS`)**: For every `Fixed` or `Placed` macro instance with `obs_rects` on routing layers (`met1`..`met5`), transform the obstacle rectangle into DBU coordinates according to the cell's origin and `Orient`.
+   - **Power/Ground Wires (`SPECIALNETS`)**: Include every routed wire rectangle in `DesignDb::special_wire_rects` (`VPWR`/`VGND` standard-cell rails on `met1` and PDN straps on `met4`/`met5`).
+   - Intersect these obstacle rectangles (bloated by half wire spacing/pitch) with overlapping GCell boundaries and subtract the blocked track count from `h_cap` / `v_cap` (clamped at `0.0`).
 
 ---
 

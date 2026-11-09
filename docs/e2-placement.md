@@ -19,25 +19,26 @@ This document breaks E2 into four concrete implementation steps (`E2.1`–`E2.4`
 
 ### Step E2.1: Smooth Weighted-Average (WA) Wirelength (`wirelength.rs`)
 
-> **Two Mandatory `f32` Numerical Safeguards**:
-> 1. **Exponent Shift (Preventing `expf` Overflow)**: In `f32`, `exp(x)` overflows to `+inf` as soon as the argument exceeds `88.72` (`NaN` in division). Never evaluate `exp(x_p / gamma)` directly; always subtract the per-net maximum $x_{\max}$ (for positive exponentials) and minimum $x_{\min}$ (for negative exponentials) so every exponent argument is $\le 0$.
-> 2. **`f64` Scalar Accumulators for Global Reductions (Preventing Mantissa Swamping)**: Keep all per-cell and per-pin arrays (`pos_x`, `grad_x`, `e_field_x`) as `Vec<f32>`, but accumulate global sums—total WA wirelength $\sum_e W(e)$, $L_1$ norm $\|\nabla W\|_1$, and Barzilai-Borwein $L_2$ dot products $\|v_k - v_{k-1}\|_2^2$, $\|g_k - g_{k-1}\|_2^2$—in scalar **`f64`** (and sum exact integer DBU HPWL in **`i64`**). Summing 100k `f32` values into an `f32` accumulator loses low-order bits and causes the Nesterov step size $\alpha_k$ to oscillate.
+> **Three Mandatory `f32` Numerical Safeguards**:
+> 1. **Exponent Shift (Preventing `expf` Overflow)**: In `f32`, `exp(x)` overflows to `+inf` as soon as the argument exceeds `88.72` (`NaN` in division). Never evaluate `exp(x_p / gamma)` directly; always use shifted coordinates $\tilde{x}_p^+ = x_p - x_{\max} \le 0$ and $\tilde{x}_p^- = x_p - x_{\min} \ge 0$ so every exponent argument is $\le 0$.
+> 2. **Shifted Coordinates Inside $B_e^\pm$ and Gradient (Preventing Catastrophic Cancellation)**: If $B_e^+ = \sum x_p a_p^+$ is evaluated with large absolute coordinates (e.g., $x_p \approx 5000\,\mu\text{m}$ while net span is $2\,\mu\text{m}$), subtracting $x_p A_e^+ - B_e^+$ in `f32` cancels the leading 12+ bits of mantissa! Because shifting all $x_p$ on net $e$ by a constant shifts $W_x^+(e)$ by that constant and leaves the gradient $\frac{\partial W_x(e)}{\partial x_p}$ **mathematically invariant**, always compute $\tilde{B}_e^+$ and the gradient using $\tilde{x}_p^+ = x_p - x_{\max}$ and $\tilde{x}_p^- = x_p - x_{\min}$.
+> 3. **`f64` Scalar Accumulators for Global Reductions (Preventing Mantissa Swamping)**: Keep all per-cell and per-pin arrays (`pos_x`, `grad_x`, `e_field_x`) as `Vec<f32>`, but accumulate global sums—total WA wirelength $\sum_e W(e)$, $L_1$ norm $\|\nabla W\|_1$, and Barzilai-Borwein $L_2$ dot products $\|v_k - v_{k-1}\|_2^2$, $\|g_k - g_{k-1}\|_2^2$—in scalar **`f64`** (and sum exact integer DBU HPWL in **`i64`**).
 
-Let movable cell $c$ have center coordinate $(x_c, y_c)$ in microns (or normalized DBU `f32`). Each pin $p \in e$ on net $e$ has position:
+Let movable cell $c$ have center coordinate $(x_c, y_c)$ in microns (with die lower-left origin shifted to $(0, 0)$). Each pin $p \in e$ on net $e$ has position:
 $$x_p = x_{c(p)} + \Delta x_p, \quad y_p = y_{c(p)} + \Delta y_p$$
 
-For a smoothing parameter $\gamma > 0$, define stabilized exponentials on net $e$ using $x_{\max} = \max_{p \in e} x_p$ and $x_{\min} = \min_{p \in e} x_p$:
+For a smoothing parameter $\gamma > 0$, define shifted pin coordinates $\tilde{x}_p^+ = x_p - x_{\max} \le 0$ and $\tilde{x}_p^- = x_p - x_{\min} \ge 0$ (where $x_{\max} = \max_{p \in e} x_p$ and $x_{\min} = \min_{p \in e} x_p$):
 
-$$a_p^+ = \exp\!\left(\frac{x_p - x_{\max}}{\gamma}\right) \in (0, 1], \quad a_p^- = \exp\!\left(\frac{x_{\min} - x_p}{\gamma}\right) \in (0, 1]$$
+$$a_p^+ = \exp\!\left(\frac{\tilde{x}_p^+}{\gamma}\right) \in (0, 1], \quad a_p^- = \exp\!\left(\frac{-\tilde{x}_p^-}{\gamma}\right) \in (0, 1]$$
 
-Define the four net accumulators:
-$$A_e^+ = \sum_{p \in e} a_p^+, \quad B_e^+ = \sum_{p \in e} x_p \, a_p^+, \quad A_e^- = \sum_{p \in e} a_p^-, \quad B_e^- = \sum_{p \in e} x_p \, a_p^-$$
+Define the four shifted net accumulators:
+$$A_e^+ = \sum_{p \in e} a_p^+, \quad \tilde{B}_e^+ = \sum_{p \in e} \tilde{x}_p^+ \, a_p^+, \quad A_e^- = \sum_{p \in e} a_p^-, \quad \tilde{B}_e^- = \sum_{p \in e} \tilde{x}_p^- \, a_p^-$$
 
 Then the WA wirelength along $x$ for net $e$ is:
-$$W_x(e) = \frac{B_e^+}{A_e^+} - \frac{B_e^-}{A_e^-}$$
+$$W_x(e) = (x_{\max} - x_{\min}) + \frac{\tilde{B}_e^+}{A_e^+} - \frac{\tilde{B}_e^-}{A_e^-}$$
 
-And the analytical partial derivative with respect to pin $p \in e$ is:
-$$\frac{\partial W_x(e)}{\partial x_p} = \frac{a_p^+}{\gamma \, (A_e^+)^2} \Bigl(\bigl(\gamma + x_p\bigr) A_e^+ - B_e^+\Bigr) - \frac{a_p^-}{\gamma \, (A_e^-)^2} \Bigl(\bigl(\gamma - x_p\bigr) A_e^- + B_e^-\Bigr)$$
+And the analytical partial derivative with respect to pin $p \in e$ (free of catastrophic cancellation) is:
+$$\frac{\partial W_x(e)}{\partial x_p} = \frac{a_p^+}{\gamma \, (A_e^+)^2} \Bigl(\bigl(\gamma + \tilde{x}_p^+\bigr) A_e^+ - \tilde{B}_e^+\Bigr) - \frac{a_p^-}{\gamma \, (A_e^-)^2} \Bigl(\bigl(\gamma - \tilde{x}_p^-\bigr) A_e^- + \tilde{B}_e^-\Bigr)$$
 
 (Identical formulas apply independently to $y_p$.)
 To accumulate cell gradients without atomic operations:
@@ -48,25 +49,46 @@ To accumulate cell gradients without atomic operations:
 
 ### Step E2.2: Electrostatic Density & 2D Spectral Solver (`density.rs`)
 
-#### 1. Bin Grid Setup
+#### 1. Physical-Only Cell Classification & Bin Grid Setup
+- **Cell Filtering**:
+  - `MacroClass::CoreSpacer` (`sky130_fd_sc_hd__fill_*`, post-placement decap fillers): excluded from E2 (if present in an input DEF, strip them on load).
+  - `PlacementStatus::Fixed` cells (`tapvpwrvgnd`, endcap `decap`, block macros): stationary. Their area is added to the fixed background bin density $\rho_{\text{fixed}}(u, v)$ scaled by $\rho_{\text{target}}$, and they act as fixed obstacles splitting rows in Step E2.4.
+  - `PlacementStatus::Placed` / `Unplaced` standard cells (`MacroClass::Core` / `CoreTie`): movable optimization variables.
 - Choose grid dimension $M = 2^k \in \{64, 128, 256, 512\}$ such that bin width $w_b = W_{\text{core}} / M$ and bin height $h_b = H_{\text{core}} / M$ are approximately $1\text{--}4\times$ standard cell height.
 - Local density stretching (ePlace rule): if movable cell $c$ has width $w_c < \sqrt{2} w_b$, stretch its density footprint width to $w'_c = \sqrt{2} w_b$ and scale its density weight by $s_c = \frac{w_c h_c}{w'_c h'_c}$ so total cell area (charge) is conserved while making the overlap function piecewise smooth across bins.
 - Accumulate cell area overlap with each bin $(u, v) \in [0, M)^2$ into $\rho(u, v)$, and subtract the DC mean $\bar{\rho} = \frac{1}{M^2}\sum_{u, v} \rho(u, v)$ so net total charge is zero.
 
-#### 2. 1D DCT-II / IDCT / IDXST via `rustfft` (Makhoul's Algorithm)
-To compute a 1D DCT-II of length $M$ in $O(M \log M)$ using a standard complex FFT of length $M$:
-1. Reorder input $x[0..M]$ into buffer $v[0..M]$:
-   $$v[k] = x[2k], \quad v[M - 1 - k] = x[2k + 1] \quad \text{for } k = 0, \dots, \frac{M}{2} - 1$$
-2. Run 1D forward complex FFT on $v$ to obtain $V[0..M]$.
-3. Multiply by twiddle factors:
-   $$\text{DCT}(x)[u] = \text{Re}\!\left(V[u] \cdot e^{-i \frac{\pi u}{2M}}\right) \quad \text{for } u = 0, \dots, M - 1$$
+#### 2. Exact 1D Forward DCT-II, Inverse IDCT (DCT-III), and Inverse IDXST via `rustfft`
+Let $M$ be a power of 2:
 
-For the inverse transforms needed for potential $\phi$ (IDCT) and electric field $E_x, E_y$ (IDXST):
-- Define frequency wavenumbers $\omega_u = \frac{\pi u}{M}$ and $\omega_v = \frac{\pi v}{M}$ (with $\omega_0 = 0$).
-- Spectral coefficients for potential $\hat{\phi}_{u, v}$ and electric field $(\hat{E}^x_{u, v}, \hat{E}^y_{u, v})$:
-  $$\hat{\phi}_{u, v} = \begin{cases} 0 & \text{if } u = 0 \text{ and } v = 0 \\ \dfrac{a_{u, v}}{\omega_u^2 + \omega_v^2} & \text{otherwise} \end{cases}$$
-  $$\hat{E}^x_{u, v} = \omega_u \, \hat{\phi}_{u, v}, \quad \hat{E}^y_{u, v} = \omega_v \, \hat{\phi}_{u, v}$$
-- Apply 2D IDCT to $\hat{\phi}_{u,v}$ to get $\phi(u, v)$, 1D IDXST along $u$ + 1D IDCT along $v$ to get $E_x(u, v)$, and 1D IDCT along $u$ + 1D IDXST along $v$ to get $E_y(u, v)$.
+- **1D Forward DCT-II (`dct1d`, unnormalized $\sum_{n=0}^{M-1} x_n \cos(\frac{\pi u (2n+1)}{2M})$)**:
+  1. Reorder $x[0..M]$ into complex buffer $v[0..M]$:
+     $$v[k] = x[2k], \quad v[M - 1 - k] = x[2k + 1] \quad \text{for } k = 0, \dots, \frac{M}{2} - 1$$
+  2. Run 1D forward complex FFT on $v \to V$.
+  3. Multiply by twiddle factors:
+     $$C[u] = \text{Re}\!\left(V[u] \cdot e^{-i \frac{\pi u}{2M}}\right) \quad \text{for } u = 0, \dots, M - 1$$
+
+- **1D Inverse DCT (`idct1d`, satisfying $\text{idct1d}(\text{dct1d}(x)) = x$)**:
+  1. Given spectral coefficients $C[0..M]$, form complex frequency vector $W[0..M]$:
+     $$W[0] = \frac{1}{M} C[0], \quad W[u] = \frac{2}{M}\bigl(C[u] - i \, C[M - u]\bigr)\,e^{i \frac{\pi u}{2M}} \quad \text{for } u = 1, \dots, M - 1$$
+     (or equivalently run inverse complex IFFT on $V[u] = \frac{2}{M} C[u] e^{i \frac{\pi u}{2M}}$ with $V[0] = \frac{1}{M} C[0]$ and take the real part).
+  2. Un-permute the real part $v[0..M]$ back to spatial order:
+     $$x[2k] = \text{Re}(v[k]), \quad x[2k + 1] = \text{Re}(v[M - 1 - k]) \quad \text{for } k = 0, \dots, \frac{M}{2} - 1$$
+
+- **1D Inverse Shifted Sine Transform (`idxst1d`, computing $\sum_{u=1}^{M-1} S[u] \sin(\frac{\pi u (2n+1)}{2M})$)**:
+  Using the identity $\sin\!\bigl(\frac{\pi u(2n+1)}{2M}\bigr) = (-1)^n \cos\!\bigl(\frac{\pi (M - u)(2n+1)}{2M}\bigr)$:
+  1. Define reversed cosine coefficients $\tilde{C}[0] = 0$ and $\tilde{C}[u] = S[M - u]$ for $u = 1, \dots, M - 1$.
+  2. Compute $y = \text{idct1d}(\tilde{C})$.
+  3. Flip signs on odd spatial indices:
+     $$\text{idxst1d}(S)[n] = (-1)^n \, y[n] \quad \text{for } n = 0, \dots, M - 1$$
+
+- **2D Spectral Poisson Solve**:
+  1. Apply `dct1d` to all rows of $\rho(u, v)$, then `dct1d` to all columns to obtain $a_{u, v}$.
+  2. Define wavenumbers $\omega_u = \frac{\pi u}{M w_b}$ and $\omega_v = \frac{\pi v}{M h_b}$:
+     $$\hat{\phi}_{u, v} = \begin{cases} 0 & \text{if } u = 0 \text{ and } v = 0 \\ \dfrac{a_{u, v}}{\omega_u^2 + \omega_v^2} & \text{otherwise} \end{cases}, \quad \hat{E}^x_{u, v} = \omega_u \, \hat{\phi}_{u, v}, \quad \hat{E}^y_{u, v} = \omega_v \, \hat{\phi}_{u, v}$$
+  3. Recover $\phi(x, y)$ by applying `idct1d` along rows and `idct1d` along columns of $\hat{\phi}$.
+  4. Recover $E_x(x, y)$ by applying `idxst1d` along $u$ (horizontal) and `idct1d` along $v$ (vertical) of $\hat{E}^x$.
+  5. Recover $E_y(x, y)$ by applying `idct1d` along $u$ (horizontal) and `idxst1d` along $v$ (vertical) of $\hat{E}^y$.
 
 ---
 

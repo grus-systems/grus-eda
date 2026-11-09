@@ -155,21 +155,29 @@ pub fn eval_nldm_constraint(
 
 #[inline]
 pub fn eval_2d(table: &NldmTable, x: f32, y: f32) -> f32 {
+    let m = table.index_1.len();
     let n2 = table.index_2.len();
-    if table.index_1.len() == 1 && n2 == 1 {
+    if m == 1 && n2 == 1 {
         return table.values[0];
     }
     let (i, u) = find_interval_unclamped(&table.index_1, x);
+    let i1 = (i + 1).min(m - 1);
     if n2 <= 1 {
         let v0 = table.values[i];
-        let v1 = table.values[(i + 1).min(table.index_1.len() - 1)];
+        let v1 = table.values[i1];
         return (1.0 - u) * v0 + u * v1;
     }
     let (j, v) = find_interval_unclamped(&table.index_2, y);
+    let j1 = (j + 1).min(n2 - 1);
+    if m <= 1 {
+        let v0 = table.values[j];
+        let v1 = table.values[j1];
+        return (1.0 - v) * v0 + v * v1;
+    }
     let t00 = table.values[i * n2 + j];
-    let t10 = table.values[(i + 1) * n2 + j];
-    let t01 = table.values[i * n2 + (j + 1)];
-    let t11 = table.values[(i + 1) * n2 + (j + 1)];
+    let t10 = table.values[i1 * n2 + j];
+    let t01 = table.values[i * n2 + j1];
+    let t11 = table.values[i1 * n2 + j1];
     (1.0 - u) * (1.0 - v) * t00
         + u * (1.0 - v) * t10
         + (1.0 - u) * v * t01
@@ -177,7 +185,16 @@ pub fn eval_2d(table: &NldmTable, x: f32, y: f32) -> f32 {
 }
 ```
 
-#### Dual Polarity Propagation Rules (`propagate.rs`)
+#### Minimal SDC Reader (`sta/sdc.rs`)
+To ensure `grus-eda sta` and OpenSTA evaluate the exact same boundary conditions, parse the benchmark `.sdc` subset:
+- `create_clock [-name <name>] -period <period_ns> [get_ports <clk_port>]`
+- `set_input_delay <delay_ns> [-clock <clk>] <port_pattern_or_all_inputs>`
+- `set_output_delay <delay_ns> [-clock <clk>] <port_pattern_or_all_outputs>`
+- `set_input_transition <slew_ns> <port_pattern_or_all_inputs>` (or `set_driving_cell -lib_cell <cell> -pin <pin>`)
+- `set_load [-pin_load] <cap_pf> <port_pattern_or_all_outputs>`
+- `set_clock_uncertainty <unc_ns> <clk>`
+
+#### Dual Polarity Propagation & OpenSTA Worst-Slew Merge Rule (`propagate.rs`)
 1. **Startpoint Initialization**:
    - Primary inputs (`PinDir::Input` on `pin_cells[p] == None`): set `arrival_max = [input_delay, input_delay]`, `arrival_min = [input_delay, input_delay]`, `slew_max = [in_slew_rise, in_slew_fall]`, `slew_min = [in_slew_rise, in_slew_fall]`.
    - Clock network pins: if running ideal clock (`propagate_clock = false`), set clock pin `CLK` of every flip-flop to `arrival = [0.0, period / 2.0]`, `slew = [clk_slew, clk_slew]`. Immediately evaluate every `RisingEdge` (`CLK -> Q` / `Q_N`) arc using `in_slew = slew[RISE]` on `CLK` and `out_cap = net_cap[RISE/FALL]` on `Q` to seed `Q`'s `arrival_max[RISE/FALL]` and `arrival_min[RISE/FALL]`.
@@ -193,7 +210,13 @@ pub fn eval_2d(table: &NldmTable, x: f32, y: f32) -> f32 {
          - `NonUnate`: `[(RISE, RISE), (FALL, RISE), (RISE, FALL), (FALL, FALL)]`
        - For each `(src_pol, dst_pol)`:
          - Lookup `delay` and `out_slew` from `cell_rise`/`rise_transition` (if `dst_pol == RISE`) or `cell_fall`/`fall_transition` (if `dst_pol == FALL`) using `in_slew = slew[s][src_pol]` and `out_cap = net_cap[net(y)][dst_pol]`.
-         - Update `arrival_max[y][dst_pol]` (and carry its `out_slew` if the new arrival exceeds the existing `arrival_max`, matching OpenSTA's critical-path slew propagation) and `arrival_min[y][dst_pol]`.
+         - **Independent Arrival & Slew Merge (OpenSTA Rule)**: OpenSTA's `GraphDelayCalc` merges slews independently of which arc wins arrival time:
+           ```rust
+           state[y].arrival_max[dst_pol] = state[y].arrival_max[dst_pol].max(cand_arr_max);
+           state[y].arrival_min[dst_pol] = state[y].arrival_min[dst_pol].min(cand_arr_min);
+           state[y].slew_max[dst_pol]    = state[y].slew_max[dst_pol].max(cand_slew_max);
+           state[y].slew_min[dst_pol]    = state[y].slew_min[dst_pol].min(cand_slew_min);
+           ```
 3. **Setup & Hold Endpoint Checks and Backward Pass**:
    - At each `TimingCheck` on flip-flop data pin $D$ with rising clock pin $CLK$:
      - **Setup (Max Path)** for data polarity $\text{pol} \in \{\text{RISE}, \text{FALL}\}$:
@@ -230,10 +253,21 @@ When `--parasitics placement` is selected:
    - Parse `*CONN` (identifies `*I inst:pin` and `*P port` nodes, with `*D` marking the driver).
    - Parse `*CAP` (ground capacitors `id node cap_val`; ignore coupling capacitors or lump them to ground).
    - Parse `*RES` (resistors `id node1 node2 res_val`).
-3. **Two-Pass Elmore Delay & Slew Degradation**:
+3. **Two-Pass Elmore Delay, Driving-Point $\pi$-Model, and $C_{\text{eff}}$**:
    - Root the RC graph at the driver node $d$ (spanning tree BFS if parallel resistor loops exist):
-   - Add sink pin Liberty capacitance $C_{\text{pin}}(s, \text{pol})$ to each sink node $s$ (or verify whether the SPEF already lumps pin cap vs. wire-only cap; OpenROAD SPEFs contain **wire-only** capacitance in `*CAP`, so always add `LibPin::cap_rise` / `cap_fall` at sink pins!).
-   - Run the same bottom-up $C_{\text{down}}$ and top-down $\tau_{\text{Elmore}}$ pass as in Step E3.2.
-   - Slew degradation at sink $s$ (matching OpenSTA's Elmore slew approximation):
-     $$\text{slew}(s) = \sqrt{\text{slew}(d)^2 + \bigl(\ln(9) \cdot \tau_{\text{Elmore}}(d \to s)\bigr)^2}$$
-     (Compare against `sta` on `gcd.spef` and adjust the slew factor if `sta` uses $0.2\text{--}0.8$ threshold factor $\ln(0.8 / 0.2) = \ln(4) \approx 1.3863$ from the Liberty library's `slew_lower_threshold_pct` / `slew_upper_threshold_pct`).
+   - Add sink pin Liberty capacitance $C_{\text{pin}}(s, \text{pol})$ to each sink node $s$ (OpenROAD SPEFs contain **wire-only** capacitance in `*CAP`, so always add `LibPin::cap_rise` / `cap_fall` at sink pins).
+   - **Stage 1 (Lumped Cap + Elmore Delay Baseline)**:
+     - Run the bottom-up $C_{\text{down}}$ and top-down $\tau_{\text{Elmore}}$ pass as in Step E3.2, with total lumped capacitance $C_{\text{total}} = C_{\text{down}}(d)$.
+     - Verify against OpenSTA first with `sta`'s lumped-cap / Elmore calculator (`set_delay_calculator lumped_cap` or short-wire `gcd` where $R_{\text{wire}} \ll R_{\text{driver}}$).
+   - **Stage 2 (O'Brien-Savarino $\pi$-Model & $C_{\text{eff}}$ for OpenSTA Default `dmp_ceff_elmore`)**:
+     - When driving long resistive nets under OpenSTA's default `dmp_ceff_elmore` calculator, resistive shielding makes effective driver load $C_{\text{eff}} < C_{\text{total}}$:
+     - Compute the first three driving-point admittance moments $(y_1, y_2, y_3)$ at the driver in a single bottom-up tree pass:
+       $$y_1(u) = C_{\text{down}}(u), \quad y_2(u) = \sum_{v \in \text{children}(u)} \bigl(y_2(v) - R_{uv} y_1(v)^2\bigr), \quad y_3(u) = \sum_{v \in \text{children}(u)} \bigl(y_3(v) - 2 R_{uv} y_1(v) y_2(v) + R_{uv}^2 y_1(v)^3\bigr)$$
+     - Construct the equivalent driving-point $\pi$-model:
+       $$C_2 = \frac{y_2^2}{y_3}, \quad C_1 = y_1 - C_2, \quad R_\pi = -\frac{y_3^2}{y_2^3}$$
+     - Run 2 fixed-point iterations matching the NLDM output transition $t_{\text{slew}}(C_{\text{eff}})$ against the $\pi$-load charge sharing equation:
+       $$C_{\text{eff}} = C_1 + C_2 \left(1 - \frac{R_\pi C_2}{t_{\text{D}}} \left(1 - e^{-t_{\text{D}} / (R_\pi C_2)}\right)\right)$$
+       where $t_{\text{D}} = t_{\text{slew}} / (\text{upper\_pct} - \text{lower\_pct})$ (for `sky130hd` $20\%\text{--}80\%$ thresholds, $t_{\text{D}} = t_{\text{slew}} / 0.6$).
+   - **Wire Slew Degradation**:
+     $$\text{slew}(s) = \sqrt{\text{slew}(d)^2 + \bigl(\ln(4) \cdot \tau_{\text{Elmore}}(d \to s)\bigr)^2}$$
+     where $\ln(0.8 / 0.2) = \ln(4) \approx 1.3863$ matches `sky130_fd_sc_hd`'s $20\%\text{--}80\%$ slew thresholds (`slew_lower_threshold_pct_rise : 20.0`, `slew_upper_threshold_pct_rise : 80.0`).

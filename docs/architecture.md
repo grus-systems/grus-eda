@@ -164,6 +164,14 @@ pub struct NetId(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PinId(pub u32);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PinDir {
+    Input,
+    Output,
+    Inout,
+    Internal,
+}
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct StringInterner {
     strings: Vec<String>,
@@ -202,16 +210,8 @@ impl StringInterner {
 All values in `LibDb` are normalized to **nanoseconds (`ns`)** for time and **picofarads (`pF`)** for capacitance during parsing so downstream STA code performs zero unit conversions.
 
 ```rust
-use crate::interner::{LibCellId, LibPinId, SymbolId};
+use crate::interner::{LibCellId, LibPinId, PinDir, SymbolId};
 use serde::{Deserialize, Serialize};
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PinDir {
-    Input,
-    Output,
-    Inout,
-    Internal,
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimingSense {
@@ -345,7 +345,7 @@ pub enum MacroClass {
     Other,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RectDbu {
     pub xl: i32,
     pub yl: i32,
@@ -383,13 +383,20 @@ pub struct TechDb {
     pub routing_layers: Vec<RoutingLayer>,
     pub macros: Vec<MacroDef>,
     pub macro_pins: Vec<MacroPin>,
+    pub layer_by_name: std::collections::HashMap<SymbolId, LayerId>,
+    pub macro_by_name: std::collections::HashMap<SymbolId, MacroId>,
 }
 ```
 
 ### 4.4 SoA / CSR Design Database (`design_db.rs`)
 
+`DesignDb` owns the shared `StringInterner` used across `TechDb` and `DesignDb` (while `LibDb` owns its own `StringInterner` so `.lib` binary caches remain self-contained).
+
 ```rust
-use crate::interner::{CellId, LayerId, LibCellId, LibPinId, MacroId, MacroPinId, NetId, PinId, SymbolId};
+use crate::interner::{
+    CellId, LayerId, LibCellId, LibPinId, MacroId, MacroPinId, NetId, PinDir, PinId,
+    StringInterner, SymbolId,
+};
 use crate::tech_db::RectDbu;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -425,13 +432,24 @@ pub struct TrackGrid {
     pub layers: Vec<LayerId>,
 }
 
+#[derive(Clone, Debug)]
+pub struct GCellGridDef {
+    pub is_x: bool, // true = GCELLGRID X, false = GCELLGRID Y
+    pub start_dbu: i32,
+    pub num_boundaries: i32,
+    pub step_dbu: i32,
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct DesignDb {
     pub design_name: String,
+    pub strings: StringInterner,
     pub dbu_per_micron: i32,
     pub die_area: RectDbu,
     pub rows: Vec<PlacementRow>,
     pub tracks: Vec<TrackGrid>,
+    pub gcell_grids: Vec<GCellGridDef>,
+    pub special_wire_rects: Vec<(LayerId, RectDbu)>, // PDN stripes/rails from SPECIALNETS
 
     // --- Cell SoA (indexed by CellId) ---
     pub cell_names: Vec<SymbolId>,
@@ -445,6 +463,8 @@ pub struct DesignDb {
     pub cell_pin_ids: Vec<PinId>,
 
     // --- Pin SoA (indexed by PinId; includes instance pins and primary I/O ports) ---
+    pub pin_names: Vec<SymbolId>, // port name for primary I/O, or macro pin name for instance pin
+    pub pin_dirs: Vec<PinDir>,
     pub pin_cells: Vec<Option<CellId>>, // None for primary I/O port
     pub pin_macro_pins: Vec<Option<MacroPinId>>,
     pub pin_lib_pins: Vec<Option<LibPinId>>,
@@ -452,6 +472,7 @@ pub struct DesignDb {
     pub pin_offset_x_dbu: Vec<i32>, // relative to cell (or absolute for I/O port)
     pub pin_offset_y_dbu: Vec<i32>,
     pub pin_is_driver: Vec<bool>,
+    pub io_pins: Vec<PinId>, // indices of primary I/O ports (where pin_cells[p] == None)
 
     // --- Net SoA & CSR (indexed by NetId) ---
     pub net_names: Vec<SymbolId>,
@@ -498,6 +519,5 @@ grus-eda sta \
   [--json <path.json> | --verilog <path.v> | --def <placed.def>] \
   [--tlef <path.tlef> --lef <path.lef>] \
   [--parasitics none | placement | --spef <path.spef>] \
-  --clock-pin <clk_port> \
-  --period-ns <period>
+  [--sdc <path.sdc> | --clock-pin <clk_port> --period-ns <period>]
 ```
