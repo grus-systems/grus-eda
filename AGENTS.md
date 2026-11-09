@@ -16,6 +16,9 @@ Instructions for AI coding agents working in this repository.
 ## 2. Verification Discipline (Most Important Rule)
 
 - Every stage (`E0` through `E3` in `README.md`) has a **reference tool**. **Passing your own unit tests does not mean a stage is done.** A stage is done only when run on the exact same inputs as the reference tool and its numbers meet the "done when" criteria in `README.md`.
+- **Never hand-write or round reference numbers**: Golden reference files (`*.reference.json`) must be emitted directly by Tcl/scripts running inside OpenROAD or OpenSTA, and integration tests must deserialize and assert against those files directly.
+- **No silent test skips**: Integration tests that require PDK or design files must fail loudly if the files are missing (do not `eprintln!("Skipping...")` and `return` green).
+- **Honest runtime measurement**: When reporting cold parse vs. warm cache runtimes in `docs/results.md`, explicitly remove the cache file before timing the cold path.
 - Record every comparison in `docs/results.md`: date, design, reference tool value, our value, difference, and our runtime.
   Keep failed or divergent runs in the log as well, along with the root cause identified.
 - Commit reference tool output files (golden files) only when they are small (< 1 MB). For larger outputs, commit the exact reproduction script/command instead.
