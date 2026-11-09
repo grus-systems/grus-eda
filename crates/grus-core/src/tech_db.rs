@@ -1,4 +1,4 @@
-use crate::interner::{LayerId, MacroId, PinDir, SymbolId};
+use crate::interner::{LayerId, MacroId, PinDir, StringInterner, SymbolId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -85,6 +85,7 @@ pub struct TechDb {
     pub site_name: String,
     pub site_width_dbu: i32,
     pub site_height_dbu: i32,
+    pub strings: StringInterner,
     pub routing_layers: Vec<RoutingLayer>,
     pub macros: Vec<MacroDef>,
     pub macro_pins: Vec<MacroPin>,
@@ -100,6 +101,7 @@ impl TechDb {
     }
 
     pub fn rebuild_maps(&mut self) {
+        self.strings.rebuild_map();
         self.layer_by_name.clear();
         self.layer_by_name.reserve(self.routing_layers.len());
         for (i, layer) in self.routing_layers.iter().enumerate() {

@@ -2,7 +2,7 @@ use crate::interner::{
     CellId, LayerId, LibCellId, LibPinId, MacroId, MacroPinId, NetId, PinDir, PinId,
     StringInterner, SymbolId,
 };
-use crate::tech_db::RectDbu;
+use crate::tech_db::{RectDbu, TechDb};
 use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,5 +133,70 @@ impl DesignDb {
         pins.first()
             .copied()
             .filter(|&first_pin| self.pin_is_driver[first_pin.0 as usize])
+    }
+
+    /// Computes the absolute coordinates (x, y) in DBU for a given pin under its cell's placement and orientation.
+    pub fn pin_pos_dbu(&self, pin: PinId, tech_db: &TechDb) -> (i32, i32) {
+        let p = pin.0 as usize;
+        match self.pin_cells[p] {
+            None => {
+                // Primary I/O pin: absolute coordinates
+                (self.pin_offset_x_dbu[p], self.pin_offset_y_dbu[p])
+            }
+            Some(cell_id) => {
+                let c = cell_id.0 as usize;
+                let cx = self.cell_x_dbu[c];
+                let cy = self.cell_y_dbu[c];
+                let orient = self.cell_orient[c];
+                let macro_id = self.cell_macros[c];
+                let mac = &tech_db.macros[macro_id.0 as usize];
+                let w = mac.width_dbu;
+                let h = mac.height_dbu;
+                let ox = self.pin_offset_x_dbu[p];
+                let oy = self.pin_offset_y_dbu[p];
+
+                match orient {
+                    Orient::N => (cx + ox, cy + oy),
+                    Orient::S => (cx + w - ox, cy + h - oy),
+                    Orient::W => (cx + oy, cy + w - ox),
+                    Orient::E => (cx + h - oy, cy + ox),
+                    Orient::FN => (cx + w - ox, cy + oy),
+                    Orient::FS => (cx + ox, cy + h - oy),
+                    Orient::FW => (cx + h - oy, cy + w - ox),
+                    Orient::FE => (cx + oy, cy + ox),
+                }
+            }
+        }
+    }
+
+    /// Computes the total Half-Perimeter Wirelength (HPWL) in DBU across all signal nets.
+    pub fn compute_hpwl_dbu(&self, tech_db: &TechDb) -> i64 {
+        let mut total_hpwl: i64 = 0;
+        for net_idx in 0..self.num_nets() {
+            let nid = NetId(net_idx as u32);
+            let pins = self.net_pins(nid);
+            if pins.len() <= 1 {
+                continue;
+            }
+            let mut min_x = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut min_y = i32::MAX;
+            let mut max_y = i32::MIN;
+
+            for &pin in pins {
+                let (px, py) = self.pin_pos_dbu(pin, tech_db);
+                min_x = min_x.min(px);
+                max_x = max_x.max(px);
+                min_y = min_y.min(py);
+                max_y = max_y.max(py);
+            }
+
+            if max_x >= min_x && max_y >= min_y {
+                let dx = (max_x - min_x) as i64;
+                let dy = (max_y - min_y) as i64;
+                total_hpwl += dx + dy;
+            }
+        }
+        total_hpwl
     }
 }

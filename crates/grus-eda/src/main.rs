@@ -166,6 +166,56 @@ fn main() -> anyhow::Result<()> {
                     tech_db.macro_pins.len(),
                     elapsed_lef_ms
                 );
+
+                if let Some(json_path) = &args.json {
+                    println!("Loading Yosys JSON netlist from {:?}", json_path);
+                    let t_json = std::time::Instant::now();
+                    let db_json = grus_core::readers::parse_yosys_json(json_path, &tech_db, Some(&lib_db))?;
+                    let elapsed_json_ms = t_json.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "Loaded Yosys JSON: design={}, cells={}, nets={}, io_pins={}, elapsed={:.2}ms",
+                        db_json.design_name,
+                        db_json.num_cells(),
+                        db_json.num_nets(),
+                        db_json.io_pins.len(),
+                        elapsed_json_ms
+                    );
+                }
+
+                if let Some(v_path) = &args.verilog {
+                    println!("Loading Verilog netlist from {:?}", v_path);
+                    let t_v = std::time::Instant::now();
+                    let db_v = grus_core::readers::parse_verilog(v_path, &tech_db, Some(&lib_db))?;
+                    let elapsed_v_ms = t_v.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "Loaded Verilog: design={}, cells={}, nets={}, io_pins={}, elapsed={:.2}ms",
+                        db_v.design_name,
+                        db_v.num_cells(),
+                        db_v.num_nets(),
+                        db_v.io_pins.len(),
+                        elapsed_v_ms
+                    );
+                }
+
+                if let Some(def_path) = &args.def {
+                    println!("Loading DEF from {:?}", def_path);
+                    let t_def = std::time::Instant::now();
+                    let db_def = grus_core::readers::parse_def(def_path, &tech_db, Some(&lib_db))?;
+                    let hpwl_dbu = db_def.compute_hpwl_dbu(&tech_db);
+                    let elapsed_def_ms = t_def.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "Loaded DEF: design={}, cells={}, rows={}, tracks={}, nets={}, io_pins={}, hpwl={:.1}um ({} dbu), elapsed={:.2}ms",
+                        db_def.design_name,
+                        db_def.num_cells(),
+                        db_def.num_rows(),
+                        db_def.tracks.len(),
+                        db_def.num_nets(),
+                        db_def.io_pins.len(),
+                        hpwl_dbu as f64 / 1000.0,
+                        hpwl_dbu,
+                        elapsed_def_ms
+                    );
+                }
             }
         }
         Commands::Congestion(args) => {

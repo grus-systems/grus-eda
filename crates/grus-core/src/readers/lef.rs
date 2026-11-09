@@ -453,10 +453,9 @@ fn parse_pin(
     let mut is_power = false;
     let mut pin_layer = None;
 
-    let mut min_x = i32::MAX;
-    let mut min_y = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut max_y = i32::MIN;
+    let mut sum_center_x: i64 = 0;
+    let mut sum_center_y: i64 = 0;
+    let mut rect_count: i64 = 0;
     let dbu = tech_db.dbu_per_micron as f32;
 
     while let Some(tok) = lexer.next_token() {
@@ -511,10 +510,11 @@ fn parse_pin(
                             let x2_dbu = (x2 * dbu).round() as i32;
                             let y2_dbu = (y2 * dbu).round() as i32;
 
-                            min_x = min_x.min(x1_dbu.min(x2_dbu));
-                            min_y = min_y.min(y1_dbu.min(y2_dbu));
-                            max_x = max_x.max(x1_dbu.max(x2_dbu));
-                            max_y = max_y.max(y1_dbu.max(y2_dbu));
+                            let cx = (x1_dbu + x2_dbu) / 2;
+                            let cy = (y1_dbu + y2_dbu) / 2;
+                            sum_center_x += cx as i64;
+                            sum_center_y += cy as i64;
+                            rect_count += 1;
                             lexer.skip_to_semi();
                         } else {
                             lexer.skip_to_semi();
@@ -527,13 +527,13 @@ fn parse_pin(
         }
     }
 
-    let offset_x_dbu = if min_x <= max_x {
-        (min_x + max_x) / 2
+    let offset_x_dbu = if rect_count > 0 {
+        (sum_center_x / rect_count) as i32
     } else {
         0
     };
-    let offset_y_dbu = if min_y <= max_y {
-        (min_y + max_y) / 2
+    let offset_y_dbu = if rect_count > 0 {
+        (sum_center_y / rect_count) as i32
     } else {
         0
     };
@@ -610,6 +610,7 @@ pub fn parse_lef(
     let file = File::open(path).with_context(|| format!("Failed to open LEF file at {:?}", path))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     parse_lef_bytes(&mmap, tech_db, interner)?;
+    tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
     Ok(())
 }
@@ -623,6 +624,7 @@ pub fn load_tech_db(
     let mut tech_db = TechDb::new();
     parse_lef(tlef_path, &mut tech_db, interner)?;
     parse_lef(lef_path, &mut tech_db, interner)?;
+    tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
     Ok(tech_db)
 }
@@ -762,9 +764,9 @@ END inv_sample
         assert_eq!(interner.resolve(pins[1].name), "Y");
         assert_eq!(pins[1].dir, PinDir::Output);
         assert!(!pins[1].is_power);
-        // bbox: (720, 255) to (1050, 2465) -> center (885, 1360)
+        // rects average center: 885, 1272
         assert_eq!(pins[1].offset_x_dbu, 885);
-        assert_eq!(pins[1].offset_y_dbu, 1360);
+        assert_eq!(pins[1].offset_y_dbu, 1272);
         assert_eq!(pins[1].layer, Some(LayerId(0)));
 
         assert_eq!(interner.resolve(pins[2].name), "VGND");
@@ -845,8 +847,8 @@ END inv_sample
         let y_pin = inv_pins.iter().find(|p| interner.resolve(p.name) == "Y").expect("Y pin");
         assert_eq!(y_pin.dir, PinDir::Output);
         assert!(!y_pin.is_power);
-        assert_eq!(y_pin.offset_x_dbu, 885);
-        assert_eq!(y_pin.offset_y_dbu, 1360);
+        assert_eq!(y_pin.offset_x_dbu, 901);
+        assert_eq!(y_pin.offset_y_dbu, 1243);
     }
 
     fn dirs_home() -> PathBuf {

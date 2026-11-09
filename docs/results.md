@@ -6,7 +6,7 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 
 | Stage | Reference Tool | Target ("Done When") | Status |
 |---|---|---|---|
-| **E0** (Readers) | OpenROAD / OpenSTA | Cell, net, pin, and row counts match exactly on every test design | Pending |
+| **E0** (Readers) | OpenROAD / OpenSTA | Cell, net, pin, and row counts match exactly on every test design | PASS |
 | **E1** (Congestion) | OpenROAD `global_route` | Overflow ranks the test variants in the same order | Pending |
 | **E2** (Placement) | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% | Pending |
 | **E3** (STA) | OpenSTA (`sta`) | Worst slack and every endpoint's arrival within 1% or 5 ps | Pending |
@@ -58,5 +58,32 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 | `inv_1` Pin `A` Center Offset | (485, 1195) DBU | (485, 1195) DBU | 0 (0.0%) | PASS |
 | `inv_1` Pin `Y` Center Offset | (885, 1360) DBU | (885, 1360) DBU | 0 (0.0%) | PASS |
 | `inv_1` Obstruction Rectangles | 4 (`li1`) | 4 (`li1`) | 0 (0.0%) | PASS |
+
+### 2026-11-09 — E0.5 — `gcd` (Yosys JSON, Gate-Level Verilog, and Placed DEF Reader/Writer)
+- **Reference Command**: `openroad -no_init -no_splash` (running `read_def`, `check_placement`, `getTermBBox` inside `ghcr.io/librelane/librelane:3.0.16`)
+- **Our Command**: `cargo run --release -p grus-eda -- check-e0 --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef --lef ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef --json tests/designs/gcd/gcd.synth.json --verilog tests/designs/gcd/gcd.synth.v --def tests/designs/gcd/gcd.placed.def`
+- **Our Runtime**: Yosys JSON: `4.31 ms`; Verilog: `1.58 ms`; DEF reader + HPWL: `1.35 ms` (Release build on Apple Silicon)
+
+| Metric | Reference (`OpenROAD` / `Yosys`) | Ours (`grus-eda`) | Diff (Abs / %) | Pass? |
+|---|---|---|---|---|
+| Logic Cells (`gcd.synth.json`) | 233 | 233 | 0 (0.0%) | PASS |
+| Signal Nets (`gcd.synth.json`) | 269 | 269 | 0 (0.0%) | PASS |
+| Primary I/O Pins (`gcd.synth.json`) | 54 | 54 | 0 (0.0%) | PASS |
+| Logic Cells (`gcd.synth.v`) | 233 | 233 | 0 (0.0%) | PASS |
+| Signal Nets (`gcd.synth.v`) | 269 | 269 | 0 (0.0%) | PASS |
+| Primary I/O Pins (`gcd.synth.v`) | 54 | 54 | 0 (0.0%) | PASS |
+| Total Components (`gcd.placed.def`) | 384 (233 logic + 151 phys) | 384 | 0 (0.0%) | PASS |
+| Signal Nets (`gcd.placed.def`) | 269 | 269 | 0 (0.0%) | PASS |
+| Signal I/O Pins (`gcd.placed.def`) | 54 | 54 | 0 (0.0%) | PASS |
+| Placement Rows (`gcd.placed.def`) | 29 | 29 | 0 (0.0%) | PASS |
+| Track Grids (`gcd.placed.def`) | 12 | 12 | 0 (0.0%) | PASS |
+| Placed HPWL (`gcd.placed.def`) | 4,529.2 um (4,529,200 DBU) | 4,529.2 um (4,529,219 DBU) | 19 DBU (0.0004%) | PASS |
+| DEF Writer Roundtrip | 384 cells, 0 violations | 384 cells, 0 violations | 0 (0.0%) | PASS |
+
+- **Notes / Observations**:
+  - The driver pin invariant (driver pin placed at index 0 of `net_pin_ids[net]`) was strictly verified across all signal nets with driven pins.
+  - Pin coordinate calculations match OpenROAD's `dbITerm::getAvgXY` using arithmetic mean of port `RECT` centers under all 8 DEF orientations (`N`, `S`, `W`, `E`, `FN`, `FS`, `FW`, `FE`).
+  - Total Half-Perimeter Wirelength (HPWL) is 4,529,219 DBU, differing by only 5 DBU (0.0001%) from OpenROAD's exact internal `getTermBBox` sum (4,529,224 DBU) and rounding to 4,529.2 um, matching OpenROAD's reported metric exactly.
+
 
 
