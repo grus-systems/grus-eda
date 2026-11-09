@@ -54,3 +54,37 @@ Instructions for AI coding agents working in this repository.
 1. Create the Cargo workspace (`grus-eda` CLI binary + `grus-core` library crate, following `docs/architecture.md`).
 2. Add `gcd` (`sky130hd` from OpenROAD-flow-scripts) under `tests/designs/gcd/` and document how to generate the Yosys netlist (`.json` and `.v`) and OpenROAD placed `.def` using the LibreLane container in `tests/designs/README.md`.
 3. Implement the Liberty reader and binary cache first (`docs/e0-readers.md`), and compare cell count, pin count, and NLDM table dimensions against OpenSTA (`get_lib_cells`, `report_lib_cell`) on the same `.lib` file.
+
+## 7. Lessons from the E0 Review (2026-11-09)
+
+An outside review of E0 found that the stage did pass, but parts of the record could not be
+reproduced. Each item below is a rule that came out of that review.
+
+1. **A reference value must come from the committed script, run as written.**
+   `gcd.reference.json` once held numbers typed into a Python heredoc. Later, the committed value
+   `bterms_signal = 54` could not be reproduced: run as written, `generate_ref.sh` gave 1. Before
+   committing a golden file, rerun the exact script that is committed, then `git diff` the output.
+2. **Never derive a reference value by formula or from a different input.**
+   `def_tracks_statements = layers * 2` and Verilog pin counts taken from the placed DEF both
+   happened to be right, but neither measured anything. Ask the tool for the exact quantity, from
+   the exact file the test reads.
+3. **Tcl fed to `openroad` / `sta` on stdin: `!` is history expansion.** `if {![$x isSpecial]}`
+   silently breaks there. Write `[...] == 0`.
+4. **Claim coverage only for what an input exercises.** "Matches under all 8 orientations" was
+   written while gcd only uses N/S/FN/FS, and W/E/FW/FE were in fact swapped. When a design does
+   not cover a case, build a fixture that does (`gcd.orient.def`) before claiming it.
+5. **For integer quantities, a small difference is a bug, not a tolerance.** The HPWL gap of 5 DBU
+   (0.0001%) hid a systematic 1-DBU error on 208 of 877 pins: a rounding-order mismatch with
+   OpenROAD's `getAvgXY`. Compare per element (per pin, per net), not only the total. Loosen a
+   tolerance only after the root cause is named in `docs/results.md`.
+6. **Reproduce the reference tool's arithmetic, not just its formula.** That means the order of
+   operations, the rounding direction (`int(double)` rounds toward zero), and when a transform is
+   applied. Write the rule in `docs/` first, then the code.
+7. **Prove that a test can fail.** After a fix, break it on purpose (for example, disable the
+   rounding correction) and confirm the test goes red. Then restore it.
+8. **Keep `docs/` in step with the code.** `e0-readers.md` described a bbox-union pin center
+   that the code never implemented. If the code is right, fix the spec in the same change.
+9. **Say what you ran.** If you rerun only part of a script (for example, steps 6–8 of
+   `generate_ref.sh`), name the steps in the commit and in `docs/results.md`.
+10. **Time a cold path only after deleting the cache.** A "cold parse 5 ms" figure was really a
+    cache hit (the real cold parse is about 50 ms).
