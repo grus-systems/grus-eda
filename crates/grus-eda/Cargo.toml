@@ -1,0 +1,10 @@
+[package]
+name = "grus-eda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+grus-core = { path = "../grus-core" }
