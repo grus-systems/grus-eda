@@ -145,3 +145,23 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - Derating calculation: floating-point conversion `(orig as f64) * (1.0 - alpha as f64)` requires an epsilon `+ 1e-6` prior to `.floor()` to counteract IEEE 754 float precision loss (e.g. `15.0 * 0.80 = 11.999999999999998`), reproducing OpenROAD's exact truncation behavior (`1,996` tracks on `met2`).
   - `met1` capacity difference: on `met1`, OpenROAD routes pin shapes through Boost.Polygon polygon decomposition which slices pin/OBS shapes into multiple trapezoids/intervals, whereas our connected-component merger produces tight rectangular jumpers per macro. The resulting total derated capacity across all five routing layers differs by only 61 tracks out of 6,316 (+0.96%), well within the 1% target.
   - Script isolation in `generate_ref.sh`: in Step 7b, `dbGCellGrid` extraction was executed prior to loading STA/SPEF/SDC to avoid `[CRITICAL ORD-2008] unknown master term type` caused by destroying non-special nets while STA graph structures are resident.
+
+### 2026-11-09 — E1.2 — `gcd` (Multi-Pin RSMT Steiner Tree Decomposition)
+- **Reference Command**: `tests/designs/gcd/generate_ref.sh` steps 7b & 8 inside `ghcr.io/librelane/librelane:3.0.16` (`openroad -no_init -no_splash` running `set_routing_layers -signal met1-met5`, adjustments `met1 0.30`, `met2-met5 0.20`, and `global_route -verbose` on full `gcd.placed.def`, yielding `[INFO GRT-0096] Total Demand = 812` recorded as `grt_total_edge_demand`).
+- **Our Command**: `cargo test --release -p grus-core test_gcd_rsmt_decomposition`
+- **Our Runtime**: `0.38 ms` (RSMT decomposition across all 269 nets on Apple Silicon; full test including LEF/DEF parse: `11.2 ms`)
+
+| Metric | Reference (`OpenROAD`) | Ours (`grus-core`) | Diff (Abs / %) | Pass? |
+|---|---|---|---|---|
+| Total Signal Nets Processed | 269 | 269 | 0 (0.0%) | PASS |
+| Intra-GCell Nets (Degree $k \le 1$, 0 segments) | — | 57 | — | PASS |
+| Multi-GCell Nets Decomposed ($k \ge 2$) | — | 212 | — | PASS |
+| Degree $\le 3$ Nets with Exact RSMT WL == HPWL | — | 169 / 169 (100%) | 0 (0.0%) | PASS (exact) |
+| Multi-GCell Nets Spanning All Terminals | — | 212 / 212 (100%) | 0 (0.0%) | PASS (exact) |
+| Total RSMT Wirelength (GCell edge units) | 812 (`grt_total_edge_demand`) | 790 | 22 (2.71%) | PASS |
+
+- **Notes / Observations**:
+  - For all 212 multi-GCell nets, the emitted Steiner segments connect 100% of the net's unique GCell terminal points into a single connected component with `rsmt_wl >= gcell_hpwl`.
+  - For all 169 nets of degree $k \le 3$, the RSMT wirelength matches the bounding-box HPWL to the exact GCell integer (`rsmt_wl == gcell_hpwl`).
+  - For $k \ge 4$ nets, Prim's rectilinear MST combined with greedy L-flip median Steiner point insertions eliminates shared trunk lengths (tested on 4-point overlapping L-branches: wirelength reduced from MST 13 to optimal RSMT 9 = HPWL).
+  - Total RSMT wirelength across the entire `gcd` design is 790 GCell edge crossings, within 2.71% of OpenROAD's global routing edge demand (812 edges), which includes maze-routing detours around local pin density and blockages.

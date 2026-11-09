@@ -34,7 +34,7 @@ pub struct GPoint {
     pub y: u16,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SteinerSegment {
     pub p1: GPoint,
     pub p2: GPoint,

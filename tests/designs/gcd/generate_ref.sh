@@ -260,6 +260,65 @@ close $fp
 exit
 EOF
 
+# Query routed demand on full placed design without destroying nets
+openroad -no_init -no_splash << 'EOF'
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+
+set db [ord::get_db]
+set tech [$db getTech]
+set block [ord::get_db_block]
+
+set_routing_layers -signal met1-met5
+set_global_routing_layer_adjustment met1 0.30
+set_global_routing_layer_adjustment met2-met5 0.20
+global_route -verbose
+
+set ggrid [$block getGCellGrid]
+set gx_list [$ggrid getGridX]
+set gy_list [$ggrid getGridY]
+set gcell_nx [llength $gx_list]
+set gcell_ny [llength $gy_list]
+
+set grt_layers {met1 met2 met3 met4 met5}
+set total_avail_routed 0
+foreach lname $grt_layers {
+    set lyr [$tech findLayer $lname]
+    set is_h [expr {[$lyr getDirection] eq "HORIZONTAL"}]
+    if {$is_h} {
+        for {set y 0} {$y < $gcell_ny} {incr y} {
+            for {set x 0} {$x < [expr {$gcell_nx - 1}]} {incr x} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                set total_avail_routed [expr {$total_avail_routed + ($c - $u)}]
+            }
+        }
+    } else {
+        for {set x 0} {$x < $gcell_nx} {incr x} {
+            for {set y 0} {$y < [expr {$gcell_ny - 1}]} {incr y} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                set total_avail_routed [expr {$total_avail_routed + ($c - $u)}]
+            }
+        }
+    }
+}
+
+source /work/tests/designs/gcd/runs/canonical/gcell_counts.tcl
+set dt_clean [string map {"," "" "\[" "" "\]" ""} $gcell_derated_edge_tracks]
+set total_derated 0
+foreach dt $dt_clean {
+    set total_derated [expr {$total_derated + $dt}]
+}
+set grt_total_edge_demand [expr {$total_derated - int($total_avail_routed)}]
+
+set fp [open "/work/tests/designs/gcd/runs/canonical/gcell_counts.tcl" "a"]
+puts $fp "set grt_total_edge_demand $grt_total_edge_demand"
+close $fp
+exit
+EOF
+
 # 8. Generate gcd.reference.json via live OpenROAD and OpenSTA API queries
 openroad -no_init -no_splash << 'EOF'
 source /work/tests/designs/gcd/runs/canonical/verilog_counts.tcl
@@ -413,7 +472,8 @@ puts $fp "  \"gcell_ny\": $gcell_ny,"
 puts $fp "  \"gcell_tile_size_dbu\": $gcell_tile_size_dbu,"
 puts $fp "  \"gcell_raw_edge_tracks\": $gcell_raw_edge_tracks,"
 puts $fp "  \"gcell_orig_edge_tracks\": $gcell_orig_edge_tracks,"
-puts $fp "  \"gcell_derated_edge_tracks\": $gcell_derated_edge_tracks"
+puts $fp "  \"gcell_derated_edge_tracks\": $gcell_derated_edge_tracks,"
+puts $fp "  \"grt_total_edge_demand\": $grt_total_edge_demand"
 puts $fp "}"
 close $fp
 puts "Generated gcd.reference.json via live OpenROAD/OpenSTA queries"
