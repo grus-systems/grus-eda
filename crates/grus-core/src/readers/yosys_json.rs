@@ -333,9 +333,14 @@ mod tests {
         let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/designs/gcd/gcd.synth.json");
 
-        if !tlef_path.is_file() || !lef_path.is_file() || !json_path.is_file() {
-            eprintln!("Skipping gcd Yosys JSON test: files not found");
-            return;
+        if !tlef_path.is_file() {
+            panic!("PDK tlef file missing at {:?}", tlef_path);
+        }
+        if !lef_path.is_file() {
+            panic!("PDK lef file missing at {:?}", lef_path);
+        }
+        if !json_path.is_file() {
+            panic!("Design JSON file missing at {:?}", json_path);
         }
 
         let mut interner = StringInterner::new();
@@ -345,10 +350,18 @@ mod tests {
         let db = parse_yosys_json(&json_path, &tech_db, None)
             .expect("Failed to parse Yosys JSON");
 
-        assert_eq!(db.design_name, "gcd");
-        assert_eq!(db.num_cells(), 233, "Expected 233 logic instances");
-        assert_eq!(db.num_nets(), 269, "Expected 269 signal nets");
-        assert_eq!(db.io_pins.len(), 54, "Expected 54 primary I/O pins");
+        let ref_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/designs/gcd/gcd.reference.json");
+        let ref_bytes = std::fs::read(&ref_path)
+            .unwrap_or_else(|e| panic!("Reference file missing at {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
+            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+
+        assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
+        assert_eq!(db.num_cells(), ref_json["logic_instances"].as_u64().unwrap() as usize);
+        assert_eq!(db.num_nets(), ref_json["signal_nets"].as_u64().unwrap() as usize);
+        assert_eq!(db.io_pins.len(), ref_json["bterms_signal"].as_u64().unwrap() as usize);
+        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
 
         // Verify driver invariant on all nets with at least one driver
         let mut driven_nets = 0;

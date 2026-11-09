@@ -847,9 +847,14 @@ mod tests {
         let def_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/designs/gcd/gcd.placed.def");
 
-        if !tlef_path.is_file() || !lef_path.is_file() || !def_path.is_file() {
-            eprintln!("Skipping gcd DEF test: files not found");
-            return;
+        if !tlef_path.is_file() {
+            panic!("PDK tlef file missing at {:?}", tlef_path);
+        }
+        if !lef_path.is_file() {
+            panic!("PDK lef file missing at {:?}", lef_path);
+        }
+        if !def_path.is_file() {
+            panic!("Design DEF file missing at {:?}", def_path);
         }
 
         let mut interner = StringInterner::new();
@@ -859,18 +864,28 @@ mod tests {
         let db = parse_def(&def_path, &tech_db, None)
             .expect("Failed to parse placed DEF");
 
-        assert_eq!(db.design_name, "gcd");
-        assert_eq!(db.num_cells(), 384, "Expected 384 components");
-        assert_eq!(db.num_rows(), 29, "Expected 29 placement rows");
-        assert_eq!(db.tracks.len(), 12, "Expected 12 track grids");
-        assert_eq!(db.num_nets(), 269, "Expected 269 signal nets");
-        assert_eq!(db.io_pins.len(), 54, "Expected 54 primary signal I/O pins");
+        let ref_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/designs/gcd/gcd.reference.json");
+        let ref_bytes = std::fs::read(&ref_path)
+            .unwrap_or_else(|e| panic!("Reference file missing at {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
+            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
-        // Verify HPWL matches golden reference (4,529,200 DBU = 4529.2 um)
+        assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
+        assert_eq!(db.num_cells(), ref_json["instances"].as_u64().unwrap() as usize);
+        assert_eq!(db.num_rows(), ref_json["rows"].as_u64().unwrap() as usize);
+        assert_eq!(db.tracks.len(), ref_json["def_tracks_statements"].as_u64().unwrap() as usize);
+        assert_eq!(db.num_nets(), ref_json["signal_nets"].as_u64().unwrap() as usize);
+        assert_eq!(db.io_pins.len(), ref_json["bterms_signal"].as_u64().unwrap() as usize);
+        assert_eq!(db.cell_pin_ids.len(), ref_json["def_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(db.net_pin_ids.len(), ref_json["connected_net_pins"].as_u64().unwrap() as usize);
+
+        // Verify HPWL matches golden reference (4,529,224 DBU = 4529.224 um)
         let hpwl = db.compute_hpwl_dbu(&tech_db);
-        println!("Calculated HPWL: {} DBU ({:.1} um)", hpwl, hpwl as f64 / 1000.0);
-        let diff = (hpwl - 4529200).abs();
-        assert!(diff <= 50, "HPWL within 50 DBU (0.001%) of golden reference: got {}, diff={}", hpwl, diff);
+        println!("Calculated HPWL: {} DBU ({:.3} um)", hpwl, hpwl as f64 / 1000.0);
+        let ref_hpwl = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
+        let diff = (hpwl - ref_hpwl).abs();
+        assert!(diff <= 50, "HPWL within 50 DBU of golden reference: got {}, ref {}, diff={}", hpwl, ref_hpwl, diff);
         let hpwl_um = (hpwl as f64 / 100.0).round() / 10.0;
         assert_eq!(hpwl_um, 4529.2, "HPWL in microns must match golden reference 4529.2 um");
 

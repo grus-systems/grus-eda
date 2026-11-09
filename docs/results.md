@@ -18,14 +18,14 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 ### 2026-11-09 — E0.3 — `sky130_fd_sc_hd__tt_025C_1v80.lib` (Liberty Reader & Binary Cache)
 - **Reference Command**: `sta -no_init -no_splash` (running `read_liberty`, `get_lib_cells`, `get_lib_pins` inside `ghcr.io/librelane/librelane:3.0.16`)
 - **Our Command**: `cargo run --release -p grus-eda -- check-e0 --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib`
-- **Our Runtime**: Cold parse: `5.35 ms` (test) / `6.11 ms` (CLI); Warm mmap cache load: `3.12 ms` (test) / `3.47 ms` (CLI) (target: `< 10 ms`)
+- **Our Runtime**: Cold parse (explicitly deleting cache before timing): `40.75 ms` (CLI) / `56.22 ms` (test); Warm mmap cache load: `5.16 ms` (CLI) / `3.59 ms` (test) (target: `< 10 ms`)
 
 | Metric | Reference (`OpenSTA`) | Ours (`grus-eda`) | Diff (Abs / %) | Pass? |
 |---|---|---|---|---|
 | Library Cells | 428 | 428 | 0 (0.0%) | PASS |
 | Library Total Pins | 1,897 | 1,897 | 0 (0.0%) | PASS |
 | Sequential Cells (Registers / Latches) | 63 (45 FF, 18 Latch) | 63 (45 FF, 18 Latch) | 0 (0.0%) | PASS |
-| Warm Cache Load Time | N/A | 3.47 ms | N/A (< 10 ms) | PASS |
+| Warm Cache Load Time | N/A | 3.59 ms | N/A (< 10 ms) | PASS |
 | Table Dimensions (`inv_1` fall delay) | 7x7 (49 values) | 7x7 (49 values) | 0 (0.0%) | PASS |
 | Table Value Sample (`inv_1` [0,0]) | 0.0143656 ns | 0.0143656 ns | 0 (0.0%) | PASS |
 | Table Value Sample (`inv_1` [6,6]) | 1.2016104 ns | 1.2016104 ns | 0 (0.0%) | PASS |
@@ -62,28 +62,34 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 ### 2026-11-09 — E0.5 — `gcd` (Yosys JSON, Gate-Level Verilog, and Placed DEF Reader/Writer)
 - **Reference Command**: `openroad -no_init -no_splash` (running `read_def`, `check_placement`, `getTermBBox` inside `ghcr.io/librelane/librelane:3.0.16`)
 - **Our Command**: `cargo run --release -p grus-eda -- check-e0 --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef --lef ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef --json tests/designs/gcd/gcd.synth.json --verilog tests/designs/gcd/gcd.synth.v --def tests/designs/gcd/gcd.placed.def`
-- **Our Runtime**: Yosys JSON: `4.31 ms`; Verilog: `1.58 ms`; DEF reader + HPWL: `1.35 ms` (Release build on Apple Silicon)
+- **Our Runtime**: Yosys JSON: `3.34 ms`; Verilog: `0.90 ms`; DEF reader + HPWL: `0.85 ms` (Release build on Apple Silicon)
 
 | Metric | Reference (`OpenROAD` / `Yosys`) | Ours (`grus-eda`) | Diff (Abs / %) | Pass? |
 |---|---|---|---|---|
 | Logic Cells (`gcd.synth.json`) | 233 | 233 | 0 (0.0%) | PASS |
 | Signal Nets (`gcd.synth.json`) | 269 | 269 | 0 (0.0%) | PASS |
 | Primary I/O Pins (`gcd.synth.json`) | 54 | 54 | 0 (0.0%) | PASS |
+| Instance Pins (`gcd.synth.json`) | 1,809 | 1,809 | 0 (0.0%) | PASS |
 | Logic Cells (`gcd.synth.v`) | 233 | 233 | 0 (0.0%) | PASS |
 | Signal Nets (`gcd.synth.v`) | 269 | 269 | 0 (0.0%) | PASS |
 | Primary I/O Pins (`gcd.synth.v`) | 54 | 54 | 0 (0.0%) | PASS |
+| Instance Pins (`gcd.synth.v`) | 1,809 | 1,809 | 0 (0.0%) | PASS |
 | Total Components (`gcd.placed.def`) | 384 (233 logic + 151 phys) | 384 | 0 (0.0%) | PASS |
+| Total Instance Pins (`gcd.placed.def`) | 2,227 | 2,227 | 0 (0.0%) | PASS |
 | Signal Nets (`gcd.placed.def`) | 269 | 269 | 0 (0.0%) | PASS |
 | Signal I/O Pins (`gcd.placed.def`) | 54 | 54 | 0 (0.0%) | PASS |
+| Connected Net Pins (`gcd.placed.def`) | 931 | 931 | 0 (0.0%) | PASS |
 | Placement Rows (`gcd.placed.def`) | 29 | 29 | 0 (0.0%) | PASS |
-| Track Grids (`gcd.placed.def`) | 12 | 12 | 0 (0.0%) | PASS |
-| Placed HPWL (`gcd.placed.def`) | 4,529.2 um (4,529,200 DBU) | 4,529.2 um (4,529,219 DBU) | 19 DBU (0.0004%) | PASS |
+| Track Grid Layers (`getTrackGrids`) | 6 | 6 | 0 (0.0%) | PASS |
+| DEF TRACKS Statements | 12 | 12 | 0 (0.0%) | PASS |
+| Placed HPWL (`gcd.placed.def`) | 4,529,224 DBU (4,529.224 um) | 4,529,219 DBU (4,529.219 um) | 5 DBU (0.0001%) | PASS |
 | DEF Writer Roundtrip | 384 cells, 0 violations | 384 cells, 0 violations | 0 (0.0%) | PASS |
 
 - **Notes / Observations**:
   - The driver pin invariant (driver pin placed at index 0 of `net_pin_ids[net]`) was strictly verified across all signal nets with driven pins.
   - Pin coordinate calculations match OpenROAD's `dbITerm::getAvgXY` using arithmetic mean of port `RECT` centers under all 8 DEF orientations (`N`, `S`, `W`, `E`, `FN`, `FS`, `FW`, `FE`).
-  - Total Half-Perimeter Wirelength (HPWL) is 4,529,219 DBU, differing by only 5 DBU (0.0001%) from OpenROAD's exact internal `getTermBBox` sum (4,529,224 DBU) and rounding to 4,529.2 um, matching OpenROAD's reported metric exactly.
+  - Total Half-Perimeter Wirelength (HPWL) is 4,529,219 DBU, differing by only 5 DBU (0.0001%) from OpenROAD's exact unrounded internal `getTermBBox` sum (4,529,224 DBU) and rounding to 4,529.2 um, matching OpenROAD's reported metric exactly.
+  - Track Grid reporting distinguishes the 6 layer track grids queried via OpenDB `$block getTrackGrids` from the 12 track direction statements in DEF syntax (X and Y patterns per layer).
 
 
 

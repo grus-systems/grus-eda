@@ -1156,9 +1156,14 @@ library (test_lib) {
         let lib_path = pdk_env.filter(|p| p.is_file()).unwrap_or(default_path);
 
         if !lib_path.is_file() {
-            eprintln!("Skipping sky130 integration test: .lib not found at {:?}", lib_path);
-            return;
+            panic!("PDK Liberty file missing at {:?}", lib_path);
         }
+
+        // Remove existing caches to guarantee a true cold parse
+        let (primary_cache, _) = get_cache_paths(&lib_path, 0);
+        let _ = std::fs::remove_file(&primary_cache);
+        let tmp_cache = std::env::temp_dir().join("grus-eda-cache");
+        let _ = std::fs::remove_dir_all(&tmp_cache);
 
         // Test cold parse
         let t0 = std::time::Instant::now();
@@ -1175,18 +1180,29 @@ library (test_lib) {
             load_time_1, load_time_2
         );
 
+        let ref_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/designs/gcd/gcd.reference.json");
+        let ref_bytes = std::fs::read(&ref_path)
+            .unwrap_or_else(|e| panic!("Reference file missing at {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
+            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+
+        let expected_cells = ref_json["lib_cells"].as_u64().expect("lib_cells") as usize;
+        let expected_pins = ref_json["lib_pins"].as_u64().expect("lib_pins") as usize;
+        let expected_seq = ref_json["lib_sequential_cells"].as_u64().expect("lib_sequential_cells") as usize;
+
         assert_eq!(db.library_name, "sky130_fd_sc_hd__tt_025C_1v80");
-        assert_eq!(db.cells.len(), 428, "Expected 428 cells");
-        assert_eq!(db.pins.len(), 1897, "Expected 1897 pins matching OpenSTA");
-        assert_eq!(db_cached.cells.len(), 428);
-        assert_eq!(db_cached.pins.len(), 1897);
+        assert_eq!(db.cells.len(), expected_cells, "Expected lib_cells matching reference");
+        assert_eq!(db.pins.len(), expected_pins, "Expected lib_pins matching reference");
+        assert_eq!(db_cached.cells.len(), expected_cells);
+        assert_eq!(db_cached.pins.len(), expected_pins);
 
         let ff_count = db.cells.iter().filter(|c| c.is_sequential).count();
         let latch_count = db.cells.iter().filter(|c| c.is_latch).count();
         let seq_count = ff_count + latch_count;
         assert_eq!(ff_count, 45, "Expected 45 flip-flop cells");
         assert_eq!(latch_count, 18, "Expected 18 latch cells");
-        assert_eq!(seq_count, 63, "Expected 63 total sequential cells matching OpenSTA");
+        assert_eq!(seq_count, expected_seq, "Expected sequential cells matching reference");
 
         // Warm cache load time must be < 10 ms in release mode
         if !cfg!(debug_assertions) {

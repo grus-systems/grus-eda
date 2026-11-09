@@ -785,9 +785,11 @@ END inv_sample
         let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
         let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
 
-        if !tlef_path.is_file() || !lef_path.is_file() {
-            eprintln!("Skipping sky130 LEF integration test: files not found");
-            return;
+        if !tlef_path.is_file() {
+            panic!("PDK tlef file missing at {:?}", tlef_path);
+        }
+        if !lef_path.is_file() {
+            panic!("PDK lef file missing at {:?}", lef_path);
         }
 
         let mut interner = StringInterner::new();
@@ -798,13 +800,20 @@ END inv_sample
 
         println!("sky130 LEF load elapsed: {:?}", elapsed);
 
-        assert_eq!(tech_db.dbu_per_micron, 1000);
+        let ref_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/designs/gcd/gcd.reference.json");
+        let ref_bytes = std::fs::read(&ref_path)
+            .unwrap_or_else(|e| panic!("Reference file missing at {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
+            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+
+        assert_eq!(tech_db.dbu_per_micron, ref_json["tech_dbu_per_micron"].as_i64().unwrap() as i32);
         assert_eq!(tech_db.site_name, "unithd");
-        assert_eq!(tech_db.site_width_dbu, 460);
-        assert_eq!(tech_db.site_height_dbu, 2720);
-        assert_eq!(tech_db.routing_layers.len(), 6);
-        assert_eq!(tech_db.macros.len(), 437);
-        assert_eq!(tech_db.macro_pins.len(), 3526);
+        assert_eq!(tech_db.site_width_dbu, ref_json["site_width_dbu"].as_i64().unwrap() as i32);
+        assert_eq!(tech_db.site_height_dbu, ref_json["site_height_dbu"].as_i64().unwrap() as i32);
+        assert_eq!(tech_db.routing_layers.len(), ref_json["tech_routing_layers"].as_u64().unwrap() as usize);
+        assert_eq!(tech_db.macros.len(), ref_json["tech_macros"].as_u64().unwrap() as usize);
+        assert_eq!(tech_db.macro_pins.len(), ref_json["tech_macro_pins"].as_u64().unwrap() as usize);
 
         // Spot-check met1
         let met1_sym = interner.get("met1").expect("met1 not interned");

@@ -96,43 +96,151 @@ estimate_parasitics -placement -spef_file /work/tests/designs/gcd/gcd.routed.spe
 exit
 EOF
 
-# 6. Generate gcd.reference.json
-python3 - << 'EOF'
-import json
+# 6. Generate gcd.reference.json via live OpenROAD and OpenSTA API queries
+openroad -no_init -no_splash << 'EOF'
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
 
-ref = {
-  "design": "gcd",
-  "pdk": "sky130_fd_sc_hd",
-  "corner": "tt_025C_1v80",
-  "lib_cells": 428,
-  "lib_pins": 1897,
-  "lib_sequential_cells": 63,
-  "lib_sequential_syntax_groups": 87,
-  "tech_dbu_per_micron": 1000,
-  "tech_routing_layers": 6,
-  "tech_macros": 437,
-  "site_width_dbu": 460,
-  "site_height_dbu": 2720,
-  "die_area_dbu": [0, 0, 91950, 102670],
-  "instances": 384,
-  "logic_instances": 233,
-  "physical_instances": 151,
-  "signal_nets": 269,
-  "total_nets": 271,
-  "bterms": 56,
-  "rows": 29,
-  "placed_hpwl_dbu": 4529200,
-  "placed_hpwl_um": 4529.2,
-  "zero_wire_wns_ns": 1.7578,
-  "zero_wire_tns_ns": 0.0,
-  "placed_spef_wns_ns": 1.6642,
-  "placed_spef_tns_ns": 0.0
+set db [ord::get_db]
+set tech [$db getTech]
+set block [ord::get_db_block]
+
+set lib_cells [llength [get_lib_cells *]]
+set lib_pins 0
+set lib_sequential_cells 0
+foreach c [get_lib_cells *] {
+    incr lib_pins [llength [get_lib_pins -of_objects $c]]
+    if {[llength [get_lib_pins -of_objects $c -filter "name == IQ"]] > 0} {
+        incr lib_sequential_cells
+    }
 }
 
-with open("/work/tests/designs/gcd/gcd.reference.json", "w") as f:
-    json.dump(ref, f, indent=2)
-    f.write("\n")
-print("Reference counts written to gcd.reference.json")
+set tech_dbu_per_micron [$tech getDbUnitsPerMicron]
+set tech_routing_layers 0
+foreach layer [$tech getLayers] {
+    if {[$layer getType] eq "ROUTING"} {
+        incr tech_routing_layers
+    }
+}
+
+set tech_macros 0
+set tech_macro_pins 0
+set site_width_dbu 0
+set site_height_dbu 0
+foreach lib [$db getLibs] {
+    set m_list [$lib getMasters]
+    incr tech_macros [llength $m_list]
+    foreach m $m_list {
+        incr tech_macro_pins [llength [$m getMTerms]]
+    }
+    foreach site [$lib getSites] {
+        if {[$site getName] eq "unithd"} {
+            set site_width_dbu [$site getWidth]
+            set site_height_dbu [$site getHeight]
+        }
+    }
+}
+
+set die_area [$block getDieArea]
+set die_xl [$die_area xMin]
+set die_yl [$die_area yMin]
+set die_xh [$die_area xMax]
+set die_yh [$die_area yMax]
+
+set instances [llength [$block getInsts]]
+set logic_instances 0
+set physical_instances 0
+set verilog_inst_pins 0
+foreach inst [$block getInsts] {
+    set type [[$inst getMaster] getType]
+    if {$type eq "CORE"} {
+        incr logic_instances
+        incr verilog_inst_pins [llength [$inst getITerms]]
+    } else {
+        incr physical_instances
+    }
+}
+
+set def_inst_pins [llength [$block getITerms]]
+set signal_nets 0
+set special_nets 0
+set connected_net_pins 0
+set placed_hpwl_dbu 0
+
+foreach net [$block getNets] {
+    if {[$net isSpecial]} {
+        incr special_nets
+    } else {
+        incr signal_nets
+        incr connected_net_pins [expr {[llength [$net getITerms]] + [llength [$net getBTerms]]}]
+        set bbox [$net getTermBBox]
+        set dx [expr {[$bbox xMax] - [$bbox xMin]}]
+        set dy [expr {[$bbox yMax] - [$bbox yMin]}]
+        incr placed_hpwl_dbu [expr {$dx + $dy}]
+    }
+}
+
+set bterms_total [llength [$block getBTerms]]
+set bterms_signal 0
+foreach bt [$block getBTerms] {
+    if {![$bt isSpecial]} {
+        incr bterms_signal
+    }
+}
+
+set rows [llength [$block getRows]]
+set track_grids_layers [llength [$block getTrackGrids]]
+set def_tracks_statements [expr {$track_grids_layers * 2}]
+
+set zero_wire_wns_ns [format "%.4f" [sta::worst_slack -max]]
+set zero_wire_tns_ns [format "%.4f" [sta::total_negative_slack -max]]
+
+read_spef /work/tests/designs/gcd/gcd.routed.spef
+set placed_spef_wns_ns [format "%.4f" [sta::worst_slack -max]]
+set placed_spef_tns_ns [format "%.4f" [sta::total_negative_slack -max]]
+
+set fp [open "/work/tests/designs/gcd/gcd.reference.json" "w"]
+puts $fp "{"
+puts $fp "  \"design\": \"gcd\","
+puts $fp "  \"pdk\": \"sky130_fd_sc_hd\","
+puts $fp "  \"corner\": \"tt_025C_1v80\","
+puts $fp "  \"lib_cells\": $lib_cells,"
+puts $fp "  \"lib_pins\": $lib_pins,"
+puts $fp "  \"lib_sequential_cells\": $lib_sequential_cells,"
+puts $fp "  \"lib_sequential_syntax_groups\": 87,"
+puts $fp "  \"tech_dbu_per_micron\": $tech_dbu_per_micron,"
+puts $fp "  \"tech_routing_layers\": $tech_routing_layers,"
+puts $fp "  \"tech_macros\": $tech_macros,"
+puts $fp "  \"tech_macro_pins\": $tech_macro_pins,"
+puts $fp "  \"site_width_dbu\": $site_width_dbu,"
+puts $fp "  \"site_height_dbu\": $site_height_dbu,"
+puts $fp "  \"die_area_dbu\": \[$die_xl, $die_yl, $die_xh, $die_yh\],"
+puts $fp "  \"instances\": $instances,"
+puts $fp "  \"logic_instances\": $logic_instances,"
+puts $fp "  \"physical_instances\": $physical_instances,"
+puts $fp "  \"def_inst_pins\": $def_inst_pins,"
+puts $fp "  \"verilog_inst_pins\": $verilog_inst_pins,"
+puts $fp "  \"signal_nets\": $signal_nets,"
+puts $fp "  \"special_nets\": $special_nets,"
+puts $fp "  \"connected_net_pins\": $connected_net_pins,"
+puts $fp "  \"bterms_total\": $bterms_total,"
+puts $fp "  \"bterms_signal\": $bterms_signal,"
+puts $fp "  \"rows\": $rows,"
+puts $fp "  \"track_grids_layers\": $track_grids_layers,"
+puts $fp "  \"def_tracks_statements\": $def_tracks_statements,"
+puts $fp "  \"placed_hpwl_dbu\": $placed_hpwl_dbu,"
+puts $fp "  \"placed_hpwl_um\": [expr {$placed_hpwl_dbu / 1000.0}],"
+puts $fp "  \"zero_wire_wns_ns\": $zero_wire_wns_ns,"
+puts $fp "  \"zero_wire_tns_ns\": $zero_wire_tns_ns,"
+puts $fp "  \"placed_spef_wns_ns\": $placed_spef_wns_ns,"
+puts $fp "  \"placed_spef_tns_ns\": $placed_spef_tns_ns"
+puts $fp "}"
+close $fp
+puts "Generated gcd.reference.json via live OpenROAD/OpenSTA queries"
+exit
 EOF
 
 echo "==> Successfully generated all gcd reference artifacts!"
