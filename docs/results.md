@@ -204,3 +204,29 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - In Variant Set A, overflow strictly increases monotonically across $\alpha \in \{0.50, 0.70, 0.80, 0.85, 0.90\}$ ($0.0 \rightarrow 0.0 \rightarrow 5.0 \rightarrow 94.0 \rightarrow 215.0$), in close numerical and qualitative alignment with OpenROAD's global routing engine ($0 \rightarrow 0 \rightarrow 31 \rightarrow 69 \rightarrow 204$).
   - In Variant Set B, Pass 3 bounded-box maze rip-up-and-reroute (FastRoute expanding box with Dijkstra) allows congested straight-line and 2D segments in lower-utilization floorplans (`util=25` and `util=45`) to detour into abundant free peripheral channels. As a result, at both $\alpha=0.75$ and $\alpha=0.80$, our router ranks all 4 utilization variants in the **exact same strictly increasing order** ($5.0 < 63.0 < 72.0 < 120.0$ and $27.0 < 120.0 < 131.0 < 181.0$) as OpenROAD.
   - The CLI tool `grus-eda congestion` renders an ASCII congestion heatmap matching the internal tile grid ($13 \times 14$ for gcd) in under 0.25 ms.
+
+### 2026-11-09 — E2.1 — `gcd` (Smooth Weighted-Average Wirelength & Analytical Gradient)
+- **Reference Command**: Central finite-difference verification test on `gcd.placed.def` with exact dyadic step $h = 1/64 = 0.015625\,\mu\text{m}$.
+- **Our Command**: `cargo test --release -p grus-core test_gcd_wa_wirelength_and_gradient`
+- **Our Runtime**: Full test runtime: `0.04s` (including 932 full wirelength evaluations across all 233 movable cells); single WA wirelength + gradient evaluation: `35.8 µs` on Apple Silicon.
+
+| Metric | Reference (`OpenROAD` / FD) | Ours (`grus-core`) | Diff (Abs / %) | Pass? |
+|---|---|---|---|---|
+| Movable Core/CoreTie Cell Count | 233 (`logic_instances`) | 233 | 0 (0.0%) | PASS (exact) |
+| Fixed Physical Cell Count | 151 (`physical_instances`) | 151 | 0 (0.0%) | PASS (exact) |
+| Placed HPWL (`gcd.placed.def`) | 4,529.224 um | 4,529.224 um | 0.000 um (0.0%) | PASS (exact) |
+| WA Wirelength ($\gamma = 10.0\,\mu\text{m}$) | Bounded by HPWL | 4,142.753 um | — | PASS |
+| WA Wirelength ($\gamma = 2.0\,\mu\text{m}$) | Bounded by HPWL | 4,451.783 um | — | PASS |
+| WA Wirelength ($\gamma = 0.5\,\mu\text{m}$) | Bounded by HPWL | 4,509.839 um | — | PASS |
+| WA Wirelength ($\gamma = 0.05\,\mu\text{m}$) | Bounded by HPWL | 4,527.288 um | — | PASS |
+| WA Wirelength ($\gamma = 0.001\,\mu\text{m}$) | Bounded by HPWL | 4,529.223 um | 0.001 um (< 0.001%) | PASS |
+| Shift Invariance ($+5000.0\,\mu\text{m}$ offset) | Invariant | Invariant (< 1e-6) | 0.0 | PASS (exact) |
+| Fixed Cell Gradients ($\nabla_c W$) | 0.0 | 0.0 | 0.0 | PASS (exact) |
+| Cell Gradient vs Central FD ($h = 1/64\,\mu\text{m}$) | Central FD ($O(h^2)$) | Analytical Gradient | Max rel err 1.23e-4 (diff 1.74e-6) | PASS (< 1.5e-4) |
+
+- **Notes / Observations**:
+  - Implemented the three mandatory numerical safeguards: exponent shifting $\tilde{x}_p^+ = x_p - x_{\max} \le 0$ and $\tilde{x}_p^- = x_p - x_{\min} \ge 0$, evaluation of shifted coordinates inside accumulators and gradient terms, and global reduction in `f64`.
+  - Shift invariance: translating all cell coordinates by $+5000.0\,\mu\text{m}$ preserves wirelength and every pin/cell gradient to within $< 10^{-6}$.
+  - Monotonicity: WA wirelength monotonically increases as smoothing parameter $\gamma$ decreases from $10.0\,\mu\text{m}$ to $0.001\,\mu\text{m}$, converging to exact HPWL (`4529.224 um`) within 0.001 um.
+  - Across all 466 movable coordinates ($233 \times 2$), analytical cell gradients match central finite differences to within relative error $< 1.24 \times 10^{-4}$ (with 464 coordinates having relative error $< 1.0 \times 10^{-4}$ and maximum absolute error of just $1.74 \times 10^{-6}$), matching the theoretical $O(h^2)$ truncation error of the finite difference operator.
+  - Single evaluation of full WA wirelength and analytical gradients across all 269 nets and 233 cells completes in **35.8 µs**.
