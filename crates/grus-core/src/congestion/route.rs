@@ -5,7 +5,36 @@ use crate::tech_db::TechDb;
 
 #[inline]
 fn edge_cost(d: f32, c: f32) -> f64 {
-    1.0 + 10.0 / (1.0 + (-2.0 * (d as f64 - c as f64)).exp())
+    let diff = (d as f64 + 1.0) - (c as f64);
+    let ovf = diff.max(0.0);
+    1.0 + 10.0 / (1.0 + (-2.0 * diff).exp()) + 50.0 * ovf
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GridEdge {
+    H(usize),
+    V(usize),
+}
+
+#[derive(Copy, Clone, PartialEq)]
+struct DijkstraState {
+    cost: f64,
+    x: usize,
+    y: usize,
+}
+
+impl Eq for DijkstraState {}
+
+impl Ord for DijkstraState {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.cost.total_cmp(&self.cost)
+    }
+}
+
+impl PartialOrd for DijkstraState {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -16,9 +45,10 @@ enum RouteChoice {
     Zvhv(usize),
 }
 
-/// Routes rectilinear Steiner segments over the GCell grid using 2-pass congestion routing:
+/// Routes rectilinear Steiner segments over the GCell grid using 3-pass congestion routing:
 /// - Pass 1: Probabilistic demand (RISA / uniform 50-50 L-split)
 /// - Pass 2: Congestion-aware L/Z pattern routing with rip-up and cost evaluation
+/// - Pass 3: Bounded-box maze rip-up and reroute (FastRoute expanding box Dijkstra)
 pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> CongestionReport {
     let nx = grid.nx;
     let ny = grid.ny;
@@ -29,7 +59,9 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
     grid.h_demand.fill(0.0);
     grid.v_demand.fill(0.0);
 
-    for s in segments {
+    let mut segment_paths: Vec<Vec<GridEdge>> = vec![Vec::new(); segments.len()];
+
+    for (seg_idx, s) in segments.iter().enumerate() {
         let p1 = s.p1;
         let p2 = s.p2;
         let x_min = (p1.x.min(p2.x) as usize).min(nx);
@@ -43,14 +75,22 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
 
         if y_min == y_max {
             let y = y_min;
+            let mut path = Vec::with_capacity(x_max - x_min);
             for x in x_min..x_max.min(edge_cols) {
-                grid.h_demand[y * edge_cols + x] += 1.0;
+                let idx = y * edge_cols + x;
+                grid.h_demand[idx] += 1.0;
+                path.push(GridEdge::H(idx));
             }
+            segment_paths[seg_idx] = path;
         } else if x_min == x_max {
             let x = x_min;
+            let mut path = Vec::with_capacity(y_max - y_min);
             for y in y_min..y_max.min(edge_rows) {
-                grid.v_demand[y * nx + x] += 1.0;
+                let idx = y * nx + x;
+                grid.v_demand[idx] += 1.0;
+                path.push(GridEdge::V(idx));
             }
+            segment_paths[seg_idx] = path;
         } else {
             for x in x_min..x_max.min(edge_cols) {
                 grid.h_demand[y_min * edge_cols + x] += 0.5;
@@ -64,7 +104,7 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
     }
 
     // Pass 2: Congestion-Aware L/Z Pattern Routing
-    for s in segments {
+    for (seg_idx, s) in segments.iter().enumerate() {
         let p1 = s.p1;
         let p2 = s.p2;
         let x_min = (p1.x.min(p2.x) as usize).min(nx);
@@ -73,7 +113,7 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         let y_max = (p1.y.max(p2.y) as usize).min(ny);
 
         if x_min == x_max || y_min == y_max {
-            // Flat segment has no routing alternative
+            // Flat segment has no L/Z routing alternative
             continue;
         }
 
@@ -228,63 +268,232 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
             }
         }
 
-        // 4. Commit +1.0 demand along the chosen minimum-cost route
+        // 4. Commit +1.0 demand along the chosen route and record path
+        let mut path = Vec::with_capacity((x_max - x_min) + (y_max - y_min));
         match best_route {
             RouteChoice::Lhv => {
                 for x in x_min..x_max.min(edge_cols) {
-                    grid.h_demand[y1 * edge_cols + x] += 1.0;
+                    let idx = y1 * edge_cols + x;
+                    grid.h_demand[idx] += 1.0;
+                    path.push(GridEdge::H(idx));
                 }
                 for y in y_min..y_max.min(edge_rows) {
-                    grid.v_demand[y * nx + x2] += 1.0;
+                    let idx = y * nx + x2;
+                    grid.v_demand[idx] += 1.0;
+                    path.push(GridEdge::V(idx));
                 }
             }
             RouteChoice::Lvh => {
                 for y in y_min..y_max.min(edge_rows) {
-                    grid.v_demand[y * nx + x1] += 1.0;
+                    let idx = y * nx + x1;
+                    grid.v_demand[idx] += 1.0;
+                    path.push(GridEdge::V(idx));
                 }
                 for x in x_min..x_max.min(edge_cols) {
-                    grid.h_demand[y2 * edge_cols + x] += 1.0;
+                    let idx = y2 * edge_cols + x;
+                    grid.h_demand[idx] += 1.0;
+                    path.push(GridEdge::H(idx));
                 }
             }
             RouteChoice::Zhvh(x_mid) => {
                 if x1 < x2 {
                     for x in x_min..x_mid.min(edge_cols) {
-                        grid.h_demand[y1 * edge_cols + x] += 1.0;
+                        let idx = y1 * edge_cols + x;
+                        grid.h_demand[idx] += 1.0;
+                        path.push(GridEdge::H(idx));
                     }
                     for x in x_mid..x_max.min(edge_cols) {
-                        grid.h_demand[y2 * edge_cols + x] += 1.0;
+                        let idx = y2 * edge_cols + x;
+                        grid.h_demand[idx] += 1.0;
+                        path.push(GridEdge::H(idx));
                     }
                 } else {
                     for x in x_mid..x_max.min(edge_cols) {
-                        grid.h_demand[y1 * edge_cols + x] += 1.0;
+                        let idx = y1 * edge_cols + x;
+                        grid.h_demand[idx] += 1.0;
+                        path.push(GridEdge::H(idx));
                     }
                     for x in x_min..x_mid.min(edge_cols) {
-                        grid.h_demand[y2 * edge_cols + x] += 1.0;
+                        let idx = y2 * edge_cols + x;
+                        grid.h_demand[idx] += 1.0;
+                        path.push(GridEdge::H(idx));
                     }
                 }
                 for y in y_min..y_max.min(edge_rows) {
-                    grid.v_demand[y * nx + x_mid] += 1.0;
+                    let idx = y * nx + x_mid;
+                    grid.v_demand[idx] += 1.0;
+                    path.push(GridEdge::V(idx));
                 }
             }
             RouteChoice::Zvhv(y_mid) => {
                 if y1 < y2 {
                     for y in y_min..y_mid.min(edge_rows) {
-                        grid.v_demand[y * nx + x1] += 1.0;
+                        let idx = y * nx + x1;
+                        grid.v_demand[idx] += 1.0;
+                        path.push(GridEdge::V(idx));
                     }
                     for y in y_mid..y_max.min(edge_rows) {
-                        grid.v_demand[y * nx + x2] += 1.0;
+                        let idx = y * nx + x2;
+                        grid.v_demand[idx] += 1.0;
+                        path.push(GridEdge::V(idx));
                     }
                 } else {
                     for y in y_mid..y_max.min(edge_rows) {
-                        grid.v_demand[y * nx + x1] += 1.0;
+                        let idx = y * nx + x1;
+                        grid.v_demand[idx] += 1.0;
+                        path.push(GridEdge::V(idx));
                     }
                     for y in y_min..y_mid.min(edge_rows) {
-                        grid.v_demand[y * nx + x2] += 1.0;
+                        let idx = y * nx + x2;
+                        grid.v_demand[idx] += 1.0;
+                        path.push(GridEdge::V(idx));
                     }
                 }
                 for x in x_min..x_max.min(edge_cols) {
-                    grid.h_demand[y_mid * edge_cols + x] += 1.0;
+                    let idx = y_mid * edge_cols + x;
+                    grid.h_demand[idx] += 1.0;
+                    path.push(GridEdge::H(idx));
                 }
+            }
+        }
+        segment_paths[seg_idx] = path;
+    }
+
+    // Pass 3: Bounded-Box Maze Rip-Up and Reroute (FastRoute Expanding Box)
+    for &margin in &[2usize, 3, 4] {
+        for seg_idx in 0..segments.len() {
+            let s = &segments[seg_idx];
+            let p1 = s.p1;
+            let p2 = s.p2;
+            if p1 == p2 {
+                continue;
+            }
+
+            // Check if any edge in segment_paths[seg_idx] currently overflows
+            let has_overflow = segment_paths[seg_idx].iter().any(|edge| match edge {
+                GridEdge::H(idx) => grid.h_demand[*idx] > grid.h_cap[*idx],
+                GridEdge::V(idx) => grid.v_demand[*idx] > grid.v_cap[*idx],
+            });
+            if !has_overflow {
+                continue;
+            }
+
+            // 1. Rip-up: subtract 1.0 demand from each edge in segment_paths[seg_idx]
+            for edge in &segment_paths[seg_idx] {
+                match edge {
+                    GridEdge::H(idx) => grid.h_demand[*idx] -= 1.0,
+                    GridEdge::V(idx) => grid.v_demand[*idx] -= 1.0,
+                }
+            }
+
+            // 2. Bounded-Box Dijkstra
+            let x_min = (p1.x.min(p2.x) as usize).min(nx);
+            let x_max = (p1.x.max(p2.x) as usize).min(nx);
+            let y_min = (p1.y.min(p2.y) as usize).min(ny);
+            let y_max = (p1.y.max(p2.y) as usize).min(ny);
+
+            let x_lo = x_min.saturating_sub(margin);
+            let x_hi = (x_max + margin).min(nx - 1);
+            let y_lo = y_min.saturating_sub(margin);
+            let y_hi = (y_max + margin).min(ny - 1);
+
+            let src_x = p1.x as usize;
+            let src_y = p1.y as usize;
+            let dst_x = p2.x as usize;
+            let dst_y = p2.y as usize;
+
+            let mut dist = vec![vec![f64::INFINITY; nx]; ny];
+            let mut prev: Vec<Vec<Option<(usize, usize, GridEdge)>>> = vec![vec![None; nx]; ny];
+            let mut heap = std::collections::BinaryHeap::new();
+
+            dist[src_y][src_x] = 0.0;
+            heap.push(DijkstraState { cost: 0.0, x: src_x, y: src_y });
+
+            while let Some(DijkstraState { cost, x, y }) = heap.pop() {
+                if x == dst_x && y == dst_y {
+                    break;
+                }
+                if cost > dist[y][x] {
+                    continue;
+                }
+
+                // Neighbor Right (x + 1, y)
+                if x < x_hi && x < edge_cols {
+                    let nx_coord = x + 1;
+                    let edge_idx = y * edge_cols + x;
+                    let w = edge_cost(grid.h_demand[edge_idx], grid.h_cap[edge_idx]);
+                    let next_cost = cost + w;
+                    if next_cost < dist[y][nx_coord] {
+                        dist[y][nx_coord] = next_cost;
+                        prev[y][nx_coord] = Some((x, y, GridEdge::H(edge_idx)));
+                        heap.push(DijkstraState { cost: next_cost, x: nx_coord, y });
+                    }
+                }
+                // Neighbor Left (x - 1, y)
+                if x > x_lo && x > 0 {
+                    let nx_coord = x - 1;
+                    let edge_idx = y * edge_cols + (x - 1);
+                    let w = edge_cost(grid.h_demand[edge_idx], grid.h_cap[edge_idx]);
+                    let next_cost = cost + w;
+                    if next_cost < dist[y][nx_coord] {
+                        dist[y][nx_coord] = next_cost;
+                        prev[y][nx_coord] = Some((x, y, GridEdge::H(edge_idx)));
+                        heap.push(DijkstraState { cost: next_cost, x: nx_coord, y });
+                    }
+                }
+                // Neighbor Up (x, y + 1)
+                if y < y_hi && y < edge_rows {
+                    let ny_coord = y + 1;
+                    let edge_idx = y * nx + x;
+                    let w = edge_cost(grid.v_demand[edge_idx], grid.v_cap[edge_idx]);
+                    let next_cost = cost + w;
+                    if next_cost < dist[ny_coord][x] {
+                        dist[ny_coord][x] = next_cost;
+                        prev[ny_coord][x] = Some((x, y, GridEdge::V(edge_idx)));
+                        heap.push(DijkstraState { cost: next_cost, x, y: ny_coord });
+                    }
+                }
+                // Neighbor Down (x, y - 1)
+                if y > y_lo && y > 0 {
+                    let ny_coord = y - 1;
+                    let edge_idx = (y - 1) * nx + x;
+                    let w = edge_cost(grid.v_demand[edge_idx], grid.v_cap[edge_idx]);
+                    let next_cost = cost + w;
+                    if next_cost < dist[ny_coord][x] {
+                        dist[ny_coord][x] = next_cost;
+                        prev[ny_coord][x] = Some((x, y, GridEdge::V(edge_idx)));
+                        heap.push(DijkstraState { cost: next_cost, x, y: ny_coord });
+                    }
+                }
+            }
+
+            // Reconstruct path
+            let mut new_path = Vec::new();
+            let mut curr_x = dst_x;
+            let mut curr_y = dst_y;
+            while let Some((px, py, edge)) = prev[curr_y][curr_x] {
+                new_path.push(edge);
+                curr_x = px;
+                curr_y = py;
+            }
+            new_path.reverse();
+
+            // 3. Commit: add 1.0 demand along shortest path
+            if new_path.is_empty() && (src_x != dst_x || src_y != dst_y) {
+                for edge in &segment_paths[seg_idx] {
+                    match edge {
+                        GridEdge::H(idx) => grid.h_demand[*idx] += 1.0,
+                        GridEdge::V(idx) => grid.v_demand[*idx] += 1.0,
+                    }
+                }
+            } else {
+                for edge in &new_path {
+                    match edge {
+                        GridEdge::H(idx) => grid.h_demand[*idx] += 1.0,
+                        GridEdge::V(idx) => grid.v_demand[*idx] += 1.0,
+                    }
+                }
+                segment_paths[seg_idx] = new_path;
             }
         }
     }
@@ -541,6 +750,18 @@ mod tests {
                      rep75.total_overflow, rep80.total_overflow);
         }
 
+        // Verify that overflow ranks all 4 utilization variants in the exact same strictly increasing order as OpenROAD
+        assert!(
+            ovfs_75[0] < ovfs_75[1] && ovfs_75[1] < ovfs_75[2] && ovfs_75[2] < ovfs_75[3],
+            "At alpha 0.75, overflow must strictly increase with utilization: ovfs_75 = {:?}",
+            ovfs_75
+        );
+        assert!(
+            ovfs_80[0] < ovfs_80[1] && ovfs_80[1] < ovfs_80[2] && ovfs_80[2] < ovfs_80[3],
+            "At alpha 0.80, overflow must strictly increase with utilization: ovfs_80 = {:?}",
+            ovfs_80
+        );
+
         // Verify that tightening layer adjustment from 0.75 to 0.80 strictly increases overflow for every variant
         for i in 0..utils.len() {
             assert!(
@@ -549,18 +770,6 @@ mod tests {
                 ovfs_80[i], ovfs_75[i], utils[i]
             );
         }
-
-        // Verify that high-utilization design (78%) has substantially higher overflow than low-utilization (25%)
-        assert!(
-            ovfs_75[3] > ovfs_75[0],
-            "Util 78 overflow ({}) must exceed util 25 overflow ({}) at alpha 0.75",
-            ovfs_75[3], ovfs_75[0]
-        );
-        assert!(
-            ovfs_80[3] > ovfs_80[0],
-            "Util 78 overflow ({}) must exceed util 25 overflow ({}) at alpha 0.80",
-            ovfs_80[3], ovfs_80[0]
-        );
 
         // Verify against committed golden reference numbers from live OpenROAD queries
         let ref_utils: Vec<i64> = ref_json["grt_util_sweep_utils"]
