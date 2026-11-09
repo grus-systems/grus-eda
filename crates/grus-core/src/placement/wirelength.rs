@@ -618,7 +618,7 @@ mod tests {
         let ana_gx = cell_grad_x.clone();
         let ana_gy = cell_grad_y.clone();
 
-        let h = 1.0f32 / 64.0f32;
+        let h = 1.0f32 / 128.0f32;
         let mut dummy_pin_gx = vec![0.0f32; num_pins];
         let mut dummy_pin_gy = vec![0.0f32; num_pins];
         let mut dummy_cell_gx = vec![0.0f32; num_cells];
@@ -669,7 +669,7 @@ mod tests {
             if fd_x.abs() > 1e-3 {
                 let rel_x = diff_x / fd_x.abs();
                 assert!(
-                    rel_x < 1.5e-4,
+                    rel_x < 1e-4,
                     "Cell {} X grad relative error too high: ana={}, fd={}, rel_err={}",
                     c, ana_x, fd_x, rel_x
                 );
@@ -718,7 +718,7 @@ mod tests {
             if fd_y.abs() > 1e-3 {
                 let rel_y = diff_y / fd_y.abs();
                 assert!(
-                    rel_y < 1.5e-4,
+                    rel_y < 1e-4,
                     "Cell {} Y grad relative error too high: ana={}, fd={}, rel_err={}",
                     c, ana_y, fd_y, rel_y
                 );
