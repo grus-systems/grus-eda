@@ -403,6 +403,8 @@ fn parse_macro(
         }
     }
 
+    merge_connected_obs(&mut obs_rects);
+
     let pin_count = (tech_db.macro_pins.len() as u32 - pin_offset) as u16;
     let mac_id = MacroId(tech_db.macros.len() as u16);
     tech_db.macro_by_name.insert(mac_sym, mac_id);
@@ -418,6 +420,37 @@ fn parse_macro(
     });
 
     Ok(())
+}
+
+/// Merges touching or overlapping obstruction rectangles on the same layer until fixed point.
+fn merge_connected_obs(obs: &mut Vec<(LayerId, RectDbu)>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0;
+        while i < obs.len() {
+            let mut j = i + 1;
+            while j < obs.len() {
+                if obs[i].0 == obs[j].0 {
+                    let a = obs[i].1;
+                    let b = obs[j].1;
+                    if a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh {
+                        obs[i].1 = RectDbu::new(
+                            a.xl.min(b.xl),
+                            a.yl.min(b.yl),
+                            a.xh.max(b.xh),
+                            a.yh.max(b.yh),
+                        );
+                        obs.remove(j);
+                        changed = true;
+                        continue;
+                    }
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+    }
 }
 
 fn parse_macro_class(c1: &str, c2: &str) -> MacroClass {
@@ -845,7 +878,8 @@ END inv_sample
         assert_eq!(inv.width_dbu, 1380);
         assert_eq!(inv.height_dbu, 2720);
         assert_eq!(inv.pin_count, 6);
-        assert_eq!(inv.obs_rects.len(), 4);
+        // 4 raw li1 rects merge into 2 connected jumpers
+        assert_eq!(inv.obs_rects.len(), 2);
 
         let inv_pins = tech_db.macro_pins(inv);
         let a_pin = inv_pins.iter().find(|p| interner.resolve(p.name) == "A").expect("A pin");
@@ -859,6 +893,23 @@ END inv_sample
         assert!(!y_pin.is_power);
         assert_eq!(y_pin.offset_x_dbu, 901);
         assert_eq!(y_pin.offset_y_dbu, 1243);
+
+        // Spot-check multi-rect internal jumper merging on met1
+        let met1_id = tech_db.layer_by_name.get(&met1_sym).copied().expect("met1 layer id");
+        let dfxtp2_sym = interner.get("sky130_fd_sc_hd__dfxtp_2").expect("dfxtp_2 symbol");
+        let dfxtp2 = &tech_db.macros[tech_db.macro_by_name[&dfxtp2_sym].0 as usize];
+        let dfxtp2_met1_obs = dfxtp2.obs_rects.iter().filter(|(l, _)| *l == met1_id).count();
+        assert_eq!(dfxtp2_met1_obs, 2, "dfxtp_2 met1 OBS: 14 rects merged into 2 jumpers");
+
+        let xnor2_sym = interner.get("sky130_fd_sc_hd__xnor2_2").expect("xnor2_2 symbol");
+        let xnor2 = &tech_db.macros[tech_db.macro_by_name[&xnor2_sym].0 as usize];
+        let xnor2_met1_obs = xnor2.obs_rects.iter().filter(|(l, _)| *l == met1_id).count();
+        assert_eq!(xnor2_met1_obs, 1, "xnor2_2 met1 OBS: 5 rects merged into 1 jumper");
+
+        let xor2_sym = interner.get("sky130_fd_sc_hd__xor2_2").expect("xor2_2 symbol");
+        let xor2 = &tech_db.macros[tech_db.macro_by_name[&xor2_sym].0 as usize];
+        let xor2_met1_obs = xor2.obs_rects.iter().filter(|(l, _)| *l == met1_id).count();
+        assert_eq!(xor2_met1_obs, 1, "xor2_2 met1 OBS: 5 rects merged into 1 jumper");
     }
 
     fn dirs_home() -> PathBuf {

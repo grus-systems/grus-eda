@@ -162,10 +162,109 @@ close $fp
 exit
 EOF
 
+# 7b. Compute GCell grid and routing resource counts via OpenROAD dbGCellGrid
+openroad -no_init -no_splash << 'EOF'
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+
+set db [ord::get_db]
+set tech [$db getTech]
+set block [ord::get_db_block]
+
+foreach net [$block getNets] {
+    if {[$net isSpecial] == 0 && [$net getName] ne "_004_"} {
+        odb::dbNet_destroy $net
+    }
+}
+
+set_routing_layers -signal met1-met5
+global_route -verbose
+
+set ggrid [$block getGCellGrid]
+set gx_list [$ggrid getGridX]
+set gy_list [$ggrid getGridY]
+set gcell_nx [llength $gx_list]
+set gcell_ny [llength $gy_list]
+set gcell_tile_size_dbu [expr {[lindex $gx_list 1] - [lindex $gx_list 0]}]
+
+set grt_layers {met1 met2 met3 met4 met5}
+set raw_tracks {}
+set orig_tracks {}
+
+foreach lname $grt_layers {
+    set lyr [$tech findLayer $lname]
+    set is_h [expr {[$lyr getDirection] eq "HORIZONTAL"}]
+    set total_cap 0
+    set total_use 0
+    if {$is_h} {
+        for {set y 0} {$y < $gcell_ny} {incr y} {
+            for {set x 0} {$x < [expr {$gcell_nx - 1}]} {incr x} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                set total_cap [expr {$total_cap + $c}]
+                set total_use [expr {$total_use + $u}]
+            }
+        }
+    } else {
+        for {set x 0} {$x < $gcell_nx} {incr x} {
+            for {set y 0} {$y < [expr {$gcell_ny - 1}]} {incr y} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                set total_cap [expr {$total_cap + $c}]
+                set total_use [expr {$total_use + $u}]
+            }
+        }
+    }
+    lappend raw_tracks [expr {int($total_cap)}]
+    lappend orig_tracks [expr {int($total_cap - $total_use)}]
+}
+
+set_global_routing_layer_adjustment met1 0.30
+set_global_routing_layer_adjustment met2-met5 0.20
+global_route -verbose
+
+set derated_tracks {}
+foreach lname $grt_layers {
+    set lyr [$tech findLayer $lname]
+    set is_h [expr {[$lyr getDirection] eq "HORIZONTAL"}]
+    set total_avail 0
+    if {$is_h} {
+        for {set y 0} {$y < $gcell_ny} {incr y} {
+            for {set x 0} {$x < [expr {$gcell_nx - 1}]} {incr x} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                set total_avail [expr {$total_avail + ($c - $u)}]
+            }
+        }
+    } else {
+        for {set x 0} {$x < $gcell_nx} {incr x} {
+            for {set y 0} {$y < [expr {$gcell_ny - 1}]} {incr y} {
+                set c [$ggrid getCapacity $lyr $x $y]
+                set u [$ggrid getUsage $lyr $x $y]
+                set total_avail [expr {$total_avail + ($c - $u)}]
+            }
+        }
+    }
+    lappend derated_tracks [expr {int($total_avail)}]
+}
+
+set fp [open "/work/tests/designs/gcd/runs/canonical/gcell_counts.tcl" "w"]
+puts $fp "set gcell_nx $gcell_nx"
+puts $fp "set gcell_ny $gcell_ny"
+puts $fp "set gcell_tile_size_dbu $gcell_tile_size_dbu"
+puts $fp "set gcell_raw_edge_tracks {\[[join $raw_tracks {, }]\]}"
+puts $fp "set gcell_orig_edge_tracks {\[[join $orig_tracks {, }]\]}"
+puts $fp "set gcell_derated_edge_tracks {\[[join $derated_tracks {, }]\]}"
+close $fp
+exit
+EOF
+
 # 8. Generate gcd.reference.json via live OpenROAD and OpenSTA API queries
 openroad -no_init -no_splash << 'EOF'
 source /work/tests/designs/gcd/runs/canonical/verilog_counts.tcl
 source /work/tests/designs/gcd/runs/canonical/orient_counts.tcl
+source /work/tests/designs/gcd/runs/canonical/gcell_counts.tcl
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
@@ -308,7 +407,13 @@ puts $fp "  \"orient_hpwl_dbu\": $orient_hpwl_dbu,"
 puts $fp "  \"zero_wire_wns_ns\": $zero_wire_wns_ns,"
 puts $fp "  \"zero_wire_tns_ns\": $zero_wire_tns_ns,"
 puts $fp "  \"placed_spef_wns_ns\": $placed_spef_wns_ns,"
-puts $fp "  \"placed_spef_tns_ns\": $placed_spef_tns_ns"
+puts $fp "  \"placed_spef_tns_ns\": $placed_spef_tns_ns,"
+puts $fp "  \"gcell_nx\": $gcell_nx,"
+puts $fp "  \"gcell_ny\": $gcell_ny,"
+puts $fp "  \"gcell_tile_size_dbu\": $gcell_tile_size_dbu,"
+puts $fp "  \"gcell_raw_edge_tracks\": $gcell_raw_edge_tracks,"
+puts $fp "  \"gcell_orig_edge_tracks\": $gcell_orig_edge_tracks,"
+puts $fp "  \"gcell_derated_edge_tracks\": $gcell_derated_edge_tracks"
 puts $fp "}"
 close $fp
 puts "Generated gcd.reference.json via live OpenROAD/OpenSTA queries"

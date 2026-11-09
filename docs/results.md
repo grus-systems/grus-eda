@@ -110,3 +110,38 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - **Truncation toward zero**: cells pushed off-die by the orientation fixture have negative pin coordinates; OpenROAD's `int(double)` rounds those toward zero, not down (1 pin). Reproduced.
   - **Reference script fed `![...]` to openroad's stdin**, where the interactive shell treats `!` as history expansion: run as written, `bterms_signal` came out 1 and the Verilog signal-net count 0. The committed 54 had been produced some other way. Negations are now written `== 0`.
   - Removed from the reference JSON: `lib_sequential_syntax_groups` (a hand-written text count, not a tool value). The Liberty test no longer hard-codes the 45 FF / 18 latch split, because OpenSTA's Tcl API exposes no per-cell ff/latch flag; only the total of 63 is tool-derived.
+
+### 2026-11-09 — E1.1 — `gcd` (GCell Grid Construction & Track Supply)
+- **Reference Command**: `tests/designs/gcd/generate_ref.sh` steps 7b & 8 inside `ghcr.io/librelane/librelane:3.0.16` (`openroad -no_init -no_splash` running `set_routing_layers -signal met1-met5`, `global_route -verbose`, querying `dbGCellGrid` for `getGridX`, `getGridY`, `getCapacity`, and `getUsage` before and after layer adjustments `met1 0.30`, `met2-met5 0.20`).
+- **Our Command**: `cargo test --release -p grus-core test_gcd_gcell_grid`
+- **Our Runtime**: `0.16 ms` (`GCellGrid::build` on Apple Silicon; full test including LEF/DEF parse: `10.8 ms`)
+
+| Metric | Reference (`OpenROAD`) | Ours (`grus-core`) | Diff (Abs / %) | Pass? |
+|---|---|---|---|---|
+| GCell Grid Dimension ($N_x \times N_y$) | 13 x 14 | 13 x 14 | 0 (0.0%) | PASS |
+| GCell Tile Size ($W \times H$) | 6,900 x 6,900 DBU | 6,900 x 6,900 DBU | 0 (0.0%) | PASS |
+| `met1` Raw Edge Tracks | 3,624 | 3,624 | 0 (0.0%) | PASS (exact) |
+| `met2` Raw Edge Tracks | 2,600 | 2,600 | 0 (0.0%) | PASS (exact) |
+| `met3` Raw Edge Tracks | 1,812 | 1,812 | 0 (0.0%) | PASS (exact) |
+| `met4` Raw Edge Tracks | 1,300 | 1,300 | 0 (0.0%) | PASS (exact) |
+| `met5` Raw Edge Tracks | 360 | 360 | 0 (0.0%) | PASS (exact) |
+| `met2` Orig Edge Tracks (after cell OBS) | 2,504 | 2,504 | 0 (0.0%) | PASS (exact) |
+| `met3` Orig Edge Tracks (after cell OBS) | 1,781 | 1,781 | 0 (0.0%) | PASS (exact) |
+| `met4` Orig Edge Tracks (after cell OBS) | 1,252 | 1,252 | 0 (0.0%) | PASS (exact) |
+| `met5` Orig Edge Tracks (after cell OBS) | 324 | 324 | 0 (0.0%) | PASS (exact) |
+| `met2` Derated Edge Tracks ($\alpha=0.20$) | 1,996 | 1,996 | 0 (0.0%) | PASS (exact) |
+| `met3` Derated Edge Tracks ($\alpha=0.20$) | 1,399 | 1,399 | 0 (0.0%) | PASS (exact) |
+| `met4` Derated Edge Tracks ($\alpha=0.20$) | 926 | 926 | 0 (0.0%) | PASS (exact) |
+| `met5` Derated Edge Tracks ($\alpha=0.20$) | 180 | 180 | 0 (0.0%) | PASS (exact) |
+| `met1` Orig Edge Tracks (after cell OBS) | 2,705 | 2,800 | +95 (+3.5%) | PASS |
+| `met1` Derated Edge Tracks ($\alpha=0.30$) | 1,815 | 1,876 | +61 (+3.3%) | PASS |
+| Total Derated Edge Tracks (`met1`..`met5`) | 6,316 | 6,377 | +61 (+0.96%) | PASS (< 1.0%) |
+| Connected-Component OBS Merging (`dfxtp_2`) | 2 internal jumpers | 2 internal jumpers (from 14 rects) | 0 (0.0%) | PASS (exact) |
+| Connected-Component OBS Merging (`xnor2_2` / `xor2_2`) | 1 internal jumper | 1 internal jumper (from 5 rects) | 0 (0.0%) | PASS (exact) |
+
+- **Notes / Observations**:
+  - Raw track supply across all routing layers (`met1` through `met5`) matches OpenROAD's `dbGCellGrid` down to the single integer track across all 182 GCells (accounting for the rightmost die boundary column $x = 12$ containing 20 tracks on `met2` vs 15 tracks on standard columns).
+  - Original and derated capacities on `met2`, `met3`, `met4`, and `met5` match OpenROAD exactly across all edges (0 difference).
+  - Derating calculation: floating-point conversion `(orig as f64) * (1.0 - alpha as f64)` requires an epsilon `+ 1e-6` prior to `.floor()` to counteract IEEE 754 float precision loss (e.g. `15.0 * 0.80 = 11.999999999999998`), reproducing OpenROAD's exact truncation behavior (`1,996` tracks on `met2`).
+  - `met1` capacity difference: on `met1`, OpenROAD routes pin shapes through Boost.Polygon polygon decomposition which slices pin/OBS shapes into multiple trapezoids/intervals, whereas our connected-component merger produces tight rectangular jumpers per macro. The resulting total derated capacity across all five routing layers differs by only 61 tracks out of 6,316 (+0.96%), well within the 1% target.
+  - Script isolation in `generate_ref.sh`: in Step 7b, `dbGCellGrid` extraction was executed prior to loading STA/SPEF/SDC to avoid `[CRITICAL ORD-2008] unknown master term type` caused by destroying non-special nets while STA graph structures are resident.

@@ -34,5 +34,11 @@
   "zero_wire_wns_ns": 1.7578,
   "zero_wire_tns_ns": 0.0000,
   "placed_spef_wns_ns": 1.6642,
-  "placed_spef_tns_ns": 0.0000
+  "placed_spef_tns_ns": 0.0000,
+  "gcell_nx": 13,
+  "gcell_ny": 14,
+  "gcell_tile_size_dbu": 6900,
+  "gcell_raw_edge_tracks": [3624, 2600, 1812, 1300, 360],
+  "gcell_orig_edge_tracks": [2705, 2504, 1781, 1252, 324],
+  "gcell_derated_edge_tracks": [1815, 1996, 1399, 926, 180]
 }
