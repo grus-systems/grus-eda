@@ -187,13 +187,13 @@ impl DensitySolver {
             let core_h_um = core_yh_um - core_yl_um;
             let site_h_um = tech_db.site_height_dbu as f32 / dbu_per_um;
             let max_bin_h = 2.0 * site_h_um;
-            let candidates = [32, 64, 128, 256, 512];
+            let candidates = [16, 32, 64, 128, 256, 512];
             for &c in &candidates {
                 if core_h_um / (c as f32) <= max_bin_h {
                     return c;
                 }
             }
-            64
+            16
         });
 
         assert!(m.is_power_of_two(), "Grid dimension M must be a power of 2");
@@ -875,6 +875,23 @@ mod tests {
             tau_placed < 0.35,
             "Legalized placement overflow must be < 0.35, got {}",
             tau_placed
+        );
+
+        // Also test default grid sizing (None -> M = 16 on gcd)
+        let mut solver_16 = DensitySolver::new(&design_db, &tech_db, 0.60, None);
+        assert_eq!(solver_16.m, 16, "Default grid sizing for gcd must choose M = 16");
+        let mut force_x_16 = vec![0.0f32; num_cells];
+        let mut force_y_16 = vec![0.0f32; num_cells];
+        let (tau_placed_16, _) = solver_16.compute_density_and_forces(
+            &placed_x_um,
+            &placed_y_um,
+            &mut force_x_16,
+            &mut force_y_16,
+        );
+        assert!(
+            tau_placed_16 < 0.05,
+            "Placed overflow on M=16 grid must be < 0.05, got {}",
+            tau_placed_16
         );
 
         // Mass conservation test: sum of movable_area equals total_movable_area_um2
