@@ -505,6 +505,7 @@ grus-eda congestion \
   --lef <path.lef> \
   --def <placed.def> \
   [--gcell-tracks 15] \
+  [--layer-adjust <0.0..1.0>] \
   [--heatmap]
 
 # E2: Global placement + greedy legalization, emitting placed DEF
