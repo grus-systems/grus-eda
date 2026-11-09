@@ -5,3 +5,4 @@
 .DS_Store
 tests/designs/pdk
 tests/designs/gcd/runs
+tests/designs/picorv32/runs

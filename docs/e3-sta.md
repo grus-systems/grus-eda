@@ -290,6 +290,11 @@ despite its name it is **not** a routed SPEF, so `placement_rc` and `placed_spef
 > the formulas below were never checked against OpenSTA, and `report_dcalc` shows that OpenSTA's driver slew
 > comes from a waveform model, so a pi model and `Ceff` alone would not close the slew gap. Measure
 > `report_dcalc` pi models first, then write the rule here before coding.
+>
+> **Correction (picorv32, 2026-11-10)**: the O'Brien-Savarino charge-sharing formula in Stage 2 below does not
+> reproduce OpenSTA's `Ceff`: on the pi models OpenSTA prints it removes < 1% of the shielding that OpenSTA
+> applies (up to 75% of `C2`). The pi-model moments (`y1..y3`) are right in form; the `Ceff` solve is not.
+> See `docs/results.md`, picorv32 entry.
 
 1. **SPEF Units & Header**:
    - Parse `*T_UNIT` (convert to `ns`), `*C_UNIT` (convert to `pF`), `*R_UNIT` (convert to $\text{k}\Omega$ so $R \cdot C = \text{k}\Omega \cdot \text{pF} = \text{ns}$ directly!), and `*NAME_MAP` (`*123 -> net_or_inst_name`).

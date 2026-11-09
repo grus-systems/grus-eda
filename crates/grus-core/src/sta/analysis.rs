@@ -494,8 +494,25 @@ mod tests {
     }
 
     #[test]
+    fn test_picorv32_zero_wire_matches_opensta() {
+        compare_design_with_opensta("picorv32", "zero_wire", Rc::None, 0.01);
+    }
+
+    #[test]
+    #[ignore = "known failing: no DMP Ceff and a greedy Steiner tree; run with --ignored, see docs/results.md"]
+    fn test_picorv32_placement_rc_matches_opensta() {
+        compare_design_with_opensta("picorv32", "placement_rc", Rc::Placement, 0.03);
+    }
+
+    #[test]
+    #[ignore = "known failing: no DMP Ceff; run with --ignored, see docs/results.md"]
+    fn test_picorv32_placed_spef_matches_opensta() {
+        compare_design_with_opensta("picorv32", "placed_spef", Rc::Spef, 0.03);
+    }
+
+    #[test]
     fn test_gcd_zero_wire_matches_opensta() {
-        compare_gcd_with_opensta("zero_wire", Rc::None, 0.01);
+        compare_design_with_opensta("gcd", "zero_wire", Rc::None, 0.01);
     }
 
     #[test]
@@ -503,12 +520,12 @@ mod tests {
         // Arrival, required time and slack must agree within 1% or 5 ps. Slews get 3%: OpenSTA's
         // DMP calculator derives the driver slew from a waveform model that differs from the plain
         // table lookup by about 1% (`report_dcalc`: 0.278732 vs 0.282240); see docs/results.md.
-        compare_gcd_with_opensta("placement_rc", Rc::Placement, 0.03);
+        compare_design_with_opensta("gcd", "placement_rc", Rc::Placement, 0.03);
     }
 
     #[test]
     fn test_gcd_placed_spef_matches_opensta() {
-        compare_gcd_with_opensta("placed_spef", Rc::Spef, 0.03);
+        compare_design_with_opensta("gcd", "placed_spef", Rc::Spef, 0.03);
     }
 
     enum Rc {
@@ -517,13 +534,13 @@ mod tests {
         Spef,
     }
 
-    fn compare_gcd_with_opensta(golden_key: &str, rc_mode: Rc, slew_rel_tol: f64) {
+    fn compare_design_with_opensta(design_name: &str, golden_key: &str, rc_mode: Rc, slew_rel_tol: f64) {
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let pdk = std::env::var("PDK_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".ciel"));
         let lib_dir = pdk.join("sky130A/libs.ref/sky130_fd_sc_hd");
-        let gcd = repo.join("tests/designs/gcd");
+        let gcd = repo.join("tests/designs").join(design_name);
 
         let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
         let mut interner = StringInterner::new();
@@ -533,8 +550,8 @@ mod tests {
             &mut interner,
         )
         .expect("LEF");
-        let design = parse_def(&gcd.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
-        let sdc = load_sdc(&gcd.join("gcd.sdc")).expect("SDC");
+        let design = parse_def(&gcd.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&gcd.join(format!("{design_name}.sdc"))).expect("SDC");
         let parasitics = match rc_mode {
             Rc::None => None,
             Rc::Placement => {
@@ -542,14 +559,14 @@ mod tests {
                 Some(crate::sta::estimate_placement_parasitics(&design, &tech, rc))
             }
             Rc::Spef => {
-                let spef = crate::readers::load_spef(&gcd.join("gcd.routed.spef")).expect("SPEF");
+                let spef = crate::readers::load_spef(&gcd.join(format!("{design_name}.routed.spef"))).expect("SPEF");
                 Some(crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics"))
             }
         };
         let report = run_sta(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
 
         let reference: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(gcd.join("gcd.sta.reference.json")).expect("golden file"))
+            serde_json::from_slice(&std::fs::read(gcd.join(format!("{design_name}.sta.reference.json"))).expect("golden file"))
                 .expect("golden JSON");
         let zero_wire = &reference[golden_key];
         let ref_endpoints = zero_wire["endpoints"].as_array().expect("endpoints");
@@ -575,7 +592,7 @@ mod tests {
                 }
             }
         }
-        println!("{golden_key} max relative diff per field: {:?}", fields.iter().zip(max_diff).collect::<Vec<_>>());
+        println!("{design_name} {golden_key} max relative diff per field: {:?}", fields.iter().zip(max_diff).collect::<Vec<_>>());
         for (ours, key) in [
             (report.wns_max_ns, "wns_max_ns"),
             (report.tns_max_ns, "tns_max_ns"),
