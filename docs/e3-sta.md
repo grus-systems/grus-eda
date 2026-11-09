@@ -285,6 +285,12 @@ despite its name it is **not** a routed SPEF, so `placement_rc` and `placed_spef
 
 ### Step E3.3: SPEF Reader & RC Tree Elmore Propagation (`readers/spef.rs`)
 
+> **Status (2026-11-10)**: Stage 1 (reader, spanning tree, Elmore, wire slew) is implemented in `readers/spef.rs`
+> and `sta/parasitics.rs::spef_parasitics`. Stage 2 (pi model, `Ceff`, DMP driver slew) is **not** implemented:
+> the formulas below were never checked against OpenSTA, and `report_dcalc` shows that OpenSTA's driver slew
+> comes from a waveform model, so a pi model and `Ceff` alone would not close the slew gap. Measure
+> `report_dcalc` pi models first, then write the rule here before coding.
+
 1. **SPEF Units & Header**:
    - Parse `*T_UNIT` (convert to `ns`), `*C_UNIT` (convert to `pF`), `*R_UNIT` (convert to $\text{k}\Omega$ so $R \cdot C = \text{k}\Omega \cdot \text{pF} = \text{ns}$ directly!), and `*NAME_MAP` (`*123 -> net_or_inst_name`).
 2. **Per-Net `*D_NET *net_id total_cap`**:

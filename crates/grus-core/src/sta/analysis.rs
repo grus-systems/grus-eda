@@ -240,11 +240,11 @@ fn topological_order(cx: &Context, graph: &TimingGraph) -> Result<Vec<PinId>> {
                 order.push(target);
             }
         };
-        if design.pin_is_driver[p] {
-            if let Some(net) = design.pin_nets[p] {
-                for &sink in &design.net_pins(net)[1..] {
-                    release(sink, &mut order);
-                }
+        if design.pin_is_driver[p]
+            && let Some(net) = design.pin_nets[p]
+        {
+            for &sink in &design.net_pins(net)[1..] {
+                release(sink, &mut order);
             }
         }
         for &e in &graph.edges_from[p] {
@@ -323,28 +323,28 @@ pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&Ne
 
     for &pin in &order {
         let p = pin.0 as usize;
-        if design.pin_is_driver[p] {
-            if let Some(net) = design.pin_nets[p] {
-                let driver_state = state[p];
-                // The ideal clock port stays unreached; its sinks keep their seeded edge.
-                if !driver_state.reached(RISE) && !driver_state.reached(FALL) {
-                    continue;
-                }
-                let wire = cx.wire_delays(net);
-                for (i, &sink) in design.net_pins(net).iter().enumerate().skip(1) {
-                    let mut sink_state = driver_state;
-                    if let Some(wire) = &wire {
-                        for pol in [RISE, FALL] {
-                            let delay = wire[pol][i];
-                            sink_state.arrival_max[pol] += delay;
-                            sink_state.arrival_min[pol] += delay;
-                            let degrade = WIRE_SLEW_FACTOR * delay;
-                            sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
-                            sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
-                        }
+        if design.pin_is_driver[p]
+            && let Some(net) = design.pin_nets[p]
+        {
+            let driver_state = state[p];
+            // The ideal clock port stays unreached; its sinks keep their seeded edge.
+            if !driver_state.reached(RISE) && !driver_state.reached(FALL) {
+                continue;
+            }
+            let wire = cx.wire_delays(net);
+            for (i, &sink) in design.net_pins(net).iter().enumerate().skip(1) {
+                let mut sink_state = driver_state;
+                if let Some(wire) = &wire {
+                    for pol in [RISE, FALL] {
+                        let delay = wire[pol][i];
+                        sink_state.arrival_max[pol] += delay;
+                        sink_state.arrival_min[pol] += delay;
+                        let degrade = WIRE_SLEW_FACTOR * delay;
+                        sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
+                        sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
                     }
-                    state[sink.0 as usize] = sink_state;
                 }
+                state[sink.0 as usize] = sink_state;
             }
         }
         for &e in &graph.edges_from[p] {
