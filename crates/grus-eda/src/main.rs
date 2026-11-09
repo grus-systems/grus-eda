@@ -115,6 +115,9 @@ struct StaArgs {
     #[arg(long, help = "Parasitic interconnect model (none, placement)")]
     parasitics: Option<String>,
 
+    #[arg(long, default_value = "met2", help = "Routing layer whose RC is used for --parasitics placement")]
+    wire_layer: String,
+
     #[arg(long, help = "Path to extracted SPEF (.spef) file")]
     spef: Option<PathBuf>,
 
@@ -347,10 +350,11 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Commands::Sta(args) => {
-            match args.parasitics.as_deref() {
-                None | Some("none") => {}
-                Some(other) => anyhow::bail!("--parasitics {other} is not implemented yet (E3.2/E3.3)"),
-            }
+            let use_placement_rc = match args.parasitics.as_deref() {
+                None | Some("none") => false,
+                Some("placement") => true,
+                Some(other) => anyhow::bail!("--parasitics {other} is not implemented yet (E3.3)"),
+            };
             let (Some(tlef), Some(lef), Some(def), Some(sdc_path)) =
                 (&args.tlef, &args.lef, &args.def, &args.sdc)
             else {
@@ -362,7 +366,13 @@ fn main() -> anyhow::Result<()> {
             let design = grus_core::readers::parse_def(def, &tech_db, Some(&lib_db))?;
             let sdc = grus_core::sta::load_sdc(sdc_path)?;
             let t0 = std::time::Instant::now();
-            let report = grus_core::sta::run_zero_wire_sta(&design, &lib_db, &sdc)?;
+            let parasitics = if use_placement_rc {
+                let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                Some(grus_core::sta::estimate_placement_parasitics(&design, &tech_db, rc))
+            } else {
+                None
+            };
+            let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
             println!(
                 "STA (zero wire): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms",
                 report.endpoints.len(),

@@ -9,13 +9,16 @@ pub fn segment_wl(s: &SteinerSegment) -> u32 {
     s.p1.x.abs_diff(s.p2.x) as u32 + s.p1.y.abs_diff(s.p2.y) as u32
 }
 
+/// Integer point used by the generic RSMT core: GCell coordinates in E1, DBU in E3.
+pub type Pt = (i32, i32);
+
 #[inline]
-fn manhattan(a: GPoint, b: GPoint) -> u32 {
-    a.x.abs_diff(b.x) as u32 + a.y.abs_diff(b.y) as u32
+fn manhattan(a: Pt, b: Pt) -> u32 {
+    a.0.abs_diff(b.0) + a.1.abs_diff(b.1)
 }
 
 #[inline]
-fn median3(a: u16, b: u16, c: u16) -> u16 {
+fn median3(a: i32, b: i32, c: i32) -> i32 {
     let mut v = [a, b, c];
     v.sort_unstable();
     v[1]
@@ -32,9 +35,9 @@ fn median3(a: u16, b: u16, c: u16) -> u16 {
 ///   L-flip Steiner point insertions on pairs of edges sharing an endpoint with
 ///   maximum wirelength reduction (`gain = manhattan(u, s)`), breaking ties
 ///   deterministically by edge indices.
-pub fn build_net_rsmt(pts: &[GPoint]) -> Vec<SteinerSegment> {
+pub fn build_rsmt_points(pts: &[Pt]) -> Vec<(Pt, Pt)> {
     let mut unique = pts.to_vec();
-    unique.sort_unstable_by_key(|a| (a.x, a.y));
+    unique.sort_unstable();
     unique.dedup();
 
     let k = unique.len();
@@ -42,19 +45,17 @@ pub fn build_net_rsmt(pts: &[GPoint]) -> Vec<SteinerSegment> {
         return Vec::new();
     }
     if k == 2 {
-        return vec![SteinerSegment {
-            p1: unique[0],
-            p2: unique[1],
-        }];
+        return vec![(unique[0], unique[1])];
     }
     if k == 3 {
-        let xs = median3(unique[0].x, unique[1].x, unique[2].x);
-        let ys = median3(unique[0].y, unique[1].y, unique[2].y);
-        let sp = GPoint { x: xs, y: ys };
+        let sp = (
+            median3(unique[0].0, unique[1].0, unique[2].0),
+            median3(unique[0].1, unique[1].1, unique[2].1),
+        );
         let mut segs = Vec::with_capacity(3);
         for &p in &unique {
             if p != sp {
-                segs.push(SteinerSegment { p1: p, p2: sp });
+                segs.push((p, sp));
             }
         }
         return segs;
@@ -100,7 +101,7 @@ pub fn build_net_rsmt(pts: &[GPoint]) -> Vec<SteinerSegment> {
 
     // Iterative L-flip Steiner refinement
     loop {
-        let mut best_candidate: Option<(u32, usize, usize, usize, usize, usize, GPoint)> = None;
+        let mut best_candidate: Option<(u32, usize, usize, usize, usize, usize, Pt)> = None;
         // (gain, e1_idx, e2_idx, u, v, w, s_pt)
 
         let num_edges = edges.len();
@@ -126,10 +127,7 @@ pub fn build_net_rsmt(pts: &[GPoint]) -> Vec<SteinerSegment> {
                     let pv = nodes[v];
                     let pw = nodes[w];
 
-                    let s_pt = GPoint {
-                        x: median3(pu.x, pv.x, pw.x),
-                        y: median3(pu.y, pv.y, pw.y),
-                    };
+                    let s_pt = (median3(pu.0, pv.0, pw.0), median3(pu.1, pv.1, pw.1));
                     let gain = manhattan(pu, s_pt);
 
                     if gain > 0 {
@@ -184,13 +182,21 @@ pub fn build_net_rsmt(pts: &[GPoint]) -> Vec<SteinerSegment> {
 
     let mut segs = Vec::with_capacity(edges.len());
     for (a, b) in edges {
-        let p1 = nodes[a];
-        let p2 = nodes[b];
-        if p1 != p2 {
-            segs.push(SteinerSegment { p1, p2 });
+        if nodes[a] != nodes[b] {
+            segs.push((nodes[a], nodes[b]));
         }
     }
     segs
+}
+
+/// Constructs a Rectilinear Steiner Minimal Tree over GCell points (see `build_rsmt_points`).
+pub fn build_net_rsmt(pts: &[GPoint]) -> Vec<SteinerSegment> {
+    let pts: Vec<Pt> = pts.iter().map(|p| (p.x as i32, p.y as i32)).collect();
+    let to_g = |p: Pt| GPoint { x: p.0 as u16, y: p.1 as u16 };
+    build_rsmt_points(&pts)
+        .into_iter()
+        .map(|(a, b)| SteinerSegment { p1: to_g(a), p2: to_g(b) })
+        .collect()
 }
 
 /// Decomposes a single net into rectilinear Steiner segments over the GCell grid.

@@ -1,4 +1,5 @@
 use super::nldm::{eval_nldm_constraint, eval_nldm_delay_or_slew};
+use super::parasitics::PlacementParasitics;
 use super::sdc::Sdc;
 use crate::design_db::DesignDb;
 use crate::interner::{CellId, NetId, PinDir, PinId};
@@ -9,6 +10,9 @@ use std::collections::BTreeMap;
 
 pub const RISE: usize = 0;
 pub const FALL: usize = 1;
+
+/// ln(0.8 / 0.2): a single-pole RC rises from the 20% to the 80% threshold in ln(4) time constants.
+const WIRE_SLEW_FACTOR: f32 = std::f32::consts::LN_2 * 2.0;
 
 /// Combinational arc between two pins of one cell instance.
 #[derive(Clone, Copy, Debug)]
@@ -87,6 +91,7 @@ struct Context<'a> {
     design: &'a DesignDb,
     lib: &'a LibDb,
     sdc: &'a Sdc,
+    parasitics: Option<&'a PlacementParasitics>,
 }
 
 impl Context<'_> {
@@ -106,25 +111,35 @@ impl Context<'_> {
         self.design.strings.resolve(self.design.pin_names[pin.0 as usize])
     }
 
-    /// Total capacitance on the net driven by an output pin for one output transition.
-    /// Zero-wire mode has no wire capacitance, only sink pins and port loads.
-    fn net_load(&self, net: NetId, pol: usize) -> f32 {
-        let mut load = 0.0;
-        for &pin in self.design.net_pins(net) {
-            let p = pin.0 as usize;
-            if self.design.pin_is_driver[p] {
-                continue;
-            }
-            load += match (self.design.pin_cells[p], self.design.pin_lib_pins[p]) {
-                (None, _) => self.sdc.output_load_pf(self.port_name(pin)),
-                (Some(_), Some(lp)) => {
-                    let lib_pin = &self.lib.pins[lp.0 as usize];
-                    if pol == RISE { lib_pin.cap_rise } else { lib_pin.cap_fall }
-                }
-                (Some(_), None) => 0.0,
-            };
+    /// Capacitance of one pin of a net for one transition. Zero-wire mode has no wire capacitance,
+    /// only sink pins and port loads.
+    fn sink_cap(&self, pin: PinId, pol: usize) -> f32 {
+        let p = pin.0 as usize;
+        if self.design.pin_is_driver[p] {
+            return 0.0;
         }
-        load
+        match (self.design.pin_cells[p], self.design.pin_lib_pins[p]) {
+            (None, _) => self.sdc.output_load_pf(self.port_name(pin)),
+            (Some(_), Some(lp)) => {
+                let lib_pin = &self.lib.pins[lp.0 as usize];
+                if pol == RISE { lib_pin.cap_rise } else { lib_pin.cap_fall }
+            }
+            (Some(_), None) => 0.0,
+        }
+    }
+
+    /// Total capacitance on the net driven by an output pin for one output transition.
+    fn net_load(&self, net: NetId, pol: usize) -> f32 {
+        let wire = self.parasitics.and_then(|par| par.net(net)).map_or(0.0, |t| t.total_wire_cap_pf);
+        wire + self.design.net_pins(net).iter().map(|&pin| self.sink_cap(pin, pol)).sum::<f32>()
+    }
+
+    /// Elmore wire delay from the driver to every pin of the net, per transition, in `net_pins` order.
+    fn wire_delays(&self, net: NetId) -> Option<[Vec<f32>; 2]> {
+        let tree = self.parasitics?.net(net)?;
+        let pins = self.design.net_pins(net);
+        let delays = |pol| tree.elmore_ns(&pins.iter().map(|&p| self.sink_cap(p, pol)).collect::<Vec<_>>());
+        Some([delays(RISE), delays(FALL)])
     }
 
     fn cell_pin_for_lib_pin(&self, cell: CellId, lib_pin: crate::interner::LibPinId) -> Option<PinId> {
@@ -262,8 +277,9 @@ fn constraint_table(arc: &crate::lib_db::LibTimingArc, pol: usize) -> Option<&Nl
     if pol == RISE { arc.rise_constraint.as_ref() } else { arc.fall_constraint.as_ref() }
 }
 
-pub fn run_zero_wire_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc) -> Result<StaReport> {
-    let cx = Context { design, lib, sdc };
+/// Zero-wire STA when `parasitics` is `None`; otherwise wire capacitance and Elmore wire delay are added.
+pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&PlacementParasitics>) -> Result<StaReport> {
+    let cx = Context { design, lib, sdc, parasitics };
     let graph = build_graph(&cx);
     let order = topological_order(&cx, &graph)?;
     let mut state = vec![PinTimingState::UNREACHED; design.num_pins()];
@@ -314,9 +330,20 @@ pub fn run_zero_wire_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc) -> Result<St
                 if !driver_state.reached(RISE) && !driver_state.reached(FALL) {
                     continue;
                 }
-                for &sink in &design.net_pins(net)[1..] {
-                    // Zero wire: sinks see the driver's arrival and slew unchanged.
-                    state[sink.0 as usize] = driver_state;
+                let wire = cx.wire_delays(net);
+                for (i, &sink) in design.net_pins(net).iter().enumerate().skip(1) {
+                    let mut sink_state = driver_state;
+                    if let Some(wire) = &wire {
+                        for pol in [RISE, FALL] {
+                            let delay = wire[pol][i];
+                            sink_state.arrival_max[pol] += delay;
+                            sink_state.arrival_min[pol] += delay;
+                            let degrade = WIRE_SLEW_FACTOR * delay;
+                            sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
+                            sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
+                        }
+                    }
+                    state[sink.0 as usize] = sink_state;
                 }
             }
         }
@@ -460,14 +487,26 @@ mod tests {
     use crate::sta::sdc::load_sdc;
     use std::path::PathBuf;
 
-    /// Per endpoint and field: pass if |ours - ref| <= max(5 ps, 1% of ref).
-    fn within_tolerance(ours: f32, reference: f64) -> (bool, f64) {
+    /// Per endpoint and field: pass if |ours - ref| <= max(5 ps, rel_tol * |ref|).
+    fn within_tolerance(ours: f32, reference: f64, rel_tol: f64) -> (bool, f64) {
         let diff = (ours as f64 - reference).abs();
-        (diff <= (0.005f64).max(0.01 * reference.abs()), diff)
+        (diff <= (0.005f64).max(rel_tol * reference.abs()), diff / reference.abs().max(1e-9))
     }
 
     #[test]
     fn test_gcd_zero_wire_matches_opensta() {
+        compare_gcd_with_opensta("zero_wire", false, 0.01);
+    }
+
+    #[test]
+    fn test_gcd_placement_rc_matches_opensta() {
+        // Arrival, required time and slack must agree within 1% or 5 ps. Slews get 3%: OpenSTA's
+        // DMP calculator derives the driver slew from a waveform model that differs from the plain
+        // table lookup by about 1% (`report_dcalc`: 0.278732 vs 0.282240); see docs/results.md.
+        compare_gcd_with_opensta("placement_rc", true, 0.03);
+    }
+
+    fn compare_gcd_with_opensta(golden_key: &str, placement_rc: bool, slew_rel_tol: f64) {
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let pdk = std::env::var("PDK_ROOT")
             .map(PathBuf::from)
@@ -485,12 +524,16 @@ mod tests {
         .expect("LEF");
         let design = parse_def(&gcd.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&gcd.join("gcd.sdc")).expect("SDC");
-        let report = run_zero_wire_sta(&design, &lib, &sdc).expect("STA");
+        let parasitics = placement_rc.then(|| {
+            let rc = crate::sta::WireRc::from_layer(&tech, "met2").expect("met2 RC");
+            crate::sta::estimate_placement_parasitics(&design, &tech, rc)
+        });
+        let report = run_sta(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
 
         let reference: serde_json::Value =
             serde_json::from_slice(&std::fs::read(gcd.join("gcd.sta.reference.json")).expect("golden file"))
                 .expect("golden JSON");
-        let zero_wire = &reference["zero_wire"];
+        let zero_wire = &reference[golden_key];
         let ref_endpoints = zero_wire["endpoints"].as_array().expect("endpoints");
         assert_eq!(report.endpoints.len(), ref_endpoints.len(), "endpoint count");
 
@@ -506,14 +549,15 @@ mod tests {
             let values = [ours.max_arr_ns, ours.max_req_ns, ours.max_slack_ns, ours.max_slew_ns, ours.min_arr_ns, ours.min_req_ns, ours.min_slack_ns, ours.min_slew_ns];
             for (i, field) in fields.iter().enumerate() {
                 let expected = r[*field].as_f64().unwrap();
-                let (ok, diff) = within_tolerance(values[i], expected);
+                let rel_tol = if field.ends_with("slew_ns") { slew_rel_tol } else { 0.01 };
+                let (ok, diff) = within_tolerance(values[i], expected, rel_tol);
                 max_diff[i] = max_diff[i].max(diff);
                 if !ok {
                     failures.push(format!("{name}.{field}: ours={} ref={expected}", values[i]));
                 }
             }
         }
-        println!("max abs diff per field: {:?}", fields.iter().zip(max_diff).collect::<Vec<_>>());
+        println!("{golden_key} max relative diff per field: {:?}", fields.iter().zip(max_diff).collect::<Vec<_>>());
         for (ours, key) in [
             (report.wns_max_ns, "wns_max_ns"),
             (report.tns_max_ns, "tns_max_ns"),
@@ -521,7 +565,7 @@ mod tests {
             (report.tns_min_ns, "tns_min_ns"),
         ] {
             let expected = zero_wire[key].as_f64().unwrap();
-            if !within_tolerance(ours, expected).0 {
+            if !within_tolerance(ours, expected, 0.01).0 {
                 failures.push(format!("{key}: ours={ours} ref={expected}"));
             }
         }

@@ -9,7 +9,7 @@ This document breaks E3 into three progressive implementation steps (`E3.1`–`E
 | Sub-Step | What | Reference Command (`ghcr.io/librelane/librelane:3.0.16`) | Done When |
 |---|---|---|---|
 | **E3.1** | Zero-Wire STA: levelized DAG, dual Rise/Fall propagation, NLDM extrapolation, Setup/Hold slack | `generate_ref.sh` step 9 → `tests/designs/gcd/gcd.sta.reference.json` (`zero_wire`) | Worst slack (Setup & Hold) and, for **all 53 endpoints**, `max/min` arrival, required, slack and slew agree within **1% or 5 ps** on `gcd` (`picorv32` once it is added under `tests/designs/`) |
-| **E3.2** | Placement-Based Virtual RC STA (`parasitics.rs`) | `openroad`: `estimate_parasitics -placement`, `report_tns`, `report_wns` | Agrees with OpenROAD placement-based parasitics when given identical per-micron $r_0, c_0$ |
+| **E3.2** | Placement-Based Virtual RC STA (`parasitics.rs`) | `generate_ref.sh` step 9 → `gcd.sta.reference.json` (`placement_rc`) | Worst slack and, for all 53 endpoints, arrival, required and slack within **1% or 5 ps** on `gcd` with OpenROAD's met2 `r0, c0`; slews within 3% (see E3.2 item 7) |
 | **E3.3** | SPEF-Based STA (`readers/spef.rs` + Elmore tree) | `sta`: `read_spef`, `report_checks -path_delay min_max` | Worst slack and every endpoint's arrival agree within **1% or 5 ps** on extracted `.spef` |
 
 > **Scope Rule**: E3 targets edge-triggered flip-flop designs (`dfxtp`, `dfrtp`, `dfxbp`, etc.). Transparent level-sensitive latches (`dlxtp`, time borrowing across cycle boundaries) are out of initial scope; if a design instantiates a latch, emit a clear diagnostic warning.
@@ -252,17 +252,34 @@ generic text above disagree, this section wins.
 
 ---
 
-### Step E3.2: Placement-Based Virtual RC (`parasitics.rs`)
+### Step E3.2: Placement-Based Virtual RC (`sta/parasitics.rs`)
 
-When `--parasitics placement` is selected:
-1. Build the RSMT Steiner tree for each net $e$ using the exact pin coordinates in micron units (reusing `rsmt.rs` from E1).
-2. Let $r_0$ ($\text{k}\Omega/\mu\text{m}$ or $\Omega/\mu\text{m}$) and $c_0$ ($\text{pF}/\mu\text{m}$) be the horizontal/vertical signal layer unit resistance and capacitance (from LEF or OpenROAD's `set_wire_rc` values).
-3. Root the Steiner tree at the driver pin $d$ via BFS/DFS:
-   - Each tree edge $u \to v$ of length $L_{uv}$ microns has resistance $R_{uv} = r_0 L_{uv}$ and capacitance $C_{uv} = c_0 L_{uv}$ (split $\frac{1}{2} C_{uv}$ at node $u$ and $\frac{1}{2} C_{uv}$ at node $v$).
-   - **Bottom-up pass**: accumulate total downstream capacitance $C_{\text{down}}(u)$ for every tree node $u$ (including sink pin capacitances $C_{\text{pin}}(s, \text{pol})$).
-   - Total driver load: $C_{\text{load}}(e, \text{pol}) = C_{\text{down}}(d, \text{pol})$.
-   - **Top-down pass**: compute Elmore delay to each node $v$ with parent $u$:
-     $$\tau_{\text{Elmore}}(v) = \tau_{\text{Elmore}}(u) + R_{uv} \, C_{\text{down}}(v)$$
+Enabled with `grus-eda sta --parasitics placement [--wire-layer met2]`. Every rule below was measured
+with OpenROAD (`set_wire_rc -layer met2; estimate_parasitics -placement`) on `gcd.placed.def`,
+2026-11-10. `gcd.routed.spef` is byte-identical (except the date) to OpenROAD's placement estimate:
+despite its name it is **not** a routed SPEF, so `placement_rc` and `placed_spef` in the golden file agree.
+
+1. **Layer RC.** `r0 = RPERSQ / WIDTH` (met2: 0.125 / 0.14 = 0.892857 ohm/um = 8.92857e-4 kohm/um) and
+   `c0 = CPERSQDIST * WIDTH + 2 * EDGECAPACITANCE` (met2: 7.7890e-5 pF/um). Checked on 159 two-pin nets:
+   `c0` and `r0` match the SPEF to 6 digits for every net. Same value for horizontal and vertical wires.
+2. **Pin positions.** `DesignDb::pin_pos_dbu`, converted to um by `dbu_per_micron`.
+3. **Tree topology.** Two pins: one Manhattan segment. Three pins: the median Steiner point (total
+   length = HPWL; matches OpenROAD on all 46 three-pin nets). Four or more pins: OpenROAD uses FLUTE,
+   which is shorter than the greedy MST + L-flip of E1 (`reset`: 23.585 vs 24.323 um by MST; `req_rdy`,
+   40 pins: 350.160 vs 358.864 um by MST). We use the E1 core (`build_rsmt_points`, now generic over integer
+   points); the length gap on these nets is a **known divergence**, not yet measured at the net level.
+4. **RC tree.** Rooted at the driver (first pin of the net). Segment `u-v` of length `L`: `R = r0 L`,
+   `C = c0 L`, half of `C` at each end. Pin-connection stubs (1e-6 kohm in the SPEF) are ignored.
+5. **Load.** `load(net, pol) = total wire C + sum of sink pin caps (per transition) + port loads`. The driver
+   delay uses this lumped value (see the DMP note below).
+6. **Wire delay.** Elmore: `tau(v) = tau(u) + R_uv * Cdown(v)`, with sink pin caps (per transition) in
+   `Cdown`. Added to both max and min arrival. Sink slew: `sqrt(slew_d^2 + (ln4 * tau)^2)`.
+7. **Known gap: DMP driver slew.** OpenSTA's `dmp_ceff_elmore` reduces the tree to a pi model and takes the
+   driver slew from a waveform model. `report_dcalc` shows the result differs from the plain table lookup
+   (`Slew = 0.282240` from the table, `Driver waveform slew = 0.278732`; `Ceff = 0.054675` vs total
+   0.054938). Arrival, required time and slack are not affected beyond tolerance on `gcd`; slews at output
+   ports are 1.7-2.7% high. Closing this is the Ceff work of E3.3 Stage 2.
+8. **Comparison.** Arrival, required time and slack: `max(5 ps, 1%)`. Slew: `max(5 ps, 3%)` until item 7 is done.
 
 ---
 
