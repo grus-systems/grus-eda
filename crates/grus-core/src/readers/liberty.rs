@@ -1151,9 +1151,10 @@ library (test_lib) {
 
     #[test]
     fn test_sky130_liberty_integration() {
-        let default_path = dirs_home().join(".ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib");
-        let pdk_env = std::env::var("PDK_ROOT").ok().map(|p| PathBuf::from(p).join("sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
-        let lib_path = pdk_env.filter(|p| p.is_file()).unwrap_or(default_path);
+        let pdk_root = std::env::var("PDK_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| dirs_home().join(".ciel"));
+        let lib_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib");
 
         if !lib_path.is_file() {
             panic!("PDK Liberty file missing at {:?}", lib_path);
@@ -1199,10 +1200,9 @@ library (test_lib) {
 
         let ff_count = db.cells.iter().filter(|c| c.is_sequential).count();
         let latch_count = db.cells.iter().filter(|c| c.is_latch).count();
-        let seq_count = ff_count + latch_count;
-        assert_eq!(ff_count, 45, "Expected 45 flip-flop cells");
-        assert_eq!(latch_count, 18, "Expected 18 latch cells");
-        assert_eq!(seq_count, expected_seq, "Expected sequential cells matching reference");
+        // OpenSTA's Tcl API exposes no per-cell ff/latch flag, so only the total is a
+        // tool-derived reference.
+        assert_eq!(ff_count + latch_count, expected_seq, "Expected sequential cells matching reference");
 
         // Warm cache load time must be < 10 ms in release mode
         if !cfg!(debug_assertions) {

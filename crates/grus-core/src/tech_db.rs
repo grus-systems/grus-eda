@@ -63,8 +63,12 @@ pub struct MacroPin {
     pub name: SymbolId,
     pub dir: PinDir,
     pub is_power: bool,    // true if USE POWER or USE GROUND
-    pub offset_x_dbu: i32, // bbox center relative to macro origin
+    pub offset_x_dbu: i32, // floor of the mean rect center, relative to macro origin
     pub offset_y_dbu: i32,
+    // The mean center is not an integer. OpenROAD truncates after applying the
+    // orientation, so a mirrored axis must round up instead (docs/e0-readers.md).
+    pub offset_x_frac: bool,
+    pub offset_y_frac: bool,
     pub layer: Option<LayerId>,
 }
 

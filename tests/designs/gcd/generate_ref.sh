@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduction script for gcd reference artifacts in grus-eda.
 # Generates gcd.synth.v, gcd.synth.json, gcd.floorplan.def, gcd.placed.def,
-# gcd.routed.spef, and gcd.reference.json using LibreLane, Yosys, OpenROAD, and OpenSTA
+# gcd.routed.spef, gcd.orient.def, gcd.orient.pins.txt, and gcd.reference.json using LibreLane, Yosys, OpenROAD, and OpenSTA
 # inside the canonical container ghcr.io/librelane/librelane:3.0.16.
 
 set -euo pipefail
@@ -96,8 +96,76 @@ estimate_parasitics -placement -spef_file /work/tests/designs/gcd/gcd.routed.spe
 exit
 EOF
 
-# 6. Generate gcd.reference.json via live OpenROAD and OpenSTA API queries
+# The Tcl below is fed to openroad on stdin, where the interactive shell treats `!` as
+# history expansion. Write negations as `== 0`, never `![...]`.
+
+# 6. Count the gate-level Verilog netlist on its own (read_verilog + link_design),
+#    so the Verilog reference numbers do not come from the placed DEF.
+mkdir -p "${RUN_DIR}"
 openroad -no_init -no_splash << 'EOF'
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_verilog /work/tests/designs/gcd/gcd.synth.v
+link_design gcd
+set block [ord::get_db_block]
+set inst_pins 0
+foreach inst [$block getInsts] { incr inst_pins [llength [$inst getITerms]] }
+set signal_nets 0
+foreach net [$block getNets] { if {[$net isSpecial] == 0} { incr signal_nets } }
+set fp [open "/work/tests/designs/gcd/runs/canonical/verilog_counts.tcl" "w"]
+puts $fp "set verilog_logic_instances [llength [$block getInsts]]"
+puts $fp "set verilog_signal_nets $signal_nets"
+puts $fp "set verilog_bterms [llength [$block getBTerms]]"
+puts $fp "set verilog_inst_pins $inst_pins"
+close $fp
+exit
+EOF
+
+# 7. Orientation fixture: gcd.placed.def with the logic cells cycled through all 8
+#    orientations (gcd itself only uses N/S/FN/FS), plus OpenROAD's getAvgXY for every
+#    signal instance pin. Cells may leave the die; only the pin arithmetic is checked.
+openroad -no_init -no_splash << 'EOF'
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+set orients {R0 R180 R90 R270 MY MX MXR90 MYR90}
+set k 0
+foreach inst [[ord::get_db_block] getInsts] {
+    if {[[$inst getMaster] getType] ne "CORE"} continue
+    $inst setOrient [lindex $orients [expr {$k % 8}]]
+    incr k
+}
+write_def /work/tests/designs/gcd/gcd.orient.def
+exit
+EOF
+openroad -no_init -no_splash << 'EOF'
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.orient.def
+set fp [open "/work/tests/designs/gcd/gcd.orient.pins.txt" "w"]
+puts $fp "# inst/pin x_dbu y_dbu (OpenROAD dbITerm::getAvgXY)"
+set hpwl 0
+foreach net [[ord::get_db_block] getNets] {
+    if {[$net isSpecial]} continue
+    set bbox [$net getTermBBox]
+    incr hpwl [expr {[$bbox dx] + [$bbox dy]}]
+    foreach it [$net getITerms] {
+        set xy [$it getAvgXY]
+        puts $fp "[[$it getInst] getName]/[[$it getMTerm] getName] [lindex $xy 1] [lindex $xy 2]"
+    }
+}
+close $fp
+set fp [open "/work/tests/designs/gcd/runs/canonical/orient_counts.tcl" "w"]
+puts $fp "set orient_hpwl_dbu $hpwl"
+close $fp
+exit
+EOF
+
+# 8. Generate gcd.reference.json via live OpenROAD and OpenSTA API queries
+openroad -no_init -no_splash << 'EOF'
+source /work/tests/designs/gcd/runs/canonical/verilog_counts.tcl
+source /work/tests/designs/gcd/runs/canonical/orient_counts.tcl
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
@@ -153,12 +221,10 @@ set die_yh [$die_area yMax]
 set instances [llength [$block getInsts]]
 set logic_instances 0
 set physical_instances 0
-set verilog_inst_pins 0
 foreach inst [$block getInsts] {
     set type [[$inst getMaster] getType]
     if {$type eq "CORE"} {
         incr logic_instances
-        incr verilog_inst_pins [llength [$inst getITerms]]
     } else {
         incr physical_instances
     }
@@ -186,14 +252,17 @@ foreach net [$block getNets] {
 set bterms_total [llength [$block getBTerms]]
 set bterms_signal 0
 foreach bt [$block getBTerms] {
-    if {![$bt isSpecial]} {
+    if {[$bt isSpecial] == 0} {
         incr bterms_signal
     }
 }
 
 set rows [llength [$block getRows]]
 set track_grids_layers [llength [$block getTrackGrids]]
-set def_tracks_statements [expr {$track_grids_layers * 2}]
+set def_tracks_statements 0
+foreach tg [$block getTrackGrids] {
+    incr def_tracks_statements [expr {[$tg getNumGridPatternsX] + [$tg getNumGridPatternsY]}]
+}
 
 set zero_wire_wns_ns [format "%.4f" [sta::worst_slack -max]]
 set zero_wire_tns_ns [format "%.4f" [sta::total_negative_slack -max]]
@@ -210,7 +279,6 @@ puts $fp "  \"corner\": \"tt_025C_1v80\","
 puts $fp "  \"lib_cells\": $lib_cells,"
 puts $fp "  \"lib_pins\": $lib_pins,"
 puts $fp "  \"lib_sequential_cells\": $lib_sequential_cells,"
-puts $fp "  \"lib_sequential_syntax_groups\": 87,"
 puts $fp "  \"tech_dbu_per_micron\": $tech_dbu_per_micron,"
 puts $fp "  \"tech_routing_layers\": $tech_routing_layers,"
 puts $fp "  \"tech_macros\": $tech_macros,"
@@ -222,6 +290,9 @@ puts $fp "  \"instances\": $instances,"
 puts $fp "  \"logic_instances\": $logic_instances,"
 puts $fp "  \"physical_instances\": $physical_instances,"
 puts $fp "  \"def_inst_pins\": $def_inst_pins,"
+puts $fp "  \"verilog_logic_instances\": $verilog_logic_instances,"
+puts $fp "  \"verilog_signal_nets\": $verilog_signal_nets,"
+puts $fp "  \"verilog_bterms\": $verilog_bterms,"
 puts $fp "  \"verilog_inst_pins\": $verilog_inst_pins,"
 puts $fp "  \"signal_nets\": $signal_nets,"
 puts $fp "  \"special_nets\": $special_nets,"
@@ -233,6 +304,7 @@ puts $fp "  \"track_grids_layers\": $track_grids_layers,"
 puts $fp "  \"def_tracks_statements\": $def_tracks_statements,"
 puts $fp "  \"placed_hpwl_dbu\": $placed_hpwl_dbu,"
 puts $fp "  \"placed_hpwl_um\": [expr {$placed_hpwl_dbu / 1000.0}],"
+puts $fp "  \"orient_hpwl_dbu\": $orient_hpwl_dbu,"
 puts $fp "  \"zero_wire_wns_ns\": $zero_wire_wns_ns,"
 puts $fp "  \"zero_wire_tns_ns\": $zero_wire_tns_ns,"
 puts $fp "  \"placed_spef_wns_ns\": $placed_spef_wns_ns,"

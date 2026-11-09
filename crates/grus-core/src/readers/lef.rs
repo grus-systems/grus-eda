@@ -442,6 +442,15 @@ fn parse_macro_class(c1: &str, c2: &str) -> MacroClass {
     }
 }
 
+/// Floor of `sum_twice / (2 * count)` and whether a remainder was dropped.
+fn mean_center(sum_twice: i64, count: i64) -> (i32, bool) {
+    if count == 0 {
+        return (0, false);
+    }
+    let den = 2 * count;
+    (sum_twice.div_euclid(den) as i32, sum_twice.rem_euclid(den) != 0)
+}
+
 fn parse_pin(
     lexer: &mut LefLexer,
     tech_db: &mut TechDb,
@@ -453,8 +462,8 @@ fn parse_pin(
     let mut is_power = false;
     let mut pin_layer = None;
 
-    let mut sum_center_x: i64 = 0;
-    let mut sum_center_y: i64 = 0;
+    let mut sum_twice_center_x: i64 = 0;
+    let mut sum_twice_center_y: i64 = 0;
     let mut rect_count: i64 = 0;
     let dbu = tech_db.dbu_per_micron as f32;
 
@@ -510,10 +519,8 @@ fn parse_pin(
                             let x2_dbu = (x2 * dbu).round() as i32;
                             let y2_dbu = (y2 * dbu).round() as i32;
 
-                            let cx = (x1_dbu + x2_dbu) / 2;
-                            let cy = (y1_dbu + y2_dbu) / 2;
-                            sum_center_x += cx as i64;
-                            sum_center_y += cy as i64;
+                            sum_twice_center_x += (x1_dbu + x2_dbu) as i64;
+                            sum_twice_center_y += (y1_dbu + y2_dbu) as i64;
                             rect_count += 1;
                             lexer.skip_to_semi();
                         } else {
@@ -527,16 +534,8 @@ fn parse_pin(
         }
     }
 
-    let offset_x_dbu = if rect_count > 0 {
-        (sum_center_x / rect_count) as i32
-    } else {
-        0
-    };
-    let offset_y_dbu = if rect_count > 0 {
-        (sum_center_y / rect_count) as i32
-    } else {
-        0
-    };
+    let (offset_x_dbu, offset_x_frac) = mean_center(sum_twice_center_x, rect_count);
+    let (offset_y_dbu, offset_y_frac) = mean_center(sum_twice_center_y, rect_count);
 
     tech_db.macro_pins.push(MacroPin {
         name: pin_sym,
@@ -544,6 +543,8 @@ fn parse_pin(
         is_power,
         offset_x_dbu,
         offset_y_dbu,
+        offset_x_frac,
+        offset_y_frac,
         layer: pin_layer,
     });
 

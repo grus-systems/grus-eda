@@ -24,55 +24,23 @@ All golden files are strictly under 1 MB and generated from a single canonical r
 | `gcd.v` | 18 KB | Original Verilog RTL source. |
 | `gcd.sdc` | 234 B | Minimal benchmark timing constraints (5.0 ns period, 1.0 ns I/O delays). |
 | `config.yaml` | 177 B | LibreLane design configuration. |
-| `generate_ref.sh` | 4.8 KB | Turnkey reproduction script running inside `ghcr.io/librelane/librelane:3.0.16`. |
+| `generate_ref.sh` | 11 KB | Turnkey reproduction script running inside `ghcr.io/librelane/librelane:3.0.16`. |
 | `gcd.synth.v` | 30 KB | Gate-level post-synthesis Verilog (Yosys + ABC, 233 logic instances). |
 | `gcd.synth.json` | 693 KB | Yosys JSON representation (`write_json`) of the exact same synthesis netlist. |
 | `gcd.floorplan.def` | 71 KB | Initialized floorplan DEF: placed I/O pins, fixed tap/endcaps (151 instances), PDN stripes, logic cells unplaced. |
 | `gcd.placed.def` | 75 KB | Legalized placement DEF (OpenROAD global placement + detailed placement without filler cells, 384 components). |
 | `gcd.routed.spef` | 164 KB | IEEE 1481 SPEF parasitics extracted from `gcd.placed.def`. |
-| `gcd.reference.json` | 666 B | Golden counts and baseline metrics dumped by OpenSTA and OpenROAD. |
+| `gcd.orient.def` | 76 KB | `gcd.placed.def` with the logic cells cycled through all 8 orientations (cells may leave the die). Checks pin transforms only. |
+| `gcd.orient.pins.txt` | 18 KB | OpenROAD `dbITerm::getAvgXY` of every signal instance pin in `gcd.orient.def`. |
+| `gcd.reference.json` | 1 KB | Golden counts and baseline metrics dumped by OpenSTA and OpenROAD (step 8 of `generate_ref.sh`). |
 
 ---
 
 ## 3. Golden Reference Metrics (`gcd.reference.json`)
 
-```json
-{
-  "design": "gcd",
-  "pdk": "sky130_fd_sc_hd",
-  "corner": "tt_025C_1v80",
-  "lib_cells": 428,
-  "lib_pins": 1897,
-  "lib_sequential_cells": 63,
-  "lib_sequential_syntax_groups": 87,
-  "tech_dbu_per_micron": 1000,
-  "tech_routing_layers": 6,
-  "tech_macros": 437,
-  "tech_macro_pins": 3526,
-  "site_width_dbu": 460,
-  "site_height_dbu": 2720,
-  "die_area_dbu": [0, 0, 91950, 102670],
-  "instances": 384,
-  "logic_instances": 233,
-  "physical_instances": 151,
-  "def_inst_pins": 2227,
-  "verilog_inst_pins": 1809,
-  "signal_nets": 269,
-  "special_nets": 2,
-  "connected_net_pins": 931,
-  "bterms_total": 56,
-  "bterms_signal": 54,
-  "rows": 29,
-  "track_grids_layers": 6,
-  "def_tracks_statements": 12,
-  "placed_hpwl_dbu": 4529224,
-  "placed_hpwl_um": 4529.224,
-  "zero_wire_wns_ns": 1.7578,
-  "zero_wire_tns_ns": 0.0000,
-  "placed_spef_wns_ns": 1.6642,
-  "placed_spef_tns_ns": 0.0000
-}
-```
+The values live only in [`gcd/gcd.reference.json`](gcd/gcd.reference.json), written by OpenROAD/OpenSTA
+in step 8 of `generate_ref.sh`; the integration tests read that file directly. Do not copy the numbers
+here or edit the file by hand.
 
 ---
 

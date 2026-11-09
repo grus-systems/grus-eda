@@ -91,5 +91,22 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - Total Half-Perimeter Wirelength (HPWL) is 4,529,219 DBU, differing by only 5 DBU (0.0001%) from OpenROAD's exact unrounded internal `getTermBBox` sum (4,529,224 DBU) and rounding to 4,529.2 um, matching OpenROAD's reported metric exactly.
   - Track Grid reporting distinguishes the 6 layer track grids queried via OpenDB `$block getTrackGrids` from the 12 track direction statements in DEF syntax (X and Y patterns per layer).
 
+### 2026-11-09 — E0.5 audit — `gcd` pin positions, all 8 orientations, and reference provenance
+- **Reference Command**: `tests/designs/gcd/generate_ref.sh` steps 6–8 inside `ghcr.io/librelane/librelane:3.0.16` (steps 1–5 not rerun; the committed netlists and placed DEF are their inputs). Step 7 writes `gcd.orient.def` (logic cells cycled through `R0 R180 R90 R270 MY MX MXR90 MYR90`) and dumps `dbITerm::getAvgXY` for every signal instance pin to `gcd.orient.pins.txt`.
+- **Our Command**: `cargo test --release` (`test_gcd_placed_def`, `test_gcd_orientations_match_openroad_pins`)
 
+| Metric | Reference (`OpenROAD`) | Ours before | Ours after | Pass? |
+|---|---|---|---|---|
+| Placed HPWL (`gcd.placed.def`) | 4,529,224 DBU | 4,529,219 DBU | 4,529,224 DBU | PASS (exact) |
+| Instance pins at OpenROAD's position (`gcd.placed.def`) | 877 | 669 | 877 | PASS (exact) |
+| Instance pins at OpenROAD's position (`gcd.orient.def`, 8 orientations) | 877 | W/E/FW/FE wrong | 877 | PASS (exact) |
+| HPWL (`gcd.orient.def`) | 5,096,591 DBU | — | 5,096,591 DBU | PASS (exact) |
+| Verilog logic cells / signal nets / I/O pins / inst pins (`read_verilog` + `link_design`) | 233 / 269 / 54 / 1,809 | — | 233 / 269 / 54 / 1,809 | PASS |
+| DEF TRACKS statements (`getNumGridPatternsX + Y`) | 12 | 12 | 12 | PASS |
 
+- **Root causes found**:
+  - **Rounding order (the 5 DBU HPWL gap)**: we truncated the mean rect center in macro-local coordinates and then mirrored it; OpenROAD mirrors each rect first and truncates last. On a mirrored axis with a fractional center the two disagree by 1 DBU (208 of 877 pins, for example the `Q` pins of `FS` flip-flops). We also rounded each rect center before averaging. Fixed by summing `x1 + x2` over all rects, dividing once, and keeping a `*_frac` flag (spec: `docs/e0-readers.md` Step E0.4).
+  - **Rotated orientations**: `W`/`E` and `FW`/`FE` were swapped in `pin_pos_dbu`. gcd only uses `N`/`S`/`FN`/`FS`, so the earlier "all 8 orientations" claim in the E0.5 entry was untested. The orientation fixture now covers all eight.
+  - **Truncation toward zero**: cells pushed off-die by the orientation fixture have negative pin coordinates; OpenROAD's `int(double)` rounds those toward zero, not down (1 pin). Reproduced.
+  - **Reference script fed `![...]` to openroad's stdin**, where the interactive shell treats `!` as history expansion: run as written, `bterms_signal` came out 1 and the Verilog signal-net count 0. The committed 54 had been produced some other way. Negations are now written `== 0`.
+  - Removed from the reference JSON: `lib_sequential_syntax_groups` (a hand-written text count, not a tool value). The Liberty test no longer hard-codes the 45 FF / 18 latch split, because OpenSTA's Tcl API exposes no per-cell ff/latch flag; only the total of 63 is tool-derived.

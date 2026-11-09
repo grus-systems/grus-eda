@@ -154,16 +154,25 @@ impl DesignDb {
                 let h = mac.height_dbu;
                 let ox = self.pin_offset_x_dbu[p];
                 let oy = self.pin_offset_y_dbu[p];
+                let (fx, fy) = match self.pin_macro_pins[p] {
+                    Some(mp) => {
+                        let mpin = &tech_db.macro_pins[mp.0 as usize];
+                        (mpin.offset_x_frac, mpin.offset_y_frac)
+                    }
+                    None => (false, false),
+                };
+                let x = |base, off, frac| truncated_axis(base, off, frac, false);
+                let mx = |base, off, frac| truncated_axis(base, off, frac, true);
 
                 match orient {
-                    Orient::N => (cx + ox, cy + oy),
-                    Orient::S => (cx + w - ox, cy + h - oy),
-                    Orient::W => (cx + oy, cy + w - ox),
-                    Orient::E => (cx + h - oy, cy + ox),
-                    Orient::FN => (cx + w - ox, cy + oy),
-                    Orient::FS => (cx + ox, cy + h - oy),
-                    Orient::FW => (cx + h - oy, cy + w - ox),
-                    Orient::FE => (cx + oy, cy + ox),
+                    Orient::N => (x(cx, ox, fx), x(cy, oy, fy)),
+                    Orient::S => (mx(cx + w, ox, fx), mx(cy + h, oy, fy)),
+                    Orient::W => (mx(cx + h, oy, fy), x(cy, ox, fx)),
+                    Orient::E => (x(cx, oy, fy), mx(cy + w, ox, fx)),
+                    Orient::FN => (mx(cx + w, ox, fx), x(cy, oy, fy)),
+                    Orient::FS => (x(cx, ox, fx), mx(cy + h, oy, fy)),
+                    Orient::FW => (x(cx, oy, fy), x(cy, ox, fx)),
+                    Orient::FE => (mx(cx + h, oy, fy), mx(cy + w, ox, fx)),
                 }
             }
         }
@@ -199,4 +208,16 @@ impl DesignDb {
         }
         total_hpwl
     }
+}
+
+/// One axis of an instance pin position, as OpenROAD's `dbITerm::getAvgXY` gives it:
+/// the exact value is `base + c` (or `base - c` when `mirrored`), where the local mean
+/// center `c` lies in `[off, off + 1)` and is fractional iff `frac`. OpenROAD truncates
+/// toward zero, so the result is whichever of `floor` and `floor + 1` is nearer zero.
+fn truncated_axis(base: i32, off: i32, frac: bool, mirrored: bool) -> i32 {
+    if !frac {
+        return if mirrored { base - off } else { base + off };
+    }
+    let floor = if mirrored { base - off - 1 } else { base + off };
+    if floor < 0 { floor + 1 } else { floor }
 }

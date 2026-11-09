@@ -272,6 +272,8 @@ mod tests {
             is_power: false,
             offset_x_dbu: 230,
             offset_y_dbu: 1360,
+            offset_x_frac: false,
+            offset_y_frac: false,
             layer: Some(LayerId(0)),
         });
         tech.macro_pins.push(MacroPin {
@@ -280,6 +282,8 @@ mod tests {
             is_power: false,
             offset_x_dbu: 400,
             offset_y_dbu: 1360,
+            offset_x_frac: false,
+            offset_y_frac: false,
             layer: Some(LayerId(0)),
         });
 

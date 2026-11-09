@@ -358,9 +358,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["bterms_signal"].as_u64().unwrap() as usize);
+        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
+        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
+        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
         assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
 
         // Verify driver invariant on all nets with at least one driver

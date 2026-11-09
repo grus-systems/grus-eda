@@ -880,14 +880,8 @@ mod tests {
         assert_eq!(db.cell_pin_ids.len(), ref_json["def_inst_pins"].as_u64().unwrap() as usize);
         assert_eq!(db.net_pin_ids.len(), ref_json["connected_net_pins"].as_u64().unwrap() as usize);
 
-        // Verify HPWL matches golden reference (4,529,224 DBU = 4529.224 um)
         let hpwl = db.compute_hpwl_dbu(&tech_db);
-        println!("Calculated HPWL: {} DBU ({:.3} um)", hpwl, hpwl as f64 / 1000.0);
-        let ref_hpwl = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
-        let diff = (hpwl - ref_hpwl).abs();
-        assert!(diff <= 50, "HPWL within 50 DBU of golden reference: got {}, ref {}, diff={}", hpwl, ref_hpwl, diff);
-        let hpwl_um = (hpwl as f64 / 100.0).round() / 10.0;
-        assert_eq!(hpwl_um, 4529.2, "HPWL in microns must match golden reference 4529.2 um");
+        assert_eq!(hpwl, ref_json["placed_hpwl_dbu"].as_i64().unwrap(), "HPWL must equal OpenROAD getTermBBox sum");
 
         // Verify write_def roundtrip and re-parse
         let tmp_dir = std::env::temp_dir();
@@ -900,5 +894,51 @@ mod tests {
         assert_eq!(db_roundtrip.num_nets(), db.num_nets());
         assert_eq!(db_roundtrip.compute_hpwl_dbu(&tech_db), hpwl);
         let _ = std::fs::remove_file(out_def_path);
+    }
+
+    /// Every instance pin of gcd with the cells cycled through all 8 orientations must
+    /// land exactly where OpenROAD's `dbITerm::getAvgXY` puts it.
+    #[test]
+    fn test_gcd_orientations_match_openroad_pins() {
+        let pdk_root = std::env::var("PDK_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".ciel"));
+        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
+        let gcd_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/designs/gcd");
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", pdk_root, e));
+        let db = parse_def(&gcd_dir.join("gcd.orient.def"), &tech_db, None)
+            .expect("Failed to parse gcd.orient.def");
+
+        let mut ours = std::collections::HashMap::new();
+        for &pin in &db.net_pin_ids {
+            let p = pin.0 as usize;
+            if let Some(cell) = db.pin_cells[p] {
+                let name = format!(
+                    "{}/{}",
+                    db.strings.resolve(db.cell_names[cell.0 as usize]),
+                    db.strings.resolve(db.pin_names[p])
+                );
+                ours.insert(name, db.pin_pos_dbu(pin, &tech_db));
+            }
+        }
+
+        let golden = std::fs::read_to_string(gcd_dir.join("gcd.orient.pins.txt"))
+            .expect("Failed to read gcd.orient.pins.txt");
+        let mut checked = 0;
+        for line in golden.lines().filter(|l| !l.starts_with('#')) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let want = (f[1].parse::<i32>().unwrap(), f[2].parse::<i32>().unwrap());
+            assert_eq!(ours.get(f[0]), Some(&want), "pin {}", f[0]);
+            checked += 1;
+        }
+        assert_eq!(checked, ours.len(), "golden file must cover every signal instance pin");
+
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(gcd_dir.join("gcd.reference.json")).unwrap()).unwrap();
+        assert_eq!(db.compute_hpwl_dbu(&tech_db), ref_json["orient_hpwl_dbu"].as_i64().unwrap());
     }
 }
