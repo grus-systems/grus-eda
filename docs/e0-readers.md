@@ -124,7 +124,22 @@ Parse `.tlef` (technology LEF) followed by `.lef` (macro cell LEF) into `TechDb`
    - For each `PIN <pin_name>`:
      - `DIRECTION INPUT | OUTPUT | INOUT ;`
      - `USE SIGNAL | CLOCK | POWER | GROUND ;` (`is_power = matches!(use, POWER | GROUND)`).
-     - Inside `PORT`, track the current `LAYER <layer_name> ;` and compute the bounding box union $[x_{\min}, y_{\min}, x_{\max}, y_{\max}]$ across all `RECT <x1> <y1> <x2> <y2> ;` statements. Store `offset_x_dbu = (x_min + x_max) / 2` and `offset_y_dbu = (y_min + y_max) / 2`.
+     - Inside `PORT`, track the current `LAYER <layer_name> ;`. The pin position is the arithmetic mean of the centers of all `RECT <x1> <y1> <x2> <y2> ;` statements across every `PORT` and layer of the pin, as OpenROAD's `dbITerm::getAvgXY` computes it. With $n$ rects and $S_x = \sum (x_1 + x_2)$ in DBU, store `offset_x_dbu = floor(S_x / 2n)` and `offset_x_frac = (S_x mod 2n != 0)` (same for `y`). Sum first and divide once; rounding each rect center separately gives a different result.
+     - **Why the `*_frac` flag**: OpenROAD transforms every rect by the instance orientation first, averages in `double`, then truncates toward zero (`int(double)`). The exact value on one axis is `base + c` or, on a mirrored axis, `base - c`, where `c` is the local mean center. `DesignDb::pin_pos_dbu` reproduces the truncation from `floor(c)` and the flag: of `floor(value)` and `floor(value) + 1` it takes the one nearer zero. Without the flag, gcd's `FS` flip-flop outputs land 1 DBU off OpenROAD (HPWL 5 DBU off).
+     - **Orientation transform** (cell origin `(cx, cy)` = placed lower-left, macro size `w x h`, local center `(ox, oy)`; matches OpenDB `dbTransform` and the DEF names `W = R90`, `E = R270`, `FW = MXR90`, `FE = MYR90`):
+
+       | DEF | x | y |
+       |---|---|---|
+       | `N`  | `cx + ox` | `cy + oy` |
+       | `S`  | `cx + w - ox` | `cy + h - oy` |
+       | `W`  | `cx + h - oy` | `cy + ox` |
+       | `E`  | `cx + oy` | `cy + w - ox` |
+       | `FN` | `cx + w - ox` | `cy + oy` |
+       | `FS` | `cx + ox` | `cy + h - oy` |
+       | `FW` | `cx + oy` | `cy + ox` |
+       | `FE` | `cx + h - oy` | `cy + w - ox` |
+
+       `tests/designs/gcd/gcd.orient.def` cycles gcd's logic cells through all eight; every instance pin must equal OpenROAD's `getAvgXY` in `gcd.orient.pins.txt`.
    - Inside `OBS`, track `LAYER <layer_name> ;` and push each `RECT` (converted to `RectDbu`) onto `obs_rects` if the layer is a routing layer.
 
 ---

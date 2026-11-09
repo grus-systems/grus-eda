@@ -358,8 +358,10 @@ pub struct MacroPin {
     pub name: SymbolId,
     pub dir: PinDir,
     pub is_power: bool, // true if USE POWER or USE GROUND
-    pub offset_x_dbu: i32, // bbox center relative to macro origin
+    pub offset_x_dbu: i32, // floor of the mean rect center, relative to macro origin
     pub offset_y_dbu: i32,
+    pub offset_x_frac: bool, // mean center is not an integer (round up on a mirrored axis)
+    pub offset_y_frac: bool,
     pub layer: Option<LayerId>,
 }
 
