@@ -8,7 +8,7 @@ This document breaks E3 into three progressive implementation steps (`E3.1`–`E
 
 | Sub-Step | What | Reference Command (`ghcr.io/librelane/librelane:3.0.16`) | Done When |
 |---|---|---|---|
-| **E3.1** | Zero-Wire STA: levelized DAG, dual Rise/Fall propagation, NLDM extrapolation, Setup/Hold slack | `sta`: `read_liberty`, `read_verilog`, `create_clock`, `report_checks -path_delay min_max` | Worst slack (Setup & Hold) and every endpoint's arrival/slew agree within **1% or 5 ps** on `gcd` and `picorv32` |
+| **E3.1** | Zero-Wire STA: levelized DAG, dual Rise/Fall propagation, NLDM extrapolation, Setup/Hold slack | `generate_ref.sh` step 9 → `tests/designs/gcd/gcd.sta.reference.json` (`zero_wire`) | Worst slack (Setup & Hold) and, for **all 53 endpoints**, `max/min` arrival, required, slack and slew agree within **1% or 5 ps** on `gcd` (`picorv32` once it is added under `tests/designs/`) |
 | **E3.2** | Placement-Based Virtual RC STA (`parasitics.rs`) | `openroad`: `estimate_parasitics -placement`, `report_tns`, `report_wns` | Agrees with OpenROAD placement-based parasitics when given identical per-micron $r_0, c_0$ |
 | **E3.3** | SPEF-Based STA (`readers/spef.rs` + Elmore tree) | `sta`: `read_spef`, `report_checks -path_delay min_max` | Worst slack and every endpoint's arrival agree within **1% or 5 ps** on extracted `.spef` |
 
@@ -228,6 +228,59 @@ To ensure `grus-eda sta` and OpenSTA evaluate the exact same boundary conditions
        $$\text{req}_{\min}(D, \text{pol}) = \text{arr}_{\max}(CLK, \text{RISE}) + t_{\text{hold}}(\text{pol}) + t_{\text{uncertainty}}$$
        $$\text{slack}_{\text{hold}}(D, \text{pol}) = \text{arr}_{\min}(D, \text{pol}) - \text{req}_{\min}(D, \text{pol})$$
    - Propagate `required_max` (taking `min` across fanout) and `required_min` (taking `max` across fanout) backward from level $L_K$ down to $L_0$.
+
+#### E3.1 Reference Semantics (measured with OpenSTA on `gcd`, 2026-11-10)
+
+Every rule below was checked against `report_checks -fields {slew cap input_pins} -digits 6` on
+`gcd.placed.def` + `gcd.sdc` in `ghcr.io/librelane/librelane:3.0.16`. Where this section and the
+generic text above disagree, this section wins.
+
+1. **Inputs.** `grus-eda sta --lib <.lib> --tlef --lef --def gcd.placed.def --sdc gcd.sdc --parasitics none`.
+   Load the design with `parse_def(def, &tech_db, Some(&lib_db))` so `pin_lib_pins` is filled. The
+   golden file is `tests/designs/gcd/gcd.sta.reference.json`; the test must deserialize it and fail
+   loudly if it is missing.
+2. **Net load is per transition.** For an output pin `y` driving net `e` with transition `pol`:
+   `load(e, RISE) = Σ_sinks cap_rise + port_load`, `load(e, FALL) = Σ_sinks cap_fall + port_load`,
+   where `port_load` is the SDC `set_load` value on any primary-output port on `e` (0.05 pF in gcd).
+   Check: `_384_/Q` rise load `0.008223 = 0.001689 + 0.001614 + 0.002495 + 0.002425`; fall
+   `0.007406`. Zero-wire mode adds no wire cap, no wire delay, and sink slew = driver slew.
+3. **Ideal clock.** The clock net is not propagated. Every register `CLK` pin has
+   `arrival = 0.0` (rise edge at t=0) and **`slew = 0.0`** for both max and min, even though
+   `set_input_transition 0.15 [all_inputs]` matches `clk`. Only `RisingEdge` arcs are used
+   for `dfxtp`; `min_pulse_width` and other non-delay arcs are ignored.
+4. **Clock-to-Q.** `RisingEdge` arcs are `non_unate`: evaluate `CLK(RISE) → Q(RISE)` with
+   `cell_rise`/`rise_transition` and `CLK(RISE) → Q(FALL)` with `cell_fall`/`fall_transition`,
+   both at `in_slew = 0.0` and `out_cap = load(net(Q), pol)`. Check: `_384_/Q` rise
+   delay `0.309059`, slew `0.055303` (linear extrapolation below `index_1[0] = 0.01`).
+5. **Primary inputs.** Arrival = `set_input_delay` (1.0 ns) for both transitions and both
+   max/min; slew = `set_input_transition` (0.15 ns) regardless of load (ideal driver, no
+   `set_driving_cell` in gcd). `clk` is excluded (`-no_clocks`).
+6. **Combinational arcs.** Use `timing_sense` exactly (`positive_unate`, `negative_unate`,
+   `non_unate`). Multiple `timing()` groups may share the same `related_pin` with different
+   `when` conditions (e.g. `xnor2` has a negative and a positive arc from `A`); evaluate **every**
+   arc and merge with max (late) / min (early). Ignore `when`.
+7. **Max and min are independent propagations.** Late: arrival and slew merged with `max`.
+   Early: arrival and slew merged with `min`. Slews are merged independently of which arc wins
+   the arrival (OpenSTA `GraphDelayCalc`).
+8. **Register setup/hold.** For data pin `D` with transition `pol` and the `setup_rising` /
+   `hold_rising` arc: table = `rise_constraint` if `pol == RISE` else `fall_constraint`. The
+   `vio_3_3_1` template has `variable_1 = related_pin_transition`, `variable_2 =
+   constrained_pin_transition`, so call `eval_nldm_constraint(table, constrained = slew(D, pol),
+   related = 0.0)` (ideal clock slew), using late slew for setup and early slew for hold.
+   - `req_max(D, pol) = period + 0.0 − setup(pol)`; `slack_max = req_max − arr_max(D, pol)`.
+   - `req_min(D, pol) = 0.0 + hold(pol)`; `slack_min = arr_min(D, pol) − req_min`.
+   - Check: `_395_/D` fall, slew 0.048424 → setup 0.124895, req 4.875105; `_399_/D` rise, early
+     slew 0.025549 → hold −0.033064.
+9. **Primary-output checks.** `req_max = period − output_delay` (4.0), `req_min = −output_delay`
+   (−1.0); `slack_max = req_max − arr_max`, `slack_min = arr_min − req_min`.
+10. **Endpoint reduction (what the golden file stores).** For each endpoint the reported row is
+    the transition with the **worst slack** (smallest `slack_max` for max; smallest `slack_min`
+    for min). Store that transition's `arr`, `req`, `slack`, and the endpoint pin's slew for the
+    same transition and min/max. `wns_max_ns = min over endpoints of max_slack_ns`; likewise
+    `wns_min_ns`. `tns = Σ min(0, slack)`.
+11. **Units.** Liberty time unit `1ns`, cap unit `1pF` in sky130; keep everything in ns / pF `f32`.
+12. **Comparison.** Per endpoint and per field: pass if `|ours − ref| <= max(0.005, 0.01 * |ref|)`.
+    Report the max abs diff per field in `docs/results.md`, and list any failing endpoint by name.
 
 ---
 
