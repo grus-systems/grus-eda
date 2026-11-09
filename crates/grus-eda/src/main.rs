@@ -35,10 +35,10 @@ struct CheckE0Args {
     lib: PathBuf,
 
     #[arg(long, help = "Path to technology LEF (.tlef) file")]
-    tlef: PathBuf,
+    tlef: Option<PathBuf>,
 
     #[arg(long, help = "Path to standard cell LEF (.lef) file")]
-    lef: PathBuf,
+    lef: Option<PathBuf>,
 
     #[arg(long, help = "Path to DEF (.def) file")]
     def: Option<PathBuf>,
@@ -129,9 +129,23 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::CheckE0(args) => {
+            println!("Loading Liberty from {:?}", args.lib);
+            let t0 = std::time::Instant::now();
+            let lib_db = grus_core::readers::load_liberty(&args.lib)?;
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let ff_count = lib_db.cells.iter().filter(|c| c.is_sequential).count();
+            let latch_count = lib_db.cells.iter().filter(|c| c.is_latch).count();
+            let seq_count = ff_count + latch_count;
             println!(
-                "grus-eda check-e0: lib={:?}, tlef={:?}, lef={:?}",
-                args.lib, args.tlef, args.lef
+                "Loaded Liberty: library={}, cells={}, pins={}, seq_cells={} (ff={}, latch={}), arcs={}, elapsed={:.2}ms",
+                lib_db.library_name,
+                lib_db.cells.len(),
+                lib_db.pins.len(),
+                seq_count,
+                ff_count,
+                latch_count,
+                lib_db.arcs.len(),
+                elapsed_ms
             );
         }
         Commands::Congestion(args) => {

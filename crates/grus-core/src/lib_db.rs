@@ -2,15 +2,17 @@ use crate::interner::{LibCellId, LibPinId, PinDir, SymbolId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimingSense {
     PositiveUnate,
     NegativeUnate,
+    #[default]
     NonUnate,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimingType {
+    #[default]
     Combinational,
     CombinationalRise,
     CombinationalFall,
@@ -27,12 +29,13 @@ pub enum TimingType {
     Other,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableAxisVar {
     InputNetTransition,
     TotalOutputNetCapacitance,
     ConstrainedPinTransition,
     RelatedPinTransition,
+    #[default]
     Other,
 }
 
