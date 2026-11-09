@@ -90,8 +90,8 @@ Let $M$ be a power of 2:
 
 - **1D Inverse DCT (`idct1d`, satisfying $\text{idct1d}(\text{dct1d}(x)) = x$)**:
   1. Given spectral coefficients $C[0..M]$, form complex frequency vector $W[0..M]$:
-     $$W[0] = \frac{1}{M} C[0], \quad W[u] = \frac{2}{M}\bigl(C[u] - i \, C[M - u]\bigr)\,e^{i \frac{\pi u}{2M}} \quad \text{for } u = 1, \dots, M - 1$$
-     (or equivalently run inverse complex IFFT on $V[u] = \frac{2}{M} C[u] e^{i \frac{\pi u}{2M}}$ with $V[0] = \frac{1}{M} C[0]$ and take the real part).
+     $$W[0] = \frac{1}{M} C[0], \quad W[u] = \frac{1}{M}\bigl(C[u] - i \, C[M - u]\bigr)\,e^{i \frac{\pi u}{2M}} \quad \text{for } u = 1, \dots, M - 1$$
+     and run 1D inverse complex IFFT (`plan_fft_inverse`) on $W \to v$. (Because $C[u] - i C[M - u]$ already combines both positive and negative frequencies via $C[M - u] = -\text{Im}(V[u] e^{-i \pi u / (2M)})$, the scale factor is $\frac{1}{M}$, not $\frac{2}{M}$.)
   2. Un-permute the real part $v[0..M]$ back to spatial order:
      $$x[2k] = \text{Re}(v[k]), \quad x[2k + 1] = \text{Re}(v[M - 1 - k]) \quad \text{for } k = 0, \dots, \frac{M}{2} - 1$$
 
@@ -107,8 +107,43 @@ Let $M$ be a power of 2:
   2. Define wavenumbers $\omega_u = \frac{\pi u}{M w_b}$ and $\omega_v = \frac{\pi v}{M h_b}$:
      $$\hat{\phi}_{u, v} = \begin{cases} 0 & \text{if } u = 0 \text{ and } v = 0 \\ \dfrac{a_{u, v}}{\omega_u^2 + \omega_v^2} & \text{otherwise} \end{cases}, \quad \hat{E}^x_{u, v} = \omega_u \, \hat{\phi}_{u, v}, \quad \hat{E}^y_{u, v} = \omega_v \, \hat{\phi}_{u, v}$$
   3. Recover $\phi(x, y)$ by applying `idct1d` along rows and `idct1d` along columns of $\hat{\phi}$.
-  4. Recover $E_x(x, y)$ by applying `idxst1d` along $u$ (horizontal) and `idct1d` along $v$ (vertical) of $\hat{E}^x$.
-  5. Recover $E_y(x, y)$ by applying `idct1d` along $u$ (horizontal) and `idxst1d` along $v$ (vertical) of $\hat{E}^y$.
+  4. Recover $E_x(x, y)$ by applying `idxst1d` along $u$ (horizontal rows) and `idct1d` along $v$ (vertical columns) of $\hat{E}^x$.
+  5. Recover $E_y(x, y)$ by applying `idct1d` along $u$ (horizontal rows) and `idxst1d` along $v$ (vertical columns) of $\hat{E}^y$.
+- **Cell Electrostatic Force Gathering**:
+  For each movable cell $c$, gather the repulsive electrostatic force:
+  $$F_x[c] = s_c \sum_{u, v} \Delta x(c, u) \, \Delta y(c, v) \, E_x(u, v), \quad F_y[c] = s_c \sum_{u, v} \Delta x(c, u) \, \Delta y(c, v) \, E_y(u, v)$$
+  (where the density penalty gradient is $\frac{\partial \Psi}{\partial x_c} = -F_x[c], \frac{\partial \Psi}{\partial y_c} = -F_y[c]$).
+
+#### Concrete Structs & Signatures (`crates/grus-core/src/placement/density.rs`)
+```rust
+pub struct DensitySolver {
+    pub m: usize, // power-of-2 grid dimension M x M
+    pub core_xl_um: f32,
+    pub core_yl_um: f32,
+    pub core_xh_um: f32,
+    pub core_yh_um: f32,
+    pub bin_w_um: f32,
+    pub bin_h_um: f32,
+    pub bin_area_um2: f32,
+    pub target_density: f32,
+    pub total_movable_area_um2: f32,
+    pub cell_w_um: Vec<f32>,
+    pub cell_h_um: Vec<f32>,
+    pub cell_stretched_w_um: Vec<f32>,
+    pub cell_stretched_h_um: Vec<f32>,
+    pub cell_density_scale: Vec<f32>, // s_c = (w_c * h_c) / (w'_c * h'_c)
+    pub movable_cell_mask: Vec<bool>,
+    pub fixed_area: Vec<f32>,   // length m * m
+    pub movable_area: Vec<f32>, // length m * m
+    pub rho: Vec<f32>,          // length m * m (zero-mean charge density)
+    pub phi: Vec<f32>,          // length m * m (electrostatic potential)
+    pub e_x: Vec<f32>,          // length m * m (horizontal electric field -dphi/dx)
+    pub e_y: Vec<f32>,          // length m * m (vertical electric field -dphi/dy)
+}
+```
+- `DensitySolver::new(design_db: &DesignDb, tech_db: &TechDb, target_density: f32, grid_m_override: Option<usize>) -> Self`
+- `DensitySolver::solve_poisson_from_rho(&mut self)` (solves `self.phi`, `self.e_x`, `self.e_y` from `self.rho`)
+- `DensitySolver::compute_density_and_forces(&mut self, cell_x_um: &[f32], cell_y_um: &[f32], force_x: &mut [f32], force_y: &mut [f32]) -> (f32, f64)` (returns `(overflow_tau, potential_energy_psi)`)
 
 ---
 
