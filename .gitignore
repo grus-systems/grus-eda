@@ -1,0 +1,5 @@
+/target/
+/out/
+*.odb
+*.vcd
+.DS_Store
