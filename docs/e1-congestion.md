@@ -35,6 +35,12 @@ pub struct GCellGrid {
     /// indexed by `y * nx + x`, length `(ny - 1) * nx`
     pub v_cap: Vec<f32>,
     pub v_demand: Vec<f32>,
+
+    /// Per-layer totals (indexed by `LayerId(0..tech_db.layers.len())`) for direct
+    /// verification against OpenROAD `dbGCellGrid` and `[INFO GRT-0053]`:
+    pub layer_raw_edge_tracks: Vec<u32>,
+    pub layer_orig_edge_tracks: Vec<u32>,
+    pub layer_derated_edge_tracks: Vec<u32>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -67,7 +73,7 @@ pub struct CongestionReport {
 
 ### Step E1.1: GCell Grid Construction & Track Supply (`gcell.rs`)
 
-1. **Grid Dimensions**:
+1. **Grid Dimensions (matching OpenDB `dbBlock::getGCellTileSize` & `FastRoute` grid)**:
    - In `sky130_fd_sc_hd` (`1000 DBU = 1 um`), the routing layer pitches in `.tlef` are:
      - `li1` (V/local): `0.46 um` (`460 DBU`)
      - `met1` (H): `0.34 um` (`340 DBU`)
@@ -75,37 +81,65 @@ pub struct CongestionReport {
      - `met3` (H): `0.68 um` (`680 DBU`)
      - `met4` (V): `0.92 um` (`920 DBU`)
      - `met5` (H): `3.40 um` (`3400 DBU`)
-   - If the input DEF already contains `GCELLGRID` statements (`DesignDb::gcell_grids`), adopt its exact `(origin_x_dbu, origin_y_dbu, gcell_w_dbu, gcell_h_dbu, nx, ny)`.
-   - Otherwise, follow OpenROAD/FastRoute's default tile size: `gcell_w_dbu = 15 * met2_pitch_dbu` (`15 * 460 = 6900 DBU` when `met2` pitch is `460 DBU`, or `15 * met1_pitch_dbu = 5100 DBU` if uniform 15-track `met1` grid is selected via CLI), with:
+   - If the input DEF already contains `GCELLGRID` statements (`DesignDb::gcell_grids`), adopt its `(origin_x_dbu, origin_y_dbu, gcell_w_dbu, gcell_h_dbu, nx, ny)`.
+   - Otherwise, follow OpenROAD's `dbBlock::getGCellTileSize()` default: `gcell_w_dbu = gcell_h_dbu = 15 * pitch_dbu(met2)` (`15 * 460 = 6900 DBU`, i.e., $15\times$ the pitch of the 3rd routing layer `met2`, overridable via CLI `--gcell-tracks`), with integer **floor** division:
      - `origin_x_dbu = die_area.xl`, `origin_y_dbu = die_area.yl`
-     - `nx = ((die_area.xh - die_area.xl + gcell_w_dbu - 1) / gcell_w_dbu).max(1) as usize`
-     - `ny = ((die_area.yh - die_area.yl + gcell_h_dbu - 1) / gcell_h_dbu).max(1) as usize`
-2. **Track Supply Calculation**:
-   - For each routing layer $l \in \{\text{met1}, \text{met2}, \text{met3}, \text{met4}, \text{met5}\}$ (skip `li1` for inter-GCell routing, matching OpenROAD `sky130hd` `set_routing_layers -signal met1-met5`):
-     - Apply layer adjustment factor $1 - \alpha_l$ (default `sky130hd` OpenROAD adjustments: `met1: 0.30`, `met2: 0.20`, `met3: 0.20`, `met4: 0.20`, `met5: 0.20`, configurable via CLI).
+     - `nx = ((die_area.xh - die_area.xl) / gcell_w_dbu).max(1) as usize`
+     - `ny = ((die_area.yh - die_area.yl) / gcell_h_dbu).max(1) as usize`
+     - Column $x \in [0, nx)$ spans $[X_x, X_{x+1})$, where $X_x = x_0 + (x as i32) \cdot W_{\text{gcell}}$ for $x < nx$ and $X_{nx} = \text{die\_area.xh}$ (the last column extends to the upper die boundary, matching `dbGCellGrid`).
+     - Row $y \in [0, ny)$ spans $[Y_y, Y_{y+1})$, where $Y_y = y_0 + (y as i32) \cdot H_{\text{gcell}}$ for $y < ny$ and $Y_{ny} = \text{die\_area.yh}$ (the last row extends to the upper die boundary).
+     - Any DBU coordinate $(x, y)$ maps to GCell indices:
+       $$gx = \text{clamp}\!\left(\frac{x - x_0}{W_{\text{gcell}}},\; 0,\; nx - 1\right), \quad gy = \text{clamp}\!\left(\frac{y - y_0}{H_{\text{gcell}}},\; 0,\; ny - 1\right)$$
+
+2. **Raw Track Supply Calculation (matching `dbGCellGrid::getCapacity`)**:
+   - Skip `li1` (`LayerId(0)`) for inter-GCell routing, matching OpenROAD `sky130hd` `set_routing_layers -signal met1-met5`.
+   - For each active routing layer $l \in \{\text{met1}, \text{met2}, \text{met3}, \text{met4}, \text{met5}\}$:
      - If layer $l$ is `Horizontal`:
-       - For each GCell row $y \in [0, ny)$, count tracks from `DEF TRACKS Y` (or `gcell_h_dbu / pitch_dbu`) whose $y$-coordinate falls inside $[y_0 + y \cdot H, y_0 + (y + 1) \cdot H)$.
-       - Add `tracks_in_row * (1.0 - alpha_l)` to `h_cap[y * (nx - 1) + x]` for all $x \in [0, nx - 1)$.
+       - For each GCell row $y \in [0, ny)$, count tracks from `DesignDb::tracks` (`TrackGrid` with `layer == l` and `is_x_grid == false`) whose coordinate $t_y = \text{start\_dbu} + k \cdot \text{step\_dbu}$ ($0 \le k < \text{num\_tracks}$) satisfies $Y_y \le t_y < Y_{y+1}$ (or $Y_y \le t_y \le Y_{ny}$ when $y == ny - 1$).
+       - If `DesignDb::tracks` has no matching `TrackGrid` for layer $l$, fall back to `(Y_{y+1} - Y_y) / pitch_dbu`.
+       - Across the $nx - 1$ horizontal edges in row $y$, the raw edge track count is `raw_tracks_y[y]`, contributing `(nx - 1) * raw_tracks_y[y]` to `layer_raw_edge_tracks[l]`.
      - If layer $l$ is `Vertical`:
-       - For each GCell column $x \in [0, nx)$, count tracks from `DEF TRACKS X` falling inside $[x_0 + x \cdot W, x_0 + (x + 1) \cdot W)$.
-       - Add `tracks_in_col * (1.0 - alpha_l)` to `v_cap[y * nx + x]` for all $y \in [0, ny - 1)$.
-3. **Obstruction & `SPECIALNETS` (PDN) Deduction**:
-   - **Macro Obstructions (`OBS`)**: For every `Fixed` or `Placed` macro instance with `obs_rects` on routing layers (`met1`..`met5`), transform the obstacle rectangle into DBU coordinates according to the cell's origin and `Orient`.
-   - **Power/Ground Wires (`SPECIALNETS`)**: Include every routed wire rectangle in `DesignDb::special_wire_rects` (`VPWR`/`VGND` standard-cell rails on `met1` and PDN straps on `met4`/`met5`).
-   - Intersect these obstacle rectangles (bloated by half wire spacing/pitch) with overlapping GCell boundaries and subtract the blocked track count from `h_cap` / `v_cap` (clamped at `0.0`).
+       - For each GCell column $x \in [0, nx)$, count tracks from `DesignDb::tracks` (`TrackGrid` with `layer == l` and `is_x_grid == true`) whose coordinate $t_x$ satisfies $X_x \le t_x < X_{x+1}$ (or $X_x \le t_x \le X_{nx}$ when $x == nx - 1$).
+       - Across the $ny - 1$ vertical edges in column $x$, the raw edge track count is `raw_tracks_x[x]`, contributing `(ny - 1) * raw_tracks_x[x]` to `layer_raw_edge_tracks[l]`.
+
+3. **Obstruction (`OBS`) Merging, `SPECIALNETS` Deduction & Layer Derating**:
+   - **Connected-Component Merging of Macro `OBS` in LEF (`readers/lef.rs`)**:
+     In `sky130_fd_sc_hd.lef`, a single internal `met1` jumper in cells like `dfxtp_2`, `xnor2_2`, and `xor2_2` is decomposed into 5–7 touching `RECT` statements (a main bar plus small via-enclosure pads). At the end of `parse_macro` in `readers/lef.rs`, merge any two `obs_rects` on the same `LayerId` that touch or overlap (`a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh`) into their bounding box union until fixed point.
+   - **Instance `OBS` 8-Orientation Transform**:
+     For every `Fixed` or `Placed` cell instance $c$ at `(cx, cy)` with macro size `(w, h)` and orientation `orient`, transform each macro `(layer, rect)` into DBU coordinates `(xl, yl, xh, yh)`:
+     - `N`: `(cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh)`
+     - `S`: `(cx + w - r.xh, cy + h - r.yh, cx + w - r.xl, cy + h - r.yl)`
+     - `W`: `(cx + h - r.yh, cy + r.xl, cx + h - r.yl, cy + r.xh)`
+     - `E`: `(cx + r.yl, cy + w - r.xh, cx + r.yh, cy + w - r.xl)`
+     - `FN`: `(cx + w - r.xh, cy + r.yl, cx + w - r.xl, cy + r.yh)`
+     - `FS`: `(cx + r.xl, cy + h - r.yh, cx + r.xh, cy + h - r.yl)`
+     - `FW`: `(cx + r.yl, cy + r.xl, cx + r.yh, cy + r.xh)`
+     - `FE`: `(cx + h - r.yh, cy + w - r.xh, cx + h - r.yl, cy + w - r.xl)`
+   - **Power/Ground Wires (`SPECIALNETS`)**:
+     Include every routed non-via wire rectangle `(layer, rect)` in `DesignDb::special_wire_rects` (`VPWR`/`VGND` `FOLLOWPIN` rails on `met1`, `STRIPE` straps on `met4`/`met5`, and `DRCFILL` patches on `met2`/`met3`).
+   - **Per-Edge 1D Cross-Track Interval Union & Track Deduction**:
+     For each routing layer $l$ with pitch $P_l = \text{pitch\_dbu}(l)$ and layer adjustment $\alpha_l \in [0.0, 1.0]$ (default `sky130hd` adjustments: `met1: 0.30`, `met2..met5: 0.20`, overridable via uniform or per-layer adjustment):
+     - If layer $l$ is `Horizontal`:
+       - Each obstacle `(xl, yl, xh, yh)` on layer $l$ maps to $gx_1 = \text{gcell\_x}(xl)$, $gx_2 = \text{gcell\_x}(xh)$, $gy_1 = \text{gcell\_y}(yl)$, $gy_2 = \text{gcell\_y}(yh)$.
+       - For each row $y \in [gy_1, gy_2]$ and horizontal edge column $x \in [gx_1, \min(\max(gx_1, gx_2 - 1), nx - 2)]$, clip the obstacle's Y-span to row $y$: $[s, e] = [\max(yl, Y_y), \min(yh, Y_{y+1})]$. If $e > s$, record interval $(s, e)$ on edge $(x, y)$.
+       - On each horizontal edge $(x, y)$, sort and merge overlapping/touching 1D intervals $(s_i, e_i)$, and compute blocked tracks:
+         $$\text{blocked}(l, x, y) = \sum_{i} \frac{e_i - s_i + P_l - 1}{P_l}$$
+       - Compute original (unadjusted) and derated edge track capacity (matching OpenROAD's `FastRoute` integer truncation and minimum-1 clamp when $\text{orig} > 0$ and $\alpha_l < 1.0$):
+         $$\text{orig}(l, x, y) = \max\bigl(0,\; \text{raw\_tracks\_y}[y] - \text{blocked}(l, x, y)\bigr)$$
+         $$\text{derated}(l, x, y) = \begin{cases} 0 & \text{if } \text{orig}(l, x, y) == 0 \text{ or } \alpha_l \ge 1.0, \\ \max\bigl(1,\; \lfloor \text{orig}(l, x, y) \cdot (1.0 - \alpha_l) \rfloor\bigr) & \text{otherwise.} \end{cases}$$
+       - Accumulate `orig` into `layer_orig_edge_tracks[l]`, `derated` into `layer_derated_edge_tracks[l]`, and add `derated as f32` to `h_cap[y * (nx - 1) + x]`.
+     - If layer $l$ is `Vertical`:
+       - Symmetric: for each column $x \in [gx_1, gx_2]$ and vertical edge row $y \in [gy_1, \min(\max(gy_1, gy_2 - 1), ny - 2)]$, clip the obstacle's X-span to $[X_x, X_{x+1})$, sort and merge 1D intervals on edge $(x, y)$, sum $\lceil (e_i - s_i) / P_l \rceil$, compute `orig` and `derated`, and add `derated as f32` to `v_cap[y * nx + x]`.
+   - **Note on `met1` Internal Jumpers vs. Boost.Polygon Slicing**:
+     On `gcd.placed.def`, this formula matches OpenROAD's `dbGCellGrid` raw edge capacities on all 5 layers (`3624, 2600, 1812, 1300, 360`) and matches OpenROAD's `[INFO GRT-0053]` `Original` and `Derated` resources **to the exact integer** on `met2` (`2504 / 1996`), `met3` (`1781 / 1399`), `met4` (`1252 / 926`), and `met5` (`324 / 180`). On `met1`, OpenROAD's `Boost.Polygon` `get_rectangles` slices the via-pad T-shapes of `dfxtp_2` jumpers vertically before mapping to GCells, yielding `2705 / 1815` vs. our merged-jumper `2800 / 1876` (total derated capacity across `met1..met5` is `6377` vs. OpenROAD's `6316`, within `0.96%`).
 
 ---
 
 ### Step E1.2: Pin Mapping & RSMT Decomposition (`rsmt.rs`)
 
 1. **Absolute Pin Coordinates**:
-   - For a primary I/O port $p$, its coordinate is `(pin_offset_x_dbu[p], pin_offset_y_dbu[p])`.
-   - For an instance pin $p$ on cell $c$ with macro size $(W_c, H_c)$ and relative pin offset $(\Delta x, \Delta y)$:
-     - `Orient::N`: $(x_c + \Delta x,\; y_c + \Delta y)$
-     - `Orient::S`: $(x_c + W_c - \Delta x,\; y_c + H_c - \Delta y)$
-     - `Orient::FN`: $(x_c + W_c - \Delta x,\; y_c + \Delta y)$
-     - `Orient::FS`: $(x_c + \Delta x,\; y_c + H_c - \Delta y)$
-   - Map to GCell index:
+   - Call `DesignDb::pin_pos_dbu(pin, tech_db)` (which handles primary I/O ports and all 8 DEF cell orientations matching OpenROAD's `dbITerm::getAvgXY`).
+   - Map $(x, y)$ to GCell index:
      $$gx = \text{clamp}\!\left(\frac{x - x_0}{W_{\text{gcell}}},\; 0,\; nx - 1\right), \quad gy = \text{clamp}\!\left(\frac{y - y_0}{H_{\text{gcell}}},\; 0,\; ny - 1\right)$$
 2. **Deduplicate GCell Pins per Net**:
    - Sort and deduplicate `GPoint`s on net $e$. If unique count $k \le 1$, the net is purely intra-GCell and emits zero inter-GCell segments.
@@ -146,15 +180,23 @@ Iterate over all non-degenerate 2D `SteinerSegment`s `(p1, p2)`:
 3. If both $L_{\text{HV}}$ and $L_{\text{VH}}$ traverse at least one edge with $d + 1.0 > c$, also evaluate **Z-shape** routes (horizontal-vertical-horizontal via intermediate column $x_{\text{mid}} \in (x_{\min}, x_{\max})$, and vertical-horizontal-vertical via intermediate row $y_{\text{mid}} \in (y_{\min}, y_{\max})$) in $O(\Delta x + \Delta y)$ time using prefix sums along the bounding box.
 4. Commit `+1.0` demand along the minimum-cost route.
 
+#### Congestion Report Aggregation
+After routing all nets:
+- For each horizontal edge $e_h \in [0, ny \cdot (nx - 1))$ and vertical edge $e_v \in [0, (ny - 1) \cdot nx)$:
+  $$\text{ovf}(d, c) = \max(0.0,\; d - c), \quad \text{ratio}(d, c) = \begin{cases} d / c & \text{if } c > 0.0, \\ \infty & \text{if } c == 0.0 \text{ and } d > 0.0, \\ 0.0 & \text{otherwise.} \end{cases}$$
+- `total_overflow`: sum of $\text{ovf}(d, c)$ across all horizontal and vertical edges (accumulated in `f64`, cast to `f32`).
+- `max_edge_overflow`: maximum $\text{ovf}(d, c)$ across all horizontal and vertical edges.
+- `top_05pct_overflow`: mean of the largest $k = \max(1, \lceil 0.005 \cdot N_{\text{edges}} \rceil)$ edge overflows sorted descending.
+- `gcell_usage_ratio[y * nx + x]`: maximum of $\text{ratio}(d, c)$ over the up to 4 boundary edges incident to GCell $(x, y)$ (left $(x-1, y)$, right $(x, y)$, bottom $(x, y-1)$, top $(x, y)$).
+- `overflow_gcells`: number of GCells $(x, y)$ with `gcell_usage_ratio[y * nx + x] > 1.0`.
+
 #### Verification Script (`OpenROAD global_route`)
-Run inside the LibreLane container:
-```tcl
-read_lef $tlef
-read_lef $lef
-read_def $placed_def
-set_routing_layers -signal met1-met5
-set_global_routing_layer_adjustment met1 0.30
-set_global_routing_layer_adjustment met2-met5 0.20
-global_route -verbose
-```
-Compare total overflow and variant ranking across test cases (`gcd` at 50%, 65%, 80%, 90% core utilization, plus `picorv32`) and record in `docs/results.md`.
+In `tests/designs/gcd/generate_ref.sh`, run inside the LibreLane container (`ghcr.io/librelane/librelane:3.0.16`) and emit all reference metrics directly into `tests/designs/gcd/gcd.reference.json`:
+1. **Baseline `gcd.placed.def` (`met1: 0.30, met2..met5: 0.20`)**:
+   - Grid dimensions `nx = 13, ny = 14`, `tile_size_dbu = 6900`.
+   - Per-layer raw edge track capacities (`3624, 2600, 1812, 1300, 360`), original capacities (`2705, 2504, 1781, 1252, 324`), and derated capacities (`1815, 1996, 1399, 926, 180`).
+2. **Variant Set A (Layer-Adjustment Sweep on `gcd.placed.def`)**:
+   - Uniform layer adjustment $\alpha \in \{0.50, 0.70, 0.80, 0.85, 0.90\}$ (`set_global_routing_layer_adjustment met1-met5 $alpha`, `global_route -verbose -allow_congestion`).
+3. **Variant Set B (Core-Utilization Placement Sweep on `gcd.synth.v`)**:
+   - Four placed DEF fixtures (`gcd.util25.def`, `gcd.util45.def`, `gcd.util65.def`, `gcd.util78.def`) generated at `25%, 45%, 65%, 78%` core utilization and routed with `set_global_routing_layer_adjustment met1-met5 0.70`.
+   - Compare total overflow and variant ranking against OpenROAD's `global_route` and record in `docs/results.md`.
