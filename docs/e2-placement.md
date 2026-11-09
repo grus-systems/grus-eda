@@ -19,12 +19,16 @@ This document breaks E2 into four concrete implementation steps (`E2.1`–`E2.4`
 
 ### Step E2.1: Smooth Weighted-Average (WA) Wirelength (`wirelength.rs`)
 
+> **Two Mandatory `f32` Numerical Safeguards**:
+> 1. **Exponent Shift (Preventing `expf` Overflow)**: In `f32`, `exp(x)` overflows to `+inf` as soon as the argument exceeds `88.72` (`NaN` in division). Never evaluate `exp(x_p / gamma)` directly; always subtract the per-net maximum $x_{\max}$ (for positive exponentials) and minimum $x_{\min}$ (for negative exponentials) so every exponent argument is $\le 0$.
+> 2. **`f64` Scalar Accumulators for Global Reductions (Preventing Mantissa Swamping)**: Keep all per-cell and per-pin arrays (`pos_x`, `grad_x`, `e_field_x`) as `Vec<f32>`, but accumulate global sums—total WA wirelength $\sum_e W(e)$, $L_1$ norm $\|\nabla W\|_1$, and Barzilai-Borwein $L_2$ dot products $\|v_k - v_{k-1}\|_2^2$, $\|g_k - g_{k-1}\|_2^2$—in scalar **`f64`** (and sum exact integer DBU HPWL in **`i64`**). Summing 100k `f32` values into an `f32` accumulator loses low-order bits and causes the Nesterov step size $\alpha_k$ to oscillate.
+
 Let movable cell $c$ have center coordinate $(x_c, y_c)$ in microns (or normalized DBU `f32`). Each pin $p \in e$ on net $e$ has position:
 $$x_p = x_{c(p)} + \Delta x_p, \quad y_p = y_{c(p)} + \Delta y_p$$
 
 For a smoothing parameter $\gamma > 0$, define stabilized exponentials on net $e$ using $x_{\max} = \max_{p \in e} x_p$ and $x_{\min} = \min_{p \in e} x_p$:
 
-$$a_p^+ = \exp\!\left(\frac{x_p - x_{\max}}{\gamma}\right), \quad a_p^- = \exp\!\left(\frac{x_{\min} - x_p}{\gamma}\right)$$
+$$a_p^+ = \exp\!\left(\frac{x_p - x_{\max}}{\gamma}\right) \in (0, 1], \quad a_p^- = \exp\!\left(\frac{x_{\min} - x_p}{\gamma}\right) \in (0, 1]$$
 
 Define the four net accumulators:
 $$A_e^+ = \sum_{p \in e} a_p^+, \quad B_e^+ = \sum_{p \in e} x_p \, a_p^+, \quad A_e^- = \sum_{p \in e} a_p^-, \quad B_e^- = \sum_{p \in e} x_p \, a_p^-$$
@@ -67,6 +71,27 @@ For the inverse transforms needed for potential $\phi$ (IDCT) and electric field
 ---
 
 ### Step E2.3: Nesterov Accelerated Gradient Loop (`nesterov.rs`)
+
+Use `f64` scalar accumulators for all vector norms and dot products over `f32` slices:
+
+```rust
+#[inline]
+pub fn l1_norm_f64(xs: &[f32], ys: &[f32]) -> f64 {
+    xs.iter().chain(ys.iter()).map(|&v| (v as f64).abs()).sum()
+}
+
+#[inline]
+pub fn l2_dist_f64(ax: &[f32], ay: &[f32], bx: &[f32], by: &[f32]) -> f32 {
+    let sum_sq: f64 = ax.iter().zip(bx.iter())
+        .chain(ay.iter().zip(by.iter()))
+        .map(|(&a, &b)| {
+            let d = (a as f64) - (b as f64);
+            d * d
+        })
+        .sum();
+    sum_sq.sqrt() as f32
+}
+```
 
 1. **Initialization ($k = 0$)**:
    - Place movable cells near the core center (or via 5–10 iterations of bound-to-bound quadratic CG pulling toward fixed I/O pins) with small deterministic perturbation ($\pm 0.01\,w_b$) so cells do not start on identical coordinates.
