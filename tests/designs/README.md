@@ -32,7 +32,8 @@ All golden files are strictly under 1 MB and generated from a single canonical r
 | `gcd.routed.spef` | 164 KB | IEEE 1481 SPEF parasitics extracted from `gcd.placed.def`. |
 | `gcd.orient.def` | 76 KB | `gcd.placed.def` with the logic cells cycled through all 8 orientations (cells may leave the die). Checks pin transforms only. |
 | `gcd.orient.pins.txt` | 18 KB | OpenROAD `dbITerm::getAvgXY` of every signal instance pin in `gcd.orient.def`. |
-| `gcd.reference.json` | 1 KB | Golden counts and baseline metrics dumped by OpenSTA and OpenROAD (step 8 of `generate_ref.sh`). |
+| `gcd.util{25,45,65,78}.def` | 48 KB ea | Placed DEF fixtures at 25%, 45%, 65%, and 78% core utilization (step 7e of `generate_ref.sh`) for E1 congestion ranking verification. |
+| `gcd.reference.json` | 1.5 KB | Golden counts and baseline metrics dumped by OpenSTA and OpenROAD (step 8 of `generate_ref.sh`). |
 
 ---
 

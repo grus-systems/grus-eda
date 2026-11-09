@@ -214,5 +214,5 @@ In `tests/designs/gcd/generate_ref.sh`, run inside the LibreLane container (`ghc
    - Emit `grt_layer_adj_sweep_alpha: [0.50, 0.70, 0.80, 0.85, 0.90]` and `grt_layer_adj_sweep_overflow` (`[0, 0, 31, 69, 204]`) into `gcd.reference.json`.
 3. **Variant Set B (Core-Utilization Placement Sweep on `gcd.synth.v`)**:
    - Four placed DEF fixtures (`gcd.util25.def`, `gcd.util45.def`, `gcd.util65.def`, `gcd.util78.def`) generated at `25%, 45%, 65%, 78%` core utilization (`initialize_floorplan -utilization $util -aspect_ratio 1.0 -core_space 5.52 -site unithd`, `make_tracks`, `place_pins -hor_layers met3 -ver_layers met2`, `global_placement -density $dens` with `$dens` in `{0.33, 0.53, 0.73, 0.86}`, `detailed_placement`) and routed with `set_global_routing_layer_adjustment met1-met5 0.75` (and `0.80`).
-   - Emit `grt_util_sweep_utils: [25, 45, 65, 78]`, `grt_util_sweep_overflow_075` (`[5, 72, 119, 176]`), and `grt_util_sweep_overflow_080` (`[160, 316, 322, 358]`) into `gcd.reference.json`.
+   - Emit `grt_util_sweep_utils: [25, 45, 65, 78]`, `grt_util_sweep_overflow_075` (`[6, 77, 116, 168]`), and `grt_util_sweep_overflow_080` (`[154, 314, 312, 350]`) into `gcd.reference.json`.
    - Compare total overflow and variant ranking against OpenROAD's `global_route` and record in `docs/results.md`.
