@@ -8,7 +8,7 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 |---|---|---|---|
 | **E0** (Readers) | OpenROAD / OpenSTA | Cell, net, pin, and row counts match exactly on every test design | PASS |
 | **E1** (Congestion) | OpenROAD `global_route` | Overflow ranks the test variants in the same order | PASS |
-| **E2** (Placement) | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% | Pending |
+| **E2** (Placement) | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% | PASS (gcd, E2.4) |
 | **E3** (STA) | OpenSTA (`sta`) | Worst slack and every endpoint's arrival within 1% or 5 ps | Pending |
 
 ---
