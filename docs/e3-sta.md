@@ -325,6 +325,7 @@ Done criterion for every E3 step: worst slack, and arrival and required time of 
 | gcd placement RC | pass | arrival 2%, slew 5% (Steiner, E3.4) |
 | picorv32 SPEF | pass | arrival floor 6 ps, setup slack 40 ps, slew 10%, TNS 2% (E3.5) |
 | picorv32 placement RC | `#[ignore]`, fails | arrival 9% off (OpenROAD's tree is not the shortest one, E3.4) |
+| Steiner length vs OpenROAD SPEF (gcd, picorv32) | pass | 2- and 3-point nets match exactly; the optimal tree is never longer than OpenROAD's (asserted) |
 | DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` 6% (one arc is 5.5% high) |
 
 ## 5. Open Work
@@ -333,7 +334,7 @@ Each task is independent. Rules that apply to all: AGENTS.md Section 2 (a stage 
 reference tool), write the rule in `docs/` before the code, record every comparison (including failures) in
 `docs/results.md`, and prove each new test can fail by breaking the code on purpose.
 
-### E3.4: Find out which Steiner tree OpenROAD builds, and reproduce it (`congestion/rsmt.rs`, `sta/parasitics.rs`)
+### E3.4: Find out which Steiner tree OpenROAD builds, and reproduce it (first part done: measurement and exact solver, merged 2026-11-10) (`congestion/rsmt.rs`, `sta/parasitics.rs`)
 - **Why**: picorv32 placement RC is 9% off in arrival and gcd placement RC needs a 2% arrival tolerance, because
   nets of four or more pins have a different tree than OpenROAD's.
 - **What is known (2026-11-10, `docs/results.md`, E3.4 entry)**: OpenROAD's tree is **not** the minimum-length tree.

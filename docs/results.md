@@ -475,3 +475,9 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
 - **Effect on STA**: picorv32 placement RC with the exact tree: setup WNS -2.118 ns (greedy: -2.792, OpenROAD: -1.715), TNS -107.8 (greedy -154.3, OpenROAD -91.6), max arrival diff unchanged at 9.1%. gcd placement RC unchanged (arrival diff 1.07%). The picorv32 test stays `#[ignore]`.
 - **E1**: the exact tree is **not** used by E1. With it the gcd utilisation sweep breaks (alpha 0.80 overflow `[31, 131, 131, 187]`: a tie, where the OpenROAD ranking is strictly increasing) and the total RSMT length drops from 790 to 788. E1 keeps the greedy tree through `build_rsmt_points`; the exact one is only reachable through `build_precise_rsmt_points`, used by `sta/parasitics.rs`. All 8 E1 tests pass.
 - **Not done**: finding out which tree OpenROAD builds. Next steps are listed in `docs/e3-sta.md` task E3.4.
+
+### 2026-11-10 — Process note — E3.4 delegated to an external agent, then taken back
+- E3.4 was started by an external agent in a separate worktree (branch `e34-steiner`). After 1 h 10 min it had written the per-net measurement (kept) and half of an exact Steiner solver; the manager stopped it (user request) and finished the work. The delegate's exploration code (debug traces, `run_sta_with_state`, widened field visibility) was discarded.
+- Review findings in the delegate's diff: solver not wired into `build_rsmt_points`; nondeterministic output order (`HashSet`/`HashMap`); an unused function; exploration tests. The solver itself was sound (exact, optimal on the Hanan grid).
+- The result of the work (OpenROAD's trees are not shortest) is in the E3.4 entry above. How to run a delegate, and what to check in its output: `AGENTS.md` Section 3c.
+- `readers::liberty::tests::test_sky130_liberty_integration` (warm cache load under 10 ms) failed once while a delegate was building in parallel and passed when run alone: a timing test, not a regression.
