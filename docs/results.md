@@ -418,3 +418,60 @@ Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.
   - picorv32 placement RC: **still fails** (max arrival 9.1%, setup slack up to 0.2 ns), test `#[ignore]`d. Cause: the same Steiner difference on the many 4+ pin nets. It needs a FLUTE-equivalent tree, not DMP work.
 - **`RD_SCALE` scan on picorv32 SPEF** (mismatch count at the then-1% rules / setup WNS): 3.0 gave 1,237 / -1.659; 4.0: 732; 5.0: 443 / -1.735; 6.5: 167 / -1.761; 8.0: 364. WNS is best near 4.5; arrival error is lowest at 5.
 - **Not done**: the driver waveform slew, a derived (not fitted) `Rd`, speed. `grus-eda sta` on picorv32 with SPEF takes 16 s (release build); zero wire takes well under a second.
+
+### 2026-11-10 — E3.4 baseline — Per-net Steiner tree wirelength vs OpenROAD SPEF (before algorithm change)
+- **Reference**: `tests/designs/gcd/gcd.routed.spef` and `tests/designs/picorv32/picorv32.routed.spef` (OpenROAD `estimate_parasitics -placement -spef_file`). Reference net tree length is `sum(*CAP) / c0` with `c0 = 7.7890e-5 pF/um`.
+- **Our Command**: `cargo test --release -p grus-core test_print_per_net_steiner_vs_spef -- --nocapture`
+- **Method**: Current greedy Prim MST + iterative L-flip (`build_rsmt_points`) on pin positions from `DesignDb::pin_pos_dbu`.
+
+#### Baseline Results on `gcd` (260 driven nets with >= 2 pins in SPEF):
+
+| Degree | Total Nets | Matched Nets (diff <= 1 DBU) | Mismatches | Max Diff (um) | Avg Diff (um) |
+|---|---|---|---|---|---|
+| 2 | 159 | 159 (100.0%) | 0 | 0.0002 | 0.0000 |
+| 3 | 47 | 47 (100.0%) | 0 | 0.0001 | 0.0000 |
+| 4 | 16 | 15 (93.8%) | 1 | 1.2840 | 0.0803 |
+| 5 | 16 | 14 (87.5%) | 2 | 2.4151 | 0.2106 |
+| 6 | 17 | 12 (70.6%) | 5 | 1.5790 | 0.3607 |
+| 7 | 7 | 4 (57.1%) | 3 | 0.7299 | 0.2054 |
+| 15 | 2 | 0 (0.0%) | 2 | 29.6830 | 18.8463 |
+| 19 | 2 | 0 (0.0%) | 2 | 14.4539 | 12.0614 |
+| 33 | 1 | 0 (0.0%) | 1 | 33.5067 | 33.5067 |
+| 40 | 1 | 0 (0.0%) | 1 | 19.3486 | 19.3486 |
+| **Total <= 9** | **262** (254 in SPEF) | **251** | **11** | **2.4151** | **0.0632** |
+
+#### Baseline Results on `picorv32` (6,707 driven nets with >= 2 pins in SPEF):
+
+| Degree | Total Nets | Matched Nets (diff <= 1 DBU) | Mismatches | Max Diff (um) | Avg Diff (um) |
+|---|---|---|---|---|---|
+| 2 | 4,030 | 4,030 (100.0%) | 0 | 0.0003 | 0.0000 |
+| 3 | 646 | 646 (100.0%) | 0 | 0.0003 | 0.0000 |
+| 4 | 1,398 | 1,328 (95.0%) | 70 | 4.3190 | 0.0467 |
+| 5 | 172 | 154 (89.5%) | 18 | 5.2749 | 0.1509 |
+| 6 | 58 | 46 (79.3%) | 12 | 3.7890 | 0.3036 |
+| 7 | 136 | 111 (81.6%) | 25 | 6.9799 | 0.3695 |
+| 8 | 62 | 41 (66.1%) | 21 | 19.6477 | 1.2366 |
+| 9 | 33 | 20 (60.6%) | 13 | 8.3348 | 1.0847 |
+| **Total <= 9** | **6,535** | **6,376** (97.6%) | **159** (2.4%) | **19.6477** | **0.0457** |
+| > 9 pins | 172 | 24 (14.0%) | 148 | 648.7410 | 47.9158 |
+
+- **Observations**:
+  - Degrees 2 and 3 match OpenROAD's FLUTE length with 100% exact agreement (< 0.0003 um / 0.3 DBU due to floating point roundoff in SPEF cap sum).
+  - Degrees 4 through 9 diverge: 11 nets on `gcd` and 159 nets on `picorv32` have longer wirelength in grus-core's greedy MST + L-flip tree compared to FLUTE.
+  - On nets > 9 pins, greedy MST + L-flip deviates significantly on large high-fanout nets (up to 648 um on degree 274 net `_00012_`).
+
+### 2026-11-10 — E3.4 — Steiner tree length vs OpenROAD: the premise was wrong (optimal trees do not match)
+- **Reference**: `gcd.routed.spef` and `picorv32.routed.spef` (OpenROAD placement estimate). Reference tree length = `sum(*CAP) / c0` per net, `c0 = 7.7890e-5 pF/um`; a net matches within `max(1 DBU, 1e-4)`. Test: `cargo test --release -p grus-core test_steiner_length -- --nocapture`.
+- **What was tried**: an exact rectilinear Steiner tree (Dreyfus-Wagner on the Hanan grid, started by an external agent and finished here) for nets of up to 9 points, `build_precise_rsmt_points`. It is provably the shortest tree.
+
+| Design / degree | nets | match (greedy, before) | match (exact) |
+|---|---|---|---|
+| gcd 2 / 3 | 159 / 47 | all | all |
+| gcd 4 / 5 / 6 / 7 | 16 / 16 / 17 / 7 | 15 / 14 / 12 / 4 | 15 / 12 / 9 / 2 |
+| picorv32 2 / 3 | 4,030 / 646 | all | all |
+| picorv32 4 / 5 / 6 / 7 / 8 / 9 | 1,398 / 172 / 58 / 136 / 62 / 33 | see the baseline entry above | 1,312 / 143 / 38 / 85 / 36 / 21 |
+
+- **Finding**: the exact tree is **never longer** than OpenROAD's and is shorter on every mismatching net of up to 9 points (gcd `_053_`: 17.088 um ours vs 18.372 um OpenROAD; `dpath.a_lt_b$in1[11]`: 37.292 vs 41.799). So OpenROAD's parasitic estimate does **not** use a minimum-length tree for those nets. The E3.4 premise ("FLUTE, optimal up to 9 pins") is wrong for `estimate_parasitics -placement`. A likely cause is a timing-driven tree that trades wire length for source-to-sink path length (Prim-Dijkstra style); this is a hypothesis, not measured.
+- **Effect on STA**: picorv32 placement RC with the exact tree: setup WNS -2.118 ns (greedy: -2.792, OpenROAD: -1.715), TNS -107.8 (greedy -154.3, OpenROAD -91.6), max arrival diff unchanged at 9.1%. gcd placement RC unchanged (arrival diff 1.07%). The picorv32 test stays `#[ignore]`.
+- **E1**: the exact tree is **not** used by E1. With it the gcd utilisation sweep breaks (alpha 0.80 overflow `[31, 131, 131, 187]`: a tie, where the OpenROAD ranking is strictly increasing) and the total RSMT length drops from 790 to 788. E1 keeps the greedy tree through `build_rsmt_points`; the exact one is only reachable through `build_precise_rsmt_points`, used by `sta/parasitics.rs`. All 8 E1 tests pass.
+- **Not done**: finding out which tree OpenROAD builds. Next steps are listed in `docs/e3-sta.md` task E3.4.

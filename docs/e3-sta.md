@@ -324,7 +324,7 @@ Done criterion for every E3 step: worst slack, and arrival and required time of 
 | gcd SPEF | pass | slew 3% |
 | gcd placement RC | pass | arrival 2%, slew 5% (Steiner, E3.4) |
 | picorv32 SPEF | pass | arrival floor 6 ps, setup slack 40 ps, slew 10%, TNS 2% (E3.5) |
-| picorv32 placement RC | `#[ignore]`, fails | arrival 9% off (Steiner, E3.4) |
+| picorv32 placement RC | `#[ignore]`, fails | arrival 9% off (OpenROAD's tree is not the shortest one, E3.4) |
 | DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` 6% (one arc is 5.5% high) |
 
 ## 5. Open Work
@@ -333,19 +333,26 @@ Each task is independent. Rules that apply to all: AGENTS.md Section 2 (a stage 
 reference tool), write the rule in `docs/` before the code, record every comparison (including failures) in
 `docs/results.md`, and prove each new test can fail by breaking the code on purpose.
 
-### E3.4: Steiner trees that match OpenROAD's (`congestion/rsmt.rs`, `sta/parasitics.rs`)
-- **Why**: picorv32 placement RC is 9% off in arrival, and gcd placement RC needs a 2% arrival tolerance, because
-  nets of four or more pins are longer in our tree (E3.2 item 3).
-- **Reference**: OpenROAD uses FLUTE (Chu and Wong, IEEE TCAD 2008): optimal for 9 pins or fewer, net splitting
-  above that. Measure it: the per-net SPEF (`gcd.routed.spef`, `picorv32.routed.spef`) gives the exact tree
-  length (`sum of *CAP / c0`) and the segments (`*RES`). Compare length per net, not only the total.
-- **Approach**: implement an exact RSMT for small degrees (Hanan-grid dynamic programming, or any exact method
-  you can justify) and keep a heuristic above 9 pins. Do **not** copy FLUTE's source or lookup tables without
-  checking their license (this repository is Apache-2.0 and may hold company IP); write it from the paper.
-- **Done when**: tree length equals OpenROAD's on every net of up to 9 pins on gcd and picorv32; for larger
-  nets the length gap is measured and recorded; the picorv32 placement-RC test passes with arrival `max(5 ps, 1%)`
-  (un-`#[ignore]` it) and the gcd placement-RC arrival tolerance returns to 1%. E1's 8 congestion tests must still pass
-  (the E1 ranking tests depend on `build_net_rsmt`); if the change alters E1 results, say so in `results.md`.
+### E3.4: Find out which Steiner tree OpenROAD builds, and reproduce it (`congestion/rsmt.rs`, `sta/parasitics.rs`)
+- **Why**: picorv32 placement RC is 9% off in arrival and gcd placement RC needs a 2% arrival tolerance, because
+  nets of four or more pins have a different tree than OpenROAD's.
+- **What is known (2026-11-10, `docs/results.md`, E3.4 entry)**: OpenROAD's tree is **not** the minimum-length tree.
+  An exact solver (`build_precise_rsmt_points`, optimal up to 9 points) is never longer than OpenROAD's tree and is
+  shorter on most nets of 4-9 points, so "FLUTE, optimal up to 9 pins" is not what `estimate_parasitics -placement`
+  uses. Two-point and three-point nets match exactly. Hypothesis (unmeasured): a timing-driven tree that trades wire
+  length for source-to-sink path length (Prim-Dijkstra style, with the net driver as the root).
+- **Reference**: the per-net SPEF (`*routed.spef`) holds the exact tree: nodes in `*CAP`, segments in `*RES`
+  (segment length = `R / r0`). Rebuild each net's tree from it and study it: is every sink's path a shortest path from
+  the driver? Is the length between the minimum and the MST length? Where are the Steiner points? Run
+  `cargo test --release -p grus-core test_steiner_length -- --nocapture` for the per-degree match table.
+- **Approach**: from the measurements, form a hypothesis about the tree-building rule, implement it from the published
+  paper (for Prim-Dijkstra: Alpert et al. 1995 and "Prim-Dijkstra Revisited", 2018), and test it on every net of
+  gcd and picorv32. Do **not** read OpenROAD or OpenSTA source (GPL) and do not copy lookup tables. The exact solver
+  is kept as a building block; it must not change E1 (E1's ranking test fails with it).
+- **Done when**: tree length equals OpenROAD's on at least 99% of the nets of up to 9 points on gcd and picorv32 and
+  the rule is written here; the picorv32 placement-RC test passes with arrival `max(5 ps, 1%)` (remove its
+  `#[ignore]`) and the gcd placement-RC arrival tolerance returns to 1%. If the rule cannot be found, record the
+  evidence and stop: SPEF mode (OpenROAD's own tree) already reproduces OpenROAD's results.
 
 ### E3.5: A derived driver model (`sta/dmp.rs`)
 - **Why**: `RD_SCALE` is fitted. One value fits arrival (about 4.5-5) but not `Ceff` (about 3), and OpenSTA's

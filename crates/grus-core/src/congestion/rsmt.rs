@@ -24,6 +24,9 @@ fn median3(a: i32, b: i32, c: i32) -> i32 {
     v[1]
 }
 
+/// Largest net degree solved exactly by [`build_precise_rsmt_points`].
+pub const EXACT_MAX_DEGREE: usize = 9;
+
 /// Constructs a Rectilinear Steiner Minimal Tree (RSMT) for a set of GCell points.
 ///
 /// Degree handling:
@@ -61,8 +64,258 @@ pub fn build_rsmt_points(pts: &[Pt]) -> Vec<(Pt, Pt)> {
         return segs;
     }
 
-    // k >= 4: Prim's Rectilinear MST + Iterative L-flip Steiner Refinement
-    let mut nodes = unique;
+    heuristic_rsmt_points(&unique)
+}
+
+/// Like [`build_rsmt_points`] but optimal for nets of up to [`EXACT_MAX_DEGREE`] distinct points,
+/// which is what FLUTE guarantees and what OpenROAD's parasitic estimate uses (E3). E1 keeps the
+/// greedy tree: its congestion ranking was verified against OpenROAD with that tree, and the optimal
+/// one produces a tie in the utilisation sweep (see docs/results.md, E3.4).
+pub fn build_precise_rsmt_points(pts: &[Pt]) -> Vec<(Pt, Pt)> {
+    let mut unique = pts.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if (4..=EXACT_MAX_DEGREE).contains(&unique.len()) {
+        return exact_rsmt_points(&unique);
+    }
+    build_rsmt_points(&unique)
+}
+
+pub(crate) fn exact_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
+    let k = unique.len();
+    let mut xs: Vec<i32> = unique.iter().map(|p| p.0).collect();
+    let mut ys: Vec<i32> = unique.iter().map(|p| p.1).collect();
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+
+    if xs.len() == 1 {
+        let mut sorted = unique.to_vec();
+        sorted.sort_by_key(|p| p.1);
+        return sorted.windows(2).map(|w| (w[0], w[1])).collect();
+    }
+    if ys.len() == 1 {
+        let mut sorted = unique.to_vec();
+        sorted.sort_by_key(|p| p.0);
+        return sorted.windows(2).map(|w| (w[0], w[1])).collect();
+    }
+
+    let nx = xs.len();
+    let ny = ys.len();
+    let nv = nx * ny;
+
+    let mut v_coords = Vec::with_capacity(nv);
+    for &x in &xs {
+        for &y in &ys {
+            v_coords.push((x, y));
+        }
+    }
+
+    let mut dist = vec![vec![0u32; nv]; nv];
+    for i in 0..nv {
+        for j in 0..nv {
+            dist[i][j] = v_coords[i].0.abs_diff(v_coords[j].0) + v_coords[i].1.abs_diff(v_coords[j].1);
+        }
+    }
+
+    let mut term_v = Vec::with_capacity(k);
+    for p in unique {
+        let idx = v_coords.iter().position(|v| v == p).unwrap();
+        term_v.push(idx);
+    }
+
+    let num_subsets = 1 << k;
+    let inf = u32::MAX / 2;
+    let mut d = vec![vec![inf; nv]; num_subsets];
+    let mut d_split = vec![vec![inf; nv]; num_subsets];
+    let mut split_choice = vec![vec![(0usize, 0usize); nv]; num_subsets];
+    let mut from_u = vec![vec![0usize; nv]; num_subsets];
+
+    for i in 0..k {
+        let tv = term_v[i];
+        for v in 0..nv {
+            d[1 << i][v] = dist[tv][v];
+            d_split[1 << i][v] = dist[tv][v];
+        }
+    }
+
+    for mask in 1..num_subsets {
+        if (mask & (mask - 1)) == 0 {
+            continue;
+        }
+
+        let mut sub = (mask - 1) & mask;
+        while sub > (mask ^ sub) {
+            let s1 = sub;
+            let s2 = mask ^ sub;
+            for v in 0..nv {
+                let val = d[s1][v] + d[s2][v];
+                if val < d_split[mask][v] {
+                    d_split[mask][v] = val;
+                    split_choice[mask][v] = (s1, s2);
+                }
+            }
+            sub = (sub - 1) & mask;
+        }
+
+        for v in 0..nv {
+            let mut best_val = d_split[mask][v];
+            let mut best_u = v;
+            for u in 0..nv {
+                let val = d_split[mask][u] + dist[u][v];
+                if val < best_val {
+                    best_val = val;
+                    best_u = u;
+                }
+            }
+            d[mask][v] = best_val;
+            from_u[mask][v] = best_u;
+        }
+    }
+
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    let mut edges: BTreeSet<(Pt, Pt)> = BTreeSet::new();
+
+    let mut add_path = |p1: Pt, p2: Pt| {
+        let (x1, y1) = p1;
+        let (x2, y2) = p2;
+        let ix1 = xs.binary_search(&x1).unwrap();
+        let iy1 = ys.binary_search(&y1).unwrap();
+        let ix2 = xs.binary_search(&x2).unwrap();
+        let iy2 = ys.binary_search(&y2).unwrap();
+
+        if ix1 != ix2 {
+            let (start, end) = (ix1.min(ix2), ix1.max(ix2));
+            for ix in start..end {
+                let a = (xs[ix], ys[iy1]);
+                let b = (xs[ix + 1], ys[iy1]);
+                edges.insert((a.min(b), a.max(b)));
+            }
+        }
+        if iy1 != iy2 {
+            let (start, end) = (iy1.min(iy2), iy1.max(iy2));
+            for iy in start..end {
+                let a = (xs[ix2], ys[iy]);
+                let b = (xs[ix2], ys[iy + 1]);
+                edges.insert((a.min(b), a.max(b)));
+            }
+        }
+    };
+
+    fn trace_dp(
+        mask: usize,
+        v: usize,
+        pts: &[Pt],
+        v_coords: &[Pt],
+        split_choice: &[Vec<(usize, usize)>],
+        from_u: &[Vec<usize>],
+        add_path: &mut impl FnMut(Pt, Pt),
+    ) {
+        if (mask & (mask - 1)) == 0 {
+            let i = mask.trailing_zeros() as usize;
+            if pts[i] != v_coords[v] {
+                add_path(v_coords[v], pts[i]);
+            }
+            return;
+        }
+        let u = from_u[mask][v];
+        if u != v {
+            add_path(v_coords[v], v_coords[u]);
+        }
+        let (s1, s2) = split_choice[mask][u];
+        trace_dp(s1, u, pts, v_coords, split_choice, from_u, add_path);
+        trace_dp(s2, u, pts, v_coords, split_choice, from_u, add_path);
+    }
+
+    let all = num_subsets - 1;
+    let mut best_root = 0;
+    let mut min_total = inf;
+    for v in 0..nv {
+        if d[all][v] < min_total {
+            min_total = d[all][v];
+            best_root = v;
+        }
+    }
+
+    trace_dp(all, best_root, unique, &v_coords, &split_choice, &from_u, &mut add_path);
+
+    // Build BFS spanning tree to guarantee zero cycles and exact minimum length
+    let mut adj: BTreeMap<Pt, Vec<Pt>> = BTreeMap::new();
+    for &(a, b) in &edges {
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
+    }
+
+    let root = unique[0];
+    let mut visited: BTreeSet<Pt> = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    visited.insert(root);
+    queue.push_back(root);
+
+    let mut tree_edges: Vec<(Pt, Pt)> = Vec::new();
+    while let Some(u) = queue.pop_front() {
+        if let Some(neighbors) = adj.get(&u) {
+            for &v in neighbors {
+                if visited.insert(v) {
+                    tree_edges.push((u.min(v), u.max(v)));
+                    queue.push_back(v);
+                }
+            }
+        }
+    }
+
+    // Merge collinear degree-2 non-terminal nodes
+    let mut tree_adj: BTreeMap<Pt, Vec<Pt>> = BTreeMap::new();
+    for &(a, b) in &tree_edges {
+        tree_adj.entry(a).or_default().push(b);
+        tree_adj.entry(b).or_default().push(a);
+    }
+
+    let term_set: BTreeSet<Pt> = unique.iter().copied().collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let nodes: Vec<Pt> = tree_adj.keys().copied().collect();
+        for node in nodes {
+            if term_set.contains(&node) {
+                continue;
+            }
+            let Some(&[n1, n2]) = tree_adj.get(&node).map(Vec::as_slice) else {
+                continue;
+            };
+            if (n1.0 == node.0 && node.0 == n2.0) || (n1.1 == node.1 && node.1 == n2.1) {
+                tree_adj.remove(&node);
+                if let Some(v1) = tree_adj.get_mut(&n1) {
+                    v1.retain(|&x| x != node);
+                    v1.push(n2);
+                }
+                if let Some(v2) = tree_adj.get_mut(&n2) {
+                    v2.retain(|&x| x != node);
+                    v2.push(n1);
+                }
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut seen: BTreeSet<(Pt, Pt)> = BTreeSet::new();
+    for (&u, neighbors) in &tree_adj {
+        for &v in neighbors {
+            let edge = (u.min(v), u.max(v));
+            if seen.insert(edge) {
+                result.push(edge);
+            }
+        }
+    }
+    result
+}
+
+pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
+    let k = unique.len();
+    let mut nodes = unique.to_vec();
     let mut visited = vec![false; k];
     let mut min_dist = vec![u32::MAX; k];
     let mut parent = vec![0usize; k];
@@ -444,5 +697,59 @@ mod tests {
 
     fn dirs_home() -> PathBuf {
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
+    }
+
+    fn total_length(segs: &[(Pt, Pt)]) -> u32 {
+        segs.iter().map(|&(a, b)| manhattan(a, b)).sum()
+    }
+
+    /// Deterministic pseudo-random points (no external crate).
+    fn points(seed: u64, k: usize) -> Vec<Pt> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) % 60) as i32
+        };
+        (0..k).map(|_| (next(), next())).collect()
+    }
+
+    #[test]
+    fn test_precise_rsmt_is_connected_never_longer_than_greedy_and_deterministic() {
+        for seed in 0..40u64 {
+            let k = 4 + (seed % 6) as usize; // 4..=9
+            let pts = points(seed, k);
+            let mut unique = pts.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            let precise = build_precise_rsmt_points(&pts);
+            let greedy = build_rsmt_points(&pts);
+            assert!(total_length(&precise) <= total_length(&greedy), "seed {seed}");
+            let (min_x, max_x) = (unique.iter().map(|p| p.0).min().unwrap(), unique.iter().map(|p| p.0).max().unwrap());
+            let (min_y, max_y) = (unique.iter().map(|p| p.1).min().unwrap(), unique.iter().map(|p| p.1).max().unwrap());
+            assert!(total_length(&precise) >= ((max_x - min_x) + (max_y - min_y)) as u32, "below HPWL, seed {seed}");
+            // Every terminal is reachable from the first one.
+            let mut reached = std::collections::HashSet::from([unique[0]]);
+            let mut grew = true;
+            while grew {
+                grew = false;
+                for &(a, b) in &precise {
+                    if reached.contains(&a) != reached.contains(&b) {
+                        reached.insert(a);
+                        reached.insert(b);
+                        grew = true;
+                    }
+                }
+            }
+            assert!(unique.iter().all(|p| reached.contains(p)), "disconnected, seed {seed}");
+            assert_eq!(precise, build_precise_rsmt_points(&pts), "not deterministic, seed {seed}");
+        }
+    }
+
+    #[test]
+    fn test_precise_rsmt_finds_the_plus_shape() {
+        // Four points around a centre: the optimal tree is a plus of length 4 * 10.
+        let pts = [(10, 0), (0, 10), (20, 10), (10, 20)];
+        assert_eq!(total_length(&build_precise_rsmt_points(&pts)), 40);
+        assert!(total_length(&build_rsmt_points(&pts)) >= 40);
     }
 }
