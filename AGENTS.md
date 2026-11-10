@@ -29,6 +29,14 @@ Instructions for AI coding agents working in this repository.
 - Speed optimizations (parallelism via `rayon`, SIMD, `Accelerate`, Metal GPU) come **only after** a stage's simple CPU version agrees with the reference tool. Lock in equivalence between the fast path and the simple baseline with regression tests.
 - Always state explicitly what you actually ran vs. what is untested. Never claim something "should work" based on guesswork.
 
+## 3. Picking Up Work
+
+- Status, tolerances and open tasks for E3 are in `docs/e3-sta.md` Sections 4-6 (open tasks `E3.4`-`E3.6`, each with
+  why, reference, approach and done criterion). `docs/results.md` is the log of every comparison, including failures.
+- Before running tests that use `picorv32`, generate its inputs (`docs/e3-sta.md` Section 6).
+- Licensing: OpenSTA and OpenROAD source (GPL) must not be read or copied into this repository; use the published
+  papers and the tools' output instead. Check the license of any third-party code or table before adding it.
+
 ## 4. Working Style & Communication
 
 - **Chat responses to the user must be in concise Japanese.**

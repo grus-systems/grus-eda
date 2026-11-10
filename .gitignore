@@ -6,3 +6,9 @@
 tests/designs/pdk
 tests/designs/gcd/runs
 tests/designs/picorv32/runs
+tests/designs/picorv32/picorv32.synth.v
+tests/designs/picorv32/picorv32.synth.json
+tests/designs/picorv32/picorv32.floorplan.def
+tests/designs/picorv32/picorv32.placed.def
+tests/designs/picorv32/picorv32.routed.spef
+tests/designs/picorv32/picorv32.sta.reference.json

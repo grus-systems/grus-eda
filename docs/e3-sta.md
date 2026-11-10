@@ -1,6 +1,6 @@
 # E3: Static Timing Analysis (STA) — Implementation Spec
 
-This document breaks E3 into three progressive implementation steps (`E3.1`–`E3.3`) with exact data structures, NLDM extrapolation code, and Elmore RC equations for the implementer.
+This document breaks E3 into implementation steps `E3.1`–`E3.3` (done) and open tasks `E3.4`–`E3.6` (Section 5), with the data structures, NLDM extrapolation code, and RC and driver-model equations an implementing agent needs. Section 4 is the current status; Section 6 says how to generate the test inputs.
 
 ---
 
@@ -10,7 +10,7 @@ This document breaks E3 into three progressive implementation steps (`E3.1`–`E
 |---|---|---|---|
 | **E3.1** | Zero-Wire STA: levelized DAG, dual Rise/Fall propagation, NLDM extrapolation, Setup/Hold slack | `generate_ref.sh` step 9 → `tests/designs/gcd/gcd.sta.reference.json` (`zero_wire`) | Worst slack (Setup & Hold) and, for **all 53 endpoints**, `max/min` arrival, required, slack and slew agree within **1% or 5 ps** on `gcd` (`picorv32` once it is added under `tests/designs/`) |
 | **E3.2** | Placement-Based Virtual RC STA (`parasitics.rs`) | `generate_ref.sh` step 9 → `gcd.sta.reference.json` (`placement_rc`) | Worst slack and, for all 53 endpoints, arrival, required and slack within **1% or 5 ps** on `gcd` with OpenROAD's met2 `r0, c0`; slews within 3% (see E3.2 item 7) |
-| **E3.3** | SPEF-Based STA (`readers/spef.rs` + Elmore tree) | `sta`: `read_spef`, `report_checks -path_delay min_max` | Worst slack and every endpoint's arrival agree within **1% or 5 ps** on extracted `.spef` |
+| **E3.3** | SPEF-Based STA (`readers/spef.rs`) and DMP driver model (`sta/dmp.rs`) | `generate_ref.sh` step 9 → `*.sta.reference.json` (`placed_spef`); `report_dcalc` for pi models and `Ceff` | Worst slack and every endpoint's arrival and required time agree within **1% or 5 ps** on `gcd` and `picorv32`; tolerances actually used: Section 4 |
 
 > **Scope Rule**: E3 targets edge-triggered flip-flop designs (`dfxtp`, `dfrtp`, `dfxbp`, etc.). Transparent level-sensitive latches (`dlxtp`, time borrowing across cycle boundaries) are out of initial scope; if a design instantiates a latch, emit a clear diagnostic warning.
 
@@ -255,77 +255,135 @@ generic text above disagree, this section wins.
 ### Step E3.2: Placement-Based Virtual RC (`sta/parasitics.rs`)
 
 Enabled with `grus-eda sta --parasitics placement [--wire-layer met2]`. Every rule below was measured
-with OpenROAD (`set_wire_rc -layer met2; estimate_parasitics -placement`) on `gcd.placed.def`,
-2026-11-10. `gcd.routed.spef` is byte-identical (except the date) to OpenROAD's placement estimate:
-despite its name it is **not** a routed SPEF, so `placement_rc` and `placed_spef` in the golden file agree.
+with OpenROAD (`set_wire_rc -layer met2; estimate_parasitics -placement`) on `gcd.placed.def` and
+`picorv32.placed.def`, 2026-11-10. `gcd.routed.spef` and `picorv32.routed.spef` are OpenROAD's placement
+estimate, **not** routed extractions, so `placement_rc` and `placed_spef` in the golden files describe the same
+RC.
 
 1. **Layer RC.** `r0 = RPERSQ / WIDTH` (met2: 0.125 / 0.14 = 0.892857 ohm/um = 8.92857e-4 kohm/um) and
-   `c0 = CPERSQDIST * WIDTH + 2 * EDGECAPACITANCE` (met2: 7.7890e-5 pF/um). Checked on 159 two-pin nets:
-   `c0` and `r0` match the SPEF to 6 digits for every net. Same value for horizontal and vertical wires.
+   `c0 = CPERSQDIST * WIDTH + 2 * EDGECAPACITANCE` (met2: 7.7890e-5 pF/um). Matches the SPEF to 6 digits on
+   159 two-pin nets. Same value for horizontal and vertical wires.
 2. **Pin positions.** `DesignDb::pin_pos_dbu`, converted to um by `dbu_per_micron`.
-3. **Tree topology.** Two pins: one Manhattan segment. Three pins: the median Steiner point (total
-   length = HPWL; matches OpenROAD on all 46 three-pin nets). Four or more pins: OpenROAD uses FLUTE,
-   which is shorter than the greedy MST + L-flip of E1 (`reset`: 23.585 vs 24.323 um by MST; `req_rdy`,
-   40 pins: 350.160 vs 358.864 um by MST). We use the E1 core (`build_rsmt_points`, now generic over integer
-   points); the length gap on these nets is a **known divergence**, not yet measured at the net level.
+3. **Tree topology.** Two pins: one Manhattan segment. Three pins: the median Steiner point (length = HPWL;
+   matches OpenROAD on all 46 three-pin nets of gcd). Four or more pins: OpenROAD uses FLUTE; we use the E1
+   greedy MST + L-flip (`build_rsmt_points`), which is longer (`reset`: 23.585 um in OpenROAD vs 24.323 um by
+   MST; `req_rdy`, 40 pins: 350.160 vs 358.864 um). **Known divergence; task E3.4.**
 4. **RC tree.** Rooted at the driver (first pin of the net). Segment `u-v` of length `L`: `R = r0 L`,
    `C = c0 L`, half of `C` at each end. Pin-connection stubs (1e-6 kohm in the SPEF) are ignored.
-5. **Load.** `load(net, pol) = total wire C + sum of sink pin caps (per transition) + port loads`. The driver
-   delay uses this lumped value (see the DMP note below).
+5. **Pin capacitance.** Sink pin capacitance per transition (`cap_rise` / `cap_fall`) plus port loads is added
+   to the wire capacitance, which is wire-only.
 6. **Wire delay.** Elmore: `tau(v) = tau(u) + R_uv * Cdown(v)`, with sink pin caps (per transition) in
    `Cdown`. Added to both max and min arrival. Sink slew: `sqrt(slew_d^2 + (ln4 * tau)^2)`.
-7. **Known gap: DMP driver slew.** OpenSTA's `dmp_ceff_elmore` reduces the tree to a pi model and takes the
-   driver slew from a waveform model. `report_dcalc` shows the result differs from the plain table lookup
-   (`Slew = 0.282240` from the table, `Driver waveform slew = 0.278732`; `Ceff = 0.054675` vs total
-   0.054938). Arrival, required time and slack are not affected beyond tolerance on `gcd`; slews at output
-   ports are 1.7-2.7% high. Closing this is the Ceff work of E3.3 Stage 2.
-8. **Comparison.** Arrival, required time and slack: `max(5 ps, 1%)`. Slew: `max(5 ps, 3%)` until item 7 is done.
+7. **Driver delay and slew** come from the DMP model of E3.3 Stage 2 (`Ceff`), not from the lumped load.
+8. **Comparison.** See Section 4.
 
 ---
 
-### Step E3.3: SPEF Reader & RC Tree Elmore Propagation (`readers/spef.rs`)
+### Step E3.3: SPEF Reader and DMP Driver Model (`readers/spef.rs`, `sta/dmp.rs`)
 
-> **Status (2026-11-10)**: Stage 1 (reader, spanning tree, Elmore, wire slew) is implemented in `readers/spef.rs`
-> and `sta/parasitics.rs::spef_parasitics`. Stage 2 (pi model, DMP `Ceff`) is implemented in `sta/dmp.rs` with a
-> fitted driver resistance; the driver waveform slew is not. The notes below are the history that led there:
-> the formulas below were never checked against OpenSTA, and `report_dcalc` shows that OpenSTA's driver slew
-> comes from a waveform model, so a pi model and `Ceff` alone would not close the slew gap. Measure
-> `report_dcalc` pi models first, then write the rule here before coding.
->
-> **Correction (picorv32, 2026-11-10)**: the O'Brien-Savarino charge-sharing formula in Stage 2 below does not
-> reproduce OpenSTA's `Ceff`: on the pi models OpenSTA prints it removes < 1% of the shielding that OpenSTA
-> applies (up to 75% of `C2`). The pi-model moments (`y1..y3`) are right in form; the `Ceff` solve is not.
-> See `docs/results.md`, picorv32 entry.
+Enabled with `grus-eda sta --spef <file>`. Implemented 2026-11-10.
 
-1. **SPEF Units & Header**:
-   - Parse `*T_UNIT` (convert to `ns`), `*C_UNIT` (convert to `pF`), `*R_UNIT` (convert to $\text{k}\Omega$ so $R \cdot C = \text{k}\Omega \cdot \text{pF} = \text{ns}$ directly!), and `*NAME_MAP` (`*123 -> net_or_inst_name`).
-2. **Per-Net `*D_NET *net_id total_cap`**:
-   - Parse `*CONN` (identifies `*I inst:pin` and `*P port` nodes, with `*D` marking the driver).
-   - Parse `*CAP` (ground capacitors `id node cap_val`; ignore coupling capacitors or lump them to ground).
-   - Parse `*RES` (resistors `id node1 node2 res_val`).
-3. **Two-Pass Elmore Delay, Driving-Point $\pi$-Model, and $C_{\text{eff}}$**:
-   - Root the RC graph at the driver node $d$ (spanning tree BFS if parallel resistor loops exist):
-   - Add sink pin Liberty capacitance $C_{\text{pin}}(s, \text{pol})$ to each sink node $s$ (OpenROAD SPEFs contain **wire-only** capacitance in `*CAP`, so always add `LibPin::cap_rise` / `cap_fall` at sink pins).
-   - **Stage 1 (Lumped Cap + Elmore Delay Baseline)**:
-     - Run the bottom-up $C_{\text{down}}$ and top-down $\tau_{\text{Elmore}}$ pass as in Step E3.2, with total lumped capacitance $C_{\text{total}} = C_{\text{down}}(d)$.
-     - Verify against OpenSTA first with `sta`'s lumped-cap / Elmore calculator (`set_delay_calculator lumped_cap` or short-wire `gcd` where $R_{\text{wire}} \ll R_{\text{driver}}$).
-   - **Stage 2 (pi model and DMP effective capacitance, `sta/dmp.rs`)**: implemented 2026-11-10 from the
-     published method (Dartu, Menezes, Pileggi, IEEE TCAD 1996), not from OpenSTA's source (GPL).
-     - Pi model from the driving-point admittance moments `y1, y2, y3` of the RC tree
-       (`NetRcTree::pi_model`): `y2(u) = sum_v (y2(v) - R_uv y1(v)^2)`,
-       `y3(u) = sum_v (y3(v) - 2 R_uv y1(v) y2(v) + R_uv^2 y1(v)^3)`, `C_far = y2^2 / y3`,
-       `C_near = y1 - C_far`, `R_pi = -y3^2 / y2^3`. Matches OpenSTA's `report_dcalc` pi models to 6 digits
-       on six picorv32 arcs (OpenSTA calls the near capacitor C2 and the far one C1).
-     - Driver: a saturated ramp (`t0`, `dt`) behind `Rd`. For a trial `Ceff` the ramp is fitted so that a
-       single capacitor `Ceff` reproduces the table delay (50%) and slew (20-80%); `Ceff` is bisected until the
-       charge the ramp delivers into the pi load up to the 50% point equals the charge into `Ceff`.
-       `Rd = RD_SCALE * d(table delay)/dC`.
-     - **`RD_SCALE` is fitted, not derived.** The natural value is 1/ln 2 = 1.44; the best arrival agreement on
-       picorv32 is at 4.5, and no single value fits every arc (see docs/results.md). The charge-sharing
-       formula that stood here before (`Ceff = C1 + C2 (1 - Rpi C2 / td (1 - e^(-td / Rpi C2)))`) was removed:
-       it leaves `Ceff` within 1% of the total, while OpenSTA shields up to 75% of `C2`.
-     - Delay is the table delay at `Ceff`. Slew is the table slew at `Ceff`; OpenSTA's driver waveform slew
-       differs from it by 1-18% on the arcs inspected and is **not** modelled.
-   - **Wire Slew Degradation**:
-     $$\text{slew}(s) = \sqrt{\text{slew}(d)^2 + \bigl(\ln(4) \cdot \tau_{\text{Elmore}}(d \to s)\bigr)^2}$$
-     where $\ln(0.8 / 0.2) = \ln(4) \approx 1.3863$ matches `sky130_fd_sc_hd`'s $20\%\text{--}80\%$ slew thresholds (`slew_lower_threshold_pct_rise : 20.0`, `slew_upper_threshold_pct_rise : 80.0`).
+**Stage 1: reader and RC tree.**
+1. Units: `*C_UNIT` to pF, `*R_UNIT` to kohm (so `R * C` is ns), `*T_UNIT` must be `1 NS`. `*NAME_MAP`
+   references (`*12`, `*12:3`) are resolved; backslash escapes are removed.
+2. Per `*D_NET`: `*CAP` lines with one node are ground capacitors; with two nodes (coupling) they are lumped to
+   ground on the first node. `*RES` lines are resistors. `*CONN` is not needed: pin nodes are found by name
+   (`cell:pin`, or the port name).
+3. The tree is a BFS spanning tree from the driver pin; self-loops and parallel resistors are dropped. A net
+   that is absent from the SPEF has no parasitics. A pin without a node, or not connected to the driver by
+   resistors, is an error.
+4. Then the same pin capacitance, Elmore delay and wire slew as E3.2 items 5-6.
+
+**Stage 2: pi model and effective capacitance** (`NetRcTree::pi_model`, `sta/dmp.rs`). Written from the
+published method (Dartu, Menezes, Pileggi, IEEE TCAD 1996), not from OpenSTA's source (GPL).
+1. Pi model from the driving-point admittance moments: `y2(u) = sum_v (y2(v) - R_uv y1(v)^2)`,
+   `y3(u) = sum_v (y3(v) - 2 R_uv y1(v) y2(v) + R_uv^2 y1(v)^3)`, `C_far = y2^2 / y3`,
+   `C_near = y1 - C_far`, `R_pi = -y3^2 / y2^3`. Matches OpenSTA's `report_dcalc` to 6 digits (OpenSTA calls
+   the near capacitor C2 and the far one C1).
+2. Driver: a saturated ramp (`t0`, `dt`) behind `Rd`. For a trial `Ceff`, the ramp is fitted so that a single
+   capacitor `Ceff` reproduces the table delay (50%) and slew (20-80%). `Ceff` is bisected until the charge the
+   ramp delivers into the pi load up to the 50% point equals the charge into `Ceff`.
+   `Rd = RD_SCALE * d(table delay)/dC`.
+3. Delay is the table delay at `Ceff`. Slew is the table slew at `Ceff`.
+4. **Known gaps** (tasks E3.5): `RD_SCALE = 4.5` is **fitted**, not derived (the natural value is 1/ln 2);
+   OpenSTA's driver waveform slew (1-18% above the table slew) is not modelled.
+5. Why the textbook charge-sharing formula was dropped: with `td = slew / 0.6` it leaves `Ceff` within 1% of
+   the total, while OpenSTA shields up to 75% of `C2` on high-fanout nets (picorv32 `_06198_/X`).
+
+---
+
+## 4. Status and Tolerances (2026-11-10)
+
+Done criterion for every E3 step: worst slack, and arrival and required time of every endpoint, within
+`max(5 ps, 1%)` of OpenSTA. Where a test uses a looser value, the cause is in `docs/results.md`.
+
+| Test (`cargo test --release -p grus-core sta`) | Status | Tolerance differing from the criterion |
+|---|---|---|
+| gcd zero wire | pass | none |
+| picorv32 zero wire | pass | none |
+| gcd SPEF | pass | slew 3% |
+| gcd placement RC | pass | arrival 2%, slew 5% (Steiner, E3.4) |
+| picorv32 SPEF | pass | arrival floor 6 ps, setup slack 40 ps, slew 10%, TNS 2% (E3.5) |
+| picorv32 placement RC | `#[ignore]`, fails | arrival 9% off (Steiner, E3.4) |
+| DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` 6% (one arc is 5.5% high) |
+
+## 5. Open Work
+
+Each task is independent. Rules that apply to all: AGENTS.md Section 2 (a stage is done only against the
+reference tool), write the rule in `docs/` before the code, record every comparison (including failures) in
+`docs/results.md`, and prove each new test can fail by breaking the code on purpose.
+
+### E3.4: Steiner trees that match OpenROAD's (`congestion/rsmt.rs`, `sta/parasitics.rs`)
+- **Why**: picorv32 placement RC is 9% off in arrival, and gcd placement RC needs a 2% arrival tolerance, because
+  nets of four or more pins are longer in our tree (E3.2 item 3).
+- **Reference**: OpenROAD uses FLUTE (Chu and Wong, IEEE TCAD 2008): optimal for 9 pins or fewer, net splitting
+  above that. Measure it: the per-net SPEF (`gcd.routed.spef`, `picorv32.routed.spef`) gives the exact tree
+  length (`sum of *CAP / c0`) and the segments (`*RES`). Compare length per net, not only the total.
+- **Approach**: implement an exact RSMT for small degrees (Hanan-grid dynamic programming, or any exact method
+  you can justify) and keep a heuristic above 9 pins. Do **not** copy FLUTE's source or lookup tables without
+  checking their license (this repository is Apache-2.0 and may hold company IP); write it from the paper.
+- **Done when**: tree length equals OpenROAD's on every net of up to 9 pins on gcd and picorv32; for larger
+  nets the length gap is measured and recorded; the picorv32 placement-RC test passes with arrival `max(5 ps, 1%)`
+  (un-`#[ignore]` it) and the gcd placement-RC arrival tolerance returns to 1%. E1's 8 congestion tests must still pass
+  (the E1 ranking tests depend on `build_net_rsmt`); if the change alters E1 results, say so in `results.md`.
+
+### E3.5: A derived driver model (`sta/dmp.rs`)
+- **Why**: `RD_SCALE` is fitted. One value fits arrival (about 4.5-5) but not `Ceff` (about 3), and OpenSTA's
+  driver waveform slew is missing. This is what forces the loosened picorv32 SPEF tolerances.
+- **Reference**: `report_dcalc -from <in> -to <out> -max -digits 6` prints the pi model, `Ceff`, `Delay`, `Slew`
+  and `Driver waveform slew` per arc. Collect a table of at least 30 arcs on picorv32 (several cells, both
+  transitions, shielded and unshielded). Run it through `target/probe`-style Tcl in the LibreLane container.
+- **Approach**: find a principled `Rd` and a waveform-slew rule that reproduce the table, from the DMP paper
+  and the measurements. The fit currently cannot reproduce the table slew with a physical ramp for large `Rd`
+  (step-response slew `1.39 Rd C` exceeds the table slew), which suggests the model structure, not the constant,
+  needs revisiting. Do **not** read OpenSTA's `DmpCeff` source (GPL).
+- **Done when**: `Ceff` within 2% and driver slew within 2% of `report_dcalc` on all collected arcs; picorv32
+  SPEF passes with the plain criterion (slack 5 ps, slew 1%, TNS 1%); `RD_SCALE` is gone or derived.
+
+### E3.6: Speed (after E3.4 and E3.5; AGENTS.md Section 2)
+- **Why**: `grus-eda sta` on picorv32 with a SPEF takes 16 s (release); zero wire takes under a second. The DMP
+  solve (nested bisections around a 200-step simulation) dominates.
+- **Approach**: first a profile. Candidates: closed-form ramp-RC response instead of the simulation, caching the
+  solve per (net, transition, quantised input slew), `rayon` over levels. The fast path must give the same numbers
+  as the simple one: keep the simple version behind a test and compare per endpoint.
+- **Done when**: picorv32 SPEF STA under 2 s, with every test in the Section 4 table giving the same results as
+  before (differences below 1e-4 ns).
+
+### Not scheduled
+- Coupling capacitors, resistor loops and `*NAME_MAP` are implemented but **untested against OpenSTA**: the SPEFs
+  here are placement estimates. Needs a routed SPEF (for example from OpenROAD global/detailed routing on gcd).
+- `set_clock_uncertainty` is applied to register checks only, not output ports (gcd and picorv32 do not use it).
+- Latches are skipped with a warning (out of E3 scope).
+
+## 6. Reproducing the Test Inputs
+
+`gcd` artifacts are committed. `picorv32` artifacts over 1 MB are not; generate them first (about 3 minutes):
+
+```bash
+mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
+bash tests/designs/picorv32/generate_ref.sh   # runs the container by itself when called from the host
+```
+
+The picorv32 tests panic (they do not skip) when `picorv32.placed.def`, `picorv32.routed.spef` or
+`picorv32.sta.reference.json` is missing. Run the whole suite with
+`cargo test --release -p grus-core sta` (about 17 s).

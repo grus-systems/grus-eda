@@ -66,7 +66,7 @@ tool. The GPU result must then equal the CPU result.
 - [`docs/e0-readers.md`](docs/e0-readers.md) — E0: File formats, Yosys JSON vs. Verilog, and Liberty binary caching
 - [`docs/e1-congestion.md`](docs/e1-congestion.md) — E1: GCell grid, RSMT (FLUTE/Steiner) decomposition, and pattern/probabilistic routing
 - [`docs/e2-placement.md`](docs/e2-placement.md) — E2: ePlace electrostatic placement, 2D DCT/FFT, and greedy legalization
-- [`docs/e3-sta.md`](docs/e3-sta.md) — E3: Levelized STA, unateness, NLDM extrapolation, and placement-based RC / SPEF
+- [`docs/e3-sta.md`](docs/e3-sta.md) — E3: Levelized STA, NLDM extrapolation, placement-based RC, SPEF, DMP driver model; status and open tasks E3.4–E3.6
 - [`docs/results.md`](docs/results.md) — Verification log against OpenROAD and OpenSTA
 
 ## Dependencies
