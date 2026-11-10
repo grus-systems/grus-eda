@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod dmp;
 pub mod nldm;
 pub mod parasitics;
 pub mod sdc;

@@ -1,4 +1,5 @@
 use crate::congestion::rsmt::{Pt, build_rsmt_points};
+use super::dmp::PiModel;
 use crate::design_db::DesignDb;
 use crate::readers::spef::{Spef, SpefNet, unescape_spef_name};
 use crate::interner::{NetId, PinId};
@@ -44,6 +45,26 @@ pub struct NetRcTree {
 }
 
 impl NetRcTree {
+    /// Driving-point pi model seen by the driver, from the admittance moments of the whole tree.
+    /// `pin_caps_pf[i]` is the pin capacitance of pin `i` for the transition being analysed.
+    pub fn pi_model(&self, pin_caps_pf: &[f32]) -> PiModel {
+        let n = self.parent.len();
+        let mut y1: Vec<f64> = self.wire_cap_pf.iter().map(|&c| c as f64).collect();
+        for (pin, &node) in self.pin_node.iter().enumerate() {
+            y1[node as usize] += pin_caps_pf[pin] as f64;
+        }
+        let (mut y2, mut y3) = (vec![0.0f64; n], vec![0.0f64; n]);
+        // Children come after their parent, so a reverse sweep sees every child's final moments.
+        for v in (1..n).rev() {
+            let (p, r) = (self.parent[v] as usize, self.edge_r_kohm[v] as f64);
+            let (a1, a2, a3) = (y1[v], y2[v], y3[v]);
+            y2[p] += a2 - r * a1 * a1;
+            y3[p] += a3 - 2.0 * r * a1 * a2 + r * r * a1 * a1 * a1;
+            y1[p] += a1;
+        }
+        PiModel::from_moments(y1[0], y2[0], y3[0])
+    }
+
     /// Elmore delay (ns) from the driver to each pin of the net, in `net_pins` order.
     /// `pin_caps_pf[i]` is the pin capacitance of pin `i` for the transition being analysed.
     pub fn elmore_ns(&self, pin_caps_pf: &[f32]) -> Vec<f32> {

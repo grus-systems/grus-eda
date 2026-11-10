@@ -286,7 +286,8 @@ despite its name it is **not** a routed SPEF, so `placement_rc` and `placed_spef
 ### Step E3.3: SPEF Reader & RC Tree Elmore Propagation (`readers/spef.rs`)
 
 > **Status (2026-11-10)**: Stage 1 (reader, spanning tree, Elmore, wire slew) is implemented in `readers/spef.rs`
-> and `sta/parasitics.rs::spef_parasitics`. Stage 2 (pi model, `Ceff`, DMP driver slew) is **not** implemented:
+> and `sta/parasitics.rs::spef_parasitics`. Stage 2 (pi model, DMP `Ceff`) is implemented in `sta/dmp.rs` with a
+> fitted driver resistance; the driver waveform slew is not. The notes below are the history that led there:
 > the formulas below were never checked against OpenSTA, and `report_dcalc` shows that OpenSTA's driver slew
 > comes from a waveform model, so a pi model and `Ceff` alone would not close the slew gap. Measure
 > `report_dcalc` pi models first, then write the rule here before coding.
@@ -308,15 +309,23 @@ despite its name it is **not** a routed SPEF, so `placement_rc` and `placed_spef
    - **Stage 1 (Lumped Cap + Elmore Delay Baseline)**:
      - Run the bottom-up $C_{\text{down}}$ and top-down $\tau_{\text{Elmore}}$ pass as in Step E3.2, with total lumped capacitance $C_{\text{total}} = C_{\text{down}}(d)$.
      - Verify against OpenSTA first with `sta`'s lumped-cap / Elmore calculator (`set_delay_calculator lumped_cap` or short-wire `gcd` where $R_{\text{wire}} \ll R_{\text{driver}}$).
-   - **Stage 2 (O'Brien-Savarino $\pi$-Model & $C_{\text{eff}}$ for OpenSTA Default `dmp_ceff_elmore`)**:
-     - When driving long resistive nets under OpenSTA's default `dmp_ceff_elmore` calculator, resistive shielding makes effective driver load $C_{\text{eff}} < C_{\text{total}}$:
-     - Compute the first three driving-point admittance moments $(y_1, y_2, y_3)$ at the driver in a single bottom-up tree pass:
-       $$y_1(u) = C_{\text{down}}(u), \quad y_2(u) = \sum_{v \in \text{children}(u)} \bigl(y_2(v) - R_{uv} y_1(v)^2\bigr), \quad y_3(u) = \sum_{v \in \text{children}(u)} \bigl(y_3(v) - 2 R_{uv} y_1(v) y_2(v) + R_{uv}^2 y_1(v)^3\bigr)$$
-     - Construct the equivalent driving-point $\pi$-model:
-       $$C_2 = \frac{y_2^2}{y_3}, \quad C_1 = y_1 - C_2, \quad R_\pi = -\frac{y_3^2}{y_2^3}$$
-     - Run 2 fixed-point iterations matching the NLDM output transition $t_{\text{slew}}(C_{\text{eff}})$ against the $\pi$-load charge sharing equation:
-       $$C_{\text{eff}} = C_1 + C_2 \left(1 - \frac{R_\pi C_2}{t_{\text{D}}} \left(1 - e^{-t_{\text{D}} / (R_\pi C_2)}\right)\right)$$
-       where $t_{\text{D}} = t_{\text{slew}} / (\text{upper\_pct} - \text{lower\_pct})$ (for `sky130hd` $20\%\text{--}80\%$ thresholds, $t_{\text{D}} = t_{\text{slew}} / 0.6$).
+   - **Stage 2 (pi model and DMP effective capacitance, `sta/dmp.rs`)**: implemented 2026-11-10 from the
+     published method (Dartu, Menezes, Pileggi, IEEE TCAD 1996), not from OpenSTA's source (GPL).
+     - Pi model from the driving-point admittance moments `y1, y2, y3` of the RC tree
+       (`NetRcTree::pi_model`): `y2(u) = sum_v (y2(v) - R_uv y1(v)^2)`,
+       `y3(u) = sum_v (y3(v) - 2 R_uv y1(v) y2(v) + R_uv^2 y1(v)^3)`, `C_far = y2^2 / y3`,
+       `C_near = y1 - C_far`, `R_pi = -y3^2 / y2^3`. Matches OpenSTA's `report_dcalc` pi models to 6 digits
+       on six picorv32 arcs (OpenSTA calls the near capacitor C2 and the far one C1).
+     - Driver: a saturated ramp (`t0`, `dt`) behind `Rd`. For a trial `Ceff` the ramp is fitted so that a
+       single capacitor `Ceff` reproduces the table delay (50%) and slew (20-80%); `Ceff` is bisected until the
+       charge the ramp delivers into the pi load up to the 50% point equals the charge into `Ceff`.
+       `Rd = RD_SCALE * d(table delay)/dC`.
+     - **`RD_SCALE` is fitted, not derived.** The natural value is 1/ln 2 = 1.44; the best arrival agreement on
+       picorv32 is at 4.5, and no single value fits every arc (see docs/results.md). The charge-sharing
+       formula that stood here before (`Ceff = C1 + C2 (1 - Rpi C2 / td (1 - e^(-td / Rpi C2)))`) was removed:
+       it leaves `Ceff` within 1% of the total, while OpenSTA shields up to 75% of `C2`.
+     - Delay is the table delay at `Ceff`. Slew is the table slew at `Ceff`; OpenSTA's driver waveform slew
+       differs from it by 1-18% on the arcs inspected and is **not** modelled.
    - **Wire Slew Degradation**:
      $$\text{slew}(s) = \sqrt{\text{slew}(d)^2 + \bigl(\ln(4) \cdot \tau_{\text{Elmore}}(d \to s)\bigr)^2}$$
      where $\ln(0.8 / 0.2) = \ln(4) \approx 1.3863$ matches `sky130_fd_sc_hd`'s $20\%\text{--}80\%$ slew thresholds (`slew_lower_threshold_pct_rise : 20.0`, `slew_upper_threshold_pct_rise : 80.0`).
