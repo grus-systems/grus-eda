@@ -68,6 +68,7 @@ tool. The GPU result must then equal the CPU result.
 - [`docs/e2-placement.md`](docs/e2-placement.md) — E2: ePlace electrostatic placement, 2D DCT/FFT, and greedy legalization
 - [`docs/e3-sta.md`](docs/e3-sta.md) — E3: Levelized STA, NLDM extrapolation, placement-based RC, SPEF, DMP driver model; status and open tasks E3.4–E3.6
 - [`docs/results.md`](docs/results.md) — Verification log against OpenROAD and OpenSTA
+- [`docs/review-2026-11-11.md`](docs/review-2026-11-11.md) — Project review: findings to fix, and what replacing the existing tools would take
 
 ## Dependencies
 
