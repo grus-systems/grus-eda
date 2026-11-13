@@ -2,14 +2,11 @@
 
 Every comparison against the reference tools (`OpenROAD` and `OpenSTA` in `ghcr.io/librelane/librelane:3.0.16`) is recorded here, including runs that did **not** yet meet the target thresholds and the root cause identified.
 
-## Summary of Stage Targets
+## Current Status
 
-| Stage | Reference Tool | Target ("Done When") | Status |
-|---|---|---|---|
-| **E0** (Readers) | OpenROAD / OpenSTA | Cell, net, pin, and row counts match exactly on every test design | PASS |
-| **E1** (Congestion) | OpenROAD `global_route` | Overflow ranks the test variants in the same order | PASS |
-| **E2** (Placement) | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% | PASS on gcd only (E2.4); picorv32 does not converge and is not yet an E2 test |
-| **E3** (STA) | OpenSTA (`sta`) | Worst slack and every endpoint's arrival within 1% or 5 ps | E3.1 PASS (gcd, zero wire); E3.2/E3.3 PASS on gcd; picorv32: zero wire and SPEF PASS, placement RC fails (Steiner) |
+The per-stage status (designs covered, tolerances actually used, known gaps) is in
+[`docs/status.md`](status.md), the single source for current status. The done criteria are in
+`README.md` and the Section 1 tables of `docs/e*-*.md`. This file is the chronological log below.
 
 ---
 

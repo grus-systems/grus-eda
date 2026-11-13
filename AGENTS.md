@@ -57,12 +57,6 @@ Instructions for AI coding agents working in this repository.
 - Versioning: Once the Cargo workspace exists, bump `[workspace.package] version` in the root `Cargo.toml` in the same commit as any functional change. While in `0.x`, features and bug fixes bump `patch`; breaking changes bump `minor`.
 - Append your agent trailer to every commit message and PR description (e.g., `Co-Authored-By: <Agent Name> <email>`).
 
-## 6. First Steps (E0)
-
-1. Create the Cargo workspace (`grus-eda` CLI binary + `grus-core` library crate, following `docs/architecture.md`).
-2. Add `gcd` (`sky130hd` from OpenROAD-flow-scripts) under `tests/designs/gcd/` and document how to generate the Yosys netlist (`.json` and `.v`) and OpenROAD placed `.def` using the LibreLane container in `tests/designs/README.md`.
-3. Implement the Liberty reader and binary cache first (`docs/e0-readers.md`), and compare cell count, pin count, and NLDM table dimensions against OpenSTA (`get_lib_cells`, `report_lib_cell`) on the same `.lib` file.
-
 ## 7. Lessons from the E0 Review (2026-11-09)
 
 An outside review of E0 found that the stage did pass, but parts of the record could not be

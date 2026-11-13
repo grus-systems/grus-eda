@@ -22,7 +22,7 @@ enum Commands {
     /// E1: Estimate global-routing congestion directly from placed DEF
     Congestion(CongestionArgs),
 
-    /// E2: Global placement + greedy legalization, emitting placed DEF
+    /// E2: Global placement + Abacus legalization, emitting placed DEF
     Place(PlaceArgs),
 
     /// E3: Static timing analysis (zero-wire, placement-based RC, or SPEF)

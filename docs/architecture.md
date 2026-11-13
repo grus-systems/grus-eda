@@ -44,7 +44,7 @@ This document is the authoritative blueprint for `grus-eda`. Implementation agen
 
 - **E0 (Readers)**: Ingests netlists, LEF/DEF geometry, and cached Liberty tables into flat in-memory arrays.
 - **E1 (Congestion Estimate)**: Scheduled immediately after E0 because global-routing overflow is the primary failure mode in microarchitectural exploration. Accepting an OpenROAD-placed `DEF` directly turns E1 into a standalone 1–2 second preflight check before E2 or E3 exist.
-- **E2 (Global Placement + Greedy Legalizer)**: Places unplaced netlists using analytical electrostatic placement (ePlace) and snaps cells onto valid rows with a greedy legalizer (Tetris/Abacus) so E2 can feed E1 and E3 in a single Rust binary without containers.
+- **E2 (Global Placement + Abacus Legalizer)**: Places unplaced netlists using analytical electrostatic placement (ePlace) and snaps cells onto valid rows with an Abacus legalizer followed by local refinement, so E2 can feed E1 and E3 in a single Rust binary without containers.
 - **E3 (Static Timing Analysis)**: Computes levelized arrival, slew, and slack using NLDM tables—first with zero-wire pin capacitances, then with placement-based virtual RC estimation, and finally with extracted `SPEF`.
 
 ---
@@ -87,13 +87,14 @@ grus-eda/
 │           │   ├── wirelength.rs # Weighted-Average (WA) wirelength & gradient
 │           │   ├── density.rs    # Bin grid & 2D DCT/IDXST Poisson solver
 │           │   ├── nesterov.rs   # Nesterov solver with BB step size
-│           │   └── legalize.rs   # Greedy Tetris/Abacus row legalizer
+│           │   └── legalize.rs   # Abacus row legalizer with local refinement
 │           └── sta/              # E3 modules
 │               ├── mod.rs
-│               ├── graph.rs      # Levelized CSR timing DAG
+│               ├── analysis.rs   # Dual Rise/Fall arrival, required, and slack propagation; endpoint reports
+│               ├── dmp.rs        # Effective capacitance of RC loads (Dartu, Menezes, Pileggi)
 │               ├── nldm.rs       # 2D bilinear interpolation + linear extrapolation
 │               ├── parasitics.rs # Zero-wire, placement RC, and SPEF Elmore models
-│               └── propagate.rs  # Dual Rise/Fall arrival, required, and slack
+│               └── sdc.rs        # Minimal SDC reader
 ├── docs/
 └── tests/
     └── designs/
@@ -107,7 +108,7 @@ resolver = "2"
 members = ["crates/grus-core", "crates/grus-eda"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.21"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -116,8 +117,6 @@ anyhow = "1"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
-rayon = "1.10"
-realfft = "3"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -508,7 +507,7 @@ grus-eda congestion \
   [--layer-adjust <0.0..1.0>] \
   [--heatmap]
 
-# E2: Global placement + greedy legalization, emitting placed DEF
+# E2: Global placement + Abacus legalization, emitting placed DEF
 grus-eda place \
   --tlef <path.tlef> \
   --lef <path.lef> \

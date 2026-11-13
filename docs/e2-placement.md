@@ -1,4 +1,4 @@
-# E2: Global Placement & Greedy Legalization — Implementation Spec
+# E2: Global Placement & Abacus Legalization — Implementation Spec
 
 This document breaks E2 into four concrete implementation steps (`E2.1`–`E2.4`) with exact equations and Rust pseudocode for the implementer.
 
@@ -11,7 +11,7 @@ This document breaks E2 into four concrete implementation steps (`E2.1`–`E2.4`
 | **E2.1** | Weighted-Average (WA) wirelength & gradient (`placement/wirelength.rs`) | Finite-difference gradient unit test | Analytical gradient matches central finite differences within `< 1e-4` relative error |
 | **E2.2** | 2D DCT/IDXST Poisson electrostatic solver (`placement/density.rs`) | Analytical 2D cosine charge test + finite-difference force check | Electric field $(E_x, E_y)$ matches $-\nabla \phi$ and total net force sums to $0$ |
 | **E2.3** | Nesterov global placer (`placement/nesterov.rs`) | `openroad`: `global_placement` | Converges to overflow $\tau \le 0.10$ in $< 300$ iterations |
-| **E2.4** | Greedy Abacus/Tetris legalizer (`placement/legalize.rs`) & DEF writer | `openroad`: `check_placement -verbose` & `report_design_area` | `check_placement` reports 0 violations, `detailed_placement` accepts output DEF, and legalized HPWL is within 5% of OpenROAD |
+| **E2.4** | Abacus legalizer with local refinement (`placement/legalize.rs`) & DEF writer | `openroad`: `check_placement -verbose` & `report_design_area` | `check_placement` reports 0 violations, `detailed_placement` accepts output DEF, and legalized HPWL is within 5% of OpenROAD |
 
 ---
 
@@ -223,7 +223,7 @@ pub fn run_nesterov_placement(
 
 ---
 
-### Step E2.4: Greedy Tetris / Abacus Legalizer & Local Refinement (`legalize.rs`)
+### Step E2.4: Abacus Legalizer & Local Refinement (`legalize.rs`)
 
 After Nesterov finishes, snap every movable standard cell to a valid, non-overlapping `PlacementRow` site in `i32` DBU, avoiding all `Fixed` cells (such as tapcells and endcap decaps), and refine local cell ordering to minimize exact DBU HPWL:
 

@@ -25,21 +25,29 @@ hands over to the established tools for everything after.
    standard files (Liberty, LEF, DEF, and Yosys JSON or gate-level Verilog) and
    writes DEF. Every stage can also consume OpenROAD's intermediate files (such
    as a placed DEF) directly, so any stage can run standalone or hand over to
-   OpenROAD at any boundary. Rust for memory safety without a garbage collector,
-   easy data parallelism (rayon) and a single static binary.
+   OpenROAD at any boundary. Rust for memory safety without a garbage collector
+   and a single static binary.
+   - Today: no parallelism; the code uses no threads.
+   - Target: data parallelism through rayon.
 3. **Data-oriented design**: flat arrays per attribute (structure of arrays),
-   graphs as index arrays (CSR) instead of pointers, no allocation per object,
-   and `f32` arithmetic across CPU and GPU. The timing graph is levelized so
-   that every level is one parallel pass.
+   graphs as index arrays instead of pointers, and `f32` arithmetic.
+   - Today: the netlist and floorplan are SoA with CSR lists (`design_db.rs`);
+     the placer and congestion estimate use `f32` on the CPU.
+   - Target: the STA timing graph in CSR with no allocation per object (today
+     it is `Vec<Vec<u32>>`, and the checks sit in a `BTreeMap`); the timing graph
+     levelized so that every level is one parallel pass (today: Kahn order, no
+     levels stored); `f32` on the GPU.
 4. **Known fast algorithms, not new ones**:
    - congestion: RSMT (Steiner tree) decomposition followed by pattern
      (L/Z-shape) and probabilistic routing on a GCell grid;
    - placement: analytical placement with an electrostatic density term solved by
-     FFT (ePlace, DREAMPlace), plus a lightweight greedy legalizer;
+     FFT (ePlace, DREAMPlace), plus an Abacus legalizer with local refinement;
    - timing: levelized propagation with NLDM table lookup, as OpenSTA computes it.
 5. **Apple Silicon first**: all cores through rayon and NEON SIMD, then
    Accelerate / Metal for the kernels that pay for it (the density FFT, the
    wirelength gradient).
+   - Today: CPU only, single-threaded, no SIMD intrinsics, no Accelerate or Metal.
+   - Target: the list above.
 6. **Agreement before speed**: a stage gets faster only after it agrees with the
    reference tool, and the fast version must give the same answer as the simple one.
 
@@ -51,7 +59,7 @@ Not goals: sign-off, detailed routing, or beating OpenROAD on result quality.
 |---|---|---|---|
 | E0 | readers: Liberty (NLDM tables), LEF (technology and cells), DEF, Yosys JSON (preferred) and gate-level Verilog | OpenROAD and OpenSTA reports on the same files | cell, net, pin and row counts match on every test design |
 | E1 | global-routing congestion estimate (overflow per GCell, from placed DEF) | OpenROAD `global_route` | overflow ranks the test variants in the same order |
-| E2 | global placement (wirelength plus a density penalty) and greedy legalization | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% |
+| E2 | global placement (wirelength plus a density penalty) and Abacus legalization with local refinement | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% |
 | E3 | static timing (edge-triggered DFFs first): arrival, slew, setup and hold — first without wires, then with placement-based RC estimation (HPWL/Steiner) and SPEF | OpenSTA | worst slack and every endpoint's arrival within 1% or 5 ps |
 
 Out of scope: detailed routing, GDS output, DRC, LVS, and (initially) transparent
@@ -62,10 +70,11 @@ tool. The GPU result must then equal the CPU result.
 
 ## Documentation
 
+- [`docs/status.md`](docs/status.md) — Current status per stage: designs covered, tolerances actually used, known gaps
 - [`docs/architecture.md`](docs/architecture.md) — Data-oriented design (SoA/CSR), decoupled pipeline, `f32` numeric model, and Apple Silicon strategy
 - [`docs/e0-readers.md`](docs/e0-readers.md) — E0: File formats, Yosys JSON vs. Verilog, and Liberty binary caching
 - [`docs/e1-congestion.md`](docs/e1-congestion.md) — E1: GCell grid, RSMT (FLUTE/Steiner) decomposition, and pattern/probabilistic routing
-- [`docs/e2-placement.md`](docs/e2-placement.md) — E2: ePlace electrostatic placement, 2D DCT/FFT, and greedy legalization
+- [`docs/e2-placement.md`](docs/e2-placement.md) — E2: ePlace electrostatic placement, 2D DCT/FFT, and Abacus legalization
 - [`docs/e3-sta.md`](docs/e3-sta.md) — E3: Levelized STA, NLDM extrapolation, placement-based RC, SPEF, DMP driver model; status and open tasks E3.4–E3.6
 - [`docs/results.md`](docs/results.md) — Verification log against OpenROAD and OpenSTA
 - [`docs/review-2026-11-11.md`](docs/review-2026-11-11.md) — Project review: findings to fix, and what replacing the existing tools would take

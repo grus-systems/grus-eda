@@ -2,6 +2,8 @@
 
 This document breaks E3 into implementation steps `E3.1`–`E3.3` (done) and open tasks `E3.4`–`E3.6` (Section 5), with the data structures, NLDM extrapolation code, and RC and driver-model equations an implementing agent needs. Section 4 is the current status; Section 6 says how to generate the test inputs.
 
+> `docs/status.md` is the cross-stage status source (E0–E3). Section 4 below keeps the per-test E3 breakdown.
+
 ---
 
 ## 1. Done Criteria & Scope
