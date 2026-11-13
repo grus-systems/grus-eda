@@ -79,3 +79,25 @@ holds two distinct pins even at equal values.
   keep full scans in this ticket.
 - Small designs (gcd) may see no gain; identity, not speed, is their
   acceptance criterion.
+
+## 5. Review resolutions (external review, 2026-11-14)
+
+The full review text is not included in this repository. Verdict: adopt
+with S3 changes; the removal argument and the cache lifetime check out.
+Adopted:
+
+- **Fallback predicate (F1)**: worded and implemented exactly as "both
+  top-2 pins of a direction are moved **and at least one unmoved pin
+  remains**" (unmoved count = pin count minus the moved pins on the net,
+  which the evaluation enumerates anyway) — not the conservative
+  `pin count > 2` test.
+- **Telemetry (F2)**: pass 1 counts evaluations that fall back to a full
+  scan; the total over the 4 rounds is returned as
+  `LegalizeResult.pass1_eval_fallbacks`. The CLI output does not change.
+- **Tests (F3)**: the differential test must include the all-pins-on-the-
+  swapped-cells case and a 3+-way tie at an extremum, on top of the cases
+  in Section 3.
+- The reviewer also noted the adversarial bound is better than Section 4
+  states (a fallback evaluation costs one scan, not two, because the
+  before sum comes from the cache); Section 4 stands as a conservative
+  bound.
