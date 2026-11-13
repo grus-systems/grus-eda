@@ -42,7 +42,7 @@ hands over to the established tools for everything after.
      (L/Z-shape) and probabilistic routing on a GCell grid;
    - placement: analytical placement with an electrostatic density term solved by
      FFT (ePlace, DREAMPlace), plus an Abacus legalizer with local refinement;
-   - timing: levelized propagation with NLDM table lookup, as OpenSTA computes it.
+   - timing: propagation in Kahn topological order with NLDM table lookup, as OpenSTA computes it.
 5. **Apple Silicon first**: all cores through rayon and NEON SIMD, then
    Accelerate / Metal for the kernels that pay for it (the density FFT, the
    wirelength gradient).
@@ -73,9 +73,9 @@ tool. The GPU result must then equal the CPU result.
 - [`docs/status.md`](docs/status.md) — Current status per stage: designs covered, tolerances actually used, known gaps
 - [`docs/architecture.md`](docs/architecture.md) — Data-oriented design (SoA/CSR), decoupled pipeline, `f32` numeric model, and Apple Silicon strategy
 - [`docs/e0-readers.md`](docs/e0-readers.md) — E0: File formats, Yosys JSON vs. Verilog, and Liberty binary caching
-- [`docs/e1-congestion.md`](docs/e1-congestion.md) — E1: GCell grid, RSMT (FLUTE/Steiner) decomposition, and pattern/probabilistic routing
+- [`docs/e1-congestion.md`](docs/e1-congestion.md) — E1: GCell grid, RSMT (Steiner tree) decomposition, and pattern/probabilistic routing
 - [`docs/e2-placement.md`](docs/e2-placement.md) — E2: ePlace electrostatic placement, 2D DCT/FFT, and Abacus legalization
-- [`docs/e3-sta.md`](docs/e3-sta.md) — E3: Levelized STA, NLDM extrapolation, placement-based RC, SPEF, DMP driver model; status and open tasks E3.4–E3.6
+- [`docs/e3-sta.md`](docs/e3-sta.md) — E3: STA in Kahn topological order, NLDM extrapolation, placement-based RC, SPEF, DMP driver model; status and open tasks E3.4–E3.6
 - [`docs/results.md`](docs/results.md) — Verification log against OpenROAD and OpenSTA
 - [`docs/review-2026-11-11.md`](docs/review-2026-11-11.md) — Project review: findings to fix, and what replacing the existing tools would take
 

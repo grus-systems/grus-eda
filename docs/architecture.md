@@ -45,7 +45,7 @@ This document is the authoritative blueprint for `grus-eda`. Implementation agen
 - **E0 (Readers)**: Ingests netlists, LEF/DEF geometry, and cached Liberty tables into flat in-memory arrays.
 - **E1 (Congestion Estimate)**: Scheduled immediately after E0 because global-routing overflow is the primary failure mode in microarchitectural exploration. Accepting an OpenROAD-placed `DEF` directly turns E1 into a standalone 1–2 second preflight check before E2 or E3 exist.
 - **E2 (Global Placement + Abacus Legalizer)**: Places unplaced netlists using analytical electrostatic placement (ePlace) and snaps cells onto valid rows with an Abacus legalizer followed by local refinement, so E2 can feed E1 and E3 in a single Rust binary without containers.
-- **E3 (Static Timing Analysis)**: Computes levelized arrival, slew, and slack using NLDM tables—first with zero-wire pin capacitances, then with placement-based virtual RC estimation, and finally with extracted `SPEF`.
+- **E3 (Static Timing Analysis)**: Computes arrival, slew, and slack in Kahn topological order using NLDM tables—first with zero-wire pin capacitances, then with placement-based virtual RC estimation, and finally with extracted `SPEF`.
 
 ---
 
@@ -80,7 +80,7 @@ grus-eda/
 │           ├── congestion/       # E1 modules
 │           │   ├── mod.rs
 │           │   ├── gcell.rs      # GCell grid & track supply
-│           │   ├── rsmt.rs       # FLUTE / Steiner tree decomposition
+│           │   ├── rsmt.rs       # RSMT: exact DP up to 9 pins, Prim MST + L-flip above
 │           │   └── route.rs      # Probabilistic & L/Z pattern routing
 │           ├── placement/        # E2 modules
 │           │   ├── mod.rs
