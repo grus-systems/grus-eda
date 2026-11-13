@@ -105,3 +105,22 @@ the resync never change a cell's y. Adopted:
   entries carry `(x, movable index, cell)`; collect candidates into one
   reusable scratch Vec cleared per cell; sort candidates with
   `sort_unstable` by movable index.
+
+## 6. Correction (2026-11-14): the cost split in Section 1 was wrong
+
+Section 1 inferred the time split from pair counts ("the cost is the scan
+itself"). That inference was never measured, and it is wrong. After the
+index landed (acceptance: placed DEF byte-identical on gcd and picorv32,
+full suite green), the maintainer re-measured both versions on the mini
+with collect/eval timers inside pass 1, per round on picorv32:
+
+- Old code: pass 1 total ~137 ms/round, of which the filter scan is
+  ~29 ms and the HPWL evaluations ~108 ms.
+- New code: candidate collection ~3.1 ms/round, evaluations ~115 ms/round.
+- Evaluations scan ~26M pins per round (~960 pins per evaluation on
+  average): high-fanout nets dominate, not pair visits.
+
+So the index removed only the scan share (~17%), and legalization stayed
+at ~1,000 ms. The follow-up that attacks the evaluation cost is
+`docs/design/f5-pass1-eval.md`. The acceptance target of 450 ms in
+Section 3 was set under the wrong model and is superseded there.
