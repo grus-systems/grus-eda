@@ -231,9 +231,9 @@ pub(crate) fn exact_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
     let all = num_subsets - 1;
     let mut best_root = 0;
     let mut min_total = inf;
-    for v in 0..nv {
-        if d[all][v] < min_total {
-            min_total = d[all][v];
+    for (v, &dist) in d[all].iter().enumerate().take(nv) {
+        if dist < min_total {
+            min_total = dist;
             best_root = v;
         }
     }
