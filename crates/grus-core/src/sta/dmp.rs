@@ -108,68 +108,151 @@ fn fit_ramp(rd: f64, c: f64, delay: f64, slew: f64) -> (f64, f64) {
     (delay - rc_crossing(0.5, dt, tau), dt)
 }
 
+/// Trapezoid steps of the charge integrator: [`pi_charge_numeric`] runs this many steps, and
+/// [`pi_charge_discrete`] sums the same recurrence in closed form.
+const TRAPEZOID_STEPS: usize = 200;
+
 /// Charge delivered by the ramp source through `rd` into the pi load between `t0` and `tx`:
-/// closed form, with the numeric integrator as fallback.
+/// closed form of the discrete recurrence, with the numeric integrator as fallback.
 fn pi_charge(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> f64 {
-    pi_charge_closed(pi, rd, t0, dt, tx).unwrap_or_else(|| pi_charge_numeric(pi, rd, t0, dt, tx))
+    pi_charge_discrete(pi, rd, t0, dt, tx).unwrap_or_else(|| pi_charge_numeric(pi, rd, t0, dt, tx))
 }
 
-/// Closed-form charge `Q = c1 V1 + c2 V2` at `tx`, where `(V1, V2)` solve
-/// `C1 V1' = (Vs - V1)/rd - (V1 - V2)/rpi`, `C2 V2' = (V1 - V2)/rpi` from rest. `Vs` is a ramp
-/// on `[t0, t0 + dt]` and 1 after it. `None` if the eigen-solve is ill-conditioned or the result
-/// is not finite.
-fn pi_charge_closed(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> Option<f64> {
-    let t = tx - t0;
-    if t <= 0.0 {
+/// One eigenmode of the trapezoid step, with `y = h lam / 2`. The step ratio is
+/// `rho = (1 + y) / (1 - y)`, so `rho - 1 = 2 y / (1 - y)` exactly and, for `rho > 0`,
+/// `ln rho = 2 atanh(y)`. Powers `rho^k - 1` are formed through `expm1`, because the modal sums
+/// below subtract nearly equal quantities when `rho` is close to 1.
+struct ModalRatio {
+    y: f64,
+    rho: f64,
+    inv: f64,
+    log: f64,
+}
+
+impl ModalRatio {
+    fn new(y: f64) -> Self {
+        let inv = 1.0 / (1.0 - y);
+        Self { y, rho: (1.0 + y) * inv, inv, log: 2.0 * y.atanh() }
+    }
+
+    /// `rho^k - 1`.
+    fn pm1(&self, k: usize) -> f64 {
+        if self.rho > 0.0 {
+            (k as f64 * self.log).exp_m1()
+        } else {
+            self.rho.powi(k as i32) - 1.0
+        }
+    }
+
+    /// Charge weight of an input with `m` steps still to run before the end:
+    /// `(1 - rho^m) / (1 - rho) + rho^m / 2 = 1/2 + (rho^m - 1) / (2 y)`.
+    fn phi(&self, m: usize) -> f64 {
+        0.5 + self.pm1(m) / (2.0 * self.y)
+    }
+
+    /// `(sum_{m<=n} phi(m), sum_{m<=n} m phi(m))`; zero for `n < 0`. With `E0 = sum (rho^m - 1)`
+    /// and `E1 = sum m (rho^m - 1)`, the closed forms are `E0 = P/Q - (n+1)` and
+    /// `E1 = [(n+1) Q - P + n P Q - n(n+1)/2 Q^2] / Q^2`, where `P = rho^(n+1) - 1` and
+    /// `Q = rho - 1`.
+    fn prefix(&self, n: isize) -> (f64, f64) {
+        if n < 0 {
+            return (0.0, 0.0);
+        }
+        let nf = n as f64;
+        let q = 2.0 * self.y * self.inv;
+        let p = self.pm1(n as usize + 1);
+        let e0 = p / q - (nf + 1.0);
+        let e1 = ((nf + 1.0) * q - p + nf * p * q - 0.5 * nf * (nf + 1.0) * q * q) / (q * q);
+        (0.5 * (nf + 1.0) + e0 / (2.0 * self.y), 0.25 * nf * (nf + 1.0) + e1 / (2.0 * self.y))
+    }
+}
+
+/// `sum_j h phi(N-1-j) u_j` over the `N` trapezoid inputs of one mode, with `u_j = vs_j + vs_{j+1}`
+/// and `k = ceil(dt / h)` the first saturated grid index. Inputs `j <= k - 2` are affine
+/// (`u_j = (2j + 1) h / dt`), input `j = k - 1` is the straddle step (`u = (k - 1) h / dt + 1`),
+/// and inputs `j >= k` are 2. The straddle step is not part of the affine run.
+fn modal_input_sum(ratio: &ModalRatio, n: usize, h: f64, dt: f64, k: usize) -> f64 {
+    let last = n as isize - 1;
+    // Affine inputs are the steps m = N-1-j with m in [N - affine, N - 1].
+    let affine = (k - 1).min(n) as isize;
+    let (p0_hi, p1_hi) = ratio.prefix(last);
+    let (p0_lo, p1_lo) = ratio.prefix(last - affine);
+    let affine_sum = (2.0 * n as f64 - 1.0) * (p0_hi - p0_lo) - 2.0 * (p1_hi - p1_lo);
+    let mut sum = h / dt * affine_sum;
+    if k <= n {
+        sum += ratio.phi(n - k) * ((k - 1) as f64 * h / dt + 1.0);
+    }
+    // Saturated inputs j in [k, N-1] are the steps m in [0, N-1-k].
+    sum += 2.0 * ratio.prefix(last - k as isize).0;
+    h * sum
+}
+
+/// Closed form of the trapezoid recurrence of [`pi_charge_numeric`] (design Section 7.1).
+///
+/// Each step is `v_{j+1} = P v_j + G u_j`, with `P = (I - hA/2)^-1 (I + hA/2)`, `G` the first
+/// column of `(I - hA/2)^-1` times `h g / (2 c1)`, and `u_j = vs_j + vs_{j+1}`. With the spectral
+/// projectors `R_i` of `A`, `P = sum_i rho_i R_i`, so `v1` is a sum over the two modes of
+/// `alpha_i` times the modal input sums of [`modal_input_sum`]. The charge keeps the loop's
+/// endpoint half-weights. `None` if the eigenbasis is ill-conditioned, a mode has `|rho| >= 1`,
+/// or the result is not finite.
+fn pi_charge_discrete(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> Option<f64> {
+    let span = tx - t0;
+    if span <= 0.0 {
         return Some(0.0);
     }
+    let n = TRAPEZOID_STEPS;
+    let h = span / n as f64;
     let c1 = pi.c1.max(1e-4 * pi.total());
-    let c2 = pi.c2;
-    let (g, gp) = (1.0 / rd, 1.0 / pi.rpi);
-    // x' = M x + forcing, with M = [[a, b], [d, e]].
+    let (c2, rpi) = (pi.c2, pi.rpi);
+    let (g, gp) = (1.0 / rd, 1.0 / rpi);
+    // A = [[a, b], [d, e]], the system matrix of the pi model.
     let (a, b, d, e) = (-(g + gp) / c1, gp / c1, gp / c2, -gp / c2);
-    let det = g * gp / (c1 * c2);
     let tr = a + e;
     // tr^2 - 4 det, written as a sum of squares so that it does not cancel.
     let sq = ((a - e) * (a - e) + 4.0 * b * d).sqrt();
-    if sq.is_nan() || sq <= 1e-6 * -tr {
+    let lam_a = 0.5 * (tr - sq);
+    let lam_b = g * gp / (c1 * c2) / lam_a;
+    // Eigenvectors (b, lam - a) normalised; for unit columns ||V||_F ||V^-1||_F = 2 / |det V|.
+    let unit = |lam: f64| {
+        let (x, y) = (b, lam - a);
+        let norm = x.hypot(y);
+        (x / norm, y / norm)
+    };
+    let ((va0, va1), (vb0, vb1)) = (unit(lam_a), unit(lam_b));
+    let det_v = va0 * vb1 - vb0 * va1;
+    let cond = 2.0 / det_v.abs();
+    if cond.is_nan() || cond > 1e12 {
         return None;
     }
-    // Both eigenvalues are negative. The larger-magnitude one comes from the trace; the other
-    // from the determinant, which avoids cancellation for the slow mode.
-    let lam_a = 0.5 * (tr - sq);
-    let lam_b = det / lam_a;
-    let shift = |v: [f64; 2], lam: f64| [(a - lam) * v[0] + b * v[1], d * v[0] + (e - lam) * v[1]];
-    // (exp(M s) - I) v, from Sylvester's formula for distinct eigenvalues.
-    let expm_minus_one = |s: f64, v: [f64; 2]| {
-        let (pa, pb) = ((lam_a * s).exp_m1(), (lam_b * s).exp_m1());
-        let (sa, sb) = (shift(v, lam_b), shift(v, lam_a));
-        [(pa * sa[0] - pb * sb[0]) / (lam_a - lam_b), (pa * sa[1] - pb * sb[1]) / (lam_a - lam_b)]
-    };
-    // M^-1 applied to (1, 1)/dt: the ramp's particular solution is (t/dt)(1, 1) - E(t)gamma.
-    let inv_apply = |v: [f64; 2]| [(e * v[0] - b * v[1]) / det, (-d * v[0] + a * v[1]) / det];
-    let gamma = inv_apply([1.0 / dt, 1.0 / dt]);
-    let (v1, v2) = if t <= dt {
-        let e_gamma = expm_minus_one(t, gamma);
-        (t / dt - e_gamma[0], t / dt - e_gamma[1])
-    } else {
-        // After the ramp both nodes relax to 1 along the homogeneous flow from x(dt) - 1.
-        let offset = expm_minus_one(dt, gamma);
-        let w = [-offset[0], -offset[1]];
-        let decay = expm_minus_one(t - dt, w);
-        (1.0 + w[0] + decay[0], 1.0 + w[1] + decay[1])
-    };
-    let q = c1 * v1 + c2 * v2;
+    let modes = [ModalRatio::new(0.5 * h * lam_a), ModalRatio::new(0.5 * h * lam_b)];
+    if !modes.iter().all(|m| m.rho.abs() < 1.0) {
+        return None;
+    }
+    // (R_i)_11 for the projectors R_a = (A - lam_b) / (lam_a - lam_b) and R_b = (A - lam_a) / (lam_b - lam_a).
+    let gap = lam_a - lam_b;
+    let r11 = [(a - lam_b) / gap, (a - lam_a) / -gap];
+    let kappa = 0.5 * h * g / c1;
+    // First saturated grid index, clamped to N+1: beyond that every input is affine.
+    let k = (dt / h).ceil().max(1.0).min((n + 1) as f64) as usize;
+    let mut iv1 = 0.0;
+    for (mode, w) in modes.iter().zip(r11) {
+        iv1 += kappa * w * mode.inv * modal_input_sum(mode, n, h, dt, k);
+    }
+    // sum_{s=1}^{N-1} vs_s is linear up to grid index k - 1 and 1 from k on; vs_N = min(span/dt, 1).
+    let linear = (k - 1).min(n - 1);
+    let vs_sum = (h / dt) * (linear * (linear + 1)) as f64 / 2.0 + n.saturating_sub(k) as f64;
+    let ivs = h * vs_sum + 0.5 * h * (span / dt).min(1.0);
+    let q = g * (ivs - iv1);
     q.is_finite().then_some(q)
 }
 
 /// Charge delivered by the ramp source through `rd` into the pi load between `t0` and `tx`, by
-/// the implicit trapezoid rule with 200 steps. Fallback for [`pi_charge_closed`], and the
+/// the implicit trapezoid rule with `TRAPEZOID_STEPS` steps. Fallback for [`pi_charge_discrete`], and the
 /// reference it is tested against.
 fn pi_charge_numeric(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> f64 {
     let c1 = pi.c1.max(1e-4 * pi.total());
     let (c2, rpi) = (pi.c2, pi.rpi);
-    let steps = 200usize;
+    let steps = TRAPEZOID_STEPS;
     let h = (tx - t0) / steps as f64;
     if h <= 0.0 {
         return 0.0;
@@ -328,23 +411,36 @@ mod tests {
         ]
     }
 
+    /// Discrete closed form against the 200-step integrator, at 1e-9 relative (1e-18 absolute floor).
+    fn assert_charge_agrees(pi: &PiModel, rd: f64, dt: f64, span: f64) {
+        let t0 = 0.05;
+        let closed = pi_charge_discrete(pi, rd, t0, dt, t0 + span)
+            .expect("discrete form must not fall back on the test grid");
+        let numeric = pi_charge_numeric(pi, rd, t0, dt, t0 + span);
+        assert!(
+            (closed - numeric).abs() <= 1e-9 * numeric.abs().max(1e-18) + 1e-18,
+            "pi {pi:?} rd {rd} dt {dt} tx-t0 {span}: closed {closed} numeric {numeric}"
+        );
+    }
+
     #[test]
-    fn closed_form_charge_matches_the_integrator() {
+    fn discrete_charge_matches_the_integrator() {
         for pi in charge_grid_models() {
             for rd in [0.2, 1.0, 5.0] {
                 for dt in [0.02, 0.1, 0.4] {
-                    let t0 = 0.05;
                     // Both regimes, the regime boundary, and points just either side of it.
-                    for t in [0.5 * dt, dt - 1e-9, dt, dt + 1e-9, 1.5 * dt, 4.0 * dt] {
-                        let closed = pi_charge_closed(&pi, rd, t0, dt, t0 + t)
-                            .expect("closed form must not fall back on the test grid");
-                        let numeric = pi_charge_numeric(&pi, rd, t0, dt, t0 + t);
-                        assert!(
-                            (closed - numeric).abs() <= 1e-4 * numeric.abs(),
-                            "pi {pi:?} rd {rd} dt {dt} tx-t0 {t}: closed {closed} numeric {numeric}"
-                        );
+                    for span in [0.5 * dt, dt - 1e-9, dt, dt + 1e-9, 1.5 * dt, 4.0 * dt] {
+                        assert_charge_agrees(&pi, rd, dt, span);
                     }
                 }
+            }
+            // The ramp saturates inside the interval at a step that is not a grid multiple.
+            for (rd, dt, span) in [(1.0, 0.03, 0.07), (0.2, 0.03, 0.07), (5.0, 0.03, 0.0437)] {
+                assert_charge_agrees(&pi, rd, dt, span);
+            }
+            // The whole charge is delivered inside the ramp (tx - t0 < dt).
+            for (rd, dt, span) in [(1.0, 0.4, 0.1234), (5.0, 0.4, 0.0009), (0.2, 0.1, 0.0731)] {
+                assert_charge_agrees(&pi, rd, dt, span);
             }
         }
     }
@@ -354,9 +450,9 @@ mod tests {
         for pi in charge_grid_models() {
             for (rd, dt) in [(0.2, 0.02), (1.0, 0.1), (5.0, 0.4)] {
                 let t0 = 0.05;
-                assert_eq!(pi_charge_closed(&pi, rd, t0, dt, t0), Some(0.0));
-                let before = pi_charge_closed(&pi, rd, t0, dt, t0 + dt - 1e-9).unwrap();
-                let after = pi_charge_closed(&pi, rd, t0, dt, t0 + dt + 1e-9).unwrap();
+                assert_eq!(pi_charge_discrete(&pi, rd, t0, dt, t0), Some(0.0));
+                let before = pi_charge_discrete(&pi, rd, t0, dt, t0 + dt - 1e-9).unwrap();
+                let after = pi_charge_discrete(&pi, rd, t0, dt, t0 + dt + 1e-9).unwrap();
                 assert!((before - after).abs() <= 1e-6 * after.abs(), "{before} vs {after}");
             }
         }

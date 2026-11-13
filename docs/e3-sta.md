@@ -370,7 +370,7 @@ reference tool), write the rule in `docs/` before the code, record every compari
 - **Done when**: `Ceff` within 2% and driver slew within 2% of `report_dcalc` on all collected arcs; picorv32
   SPEF passes with the plain criterion (slack 5 ps, slew 1%, TNS 1%); `RD_SCALE` is gone or derived.
 
-### E3.6: Speed (after E3.4 and E3.5; AGENTS.md Section 2)
+### E3.6: Speed — DONE 2026-11-13 (after E3.4 and E3.5; AGENTS.md Section 2)
 - **Why**: `grus-eda sta` on picorv32 with a SPEF takes 16 s (release); zero wire takes under a second. The DMP
   solve (nested bisections around a 200-step simulation) dominates.
 - **Approach**: first a profile. Candidates: closed-form ramp-RC response instead of the simulation, caching the
@@ -378,6 +378,10 @@ reference tool), write the rule in `docs/` before the code, record every compari
   as the simple one: keep the simple version behind a test and compare per endpoint.
 - **Done when**: picorv32 SPEF STA under 2 s, with every test in the Section 4 table giving the same results as
   before (differences below 1e-4 ns).
+- **Outcome**: design `docs/design/e36-dmp-speed.md` (Sections 3a/3b/3d plus the Section 7 discrete charge
+  form; the ODE charge form was implemented, measured and rejected — fitted `RD_SCALE` had absorbed the
+  trapezoid's error). picorv32 SPEF STA 10.45 s -> 0.98 s; WNS/TNS moved by at most 2.4e-4 ns; full test
+  suite green (58 passed). Entry: `docs/results.md`, 2026-11-13.
 
 ### Not scheduled
 - Coupling capacitors, resistor loops and `*NAME_MAP` are implemented but **untested against OpenSTA**: the SPEFs
