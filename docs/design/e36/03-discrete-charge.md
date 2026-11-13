@@ -21,6 +21,20 @@ from HEAD.
   rejected at acceptance with the measured reasons, discrete form adopted; the
   maintainer completes the mini timings)
 
+## Review resolutions (design Section 7.3, binding)
+
+- The input sequence `u_k = vs_k + vs_{k+1}` has three pieces: affine up to
+  `k* - 2`, the single straddle step at `k* - 1` with `u = (k* - 1) h / dt + 1`
+  (where `k* = ceil(dt / h)`), and 2 from `k*` on. Do not run the affine segment
+  through the straddle step.
+- Keep the charge sum's endpoint half-weights exactly as the loop has them.
+- Fallback triggers: non-finite intermediates, an ill-conditioned coefficient
+  solve, any `|rho_i| >= 1`, or an eigenvector condition number above 1e12.
+- Evaluate modal powers with `powi` (or equivalent repeated squaring), not
+  `exp(k * ln rho)`.
+- The 1e-9 agreement test compares as
+  `|Q_cf - Q_num| <= 1e-9 * max(|Q_num|, 1e-18) + 1e-18`.
+
 ## Interface
 
 `pi_charge` dispatches to the discrete closed form, falling back to

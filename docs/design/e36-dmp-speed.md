@@ -218,3 +218,25 @@ multiple of `h`.
   stiff cases by).
 - The mini acceptance (full STA suite, dcalc test, CLI WNS/TNS within 1e-3 ns and
   under 2 s) is unchanged and is now the binding check that the model did not move.
+
+### 7.3 Review resolutions (external review, 2026-11-13)
+
+The full review text is not included in this repository. Verdict: adopt with
+changes. The reviewer independently re-derived the recurrence from
+`pi_charge_numeric` (step matrix, forcing indices, charge endpoint half-weights)
+and found no off-by-one. Adopted:
+
+- **Straddle step is a separate segment (F1/F2, S2/S3):** with
+  `k* = ceil(dt / h)` the first saturated grid index, the input sequence
+  `u_k = vs_k + vs_{k+1}` is affine for `k <= k* - 2`, a single mixed step at
+  `k = k* - 1` (`u = (k* - 1) h / dt + 1`), and 2 from `k*` on. The closed-form
+  sums must not run the affine segment through the straddle step.
+- **Charge endpoints (F3, S3):** the trapezoid sum keeps its half-weight
+  endpoints exactly as in the loop.
+- **Fallback conditions extended (Q3, S2):** in addition to non-finite
+  intermediates and an ill-conditioned coefficient solve, fall back when any
+  `|rho_i| >= 1` (roundoff) or the eigenvector condition number exceeds 1e12.
+- **Test tolerance form (Q3):** the 1e-9 agreement test uses
+  `|Q_cf - Q_num| <= 1e-9 * max(|Q_num|, 1e-18) + 1e-18` so a near-zero charge is
+  not failed on relative error alone.
+- **Modal powers by `powi`** (S3), not `exp(k * ln rho)`.
