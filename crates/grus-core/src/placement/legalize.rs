@@ -126,6 +126,137 @@ fn net_hpwl_dbu(db: &DesignDb, tech_db: &TechDb, net_idx: usize) -> i64 {
     }
 }
 
+const SWAP_MAX_DX_DBU: i32 = 25_000;
+
+// (x_dbu, movable index, cell): sorted, so the x window is a binary-searched range.
+type BandEntry = (i32, usize, usize);
+
+// Invariant: at the start of every pass 1 round each movable cell sits on a sub-row y.
+// Abacus writes sub-row y, pass 1 swaps exchange positions (y stays a sub-row y), and
+// passes 2/3 never change y. A cell missing from `band_ys` would be missing from the
+// index and silently drop candidate pairs, so this panics instead.
+fn band_of(band_ys: &[i32], y: i32) -> usize {
+    band_ys
+        .binary_search(&y)
+        .unwrap_or_else(|_| panic!("movable cell at y={} is not on a sub-row", y))
+}
+
+fn band_remove(band: &mut Vec<BandEntry>, entry: BandEntry) {
+    let pos = band.binary_search(&entry).expect("pass 1 index lost a cell");
+    band.remove(pos);
+}
+
+fn band_insert(band: &mut Vec<BandEntry>, entry: BandEntry) {
+    let pos = band.partition_point(|e| *e < entry);
+    band.insert(pos, entry);
+}
+
+// Equal-width swaps, each cell against later cells in `movable_cells` order.
+// The index is rebuilt here, once per round, and updated on every accepted swap.
+fn equal_width_swap_pass(
+    design_db: &mut DesignDb,
+    tech_db: &TechDb,
+    movable_cells: &[usize],
+    cell_w_dbu: &[i32],
+    cell_nets: &[Vec<usize>],
+    band_ys: &[i32],
+) {
+    let max_dy = 4 * tech_db.site_height_dbu;
+
+    let mut cell_mi = vec![usize::MAX; design_db.num_cells()];
+    for (mi, &c) in movable_cells.iter().enumerate() {
+        cell_mi[c] = mi;
+    }
+
+    let mut bands: Vec<Vec<BandEntry>> = vec![Vec::new(); band_ys.len()];
+    for (mi, &c) in movable_cells.iter().enumerate() {
+        let b = band_of(band_ys, design_db.cell_y_dbu[c]);
+        bands[b].push((design_db.cell_x_dbu[c], mi, c));
+    }
+    for band in &mut bands {
+        band.sort_unstable();
+    }
+
+    let mut candidates: Vec<usize> = Vec::new();
+    for (i, &c1) in movable_cells.iter().enumerate() {
+        let w1 = cell_w_dbu[c1];
+        let x1 = design_db.cell_x_dbu[c1];
+        let y1 = design_db.cell_y_dbu[c1];
+        let o1 = design_db.cell_orient[c1];
+
+        candidates.clear();
+        let band_lo = band_ys.partition_point(|&by| by < y1.saturating_sub(max_dy));
+        let band_hi = band_ys.partition_point(|&by| by <= y1.saturating_add(max_dy));
+        for band in &bands[band_lo..band_hi] {
+            let lo = band.partition_point(|e| e.0 < x1.saturating_sub(SWAP_MAX_DX_DBU));
+            let hi = band.partition_point(|e| e.0 <= x1.saturating_add(SWAP_MAX_DX_DBU));
+            for &(_, _, c2) in &band[lo..hi] {
+                if cell_mi[c2] > i && cell_w_dbu[c2] == w1 {
+                    candidates.push(c2);
+                }
+            }
+        }
+        candidates.sort_unstable_by_key(|&c2| cell_mi[c2]);
+
+        for &c2 in &candidates {
+            if cell_w_dbu[c2] != w1 {
+                continue;
+            }
+            let x2 = design_db.cell_x_dbu[c2];
+            let y2 = design_db.cell_y_dbu[c2];
+            let o2 = design_db.cell_orient[c2];
+
+            if (y1 - y2).abs() > max_dy || (x1 - x2).abs() > SWAP_MAX_DX_DBU {
+                continue;
+            }
+
+            // Collect incident nets
+            let mut incident: Vec<usize> = cell_nets[c1].to_vec();
+            for &net in &cell_nets[c2] {
+                if !incident.contains(&net) {
+                    incident.push(net);
+                }
+            }
+            if incident.is_empty() {
+                continue;
+            }
+
+            let hpwl_before: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
+
+            design_db.cell_x_dbu[c1] = x2;
+            design_db.cell_y_dbu[c1] = y2;
+            design_db.cell_orient[c1] = o2;
+            design_db.cell_x_dbu[c2] = x1;
+            design_db.cell_y_dbu[c2] = y1;
+            design_db.cell_orient[c2] = o1;
+
+            let hpwl_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
+
+            if hpwl_after < hpwl_before {
+                // design_db already holds the new positions. Remove both old entries before
+                // inserting either, so the same-band case works.
+                let b1 = band_of(band_ys, y1);
+                let b2 = band_of(band_ys, y2);
+                let mi2 = cell_mi[c2];
+                band_remove(&mut bands[b1], (x1, i, c1));
+                band_remove(&mut bands[b2], (x2, mi2, c2));
+                band_insert(&mut bands[b2], (x2, i, c1));
+                band_insert(&mut bands[b1], (x1, mi2, c2));
+                // Keep swap!
+                break;
+            } else {
+                // Revert swap
+                design_db.cell_x_dbu[c1] = x1;
+                design_db.cell_y_dbu[c1] = y1;
+                design_db.cell_orient[c1] = o1;
+                design_db.cell_x_dbu[c2] = x2;
+                design_db.cell_y_dbu[c2] = y2;
+                design_db.cell_orient[c2] = o2;
+            }
+        }
+    }
+}
+
 pub fn legalize_placement(
     design_db: &mut DesignDb,
     tech_db: &TechDb,
@@ -375,61 +506,10 @@ pub fn legalize_placement(
 
     for _round in 0..4 {
         // Pass 1: Equal-width cell swaps
-        for i in 0..movable_cells.len() {
-            let c1 = movable_cells[i];
-            let w1 = cell_w_dbu[c1];
-            let x1 = design_db.cell_x_dbu[c1];
-            let y1 = design_db.cell_y_dbu[c1];
-            let o1 = design_db.cell_orient[c1];
-
-            for &c2 in &movable_cells[(i + 1)..] {
-                if cell_w_dbu[c2] != w1 {
-                    continue;
-                }
-                let x2 = design_db.cell_x_dbu[c2];
-                let y2 = design_db.cell_y_dbu[c2];
-                let o2 = design_db.cell_orient[c2];
-
-                if (y1 - y2).abs() > 4 * site_height || (x1 - x2).abs() > 25_000 {
-                    continue;
-                }
-
-                // Collect incident nets
-                let mut incident: Vec<usize> = cell_nets[c1].to_vec();
-                for &net in &cell_nets[c2] {
-                    if !incident.contains(&net) {
-                        incident.push(net);
-                    }
-                }
-                if incident.is_empty() {
-                    continue;
-                }
-
-                let hpwl_before: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
-
-                design_db.cell_x_dbu[c1] = x2;
-                design_db.cell_y_dbu[c1] = y2;
-                design_db.cell_orient[c1] = o2;
-                design_db.cell_x_dbu[c2] = x1;
-                design_db.cell_y_dbu[c2] = y1;
-                design_db.cell_orient[c2] = o1;
-
-                let hpwl_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
-
-                if hpwl_after < hpwl_before {
-                    // Keep swap!
-                    break;
-                } else {
-                    // Revert swap
-                    design_db.cell_x_dbu[c1] = x1;
-                    design_db.cell_y_dbu[c1] = y1;
-                    design_db.cell_orient[c1] = o1;
-                    design_db.cell_x_dbu[c2] = x2;
-                    design_db.cell_y_dbu[c2] = y2;
-                    design_db.cell_orient[c2] = o2;
-                }
-            }
-        }
+        let mut band_ys: Vec<i32> = sub_rows.iter().map(|sr| sr.orig_y_dbu).collect();
+        band_ys.sort_unstable();
+        band_ys.dedup();
+        equal_width_swap_pass(design_db, tech_db, &movable_cells, &cell_w_dbu, &cell_nets, &band_ys);
 
         // Re-synchronize sub_row.cells according to current design_db positions
         for sr in &mut sub_rows {
@@ -702,8 +782,9 @@ pub fn verify_legality(design_db: &DesignDb, tech_db: &TechDb) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use crate::interner::StringInterner;
+    use crate::interner::{CellId, MacroId, NetId, PinDir, PinId, StringInterner, SymbolId};
     use crate::placement::nesterov::{run_nesterov_placement, NesterovConfig};
+    use crate::tech_db::MacroDef;
     use crate::readers::def::{parse_def, write_def};
     use crate::readers::lef::load_tech_db;
 
@@ -780,6 +861,87 @@ mod tests {
             "Reloaded DEF HPWL {} must match legalized HPWL {}",
             reloaded_hpwl, leg_res.final_hpwl_dbu
         );
+    }
+
+    // PDK-free pass 1 fixture: one 200 x 100 dbu Core macro, 12 cells in movable order.
+    // Cell 0 sits at the origin; net 0 joins its pin to a fixed IO pin at (anchor_x, 0).
+    // Cells 1..=10 are unconnected fillers far to the right. Cell 11, last in movable
+    // order, is the only same-width partner near cell 0 and sits at `partner_xy`.
+    fn pass1_fixture(anchor_x: i32, partner_xy: (i32, i32)) -> (DesignDb, TechDb) {
+        let mut tech_db = TechDb::new();
+        tech_db.site_height_dbu = 100;
+        tech_db.macros.push(MacroDef {
+            name: SymbolId(0),
+            class: MacroClass::Core,
+            width_dbu: 200,
+            height_dbu: 100,
+            pin_offset: 0,
+            pin_count: 0,
+            obs_rects: Vec::new(),
+        });
+
+        let n = 12;
+        let mut cell_x_dbu: Vec<i32> = (0..n as i32).map(|k| 200_000 + 1_000 * k).collect();
+        let mut cell_y_dbu = vec![0; n];
+        cell_x_dbu[0] = 0;
+        cell_x_dbu[11] = partner_xy.0;
+        cell_y_dbu[11] = partner_xy.1;
+
+        let mut cell_pin_offsets = vec![1u32; n + 1];
+        cell_pin_offsets[0] = 0;
+
+        let mut db = DesignDb::new();
+        db.cell_names = vec![SymbolId(0); n];
+        db.cell_macros = vec![MacroId(0); n];
+        db.cell_status = vec![PlacementStatus::Placed; n];
+        db.cell_x_dbu = cell_x_dbu;
+        db.cell_y_dbu = cell_y_dbu;
+        db.cell_orient = vec![Orient::N; n];
+        db.cell_pin_offsets = cell_pin_offsets;
+        db.cell_pin_ids = vec![PinId(0)];
+        db.pin_names = vec![SymbolId(0); 2];
+        db.pin_dirs = vec![PinDir::Input; 2];
+        db.pin_cells = vec![Some(CellId(0)), None];
+        db.pin_macro_pins = vec![None; 2];
+        db.pin_lib_pins = vec![None; 2];
+        db.pin_nets = vec![Some(NetId(0)); 2];
+        db.pin_offset_x_dbu = vec![0, anchor_x];
+        db.pin_offset_y_dbu = vec![0, 0];
+        db.pin_is_driver = vec![false; 2];
+        db.io_pins = vec![PinId(1)];
+        db.net_names = vec![SymbolId(0)];
+        db.net_pin_offsets = vec![0, 2];
+        db.net_pin_ids = vec![PinId(1), PinId(0)];
+        (db, tech_db)
+    }
+
+    fn run_pass1(db: &mut DesignDb, tech_db: &TechDb) {
+        let n = db.num_cells();
+        let movable: Vec<usize> = (0..n).collect();
+        let widths = vec![200; n];
+        let mut nets = vec![Vec::new(); n];
+        nets[0] = vec![0];
+        equal_width_swap_pass(db, tech_db, &movable, &widths, &nets, &[0, 100]);
+    }
+
+    #[test]
+    fn test_pass1_swaps_with_partner_far_in_movable_order() {
+        // Anchor at x=20_000 pulls cell 0 right. The partner at (15_000, 100) is within
+        // the window (|dx| = 15_000, |dy| = 100) and is 11 positions after cell 0.
+        let (mut db, tech_db) = pass1_fixture(20_000, (15_000, 100));
+        run_pass1(&mut db, &tech_db);
+        assert_eq!((db.cell_x_dbu[0], db.cell_y_dbu[0]), (15_000, 100));
+        assert_eq!((db.cell_x_dbu[11], db.cell_y_dbu[11]), (0, 0));
+    }
+
+    #[test]
+    fn test_pass1_skips_partner_outside_x_window() {
+        // The swap would cut net HPWL from 60_000 to 20_100, but the partner at
+        // x=40_000 is 40_000 away, beyond the 25_000 dbu window, so pass 1 must not try it.
+        let (mut db, tech_db) = pass1_fixture(60_000, (40_000, 100));
+        run_pass1(&mut db, &tech_db);
+        assert_eq!((db.cell_x_dbu[0], db.cell_y_dbu[0]), (0, 0));
+        assert_eq!((db.cell_x_dbu[11], db.cell_y_dbu[11]), (40_000, 100));
     }
 
     fn dirs_home() -> PathBuf {
