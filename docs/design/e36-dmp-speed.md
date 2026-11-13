@@ -160,3 +160,61 @@ out. Adopted changes to Sections 3-4:
   review text). Neither assumption is new.
 - **Iteration-count assertions declined (Q4 S3):** brittle across parameter
   ranges; the speed claim is verified by the CLI timing acceptance instead.
+
+## 7. Addendum (2026-11-13, maintainer): the charge must stay the trapezoid's
+
+The ODE closed form of Section 3c was implemented and **rejected at acceptance**,
+on measurements (Mac mini, RD_SCALE = 4.5):
+
+- `test_dmp_ceff_matches_opensta_report_dcalc` failed: the most shielded arc
+  (`_06198_/X` fall) moved from 5.5% above OpenSTA's Ceff (old code, inside the 6%
+  tolerance) to 6.2% above.
+- `test_picorv32_placed_spef_matches_opensta` failed with 74 endpoint mismatches
+  (setup slack about 50-70 ps more pessimistic than OpenSTA across the design).
+- A fine-integration study (trapezoid at 200,000 steps, tight bisection) shows the
+  closed form is the *exact* solution of the DMP equations (agreement 6e-6 relative)
+  and the old 200-step trapezoid is what deviates (up to 6e-3 relative on Ceff for
+  stiff or large-`rpi` cases). The old numbers agree with OpenSTA because
+  `RD_SCALE = 4.5` was fitted *through* the old integrator (E3.5): its error is part
+  of the fitted model. A rescan (3.5 / 4.0 / 4.25 / 4.75 / 5.0) does not restore the
+  picorv32 SPEF agreement (40-74 mismatches at every value), because the
+  integrator's error varies per net and is not a scale factor.
+
+Decision: **the model is the 200-step trapezoid as fitted; only its evaluation
+cost may change.** Sections 3a, 3b and 3d stand (with them and the numeric charge,
+all STA tests pass and the CLI takes 3.9 s, WNS within 3e-6 ns of the baseline).
+Section 3c is replaced by 7.1.
+
+### 7.1 `pi_charge`: closed form of the discrete recurrence
+
+The trapezoid step in `pi_charge_numeric` is a constant-coefficient linear
+recurrence. With `A` the 2x2 system matrix, `M = I - (h/2) A`, step size
+`h = (tx - t0) / 200`:
+
+```
+v_{k+1} = M^{-1} (I + (h/2) A) v_k + M^{-1} ((h/2) (g/c1) (vs_k + vs_{k+1}), 0)
+```
+
+where `vs_k = clamp(k h / dt, 0, 1)` is affine in `k` up to the saturation index
+and 1 after it. The homogeneous modes are geometric with ratios given by the
+Cayley transform of `A`'s eigenvalues, `rho_i = (1 + h lam_i / 2) / (1 - h lam_i / 2)`;
+the forcing is affine in `k` on each side of the saturation index, so `v_k` and the
+trapezoid charge sum `Q = sum_k (h/2) (i_k + i_{k+1})`, `i_k = g (vs_k - v1_k)`,
+both have closed forms (geometric and arithmetico-geometric sums). Evaluating them
+reproduces the 200-step loop's result up to floating-point summation order
+(expected agreement ~1e-12 relative, test tolerance 1e-9), at O(1) cost.
+
+Fallback and reference stay as in Section 6: non-finite intermediates or an
+ill-conditioned solve fall back to `pi_charge_numeric`, which also remains the
+test reference — now at 1e-9 relative over the Section 6 grid, including cases
+where the saturation index falls inside the interval and where `dt` is not a
+multiple of `h`.
+
+### 7.2 Equivalence protocol, updated
+
+- The golden regression returns to the values recorded from the pre-E3.6
+  implementation (ticket 01's table), tolerance 5e-5 relative (observed stop-rule
+  noise is ~1e-5; the tolerance must stay far below the 6e-3 the ODE form shifted
+  stiff cases by).
+- The mini acceptance (full STA suite, dcalc test, CLI WNS/TNS within 1e-3 ns and
+  under 2 s) is unchanged and is now the binding check that the model did not move.
