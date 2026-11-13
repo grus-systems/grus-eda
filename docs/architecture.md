@@ -504,7 +504,7 @@ grus-eda congestion \
   --tlef <path.tlef> \
   --lef <path.lef> \
   --def <placed.def> \
-  [--gcell-tracks 15] \
+  [--gcell-tracks <n>] \
   [--layer-adjust <0.0..1.0>] \
   [--heatmap]
 
@@ -519,8 +519,11 @@ grus-eda place \
 # E3: Static timing analysis (zero-wire, placement-based RC, or SPEF)
 grus-eda sta \
   --lib <path.lib> \
-  [--json <path.json> | --verilog <path.v> | --def <placed.def>] \
-  [--tlef <path.tlef> --lef <path.lef>] \
-  [--parasitics none | placement | --spef <path.spef>] \
-  [--sdc <path.sdc> | --clock-pin <clk_port> --period-ns <period>]
+  --tlef <path.tlef> \
+  --lef <path.lef> \
+  --def <placed.def> \
+  --sdc <path.sdc> \
+  [--parasitics none | placement] \
+  [--spef <path.spef>] \
+  [--wire-layer <layer>]
 ```

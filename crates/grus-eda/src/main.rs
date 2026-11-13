@@ -53,6 +53,16 @@ struct CheckE0Args {
     top: Option<String>,
 }
 
+// NaN fails the range check too, since `contains` is false for NaN.
+fn parse_unit_interval(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("not a number: {e}"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("{v} is outside 0.0..=1.0"))
+    }
+}
+
 #[derive(Args, Debug)]
 struct CongestionArgs {
     #[arg(long, help = "Path to technology LEF (.tlef) file")]
@@ -64,10 +74,14 @@ struct CongestionArgs {
     #[arg(long, help = "Path to placed DEF (.def) file")]
     def: PathBuf,
 
-    #[arg(long, default_value_t = 15, help = "GCell grid track supply")]
-    gcell_tracks: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), help = "GCell grid track supply (default: from the DEF GCELLGRID)")]
+    gcell_tracks: Option<u32>,
 
-    #[arg(long, help = "Uniform layer adjustment factor (0.0 to 1.0)")]
+    #[arg(
+        long,
+        value_parser = parse_unit_interval,
+        help = "Uniform layer adjustment factor (0.0 to 1.0)"
+    )]
     layer_adjust: Option<f32>,
 
     #[arg(long, help = "Print ASCII routing congestion heatmap")]
@@ -92,43 +106,38 @@ struct PlaceArgs {
     target_density: f32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ParasiticsMode {
+    None,
+    Placement,
+    Spef,
+}
+
 #[derive(Args, Debug)]
 struct StaArgs {
     #[arg(long, help = "Path to Liberty (.lib) file")]
     lib: PathBuf,
 
-    #[arg(long, help = "Path to Yosys netlist JSON (.json) file")]
-    json: Option<PathBuf>,
-
-    #[arg(long, help = "Path to gate-level Verilog (.v) file")]
-    verilog: Option<PathBuf>,
-
-    #[arg(long, help = "Path to placed DEF (.def) file")]
-    def: Option<PathBuf>,
-
     #[arg(long, help = "Path to technology LEF (.tlef) file")]
-    tlef: Option<PathBuf>,
+    tlef: PathBuf,
 
     #[arg(long, help = "Path to standard cell LEF (.lef) file")]
-    lef: Option<PathBuf>,
+    lef: PathBuf,
 
-    #[arg(long, help = "Parasitic interconnect model (none, placement, spef)")]
-    parasitics: Option<String>,
+    #[arg(long, help = "Path to placed DEF (.def) file")]
+    def: PathBuf,
+
+    #[arg(long, help = "Path to SDC (.sdc) timing constraints file")]
+    sdc: PathBuf,
+
+    #[arg(long, value_enum, help = "Parasitic interconnect model (default: zero wire unless --spef is given)")]
+    parasitics: Option<ParasiticsMode>,
 
     #[arg(long, default_value = "met2", help = "Routing layer whose RC is used for --parasitics placement")]
     wire_layer: String,
 
     #[arg(long, help = "Path to extracted SPEF (.spef) file")]
     spef: Option<PathBuf>,
-
-    #[arg(long, help = "Path to SDC (.sdc) timing constraints file")]
-    sdc: Option<PathBuf>,
-
-    #[arg(long, help = "Clock port name (if SDC omitted)")]
-    clock_pin: Option<String>,
-
-    #[arg(long, help = "Clock period in nanoseconds (if SDC omitted)")]
-    period_ns: Option<f32>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -233,13 +242,11 @@ fn main() -> anyhow::Result<()> {
             let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
 
             let layer_adjustments = args.layer_adjust.map(|alpha| {
-                vec![0.0f32, alpha, alpha, alpha, alpha, alpha]
+                (0..tech_db.routing_layers.len())
+                    .map(|i| if i == 0 { 0.0f32 } else { alpha })
+                    .collect::<Vec<f32>>()
             });
-            let gcell_tracks_override = if args.gcell_tracks != 15 {
-                Some(args.gcell_tracks as i32)
-            } else {
-                None
-            };
+            let gcell_tracks_override = args.gcell_tracks.map(|t| t as i32);
 
             let t_route = std::time::Instant::now();
             let (grid, report) = grus_core::congestion::estimate_congestion(
@@ -365,22 +372,17 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Commands::Sta(args) => {
-            let mode = match (args.parasitics.as_deref(), &args.spef) {
-                (None | Some("none"), None) => "zero wire",
-                (Some("placement"), None) => "placement RC",
-                (None | Some("spef"), Some(_)) => "SPEF",
-                (other, spef) => anyhow::bail!("unsupported --parasitics {:?} with --spef {:?}", other, spef),
-            };
-            let (Some(tlef), Some(lef), Some(def), Some(sdc_path)) =
-                (&args.tlef, &args.lef, &args.def, &args.sdc)
-            else {
-                anyhow::bail!("sta requires --tlef, --lef, --def and --sdc");
+            let mode = match (args.parasitics, &args.spef) {
+                (None | Some(ParasiticsMode::None), None) => "zero wire",
+                (Some(ParasiticsMode::Placement), None) => "placement RC",
+                (None | Some(ParasiticsMode::Spef), Some(_)) => "SPEF",
+                (parasitics, spef) => anyhow::bail!("unsupported --parasitics {:?} with --spef {:?}", parasitics, spef),
             };
             let lib_db = grus_core::readers::load_liberty(&args.lib)?;
             let mut interner = grus_core::interner::StringInterner::new();
-            let tech_db = grus_core::readers::load_tech_db(tlef, lef, &mut interner)?;
-            let design = grus_core::readers::parse_def(def, &tech_db, Some(&lib_db))?;
-            let sdc = grus_core::sta::load_sdc(sdc_path)?;
+            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let design = grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?;
+            let sdc = grus_core::sta::load_sdc(&args.sdc)?;
             let t0 = std::time::Instant::now();
             let parasitics = match (mode, &args.spef) {
                 ("placement RC", _) => {
