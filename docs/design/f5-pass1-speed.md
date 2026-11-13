@@ -84,3 +84,24 @@ heights, equal width).
 - Duplicate x within a band and cells with identical (x, y) after swaps:
   ordering by (x, movable index) keeps the index deterministic; candidacy
   does not depend on intra-band order beyond the x-range search.
+
+## 5. Review resolutions (external review, 2026-11-13)
+
+The full review text is not included in this repository. Verdict: adopt with changes.
+The reviewer confirmed the exactness argument, including that passes 2/3 and
+the resync never change a cell's y. Adopted:
+
+- **Missing-y handling (Q2, S2):** a round-start y that is not a band y is
+  unreachable (Abacus writes sub-row y; pass 1 swaps exchange positions, so y
+  stays a sub-row y; passes 2/3 keep y). Enforce it with a hard `assert!` at
+  index build plus a comment stating the invariant — no silent catch-all band,
+  which could drop pairs and quietly change the output.
+- **Index update order (Q4, S2):** on an accepted swap, `design_db` already
+  holds the new positions; remove both cells from their band lists before
+  inserting either (covers the same-band case), then insert each at its
+  sorted position in the other's band.
+- **Implementation details (Q1/Q3, S3):** precompute a
+  `cell -> movable_cells index` array (no HashMap in the hot loop); band
+  entries carry `(x, movable index, cell)`; collect candidates into one
+  reusable scratch Vec cleared per cell; sort candidates with
+  `sort_unstable` by movable index.
