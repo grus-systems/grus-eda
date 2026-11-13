@@ -47,8 +47,11 @@ impl Default for NesterovConfig {
 pub struct NesterovResult {
     pub cell_x_um: Vec<f32>,
     pub cell_y_um: Vec<f32>,
+    /// Gradient steps executed (0 when the initial overflow already meets the stop value).
     pub iterations: usize,
+    pub converged: bool,
     pub initial_overflow: f32,
+    /// Overflow of the returned `cell_x_um` / `cell_y_um` when `converged` is false.
     pub final_overflow: f32,
     pub initial_hpwl_um: f64,
     pub final_hpwl_um: f64,
@@ -230,15 +233,16 @@ pub fn run_nesterov_placement(
     let mut prev_g_y = vec![0.0f32; num_cells];
     let mut hpwl_cur = init_hpwl_um;
     let mut final_overflow = init_tau;
-    let mut final_iters = 0;
+    let mut iterations = 0;
+    let mut converged = false;
 
     for k in 0..config.max_iters {
-        final_iters = k;
         if k > 0 {
             let (tau_k, _) =
                 density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y);
             final_overflow = tau_k;
             if tau_k <= config.stop_overflow {
+                converged = true;
                 break;
             }
             let gamma_k = base_gamma * 10.0f32.powf(2.0 * (tau_k - 0.10));
@@ -256,6 +260,7 @@ pub fn run_nesterov_placement(
         } else {
             final_overflow = init_tau;
             if init_tau <= config.stop_overflow {
+                converged = true;
                 break;
             }
         }
@@ -323,6 +328,16 @@ pub fn run_nesterov_placement(
         u_y = u_next_y;
         t_k = t_next;
         hpwl_cur = hpwl_next;
+        iterations += 1;
+    }
+
+    // The loop exits without a stop check after its last step, so the overflow
+    // it last saw belongs to v, not to the returned u.
+    if !converged {
+        let (tau_u, _) =
+            density_solver.compute_density_and_forces(&u_x, &u_y, &mut force_x, &mut force_y);
+        final_overflow = tau_u;
+        converged = tau_u <= config.stop_overflow;
     }
 
     let final_hpwl_um = compute_hpwl_um(design_db, &wl_precomp, &u_x, &u_y);
@@ -330,7 +345,8 @@ pub fn run_nesterov_placement(
     NesterovResult {
         cell_x_um: u_x,
         cell_y_um: u_y,
-        iterations: final_iters,
+        iterations,
+        converged,
         initial_overflow: init_tau,
         final_overflow,
         initial_hpwl_um: init_hpwl_um,
@@ -374,9 +390,10 @@ mod tests {
         let res = run_nesterov_placement(&design_db, &tech_db, &config);
         let elapsed = t0.elapsed();
 
+        let status = if res.converged { "converged" } else { "did not converge" };
         println!(
-            "Nesterov placement converged in {} iters, time: {:?}, init_ovf: {:.4}, final_ovf: {:.4}, init_hpwl: {:.2} um, final_hpwl: {:.2} um",
-            res.iterations, elapsed, res.initial_overflow, res.final_overflow, res.initial_hpwl_um, res.final_hpwl_um
+            "Nesterov placement {} in {} iters, time: {:?}, init_ovf: {:.4}, final_ovf: {:.4}, init_hpwl: {:.2} um, final_hpwl: {:.2} um",
+            status, res.iterations, elapsed, res.initial_overflow, res.final_overflow, res.initial_hpwl_um, res.final_hpwl_um
         );
 
         // 1. Initial overflow > 0.50 and final overflow <= 0.10
@@ -392,6 +409,7 @@ mod tests {
         );
 
         // 2. Converged in < 300 iterations
+        assert!(res.converged, "gcd must report convergence");
         assert!(
             res.iterations < 300,
             "Must converge in < 300 iterations, took {}",
@@ -452,6 +470,118 @@ mod tests {
             "Final HPWL must be < 5000 um, got {}",
             res.final_hpwl_um
         );
+    }
+
+    /// PDK-free fixture: 40 Core cells of 4 um x 2 um in a 20 um x 20 um die.
+    /// Movable area (320 um^2) exceeds the target density (0.60) of the die (400 um^2),
+    /// so the density overflow starts above zero. Cells are grouped into 10 nets of 4.
+    fn synthetic_design() -> (DesignDb, TechDb) {
+        use crate::design_db::Orient;
+        use crate::interner::{CellId, MacroId, MacroPinId, NetId, PinDir, PinId, StringInterner};
+        use crate::tech_db::{MacroClass, MacroDef, MacroPin, RectDbu};
+
+        let num_cells = 40usize;
+        let mut tech_db = TechDb::new();
+        tech_db.dbu_per_micron = 1000;
+        tech_db.site_height_dbu = 2000;
+        let mut interner = StringInterner::new();
+
+        let m_name = interner.intern("TEST_MACRO");
+        let mp_name = interner.intern("A");
+        tech_db.macro_pins.push(MacroPin {
+            name: mp_name,
+            dir: PinDir::Input,
+            is_power: false,
+            offset_x_dbu: 2000,
+            offset_y_dbu: 1000,
+            offset_x_frac: false,
+            offset_y_frac: false,
+            layer: None,
+        });
+        tech_db.macros.push(MacroDef {
+            name: m_name,
+            class: MacroClass::Core,
+            width_dbu: 4000,
+            height_dbu: 2000,
+            pin_offset: 0,
+            pin_count: 1,
+            obs_rects: Vec::new(),
+        });
+        tech_db.macro_by_name.insert(m_name, MacroId(0));
+
+        let mut design_db = DesignDb::new();
+        design_db.dbu_per_micron = 1000;
+        design_db.die_area = RectDbu::new(0, 0, 20000, 20000);
+
+        for i in 0..num_cells {
+            let cname = interner.intern(&format!("c{}", i));
+            design_db.cell_names.push(cname);
+            design_db.cell_macros.push(MacroId(0));
+            design_db.cell_lib_ids.push(None);
+            design_db.cell_orient.push(Orient::N);
+            design_db.cell_status.push(PlacementStatus::Placed);
+            design_db.cell_x_dbu.push(0);
+            design_db.cell_y_dbu.push(0);
+            design_db.cell_pin_offsets.push(i as u32);
+            design_db.cell_pin_ids.push(PinId(i as u32));
+
+            let pname = interner.intern(&format!("p{}", i));
+            design_db.pin_names.push(pname);
+            design_db.pin_cells.push(Some(CellId(i as u32)));
+            design_db.pin_nets.push(Some(NetId((i / 4) as u32)));
+            design_db.pin_macro_pins.push(Some(MacroPinId(0)));
+            design_db.pin_lib_pins.push(None);
+            design_db.pin_dirs.push(PinDir::Input);
+            design_db.pin_offset_x_dbu.push(2000);
+            design_db.pin_offset_y_dbu.push(1000);
+            design_db.pin_is_driver.push(i % 4 == 0);
+        }
+        design_db.cell_pin_offsets.push(num_cells as u32);
+
+        let num_nets = num_cells / 4;
+        for e in 0..num_nets {
+            let nname = interner.intern(&format!("net{}", e));
+            design_db.net_names.push(nname);
+            design_db.net_pin_offsets.push((e * 4) as u32);
+            design_db
+                .net_pin_ids
+                .extend((e * 4..e * 4 + 4).map(|p| PinId(p as u32)));
+        }
+        design_db.net_pin_offsets.push((num_nets * 4) as u32);
+
+        (design_db, tech_db)
+    }
+
+    #[test]
+    fn test_convergence_accounting_iteration_limit() {
+        let (design_db, tech_db) = synthetic_design();
+        // A negative stop value can never be met, so the loop must exhaust max_iters.
+        let config = NesterovConfig {
+            max_iters: 3,
+            stop_overflow: -1.0,
+            ..NesterovConfig::default()
+        };
+        let res = run_nesterov_placement(&design_db, &tech_db, &config);
+
+        assert!(!res.converged, "run that hit max_iters must not report convergence");
+        assert_eq!(res.iterations, 3, "3 gradient steps were executed");
+        assert_eq!(res.cell_x_um.len(), design_db.num_cells());
+        assert!(res.final_overflow.is_finite() && res.final_overflow >= 0.0);
+    }
+
+    #[test]
+    fn test_convergence_accounting_initial_overflow_satisfies_stop() {
+        let (design_db, tech_db) = synthetic_design();
+        let config = NesterovConfig {
+            max_iters: 3,
+            stop_overflow: 1.0e6,
+            ..NesterovConfig::default()
+        };
+        let res = run_nesterov_placement(&design_db, &tech_db, &config);
+
+        assert!(res.converged, "initial overflow already below stop value");
+        assert_eq!(res.iterations, 0, "no gradient step should run");
+        assert_eq!(res.final_overflow, res.initial_overflow);
     }
 
     fn dirs_home() -> PathBuf {

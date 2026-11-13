@@ -308,14 +308,29 @@ fn main() -> anyhow::Result<()> {
             let t_gp = std::time::Instant::now();
             let gp_res = grus_core::placement::run_nesterov_placement(&design_db, &tech_db, &config);
             let elapsed_gp = t_gp.elapsed().as_secs_f64() * 1000.0;
-            println!(
-                "Global placement: converged in {} iters, final_overflow={:.4}, final_hpwl={:.1}um, elapsed={:.2}ms ({:.1}us/iter)",
-                gp_res.iterations,
-                gp_res.final_overflow,
-                gp_res.final_hpwl_um,
-                elapsed_gp,
-                (elapsed_gp * 1000.0) / gp_res.iterations.max(1) as f64
-            );
+            if gp_res.converged {
+                println!(
+                    "Global placement: converged in {} iters, final_overflow={:.4}, final_hpwl={:.1}um, elapsed={:.2}ms ({:.1}us/iter)",
+                    gp_res.iterations,
+                    gp_res.final_overflow,
+                    gp_res.final_hpwl_um,
+                    elapsed_gp,
+                    (elapsed_gp * 1000.0) / gp_res.iterations.max(1) as f64
+                );
+            } else {
+                println!(
+                    "Global placement: did not converge (iteration limit reached) in {} iters, final_overflow={:.4}, final_hpwl={:.1}um, elapsed={:.2}ms ({:.1}us/iter)",
+                    gp_res.iterations,
+                    gp_res.final_overflow,
+                    gp_res.final_hpwl_um,
+                    elapsed_gp,
+                    (elapsed_gp * 1000.0) / gp_res.iterations.max(1) as f64
+                );
+                eprintln!(
+                    "warning: global placement did not converge (final_overflow={:.4}); the placed DEF is an estimate",
+                    gp_res.final_overflow
+                );
+            }
 
             // Detailed Placement (Abacus Legalization + Local Refinement)
             println!("Running legalization and detailed placement refinement...");
