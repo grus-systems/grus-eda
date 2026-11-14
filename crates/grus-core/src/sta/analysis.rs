@@ -4,7 +4,7 @@ use super::parasitics::NetParasitics;
 use super::sdc::Sdc;
 use crate::design_db::DesignDb;
 use crate::interner::{CellId, NetId, PinDir, PinId};
-use crate::lib_db::{LibDb, NldmTable, TimingSense, TimingType};
+use crate::lib_db::{LibCell, LibDb, NldmTable, TimingSense, TimingType};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -34,11 +34,22 @@ struct LaunchArc {
     lib_arc: u32,
 }
 
+/// Enable-to-output arc of a latch. The output launches when the latch opens, half a period after
+/// the closing edge (`dlxtn`: GATE_N falls). The D-to-Q path is not propagated.
+#[derive(Clone, Copy, Debug)]
+struct LatchOpen {
+    enable: PinId,
+    q: PinId,
+    lib_arc: u32,
+}
+
 /// Timing checks of one constrained pin. D pins carry setup and hold; asynchronous set/reset pins
 /// carry recovery and removal, which take the same role (late and early bound) against the same clock.
+/// `latch` marks a latch D pin, whose setup arc closes the latch (see `collect_endpoints`).
 #[derive(Clone, Copy, Debug, Default)]
 struct RegisterCheck {
     clk: Option<PinId>,
+    latch: bool,
     setup_arc: Option<u32>,
     hold_arc: Option<u32>,
     recovery_arc: Option<u32>,
@@ -195,7 +206,59 @@ struct TimingGraph {
     edges: Vec<ArcEdge>,
     edges_from: Vec<Vec<u32>>,
     launches: Vec<LaunchArc>,
+    latch_opens: Vec<LatchOpen>,
+    /// Enable pins of AND-type clock gates, checked against the clock (see `gating_enables`).
+    gating_enables: Vec<PinId>,
+    /// Per net: reached by a register clock pin or by a gated clock output. Such nets keep the ideal
+    /// clock latency, so data arriving at a clock gate does not propagate onto them.
+    clock_net: Vec<bool>,
     checks: BTreeMap<u32, RegisterCheck>,
+}
+
+/// Enable pin of a latch: the clock pin of its `setup_rising` check on D (`dlxtn`: GATE_N).
+/// Latches without that check are not modelled.
+fn latch_enable(cx: &Context, cell: CellId, lib_cell: &LibCell) -> Option<PinId> {
+    (lib_cell.arc_offset..lib_cell.arc_offset + lib_cell.arc_count as u32)
+        .map(|i| &cx.lib.arcs[i as usize])
+        .find(|arc| arc.timing_type == TimingType::SetupRising)
+        .and_then(|arc| cx.cell_pin_for_lib_pin(cell, arc.related_pin))
+}
+
+/// Pins of an AND-type clock gate: a combinational output on a clock net with a positive-unate
+/// arc from a clock input. Every other input with a positive-unate arc to that output is an enable.
+/// Covers `and2` only; OR/NAND-type gates (negative sense or other clock polarity) are not matched.
+fn gating_enables(cx: &Context, graph: &TimingGraph) -> Vec<PinId> {
+    let design = cx.design;
+    let positive_arc = |lib_cell: &LibCell, from: PinId, to: PinId| {
+        let (Some(f), Some(t)) = (design.pin_lib_pins[from.0 as usize], design.pin_lib_pins[to.0 as usize]) else {
+            return false;
+        };
+        (lib_cell.arc_offset..lib_cell.arc_offset + lib_cell.arc_count as u32).any(|i| {
+            let arc = &cx.lib.arcs[i as usize];
+            arc.related_pin == f && arc.target_pin == t && arc.timing_sense == TimingSense::PositiveUnate
+        })
+    };
+    let on_clock = |pin: PinId| design.pin_nets[pin.0 as usize].is_some_and(|n| graph.clock_net[n.0 as usize]);
+    let mut enables = Vec::new();
+    for c in 0..design.num_cells() {
+        let Some(lib_cell_id) = design.cell_lib_ids[c] else { continue };
+        let lib_cell = &cx.lib.cells[lib_cell_id.0 as usize];
+        if lib_cell.is_sequential || lib_cell.is_latch {
+            continue;
+        }
+        let pins = design.cell_pins(CellId(c as u32));
+        for &out in pins.iter().filter(|&&p| design.pin_is_driver[p.0 as usize]) {
+            if !on_clock(out) {
+                continue;
+            }
+            let inputs = || pins.iter().copied().filter(|&p| !design.pin_is_driver[p.0 as usize]);
+            if !inputs().any(|p| on_clock(p) && positive_arc(lib_cell, p, out)) {
+                continue;
+            }
+            enables.extend(inputs().filter(|&p| !on_clock(p) && positive_arc(lib_cell, p, out)));
+        }
+    }
+    enables
 }
 
 fn build_graph(cx: &Context) -> TimingGraph {
@@ -204,19 +267,29 @@ fn build_graph(cx: &Context) -> TimingGraph {
         edges: Vec::new(),
         edges_from: vec![Vec::new(); design.num_pins()],
         launches: Vec::new(),
+        latch_opens: Vec::new(),
+        gating_enables: Vec::new(),
+        clock_net: Vec::new(),
         checks: BTreeMap::new(),
     };
     for c in 0..design.num_cells() {
         let cell = CellId(c as u32);
         let Some(lib_cell_id) = design.cell_lib_ids[c] else { continue };
         let lib_cell = &cx.lib.cells[lib_cell_id.0 as usize];
-        if lib_cell.is_latch {
-            eprintln!(
-                "warning: latch cell {} is outside E3 scope (no time borrowing); its arcs are ignored",
-                design.strings.resolve(design.cell_names[c])
-            );
-            continue;
-        }
+        let enable = if lib_cell.is_latch {
+            match latch_enable(cx, cell, lib_cell) {
+                Some(enable) => Some(enable),
+                None => {
+                    eprintln!(
+                        "warning: latch cell {} has no setup_rising check on D (outside the modelled shape); its arcs are ignored",
+                        design.strings.resolve(design.cell_names[c])
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         for i in 0..lib_cell.arc_count as u32 {
             let lib_arc = lib_cell.arc_offset + i;
             let arc = &cx.lib.arcs[lib_arc as usize];
@@ -227,21 +300,28 @@ fn build_graph(cx: &Context) -> TimingGraph {
                 continue;
             };
             match arc.timing_type {
-                TimingType::Combinational | TimingType::CombinationalRise | TimingType::CombinationalFall => {
-                    graph.edges_from[src.0 as usize].push(graph.edges.len() as u32);
-                    graph.edges.push(ArcEdge { dst, lib_arc });
-                }
-                TimingType::RisingEdge => graph.launches.push(LaunchArc { clk: src, q: dst, lib_arc }),
                 TimingType::SetupRising => {
                     let check = graph.checks.entry(dst.0).or_default();
                     check.clk = Some(src);
+                    check.latch = lib_cell.is_latch;
                     check.setup_arc = Some(lib_arc);
                 }
                 TimingType::HoldRising => {
                     let check = graph.checks.entry(dst.0).or_default();
                     check.clk = Some(src);
+                    check.latch = lib_cell.is_latch;
                     check.hold_arc = Some(lib_arc);
                 }
+                _ if lib_cell.is_latch => {
+                    if Some(src) == enable && design.pin_is_driver[dst.0 as usize] {
+                        graph.latch_opens.push(LatchOpen { enable: src, q: dst, lib_arc });
+                    }
+                }
+                TimingType::Combinational | TimingType::CombinationalRise | TimingType::CombinationalFall => {
+                    graph.edges_from[src.0 as usize].push(graph.edges.len() as u32);
+                    graph.edges.push(ArcEdge { dst, lib_arc });
+                }
+                TimingType::RisingEdge => graph.launches.push(LaunchArc { clk: src, q: dst, lib_arc }),
                 TimingType::RecoveryRising => {
                     let check = graph.checks.entry(dst.0).or_default();
                     check.clk = Some(src);
@@ -256,6 +336,15 @@ fn build_graph(cx: &Context) -> TimingGraph {
             }
         }
     }
+    graph.clock_net = vec![false; design.num_nets()];
+    let register_clock_pins = graph.launches.iter().map(|l| l.clk).chain(graph.checks.values().filter_map(|c| c.clk));
+    for pin in register_clock_pins {
+        if let Some(net) = design.pin_nets[pin.0 as usize] {
+            graph.clock_net[net.0 as usize] = true;
+        }
+    }
+    let enables = gating_enables(cx, &graph);
+    graph.gating_enables = enables;
     graph
 }
 
@@ -357,11 +446,11 @@ pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&Ne
         }
     }
 
-    // Ideal clock: every register clock pin sees an edge at the clock latency with zero slew.
-    for launch in &graph.launches {
-        let clk = launch.clk.0 as usize;
+    // Ideal clock: every register clock pin and latch enable sees an edge at the clock latency with zero slew.
+    let clock_pins = graph.launches.iter().map(|l| l.clk).chain(graph.checks.values().filter_map(|c| c.clk));
+    for clk in clock_pins {
         for pol in [RISE, FALL] {
-            state[clk].merge(pol, sdc.clock_latency_ns, sdc.clock_latency_ns, 0.0, 0.0);
+            state[clk.0 as usize].merge(pol, sdc.clock_latency_ns, sdc.clock_latency_ns, 0.0, 0.0);
         }
     }
     for launch in &graph.launches {
@@ -374,6 +463,19 @@ pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&Ne
             let (delay, slew) = cx.driver_response(q_net, dst_pol, delay_table, slew_table, clk_state.slew_max[RISE]);
             let arrival = clk_state.arrival_max[RISE] + delay;
             state[launch.q.0 as usize].merge(dst_pol, arrival, arrival, slew, slew);
+        }
+    }
+    // A latch opens on the falling edge of a `dlxtn` enable, half a period after the ideal edge.
+    let half_period = 0.5 * sdc.period_ns;
+    for open in &graph.latch_opens {
+        let Some(q_net) = design.pin_nets[open.q.0 as usize] else { continue };
+        let arc = &lib.arcs[open.lib_arc as usize];
+        let enable_state = state[open.enable.0 as usize];
+        for dst_pol in [RISE, FALL] {
+            let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) else { continue };
+            let (delay, slew) = cx.driver_response(q_net, dst_pol, delay_table, slew_table, enable_state.slew_max[RISE]);
+            let arrival = enable_state.arrival_max[RISE] + half_period + delay;
+            state[open.q.0 as usize].merge(dst_pol, arrival, arrival, slew, slew);
         }
     }
 
@@ -407,6 +509,9 @@ pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&Ne
             let edge = graph.edges[e as usize];
             let arc = &lib.arcs[edge.lib_arc as usize];
             let Some(out_net) = design.pin_nets[edge.dst.0 as usize] else { continue };
+            if graph.clock_net[out_net.0 as usize] {
+                continue;
+            }
             let src = state[p];
             for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
                 if !src.reached(src_pol) {
@@ -444,6 +549,7 @@ struct Worst {
 fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]) -> Result<StaReport> {
     let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
     let mut endpoints = Vec::new();
+    let half_period = 0.5 * sdc.period_ns;
 
     for (&data_id, check) in &graph.checks {
         let data = PinId(data_id);
@@ -462,10 +568,47 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
                 continue;
             };
             let late_time = eval_nldm_constraint(late_table, s.slew_max[pol], clk_state.slew_max[RISE]);
-            let req_max = sdc.period_ns + clk_state.arrival_min[RISE] - late_time - sdc.uncertainty_ns;
-            let slack_max = req_max - s.arrival_max[pol];
+            let closing_max = sdc.period_ns + clk_state.arrival_min[RISE] - late_time - sdc.uncertainty_ns;
+            // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
+            // is reported at the opening edge and the slack is what remains before the closing edge.
+            let opening_max = half_period + clk_state.arrival_min[RISE];
+            let arr_max = s.arrival_max[pol];
+            let (req_max, slack_max) = if !check.latch {
+                (closing_max, closing_max - arr_max)
+            } else if arr_max <= opening_max {
+                (opening_max, opening_max - arr_max)
+            } else {
+                (opening_max, closing_max - arr_max)
+            };
             let early_time = eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_max[RISE]);
             let req_min = clk_state.arrival_max[RISE] + early_time + sdc.uncertainty_ns;
+            let slack_min = s.arrival_min[pol] - req_min;
+            if worst_max.as_ref().is_none_or(|w| slack_max < w.slack) {
+                worst_max = Some(Worst { arr: arr_max, req: req_max, slack: slack_max, slew: s.slew_max[pol] });
+            }
+            if worst_min.as_ref().is_none_or(|w| slack_min < w.slack) {
+                worst_min = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
+            }
+        }
+        if let (Some(max), Some(min)) = (worst_max, worst_min) {
+            endpoints.push(endpoint_report(cx.pin_name(data), &max, &min));
+        }
+    }
+
+    // AND-type clock gate: the enable must settle before the rising edge and hold past the falling edge.
+    // The gate's clock pin is not seeded (its output is a clock net), so the ideal latency is used directly.
+    let gate_latency = sdc.clock_latency_ns;
+    for &enable in &graph.gating_enables {
+        let s = state[enable.0 as usize];
+        let req_max = sdc.period_ns + gate_latency - sdc.uncertainty_ns;
+        let req_min = half_period + gate_latency + sdc.uncertainty_ns;
+        let mut worst_max: Option<Worst> = None;
+        let mut worst_min: Option<Worst> = None;
+        for pol in [RISE, FALL] {
+            if !s.reached(pol) {
+                continue;
+            }
+            let slack_max = req_max - s.arrival_max[pol];
             let slack_min = s.arrival_min[pol] - req_min;
             if worst_max.as_ref().is_none_or(|w| slack_max < w.slack) {
                 worst_max = Some(Worst { arr: s.arrival_max[pol], req: req_max, slack: slack_max, slew: s.slew_max[pol] });
@@ -475,7 +618,7 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
             }
         }
         if let (Some(max), Some(min)) = (worst_max, worst_min) {
-            endpoints.push(endpoint_report(cx.pin_name(data), &max, &min));
+            endpoints.push(endpoint_report(cx.pin_name(enable), &max, &min));
         }
     }
 
@@ -658,23 +801,28 @@ mod tests {
     /// ibex's SDC (ORFS `constraint.sdc`, verbatim) sets `set_clock_latency 1.095` and I/O delays
     /// against the virtual clock `vclk_core_clock`, which no earlier design exercised. Any failure
     /// here must be checked against those constructs before the tolerance is touched.
-    /// Ignored 2026-11-14: our STA counts 3,700 endpoints vs the golden's 3,702; the two
-    /// missing are both clock-gate endpoints (see ticket 10). The values on the 3,700
-    /// shared endpoints match the golden with zero failures at the strict tolerance
-    /// (worst diff ~8e-6 ns; WNS -8.7635 ns and TNS -12,328.7 ns identical) — the
-    /// latency semantics from ticket 09 are confirmed, only the endpoints are missing.
+    /// The two clock-gate endpoints (latch D and the gate enable) come from ticket 10.
     #[test]
-    #[ignore]
     fn test_ibex_zero_wire_matches_opensta() {
         compare_design_with_opensta("ibex", "zero_wire", Rc::None, Tol::STRICT);
     }
 
+    /// Ignored: placement RC fails broadly at ibex scale (14,257 failing fields over 2,604 of
+    /// 3,702 endpoints; WNS ours -14.064 vs ref -14.417 ns, TNS -26,802 vs -21,282 ns). All 1,655
+    /// RESET_B and 9 SET_B async pins fail: the placement-RC slew at the reset pins is far over
+    /// the golden (e.g. 8.13 vs 2.92 ns), which also inflates the NLDM recovery time and so the
+    /// required times. Same fitted-model root cause as aes/jpeg; see docs/results.md (step 4
+    /// part 3). Sunset: review step 6; thresholds are not fitted.
     #[test]
     #[ignore]
     fn test_ibex_placement_rc_matches_opensta() {
         compare_design_with_opensta("ibex", "placement_rc", Rc::Placement, Tol::IBEX_PLACEMENT);
     }
 
+    /// Ignored: SPEF mode fails broadly (8,855 failing fields over 3,479 of 3,702 endpoints;
+    /// WNS ours -14.202 vs ref -14.417 ns, TNS -20,918 vs -21,282 ns). Same fitted DMP-model
+    /// root cause as jpeg SPEF; see docs/results.md (step 4 part 3). The two clock-gate
+    /// endpoints pass in both wire modes. Sunset: review step 6; thresholds are not fitted.
     #[test]
     #[ignore]
     fn test_ibex_placed_spef_matches_opensta() {
