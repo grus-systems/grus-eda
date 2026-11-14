@@ -908,7 +908,7 @@ mod tests {
     /// membership is arbitrary); a fixed cut names the hot region itself. See
     /// docs/results.md (E1, aes) for the measured plateau.
     fn hot_set(values: &[f64]) -> HashSet<usize> {
-        values.iter().enumerate().filter(|(_, &v)| v >= 0.9).map(|(i, _)| i).collect()
+        (0..values.len()).filter(|&i| values[i] >= 0.9).collect()
     }
 
     /// |A ∩ B| / min(|A|, |B|).
