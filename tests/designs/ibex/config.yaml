@@ -1,5 +1,5 @@
 DESIGN_NAME: ibex_core
-SYNTH_HDL_FRONTEND: slang
+USE_SLANG: true
 VERILOG_FILES:
   - dir::ibex_alu.sv
   - dir::ibex_compressed_decoder.sv
