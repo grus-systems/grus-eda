@@ -96,3 +96,49 @@ workflow gains a generation step for them (picorv32 precedent).
 - CI stays green: any git-ignored generated inputs are produced by
   the workflow's generation steps.
 - `docs/results.md` and `docs/status.md` reflect the final matrix.
+
+## Review resolutions (external review, 2026-11-14)
+
+The full review text is not included in this repository. Verdict: adopt
+with changes. Adopted, with one structural adaptation:
+
+- **Metric (Q1, S2), adapted**: the reviewer asked for per-layer
+  Spearman on overflow. Our estimator does not retain per-layer maps:
+  it aggregates layers into per-direction GCell **edge** demand and
+  capacity (the structure documented in `docs/e1-congestion.md`), and
+  OpenROAD's router is likewise edge-based per layer. The comparison
+  therefore runs per direction (H edges, V edges): OpenROAD's per-layer
+  edge usage/capacity is summed over layers in the dump, and the
+  correlated quantity is per-edge overflow `(demand - capacity)+`
+  over the support set of edges with demand > 0 in either map. The
+  reviewer's core points stand and are kept: no whole-grid raw-usage
+  Spearman (zero-tie mass), overflow not raw usage, support restricted
+  to nonzero-demand edges, grid alignment asserted from the dump's
+  recorded origin/pitch before correlating. Top-set overlap uses the
+  overlap coefficient on the top 5% of support edges by overflow, or
+  all positive-overflow edges when those are fewer.
+- **Thresholds (Q2, S1)**: not fitted to measurements. The criterion is
+  fixed here: per direction, Spearman rho must be **>= 0.60** and
+  **>= the 95th percentile of the negative-control distribution +
+  0.15** (controls: the OpenROAD map shifted by one GCell, and a
+  permutation of its values over the support, both computed in the
+  same test run and recorded), and the top-set overlap must be
+  **>= 0.50**. If a design fails, the outcome is recorded with a root
+  cause; the thresholds do not move.
+- **Golden determinism (Q3, S2)**: the container image is pinned
+  (`librelane:3.0.16`); per design, the SHA-256 of every generated
+  golden file is recorded in `tests/designs/README.md` at generation
+  time, and the maintainer checks the CI generation log against them
+  on the first CI run.
+- **ibex checkpoint (Q3, S2)**: timebox one working day of spike
+  effort. Success = Yosys synthesis completes in the container with
+  the sky130 prim stubs and produces a netlist. Fallbacks to present
+  to the user if it fails: pin an older ORFS commit that still ships
+  ibex sources; an sv2v conversion route; or closing step 4 with
+  aes/jpeg + picorv32 only.
+- **GP density fallback (Q3, S2)**: E2 starts at the ORFS density; on
+  non-convergence the target density steps down in documented steps
+  and the density actually used is recorded. E1 always uses the
+  OpenROAD high-utilisation placed DEF, independent of our GP.
+- **STA tolerances (Q3, S2)**: a per-design tolerance is allowed only
+  with a named root cause and a sunset condition in `docs/results.md`.

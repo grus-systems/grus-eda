@@ -1,0 +1,16 @@
+DESIGN_NAME: aes_cipher_top
+VERILOG_FILES:
+  - dir::aes_cipher_top.v
+  - dir::aes_inv_cipher_top.v
+  - dir::aes_inv_sbox.v
+  - dir::aes_key_expand_128.v
+  - dir::aes_rcon.v
+  - dir::aes_sbox.v
+  - dir::timescale.v
+CLOCK_PERIOD: 3.6
+CLOCK_PORT: clk
+PNR_SDC_FILE: dir::aes.sdc
+SIGNOFF_SDC_FILE: dir::aes.sdc
+
+FP_CORE_UTIL: 35
+PL_TARGET_DENSITY: 0.55
