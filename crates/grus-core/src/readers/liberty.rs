@@ -2,7 +2,7 @@ use crate::interner::{LibPinId, PinDir, SymbolId};
 use crate::lib_db::{
     LibCell, LibDb, LibPin, LibTimingArc, NldmTable, TableAxisVar, TimingSense, TimingType,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -221,38 +221,48 @@ fn parse_timing_type(s: &str) -> TimingType {
     }
 }
 
-fn parse_pin_direction(s: &str) -> PinDir {
+fn parse_pin_direction(s: &str) -> Result<PinDir> {
     let clean = s.trim_matches('"').trim();
     match clean {
-        "input" => PinDir::Input,
-        "output" => PinDir::Output,
-        "inout" => PinDir::Inout,
-        "internal" => PinDir::Internal,
-        _ => PinDir::Input,
+        "input" => Ok(PinDir::Input),
+        "output" => Ok(PinDir::Output),
+        "inout" => Ok(PinDir::Inout),
+        "internal" => Ok(PinDir::Internal),
+        _ => bail!("liberty pin direction `{clean}` is not input, output, inout or internal"),
     }
 }
 
-fn parse_time_unit(s: &str) -> f32 {
+/// A numeric attribute value. A value that does not parse is a malformed library, not zero.
+fn number_value(s: &str, attribute: &str) -> Result<f32> {
+    s.trim()
+        .parse::<f32>()
+        .with_context(|| format!("liberty {attribute} value `{s}` is not a number"))
+}
+
+/// `time_unit` such as `1ns` or `100ps`, converted to ns. A bare number is taken as ns.
+fn parse_time_unit(s: &str) -> Result<f32> {
     let clean = s.trim_matches('"').trim();
-    if let Some(num_str) = clean.strip_suffix("ps") {
-        num_str.trim().parse::<f32>().unwrap_or(1000.0) * 0.001
+    let (num_str, scale) = if let Some(num_str) = clean.strip_suffix("ps") {
+        (num_str, 0.001)
     } else if let Some(num_str) = clean.strip_suffix("ns") {
-        num_str.trim().parse::<f32>().unwrap_or(1.0)
+        (num_str, 1.0)
     } else if let Some(num_str) = clean.strip_suffix("us") {
-        num_str.trim().parse::<f32>().unwrap_or(1.0) * 1000.0
+        (num_str, 1000.0)
     } else {
-        clean.parse::<f32>().unwrap_or(1.0)
-    }
+        (clean, 1.0)
+    };
+    Ok(number_value(num_str, "time_unit")? * scale)
 }
 
-fn parse_float_list(s: &str, scale: f32, out: &mut Vec<f32>) {
+fn parse_float_list(s: &str, scale: f32, out: &mut Vec<f32>) -> Result<()> {
     for part in s.split(',') {
-        let trimmed = part.trim();
-        if !trimmed.is_empty()
-            && let Ok(v) = trimmed.parse::<f32>() {
-                out.push(v * scale);
-            }
+        // A backslash line continuation inside a quoted list is layout, not part of a value.
+        let trimmed = part.trim_matches(|c: char| c.is_whitespace() || c == '\\');
+        if !trimmed.is_empty() {
+            out.push(number_value(trimmed, "table index or value")? * scale);
+        }
     }
+    Ok(())
 }
 
 /// Parses a Liberty (`.lib`) formatted byte slice into a `LibDb`.
@@ -298,7 +308,7 @@ fn parse_library_body(
             Token::Ident("time_unit") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Str(s) | Token::Ident(s)) = lexer.next_token() {
-                        db.time_unit_ns = parse_time_unit(s);
+                        db.time_unit_ns = parse_time_unit(s)?;
                     }
             }
             Token::Ident("capacitive_load_unit") => {
@@ -307,7 +317,7 @@ fn parse_library_body(
                     let mut unit_str = "pf";
                     if let Some(tok_val) = lexer.next_token()
                         && let Token::Ident(s) | Token::Str(s) = tok_val {
-                            val = s.parse::<f32>().unwrap_or(1.0);
+                            val = number_value(s, "capacitive_load_unit")?;
                         }
                     if let Some(Token::Comma) = lexer.next_token()
                         && let Some(tok_unit) = lexer.next_token()
@@ -391,7 +401,7 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
                     while let Some(tok_arg) = lexer.next_token() {
                         match tok_arg {
                             Token::RParen => break,
-                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut tpl.index_1),
+                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut tpl.index_1)?,
                             _ => {}
                         }
                     }
@@ -406,7 +416,7 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
                     while let Some(tok_arg) = lexer.next_token() {
                         match tok_arg {
                             Token::RParen => break,
-                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut tpl.index_2),
+                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut tpl.index_2)?,
                             _ => {}
                         }
                     }
@@ -443,7 +453,7 @@ fn parse_cell_body(
             Token::Ident("area") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-                        area = s.parse::<f32>().unwrap_or(0.0);
+                        area = number_value(s, "area")?;
                     }
             }
             Token::Ident("ff") => {
@@ -619,26 +629,26 @@ fn parse_pin_body(
             Token::Ident("direction") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-                        dir = parse_pin_direction(s);
+                        dir = parse_pin_direction(s)?;
                     }
             }
             Token::Ident("capacitance") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-                        cap = s.parse::<f32>().unwrap_or(0.0) * db.cap_unit_pf;
+                        cap = number_value(s, "capacitance")? * db.cap_unit_pf;
                     }
             }
             Token::Ident("rise_capacitance") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-                        cap_rise = s.parse::<f32>().unwrap_or(0.0) * db.cap_unit_pf;
+                        cap_rise = number_value(s, "rise_capacitance")? * db.cap_unit_pf;
                         has_rise_cap = true;
                     }
             }
             Token::Ident("fall_capacitance") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-                        cap_fall = s.parse::<f32>().unwrap_or(0.0) * db.cap_unit_pf;
+                        cap_fall = number_value(s, "fall_capacitance")? * db.cap_unit_pf;
                         has_fall_cap = true;
                     }
             }
@@ -651,13 +661,13 @@ fn parse_pin_body(
             Token::Ident("max_capacitance") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-                        max_cap = Some(s.parse::<f32>().unwrap_or(0.0) * db.cap_unit_pf);
+                        max_cap = Some(number_value(s, "max_capacitance")? * db.cap_unit_pf);
                     }
             }
             Token::Ident("max_transition") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-                        max_transition = Some(s.parse::<f32>().unwrap_or(0.0) * db.time_unit_ns);
+                        max_transition = Some(number_value(s, "max_transition")? * db.time_unit_ns);
                     }
             }
             Token::Ident("timing") => {
@@ -857,7 +867,7 @@ fn parse_nldm_table(
                         while let Some(arg) = lexer.next_token() {
                             match arg {
                                 Token::RParen => break,
-                                Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut index_1),
+                                Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut index_1)?,
                                 _ => {}
                             }
                         }
@@ -872,7 +882,7 @@ fn parse_nldm_table(
                         while let Some(arg) = lexer.next_token() {
                             match arg {
                                 Token::RParen => break,
-                                Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut index_2),
+                                Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut index_2)?,
                                 _ => {}
                             }
                         }
@@ -884,7 +894,7 @@ fn parse_nldm_table(
                             match arg {
                                 Token::RParen => break,
                                 Token::Str(s) | Token::Ident(s) => {
-                                    parse_float_list(s, db.time_unit_ns, &mut values);
+                                    parse_float_list(s, db.time_unit_ns, &mut values)?;
                                 }
                                 _ => {}
                             }
@@ -1369,5 +1379,46 @@ library(test_fwd) {
         assert_eq!(entries, vec![OsString::from("sample.lib")], "cache written next to the .lib");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Error text for a library that must be rejected. The needle must be in the fixture, so a
+    /// test cannot pass by editing nothing.
+    fn sample_lib_error(needle: &str, replacement: &str) -> String {
+        assert!(SAMPLE_LIB.contains(needle), "fixture no longer contains `{needle}`");
+        let text = SAMPLE_LIB.replacen(needle, replacement, 1);
+        match parse_liberty_bytes(text.as_bytes()) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("malformed library was accepted: `{replacement}`"),
+        }
+    }
+
+    #[test]
+    fn test_non_numeric_cell_area_is_an_error() {
+        let msg = sample_lib_error("area : 1.25;", "area : 1.2x;");
+        assert!(msg.contains("area") && msg.contains("1.2x"), "{msg}");
+    }
+
+    #[test]
+    fn test_non_numeric_pin_capacitance_is_an_error() {
+        let msg = sample_lib_error("capacitance : 0.004;", "capacitance : 0.00x;");
+        assert!(msg.contains("capacitance") && msg.contains("0.00x"), "{msg}");
+    }
+
+    #[test]
+    fn test_non_numeric_table_value_is_an_error() {
+        let msg = sample_lib_error("values (\"0.02, 0.05\"", "values (\"0.02, 0.0x\"");
+        assert!(msg.contains("0.0x"), "{msg}");
+    }
+
+    #[test]
+    fn test_unknown_time_unit_scale_is_an_error() {
+        let msg = sample_lib_error("time_unit : \"1ns\";", "time_unit : \"1xns\";");
+        assert!(msg.contains("time_unit") && msg.contains("1x"), "{msg}");
+    }
+
+    #[test]
+    fn test_unknown_pin_direction_is_an_error() {
+        let msg = sample_lib_error("direction : input;", "direction : sideways;");
+        assert!(msg.contains("sideways"), "{msg}");
     }
 }

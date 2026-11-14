@@ -2,11 +2,12 @@ use crate::design_db::{DesignDb, GCellGridDef, Orient, PlacementRow, PlacementSt
 use crate::interner::{CellId, LibPinId, MacroPinId, NetId, PinDir, PinId};
 use crate::lib_db::LibDb;
 use crate::tech_db::{RectDbu, TechDb};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::str::FromStr;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum DefToken<'a> {
@@ -18,26 +19,37 @@ pub(crate) enum DefToken<'a> {
 }
 
 pub(crate) struct DefLexer<'a> {
-    input: &'a [u8],
+    input: &'a str,
     pos: usize,
+    line: usize,
 }
 
 impl<'a> DefLexer<'a> {
-    pub fn new(input: &'a [u8]) -> Self {
-        Self { input, pos: 0 }
+    pub fn new(input: &'a str) -> Self {
+        Self { input, pos: 0, line: 1 }
+    }
+
+    /// One-based line of the read position, for error messages. Counted incrementally:
+    /// rescanning the prefix on every call made large DEFs quadratic.
+    pub fn line(&self) -> usize {
+        self.line
     }
 
     pub fn next_token(&mut self) -> DefToken<'a> {
-        let len = self.input.len();
+        let bytes = self.input.as_bytes();
+        let len = bytes.len();
         while self.pos < len {
-            let b = self.input[self.pos];
+            let b = bytes[self.pos];
             if b.is_ascii_whitespace() {
+                if b == b'\n' {
+                    self.line += 1;
+                }
                 self.pos += 1;
                 continue;
             }
             if b == b'#' {
                 self.pos += 1;
-                while self.pos < len && self.input[self.pos] != b'\n' {
+                while self.pos < len && bytes[self.pos] != b'\n' {
                     self.pos += 1;
                 }
                 continue;
@@ -57,14 +69,14 @@ impl<'a> DefLexer<'a> {
 
             let start = self.pos;
             while self.pos < len {
-                let c = self.input[self.pos];
+                let c = bytes[self.pos];
                 if c.is_ascii_whitespace() || c == b';' || c == b'(' || c == b')' || c == b'#' {
                     break;
                 }
                 self.pos += 1;
             }
-            let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("");
-            return DefToken::Word(s);
+            // Every boundary is an ASCII delimiter or the end of input, so the slice is on char boundaries.
+            return DefToken::Word(&self.input[start..self.pos]);
         }
         DefToken::Eof
     }
@@ -85,8 +97,8 @@ pub fn unescape_def_name(s: &str) -> String {
     out
 }
 
-pub fn parse_orient(s: &str) -> Orient {
-    match s {
+fn parse_orient(s: &str, line: usize) -> Result<Orient> {
+    Ok(match s {
         "N" => Orient::N,
         "S" => Orient::S,
         "W" => Orient::W,
@@ -95,8 +107,8 @@ pub fn parse_orient(s: &str) -> Orient {
         "FS" => Orient::FS,
         "FW" => Orient::FW,
         "FE" => Orient::FE,
-        _ => Orient::N,
-    }
+        _ => bail!("DEF line {line}: unknown orientation `{s}`"),
+    })
 }
 
 pub fn orient_str(o: Orient) -> &'static str {
@@ -112,13 +124,398 @@ pub fn orient_str(o: Orient) -> &'static str {
     }
 }
 
-fn skip_to_semi(lexer: &mut DefLexer) {
+/// Words of one `;`-terminated statement. Parentheses are dropped: they only punctuate
+/// coordinates whose position is fixed by the statement shape.
+fn read_statement<'a>(lexer: &mut DefLexer<'a>) -> Result<Vec<&'a str>> {
+    let mut words = Vec::new();
     loop {
-        let t = lexer.next_token();
-        if t == DefToken::Semi || t == DefToken::Eof {
-            break;
+        match lexer.next_token() {
+            DefToken::Semi => return Ok(words),
+            DefToken::Word(w) => words.push(w),
+            DefToken::LParen | DefToken::RParen => {}
+            DefToken::Eof => bail!(
+                "DEF line {}: statement is not terminated by `;` (truncated file?)",
+                lexer.line()
+            ),
         }
     }
+}
+
+/// Words inside a `( ... )` group whose `(` has already been consumed.
+fn read_group<'a>(lexer: &mut DefLexer<'a>) -> Result<Vec<&'a str>> {
+    let mut words = Vec::new();
+    loop {
+        match lexer.next_token() {
+            DefToken::RParen => return Ok(words),
+            DefToken::Word(w) => words.push(w),
+            other => bail!("DEF line {}: unexpected {other:?} inside `( ... )`", lexer.line()),
+        }
+    }
+}
+
+fn number<T: FromStr>(word: &str, field: &str, line: usize) -> Result<T> {
+    word.parse::<T>()
+        .map_err(|_| anyhow!("DEF line {line}: {field} `{word}` is not a number"))
+}
+
+/// `X` is true, `Y` is false; the DEF grammar allows nothing else.
+fn axis(word: &str, section: &str, line: usize) -> Result<bool> {
+    match word {
+        "X" => Ok(true),
+        "Y" => Ok(false),
+        _ => bail!("DEF line {line}: {section} axis must be X or Y, found `{word}`"),
+    }
+}
+
+/// Splits `+ KEYWORD args...` attributes; the args of each keyword run up to the next `+`.
+fn split_attributes<'w, 'a>(
+    words: &'w [&'a str],
+    line: usize,
+) -> Result<Vec<(&'a str, &'w [&'a str])>> {
+    let mut out = Vec::new();
+    let mut rest = words;
+    while let Some((&first, tail)) = rest.split_first() {
+        if first != "+" {
+            bail!("DEF line {line}: expected `+` before `{first}`");
+        }
+        let Some((&keyword, after)) = tail.split_first() else {
+            bail!("DEF line {line}: `+` without an attribute keyword");
+        };
+        let end = after.iter().position(|&w| w == "+").unwrap_or(after.len());
+        out.push((keyword, &after[..end]));
+        rest = &after[end..];
+    }
+    Ok(out)
+}
+
+/// Consumes the name that follows an `END` and checks that it closes `section`.
+fn end_section(lexer: &mut DefLexer, section: &str) -> Result<()> {
+    match lexer.next_token() {
+        DefToken::Word(name) if name == section => Ok(()),
+        other => bail!(
+            "DEF line {}: expected `END {section}`, found {other:?}",
+            lexer.line()
+        ),
+    }
+}
+
+/// Reads the `SECTION <count> ;` header of a counted section.
+fn section_count(lexer: &mut DefLexer, section: &str) -> Result<usize> {
+    let words = read_statement(lexer)?;
+    let line = lexer.line();
+    match words.as_slice() {
+        [count] => number(count, &format!("{section} count"), line),
+        _ => bail!("DEF line {line}: {section} header must be `{section} <count> ;`"),
+    }
+}
+
+/// Skips a section the database does not model, through its `END <section>`.
+/// Every token is skipped by design, so there is no content to validate.
+fn skip_section(lexer: &mut DefLexer, section: &str) -> Result<()> {
+    loop {
+        match lexer.next_token() {
+            DefToken::Word("END") => return end_section(lexer, section),
+            DefToken::Eof => bail!("DEF: {section} is not terminated by `END {section}` (truncated file?)"),
+            _ => {}
+        }
+    }
+}
+
+/// Runs `entry` on each `- ...;` record of a counted section, through its `END <section>`,
+/// and checks the record count against the header.
+fn for_each_record<'a>(
+    lexer: &mut DefLexer<'a>,
+    section: &str,
+    mut entry: impl FnMut(&[&'a str], usize) -> Result<()>,
+) -> Result<()> {
+    let declared = section_count(lexer, section)?;
+    let mut found = 0;
+    loop {
+        match lexer.next_token() {
+            DefToken::Word("-") => {
+                let words = read_statement(lexer)?;
+                entry(&words, lexer.line())?;
+                found += 1;
+            }
+            DefToken::Word("END") => {
+                end_section(lexer, section)?;
+                break;
+            }
+            DefToken::Eof => bail!("DEF: {section} is not terminated by `END {section}` (truncated file?)"),
+            other => bail!(
+                "DEF line {}: unexpected {other:?} in {section}; records start with `-`",
+                lexer.line()
+            ),
+        }
+    }
+    if declared != found {
+        bail!(
+            "DEF line {}: {section} header declares {declared} records but {found} were read (truncated or edited file?)",
+            lexer.line()
+        );
+    }
+    Ok(())
+}
+
+fn add_component(
+    db: &mut DesignDb,
+    tech_db: &TechDb,
+    lib_db: Option<&LibDb>,
+    cell_name_to_id: &mut HashMap<String, CellId>,
+    words: &[&str],
+    line: usize,
+) -> Result<()> {
+    let [inst, macro_name, attributes @ ..] = words else {
+        bail!("DEF line {line}: component record needs an instance name and a macro name");
+    };
+    let inst_token = unescape_def_name(inst);
+
+    let mut status = PlacementStatus::Unplaced;
+    let mut x = 0;
+    let mut y = 0;
+    let mut orient = Orient::N;
+    for (keyword, args) in split_attributes(attributes, line)? {
+        match keyword {
+            "PLACED" | "FIXED" | "COVER" => {
+                let [px, py, o] = args else {
+                    bail!("DEF line {line}: component {inst} `+ {keyword}` needs `( x y ) orient`");
+                };
+                x = number(px, "component x", line)?;
+                y = number(py, "component y", line)?;
+                orient = parse_orient(o, line)?;
+                status = match keyword {
+                    "PLACED" => PlacementStatus::Placed,
+                    "FIXED" => PlacementStatus::Fixed,
+                    _ => PlacementStatus::Cover,
+                };
+            }
+            "UNPLACED" => {
+                if !args.is_empty() {
+                    bail!("DEF line {line}: component {inst} `+ UNPLACED` takes no arguments");
+                }
+                status = PlacementStatus::Unplaced;
+            }
+            // Attributes the database does not model (source, weights, halos, regions,
+            // foreign cells, properties). Their arguments are skipped with them.
+            "SOURCE" | "WEIGHT" | "HALO" | "ROUTEHALO" | "REGION" | "EEQMASTER" | "FOREIGN"
+            | "PROPERTY" => {}
+            other => bail!("DEF line {line}: unknown component attribute `+ {other}`"),
+        }
+    }
+
+    let macro_id = tech_db
+        .strings
+        .get(macro_name)
+        .and_then(|s| tech_db.macro_by_name.get(&s).copied())
+        .with_context(|| {
+            format!("DEF line {line}: component {inst} uses macro {macro_name}, which the LEF does not define")
+        })?;
+    let mac = &tech_db.macros[macro_id.0 as usize];
+
+    let lib_cell_id = lib_db.and_then(|lib| {
+        lib.strings
+            .get(macro_name)
+            .and_then(|s| lib.cell_by_name.get(&s).copied())
+    });
+
+    let cell_id = CellId(db.cell_names.len() as u32);
+    cell_name_to_id.insert(inst_token.clone(), cell_id);
+    db.cell_names.push(db.strings.intern(&inst_token));
+    db.cell_macros.push(macro_id);
+    db.cell_lib_ids.push(lib_cell_id);
+    db.cell_status.push(status);
+    db.cell_x_dbu.push(x);
+    db.cell_y_dbu.push(y);
+    db.cell_orient.push(orient);
+
+    let mac_pins = tech_db.macro_pins(mac);
+    for (pin_idx, mpin) in mac_pins.iter().enumerate() {
+        let pin_name = tech_db.strings.resolve(mpin.name);
+        let pin_id = PinId(db.pin_names.len() as u32);
+        let is_driver = matches!(mpin.dir, PinDir::Output);
+
+        let lib_pin_id = lib_db.and_then(|lib| {
+            if let Some(lcid) = lib_cell_id {
+                let lcell = &lib.cells[lcid.0 as usize];
+                let lpins = lib.cell_pins(lcell);
+                lpins
+                    .iter()
+                    .position(|lp| lib.strings.resolve(lp.name) == pin_name)
+                    .map(|idx| LibPinId((lcell.pin_offset as usize + idx) as u16))
+            } else {
+                None
+            }
+        });
+
+        db.pin_names.push(mpin.name);
+        db.pin_dirs.push(mpin.dir);
+        db.pin_cells.push(Some(cell_id));
+        db.pin_macro_pins
+            .push(Some(MacroPinId(mac.pin_offset + pin_idx as u32)));
+        db.pin_lib_pins.push(lib_pin_id);
+        db.pin_nets.push(None); // linked during NETS
+        db.pin_offset_x_dbu.push(mpin.offset_x_dbu);
+        db.pin_offset_y_dbu.push(mpin.offset_y_dbu);
+        db.pin_is_driver.push(is_driver);
+        db.cell_pin_ids.push(pin_id);
+    }
+
+    db.cell_pin_offsets.push(db.cell_pin_ids.len() as u32);
+    Ok(())
+}
+
+fn add_pin(
+    db: &mut DesignDb,
+    io_pin_name_to_id: &mut HashMap<String, PinId>,
+    words: &[&str],
+    line: usize,
+) -> Result<()> {
+    let [name, attributes @ ..] = words else {
+        bail!("DEF line {line}: PINS record without a pin name");
+    };
+    let pin_name = unescape_def_name(name);
+
+    let mut dir = PinDir::Inout;
+    let mut x = 0;
+    let mut y = 0;
+    let mut layer_off_x = 0;
+    let mut layer_off_y = 0;
+    let mut is_special = false;
+    for (keyword, args) in split_attributes(attributes, line)? {
+        match keyword {
+            "SPECIAL" => is_special = true,
+            "DIRECTION" => {
+                dir = match args {
+                    [d] => match *d {
+                        "INPUT" => PinDir::Input,
+                        "OUTPUT" => PinDir::Output,
+                        "INOUT" => PinDir::Inout,
+                        other => bail!("DEF line {line}: pin {pin_name} has unsupported DIRECTION `{other}`"),
+                    },
+                    _ => bail!("DEF line {line}: pin {pin_name} DIRECTION takes one value"),
+                };
+            }
+            "LAYER" => {
+                let [_, x1, y1, x2, y2] = args else {
+                    bail!("DEF line {line}: pin {pin_name} `+ LAYER` needs `layer ( x1 y1 ) ( x2 y2 )`");
+                };
+                let x1: i32 = number(x1, "pin LAYER x1", line)?;
+                let y1: i32 = number(y1, "pin LAYER y1", line)?;
+                let x2: i32 = number(x2, "pin LAYER x2", line)?;
+                let y2: i32 = number(y2, "pin LAYER y2", line)?;
+                layer_off_x = (x1 + x2) / 2;
+                layer_off_y = (y1 + y2) / 2;
+            }
+            "PLACED" | "FIXED" | "COVER" => {
+                let [px, py, o] = args else {
+                    bail!("DEF line {line}: pin {pin_name} `+ {keyword}` needs `( x y ) orient`");
+                };
+                x = number(px, "pin x", line)?;
+                y = number(py, "pin y", line)?;
+                // The pin orientation is validated but not stored: pin shapes come from the LEF.
+                parse_orient(o, line)?;
+            }
+            // Attributes the database does not model: net name, expressions, sensitivity,
+            // use (power/signal, derived from the LEF), and port-shape markers.
+            "NET" | "NETEXPR" | "SUPPLYSENSITIVITY" | "GROUNDSENSITIVITY" | "USE" | "PORT" => {}
+            other => bail!("DEF line {line}: unknown pin attribute `+ {other}`"),
+        }
+    }
+
+    let sym = db.strings.intern(&pin_name);
+    let pin_id = PinId(db.pin_names.len() as u32);
+    let is_driver = matches!(dir, PinDir::Input | PinDir::Inout);
+
+    db.pin_names.push(sym);
+    db.pin_dirs.push(dir);
+    db.pin_cells.push(None);
+    db.pin_macro_pins.push(None);
+    db.pin_lib_pins.push(None);
+    db.pin_nets.push(None);
+    db.pin_offset_x_dbu.push(x + layer_off_x);
+    db.pin_offset_y_dbu.push(y + layer_off_y);
+    db.pin_is_driver.push(is_driver);
+
+    if !is_special {
+        io_pin_name_to_id.insert(pin_name, pin_id);
+        db.io_pins.push(pin_id);
+    }
+    Ok(())
+}
+
+fn add_special_net(
+    db: &mut DesignDb,
+    tech_db: &TechDb,
+    words: &[&str],
+    line: usize,
+) -> Result<()> {
+    // Wire segments: `ROUTED|NEW layer width ( x1 y1 ) ( x2 y2 )`, where `*` repeats the previous coordinate.
+    let mut last_x = 0;
+    let mut last_y = 0;
+    let mut i = 0;
+    while i < words.len() {
+        if (words[i] == "ROUTED" || words[i] == "NEW") && i + 2 < words.len() {
+            let lname = words[i + 1];
+            let width: i32 = number(words[i + 2], "SPECIALNETS wire width", line)?;
+            i += 3;
+
+            if let Some(&lid) = tech_db
+                .strings
+                .get(lname)
+                .and_then(|s| tech_db.layer_by_name.get(&s))
+            {
+                while i < words.len() && words[i] != "NEW" && words[i] != "ROUTED" {
+                    if words[i] == "+" && i + 2 < words.len() && words[i + 1] == "SHAPE" {
+                        i += 3;
+                        continue;
+                    }
+                    if words[i] == "+SHAPE" || words[i] == "SHAPE" {
+                        i += 2;
+                        continue;
+                    }
+                    if i + 3 < words.len() {
+                        let is_c1 = words[i] == "*" || words[i].parse::<i32>().is_ok();
+                        let is_c2 = words[i + 1] == "*" || words[i + 1].parse::<i32>().is_ok();
+                        let is_c3 = words[i + 2] == "*" || words[i + 2].parse::<i32>().is_ok();
+                        let is_c4 = words[i + 3] == "*" || words[i + 3].parse::<i32>().is_ok();
+
+                        if is_c1 && is_c2 && is_c3 && is_c4 {
+                            let x1 = if words[i] == "*" { last_x } else { number(words[i], "SPECIALNETS x", line)? };
+                            let y1 = if words[i + 1] == "*" { last_y } else { number(words[i + 1], "SPECIALNETS y", line)? };
+                            let x2 = if words[i + 2] == "*" { x1 } else { number(words[i + 2], "SPECIALNETS x", line)? };
+                            let y2 = if words[i + 3] == "*" { y1 } else { number(words[i + 3], "SPECIALNETS y", line)? };
+
+                            last_x = x2;
+                            last_y = y2;
+                            i += 4;
+
+                            if width > 0 {
+                                let half = width / 2;
+                                let rect = if y1 == y2 {
+                                    RectDbu::new(x1.min(x2), y1 - half, x1.max(x2), y1 + half)
+                                } else if x1 == x2 {
+                                    RectDbu::new(x1 - half, y1.min(y2), x1 + half, y1.max(y2))
+                                } else {
+                                    RectDbu::new(
+                                        x1.min(x2) - half,
+                                        y1.min(y2) - half,
+                                        x1.max(x2) + half,
+                                        y1.max(y2) + half,
+                                    )
+                                };
+                                db.special_wire_rects.push((lid, rect));
+                            }
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 pub fn parse_def_bytes(
@@ -126,7 +523,8 @@ pub fn parse_def_bytes(
     tech_db: &TechDb,
     lib_db: Option<&LibDb>,
 ) -> Result<DesignDb> {
-    let mut lexer = DefLexer::new(bytes);
+    let text = std::str::from_utf8(bytes).context("DEF is not valid UTF-8")?;
+    let mut lexer = DefLexer::new(text);
     let mut db = DesignDb::new();
     db.strings = tech_db.strings.clone();
     db.dbu_per_micron = if tech_db.dbu_per_micron > 0 {
@@ -137,588 +535,217 @@ pub fn parse_def_bytes(
 
     let mut cell_name_to_id: HashMap<String, CellId> = HashMap::new();
     let mut io_pin_name_to_id: HashMap<String, PinId> = HashMap::new();
+    let mut saw_end_design = false;
 
     loop {
         let tok = lexer.next_token();
         match tok {
             DefToken::Eof => break,
             DefToken::Word("END") => {
-                let _sec = lexer.next_token();
+                end_section(&mut lexer, "DESIGN")?;
+                saw_end_design = true;
             }
-            DefToken::Word("DESIGN") => {
-                if let DefToken::Word(name) = lexer.next_token() {
-                    db.design_name = name.to_string();
+            DefToken::Word("DESIGN") => match read_statement(&mut lexer)?.as_slice() {
+                [name] => db.design_name = name.to_string(),
+                _ => bail!("DEF line {}: DESIGN takes exactly one name", lexer.line()),
+            },
+            DefToken::Word("UNITS") => match read_statement(&mut lexer)?.as_slice() {
+                ["DISTANCE", "MICRONS", dbu] => {
+                    db.dbu_per_micron = number(dbu, "UNITS MICRONS", lexer.line())?;
                 }
-                skip_to_semi(&mut lexer);
-            }
-            DefToken::Word("UNITS") => {
-                let mut dbu = 1000;
-                loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Semi || t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word("MICRONS") = t
-                        && let DefToken::Word(dstr) = lexer.next_token() {
-                            dbu = dstr.parse::<i32>().unwrap_or(1000);
-                        }
-                }
-                db.dbu_per_micron = dbu;
+                _ => bail!("DEF line {}: UNITS must be `UNITS DISTANCE MICRONS <dbu> ;`", lexer.line()),
+            },
+            // Header statements. The database takes names as written and the technology from
+            // the LEF, so these describe conventions it does not need.
+            DefToken::Word("VERSION" | "DIVIDERCHAR" | "BUSBITCHARS" | "TECHNOLOGY") => {
+                read_statement(&mut lexer)?;
             }
             DefToken::Word("DIEAREA") => {
-                let mut coords = Vec::new();
-                loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Semi || t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word(w) = t
-                        && let Ok(v) = w.parse::<i32>() {
-                            coords.push(v);
-                        }
-                }
-                if coords.len() >= 4 {
-                    db.die_area = RectDbu::new(coords[0], coords[1], coords[2], coords[3]);
+                let words = read_statement(&mut lexer)?;
+                let line = lexer.line();
+                let coords = words
+                    .iter()
+                    .map(|w| number::<i32>(w, "DIEAREA coordinate", line))
+                    .collect::<Result<Vec<i32>>>()?;
+                match coords.as_slice() {
+                    [x1, y1, x2, y2, ..] => db.die_area = RectDbu::new(*x1, *y1, *x2, *y2),
+                    _ => bail!("DEF line {line}: DIEAREA needs two points"),
                 }
             }
             DefToken::Word("ROW") => {
-                // ROW row_name site_name orig_x orig_y orient DO num_x BY num_y STEP step_x step_y ;
-                let mut row_name = String::new();
-                let mut site_name = String::new();
-                let mut orig_x = 0;
-                let mut orig_y = 0;
-                let mut orient = Orient::N;
-                let mut num_x = 0;
-                let mut step_x = 0;
-
-                let mut words = Vec::new();
-                loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Semi || t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word(w) = t {
-                        words.push(w);
-                    }
-                }
-
-                if words.len() >= 5 {
-                    row_name = words[0].to_string();
-                    site_name = words[1].to_string();
-                    orig_x = words[2].parse().unwrap_or(0);
-                    orig_y = words[3].parse().unwrap_or(0);
-                    orient = parse_orient(words[4]);
-
-                    let mut i = 5;
-                    while i < words.len() {
-                        if words[i] == "DO" && i + 1 < words.len() {
-                            num_x = words[i + 1].parse().unwrap_or(0);
-                            i += 2;
-                        } else if words[i] == "STEP" && i + 1 < words.len() {
-                            step_x = words[i + 1].parse().unwrap_or(0);
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
-
+                // ROW name site orig_x orig_y orient DO num_x BY num_y STEP step_x step_y
+                let words = read_statement(&mut lexer)?;
+                let line = lexer.line();
+                let [name, site, orig_x, orig_y, orient, "DO", num_x, "BY", num_y, "STEP", step_x, step_y] =
+                    words.as_slice()
+                else {
+                    bail!(
+                        "DEF line {line}: ROW must be `ROW name site x y orient DO n BY m STEP sx sy ;` ({} words given)",
+                        words.len()
+                    );
+                };
+                // num_y and step_y must be numbers but the database has no field for them.
+                number::<i32>(num_y, "ROW BY count", line)?;
+                number::<i32>(step_y, "ROW step y", line)?;
                 db.rows.push(PlacementRow {
-                    row_name: db.strings.intern(&row_name),
-                    site_name: db.strings.intern(&site_name),
-                    orig_x_dbu: orig_x,
-                    orig_y_dbu: orig_y,
-                    orient,
-                    num_x,
-                    step_x_dbu: step_x,
+                    row_name: db.strings.intern(name),
+                    site_name: db.strings.intern(site),
+                    orig_x_dbu: number(orig_x, "ROW origin x", line)?,
+                    orig_y_dbu: number(orig_y, "ROW origin y", line)?,
+                    orient: parse_orient(orient, line)?,
+                    num_x: number(num_x, "ROW count", line)?,
+                    step_x_dbu: number(step_x, "ROW step x", line)?,
                 });
             }
             DefToken::Word("TRACKS") => {
-                // TRACKS ( X | Y ) start DO num STEP step LAYER layers... ;
-                let mut is_vertical = true;
-                let mut start = 0;
-                let mut num_tracks = 0;
-                let mut step = 0;
-                let mut layers = Vec::new();
-
-                let mut words = Vec::new();
-                loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Semi || t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word(w) = t {
-                        words.push(w);
-                    }
-                }
-
-                if words.len() >= 6 {
-                    is_vertical = words[0] == "X";
-                    start = words[1].parse().unwrap_or(0);
-                    let mut i = 2;
-                    while i < words.len() {
-                        if words[i] == "DO" && i + 1 < words.len() {
-                            num_tracks = words[i + 1].parse().unwrap_or(0);
-                            i += 2;
-                        } else if words[i] == "STEP" && i + 1 < words.len() {
-                            step = words[i + 1].parse().unwrap_or(0);
-                            i += 2;
-                        } else if words[i] == "LAYER" {
-                            for lname in &words[i + 1..] {
-                                if let Some(&lid) = tech_db
-                                    .strings
-                                    .get(lname)
-                                    .and_then(|s| tech_db.layer_by_name.get(&s))
-                                {
-                                    layers.push(lid);
-                                }
-                            }
-                            break;
-                        } else {
-                            i += 1;
+                // TRACKS X|Y start DO num STEP step [LAYER layer...]
+                let words = read_statement(&mut lexer)?;
+                let line = lexer.line();
+                let (dir, start, num, step, layer_names): (&str, &str, &str, &str, &[&str]) =
+                    match words.as_slice() {
+                        [dir, start, "DO", num, "STEP", step, "LAYER", layers @ ..] => {
+                            (dir, start, num, step, layers)
                         }
+                        [dir, start, "DO", num, "STEP", step] => (dir, start, num, step, &[]),
+                        _ => bail!("DEF line {line}: TRACKS must be `TRACKS X|Y start DO n STEP step [LAYER ...] ;`"),
+                    };
+                let mut layers = Vec::new();
+                for lname in layer_names {
+                    // Only layers the tech DB has as routing layers can carry tracks here.
+                    if let Some(&lid) = tech_db
+                        .strings
+                        .get(lname)
+                        .and_then(|s| tech_db.layer_by_name.get(&s))
+                    {
+                        layers.push(lid);
                     }
                 }
-
                 db.tracks.push(TrackGrid {
-                    is_vertical_tracks: is_vertical,
-                    start_dbu: start,
-                    num_tracks,
-                    step_dbu: step,
+                    is_vertical_tracks: axis(dir, "TRACKS", line)?,
+                    start_dbu: number(start, "TRACKS start", line)?,
+                    num_tracks: number(num, "TRACKS count", line)?,
+                    step_dbu: number(step, "TRACKS step", line)?,
                     layers,
                 });
             }
             DefToken::Word("GCELLGRID") => {
-                // GCELLGRID ( X | Y ) start DO num STEP step ;
-                let mut is_x = true;
-                let mut start = 0;
-                let mut num = 0;
-                let mut step = 0;
-
-                let mut words = Vec::new();
-                loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Semi || t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word(w) = t {
-                        words.push(w);
-                    }
-                }
-
-                if words.len() >= 6 {
-                    is_x = words[0] == "X";
-                    start = words[1].parse().unwrap_or(0);
-                    let mut i = 2;
-                    while i < words.len() {
-                        if words[i] == "DO" && i + 1 < words.len() {
-                            num = words[i + 1].parse().unwrap_or(0);
-                            i += 2;
-                        } else if words[i] == "STEP" && i + 1 < words.len() {
-                            step = words[i + 1].parse().unwrap_or(0);
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
-
+                // GCELLGRID X|Y start DO num STEP step
+                let words = read_statement(&mut lexer)?;
+                let line = lexer.line();
+                let [dir, start, "DO", num, "STEP", step] = words.as_slice() else {
+                    bail!("DEF line {line}: GCELLGRID must be `GCELLGRID X|Y start DO n STEP step ;`");
+                };
                 db.gcell_grids.push(GCellGridDef {
-                    is_x,
-                    start_dbu: start,
-                    num_boundaries: num,
-                    step_dbu: step,
+                    is_x: axis(dir, "GCELLGRID", line)?,
+                    start_dbu: number(start, "GCELLGRID start", line)?,
+                    num_boundaries: number(num, "GCELLGRID count", line)?,
+                    step_dbu: number(step, "GCELLGRID step", line)?,
                 });
             }
             DefToken::Word("COMPONENTS") => {
                 db.cell_pin_offsets.push(0);
-
-                loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word("END") = t {
-                        let _sec = lexer.next_token();
-                        break;
-                    }
-                    if let DefToken::Word("-") = t {
-                        // - inst_name macro_name [attributes] ;
-                        let inst_token = match lexer.next_token() {
-                            DefToken::Word(w) => unescape_def_name(w),
-                            _ => continue,
-                        };
-                        let macro_token = match lexer.next_token() {
-                            DefToken::Word(w) => w.to_string(),
-                            _ => continue,
-                        };
-
-                        let mut status = PlacementStatus::Unplaced;
-                        let mut x = 0;
-                        let mut y = 0;
-                        let mut orient = Orient::N;
-
-                        let mut comp_words = Vec::new();
-                        loop {
-                            let ct = lexer.next_token();
-                            if ct == DefToken::Semi || ct == DefToken::Eof {
-                                break;
-                            }
-                            if let DefToken::Word(w) = ct {
-                                comp_words.push(w);
-                            }
-                        }
-
-                        let mut i = 0;
-                        while i < comp_words.len() {
-                            match comp_words[i] {
-                                "PLACED" => {
-                                    status = PlacementStatus::Placed;
-                                    if i + 3 < comp_words.len() {
-                                        x = comp_words[i + 1].parse().unwrap_or(0);
-                                        y = comp_words[i + 2].parse().unwrap_or(0);
-                                        orient = parse_orient(comp_words[i + 3]);
-                                        i += 4;
-                                        continue;
-                                    }
-                                }
-                                "FIXED" => {
-                                    status = PlacementStatus::Fixed;
-                                    if i + 3 < comp_words.len() {
-                                        x = comp_words[i + 1].parse().unwrap_or(0);
-                                        y = comp_words[i + 2].parse().unwrap_or(0);
-                                        orient = parse_orient(comp_words[i + 3]);
-                                        i += 4;
-                                        continue;
-                                    }
-                                }
-                                "COVER" => {
-                                    status = PlacementStatus::Cover;
-                                    if i + 3 < comp_words.len() {
-                                        x = comp_words[i + 1].parse().unwrap_or(0);
-                                        y = comp_words[i + 2].parse().unwrap_or(0);
-                                        orient = parse_orient(comp_words[i + 3]);
-                                        i += 4;
-                                        continue;
-                                    }
-                                }
-                                "UNPLACED" => {
-                                    status = PlacementStatus::Unplaced;
-                                }
-                                _ => {}
-                            }
-                            i += 1;
-                        }
-
-                        let macro_id = match tech_db
-                            .strings
-                            .get(&macro_token)
-                            .and_then(|s| tech_db.macro_by_name.get(&s).copied())
-                        {
-                            Some(mid) => mid,
-                            None => continue,
-                        };
-                        let mac = &tech_db.macros[macro_id.0 as usize];
-
-                        let lib_cell_id = lib_db.and_then(|lib| {
-                            lib.strings
-                                .get(&macro_token)
-                                .and_then(|s| lib.cell_by_name.get(&s).copied())
-                        });
-
-                        let cell_id = CellId(db.cell_names.len() as u32);
-                        cell_name_to_id.insert(inst_token.clone(), cell_id);
-                        db.cell_names.push(db.strings.intern(&inst_token));
-                        db.cell_macros.push(macro_id);
-                        db.cell_lib_ids.push(lib_cell_id);
-                        db.cell_status.push(status);
-                        db.cell_x_dbu.push(x);
-                        db.cell_y_dbu.push(y);
-                        db.cell_orient.push(orient);
-
-                        let mac_pins = tech_db.macro_pins(mac);
-                        for (pin_idx, mpin) in mac_pins.iter().enumerate() {
-                            let pin_name = tech_db.strings.resolve(mpin.name);
-                            let pin_id = PinId(db.pin_names.len() as u32);
-                            let is_driver = matches!(mpin.dir, PinDir::Output);
-
-                            let lib_pin_id = lib_db.and_then(|lib| {
-                                if let Some(lcid) = lib_cell_id {
-                                    let lcell = &lib.cells[lcid.0 as usize];
-                                    let lpins = lib.cell_pins(lcell);
-                                    lpins
-                                        .iter()
-                                        .position(|lp| lib.strings.resolve(lp.name) == pin_name)
-                                        .map(|idx| {
-                                            LibPinId((lcell.pin_offset as usize + idx) as u16)
-                                        })
-                                } else {
-                                    None
-                                }
-                            });
-
-                            db.pin_names.push(mpin.name);
-                            db.pin_dirs.push(mpin.dir);
-                            db.pin_cells.push(Some(cell_id));
-                            db.pin_macro_pins
-                                .push(Some(MacroPinId(mac.pin_offset + pin_idx as u32)));
-                            db.pin_lib_pins.push(lib_pin_id);
-                            db.pin_nets.push(None); // linked during NETS
-                            db.pin_offset_x_dbu.push(mpin.offset_x_dbu);
-                            db.pin_offset_y_dbu.push(mpin.offset_y_dbu);
-                            db.pin_is_driver.push(is_driver);
-                            db.cell_pin_ids.push(pin_id);
-                        }
-
-                        db.cell_pin_offsets.push(db.cell_pin_ids.len() as u32);
-                    }
-                }
+                for_each_record(&mut lexer, "COMPONENTS", |words, line| {
+                    add_component(&mut db, tech_db, lib_db, &mut cell_name_to_id, words, line)
+                })?;
             }
             DefToken::Word("PINS") => {
-                loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word("END") = t {
-                        let _sec = lexer.next_token();
-                        break;
-                    }
-                    if let DefToken::Word("-") = t {
-                        let pin_name = match lexer.next_token() {
-                            DefToken::Word(w) => unescape_def_name(w),
-                            _ => continue,
-                        };
-
-                        let mut dir = PinDir::Inout;
-                        let mut x = 0;
-                        let mut y = 0;
-                        let mut layer_off_x = 0;
-                        let mut layer_off_y = 0;
-                        let mut is_special = false;
-
-                        let mut pin_words = Vec::new();
-                        loop {
-                            let pt = lexer.next_token();
-                            if pt == DefToken::Semi || pt == DefToken::Eof {
-                                break;
-                            }
-                            if let DefToken::Word(w) = pt {
-                                pin_words.push(w);
-                            }
-                        }
-
-                        let mut i = 0;
-                        while i < pin_words.len() {
-                            match pin_words[i] {
-                                "SPECIAL" => {
-                                    is_special = true;
-                                }
-                                "DIRECTION" if i + 1 < pin_words.len() => {
-                                    dir = match pin_words[i + 1] {
-                                        "INPUT" => PinDir::Input,
-                                        "OUTPUT" => PinDir::Output,
-                                        _ => PinDir::Inout,
-                                    };
-                                    i += 1;
-                                }
-                                "LAYER" if i + 5 < pin_words.len() => {
-                                    let x1: i32 = pin_words[i + 2].parse().unwrap_or(0);
-                                    let y1: i32 = pin_words[i + 3].parse().unwrap_or(0);
-                                    let x2: i32 = pin_words[i + 4].parse().unwrap_or(0);
-                                    let y2: i32 = pin_words[i + 5].parse().unwrap_or(0);
-                                    layer_off_x = (x1 + x2) / 2;
-                                    layer_off_y = (y1 + y2) / 2;
-                                    i += 5;
-                                }
-                                "PLACED" | "FIXED" | "COVER" if i + 2 < pin_words.len() => {
-                                    x = pin_words[i + 1].parse().unwrap_or(0);
-                                    y = pin_words[i + 2].parse().unwrap_or(0);
-                                    i += 2;
-                                }
-                                _ => {}
-                            }
-                            i += 1;
-                        }
-
-                        let sym = db.strings.intern(&pin_name);
-                        let pin_id = PinId(db.pin_names.len() as u32);
-                        let is_driver = matches!(dir, PinDir::Input | PinDir::Inout);
-
-                        db.pin_names.push(sym);
-                        db.pin_dirs.push(dir);
-                        db.pin_cells.push(None);
-                        db.pin_macro_pins.push(None);
-                        db.pin_lib_pins.push(None);
-                        db.pin_nets.push(None);
-                        db.pin_offset_x_dbu.push(x + layer_off_x);
-                        db.pin_offset_y_dbu.push(y + layer_off_y);
-                        db.pin_is_driver.push(is_driver);
-
-                        if !is_special {
-                            io_pin_name_to_id.insert(pin_name, pin_id);
-                            db.io_pins.push(pin_id);
-                        }
-                    }
-                }
+                for_each_record(&mut lexer, "PINS", |words, line| {
+                    add_pin(&mut db, &mut io_pin_name_to_id, words, line)
+                })?;
             }
             DefToken::Word("SPECIALNETS") => {
-                loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word("END") = t {
-                        let _sec = lexer.next_token();
-                        break;
-                    }
-                    if let DefToken::Word("-") = t {
-                        // Parse special net routed segments until semicolon
-                        let mut words = Vec::new();
-                        loop {
-                            let st = lexer.next_token();
-                            if st == DefToken::Semi || st == DefToken::Eof {
-                                break;
-                            }
-                            if let DefToken::Word(w) = st {
-                                words.push(w);
-                            }
-                        }
-
-                        let mut last_x = 0;
-                        let mut last_y = 0;
-                        let mut i = 0;
-                        while i < words.len() {
-                            if (words[i] == "ROUTED" || words[i] == "NEW") && i + 2 < words.len() {
-                                let lname = words[i + 1];
-                                let width: i32 = words[i + 2].parse().unwrap_or(0);
-                                i += 3;
-
-                                if let Some(&lid) = tech_db
-                                    .strings
-                                    .get(lname)
-                                    .and_then(|s| tech_db.layer_by_name.get(&s))
-                                {
-                                    // Look for segment coordinates `( x1 y1 ) ( x2 y2 )`
-                                    while i < words.len() && words[i] != "NEW" && words[i] != "ROUTED" {
-                                        if words[i] == "+" && i + 2 < words.len() && words[i + 1] == "SHAPE" {
-                                            i += 3;
-                                            continue;
-                                        }
-                                        if words[i] == "+SHAPE" || words[i] == "SHAPE" {
-                                            i += 2;
-                                            continue;
-                                        }
-                                        if i + 3 < words.len() {
-                                            let is_c1 = words[i] == "*" || words[i].parse::<i32>().is_ok();
-                                            let is_c2 = words[i + 1] == "*" || words[i + 1].parse::<i32>().is_ok();
-                                            let is_c3 = words[i + 2] == "*" || words[i + 2].parse::<i32>().is_ok();
-                                            let is_c4 = words[i + 3] == "*" || words[i + 3].parse::<i32>().is_ok();
-
-                                            if is_c1 && is_c2 && is_c3 && is_c4 {
-                                                let x1 = if words[i] == "*" { last_x } else { words[i].parse().unwrap_or(last_x) };
-                                                let y1 = if words[i + 1] == "*" { last_y } else { words[i + 1].parse().unwrap_or(last_y) };
-                                                let x2 = if words[i + 2] == "*" { x1 } else { words[i + 2].parse().unwrap_or(x1) };
-                                                let y2 = if words[i + 3] == "*" { y1 } else { words[i + 3].parse().unwrap_or(y1) };
-
-                                                last_x = x2;
-                                                last_y = y2;
-                                                i += 4;
-
-                                                if width > 0 {
-                                                    let half = width / 2;
-                                                    let rect = if y1 == y2 {
-                                                        RectDbu::new(x1.min(x2), y1 - half, x1.max(x2), y1 + half)
-                                                    } else if x1 == x2 {
-                                                        RectDbu::new(x1 - half, y1.min(y2), x1 + half, y1.max(y2))
-                                                    } else {
-                                                        RectDbu::new(x1.min(x2) - half, y1.min(y2) - half, x1.max(x2) + half, y1.max(y2) + half)
-                                                    };
-                                                    db.special_wire_rects.push((lid, rect));
-                                                }
-                                                continue;
-                                            }
-                                        }
-                                        i += 1;
-                                    }
-                                    continue;
-                                }
-                            }
-                            i += 1;
-                        }
-                    }
-                }
+                for_each_record(&mut lexer, "SPECIALNETS", |words, line| {
+                    add_special_net(&mut db, tech_db, words, line)
+                })?;
             }
+            // Vias are not in the database: they come from the tech LEF's via definitions.
+            DefToken::Word("VIAS") => skip_section(&mut lexer, "VIAS")?,
             DefToken::Word("NETS") => {
+                let declared = section_count(&mut lexer, "NETS")?;
                 let mut net_pins_list: Vec<Vec<PinId>> = Vec::new();
                 let mut net_names_vec: Vec<String> = Vec::new();
 
                 loop {
-                    let t = lexer.next_token();
-                    if t == DefToken::Eof {
-                        break;
-                    }
-                    if let DefToken::Word("END") = t {
-                        let _sec = lexer.next_token();
-                        break;
-                    }
-                    if let DefToken::Word("-") = t {
-                        let net_token = match lexer.next_token() {
-                            DefToken::Word(w) => unescape_def_name(w),
-                            _ => continue,
-                        };
+                    match lexer.next_token() {
+                        DefToken::Word("-") => {
+                            let net_name = match lexer.next_token() {
+                                DefToken::Word(w) => unescape_def_name(w),
+                                other => bail!(
+                                    "DEF line {}: expected a net name after `-`, found {other:?}",
+                                    lexer.line()
+                                ),
+                            };
+                            let net_id = NetId(net_names_vec.len() as u32);
+                            net_names_vec.push(net_name.clone());
+                            let mut current_pins: Vec<PinId> = Vec::new();
 
-                        let net_id = NetId(net_names_vec.len() as u32);
-                        net_names_vec.push(net_token);
-                        let mut current_pins: Vec<PinId> = Vec::new();
-
-                        // Parse connection pairs `( ... )` until `;`
-                        loop {
-                            let nt = lexer.next_token();
-                            if nt == DefToken::Semi || nt == DefToken::Eof {
-                                break;
-                            }
-                            if nt == DefToken::LParen {
-                                let mut conn_words = Vec::new();
-                                loop {
-                                    let ct = lexer.next_token();
-                                    if ct == DefToken::RParen || ct == DefToken::Eof {
-                                        break;
+                            // Connections `( comp pin )` come first; then `+` attributes and routed
+                            // wiring follow. Those are not modeled, so they are skipped.
+                            let mut in_attributes = false;
+                            loop {
+                                match lexer.next_token() {
+                                    DefToken::Semi => break,
+                                    DefToken::Word("+") => in_attributes = true,
+                                    DefToken::Word(_) if in_attributes => {}
+                                    DefToken::LParen if in_attributes => {
+                                        read_group(&mut lexer)?;
                                     }
-                                    if let DefToken::Word(w) = ct {
-                                        conn_words.push(w);
-                                    }
-                                }
-
-                                if conn_words.len() >= 2 {
-                                    if conn_words[0] == "PIN" {
-                                        let pname = unescape_def_name(conn_words[1]);
-                                        if let Some(&pid) = io_pin_name_to_id.get(&pname) {
+                                    DefToken::LParen => {
+                                        let group = read_group(&mut lexer)?;
+                                        let line = lexer.line();
+                                        let [comp, pin] = group.as_slice() else {
+                                            bail!("DEF line {line}: connection of net {net_name} must be `( component pin )`");
+                                        };
+                                        if *comp == "PIN" {
+                                            let pname = unescape_def_name(pin);
+                                            let &pid = io_pin_name_to_id.get(&pname).with_context(|| {
+                                                format!("DEF line {line}: net {net_name} connects to PIN {pname}, which PINS does not define")
+                                            })?;
+                                            current_pins.push(pid);
+                                            db.pin_nets[pid.0 as usize] = Some(net_id);
+                                        } else {
+                                            let iname = unescape_def_name(comp);
+                                            let &cid = cell_name_to_id.get(&iname).with_context(|| {
+                                                format!("DEF line {line}: net {net_name} connects to component {iname}, which COMPONENTS does not define")
+                                            })?;
+                                            let pid = db
+                                                .cell_pins(cid)
+                                                .iter()
+                                                .copied()
+                                                .find(|&pid| db.strings.resolve(db.pin_names[pid.0 as usize]) == *pin)
+                                                .with_context(|| {
+                                                    format!("DEF line {line}: net {net_name} connects to {iname}/{pin}, which the macro does not have")
+                                                })?;
                                             current_pins.push(pid);
                                             db.pin_nets[pid.0 as usize] = Some(net_id);
                                         }
-                                    } else {
-                                        let iname = unescape_def_name(conn_words[0]);
-                                        let mpin_name = conn_words[1];
-
-                                        if let Some(&cid) = cell_name_to_id.get(&iname) {
-                                            let cell_pins = db.cell_pins(cid);
-                                            for &pid in cell_pins {
-                                                let pname = db.strings.resolve(db.pin_names[pid.0 as usize]);
-                                                if pname == mpin_name {
-                                                    current_pins.push(pid);
-                                                    db.pin_nets[pid.0 as usize] = Some(net_id);
-                                                    break;
-                                                }
-                                            }
-                                        }
                                     }
+                                    other => bail!(
+                                        "DEF line {}: unexpected {other:?} in net {net_name}; connections must be `( component pin )`",
+                                        lexer.line()
+                                    ),
                                 }
                             }
-                        }
 
-                        net_pins_list.push(current_pins);
+                            net_pins_list.push(current_pins);
+                        }
+                        DefToken::Word("END") => {
+                            end_section(&mut lexer, "NETS")?;
+                            break;
+                        }
+                        DefToken::Eof => bail!("DEF: NETS is not terminated by `END NETS` (truncated file?)"),
+                        other => bail!(
+                            "DEF line {}: unexpected {other:?} in NETS; records start with `-`",
+                            lexer.line()
+                        ),
                     }
+                }
+                if declared != net_names_vec.len() {
+                    bail!(
+                        "DEF line {}: NETS header declares {declared} nets but {} were read (truncated or edited file?)",
+                        lexer.line(),
+                        net_names_vec.len()
+                    );
                 }
 
                 // Build Net SoA & CSR
@@ -742,10 +769,16 @@ pub fn parse_def_bytes(
                 }
                 db.net_pin_offsets.push(db.net_pin_ids.len() as u32);
             }
-            _ => {}
+            DefToken::Word(keyword) => {
+                bail!("DEF line {}: unknown section or statement `{keyword}`", lexer.line())
+            }
+            other => bail!("DEF line {}: unexpected {other:?} at top level", lexer.line()),
         }
     }
 
+    if !saw_end_design {
+        bail!("DEF: missing `END DESIGN` (truncated file?)");
+    }
     Ok(db)
 }
 
@@ -759,6 +792,7 @@ pub fn parse_def(
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
     parse_def_bytes(&contents, tech_db, lib_db)
+        .with_context(|| format!("Failed to parse DEF file at {:?}", path))
 }
 
 pub fn write_def(
@@ -833,7 +867,7 @@ mod tests {
     use super::*;
     use crate::test_support::{design_dir, require, sky130_hd};
     use crate::interner::StringInterner;
-    use crate::readers::lef::load_tech_db;
+    use crate::readers::lef::{load_tech_db, parse_lef_bytes};
 
     #[test]
     fn test_gcd_placed_def() {
@@ -1182,5 +1216,170 @@ mod tests {
         let ref_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(require(ibex_dir.join("ibex.reference.json"))).unwrap()).unwrap();
         assert_eq!(db.compute_hpwl_dbu(&tech_db), ref_json["orient_hpwl_dbu"].as_i64().unwrap());
+    }
+
+    const MINI_LEF: &str = r#"
+VERSION 5.8 ;
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  OFFSET 0.17 ;
+  WIDTH 0.14 ;
+END met1
+MACRO INV
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+  PIN A
+    DIRECTION INPUT ;
+    PORT
+      LAYER met1 ;
+        RECT 0.10 0.10 0.20 0.20 ;
+    END
+  END A
+  PIN Y
+    DIRECTION OUTPUT ;
+    PORT
+      LAYER met1 ;
+        RECT 0.30 0.10 0.40 0.20 ;
+    END
+  END Y
+END INV
+END LIBRARY
+"#;
+
+    const MINI_DEF: &str = "\
+VERSION 5.8 ;
+DIVIDERCHAR \"/\" ;
+BUSBITCHARS \"[]\" ;
+DESIGN top ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 4600 2720 ) ;
+ROW ROW_0 unithd 0 0 N DO 10 BY 1 STEP 460 2720 ;
+TRACKS X 170 DO 100 STEP 340 LAYER met1 ;
+COMPONENTS 1 ;
+- u1 INV + PLACED ( 460 0 ) N ;
+END COMPONENTS
+PINS 1 ;
+- clk + NET clk + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 0 ) N ;
+END PINS
+NETS 1 ;
+- n1 ( PIN clk ) ( u1 A ) + USE SIGNAL ;
+END NETS
+END DESIGN
+";
+
+    fn mini_tech() -> TechDb {
+        let mut interner = StringInterner::new();
+        let mut tech_db = TechDb::new();
+        parse_lef_bytes(MINI_LEF.as_bytes(), &mut tech_db, &mut interner)
+            .expect("mini LEF must parse");
+        tech_db.strings = interner.clone();
+        tech_db.rebuild_maps();
+        tech_db
+    }
+
+    /// Error text for a DEF that must be rejected.
+    fn mini_def_error(def: &str) -> String {
+        match parse_def_bytes(def.as_bytes(), &mini_tech(), None) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("malformed DEF was accepted:\n{def}"),
+        }
+    }
+
+    #[test]
+    fn test_mini_def_parses_every_section() {
+        let db = parse_def_bytes(MINI_DEF.as_bytes(), &mini_tech(), None).expect("mini DEF must parse");
+        assert_eq!(db.design_name, "top");
+        assert_eq!(db.die_area, RectDbu::new(0, 0, 4600, 2720));
+        assert_eq!(db.num_rows(), 1);
+        assert_eq!(db.tracks.len(), 1);
+        assert_eq!(db.tracks[0].layers.len(), 1);
+        assert_eq!(db.num_cells(), 1);
+        assert_eq!(db.cell_x_dbu[0], 460);
+        assert_eq!(db.io_pins.len(), 1);
+        assert_eq!(db.num_nets(), 1);
+        assert_eq!(db.net_pin_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_bad_number_in_placed_component_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("PLACED ( 460 0 )", "PLACED ( 4x6 0 )"));
+        assert!(msg.contains("4x6") && msg.contains("line 10"), "{msg}");
+    }
+
+    #[test]
+    fn test_bad_number_in_die_area_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( 4600 2720 )", "( 4600 2o72 )"));
+        assert!(msg.contains("2o72"), "{msg}");
+    }
+
+    #[test]
+    fn test_truncated_row_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("ROW ROW_0 unithd 0 0 N DO 10 BY 1 STEP 460 2720 ;", "ROW ROW_0 unithd 0 0 N ;"));
+        assert!(msg.contains("ROW must be"), "{msg}");
+    }
+
+    #[test]
+    fn test_unknown_section_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("DESIGN top ;", "DESIGN top ;\nFOO 1 ;"));
+        assert!(msg.contains("FOO"), "{msg}");
+    }
+
+    #[test]
+    fn test_unknown_component_attribute_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("+ PLACED ( 460 0 ) N ;", "+ PLACED ( 460 0 ) N + BOGUS 1 ;"));
+        assert!(msg.contains("BOGUS"), "{msg}");
+    }
+
+    #[test]
+    fn test_missing_end_design_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("END DESIGN\n", ""));
+        assert!(msg.contains("END DESIGN"), "{msg}");
+    }
+
+    #[test]
+    fn test_component_count_mismatch_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("COMPONENTS 1 ;", "COMPONENTS 2 ;"));
+        assert!(msg.contains("COMPONENTS header declares 2"), "{msg}");
+    }
+
+    #[test]
+    fn test_unknown_macro_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("- u1 INV", "- u1 NAND9"));
+        assert!(msg.contains("NAND9"), "{msg}");
+    }
+
+    #[test]
+    fn test_net_to_unknown_component_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u9 A )"));
+        assert!(msg.contains("u9"), "{msg}");
+    }
+
+    #[test]
+    fn test_net_to_unknown_macro_pin_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 Q )"));
+        assert!(msg.contains("u1/Q"), "{msg}");
+    }
+
+    /// Every truncation of the mini DEF must return `Ok` or `Err` without panicking, and only the
+    /// full document (through `END DESIGN`) may parse, because the trailer is required.
+    #[test]
+    fn test_every_truncation_of_mini_def_is_rejected_or_parsed_without_panic() {
+        let tech = mini_tech();
+        let trailer_end = MINI_DEF.find("END DESIGN").expect("fixture has END DESIGN") + "END DESIGN".len();
+        for n in 0..=MINI_DEF.len() {
+            let result = parse_def_bytes(&MINI_DEF.as_bytes()[..n], &tech, None);
+            if n < trailer_end {
+                assert!(result.is_err(), "prefix of {n} bytes was accepted");
+            }
+        }
     }
 }

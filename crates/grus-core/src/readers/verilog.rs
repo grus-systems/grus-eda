@@ -13,6 +13,9 @@ pub(crate) enum VerilogToken {
     Ident(String),
     Int(i64),
     Const(bool), // 1'b0 (false) or 1'b1 (true)
+    /// A literal this reader does not model (wider constants, x/z, bad digits). Reported where a
+    /// net is expected instead of being read as a net or as zero.
+    Unsupported(String),
     LParen,
     RParen,
     LBracket,
@@ -64,6 +67,26 @@ impl<'a> VerilogLexer<'a> {
                 }
             }
             break;
+        }
+    }
+
+    /// The part of a based literal after its apostrophe: an optional base letter, then the value.
+    /// Only a constant 0 or 1 of one bit is modeled. Anything else is `Unsupported`, because
+    /// reading it as a net or as zero would be silently wrong.
+    fn based_constant(&mut self, start: usize, one_bit: bool) -> VerilogToken {
+        let input = self.input;
+        if self.pos < input.len() && matches!(input[self.pos], b'b' | b'B' | b'd' | b'D' | b'h' | b'H' | b'o' | b'O') {
+            self.pos += 1;
+        }
+        let value_start = self.pos;
+        while self.pos < input.len() && (input[self.pos].is_ascii_alphanumeric() || input[self.pos] == b'_') {
+            self.pos += 1;
+        }
+        let value = &input[value_start..self.pos];
+        if one_bit && (value == b"0" || value == b"1") {
+            VerilogToken::Const(value == b"1")
+        } else {
+            VerilogToken::Unsupported(String::from_utf8_lossy(&input[start..self.pos]).into_owned())
         }
     }
 
@@ -130,49 +153,26 @@ impl<'a> VerilogLexer<'a> {
                 VerilogToken::Ident(s)
             }
             b'\'' => {
-                // Sized or unsized constant like '0, '1, 'b0, 'b1
+                // Unsized constant: '0, '1, 'b0, 'h1, ...
+                let start = self.pos;
                 self.pos += 1;
-                if self.pos < self.input.len() && (self.input[self.pos] == b'b' || self.input[self.pos] == b'B') {
-                    self.pos += 1;
-                }
-                if self.pos < self.input.len() {
-                    let bit = self.input[self.pos];
-                    self.pos += 1;
-                    if bit == b'0' {
-                        VerilogToken::Const(false)
-                    } else if bit == b'1' {
-                        VerilogToken::Const(true)
-                    } else {
-                        VerilogToken::Ident(format!("'{}", bit as char))
-                    }
-                } else {
-                    VerilogToken::Ident("'".to_string())
-                }
+                self.based_constant(start, true)
             }
             b'0'..=b'9' => {
                 let start = self.pos;
                 while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
                     self.pos += 1;
                 }
-                // Check if followed by 'b0 or 'b1
                 if self.pos < self.input.len() && self.input[self.pos] == b'\'' {
+                    let one_bit = &self.input[start..self.pos] == b"1";
                     self.pos += 1;
-                    if self.pos < self.input.len() && (self.input[self.pos] == b'b' || self.input[self.pos] == b'B') {
-                        self.pos += 1;
-                    }
-                    if self.pos < self.input.len() {
-                        let bit = self.input[self.pos];
-                        self.pos += 1;
-                        if bit == b'0' {
-                            return VerilogToken::Const(false);
-                        } else if bit == b'1' {
-                            return VerilogToken::Const(true);
-                        }
-                    }
+                    return self.based_constant(start, one_bit);
                 }
-                let num_str = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("0");
-                let val = num_str.parse::<i64>().unwrap_or(0);
-                VerilogToken::Int(val)
+                let text = String::from_utf8_lossy(&self.input[start..self.pos]).into_owned();
+                match text.parse::<i64>() {
+                    Ok(val) => VerilogToken::Int(val),
+                    Err(_) => VerilogToken::Unsupported(text),
+                }
             }
             _ => {
                 let start = self.pos;
@@ -323,6 +323,7 @@ pub fn parse_verilog_bytes(
                 *tok = lexer.next_token();
                 Ok(Some("__const_1".to_string()))
             }
+            VerilogToken::Unsupported(text) => bail!("unsupported Verilog constant or literal `{text}`"),
             VerilogToken::Ident(name) => {
                 let base = name.clone();
                 *tok = lexer.next_token();
@@ -853,5 +854,81 @@ mod tests {
             }
         }
         println!("ibex verilog: {} of {} nets have a driver", driven_nets, db.num_nets());
+    }
+
+    const INV_LEF: &str = r#"
+VERSION 5.8 ;
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+MACRO INV
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+  PIN A
+    DIRECTION INPUT ;
+    PORT
+      LAYER met1 ;
+        RECT 0.10 0.10 0.20 0.20 ;
+    END
+  END A
+  PIN Y
+    DIRECTION OUTPUT ;
+    PORT
+      LAYER met1 ;
+        RECT 0.30 0.10 0.40 0.20 ;
+    END
+  END Y
+END INV
+END LIBRARY
+"#;
+
+    const TOP_V: &str = "module top (a, y);\n  input a;\n  output y;\n  INV u1 (.A(a), .Y(y));\nendmodule\n";
+
+    fn inv_tech() -> TechDb {
+        let mut interner = StringInterner::new();
+        let mut tech_db = TechDb::new();
+        crate::readers::lef::parse_lef_bytes(INV_LEF.as_bytes(), &mut tech_db, &mut interner)
+            .expect("INV LEF must parse");
+        tech_db.strings = interner.clone();
+        tech_db.rebuild_maps();
+        tech_db
+    }
+
+    fn verilog_error(text: &str) -> String {
+        match parse_verilog_bytes(text.as_bytes(), &inv_tech(), None) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("malformed netlist was accepted:\n{text}"),
+        }
+    }
+
+    #[test]
+    fn test_one_bit_constant_connection_is_read() {
+        let text = TOP_V.replace(".A(a)", ".A(1'h0)");
+        let db = parse_verilog_bytes(text.as_bytes(), &inv_tech(), None).expect("1'h0 is a valid constant");
+        assert_eq!(db.num_cells(), 1);
+    }
+
+    #[test]
+    fn test_wide_constant_connection_is_an_error() {
+        let msg = verilog_error(&TOP_V.replace(".A(a)", ".A(4'hF)"));
+        assert!(msg.contains("unsupported Verilog constant or literal `4'hF`"), "{msg}");
+    }
+
+    #[test]
+    fn test_unknown_base_constant_connection_is_an_error() {
+        let msg = verilog_error(&TOP_V.replace(".A(a)", ".A(1'bx)"));
+        assert!(msg.contains("1'bx"), "{msg}");
+    }
+
+    #[test]
+    fn test_every_truncation_of_netlist_is_rejected_or_parsed_without_panic() {
+        let tech = inv_tech();
+        for n in 0..=TOP_V.len() {
+            let _ = parse_verilog_bytes(&TOP_V.as_bytes()[..n], &tech, None);
+        }
     }
 }

@@ -72,15 +72,18 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
         let Some(&first) = tokens.first() else { continue };
         let at = || format!("SPEF line {}", line_no + 1);
         match first {
-            "*C_UNIT" if tokens.len() >= 3 => {
+            "*C_UNIT" | "*R_UNIT" | "*T_UNIT" if tokens.len() < 3 => {
+                bail!("{}: `{first}` needs a value and a unit", at());
+            }
+            "*C_UNIT" => {
                 c_scale = unit_scale(tokens[1], tokens[2], &[("PF", 1.0), ("FF", 1e-3), ("NF", 1e3)])
                     .with_context(at)?;
             }
-            "*R_UNIT" if tokens.len() >= 3 => {
+            "*R_UNIT" => {
                 r_scale = unit_scale(tokens[1], tokens[2], &[("KOHM", 1.0), ("OHM", 1e-3), ("MOHM", 1e3)])
                     .with_context(at)?;
             }
-            "*T_UNIT" if tokens.len() >= 3 => {
+            "*T_UNIT" => {
                 // R [kohm] * C [pF] is in ns, so only a ns time unit is consistent with the model.
                 let scale = unit_scale(tokens[1], tokens[2], &[("NS", 1.0), ("PS", 1e-3)]).with_context(at)?;
                 if (scale - 1.0).abs() > 1e-6 {
@@ -109,7 +112,10 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
                 }
                 section = Section::None;
             }
-            _ if in_name_map && first.starts_with('*') && tokens.len() >= 2 => {
+            _ if in_name_map && first.starts_with('*') => {
+                if tokens.len() < 2 {
+                    bail!("{}: NAME_MAP entry `{first}` has no name", at());
+                }
                 name_map.insert(first.to_string(), unescape_spef_name(tokens[1]));
             }
             _ => {
@@ -121,6 +127,7 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
                     Section::Cap if tokens.len() == 4 => {
                         net.caps.push((resolve(tokens[1], &name_map), tokens[3].parse::<f32>().with_context(at)? * c_scale));
                     }
+                    Section::Cap => bail!("{}: *CAP entry must have 3 or 4 fields", at()),
                     Section::Res if tokens.len() == 4 => {
                         net.resistors.push((
                             resolve(tokens[1], &name_map),
@@ -128,10 +135,16 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
                             tokens[3].parse::<f32>().with_context(at)? * r_scale,
                         ));
                     }
-                    _ => {}
+                    Section::Res => bail!("{}: *RES entry must have 4 fields", at()),
+                    // *CONN entries are not modeled, and lines outside any section carry header
+                    // fields (*SPEF, *DESIGN, *DATE, ...) that the database does not use.
+                    Section::Conn | Section::None => {}
                 }
             }
         }
+    }
+    if current.is_some() {
+        bail!("SPEF: *D_NET without *END (truncated file?)");
     }
     Ok(spef)
 }
@@ -182,5 +195,50 @@ mod tests {
         let path = require(design_dir("ibex").join("ibex.routed.spef"));
         let spef = load_spef(&path).expect("ibex.routed.spef must parse");
         assert!(!spef.nets.is_empty(), "ibex.routed.spef has no nets");
+    }
+
+    #[test]
+    fn rejects_a_unit_line_without_its_unit() {
+        assert!(parse_spef("*C_UNIT 1\n").is_err());
+    }
+
+    #[test]
+    fn rejects_a_cap_entry_with_a_missing_value() {
+        let text = SAMPLE.replace("2 *1:1 *1:2 1\n", "2 *1:1 *1:2\n");
+        let msg = format!("{:#}", parse_spef(&text).unwrap_err());
+        assert!(msg.contains("SPEF line 13"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_a_res_entry_with_a_missing_value() {
+        let text = SAMPLE.replace("1 *1:1 *2:A 100\n", "1 *1:1 *2:A\n");
+        assert!(parse_spef(&text).is_err());
+    }
+
+    #[test]
+    fn rejects_a_net_without_end() {
+        let text = SAMPLE.replace("*END\n", "");
+        let msg = format!("{:#}", parse_spef(&text).unwrap_err());
+        assert!(msg.contains("without *END"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_a_name_map_entry_without_a_name() {
+        let text = SAMPLE.replace("*2 u1\n", "*2\n");
+        assert!(parse_spef(&text).is_err());
+    }
+
+    /// Every truncation from the first `*D_NET` through its `*END` must be rejected, and no
+    /// truncation may panic.
+    #[test]
+    fn test_every_truncation_of_sample_is_rejected_or_parsed_without_panic() {
+        let net_start = SAMPLE.find("*D_NET").expect("fixture has a net");
+        let end = SAMPLE.find("*END").expect("fixture has *END") + "*END".len();
+        for n in 0..=SAMPLE.len() {
+            let result = parse_spef(&SAMPLE[..n]);
+            if n >= net_start + "*D_NET".len() && n < end {
+                assert!(result.is_err(), "truncation at {n} bytes was accepted");
+            }
+        }
     }
 }

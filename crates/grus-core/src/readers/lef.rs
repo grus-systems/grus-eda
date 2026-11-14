@@ -1,6 +1,6 @@
 use crate::interner::{LayerId, MacroId, PinDir, StringInterner};
 use crate::tech_db::{LayerDir, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer, TechDb};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::path::Path;
 
@@ -12,34 +12,46 @@ pub(crate) enum Token<'a> {
 }
 
 pub(crate) struct LefLexer<'a> {
-    input: &'a [u8],
+    input: &'a str,
     pos: usize,
+    line: usize,
 }
 
 impl<'a> LefLexer<'a> {
-    pub fn new(input: &'a [u8]) -> Self {
-        Self { input, pos: 0 }
+    pub fn new(input: &'a str) -> Self {
+        Self { input, pos: 0, line: 1 }
+    }
+
+    /// One-based line of the read position, for error messages. Counted incrementally:
+    /// rescanning the prefix on every call made large LEFs quadratic.
+    pub fn line(&self) -> usize {
+        self.line
     }
 
     pub fn peek_token(&self) -> Option<Token<'a>> {
         let mut cloned = Self {
             input: self.input,
             pos: self.pos,
+            line: self.line,
         };
         cloned.next_token()
     }
 
     pub(crate) fn next_token(&mut self) -> Option<Token<'a>> {
-        let len = self.input.len();
+        let bytes = self.input.as_bytes();
+        let len = bytes.len();
         while self.pos < len {
-            let b = self.input[self.pos];
+            let b = bytes[self.pos];
             if b.is_ascii_whitespace() {
+                if b == b'\n' {
+                    self.line += 1;
+                }
                 self.pos += 1;
                 continue;
             }
             if b == b'#' {
                 self.pos += 1;
-                while self.pos < len && self.input[self.pos] != b'\n' {
+                while self.pos < len && bytes[self.pos] != b'\n' {
                     self.pos += 1;
                 }
                 continue;
@@ -51,11 +63,15 @@ impl<'a> LefLexer<'a> {
             if b == b'"' {
                 self.pos += 1;
                 let start = self.pos;
-                while self.pos < len && self.input[self.pos] != b'"' {
+                while self.pos < len && bytes[self.pos] != b'"' {
+                    if bytes[self.pos] == b'\n' {
+                        self.line += 1;
+                    }
                     self.pos += 1;
                 }
-                let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("");
-                if self.pos < len && self.input[self.pos] == b'"' {
+                // Quotes and the delimiters below are ASCII, so the slice is on char boundaries.
+                let s = &self.input[start..self.pos];
+                if self.pos < len && bytes[self.pos] == b'"' {
                     self.pos += 1;
                 }
                 return Some(Token::Str(s));
@@ -64,14 +80,13 @@ impl<'a> LefLexer<'a> {
             // Word or number up to whitespace, comment, or semicolon
             let start = self.pos;
             while self.pos < len {
-                let curr = self.input[self.pos];
+                let curr = bytes[self.pos];
                 if curr.is_ascii_whitespace() || curr == b';' || curr == b'#' {
                     break;
                 }
                 self.pos += 1;
             }
-            let word = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("");
-            return Some(Token::Word(word));
+            return Some(Token::Word(&self.input[start..self.pos]));
         }
         None
     }
@@ -90,28 +105,56 @@ impl<'a> LefLexer<'a> {
             _ => None,
         }
     }
+}
 
-    pub fn next_f32(&mut self) -> Option<f32> {
-        self.next_word().and_then(|w| w.parse::<f32>().ok())
-    }
-
-    pub fn next_i32(&mut self) -> Option<i32> {
-        self.next_word().and_then(|w| w.parse::<i32>().ok())
+/// The next word, which the construct cannot do without.
+fn required_word<'a>(lexer: &mut LefLexer<'a>, construct: &str) -> Result<&'a str> {
+    match lexer.next_token() {
+        Some(Token::Word(w) | Token::Str(w)) => Ok(w),
+        other => bail!("LEF line {}: {construct} is missing its value (found {other:?})", lexer.line()),
     }
 }
 
-fn consume_end(lexer: &mut LefLexer, expected_name: Option<&str>) {
-    if let Some(exp) = expected_name
-        && let Some(Token::Word(w)) = lexer.peek_token()
-            && w.eq_ignore_ascii_case(exp) {
-                let _ = lexer.next_token();
-            }
+fn required_f32(lexer: &mut LefLexer, construct: &str) -> Result<f32> {
+    let w = required_word(lexer, construct)?;
+    w.parse::<f32>()
+        .with_context(|| format!("LEF line {}: {construct} value `{w}` is not a number", lexer.line()))
+}
+
+fn required_i32(lexer: &mut LefLexer, construct: &str) -> Result<i32> {
+    let w = required_word(lexer, construct)?;
+    w.parse::<i32>()
+        .with_context(|| format!("LEF line {}: {construct} value `{w}` is not an integer", lexer.line()))
+}
+
+/// `w BY h` after a `SIZE` keyword; both numbers are required by the LEF grammar.
+fn parse_size(lexer: &mut LefLexer, construct: &str) -> Result<(f32, f32)> {
+    let w = required_f32(lexer, &format!("{construct} SIZE width"))?;
+    let by = required_word(lexer, &format!("{construct} SIZE"))?;
+    if !by.eq_ignore_ascii_case("BY") {
+        bail!("LEF line {}: {construct} SIZE expects BY, found `{by}`", lexer.line());
+    }
+    let h = required_f32(lexer, &format!("{construct} SIZE height"))?;
+    Ok((w, h))
+}
+
+/// Consumes the `END` that was just read. A named block must be closed by its own name; an
+/// optional `;` after it is consumed.
+fn end_block(lexer: &mut LefLexer, block: &str, name: Option<&str>) -> Result<()> {
+    if let Some(exp) = name {
+        match lexer.next_token() {
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case(exp) => {}
+            other => bail!("LEF line {}: expected `END {exp}` closing {block}, found {other:?}", lexer.line()),
+        }
+    }
     if let Some(Token::Semi) = lexer.peek_token() {
         let _ = lexer.next_token();
     }
+    Ok(())
 }
 
-fn skip_block(lexer: &mut LefLexer, block_name: &str) {
+/// Skips a block whose contents are not modeled, through its `END <block_name>`.
+fn skip_block(lexer: &mut LefLexer, block_name: &str) -> Result<()> {
     while let Some(tok) = lexer.next_token() {
         if let Token::Word(w) = tok
             && w.eq_ignore_ascii_case("END")
@@ -121,9 +164,10 @@ fn skip_block(lexer: &mut LefLexer, block_name: &str) {
                         if let Some(Token::Semi) = lexer.peek_token() {
                             let _ = lexer.next_token();
                         }
-                        break;
+                        return Ok(());
                     }
     }
+    bail!("LEF: {block_name} block is not terminated by END {block_name} (truncated file?)")
 }
 
 /// Parses a Technology LEF (.tlef) or Macro LEF (.lef) file bytes into `TechDb`.
@@ -136,8 +180,12 @@ pub fn parse_lef_bytes(
         tech_db.dbu_per_micron = 1000;
     }
 
-    let mut lexer = LefLexer::new(bytes);
+    let text = std::str::from_utf8(bytes).context("LEF is not valid UTF-8")?;
+    let mut lexer = LefLexer::new(text);
 
+    // Top-level statements we do not model (VERSION, BUSBITCHARS, DIVIDERCHAR, MANUFACTURINGGRID,
+    // NAMESCASESENSITIVE, ...) fall through to the `skip_to_semi` at the end of the chain. The
+    // top-level keyword set is open-ended in LEF, so unknown ones are skipped, not rejected.
     while let Some(tok) = lexer.next_token() {
         let word = match tok {
             Token::Word(w) => w,
@@ -153,15 +201,15 @@ pub fn parse_lef_bytes(
         } else if word.eq_ignore_ascii_case("MACRO") {
             parse_macro(&mut lexer, tech_db, interner)?;
         } else if word.eq_ignore_ascii_case("PROPERTYDEFINITIONS") {
-            skip_block(&mut lexer, "PROPERTYDEFINITIONS");
+            skip_block(&mut lexer, "PROPERTYDEFINITIONS")?;
         } else if word.eq_ignore_ascii_case("VIA")
             || word.eq_ignore_ascii_case("VIARULE")
             || word.eq_ignore_ascii_case("NONDEFAULTRULE")
         {
-            let name = lexer.next_word().unwrap_or("").to_string();
-            skip_block(&mut lexer, &name);
+            let name = required_word(&mut lexer, word)?.to_string();
+            skip_block(&mut lexer, &name)?;
         } else if word.eq_ignore_ascii_case("SPACING") {
-            skip_block(&mut lexer, "SPACING");
+            skip_block(&mut lexer, "SPACING")?;
         } else if word.eq_ignore_ascii_case("END") {
             let _ = lexer.next_word();
             if let Some(Token::Semi) = lexer.peek_token() {
@@ -179,33 +227,32 @@ fn parse_units(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
     while let Some(tok) = lexer.next_token() {
         if let Token::Word(w) = tok {
             if w.eq_ignore_ascii_case("END") {
-                consume_end(lexer, Some("UNITS"));
-                break;
+                end_block(lexer, "UNITS", Some("UNITS"))?;
+                return Ok(());
             } else if w.eq_ignore_ascii_case("DATABASE") {
-                if let Some(sub) = lexer.next_word()
-                    && sub.eq_ignore_ascii_case("MICRONS")
-                        && let Some(val) = lexer.next_i32() {
-                            tech_db.dbu_per_micron = val;
-                        }
+                if required_word(lexer, "UNITS DATABASE")?.eq_ignore_ascii_case("MICRONS") {
+                    tech_db.dbu_per_micron = required_i32(lexer, "UNITS DATABASE MICRONS")?;
+                }
                 lexer.skip_to_semi();
             } else {
                 lexer.skip_to_semi();
             }
         }
     }
-    Ok(())
+    bail!("LEF: UNITS is not terminated by END UNITS (truncated file?)")
 }
 
 fn parse_site(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
-    let site_id = lexer.next_word().unwrap_or("").to_string();
+    let site_id = required_word(lexer, "SITE name")?.to_string();
     let mut is_core = false;
-    let mut w_um = 0.0f32;
-    let mut h_um = 0.0f32;
+    let mut size_um = None;
+    let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
         if let Token::Word(w) = tok {
             if w.eq_ignore_ascii_case("END") {
-                consume_end(lexer, Some(&site_id));
+                end_block(lexer, "SITE", Some(&site_id))?;
+                closed = true;
                 break;
             } else if w.eq_ignore_ascii_case("CLASS") {
                 if let Some(c) = lexer.next_word()
@@ -214,15 +261,19 @@ fn parse_site(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
                     }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("SIZE") {
-                w_um = lexer.next_f32().unwrap_or(0.0);
-                let _ = lexer.next_word(); // BY
-                h_um = lexer.next_f32().unwrap_or(0.0);
+                size_um = Some(parse_size(lexer, &format!("SITE {site_id}"))?);
                 lexer.skip_to_semi();
             } else {
                 lexer.skip_to_semi();
             }
         }
     }
+    if !closed {
+        bail!("LEF: SITE {site_id} is not terminated by END {site_id} (truncated file?)");
+    }
+    let Some((w_um, h_um)) = size_um else {
+        bail!("LEF: SITE {site_id} has no SIZE");
+    };
 
     let dbu = tech_db.dbu_per_micron as f32;
     if is_core && (tech_db.site_name.is_empty() || site_id.eq_ignore_ascii_case("unithd")) {
@@ -239,22 +290,24 @@ fn parse_layer(
     tech_db: &mut TechDb,
     interner: &mut StringInterner,
 ) -> Result<()> {
-    let layer_name = lexer.next_word().unwrap_or("").to_string();
+    let layer_name = required_word(lexer, "LAYER name")?.to_string();
     let mut is_routing = false;
     let mut dir = LayerDir::Horizontal;
     let mut pitch_x_um = None;
     let mut pitch_y_um = None;
     let mut offset_x_um = None;
     let mut offset_y_um = None;
-    let mut width_um = 0.0f32;
+    let mut width_um = None;
     let mut res_per_sq = 0.0f32;
     let mut cap_per_sq_um = 0.0f32;
     let mut edge_cap_per_um = 0.0f32;
+    let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
         if let Token::Word(w) = tok {
             if w.eq_ignore_ascii_case("END") {
-                consume_end(lexer, Some(&layer_name));
+                end_block(lexer, "LAYER", Some(&layer_name))?;
+                closed = true;
                 break;
             } else if w.eq_ignore_ascii_case("TYPE") {
                 if let Some(t) = lexer.next_word()
@@ -272,59 +325,65 @@ fn parse_layer(
                 }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("PITCH") {
-                if let Some(p1) = lexer.next_f32() {
-                    pitch_x_um = Some(p1);
-                    if let Some(Token::Word(p2_str)) = lexer.peek_token()
-                        && let Ok(p2) = p2_str.parse::<f32>() {
-                            let _ = lexer.next_token();
-                            pitch_y_um = Some(p2);
-                        }
-                }
+                pitch_x_um = Some(required_f32(lexer, "LAYER PITCH")?);
+                // The second value (y pitch) is optional.
+                if let Some(Token::Word(p2_str)) = lexer.peek_token()
+                    && let Ok(p2) = p2_str.parse::<f32>() {
+                        let _ = lexer.next_token();
+                        pitch_y_um = Some(p2);
+                    }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("OFFSET") {
-                if let Some(o1) = lexer.next_f32() {
-                    offset_x_um = Some(o1);
-                    if let Some(Token::Word(o2_str)) = lexer.peek_token()
-                        && let Ok(o2) = o2_str.parse::<f32>() {
-                            let _ = lexer.next_token();
-                            offset_y_um = Some(o2);
-                        }
-                }
+                offset_x_um = Some(required_f32(lexer, "LAYER OFFSET")?);
+                // The second value (y offset) is optional.
+                if let Some(Token::Word(o2_str)) = lexer.peek_token()
+                    && let Ok(o2) = o2_str.parse::<f32>() {
+                        let _ = lexer.next_token();
+                        offset_y_um = Some(o2);
+                    }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("WIDTH") {
-                width_um = lexer.next_f32().unwrap_or(0.0);
+                width_um = Some(required_f32(lexer, "LAYER WIDTH")?);
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("RESISTANCE") {
                 if let Some(r_kw) = lexer.next_word()
                     && r_kw.eq_ignore_ascii_case("RPERSQ") {
-                        res_per_sq = lexer.next_f32().unwrap_or(0.0);
+                        res_per_sq = required_f32(lexer, "LAYER RESISTANCE RPERSQ")?;
                     }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("CAPACITANCE") {
                 if let Some(c_kw) = lexer.next_word()
                     && c_kw.eq_ignore_ascii_case("CPERSQDIST") {
-                        cap_per_sq_um = lexer.next_f32().unwrap_or(0.0);
+                        cap_per_sq_um = required_f32(lexer, "LAYER CAPACITANCE CPERSQDIST")?;
                     }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("EDGECAPACITANCE") {
-                edge_cap_per_um = lexer.next_f32().unwrap_or(0.0);
+                edge_cap_per_um = required_f32(lexer, "LAYER EDGECAPACITANCE")?;
                 lexer.skip_to_semi();
             } else {
                 lexer.skip_to_semi();
             }
         }
     }
+    if !closed {
+        bail!("LEF: LAYER {layer_name} is not terminated by END {layer_name} (truncated file?)");
+    }
 
     if is_routing {
         let dbu = tech_db.dbu_per_micron as f32;
+        let width_um = width_um
+            .with_context(|| format!("LEF: routing layer {layer_name} has no WIDTH"))?;
         let pitch_um = match dir {
-            LayerDir::Vertical => pitch_x_um.or(pitch_y_um).unwrap_or(0.0),
-            LayerDir::Horizontal => pitch_y_um.or(pitch_x_um).unwrap_or(0.0),
-        };
+            LayerDir::Vertical => pitch_x_um.or(pitch_y_um),
+            LayerDir::Horizontal => pitch_y_um.or(pitch_x_um),
+        }
+        .with_context(|| format!("LEF: routing layer {layer_name} has no PITCH"))?;
+        // OFFSET is optional; an absent OFFSET is the LEF default of 0.
         let offset_um = match dir {
-            LayerDir::Vertical => offset_x_um.or(offset_y_um).unwrap_or(0.0),
-            LayerDir::Horizontal => offset_y_um.or(offset_x_um).unwrap_or(0.0),
-        };
+            LayerDir::Vertical => offset_x_um.or(offset_y_um),
+            LayerDir::Horizontal => offset_y_um.or(offset_x_um),
+        }
+        .unwrap_or(0.0);
 
         let pitch_dbu = (pitch_um * dbu).round() as i32;
         let offset_dbu = (offset_um * dbu).round() as i32;
@@ -354,20 +413,21 @@ fn parse_macro(
     tech_db: &mut TechDb,
     interner: &mut StringInterner,
 ) -> Result<()> {
-    let macro_name = lexer.next_word().unwrap_or("").to_string();
+    let macro_name = required_word(lexer, "MACRO name")?.to_string();
     let mac_sym = interner.intern(&macro_name);
     let pin_offset = tech_db.macro_pins.len() as u32;
 
     let mut class = MacroClass::Core;
-    let mut width_dbu = 0;
-    let mut height_dbu = 0;
+    let mut size_dbu = None;
     let mut obs_rects = Vec::new();
     let dbu = tech_db.dbu_per_micron as f32;
+    let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
         if let Token::Word(w) = tok {
             if w.eq_ignore_ascii_case("END") {
-                consume_end(lexer, Some(&macro_name));
+                end_block(lexer, "MACRO", Some(&macro_name))?;
+                closed = true;
                 break;
             } else if w.eq_ignore_ascii_case("CLASS") {
                 let mut c1 = String::new();
@@ -382,17 +442,19 @@ fn parse_macro(
                                 c2 = arg.to_string();
                             }
                         }
-                        _ => {}
+                        // Quoted or otherwise unexpected tokens in CLASS are ignored: the class
+                        // name is only the first one or two words.
+                        Token::Str(_) => {}
                     }
                 }
                 class = parse_macro_class(&c1, &c2);
             } else if w.eq_ignore_ascii_case("SIZE") {
-                let w_um = lexer.next_f32().unwrap_or(0.0);
-                let _ = lexer.next_word(); // BY
-                let h_um = lexer.next_f32().unwrap_or(0.0);
-                width_dbu = (w_um * dbu).round() as i32;
-                height_dbu = (h_um * dbu).round() as i32;
+                let (w_um, h_um) = parse_size(lexer, &format!("MACRO {macro_name}"))?;
                 lexer.skip_to_semi();
+                size_dbu = Some((
+                    (w_um * dbu).round() as i32,
+                    (h_um * dbu).round() as i32,
+                ));
             } else if w.eq_ignore_ascii_case("PIN") {
                 parse_pin(lexer, tech_db, interner)?;
             } else if w.eq_ignore_ascii_case("OBS") {
@@ -402,6 +464,12 @@ fn parse_macro(
             }
         }
     }
+    if !closed {
+        bail!("LEF: MACRO {macro_name} is not terminated by END {macro_name} (truncated file?)");
+    }
+    let Some((width_dbu, height_dbu)) = size_dbu else {
+        bail!("LEF: MACRO {macro_name} has no SIZE");
+    };
 
     merge_connected_obs(&mut obs_rects);
 
@@ -489,7 +557,7 @@ fn parse_pin(
     tech_db: &mut TechDb,
     interner: &mut StringInterner,
 ) -> Result<()> {
-    let pin_name = lexer.next_word().unwrap_or("").to_string();
+    let pin_name = required_word(lexer, "PIN name")?.to_string();
     let pin_sym = interner.intern(&pin_name);
     let mut dir = PinDir::Input;
     let mut is_power = false;
@@ -499,11 +567,13 @@ fn parse_pin(
     let mut sum_twice_center_y: i64 = 0;
     let mut rect_count: i64 = 0;
     let dbu = tech_db.dbu_per_micron as f32;
+    let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
         if let Token::Word(w) = tok {
             if w.eq_ignore_ascii_case("END") {
-                consume_end(lexer, Some(&pin_name));
+                end_block(lexer, "PIN", Some(&pin_name))?;
+                closed = true;
                 break;
             } else if w.eq_ignore_ascii_case("DIRECTION") {
                 if let Some(d) = lexer.next_word() {
@@ -530,22 +600,21 @@ fn parse_pin(
                 while let Some(port_tok) = lexer.next_token() {
                     if let Token::Word(pw) = port_tok {
                         if pw.eq_ignore_ascii_case("END") {
-                            consume_end(lexer, None);
+                            end_block(lexer, "PORT", None)?;
                             break;
                         } else if pw.eq_ignore_ascii_case("LAYER") {
-                            if let Some(lname) = lexer.next_word() {
-                                let lsym = interner.intern(lname);
-                                let l_id = tech_db.layer_by_name.get(&lsym).copied();
-                                if pin_layer.is_none() && l_id.is_some() {
-                                    pin_layer = l_id;
-                                }
+                            let lname = required_word(lexer, "PIN PORT LAYER")?;
+                            let lsym = interner.intern(lname);
+                            let l_id = tech_db.layer_by_name.get(&lsym).copied();
+                            if pin_layer.is_none() && l_id.is_some() {
+                                pin_layer = l_id;
                             }
                             lexer.skip_to_semi();
                         } else if pw.eq_ignore_ascii_case("RECT") {
-                            let x1 = lexer.next_f32().unwrap_or(0.0);
-                            let y1 = lexer.next_f32().unwrap_or(0.0);
-                            let x2 = lexer.next_f32().unwrap_or(0.0);
-                            let y2 = lexer.next_f32().unwrap_or(0.0);
+                            let x1 = required_f32(lexer, "PIN PORT RECT x1")?;
+                            let y1 = required_f32(lexer, "PIN PORT RECT y1")?;
+                            let x2 = required_f32(lexer, "PIN PORT RECT x2")?;
+                            let y2 = required_f32(lexer, "PIN PORT RECT y2")?;
 
                             let x1_dbu = (x1 * dbu).round() as i32;
                             let y1_dbu = (y1 * dbu).round() as i32;
@@ -565,6 +634,9 @@ fn parse_pin(
                 lexer.skip_to_semi();
             }
         }
+    }
+    if !closed {
+        bail!("LEF: PIN {pin_name} is not terminated by END {pin_name} (truncated file?)");
     }
 
     let (offset_x_dbu, offset_x_frac) = mean_center(sum_twice_center_x, rect_count);
@@ -592,23 +664,24 @@ fn parse_obs(
 ) -> Result<()> {
     let mut current_obs_layer = None;
     let dbu = tech_db.dbu_per_micron as f32;
+    let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
         if let Token::Word(w) = tok {
             if w.eq_ignore_ascii_case("END") {
-                consume_end(lexer, None);
+                end_block(lexer, "OBS", None)?;
+                closed = true;
                 break;
             } else if w.eq_ignore_ascii_case("LAYER") {
-                if let Some(lname) = lexer.next_word() {
-                    let lsym = interner.intern(lname);
-                    current_obs_layer = tech_db.layer_by_name.get(&lsym).copied();
-                }
+                let lname = required_word(lexer, "OBS LAYER")?;
+                let lsym = interner.intern(lname);
+                current_obs_layer = tech_db.layer_by_name.get(&lsym).copied();
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("RECT") {
-                let x1 = lexer.next_f32().unwrap_or(0.0);
-                let y1 = lexer.next_f32().unwrap_or(0.0);
-                let x2 = lexer.next_f32().unwrap_or(0.0);
-                let y2 = lexer.next_f32().unwrap_or(0.0);
+                let x1 = required_f32(lexer, "OBS RECT x1")?;
+                let y1 = required_f32(lexer, "OBS RECT y1")?;
+                let x2 = required_f32(lexer, "OBS RECT x2")?;
+                let y2 = required_f32(lexer, "OBS RECT y2")?;
 
                 if let Some(layer_id) = current_obs_layer {
                     let x1_dbu = (x1 * dbu).round() as i32;
@@ -632,6 +705,9 @@ fn parse_obs(
             }
         }
     }
+    if !closed {
+        bail!("LEF: OBS is not terminated by END (truncated file?)");
+    }
     Ok(())
 }
 
@@ -643,7 +719,8 @@ pub fn parse_lef(
 ) -> Result<()> {
     let file = File::open(path).with_context(|| format!("Failed to open LEF file at {:?}", path))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    parse_lef_bytes(&mmap, tech_db, interner)?;
+    parse_lef_bytes(&mmap, tech_db, interner)
+        .with_context(|| format!("Failed to parse LEF file at {:?}", path))?;
     tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
     Ok(())
@@ -904,5 +981,95 @@ END inv_sample
         let xor2 = &tech_db.macros[tech_db.macro_by_name[&xor2_sym].0 as usize];
         let xor2_met1_obs = xor2.obs_rects.iter().filter(|(l, _)| *l == met1_id).count();
         assert_eq!(xor2_met1_obs, 1, "xor2_2 met1 OBS: 5 rects merged into 1 jumper");
+    }
+
+
+    fn lef_error(text: &str) -> String {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        match parse_lef_bytes(text.as_bytes(), &mut db, &mut interner) {
+            Err(e) => format!("{e:#}"),
+            Ok(()) => panic!("malformed LEF was accepted:\n{text}"),
+        }
+    }
+
+    /// Asserts the fixture still contains `needle`, so a test cannot pass by editing nothing.
+    fn edit_fixture(base: &str, needle: &str, replacement: &str) -> String {
+        assert!(base.contains(needle), "fixture no longer contains `{needle}`");
+        base.replacen(needle, replacement, 1)
+    }
+
+    #[test]
+    fn test_bad_site_size_is_an_error() {
+        let text = edit_fixture(SAMPLE_TLEF, "SIZE 0.46 BY 2.72 ;", "SIZE 0.46 BY 2.7x ;");
+        let msg = lef_error(&text);
+        assert!(msg.contains("SITE unithd") && msg.contains("2.7x"), "{msg}");
+    }
+
+    #[test]
+    fn test_layer_width_without_value_is_an_error() {
+        let text = edit_fixture(SAMPLE_TLEF, "WIDTH 0.14 ;", "WIDTH ;");
+        let msg = lef_error(&text);
+        assert!(msg.contains("LAYER WIDTH") && msg.contains("missing"), "{msg}");
+    }
+
+    #[test]
+    fn test_routing_layer_without_width_is_an_error() {
+        let text = edit_fixture(SAMPLE_TLEF, "  WIDTH 0.14 ;\n", "");
+        let msg = lef_error(&text);
+        assert!(msg.contains("met1") && msg.contains("no WIDTH"), "{msg}");
+    }
+
+    #[test]
+    fn test_truncated_rect_is_an_error() {
+        let text = edit_fixture(SAMPLE_LEF, "RECT 0.320 1.075 0.650 1.315 ;", "RECT 0.320 1.075 0.650 ;");
+        let msg = lef_error(&text);
+        assert!(msg.contains("PIN PORT RECT y2"), "{msg}");
+    }
+
+    #[test]
+    fn test_macro_without_size_is_an_error() {
+        let text = edit_fixture(SAMPLE_LEF, "  SIZE 1.380 BY 2.720 ;\n", "");
+        let msg = lef_error(&text);
+        assert!(msg.contains("inv_sample") && msg.contains("no SIZE"), "{msg}");
+    }
+
+    #[test]
+    fn test_unterminated_macro_is_an_error() {
+        let text = edit_fixture(SAMPLE_LEF, "END inv_sample", "");
+        let msg = lef_error(&text);
+        assert!(msg.contains("MACRO inv_sample") && msg.contains("not terminated"), "{msg}");
+    }
+
+    #[test]
+    fn test_block_closed_by_another_name_is_an_error() {
+        let text = edit_fixture(SAMPLE_TLEF, "END met1", "END met");
+        let msg = lef_error(&text);
+        assert!(msg.contains("expected `END met1`"), "{msg}");
+    }
+
+    /// Every truncation of the sample technology LEF must return `Ok` or `Err` without panicking,
+    /// and a truncation inside the `met1` layer block must be an error.
+    #[test]
+    fn test_every_truncation_of_sample_tlef_is_rejected_or_parsed_without_panic() {
+        let layer_start = SAMPLE_TLEF.find("LAYER met1").expect("fixture has met1") + "LAYER met1".len();
+        let layer_end = SAMPLE_TLEF.find("END met1").expect("fixture has END met1") + "END met1".len();
+        for n in 0..=SAMPLE_TLEF.len() {
+            let mut interner = StringInterner::new();
+            let mut db = TechDb::new();
+            let result = parse_lef_bytes(&SAMPLE_TLEF.as_bytes()[..n], &mut db, &mut interner);
+            if n >= layer_start && n < layer_end {
+                assert!(result.is_err(), "truncation at {n} bytes inside met1 was accepted");
+            }
+        }
+    }
+
+    #[test]
+    fn test_every_truncation_of_sample_lef_is_rejected_or_parsed_without_panic() {
+        for n in 0..=SAMPLE_LEF.len() {
+            let mut interner = StringInterner::new();
+            let mut db = TechDb::new();
+            let _ = parse_lef_bytes(&SAMPLE_LEF.as_bytes()[..n], &mut db, &mut interner);
+        }
     }
 }
