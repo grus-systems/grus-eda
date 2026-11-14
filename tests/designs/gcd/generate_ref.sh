@@ -128,7 +128,17 @@ exit
 EOF
 
 # write_spef puts the wall-clock time in the *DATE line; pin it so regeneration is bit-identical.
-sed -i 's/^\*DATE .*/*DATE "normalized"/' "${SCRIPT_DIR}/gcd.rcx.spef"
+# sed is not installed in the pinned container image, so python3 does the edit.
+python3 - "${SCRIPT_DIR}/gcd.rcx.spef" <<'PYEOF'
+import sys
+path = sys.argv[1]
+lines = open(path).read().splitlines(keepends=True)
+dated = [i for i, line in enumerate(lines) if line.startswith("*DATE ")]
+if len(dated) != 1:
+    sys.exit(f"expected exactly one *DATE line in {path}, found {len(dated)}")
+lines[dated[0]] = '*DATE "normalized"\n'
+open(path, "w").writelines(lines)
+PYEOF
 if [ "$(grep -c '^\*DATE "normalized"$' "${SCRIPT_DIR}/gcd.rcx.spef")" -ne 1 ]; then
     echo "Error: expected exactly one *DATE line in gcd.rcx.spef to normalize." >&2
     exit 1
