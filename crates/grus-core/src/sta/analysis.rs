@@ -568,6 +568,9 @@ mod tests {
         /// Not yet measured on jpeg: starts at the gcd values until the first jpeg run sets them.
         const JPEG_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
         const JPEG_SPEF: Tol = Tol::GCD_SPEF;
+        /// Not yet measured on ibex: starts at the gcd values until the first ibex run sets them.
+        const IBEX_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
+        const IBEX_SPEF: Tol = Tol::GCD_SPEF;
     }
 
     fn within_tolerance(ours: f32, reference: f64, rel_tol: f64, abs_tol: f64) -> (bool, f64) {
@@ -648,6 +651,31 @@ mod tests {
     #[ignore]
     fn test_jpeg_placed_spef_matches_opensta() {
         compare_design_with_opensta("jpeg", "placed_spef", Rc::Spef, Tol::JPEG_SPEF);
+    }
+
+    /// ibex's SDC (ORFS `constraint.sdc`, verbatim) sets `set_clock_latency 1.095` and I/O delays
+    /// against the virtual clock `vclk_core_clock`, which no earlier design exercised. Any failure
+    /// here must be checked against those constructs before the tolerance is touched.
+    /// Ignored 2026-11-14: `parse_sdc` cannot read this SDC at all — the file is Tcl
+    /// (`current_design`, `set` variables, `[expr ...]`), and the parser bails on line 1.
+    /// Ticket 09 owns the Tcl-subset parser plus latency handling; these tests are
+    /// un-ignored by that landing.
+    #[test]
+    #[ignore]
+    fn test_ibex_zero_wire_matches_opensta() {
+        compare_design_with_opensta("ibex", "zero_wire", Rc::None, Tol::STRICT);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ibex_placement_rc_matches_opensta() {
+        compare_design_with_opensta("ibex", "placement_rc", Rc::Placement, Tol::IBEX_PLACEMENT);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ibex_placed_spef_matches_opensta() {
+        compare_design_with_opensta("ibex", "placed_spef", Rc::Spef, Tol::IBEX_SPEF);
     }
 
 

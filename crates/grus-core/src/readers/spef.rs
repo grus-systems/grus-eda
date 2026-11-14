@@ -176,4 +176,11 @@ mod tests {
         let spef = load_spef(&path).expect("jpeg.routed.spef must parse");
         assert!(!spef.nets.is_empty(), "jpeg.routed.spef has no nets");
     }
+
+    #[test]
+    fn test_ibex_routed_spef_present() {
+        let path = require(design_dir("ibex").join("ibex.routed.spef"));
+        let spef = load_spef(&path).expect("ibex.routed.spef must parse");
+        assert!(!spef.nets.is_empty(), "ibex.routed.spef has no nets");
+    }
 }

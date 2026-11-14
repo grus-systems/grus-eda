@@ -1101,4 +1101,49 @@ mod tests {
             assert!(r.overlap >= 0.50, "{label}: hot-set overlap {:.4} below 0.50", r.overlap);
         }
     }
+
+    /// Congestion map against OpenROAD on ibex at 65% utilisation (F2), same criterion as aes.
+    /// Ignored 2026-11-14: measured H rho 0.7188 misses the null+0.15 rule by 0.007
+    /// (null 0.5759, needs >= 0.7259) and both hot-set overlaps are below 0.50
+    /// (H 0.3529, V 0.4809); V rho 0.8214 passes both its rules. Recorded in
+    /// docs/results.md (step 4, part 3); thresholds are not moved (F2 follow-up).
+    #[test]
+    #[ignore]
+    fn test_ibex_congestion_map() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let def_path = require(design_dir("ibex").join("ibex.util65.def"));
+        let dump = parse_usage_dump(&require(design_dir("ibex").join("ibex.gcell_usage.txt")));
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse ibex.util65.def");
+
+        // The dump was routed with `set_global_routing_layer_adjustment met1-met5 0.2` (ORFS ibex value).
+        let adj = [0.0f32, 0.2, 0.2, 0.2, 0.2, 0.2];
+        let (grid, report) = estimate_congestion(&design_db, &tech_db, Some(&adj), None);
+
+        assert_eq!(grid.origin_x_dbu, dump.origin_x_dbu, "grid origin x");
+        assert_eq!(grid.origin_y_dbu, dump.origin_y_dbu, "grid origin y");
+        assert_eq!(grid.gcell_w_dbu, dump.tile_dbu, "grid tile width");
+        assert_eq!(grid.gcell_h_dbu, dump.tile_dbu, "grid tile height");
+        assert_eq!((grid.nx, grid.ny), (dump.nx, dump.ny), "grid dimensions");
+
+        let (nx, ny) = (dump.nx, dump.ny);
+        assert_eq!(ny * (nx - 1), report.h_usage_ratio.len(), "H edge count");
+        assert_eq!((ny - 1) * nx, report.v_usage_ratio.len(), "V edge count");
+
+        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| e.y * (nx - 1) + e.x);
+        let v = compare_direction("V", &dump.v, &report.v_usage_ratio, |e| e.y * nx + e.x);
+
+        for (label, r) in [("H", &h), ("V", &v)] {
+            assert!(r.rho >= 0.60, "{label}: Spearman rho {:.4} below 0.60 (support {})", r.rho, r.support);
+            assert!(
+                r.rho >= r.null_rho + 0.15,
+                "{label}: rho {:.4} must exceed the control null {:.4} by 0.15",
+                r.rho, r.null_rho
+            );
+            assert!(r.overlap >= 0.50, "{label}: hot-set overlap {:.4} below 0.50", r.overlap);
+        }
+    }
 }
