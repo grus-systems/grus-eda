@@ -53,6 +53,12 @@ any) get the picorv32 treatment (git-ignored, listed in
 under 1 MB are committed by the maintainer after a verified run,
 not by this ticket — this ticket delivers the script only.
 
+## Files
+
+- Create: `tests/designs/aes/generate_ref.sh`
+- Possibly modify: `.gitignore` (only if per-design generated-file
+  entries exist there for gcd/picorv32)
+
 ## Out of scope
 
 - Rust tests or harness changes (next ticket).
