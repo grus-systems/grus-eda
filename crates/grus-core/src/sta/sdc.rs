@@ -332,7 +332,7 @@ impl Interp {
                 Ok(empty())
             }
             "set_clock_uncertainty" => {
-                self.sdc.uncertainty_ns = first_number(args).context("missing numeric value")?;
+                self.sdc.uncertainty_ns = first_number(args)?.context("missing numeric value")?;
                 Ok(empty())
             }
             "set_input_delay" => {
@@ -372,7 +372,7 @@ impl Interp {
     fn create_clock(&mut self, args: &[Value]) -> Result<()> {
         let name = flag_value(args, "-name")?.map(str::to_string);
         let period_ns = parse_f32(flag_value(args, "-period")?.context("missing -period")?)?;
-        match positionals(args).as_slice() {
+        match positionals(args)?.as_slice() {
             [] => {
                 let Some(name) = name else {
                     bail!("a virtual clock needs -name");
@@ -383,6 +383,10 @@ impl Interp {
                 let [port] = ports.as_slice() else {
                     bail!("create_clock takes one source port");
                 };
+                // A second design clock would overwrite the first one's port, name and period.
+                if self.sdc.clock_port.is_some() {
+                    bail!("a second design clock is not supported");
+                }
                 self.sdc.clock_name = name;
                 self.sdc.clock_port = Some(port.clone());
                 self.sdc.period_ns = period_ns;
@@ -489,31 +493,39 @@ fn flag_value<'a>(args: &'a [Value], flag: &str) -> Result<Option<&'a str>> {
     }
 }
 
-fn positionals(args: &[Value]) -> Vec<&Value> {
+/// `-1.5` or `-.5`: a dash followed by a decimal number. `-inf` is not one.
+fn is_negative_number(text: &str) -> bool {
+    text.strip_prefix('-')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit() || c == '.') && rest.parse::<f32>().is_ok())
+}
+
+/// The arguments that are neither a value flag nor the value of one. Any other flag is an error:
+/// skipping it would drop a meaning-changing option such as `-max`, `-add_delay` or `-setup`.
+fn positionals(args: &[Value]) -> Result<Vec<&Value>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match &args[i] {
             Value::Str(s) if VALUE_FLAGS.contains(&s.as_str()) => i += 2,
-            Value::Str(s) if s.starts_with('-') && s.parse::<f32>().is_err() => i += 1,
+            Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => bail!("unsupported option `{s}`"),
             value => {
                 out.push(value);
                 i += 1;
             }
         }
     }
-    out
+    Ok(out)
 }
 
-fn first_number(args: &[Value]) -> Option<f32> {
-    positionals(args).into_iter().find_map(|v| match v {
+fn first_number(args: &[Value]) -> Result<Option<f32>> {
+    Ok(positionals(args)?.into_iter().find_map(|v| match v {
         Value::Str(s) => s.parse().ok(),
         _ => None,
-    })
+    }))
 }
 
 fn value_and_ports(args: &[Value]) -> Result<(PortSel, f32)> {
-    let value = first_number(args).context("missing numeric value")?;
+    let value = first_number(args)?.context("missing numeric value")?;
     let sel = args
         .iter()
         .find_map(|a| match a {
@@ -703,6 +715,34 @@ mod tests {
     fn rejects_a_virtual_clock_with_another_period() {
         let text = format!("{GCD}create_clock -name vclk -period 4.0\n");
         assert!(parse_sdc(&text).is_err());
+    }
+
+    #[test]
+    fn rejects_a_second_design_clock() {
+        let text = format!("{GCD}create_clock -name core_clk2 -period 5.0 [get_ports other]\n");
+        assert!(parse_sdc(&text).is_err());
+    }
+
+    #[test]
+    fn rejects_flags_that_change_the_meaning() {
+        let cases = [
+            "set_input_delay -max 1.0 -clock core_clk [all_inputs]",
+            "set_input_delay 1.0 -add_delay -clock core_clk [all_inputs]",
+            "set_output_delay -min 1.0 -clock core_clk [all_outputs]",
+            "set_clock_uncertainty -setup 0.1",
+            "set_clock_uncertainty -hold 0.1",
+        ];
+        for snippet in cases {
+            let text = format!("{GCD}{snippet}\n");
+            assert!(parse_sdc(&text).is_err(), "accepted: {snippet}");
+        }
+    }
+
+    #[test]
+    fn keeps_negative_values_and_the_known_flags() {
+        let sdc = parse_sdc(&format!("{GCD}set_input_delay -0.5 -clock core_clk [all_inputs -no_clocks]\n")).unwrap();
+        assert_eq!(sdc.input_delay_ns("req_val"), -0.5);
+        assert!(parse_sdc(&format!("{GCD}set_clock_uncertainty 0.1\n")).is_ok());
     }
 
     #[test]

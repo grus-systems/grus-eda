@@ -108,6 +108,44 @@ pub struct EndpointReport {
     pub min_slew_ns: f32,
 }
 
+/// Inputs and checks the analysis left out, counted per category. A non-zero count means the
+/// report is missing timing that the design has.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SkipReport {
+    /// Non-latch arcs that have no model, by `TimingType` name.
+    pub unsupported_arcs: BTreeMap<String, usize>,
+    /// Arcs whose related or target pin does not resolve on the instance.
+    pub unresolved_arcs: usize,
+    /// Register checks without a clock or without a late/early arc pair.
+    pub incomplete_checks: usize,
+    /// Checks and outputs that no polarity of a path reached.
+    pub unreached_endpoints: usize,
+    /// Clock nets driven by a cell output (buffered or gated clock), which the ideal clock does not model.
+    pub cell_driven_clock_nets: usize,
+}
+
+impl SkipReport {
+    /// Each non-zero category as `name=count`; unsupported arcs are listed by timing type.
+    pub fn nonzero(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.unsupported_arcs.is_empty() {
+            let by_type: Vec<String> = self.unsupported_arcs.iter().map(|(t, n)| format!("{t}={n}")).collect();
+            out.push(format!("unsupported_arcs[{}]", by_type.join(", ")));
+        }
+        for (name, count) in [
+            ("unresolved_arcs", self.unresolved_arcs),
+            ("incomplete_checks", self.incomplete_checks),
+            ("unreached_endpoints", self.unreached_endpoints),
+            ("cell_driven_clock_nets", self.cell_driven_clock_nets),
+        ] {
+            if count > 0 {
+                out.push(format!("{name}={count}"));
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StaReport {
     pub wns_max_ns: f32,
@@ -115,6 +153,7 @@ pub struct StaReport {
     pub wns_min_ns: f32,
     pub tns_min_ns: f32,
     pub endpoints: Vec<EndpointReport>,
+    pub skipped: SkipReport,
 }
 
 struct Context<'a> {
@@ -261,7 +300,7 @@ fn gating_enables(cx: &Context, graph: &TimingGraph) -> Vec<PinId> {
     enables
 }
 
-fn build_graph(cx: &Context) -> TimingGraph {
+fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
     let design = cx.design;
     let mut graph = TimingGraph {
         edges: Vec::new(),
@@ -297,6 +336,7 @@ fn build_graph(cx: &Context) -> TimingGraph {
                 cx.cell_pin_for_lib_pin(cell, arc.related_pin),
                 cx.cell_pin_for_lib_pin(cell, arc.target_pin),
             ) else {
+                skipped.unresolved_arcs += 1;
                 continue;
             };
             match arc.timing_type {
@@ -332,7 +372,7 @@ fn build_graph(cx: &Context) -> TimingGraph {
                     check.clk = Some(src);
                     check.removal_arc = Some(lib_arc);
                 }
-                _ => {}
+                _ => *skipped.unsupported_arcs.entry(format!("{:?}", arc.timing_type)).or_default() += 1,
             }
         }
     }
@@ -341,6 +381,11 @@ fn build_graph(cx: &Context) -> TimingGraph {
     for pin in register_clock_pins {
         if let Some(net) = design.pin_nets[pin.0 as usize] {
             graph.clock_net[net.0 as usize] = true;
+        }
+    }
+    for (net, _) in graph.clock_net.iter().enumerate().filter(|(_, is_clock)| **is_clock) {
+        if design.net_driver(NetId(net as u32)).is_some_and(|d| design.pin_cells[d.0 as usize].is_some()) {
+            skipped.cell_driven_clock_nets += 1;
         }
     }
     let enables = gating_enables(cx, &graph);
@@ -428,7 +473,8 @@ pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&Ne
             Some([pi(RISE), pi(FALL)])
         })
         .collect();
-    let graph = build_graph(&cx);
+    let mut skipped = SkipReport::default();
+    let graph = build_graph(&cx, &mut skipped);
     let order = topological_order(&cx, &graph)?;
     let mut state = vec![PinTimingState::UNREACHED; design.num_pins()];
 
@@ -536,7 +582,11 @@ pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&Ne
         }
     }
 
-    collect_endpoints(&cx, &graph, &state)
+    let report = collect_endpoints(&cx, &graph, &state, skipped)?;
+    for category in report.skipped.nonzero() {
+        eprintln!("warning: STA skipped {category}; the report does not model these");
+    }
+    Ok(report)
 }
 
 struct Worst {
@@ -546,7 +596,7 @@ struct Worst {
     slew: f32,
 }
 
-fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]) -> Result<StaReport> {
+fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState], mut skipped: SkipReport) -> Result<StaReport> {
     let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
     let mut endpoints = Vec::new();
     let half_period = 0.5 * sdc.period_ns;
@@ -554,6 +604,7 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
     for (&data_id, check) in &graph.checks {
         let data = PinId(data_id);
         let (Some(clk), Some(late_arc), Some(early_arc)) = (check.clk, check.late_arc(), check.early_arc()) else {
+            skipped.incomplete_checks += 1;
             continue;
         };
         let (s, clk_state) = (state[data.0 as usize], state[clk.0 as usize]);
@@ -590,8 +641,9 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
                 worst_min = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
             }
         }
-        if let (Some(max), Some(min)) = (worst_max, worst_min) {
-            endpoints.push(endpoint_report(cx.pin_name(data), &max, &min));
+        match (worst_max, worst_min) {
+            (Some(max), Some(min)) => endpoints.push(endpoint_report(cx.pin_name(data), &max, &min)),
+            _ => skipped.unreached_endpoints += 1,
         }
     }
 
@@ -617,8 +669,9 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
                 worst_min = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
             }
         }
-        if let (Some(max), Some(min)) = (worst_max, worst_min) {
-            endpoints.push(endpoint_report(cx.pin_name(enable), &max, &min));
+        match (worst_max, worst_min) {
+            (Some(max), Some(min)) => endpoints.push(endpoint_report(cx.pin_name(enable), &max, &min)),
+            _ => skipped.unreached_endpoints += 1,
         }
     }
 
@@ -648,8 +701,9 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
                 worst_min = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
             }
         }
-        if let (Some(max), Some(min)) = (worst_max, worst_min) {
-            endpoints.push(endpoint_report(cx.pin_name(pin), &max, &min));
+        match (worst_max, worst_min) {
+            (Some(max), Some(min)) => endpoints.push(endpoint_report(cx.pin_name(pin), &max, &min)),
+            _ => skipped.unreached_endpoints += 1,
         }
     }
 
@@ -662,6 +716,7 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
         wns_min_ns: wns(|e| e.min_slack_ns),
         tns_min_ns: tns(|e| e.min_slack_ns),
         endpoints,
+        skipped,
     })
 }
 
@@ -851,7 +906,7 @@ mod tests {
         let spef = crate::readers::load_spef(&dir.join("picorv32.routed.spef")).expect("SPEF");
         let par = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
         let cx = Context { design: &design, lib: &lib, sdc: &sdc, parasitics: Some(&par), pi_models: Vec::new() };
-        let graph = build_graph(&cx);
+        let graph = build_graph(&cx, &mut SkipReport::default());
         let find_pin = |name: &str| {
             (0..design.num_pins()).map(|i| PinId(i as u32)).find(|&p| cx.pin_name(p) == name).expect("pin")
         };

@@ -396,15 +396,18 @@ fn main() -> anyhow::Result<()> {
                 _ => None,
             };
             let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
+            let skipped = report.skipped.nonzero();
+            let skipped_note = if skipped.is_empty() { String::new() } else { format!(", skipped: {}", skipped.join(" ")) };
             println!(
-                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms",
+                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms{}",
                 mode,
                 report.endpoints.len(),
                 report.wns_max_ns,
                 report.tns_max_ns,
                 report.wns_min_ns,
                 report.tns_min_ns,
-                t0.elapsed().as_secs_f64() * 1000.0
+                t0.elapsed().as_secs_f64() * 1000.0,
+                skipped_note
             );
         }
     }
