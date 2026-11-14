@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Put cargo and mise on PATH
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Generate picorv32 reference inputs
+        if: ${{ hashFiles('tests/designs/picorv32/picorv32.routed.spef') == '' }}
+        run: |
+          mise exec docker-cli@latest colima@latest lima@latest -- colima status >/dev/null 2>&1 \
+            || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
+          tests/designs/picorv32/generate_ref.sh
+
+      - name: Test (release)
+        run: cargo test --release
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
