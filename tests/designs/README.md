@@ -31,6 +31,15 @@ This directory contains public benchmark designs used for verification against r
 - **Description**: AES-128 encryption/decryption top (`aes_cipher_top`) from the OpenCores AES core packaged by ORFS. Used across E0-E3; the high-utilisation variant feeds the E1 congestion-map comparison (F2).
 - **Constraints**: `aes.sdc`, 3.6 ns clock, 0.72 ns I/O delays (ORFS `constraint.sdc` for sky130hd/aes uses period 3.6 and 20% I/O percentage), 0.15 ns input transition, 0.05 pF output load. LibreLane config follows ORFS: `FP_CORE_UTIL` 35.
 
+### `jpeg` (JPEG encoder)
+
+- **Directory**: `tests/designs/jpeg/`
+- **Origin**: [The-OpenROAD-Project/OpenROAD-flow-scripts](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts) (`flow/designs/src/jpeg/`), commit `73c804d45dc4084b05e0536dab69053b3bf9e591`. All `.v` files, the `include/` directory, and the `LICENSE` file are copied verbatim.
+- **License**: BSD-style license (Copyright (C) 2000-2009, ASICs World Services, LTD.). See `tests/designs/jpeg/LICENSE`.
+- **Target PDK**: SkyWater `sky130_fd_sc_hd` (1.8 V nominal corner `tt_025C_1v80`).
+- **Description**: DCT-based JPEG encoder (`jpeg_encoder`) from the OpenCores JPEG core packaged by ORFS. Used across E0-E3; the high-utilisation variant feeds the E1 congestion-map comparison (F2).
+- **Constraints**: `jpeg.sdc`, 5.0 ns clock, 1.0 ns I/O delays (ORFS `constraint.sdc` for sky130hd/jpeg uses period 5 and 20% I/O percentage), 0.15 ns input transition, 0.05 pF output load. LibreLane config follows ORFS: `FP_CORE_UTIL` 50.
+
 ---
 
 ## 2. Reference Artifacts (`tests/designs/gcd/`)
