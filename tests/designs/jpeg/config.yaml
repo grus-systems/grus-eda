@@ -7,13 +7,14 @@ VERILOG_FILES:
   - dir::div_su.v
   - dir::div_uu.v
   - dir::fdct.v
-  - dir::include/dct_cos_table.v
   - dir::jpeg_encoder.v
   - dir::jpeg_qnr.v
   - dir::jpeg_rle.v
   - dir::jpeg_rle1.v
   - dir::jpeg_rzs.v
   - dir::zigzag.v
+VERILOG_INCLUDE_DIRS:
+  - dir::include
 CLOCK_PERIOD: 5.0
 CLOCK_PORT: clk
 PNR_SDC_FILE: dir::jpeg.sdc
