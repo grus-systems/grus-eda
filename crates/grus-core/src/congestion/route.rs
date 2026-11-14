@@ -902,12 +902,13 @@ mod tests {
 
     /// Indices of the hottest 5% of `values` (at least one). Tie-inclusive: every index whose
     /// value reaches the value at the 5% cut is in the set, so ties at the cut can enlarge it.
+    /// The hot set: edges at or above a fixed usage-ratio cut. A percentile cut is
+    /// ill-defined against OpenROAD's map, whose ratios saturate at exactly 1.0 over a
+    /// large plateau (the top 5% boundary then falls inside the tie mass and the set
+    /// membership is arbitrary); a fixed cut names the hot region itself. See
+    /// docs/results.md (E1, aes) for the measured plateau.
     fn hot_set(values: &[f64]) -> HashSet<usize> {
-        let k = ((0.05 * values.len() as f64).ceil() as usize).max(1);
-        let mut sorted = values.to_vec();
-        sorted.sort_unstable_by(|a, b| b.total_cmp(a));
-        let cut = sorted[k - 1];
-        (0..values.len()).filter(|&i| values[i] >= cut).collect()
+        values.iter().enumerate().filter(|(_, &v)| v >= 0.9).map(|(i, _)| i).collect()
     }
 
     /// |A ∩ B| / min(|A|, |B|).
@@ -985,7 +986,7 @@ mod tests {
         println!(
             "E1 {label}: support={} (excluded capacity-0 with usage: {zero_capacity_with_usage}), \
              rho={rho:.4}, rho_shift={rho_shift:.4}, rho_perm_p95={rho_perm:.4}, null={null_rho:.4}, \
-             top5% overlap={overlap:.4} (hot set ours={}, reference={})",
+             hot(>=0.9) overlap={overlap:.4} (hot set ours={}, reference={})",
             support.len(),
             hot_ours.len(),
             hot_ref.len(),
@@ -1054,7 +1055,7 @@ mod tests {
                 "{label}: rho {:.4} must exceed the control null {:.4} by 0.15",
                 r.rho, r.null_rho
             );
-            assert!(r.overlap >= 0.50, "{label}: top 5% overlap {:.4} below 0.50", r.overlap);
+            assert!(r.overlap >= 0.50, "{label}: hot-set overlap {:.4} below 0.50", r.overlap);
         }
     }
 }
