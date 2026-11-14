@@ -5,6 +5,7 @@
 .DS_Store
 tests/designs/pdk
 tests/designs/gcd/runs
+tests/designs/aes/runs
 tests/designs/picorv32/runs
 tests/designs/picorv32/picorv32.synth.v
 tests/designs/picorv32/picorv32.synth.json
