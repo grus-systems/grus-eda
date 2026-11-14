@@ -5,17 +5,19 @@ on:
     branches: [dev]
   pull_request:
 
-# Both jobs run on the Intel runner (org runner, label
-# `intel`): it has a native Docker daemon for the LibreLane
-# container, the sky130A PDK under ~/.ciel, and a mise-installed
-# Rust toolchain. Keeping this repo's CI off the org Mac mini
-# leaves that queue for the repositories that need macOS/ARM64.
-# Generated inputs cross between the jobs as a workflow
-# artifact.
+# Both jobs run on the org Mac mini (M4, labels macOS/ARM64):
+# the Intel runner (Late 2014) needs ~17 min for the jpeg
+# OpenROAD flow alone, and generated outputs were verified
+# bit-identical between the two machines, so the golden files
+# do not care which one produced the inputs. Docker comes
+# from Colima; the sky130A PDK is under ~/.ciel and Rust is
+# mise-installed. The trade-off is the shared queue with the
+# repositories that need macOS/ARM64. Generated inputs cross
+# between the jobs as a workflow artifact.
 
 jobs:
   generate:
-    runs-on: [self-hosted, Linux, X64, intel]
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -26,25 +28,26 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
 
-      # The runner's systemd user manager predates the user's
-      # docker group membership, so job processes start without
-      # the docker group; sg re-reads /etc/group and grants it.
-      # (A host reboot makes this a no-op.)
+      - name: Start Colima
+        run: |
+          mise exec docker-cli@latest colima@latest lima@latest -- colima status >/dev/null 2>&1 \
+            || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
+
       - name: Generate picorv32 reference inputs
         if: ${{ hashFiles('tests/designs/picorv32/picorv32.routed.spef') == '' }}
-        run: sg docker -c 'tests/designs/picorv32/generate_ref.sh'
+        run: tests/designs/picorv32/generate_ref.sh
 
       - name: Generate aes reference inputs
         if: ${{ hashFiles('tests/designs/aes/aes.util65.def') == '' }}
-        run: sg docker -c 'tests/designs/aes/generate_ref.sh'
+        run: tests/designs/aes/generate_ref.sh
 
       - name: Generate jpeg reference inputs
         if: ${{ hashFiles('tests/designs/jpeg/jpeg.util65.def') == '' }}
-        run: sg docker -c 'tests/designs/jpeg/generate_ref.sh'
+        run: tests/designs/jpeg/generate_ref.sh
 
       - name: Generate ibex reference inputs
         if: ${{ hashFiles('tests/designs/ibex/ibex.util65.def') == '' }}
-        run: sg docker -c 'tests/designs/ibex/generate_ref.sh'
+        run: tests/designs/ibex/generate_ref.sh
 
       - name: Upload generated reference inputs
         uses: actions/upload-artifact@v4
@@ -87,7 +90,7 @@ jobs:
 
   test:
     needs: generate
-    runs-on: [self-hosted, Linux, X64, intel]
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
