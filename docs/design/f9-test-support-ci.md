@@ -83,3 +83,41 @@ already serves other grus-systems repositories.
 - `HOME` under the runner service is the user's home (the runner runs
   via launchd), so `~/.ciel` resolves; `test_support`
   panics clearly if that ever changes.
+
+## Review resolutions (external review, 2026-11-14)
+
+The full review text is not included in this repository. Verdict: adopt with
+changes. Maintainer spot-checks: no code outside `readers/liberty.rs`
+references the cache path (grep for `grus.cache`/`grus-cache` is empty);
+there is no `crates/grus-core/tests/` directory, so all tests are unit
+tests; every `sky130_fd_sc_*` reference in tests is `sky130_fd_sc_hd`;
+every `.exists()` check in tests panics (no skip-tolerant test exists).
+Adopted:
+
+- **Unique temp file (S1)**: the cache write uses a per-writer unique
+  temp name in the cache directory (process id + an atomic counter),
+  then renames. (Load validation — magic, size, xxh3 — already bounds
+  the damage of a torn entry to a reparse; this removes the race.)
+- **Cache format version (S2)**: `CacheFile` gains a `version` field,
+  checked on load; a mismatch is a cache miss.
+- **design_dir (S1/S2)**: defined explicitly as
+  `CARGO_MANIFEST_DIR/../../tests/designs/<name>` (the form the current
+  tests already use), not a naive join.
+- **cfg(test) scope (S2)**: with no integration tests, `#[cfg(test)]`
+  covers every test module. The benchmark keeps its own small lookup,
+  with a comment pointing at `test_support` as the canonical logic; no
+  public feature is added for one bench.
+- **Generic PDK helper (S2/S3)**: not needed — survey shows only
+  `sky130_fd_sc_hd` is referenced. `sky130_hd()` only.
+- **XDG edge (S3)**: an empty or relative `XDG_CACHE_HOME` is ignored
+  (treated as unset).
+- **Temp fallback (S2)**: the shared-temp fallback directory gains a
+  `$USER` suffix when set; with unique temp names + rename this is the
+  remaining mitigation, and the fallback only triggers when neither
+  XDG nor HOME is set.
+- **CI (Part B)**: PATH is extended via `$GITHUB_PATH`; the Colima
+  step is guarded (`colima status` first, start only if not running);
+  `runs-on` stays `[self-hosted, macOS, ARM64]` (the runner's default
+  labels; the maintainer verifies via the API at first run). The repo
+  is private and PRs are internal, so the fork-PR runner risk does not
+  apply today; noted here so a future public flip reopens it.
