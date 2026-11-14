@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use anyhow::{bail, Context, Result};
 use crate::design_db::{DesignDb, Orient, PlacementStatus};
-use crate::interner::NetId;
+use crate::interner::{CellId, NetId, PinId};
 use crate::tech_db::{MacroClass, TechDb};
 
 #[derive(Clone, Debug)]
@@ -11,6 +11,8 @@ pub struct LegalizeResult {
     pub pre_legal_hpwl_dbu: i64,
     pub post_abacus_hpwl_dbu: i64,
     pub final_hpwl_dbu: i64,
+    /// Full net rescans done by pass 1 trial evaluations, summed over all rounds.
+    pub pass1_eval_fallbacks: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +128,178 @@ fn net_hpwl_dbu(db: &DesignDb, tech_db: &TechDb, net_idx: usize) -> i64 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Extremum {
+    val: i32,
+    pin: PinId,
+}
+
+// Placeholder for the unused slots of nets with fewer than two pins; never read.
+const UNUSED_EXTREMUM: Extremum = Extremum { val: 0, pin: PinId(0) };
+
+// Two smallest (`lo`) and two largest (`hi`) pin coordinates per axis (0 = x, 1 = y), best
+// first, each with its pin. The slots hold real pins only when `pin_count >= 2`.
+#[derive(Clone, Copy)]
+struct NetExtrema {
+    pin_count: usize,
+    lo: [[Extremum; 2]; 2],
+    hi: [[Extremum; 2]; 2],
+}
+
+// Keeps the two best of the values offered so far. `seen` is the number of values before `e`.
+// `ahead` is strict, so a tie keeps the earlier pin in front and a 3+-way tie still fills both slots.
+fn offer_extremum(top: &mut [Extremum; 2], e: Extremum, seen: usize, ahead: fn(i32, i32) -> bool) {
+    match seen {
+        0 => top[0] = e,
+        1 => {
+            if ahead(e.val, top[0].val) {
+                top[1] = top[0];
+                top[0] = e;
+            } else {
+                top[1] = e;
+            }
+        }
+        _ => {
+            if ahead(e.val, top[0].val) {
+                top[1] = top[0];
+                top[0] = e;
+            } else if ahead(e.val, top[1].val) {
+                top[1] = e;
+            }
+        }
+    }
+}
+
+fn build_net_extrema(db: &DesignDb, tech_db: &TechDb, net: usize) -> NetExtrema {
+    let pins = db.net_pins(NetId(net as u32));
+    let mut ext = NetExtrema {
+        pin_count: pins.len(),
+        lo: [[UNUSED_EXTREMUM; 2]; 2],
+        hi: [[UNUSED_EXTREMUM; 2]; 2],
+    };
+    if pins.len() < 2 {
+        return ext;
+    }
+    let less: fn(i32, i32) -> bool = |a, b| a < b;
+    let greater: fn(i32, i32) -> bool = |a, b| a > b;
+    for (seen, &pin) in pins.iter().enumerate() {
+        let (px, py) = db.pin_pos_dbu(pin, tech_db);
+        for (axis, val) in [px, py].into_iter().enumerate() {
+            let e = Extremum { val, pin };
+            offer_extremum(&mut ext.lo[axis], e, seen, less);
+            offer_extremum(&mut ext.hi[axis], e, seen, greater);
+        }
+    }
+    ext
+}
+
+// Same expression as `net_hpwl_dbu`, read from the cache.
+fn cached_hpwl(ext: &NetExtrema) -> i64 {
+    if ext.pin_count <= 1 {
+        return 0;
+    }
+    (ext.hi[0][0].val - ext.lo[0][0].val) as i64 + (ext.hi[1][0].val - ext.lo[1][0].val) as i64
+}
+
+// Extremum over the pins that did not move, or None when both top-2 pins moved and the
+// caller must rescan the net.
+fn surviving_extremum(top: &[Extremum; 2], moved: &[PinId]) -> Option<i32> {
+    if !moved.contains(&top[0].pin) {
+        Some(top[0].val)
+    } else if !moved.contains(&top[1].pin) {
+        Some(top[1].val)
+    } else {
+        None
+    }
+}
+
+// Pins of cells `c1` and `c2` on `net`. Those are the only pins a trial swap moves.
+fn moved_pins_on_net(db: &DesignDb, net: usize, c1: usize, c2: usize, moved: &mut Vec<PinId>) {
+    moved.clear();
+    for c in [c1, c2] {
+        for &pin in db.cell_pins(CellId(c as u32)) {
+            if db.pin_nets[pin.0 as usize] == Some(NetId(net as u32)) {
+                moved.push(pin);
+            }
+        }
+    }
+}
+
+// HPWL of `net` with the trial positions already in `db`. `moved` are the pins of the swapped
+// cells on this net. Each direction is read from the cache; `net_hpwl_dbu` is the fallback.
+fn net_hpwl_after_swap(
+    db: &DesignDb,
+    tech_db: &TechDb,
+    net: usize,
+    ext: &NetExtrema,
+    moved: &[PinId],
+    fallbacks: &mut usize,
+) -> i64 {
+    if ext.pin_count <= 1 {
+        return 0;
+    }
+    let mut lo = [i32::MAX; 2];
+    let mut hi = [i32::MIN; 2];
+    if moved.len() < ext.pin_count {
+        for axis in 0..2 {
+            let (Some(l), Some(h)) = (
+                surviving_extremum(&ext.lo[axis], moved),
+                surviving_extremum(&ext.hi[axis], moved),
+            ) else {
+                *fallbacks += 1;
+                return net_hpwl_dbu(db, tech_db, net);
+            };
+            lo[axis] = l;
+            hi[axis] = h;
+        }
+    }
+    for &pin in moved {
+        let (px, py) = db.pin_pos_dbu(pin, tech_db);
+        lo[0] = lo[0].min(px);
+        hi[0] = hi[0].max(px);
+        lo[1] = lo[1].min(py);
+        hi[1] = hi[1].max(py);
+    }
+    (hi[0] - lo[0]) as i64 + (hi[1] - lo[1]) as i64
+}
+
+// Scratch state for trial evaluations: the moved pins of the current net, and the count of
+// full rescans so far.
+#[derive(Default)]
+struct Pass1Eval {
+    moved: Vec<PinId>,
+    fallbacks: usize,
+}
+
+// Trial-swaps `c1` and `c2`, returning the net HPWL sums over `incident` before and after.
+// The before sum comes from the cache of committed positions. The trial stays applied, so a
+// rejecting caller reverts it with `exchange_cells`.
+fn evaluate_trial_swap(
+    db: &mut DesignDb,
+    tech_db: &TechDb,
+    net_ext: &[NetExtrema],
+    incident: &[usize],
+    c1: usize,
+    c2: usize,
+    eval: &mut Pass1Eval,
+) -> (i64, i64) {
+    let hpwl_before: i64 = incident.iter().map(|&n| cached_hpwl(&net_ext[n])).sum();
+    exchange_cells(db, c1, c2);
+    let mut hpwl_after = 0i64;
+    for &n in incident {
+        moved_pins_on_net(db, n, c1, c2, &mut eval.moved);
+        hpwl_after += net_hpwl_after_swap(db, tech_db, n, &net_ext[n], &eval.moved, &mut eval.fallbacks);
+    }
+    (hpwl_before, hpwl_after)
+}
+
+// Exchanges position and orientation of two cells. Applying it twice restores both.
+fn exchange_cells(db: &mut DesignDb, c1: usize, c2: usize) {
+    db.cell_x_dbu.swap(c1, c2);
+    db.cell_y_dbu.swap(c1, c2);
+    db.cell_orient.swap(c1, c2);
+}
+
 const SWAP_MAX_DX_DBU: i32 = 25_000;
 
 // (x_dbu, movable index, cell): sorted, so the x window is a binary-searched range.
@@ -153,6 +327,7 @@ fn band_insert(band: &mut Vec<BandEntry>, entry: BandEntry) {
 
 // Equal-width swaps, each cell against later cells in `movable_cells` order.
 // The index is rebuilt here, once per round, and updated on every accepted swap.
+// Returns the number of trial evaluations that rescanned a net in full.
 fn equal_width_swap_pass(
     design_db: &mut DesignDb,
     tech_db: &TechDb,
@@ -160,7 +335,7 @@ fn equal_width_swap_pass(
     cell_w_dbu: &[i32],
     cell_nets: &[Vec<usize>],
     band_ys: &[i32],
-) {
+) -> usize {
     let max_dy = 4 * tech_db.site_height_dbu;
 
     let mut cell_mi = vec![usize::MAX; design_db.num_cells()];
@@ -177,12 +352,17 @@ fn equal_width_swap_pass(
         band.sort_unstable();
     }
 
+    // Extrema of every net at the committed positions. Rebuilt for a pair's incident nets on accept.
+    let mut net_ext: Vec<NetExtrema> = (0..design_db.num_nets())
+        .map(|net| build_net_extrema(design_db, tech_db, net))
+        .collect();
+    let mut eval = Pass1Eval::default();
+
     let mut candidates: Vec<usize> = Vec::new();
     for (i, &c1) in movable_cells.iter().enumerate() {
         let w1 = cell_w_dbu[c1];
         let x1 = design_db.cell_x_dbu[c1];
         let y1 = design_db.cell_y_dbu[c1];
-        let o1 = design_db.cell_orient[c1];
 
         candidates.clear();
         let band_lo = band_ys.partition_point(|&by| by < y1.saturating_sub(max_dy));
@@ -204,7 +384,6 @@ fn equal_width_swap_pass(
             }
             let x2 = design_db.cell_x_dbu[c2];
             let y2 = design_db.cell_y_dbu[c2];
-            let o2 = design_db.cell_orient[c2];
 
             if (y1 - y2).abs() > max_dy || (x1 - x2).abs() > SWAP_MAX_DX_DBU {
                 continue;
@@ -221,16 +400,8 @@ fn equal_width_swap_pass(
                 continue;
             }
 
-            let hpwl_before: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
-
-            design_db.cell_x_dbu[c1] = x2;
-            design_db.cell_y_dbu[c1] = y2;
-            design_db.cell_orient[c1] = o2;
-            design_db.cell_x_dbu[c2] = x1;
-            design_db.cell_y_dbu[c2] = y1;
-            design_db.cell_orient[c2] = o1;
-
-            let hpwl_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
+            let (hpwl_before, hpwl_after) =
+                evaluate_trial_swap(design_db, tech_db, &net_ext, &incident, c1, c2, &mut eval);
 
             if hpwl_after < hpwl_before {
                 // design_db already holds the new positions. Remove both old entries before
@@ -242,19 +413,17 @@ fn equal_width_swap_pass(
                 band_remove(&mut bands[b2], (x2, mi2, c2));
                 band_insert(&mut bands[b2], (x2, i, c1));
                 band_insert(&mut bands[b1], (x1, mi2, c2));
+                for &n in &incident {
+                    net_ext[n] = build_net_extrema(design_db, tech_db, n);
+                }
                 // Keep swap!
                 break;
             } else {
-                // Revert swap
-                design_db.cell_x_dbu[c1] = x1;
-                design_db.cell_y_dbu[c1] = y1;
-                design_db.cell_orient[c1] = o1;
-                design_db.cell_x_dbu[c2] = x2;
-                design_db.cell_y_dbu[c2] = y2;
-                design_db.cell_orient[c2] = o2;
+                exchange_cells(design_db, c1, c2);
             }
         }
     }
+    eval.fallbacks
 }
 
 pub fn legalize_placement(
@@ -504,12 +673,14 @@ pub fn legalize_placement(
         *nets_entry = nets.into_iter().collect();
     }
 
+    let mut pass1_eval_fallbacks = 0usize;
     for _round in 0..4 {
         // Pass 1: Equal-width cell swaps
         let mut band_ys: Vec<i32> = sub_rows.iter().map(|sr| sr.orig_y_dbu).collect();
         band_ys.sort_unstable();
         band_ys.dedup();
-        equal_width_swap_pass(design_db, tech_db, &movable_cells, &cell_w_dbu, &cell_nets, &band_ys);
+        pass1_eval_fallbacks +=
+            equal_width_swap_pass(design_db, tech_db, &movable_cells, &cell_w_dbu, &cell_nets, &band_ys);
 
         // Re-synchronize sub_row.cells according to current design_db positions
         for sr in &mut sub_rows {
@@ -682,6 +853,7 @@ pub fn legalize_placement(
         pre_legal_hpwl_dbu,
         post_abacus_hpwl_dbu,
         final_hpwl_dbu,
+        pass1_eval_fallbacks,
     })
 }
 
@@ -942,6 +1114,206 @@ mod tests {
         run_pass1(&mut db, &tech_db);
         assert_eq!((db.cell_x_dbu[0], db.cell_y_dbu[0]), (0, 0));
         assert_eq!((db.cell_x_dbu[11], db.cell_y_dbu[11]), (40_000, 100));
+    }
+
+    // xorshift64: deterministic random inputs without a dev-dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    fn pass1_tech() -> TechDb {
+        let mut tech_db = TechDb::new();
+        tech_db.site_height_dbu = 100;
+        tech_db.macros.push(MacroDef {
+            name: SymbolId(0),
+            class: MacroClass::Core,
+            width_dbu: 200,
+            height_dbu: 100,
+            pin_offset: 0,
+            pin_count: 0,
+            obs_rects: Vec::new(),
+        });
+        tech_db
+    }
+
+    // `cells[c]` is (x, y, orient). `pins[p]` is (cell, net, offset_x, offset_y) in pin id
+    // order; a pin with no cell is a primary I/O port whose offset is absolute.
+    fn build_pass1_db(
+        cells: &[(i32, i32, Orient)],
+        pins: &[(Option<usize>, Option<usize>, i32, i32)],
+        num_nets: usize,
+    ) -> DesignDb {
+        let n = cells.len();
+        let p = pins.len();
+        let mut cell_pin_ids = Vec::new();
+        let mut cell_pin_offsets = vec![0u32];
+        for c in 0..n {
+            cell_pin_ids.extend((0..p).filter(|&i| pins[i].0 == Some(c)).map(|i| PinId(i as u32)));
+            cell_pin_offsets.push(cell_pin_ids.len() as u32);
+        }
+        let mut net_pin_ids = Vec::new();
+        let mut net_pin_offsets = vec![0u32];
+        for net in 0..num_nets {
+            net_pin_ids.extend((0..p).filter(|&i| pins[i].1 == Some(net)).map(|i| PinId(i as u32)));
+            net_pin_offsets.push(net_pin_ids.len() as u32);
+        }
+
+        let mut db = DesignDb::new();
+        db.cell_names = vec![SymbolId(0); n];
+        db.cell_macros = vec![MacroId(0); n];
+        db.cell_status = vec![PlacementStatus::Placed; n];
+        db.cell_x_dbu = cells.iter().map(|c| c.0).collect();
+        db.cell_y_dbu = cells.iter().map(|c| c.1).collect();
+        db.cell_orient = cells.iter().map(|c| c.2).collect();
+        db.cell_pin_offsets = cell_pin_offsets;
+        db.cell_pin_ids = cell_pin_ids;
+        db.pin_names = vec![SymbolId(0); p];
+        db.pin_dirs = vec![PinDir::Input; p];
+        db.pin_cells = pins.iter().map(|q| q.0.map(|c| CellId(c as u32))).collect();
+        db.pin_macro_pins = vec![None; p];
+        db.pin_lib_pins = vec![None; p];
+        db.pin_nets = pins.iter().map(|q| q.1.map(|net| NetId(net as u32))).collect();
+        db.pin_offset_x_dbu = pins.iter().map(|q| q.2).collect();
+        db.pin_offset_y_dbu = pins.iter().map(|q| q.3).collect();
+        db.pin_is_driver = vec![false; p];
+        db.io_pins = (0..p).filter(|&i| pins[i].0.is_none()).map(|i| PinId(i as u32)).collect();
+        db.net_names = vec![SymbolId(0); num_nets];
+        db.net_pin_offsets = net_pin_offsets;
+        db.net_pin_ids = net_pin_ids;
+        db
+    }
+
+    fn random_pass1_db(rng: &mut Rng) -> DesignDb {
+        // Coordinates come from a small grid so that ties at the extrema are common.
+        let orients = [Orient::N, Orient::S, Orient::FN, Orient::FS];
+        let n_cells = 3 + rng.below(6) as usize;
+        let n_nets = 2 + rng.below(4) as usize;
+        let cells: Vec<(i32, i32, Orient)> = (0..n_cells)
+            .map(|_| {
+                let x = 100 * rng.below(6) as i32;
+                let y = 100 * rng.below(3) as i32;
+                (x, y, orients[rng.below(4) as usize])
+            })
+            .collect();
+        let mut pins = Vec::new();
+        for c in 0..n_cells {
+            for _ in 0..1 + rng.below(4) {
+                let net = (rng.below(5) != 0).then(|| rng.below(n_nets as u64) as usize);
+                let ox = 50 * rng.below(5) as i32;
+                let oy = 50 * rng.below(3) as i32;
+                pins.push((Some(c), net, ox, oy));
+            }
+        }
+        for _ in 0..rng.below(3) {
+            let net = rng.below(n_nets as u64) as usize;
+            let x = 100 * rng.below(6) as i32;
+            let y = 100 * rng.below(3) as i32;
+            pins.push((None, Some(net), x, y));
+        }
+        build_pass1_db(&cells, &pins, n_nets)
+    }
+
+    fn incident_nets(db: &DesignDb, c1: usize, c2: usize) -> Vec<usize> {
+        let mut nets: Vec<usize> = [c1, c2]
+            .into_iter()
+            .flat_map(|c| db.cell_pins(CellId(c as u32)).iter())
+            .filter_map(|p| db.pin_nets[p.0 as usize])
+            .map(|n| n.0 as usize)
+            .collect();
+        nets.sort_unstable();
+        nets.dedup();
+        nets
+    }
+
+    // Tries every cell pair as a swap, like pass 1 does, and checks the cached sums against
+    // full scans on the same positions. An improving swap is accepted and the cache of its
+    // incident nets rebuilt, so later trials start from the accepted state.
+    // Returns the number of full rescans.
+    fn differential_sweep(db: &mut DesignDb, tech_db: &TechDb) -> usize {
+        let mut net_ext: Vec<NetExtrema> = Vec::new();
+        for net in 0..db.num_nets() {
+            net_ext.push(build_net_extrema(db, tech_db, net));
+        }
+        let mut eval = Pass1Eval::default();
+        for c1 in 0..db.num_cells() {
+            for c2 in (c1 + 1)..db.num_cells() {
+                let incident = incident_nets(db, c1, c2);
+                if incident.is_empty() {
+                    continue;
+                }
+                let full_before: i64 = incident.iter().map(|&n| net_hpwl_dbu(db, tech_db, n)).sum();
+                let (cached_before, cached_after) =
+                    evaluate_trial_swap(db, tech_db, &net_ext, &incident, c1, c2, &mut eval);
+                assert_eq!(cached_before, full_before, "before sum, pair ({c1}, {c2})");
+                // The trial is applied here, so this is the full-scan after sum.
+                let full_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(db, tech_db, n)).sum();
+                assert_eq!(cached_after, full_after, "after sum, pair ({c1}, {c2})");
+
+                if cached_after < cached_before {
+                    for &n in &incident {
+                        net_ext[n] = build_net_extrema(db, tech_db, n);
+                    }
+                } else {
+                    exchange_cells(db, c1, c2);
+                }
+            }
+        }
+        for net in 0..db.num_nets() {
+            assert_eq!(cached_hpwl(&net_ext[net]), net_hpwl_dbu(db, tech_db, net), "final cache, net {net}");
+        }
+        eval.fallbacks
+    }
+
+    #[test]
+    fn test_cached_pass1_eval_matches_full_scan_on_random_designs() {
+        let tech_db = pass1_tech();
+        let mut total_fallbacks = 0;
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut db = random_pass1_db(&mut rng);
+            total_fallbacks += differential_sweep(&mut db, &tech_db);
+        }
+        assert!(total_fallbacks > 0, "random designs must exercise the full-scan fallback");
+    }
+
+    #[test]
+    fn test_cached_pass1_eval_falls_back_when_both_top2_pins_move() {
+        // Net 0: A holds the two smallest x (0 and 10) and B holds 600. Swapping A and B moves
+        // both top-2 pins, while C at x=1000 stays put. Only a full rescan of net 0 gives the
+        // new minimum x=100. Trial positions are A at 100 (pins 100 and 110), B at 0.
+        // Net 1 joins only A and B, so every pin on it moves and no rescan is needed.
+        let tech_db = pass1_tech();
+        let cells = [(0, 0, Orient::N), (100, 0, Orient::N), (1000, 0, Orient::N)];
+        let pins = [
+            (Some(0), Some(0), 0, 0),
+            (Some(0), Some(0), 10, 0),
+            (Some(1), Some(0), 500, 0),
+            (Some(2), Some(0), 0, 0),
+            (Some(0), Some(1), 0, 0),
+            (Some(1), Some(1), 0, 0),
+        ];
+        let mut db = build_pass1_db(&cells, &pins, 2);
+        let net_ext: Vec<NetExtrema> = (0..2).map(|n| build_net_extrema(&db, &tech_db, n)).collect();
+        let mut eval = Pass1Eval::default();
+
+        let incident = incident_nets(&db, 0, 1);
+        assert_eq!(incident, vec![0, 1]);
+        let (cached_before, cached_after) =
+            evaluate_trial_swap(&mut db, &tech_db, &net_ext, &incident, 0, 1, &mut eval);
+        assert_eq!(cached_before, 1100);
+        assert_eq!(cached_after, 1000);
+        assert_eq!(eval.fallbacks, 1, "only net 0 needs a full rescan");
+
+        // The trial is still applied, so the full scan sees the same positions as the cache.
+        let full_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(&db, &tech_db, n)).sum();
+        assert_eq!(full_after, 1000);
     }
 
     fn dirs_home() -> PathBuf {
