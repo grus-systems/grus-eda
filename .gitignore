@@ -5,6 +5,7 @@
 .DS_Store
 tests/designs/pdk
 tests/designs/gcd/runs
+tests/designs/gcd/gcd.drc.rpt
 tests/designs/aes/runs
 tests/designs/jpeg/runs
 tests/designs/ibex/runs
