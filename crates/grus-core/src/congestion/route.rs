@@ -603,11 +603,11 @@ pub fn estimate_congestion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{design_dir, sky130_hd};
     use crate::congestion::gcell::GPoint;
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
-    use std::path::PathBuf;
 
     #[test]
     fn test_pass1_and_pass2_routing() {
@@ -656,14 +656,9 @@ mod tests {
 
     #[test]
     fn test_gcd_congestion_estimation_ranking() {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join(".ciel"));
-
-        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
-        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
-        let def_path = repo_root.join("tests/designs/gcd/gcd.placed.def");
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        let def_path = design_dir("gcd").join("gcd.placed.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !def_path.exists() {
             panic!("Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
@@ -708,19 +703,14 @@ mod tests {
 
     #[test]
     fn test_gcd_util_sweep_ranking() {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join(".ciel"));
-
-        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
-        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
             .expect("Failed to load TechDb");
 
-        let ref_path = repo_root.join("tests/designs/gcd/gcd.reference.json");
+        let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path).expect("Reference JSON");
         let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes).expect("Parse JSON");
 
@@ -729,7 +719,7 @@ mod tests {
         let mut ovfs_80 = Vec::new();
 
         for &util in &utils {
-            let def_path = repo_root.join(format!("tests/designs/gcd/gcd.util{}.def", util));
+            let def_path = design_dir("gcd").join(format!("gcd.util{}.def", util));
             assert!(def_path.exists(), "DEF fixture {:?} missing", def_path);
             let design_db = parse_def(&def_path, &tech_db, None).expect("Parse util DEF");
 
@@ -795,9 +785,5 @@ mod tests {
             .map(|v| v.as_f64().unwrap())
             .collect();
         assert_eq!(ref_ovfs_80, vec![154.0, 314.0, 312.0, 350.0]);
-    }
-
-    fn dirs_home() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
     }
 }

@@ -666,7 +666,7 @@ pub fn load_tech_db(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::test_support::{design_dir, sky130_hd};
 
     const SAMPLE_TLEF: &str = r#"
 VERSION 5.7 ;
@@ -811,13 +811,8 @@ END inv_sample
 
     #[test]
     fn test_sky130_lef_integration() {
-        let home = dirs_home();
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".ciel"));
-
-        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
-        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
 
         if !tlef_path.is_file() {
             panic!("PDK tlef file missing at {:?}", tlef_path);
@@ -834,8 +829,7 @@ END inv_sample
 
         println!("sky130 LEF load elapsed: {:?}", elapsed);
 
-        let ref_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/designs/gcd/gcd.reference.json");
+        let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
             .unwrap_or_else(|e| panic!("Reference file missing at {:?}: {}", ref_path, e));
         let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
@@ -910,9 +904,5 @@ END inv_sample
         let xor2 = &tech_db.macros[tech_db.macro_by_name[&xor2_sym].0 as usize];
         let xor2_met1_obs = xor2.obs_rects.iter().filter(|(l, _)| *l == met1_id).count();
         assert_eq!(xor2_met1_obs, 1, "xor2_2 met1 OBS: 5 rects merged into 1 jumper");
-    }
-
-    fn dirs_home() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
     }
 }

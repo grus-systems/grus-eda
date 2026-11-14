@@ -953,7 +953,7 @@ pub fn verify_legality(design_db: &DesignDb, tech_db: &TechDb) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::test_support::{design_dir, sky130_hd};
     use crate::interner::{CellId, MacroId, NetId, PinDir, PinId, StringInterner, SymbolId};
     use crate::placement::nesterov::{run_nesterov_placement, NesterovConfig};
     use crate::tech_db::MacroDef;
@@ -962,14 +962,9 @@ mod tests {
 
     #[test]
     fn test_gcd_place_and_legalize() {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join(".ciel"));
-
-        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
-        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
-        let floorplan_def_path = repo_root.join("tests/designs/gcd/gcd.floorplan.def");
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        let floorplan_def_path = design_dir("gcd").join("gcd.floorplan.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !floorplan_def_path.exists() {
             panic!("Required test files missing: tlef={:?}, lef={:?}, def={:?}",
@@ -1001,7 +996,7 @@ mod tests {
         verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
 
         // 4. Assert final HPWL is within 5% of reference placed_hpwl_dbu
-        let ref_path = repo_root.join("tests/designs/gcd/gcd.reference.json");
+        let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path).expect("Reference JSON");
         let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes).expect("Parse JSON");
         let ref_hpwl_dbu = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
@@ -1265,8 +1260,8 @@ mod tests {
                 }
             }
         }
-        for net in 0..db.num_nets() {
-            assert_eq!(cached_hpwl(&net_ext[net]), net_hpwl_dbu(db, tech_db, net), "final cache, net {net}");
+        for (net, ext) in net_ext.iter().enumerate() {
+            assert_eq!(cached_hpwl(ext), net_hpwl_dbu(db, tech_db, net), "final cache, net {net}");
         }
         eval.fallbacks
     }
@@ -1314,9 +1309,5 @@ mod tests {
         // The trial is still applied, so the full scan sees the same positions as the cache.
         let full_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(&db, &tech_db, n)).sum();
         assert_eq!(full_after, 1000);
-    }
-
-    fn dirs_home() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
     }
 }

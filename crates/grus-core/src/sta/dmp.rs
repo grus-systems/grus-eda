@@ -357,7 +357,8 @@ mod tests {
     /// (~1e-5) only. The charge evaluation must not move the model: see design Section 7.
     #[test]
     fn golden_regression_values_are_reproduced() {
-        let tables: [(&str, &dyn Fn(f64) -> (f64, f64)); 3] = [
+        type TableFn = dyn Fn(f64) -> (f64, f64);
+        let tables: [(&str, &TableFn); 3] = [
             ("lin1", &|c| (0.7 * c + 0.05, 2.2 * c + 0.02)),
             ("lin2", &|c| (1.4 * c + 0.05, 4.4 * c + 0.02)),
             ("nl", &|c| (0.05 + 0.9 * c.powf(0.8), 0.02 + 1.4 * c.powf(0.9))),

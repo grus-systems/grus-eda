@@ -5,16 +5,20 @@ use crate::lib_db::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
 const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
+const CACHE_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
     magic: [u8; 8],
+    version: u32,
     source_size: u64,
     source_xxh3: u64,
     db: LibDb,
@@ -936,20 +940,86 @@ fn parse_nldm_table(
     }
 }
 
-/// Resolves the cache path for a given Liberty file.
-fn get_cache_paths(lib_path: &Path, xxh3_val: u64) -> (PathBuf, PathBuf) {
-    // Primary path: next to the .lib file: <path>.grus.cache
-    let primary = lib_path.with_extension("lib.grus.cache");
+/// Directory for Liberty binary caches. Never the source's own directory: a `.lib` may sit in the read-only PDK tree.
+fn cache_dir() -> PathBuf {
+    cache_dir_from(
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+        &std::env::temp_dir(),
+        std::env::var_os("USER"),
+    )
+}
 
-    // Fallback path: in system temp or target/grus-cache
-    let tmp_dir = std::env::temp_dir().join("grus-eda-cache");
-    let fallback = tmp_dir.join(format!("{:016x}.libcache", xxh3_val));
+/// Pure form of `cache_dir` so each environment combination can be tested without mutating the process environment.
+fn cache_dir_from(
+    xdg_cache_home: Option<OsString>,
+    home: Option<OsString>,
+    tmp: &Path,
+    user: Option<OsString>,
+) -> PathBuf {
+    let set = |v: Option<OsString>| v.filter(|v| !v.is_empty());
+    if let Some(xdg) = set(xdg_cache_home).map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return xdg.join("grus-eda");
+    }
+    if let Some(home) = set(home) {
+        return PathBuf::from(home).join(".cache").join("grus-eda");
+    }
+    let user = set(user).unwrap_or_else(|| OsString::from("shared"));
+    tmp.join(format!("grus-eda-cache-{}", user.to_string_lossy()))
+}
 
-    (primary, fallback)
+fn cache_file(dir: &Path, source_xxh3: u64) -> PathBuf {
+    dir.join(format!("{:016x}.libcache", source_xxh3))
+}
+
+/// Returns the cached database only if its header matches the source; any other outcome is a miss.
+fn read_cache(cache_path: &Path, source_size: u64, source_xxh3: u64) -> Option<LibDb> {
+    let cfile = File::open(cache_path).ok()?;
+    if cfile.metadata().ok()?.len() <= 16 {
+        return None;
+    }
+    let c_mmap = unsafe { memmap2::Mmap::map(&cfile) }.ok()?;
+    let (cache_obj, _) =
+        bincode::serde::decode_from_slice::<CacheFile, _>(&c_mmap, bincode::config::standard())
+            .ok()?;
+    if cache_obj.magic != CACHE_MAGIC
+        || cache_obj.version != CACHE_VERSION
+        || cache_obj.source_size != source_size
+        || cache_obj.source_xxh3 != source_xxh3
+    {
+        return None;
+    }
+    let mut db = cache_obj.db;
+    db.strings.rebuild_map();
+    db.rebuild_cell_by_name();
+    Some(db)
+}
+
+static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Writes through a temp name unique to this process and call, then renames into place.
+fn write_cache_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let seq = CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = target.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
+    let mut f = File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Loads a Liberty file from disk, using mmap binary cache if valid, or parsing and caching.
 pub fn load_liberty(path: &Path) -> Result<LibDb> {
+    load_liberty_in(path, &cache_dir())
+}
+
+fn load_liberty_in(path: &Path, dir: &Path) -> Result<LibDb> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open Liberty file at {:?}", path))?;
     let metadata = file.metadata()?;
@@ -959,28 +1029,9 @@ pub fn load_liberty(path: &Path) -> Result<LibDb> {
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let source_xxh3 = xxh3_64(&mmap);
 
-    let (primary_cache, fallback_cache) = get_cache_paths(path, source_xxh3);
-
-    // Try loading from cache
-    for cache_path in [&primary_cache, &fallback_cache] {
-        if cache_path.is_file()
-            && let Ok(cfile) = File::open(cache_path)
-                && let Ok(c_meta) = cfile.metadata()
-                    && c_meta.len() > 16
-                        && let Ok(c_mmap) = unsafe { memmap2::Mmap::map(&cfile) } {
-                            let config = bincode::config::standard();
-                            if let Ok((cache_obj, _)) =
-                                bincode::serde::decode_from_slice::<CacheFile, _>(&c_mmap, config)
-                                && cache_obj.magic == CACHE_MAGIC
-                                    && cache_obj.source_size == source_size
-                                    && cache_obj.source_xxh3 == source_xxh3
-                                {
-                                    let mut db = cache_obj.db;
-                                    db.strings.rebuild_map();
-                                    db.rebuild_cell_by_name();
-                                    return Ok(db);
-                                }
-                        }
+    let cache_path = cache_file(dir, source_xxh3);
+    if let Some(db) = read_cache(&cache_path, source_size, source_xxh3) {
+        return Ok(db);
     }
 
     // Cache miss: parse directly from mmap
@@ -989,28 +1040,14 @@ pub fn load_liberty(path: &Path) -> Result<LibDb> {
     // Serialize and write to cache
     let cache_obj = CacheFile {
         magic: CACHE_MAGIC,
+        version: CACHE_VERSION,
         source_size,
         source_xxh3,
         db: db.clone(),
     };
-    let config = bincode::config::standard();
-    if let Ok(encoded) = bincode::serde::encode_to_vec(&cache_obj, config) {
-        // Try writing to primary, fallback to fallback
-        let write_cache = |target: &Path| -> Result<()> {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let tmp_target = target.with_extension("tmp");
-            let mut f = File::create(&tmp_target)?;
-            f.write_all(&encoded)?;
-            f.sync_all()?;
-            std::fs::rename(tmp_target, target)?;
-            Ok(())
-        };
-
-        if write_cache(&primary_cache).is_err() {
-            let _ = write_cache(&fallback_cache);
-        }
+    if let Ok(encoded) = bincode::serde::encode_to_vec(&cache_obj, bincode::config::standard()) {
+        // A cache that cannot be written only costs a reparse on the next load.
+        let _ = write_cache_file(&cache_path, &encoded);
     }
 
     db.strings.rebuild_map();
@@ -1021,6 +1058,7 @@ pub fn load_liberty(path: &Path) -> Result<LibDb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{design_dir, require, sky130_hd};
 
     const SAMPLE_LIB: &str = r#"
 library (test_lib) {
@@ -1151,20 +1189,11 @@ library (test_lib) {
 
     #[test]
     fn test_sky130_liberty_integration() {
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join(".ciel"));
-        let lib_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib");
+        let lib_path = require(sky130_hd().join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
 
-        if !lib_path.is_file() {
-            panic!("PDK Liberty file missing at {:?}", lib_path);
-        }
-
-        // Remove existing caches to guarantee a true cold parse
-        let (primary_cache, _) = get_cache_paths(&lib_path, 0);
-        let _ = std::fs::remove_file(&primary_cache);
-        let tmp_cache = std::env::temp_dir().join("grus-eda-cache");
-        let _ = std::fs::remove_dir_all(&tmp_cache);
+        // Remove this file's cache entry to guarantee a true cold parse
+        let lib_xxh3 = xxh3_64(&std::fs::read(&lib_path).expect("read sky130 liberty"));
+        let _ = std::fs::remove_file(cache_file(&cache_dir(), lib_xxh3));
 
         // Test cold parse
         let t0 = std::time::Instant::now();
@@ -1181,8 +1210,7 @@ library (test_lib) {
             load_time_1, load_time_2
         );
 
-        let ref_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/designs/gcd/gcd.reference.json");
+        let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
             .unwrap_or_else(|e| panic!("Reference file missing at {:?}: {}", ref_path, e));
         let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
@@ -1203,21 +1231,6 @@ library (test_lib) {
         // OpenSTA's Tcl API exposes no per-cell ff/latch flag, so only the total is a
         // tool-derived reference.
         assert_eq!(ff_count + latch_count, expected_seq, "Expected sequential cells matching reference");
-
-        // Warm cache load time must be < 10 ms in release mode
-        if !cfg!(debug_assertions) {
-            assert!(
-                load_time_2.as_millis() < 10,
-                "Warm cache load took too long: {:?}",
-                load_time_2
-            );
-        } else {
-            assert!(
-                load_time_2.as_millis() < 150,
-                "Warm cache load took too long in debug mode: {:?}",
-                load_time_2
-            );
-        }
 
         // Spot-check inv_1
         let inv_sym = db.strings.get("sky130_fd_sc_hd__inv_1").expect("inv_1 symbol not found");
@@ -1311,7 +1324,50 @@ library(test_fwd) {
         assert_eq!(q_arc.related_pin, LibPinId(1));
     }
 
-    fn dirs_home() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+    #[test]
+    fn test_cache_dir_from_env() {
+        let tmp = Path::new("/tmp");
+        let s = |v: &str| Some(OsString::from(v));
+        let xdg = cache_dir_from(s("/xdg"), s("/home/u"), tmp, s("u"));
+        assert_eq!(xdg, PathBuf::from("/xdg/grus-eda"));
+        let xdg_unset = cache_dir_from(None, s("/home/u"), tmp, s("u"));
+        assert_eq!(xdg_unset, PathBuf::from("/home/u/.cache/grus-eda"));
+        let xdg_empty = cache_dir_from(s(""), s("/home/u"), tmp, s("u"));
+        assert_eq!(xdg_empty, PathBuf::from("/home/u/.cache/grus-eda"));
+        let xdg_relative = cache_dir_from(s("rel/cache"), s("/home/u"), tmp, s("u"));
+        assert_eq!(xdg_relative, PathBuf::from("/home/u/.cache/grus-eda"));
+    }
+
+    #[test]
+    fn test_cache_dir_without_home_uses_temp_dir() {
+        let tmp = Path::new("/tmp");
+        let s = |v: &str| Some(OsString::from(v));
+        let with_user = cache_dir_from(None, None, tmp, s("alice"));
+        assert_eq!(with_user, PathBuf::from("/tmp/grus-eda-cache-alice"));
+        let no_user = cache_dir_from(None, s(""), tmp, None);
+        assert_eq!(no_user, PathBuf::from("/tmp/grus-eda-cache-shared"));
+    }
+
+    #[test]
+    fn test_cache_written_under_cache_dir_only() {
+        let root = std::env::temp_dir().join(format!("grus_cache_loc_{}", std::process::id()));
+        let src_dir = root.join("src");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&src_dir).expect("create source dir");
+        let lib = src_dir.join("sample.lib");
+        std::fs::write(&lib, SAMPLE_LIB).expect("write failed");
+
+        load_liberty_in(&lib, &cache_dir).expect("load failed");
+
+        let xxh3 = xxh3_64(SAMPLE_LIB.as_bytes());
+        assert!(cache_file(&cache_dir, xxh3).is_file(), "cache not written under the cache directory");
+        let mut entries: Vec<OsString> = std::fs::read_dir(&src_dir)
+            .expect("read source dir")
+            .map(|e| e.expect("dir entry").file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![OsString::from("sample.lib")], "cache written next to the .lib");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

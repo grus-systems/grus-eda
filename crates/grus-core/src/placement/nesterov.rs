@@ -357,7 +357,7 @@ pub fn run_nesterov_placement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::test_support::{design_dir, sky130_hd};
     use crate::design_db::PlacementStatus;
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
@@ -365,14 +365,9 @@ mod tests {
 
     #[test]
     fn test_gcd_nesterov_global_placement() {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join(".ciel"));
-
-        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
-        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
-        let floorplan_def_path = repo_root.join("tests/designs/gcd/gcd.floorplan.def");
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        let floorplan_def_path = design_dir("gcd").join("gcd.floorplan.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !floorplan_def_path.exists() {
             panic!("Required test files missing: tlef={:?}, lef={:?}, def={:?}",
@@ -582,9 +577,5 @@ mod tests {
         assert!(res.converged, "initial overflow already below stop value");
         assert_eq!(res.iterations, 0, "no gradient step should run");
         assert_eq!(res.final_overflow, res.initial_overflow);
-    }
-
-    fn dirs_home() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
     }
 }

@@ -486,11 +486,11 @@ pub fn decompose_design_nets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{design_dir, sky130_hd};
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
     use std::collections::{HashMap, HashSet, VecDeque};
-    use std::path::PathBuf;
 
     fn verify_connectivity(pts: &[GPoint], segs: &[SteinerSegment]) {
         let mut unique: Vec<GPoint> = pts.to_vec();
@@ -596,14 +596,9 @@ mod tests {
 
     #[test]
     fn test_gcd_rsmt_decomposition() {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_home().join(".ciel"));
-
-        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
-        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
-        let def_path = repo_root.join("tests/designs/gcd/gcd.placed.def");
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        let def_path = design_dir("gcd").join("gcd.placed.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !def_path.exists() {
             panic!("Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
@@ -617,7 +612,7 @@ mod tests {
         let design_db = parse_def(&def_path, &tech_db, None)
             .expect("Failed to parse placed DEF");
 
-        let ref_path = repo_root.join("tests/designs/gcd/gcd.reference.json");
+        let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
             .unwrap_or_else(|e| panic!("Reference file missing at {:?}: {}", ref_path, e));
         let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
@@ -693,10 +688,6 @@ mod tests {
         let diff = (total_rsmt_wl as f64 - ref_total_demand as f64).abs();
         let pct_diff = (diff / ref_total_demand as f64) * 100.0;
         println!("RSMT WL vs OpenROAD GRT Demand diff: {:.2}%", pct_diff);
-    }
-
-    fn dirs_home() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
     }
 
     fn total_length(segs: &[(Pt, Pt)]) -> u32 {

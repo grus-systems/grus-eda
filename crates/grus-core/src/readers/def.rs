@@ -831,21 +831,15 @@ pub fn write_def(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{design_dir, sky130_hd};
     use crate::interner::StringInterner;
     use crate::readers::lef::load_tech_db;
-    use std::path::PathBuf;
 
     #[test]
     fn test_gcd_placed_def() {
-        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".ciel"));
-
-        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
-        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
-        let def_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/designs/gcd/gcd.placed.def");
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        let def_path = design_dir("gcd").join("gcd.placed.def");
 
         if !tlef_path.is_file() {
             panic!("PDK tlef file missing at {:?}", tlef_path);
@@ -864,8 +858,7 @@ mod tests {
         let db = parse_def(&def_path, &tech_db, None)
             .expect("Failed to parse placed DEF");
 
-        let ref_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/designs/gcd/gcd.reference.json");
+        let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
             .unwrap_or_else(|e| panic!("Reference file missing at {:?}: {}", ref_path, e));
         let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
@@ -900,16 +893,13 @@ mod tests {
     /// land exactly where OpenROAD's `dbITerm::getAvgXY` puts it.
     #[test]
     fn test_gcd_orientations_match_openroad_pins() {
-        let pdk_root = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".ciel"));
-        let tlef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef");
-        let lef_path = pdk_root.join("sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef");
-        let gcd_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/designs/gcd");
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        let gcd_dir = design_dir("gcd");
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", pdk_root, e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
         let db = parse_def(&gcd_dir.join("gcd.orient.def"), &tech_db, None)
             .expect("Failed to parse gcd.orient.def");
 

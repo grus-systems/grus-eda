@@ -7,6 +7,9 @@ pub mod readers;
 pub mod sta;
 pub mod tech_db;
 
+#[cfg(test)]
+mod test_support;
+
 pub use congestion::*;
 pub use design_db::*;
 pub use interner::*;

@@ -272,11 +272,11 @@ fn spef_net_tree(design: &DesignDb, net: NetId, net_name: &str, spef_net: &SpefN
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{design_dir, sky130_hd};
     use crate::congestion::rsmt::{EXACT_MAX_DEGREE, build_precise_rsmt_points};
     use crate::interner::StringInterner;
     use crate::readers::{load_liberty, load_spef, load_tech_db, parse_def};
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
 
     struct Lengths {
         table: BTreeMap<usize, (usize, usize, f64)>,
@@ -288,12 +288,8 @@ mod tests {
     /// Tree length of every net against OpenROAD's SPEF (`sum of *CAP / c0`), per net degree.
     /// The table maps degree to (nets, matching nets, worst excess in um).
     fn compare_lengths(design_name: &str) -> Lengths {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pdk = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".ciel"));
-        let lib_dir = pdk.join("sky130A/libs.ref/sky130_fd_sc_hd");
-        let dir = repo.join("tests/designs").join(design_name);
+        let lib_dir = sky130_hd();
+        let dir = design_dir(design_name);
         let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
         let mut interner = StringInterner::new();
         let tech = load_tech_db(

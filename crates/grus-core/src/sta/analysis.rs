@@ -513,10 +513,10 @@ fn endpoint_report(pin: String, max: &Worst, min: &Worst) -> EndpointReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{design_dir, sky130_hd};
     use crate::readers::{load_liberty, load_tech_db, parse_def};
     use crate::interner::StringInterner;
     use crate::sta::sdc::load_sdc;
-    use std::path::PathBuf;
 
     /// Tolerances against OpenSTA. A value passes if |ours - ref| <= max(abs, rel * |ref|).
     /// Arrival, required time and WNS use `arr_rel` or 5 ps; the E3 done criterion is 1%.
@@ -586,12 +586,8 @@ mod tests {
     #[test]
     fn test_dmp_ceff_matches_opensta_report_dcalc() {
         use crate::sta::dmp::solve_dmp;
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pdk = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".ciel"));
-        let lib_dir = pdk.join("sky130A/libs.ref/sky130_fd_sc_hd");
-        let dir = repo.join("tests/designs/picorv32");
+        let lib_dir = sky130_hd();
+        let dir = design_dir("picorv32");
         let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
         let mut interner = StringInterner::new();
         let tech = load_tech_db(
@@ -654,12 +650,8 @@ mod tests {
     }
 
     fn compare_design_with_opensta(design_name: &str, golden_key: &str, rc_mode: Rc, tol: Tol) {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pdk = std::env::var("PDK_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".ciel"));
-        let lib_dir = pdk.join("sky130A/libs.ref/sky130_fd_sc_hd");
-        let gcd = repo.join("tests/designs").join(design_name);
+        let lib_dir = sky130_hd();
+        let gcd = design_dir(design_name);
 
         let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
         let mut interner = StringInterner::new();
