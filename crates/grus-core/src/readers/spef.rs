@@ -139,6 +139,7 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{design_dir, require};
 
     const SAMPLE: &str = "*SPEF \"ieee 1481-1999\"\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n*T_UNIT 1 NS\n\
         *NAME_MAP\n*1 net\\[0\\]\n*2 u1\n\
@@ -160,5 +161,12 @@ mod tests {
     #[test]
     fn rejects_a_time_unit_other_than_ns() {
         assert!(parse_spef("*T_UNIT 1 PS\n").is_err());
+    }
+
+    #[test]
+    fn test_aes_routed_spef_present() {
+        let path = require(design_dir("aes").join("aes.routed.spef"));
+        let spef = load_spef(&path).expect("aes.routed.spef must parse");
+        assert!(!spef.nets.is_empty(), "aes.routed.spef has no nets");
     }
 }

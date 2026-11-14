@@ -831,7 +831,7 @@ pub fn write_def(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
+    use crate::test_support::{design_dir, require, sky130_hd};
     use crate::interner::StringInterner;
     use crate::readers::lef::load_tech_db;
 
@@ -929,6 +929,90 @@ mod tests {
 
         let ref_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(gcd_dir.join("gcd.reference.json")).unwrap()).unwrap();
+        assert_eq!(db.compute_hpwl_dbu(&tech_db), ref_json["orient_hpwl_dbu"].as_i64().unwrap());
+    }
+
+    #[test]
+    fn test_aes_placed_def() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let def_path = require(design_dir("aes").join("aes.placed.def"));
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb");
+
+        let db = parse_def(&def_path, &tech_db, None)
+            .expect("Failed to parse placed DEF");
+
+        let ref_path = require(design_dir("aes").join("aes.reference.json"));
+        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
+            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+
+        assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
+        assert_eq!(db.num_cells(), ref_json["instances"].as_u64().unwrap() as usize);
+        assert_eq!(db.num_rows(), ref_json["rows"].as_u64().unwrap() as usize);
+        assert_eq!(db.tracks.len(), ref_json["def_tracks_statements"].as_u64().unwrap() as usize);
+        assert_eq!(db.num_nets(), ref_json["signal_nets"].as_u64().unwrap() as usize);
+        assert_eq!(db.io_pins.len(), ref_json["bterms_signal"].as_u64().unwrap() as usize);
+        assert_eq!(db.cell_pin_ids.len(), ref_json["def_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(db.net_pin_ids.len(), ref_json["connected_net_pins"].as_u64().unwrap() as usize);
+
+        let hpwl = db.compute_hpwl_dbu(&tech_db);
+        assert_eq!(hpwl, ref_json["placed_hpwl_dbu"].as_i64().unwrap(), "HPWL must equal OpenROAD getTermBBox sum");
+
+        let tmp_dir = std::env::temp_dir();
+        let out_def_path = tmp_dir.join("grus_aes_placed_roundtrip.def");
+        write_def(&db, &tech_db, &def_path, &out_def_path)
+            .expect("Failed to write DEF template");
+        let db_roundtrip = parse_def(&out_def_path, &tech_db, None)
+            .expect("Failed to re-parse written DEF");
+        assert_eq!(db_roundtrip.num_cells(), db.num_cells());
+        assert_eq!(db_roundtrip.num_nets(), db.num_nets());
+        assert_eq!(db_roundtrip.compute_hpwl_dbu(&tech_db), hpwl);
+        let _ = std::fs::remove_file(out_def_path);
+    }
+
+    /// Every instance pin of aes with the cells cycled through all 8 orientations must
+    /// land exactly where OpenROAD's `dbITerm::getAvgXY` puts it.
+    #[test]
+    fn test_aes_orientations_match_openroad_pins() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let aes_dir = design_dir("aes");
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+        let db = parse_def(&require(aes_dir.join("aes.orient.def")), &tech_db, None)
+            .expect("Failed to parse aes.orient.def");
+
+        let mut ours = std::collections::HashMap::new();
+        for &pin in &db.net_pin_ids {
+            let p = pin.0 as usize;
+            if let Some(cell) = db.pin_cells[p] {
+                let name = format!(
+                    "{}/{}",
+                    db.strings.resolve(db.cell_names[cell.0 as usize]),
+                    db.strings.resolve(db.pin_names[p])
+                );
+                ours.insert(name, db.pin_pos_dbu(pin, &tech_db));
+            }
+        }
+
+        let golden = std::fs::read_to_string(require(aes_dir.join("aes.orient.pins.txt")))
+            .expect("Failed to read aes.orient.pins.txt");
+        let mut checked = 0;
+        for line in golden.lines().filter(|l| !l.starts_with('#')) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let want = (f[1].parse::<i32>().unwrap(), f[2].parse::<i32>().unwrap());
+            assert_eq!(ours.get(f[0]), Some(&want), "pin {}", f[0]);
+            checked += 1;
+        }
+        assert_eq!(checked, ours.len(), "golden file must cover every signal instance pin");
+
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(require(aes_dir.join("aes.reference.json"))).unwrap()).unwrap();
         assert_eq!(db.compute_hpwl_dbu(&tech_db), ref_json["orient_hpwl_dbu"].as_i64().unwrap());
     }
 }

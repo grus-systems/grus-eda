@@ -48,7 +48,13 @@ pub struct CongestionReport {
     pub max_edge_overflow: f32,
     pub top_05pct_overflow: f32,
     pub overflow_gcells: usize,
-    pub gcell_usage_ratio: Vec<f32>, // length nx * ny, max(demand/cap) over adjacent edges
+    pub gcell_usage_ratio: Vec<f32>,
+    /// Usage ratio (demand / capacity) per horizontal edge, indexed
+    /// `y * (nx - 1) + x` like `GCellGrid::h_cap`.
+    pub h_usage_ratio: Vec<f32>,
+    /// Usage ratio per vertical edge, indexed `y * nx + x` like
+    /// `GCellGrid::v_cap`.
+    pub v_usage_ratio: Vec<f32>, // length nx * ny, max(demand/cap) over adjacent edges
 }
 
 impl GCellGrid {

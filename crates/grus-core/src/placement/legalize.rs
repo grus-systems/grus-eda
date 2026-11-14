@@ -953,7 +953,7 @@ pub fn verify_legality(design_db: &DesignDb, tech_db: &TechDb) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
+    use crate::test_support::{design_dir, require, sky130_hd};
     use crate::interner::{CellId, MacroId, NetId, PinDir, PinId, StringInterner, SymbolId};
     use crate::placement::nesterov::{run_nesterov_placement, NesterovConfig};
     use crate::tech_db::MacroDef;
@@ -1309,5 +1309,77 @@ mod tests {
         // The trial is still applied, so the full scan sees the same positions as the cache.
         let full_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(&db, &tech_db, n)).sum();
         assert_eq!(full_after, 1000);
+    }
+
+    #[test]
+    fn test_aes_place_and_legalize() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let floorplan_def_path = require(design_dir("aes").join("aes.floorplan.def"));
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb");
+        let mut design_db = parse_def(&floorplan_def_path, &tech_db, None)
+            .expect("Failed to parse floorplan DEF");
+
+        let gp_res = run_nesterov_placement(&design_db, &tech_db, &NesterovConfig::default());
+        println!(
+            "aes GP: converged={}, iterations={}, final_overflow={:.4}, final_hpwl_um={:.1}",
+            gp_res.converged, gp_res.iterations, gp_res.final_overflow, gp_res.final_hpwl_um
+        );
+
+        let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
+            .expect("Legalization must succeed");
+        verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
+
+        // Printed, not asserted: the 5% HPWL bound is applied only once this gap is recorded in docs/results.md.
+        let ref_path = require(design_dir("aes").join("aes.reference.json"));
+        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
+            .expect("Parse aes.reference.json");
+        let ref_hpwl_dbu = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
+        let gap = (leg_res.final_hpwl_dbu - ref_hpwl_dbu) as f64 / ref_hpwl_dbu as f64;
+        println!(
+            "aes HPWL: reference={} dbu, ours={} dbu, gap={:+.2}%",
+            ref_hpwl_dbu, leg_res.final_hpwl_dbu, gap * 100.0
+        );
+
+        let out_def_path = std::env::temp_dir().join("grus_aes_legalized_test.def");
+        write_def(&design_db, &tech_db, &floorplan_def_path, &out_def_path)
+            .expect("Failed to write legalized DEF");
+        let reloaded_db = parse_def(&out_def_path, &tech_db, None)
+            .expect("Failed to re-parse written DEF");
+        verify_legality(&reloaded_db, &tech_db).expect("Reloaded DEF must pass verify_legality");
+        assert_eq!(
+            reloaded_db.compute_hpwl_dbu(&tech_db),
+            leg_res.final_hpwl_dbu,
+            "Reloaded DEF HPWL must match legalized HPWL"
+        );
+    }
+
+    /// picorv32 does not converge within the iteration limit (docs/results.md), so this test asserts
+    /// only that placement completes and the legalized result is legal; the outcome is printed.
+    #[test]
+    fn test_picorv32_place_and_legalize() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let floorplan_def_path = require(design_dir("picorv32").join("picorv32.floorplan.def"));
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb");
+        let mut design_db = parse_def(&floorplan_def_path, &tech_db, None)
+            .expect("Failed to parse floorplan DEF");
+
+        let gp_res = run_nesterov_placement(&design_db, &tech_db, &NesterovConfig::default());
+        println!(
+            "picorv32 GP: converged={}, iterations={}, final_overflow={:.4}, final_hpwl_um={:.1}",
+            gp_res.converged, gp_res.iterations, gp_res.final_overflow, gp_res.final_hpwl_um
+        );
+
+        let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
+            .expect("Legalization must succeed");
+        verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
+        println!("picorv32 legalized: final_hpwl_dbu={}", leg_res.final_hpwl_dbu);
     }
 }

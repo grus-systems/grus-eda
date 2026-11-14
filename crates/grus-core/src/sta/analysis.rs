@@ -538,6 +538,9 @@ mod tests {
         /// picorv32 with OpenSTA's own RC: the fitted DMP model leaves a residual, see docs/results.md.
         const PICORV32_SPEF: Tol = Tol { arr_abs_ns: 0.006, slack_abs_ns: 0.04, slew_rel: 0.10, tns_rel: 0.02, ..Tol::STRICT };
         const PICORV32_PLACEMENT: Tol = Tol { arr_rel: 0.03, slack_abs_ns: 0.2, slew_rel: 0.20, tns_rel: 0.10, ..Tol::STRICT };
+        /// Not yet measured on aes: starts at the gcd values until the first aes run sets them.
+        const AES_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
+        const AES_SPEF: Tol = Tol::GCD_SPEF;
     }
 
     fn within_tolerance(ours: f32, reference: f64, rel_tol: f64, abs_tol: f64) -> (bool, f64) {
@@ -577,6 +580,21 @@ mod tests {
     #[test]
     fn test_gcd_placed_spef_matches_opensta() {
         compare_design_with_opensta("gcd", "placed_spef", Rc::Spef, Tol::GCD_SPEF);
+    }
+
+    #[test]
+    fn test_aes_zero_wire_matches_opensta() {
+        compare_design_with_opensta("aes", "zero_wire", Rc::None, Tol::STRICT);
+    }
+
+    #[test]
+    fn test_aes_placement_rc_matches_opensta() {
+        compare_design_with_opensta("aes", "placement_rc", Rc::Placement, Tol::AES_PLACEMENT);
+    }
+
+    #[test]
+    fn test_aes_placed_spef_matches_opensta() {
+        compare_design_with_opensta("aes", "placed_spef", Rc::Spef, Tol::AES_SPEF);
     }
 
 

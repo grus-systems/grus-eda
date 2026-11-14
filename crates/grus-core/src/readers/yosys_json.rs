@@ -317,7 +317,7 @@ pub fn parse_yosys_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
+    use crate::test_support::{design_dir, require, sky130_hd};
     use crate::readers::lef::load_tech_db;
     use crate::interner::StringInterner;
 
@@ -367,5 +367,42 @@ mod tests {
             }
         }
         assert!(driven_nets >= 260, "Expected most nets to be driven, got {}", driven_nets);
+    }
+
+    #[test]
+    fn test_aes_yosys_json() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let json_path = require(design_dir("aes").join("aes.synth.json"));
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb");
+
+        let db = parse_yosys_json(&json_path, &tech_db, None)
+            .expect("Failed to parse Yosys JSON");
+
+        let ref_path = require(design_dir("aes").join("aes.reference.json"));
+        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
+            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+
+        assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
+        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
+        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
+        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
+        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+
+        // Driver invariant on every driven net. The count is printed, not asserted: no aes
+        // golden value exists for it.
+        let mut driven_nets = 0;
+        for net_idx in 0..db.num_nets() {
+            let nid = NetId(net_idx as u32);
+            if let Some(drv) = db.net_driver(nid) {
+                driven_nets += 1;
+                let first_pin = db.net_pins(nid)[0];
+                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+            }
+        }
+        println!("aes yosys: {} of {} nets have a driver", driven_nets, db.num_nets());
     }
 }

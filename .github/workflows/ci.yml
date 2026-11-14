@@ -25,6 +25,13 @@ jobs:
             || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
           tests/designs/picorv32/generate_ref.sh
 
+      - name: Generate aes reference inputs
+        if: ${{ hashFiles('tests/designs/aes/aes.util65.def') == '' }}
+        run: |
+          mise exec docker-cli@latest colima@latest lima@latest -- colima status >/dev/null 2>&1 \
+            || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
+          tests/designs/aes/generate_ref.sh
+
       - name: Test (release)
         run: cargo test --release
 

@@ -10,6 +10,18 @@ fn edge_cost(d: f32, c: f32) -> f64 {
     1.0 + 10.0 / (1.0 + (-2.0 * diff).exp()) + 50.0 * ovf
 }
 
+/// Demand over capacity. An edge with demand but no capacity is infinitely over-used.
+#[inline]
+fn usage_ratio(d: f32, c: f32) -> f32 {
+    if c > 0.0 {
+        d / c
+    } else if d > 0.0 {
+        f32::INFINITY
+    } else {
+        0.0
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GridEdge {
     H(usize),
@@ -536,13 +548,7 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
             let mut max_ratio = 0.0f32;
 
             let check_ratio = |d: f32, c: f32, cur_max: &mut f32| {
-                let r = if c > 0.0 {
-                    d / c
-                } else if d > 0.0 {
-                    f32::INFINITY
-                } else {
-                    0.0
-                };
+                let r = usage_ratio(d, c);
                 if r > *cur_max {
                     *cur_max = r;
                 }
@@ -576,6 +582,9 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         }
     }
 
+    let h_usage_ratio = grid.h_demand.iter().zip(grid.h_cap.iter()).map(|(&d, &c)| usage_ratio(d, c)).collect();
+    let v_usage_ratio = grid.v_demand.iter().zip(grid.v_cap.iter()).map(|(&d, &c)| usage_ratio(d, c)).collect();
+
     CongestionReport {
         nx,
         ny,
@@ -584,6 +593,8 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         top_05pct_overflow,
         overflow_gcells,
         gcell_usage_ratio,
+        h_usage_ratio,
+        v_usage_ratio,
     }
 }
 
@@ -603,8 +614,9 @@ pub fn estimate_congestion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
+    use crate::test_support::{design_dir, require, sky130_hd};
     use crate::congestion::gcell::GPoint;
+    use std::collections::{HashMap, HashSet};
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
@@ -785,5 +797,264 @@ mod tests {
             .map(|v| v.as_f64().unwrap())
             .collect();
         assert_eq!(ref_ovfs_80, vec![154.0, 314.0, 312.0, 350.0]);
+    }
+
+    /// One edge of OpenROAD's usage dump, summed over met1..met5 (`tests/designs/aes/generate_ref.sh` step 7f).
+    #[derive(Clone, Copy)]
+    struct DumpEdge {
+        x: usize,
+        y: usize,
+        usage: f64,
+        capacity: f64,
+    }
+
+    struct UsageDump {
+        origin_x_dbu: i32,
+        origin_y_dbu: i32,
+        tile_dbu: i32,
+        nx: usize,
+        ny: usize,
+        h: Vec<DumpEdge>,
+        v: Vec<DumpEdge>,
+    }
+
+    /// Reads the `# key value` header and the `H|V x y usage capacity` lines of a usage dump.
+    fn parse_usage_dump(path: &std::path::Path) -> UsageDump {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("usage dump {path:?}: {e}"));
+        let mut header = HashMap::new();
+        let mut h = Vec::new();
+        let mut v = Vec::new();
+        let edge = |x: &str, y: &str, usage: &str, capacity: &str| DumpEdge {
+            x: x.parse().expect("edge x"),
+            y: y.parse().expect("edge y"),
+            usage: usage.parse().expect("edge usage"),
+            capacity: capacity.parse().expect("edge capacity"),
+        };
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["#", key, value] => {
+                    header.insert(*key, *value);
+                }
+                ["H", x, y, usage, capacity] => h.push(edge(x, y, usage, capacity)),
+                ["V", x, y, usage, capacity] => v.push(edge(x, y, usage, capacity)),
+                _ => panic!("unrecognised line in {path:?}: {line:?}"),
+            }
+        }
+        let get = |key: &str| -> i64 {
+            header
+                .get(key)
+                .unwrap_or_else(|| panic!("{path:?}: header `{key}` missing"))
+                .parse()
+                .unwrap_or_else(|e| panic!("{path:?}: header `{key}`: {e}"))
+        };
+        UsageDump {
+            origin_x_dbu: get("origin_x_dbu") as i32,
+            origin_y_dbu: get("origin_y_dbu") as i32,
+            tile_dbu: get("tile_dbu") as i32,
+            nx: get("nx") as usize,
+            ny: get("ny") as usize,
+            h,
+            v,
+        }
+    }
+
+    /// 1-based ranks; tied values share the mean of the ranks they occupy.
+    fn average_ranks(values: &[f64]) -> Vec<f64> {
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+        let mut ranks = vec![0.0; values.len()];
+        let mut start = 0;
+        while start < order.len() {
+            let mut end = start;
+            while end + 1 < order.len() && values[order[end + 1]] == values[order[start]] {
+                end += 1;
+            }
+            let mean_rank = (start + end) as f64 / 2.0 + 1.0;
+            for &i in &order[start..=end] {
+                ranks[i] = mean_rank;
+            }
+            start = end + 1;
+        }
+        ranks
+    }
+
+    /// Pearson correlation; NaN when either side is constant.
+    fn pearson(a: &[f64], b: &[f64]) -> f64 {
+        let n = a.len() as f64;
+        let mean_a = a.iter().sum::<f64>() / n;
+        let mean_b = b.iter().sum::<f64>() / n;
+        let (mut cov, mut var_a, mut var_b) = (0.0, 0.0, 0.0);
+        for (&x, &y) in a.iter().zip(b) {
+            cov += (x - mean_a) * (y - mean_b);
+            var_a += (x - mean_a).powi(2);
+            var_b += (y - mean_b).powi(2);
+        }
+        if var_a == 0.0 || var_b == 0.0 {
+            return f64::NAN;
+        }
+        cov / (var_a.sqrt() * var_b.sqrt())
+    }
+
+    fn spearman(a: &[f64], b: &[f64]) -> f64 {
+        pearson(&average_ranks(a), &average_ranks(b))
+    }
+
+    /// Indices of the hottest 5% of `values` (at least one). Tie-inclusive: every index whose
+    /// value reaches the value at the 5% cut is in the set, so ties at the cut can enlarge it.
+    fn hot_set(values: &[f64]) -> HashSet<usize> {
+        let k = ((0.05 * values.len() as f64).ceil() as usize).max(1);
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable_by(|a, b| b.total_cmp(a));
+        let cut = sorted[k - 1];
+        (0..values.len()).filter(|&i| values[i] >= cut).collect()
+    }
+
+    /// |A ∩ B| / min(|A|, |B|).
+    fn overlap_coefficient(a: &HashSet<usize>, b: &HashSet<usize>) -> f64 {
+        a.intersection(b).count() as f64 / a.len().min(b.len()) as f64
+    }
+
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    const PERMUTATION_SEED: u64 = 0x5EED_1114;
+
+    struct DirectionResult {
+        support: usize,
+        rho: f64,
+        null_rho: f64,
+        overlap: f64,
+    }
+
+    /// Compares one direction over the dump edges with capacity > 0. `index` maps a dump edge to its
+    /// position in our per-edge usage-ratio vector.
+    fn compare_direction(
+        label: &str,
+        edges: &[DumpEdge],
+        ours: &[f32],
+        index: impl Fn(&DumpEdge) -> usize,
+    ) -> DirectionResult {
+        let support: Vec<DumpEdge> = edges.iter().copied().filter(|e| e.capacity > 0.0).collect();
+        let zero_capacity_with_usage = edges.iter().filter(|e| e.capacity <= 0.0 && e.usage > 0.0).count();
+        assert!(!support.is_empty(), "{label}: dump has no edge with capacity > 0");
+
+        let reference: Vec<f64> = support.iter().map(|e| e.usage / e.capacity).collect();
+        let our_ratio: Vec<f64> = support.iter().map(|e| ours[index(e)] as f64).collect();
+
+        // Control 1: the reference shifted one GCell in +x. Edge (x, y) is paired with the reference
+        // at (x - 1, y), and 0 where that edge is not in the support.
+        let reference_at: HashMap<(usize, usize), f64> =
+            support.iter().zip(&reference).map(|(e, &r)| ((e.x, e.y), r)).collect();
+        let shifted: Vec<f64> = support
+            .iter()
+            .map(|e| if e.x == 0 { 0.0 } else { reference_at.get(&(e.x - 1, e.y)).copied().unwrap_or(0.0) })
+            .collect();
+
+        // Control 2: the reference values permuted over the support. Twenty fixed seeds give a
+        // null distribution; its 95th percentile (the 19th of 20 sorted values) is the control.
+        let mut perm_rhos: Vec<f64> = (0..20u64)
+            .map(|k| {
+                let mut permuted = reference.clone();
+                let mut rng = SplitMix64(PERMUTATION_SEED + k);
+                for i in (1..permuted.len()).rev() {
+                    let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+                    permuted.swap(i, j);
+                }
+                spearman(&our_ratio, &permuted)
+            })
+            .collect();
+        perm_rhos.sort_by(|a, b| a.total_cmp(b));
+        let rho_perm = perm_rhos[18];
+
+        let rho = spearman(&our_ratio, &reference);
+        let rho_shift = spearman(&our_ratio, &shifted);
+        let null_rho = rho_shift.max(rho_perm);
+        let (hot_ours, hot_ref) = (hot_set(&our_ratio), hot_set(&reference));
+        let overlap = overlap_coefficient(&hot_ours, &hot_ref);
+
+        println!(
+            "E1 {label}: support={} (excluded capacity-0 with usage: {zero_capacity_with_usage}), \
+             rho={rho:.4}, rho_shift={rho_shift:.4}, rho_perm_p95={rho_perm:.4}, null={null_rho:.4}, \
+             top5% overlap={overlap:.4} (hot set ours={}, reference={})",
+            support.len(),
+            hot_ours.len(),
+            hot_ref.len(),
+        );
+        DirectionResult { support: support.len(), rho, null_rho, overlap }
+    }
+
+    #[test]
+    fn test_rank_correlation_and_overlap_helpers() {
+        assert_eq!(average_ranks(&[10.0, 20.0, 20.0, 30.0]), vec![1.0, 2.5, 2.5, 4.0]);
+
+        let a = [0.3, 0.1, 0.7, 0.5];
+        assert!((spearman(&a, &a) - 1.0).abs() < 1e-12);
+        // Ranks of a are 2,1,4,3; these are 5 minus those, so the order is exactly reversed.
+        assert!((spearman(&a, &[3.0, 4.0, 1.0, 2.0]) + 1.0).abs() < 1e-12);
+        // Tied ranks: a = 1,2,3,4 against b = 1,1,2,2 (ranks 1.5,1.5,3.5,3.5) gives 4 / sqrt(20).
+        assert!((spearman(&[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 2.0, 2.0]) - 4.0 / 20f64.sqrt()).abs() < 1e-12);
+        assert!(spearman(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]).is_nan(), "constant side is undefined");
+
+        // 20 values: the 5% set is 1 edge, and a tie at the cut value enlarges it.
+        let mut values = vec![0.0; 20];
+        values[7] = 2.0;
+        assert_eq!(hot_set(&values), HashSet::from([7]));
+        values[3] = 2.0;
+        assert_eq!(hot_set(&values), HashSet::from([3, 7]));
+
+        let a: HashSet<usize> = [1, 2, 3].into_iter().collect();
+        let b: HashSet<usize> = [2, 3, 4, 5].into_iter().collect();
+        assert!((overlap_coefficient(&a, &b) - 2.0 / 3.0).abs() < 1e-12);
+    }
+
+    /// Congestion map against OpenROAD on aes at 65% utilisation (F2): per direction, the per-edge
+    /// usage ratio (demand / capacity) must rank like OpenROAD's and agree on the hottest 5% of edges.
+    #[test]
+    fn test_aes_congestion_map() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let def_path = require(design_dir("aes").join("aes.util65.def"));
+        let dump = parse_usage_dump(&require(design_dir("aes").join("aes.gcell_usage.txt")));
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse aes.util65.def");
+
+        // The dump was routed with `set_global_routing_layer_adjustment met1-met5 0.3`.
+        let adj = [0.0f32, 0.3, 0.3, 0.3, 0.3, 0.3];
+        let (grid, report) = estimate_congestion(&design_db, &tech_db, Some(&adj), None);
+
+        assert_eq!(grid.origin_x_dbu, dump.origin_x_dbu, "grid origin x");
+        assert_eq!(grid.origin_y_dbu, dump.origin_y_dbu, "grid origin y");
+        assert_eq!(grid.gcell_w_dbu, dump.tile_dbu, "grid tile width");
+        assert_eq!(grid.gcell_h_dbu, dump.tile_dbu, "grid tile height");
+        assert_eq!((grid.nx, grid.ny), (dump.nx, dump.ny), "grid dimensions");
+
+        let (nx, ny) = (dump.nx, dump.ny);
+        assert_eq!(ny * (nx - 1), report.h_usage_ratio.len(), "H edge count");
+        assert_eq!((ny - 1) * nx, report.v_usage_ratio.len(), "V edge count");
+
+        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| e.y * (nx - 1) + e.x);
+        let v = compare_direction("V", &dump.v, &report.v_usage_ratio, |e| e.y * nx + e.x);
+
+        for (label, r) in [("H", &h), ("V", &v)] {
+            assert!(r.rho >= 0.60, "{label}: Spearman rho {:.4} below 0.60 (support {})", r.rho, r.support);
+            assert!(
+                r.rho >= r.null_rho + 0.15,
+                "{label}: rho {:.4} must exceed the control null {:.4} by 0.15",
+                r.rho, r.null_rho
+            );
+            assert!(r.overlap >= 0.50, "{label}: top 5% overlap {:.4} below 0.50", r.overlap);
+        }
     }
 }
