@@ -41,6 +41,15 @@ This directory contains public benchmark designs used for verification against r
 - **Description**: DCT-based JPEG encoder (`jpeg_encoder`) from the OpenCores JPEG core packaged by ORFS. Used across E0-E3; the high-utilisation variant feeds the E1 congestion-map comparison (F2).
 - **Constraints**: `jpeg.sdc`, 5.0 ns clock, 1.0 ns I/O delays (ORFS `constraint.sdc` for sky130hd/jpeg uses period 5 and 20% I/O percentage), 0.15 ns input transition, 0.05 pF output load. LibreLane config follows ORFS: `FP_CORE_UTIL` 50.
 
+### `ibex` (RISC-V Ibex core, SystemVerilog)
+
+- **Directory**: `tests/designs/ibex/`
+- **Origin**: [The-OpenROAD-Project/OpenROAD-flow-scripts](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts) (`flow/designs/src/ibex_sv/`), commit `73c804d45dc4084b05e0536dab69053b3bf9e591` — ORFS's vendored snapshot of lowRISC Ibex, including `syn/rtl/prim_clock_gating.v` and the `vendor/lowrisc_ip/prim/rtl/` include directory. Copied verbatim.
+- **License**: Apache License 2.0 (lowRISC). See `tests/designs/ibex/LICENSE`.
+- **Target PDK**: SkyWater `sky130_fd_sc_hd` (1.8 V nominal corner `tt_025C_1v80`).
+- **Description**: `ibex_core`, a 32-bit RISC-V core in SystemVerilog. ORFS synthesises it with the **slang** HDL frontend (`SYNTH_HDL_FRONTEND = slang` in its config.mk); whether the pinned LibreLane container can do the same is the step-4 spike question.
+- **Constraints**: `ibex.sdc`, 8.0 ns clock on `clk_i`, 1.6 ns I/O delays (ORFS `constraint.sdc` for sky130hd/ibex uses period 8.0 and 20% I/O percentage), 0.15 ns input transition, 0.05 pF output load. LibreLane config follows ORFS: `FP_CORE_UTIL` 50.
+
 ---
 
 ## 2. Reference Artifacts (`tests/designs/gcd/`)

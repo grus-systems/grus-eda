@@ -1,0 +1,32 @@
+DESIGN_NAME: ibex_core
+VERILOG_FILES:
+  - dir::ibex_alu.sv
+  - dir::ibex_compressed_decoder.sv
+  - dir::ibex_controller.sv
+  - dir::ibex_core.sv
+  - dir::ibex_counter.sv
+  - dir::ibex_cs_registers.sv
+  - dir::ibex_csr.sv
+  - dir::ibex_decoder.sv
+  - dir::ibex_ex_block.sv
+  - dir::ibex_fetch_fifo.sv
+  - dir::ibex_id_stage.sv
+  - dir::ibex_if_stage.sv
+  - dir::ibex_load_store_unit.sv
+  - dir::ibex_multdiv_fast.sv
+  - dir::ibex_multdiv_slow.sv
+  - dir::ibex_pkg.sv
+  - dir::ibex_pmp.sv
+  - dir::ibex_prefetch_buffer.sv
+  - dir::ibex_register_file_ff.sv
+  - dir::ibex_wb_stage.sv
+  - dir::syn/rtl/prim_clock_gating.v
+VERILOG_INCLUDE_DIRS:
+  - dir::vendor/lowrisc_ip/prim/rtl
+CLOCK_PERIOD: 8.0
+CLOCK_PORT: clk_i
+PNR_SDC_FILE: dir::ibex.sdc
+SIGNOFF_SDC_FILE: dir::ibex.sdc
+
+FP_CORE_UTIL: 50
+PL_TARGET_DENSITY: 0.6
