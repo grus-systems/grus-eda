@@ -7,6 +7,7 @@ tests/designs/pdk
 tests/designs/gcd/runs
 tests/designs/aes/runs
 tests/designs/jpeg/runs
+tests/designs/ibex/runs
 tests/designs/picorv32/runs
 tests/designs/picorv32/picorv32.synth.v
 tests/designs/picorv32/picorv32.synth.json
@@ -34,3 +35,13 @@ tests/designs/jpeg/jpeg.orient.pins.txt
 tests/designs/jpeg/jpeg.util65.def
 tests/designs/jpeg/jpeg.routed.spef
 tests/designs/jpeg/jpeg.sta.reference.json
+# ibex generated artifacts over 1 MB (regenerate with tests/designs/ibex/generate_ref.sh)
+tests/designs/ibex/ibex.synth.v
+tests/designs/ibex/ibex.synth.json
+tests/designs/ibex/ibex.floorplan.def
+tests/designs/ibex/ibex.placed.def
+tests/designs/ibex/ibex.orient.def
+tests/designs/ibex/ibex.orient.pins.txt
+tests/designs/ibex/ibex.util65.def
+tests/designs/ibex/ibex.routed.spef
+tests/designs/ibex/ibex.sta.reference.json
