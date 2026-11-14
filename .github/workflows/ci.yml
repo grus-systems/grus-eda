@@ -26,17 +26,21 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
 
+      # The runner's systemd user manager predates the user's
+      # docker group membership, so job processes start without
+      # the docker group; sg re-reads /etc/group and grants it.
+      # (A host reboot makes this a no-op.)
       - name: Generate picorv32 reference inputs
         if: ${{ hashFiles('tests/designs/picorv32/picorv32.routed.spef') == '' }}
-        run: tests/designs/picorv32/generate_ref.sh
+        run: sg docker -c 'tests/designs/picorv32/generate_ref.sh'
 
       - name: Generate aes reference inputs
         if: ${{ hashFiles('tests/designs/aes/aes.util65.def') == '' }}
-        run: tests/designs/aes/generate_ref.sh
+        run: sg docker -c 'tests/designs/aes/generate_ref.sh'
 
       - name: Generate jpeg reference inputs
         if: ${{ hashFiles('tests/designs/jpeg/jpeg.util65.def') == '' }}
-        run: tests/designs/jpeg/generate_ref.sh
+        run: sg docker -c 'tests/designs/jpeg/generate_ref.sh'
 
       - name: Upload generated reference inputs
         uses: actions/upload-artifact@v4
