@@ -142,3 +142,20 @@ with changes. Adopted, with one structural adaptation:
   OpenROAD high-utilisation placed DEF, independent of our GP.
 - **STA tolerances (Q3, S2)**: a per-design tolerance is allowed only
   with a named root cause and a sunset condition in `docs/results.md`.
+
+## Measurement note (2026-11-14, aes first run)
+
+The aes reference generation ran end to end on the first attempt.
+Measured property of the reference tool that changes the E1 metric:
+on `aes.util65.def`, OpenROAD's global router saturates at a usage
+ratio of exactly 1.0 — **zero edges overflow** (median edge usage
+ratio 0.78–0.82, p99 1.0, both directions; grid 55x55 at 6900 dbu).
+Per-edge overflow on the reference side is therefore an all-zero
+map and cannot be correlated. The correlated quantity is the
+per-edge **usage ratio** (demand / capacity), per direction, over
+all edges with capacity > 0 in the dump; the top set is the 5%
+hottest edges by ratio. The thresholds and negative controls from
+the review resolutions are unchanged. This is a deviation from the
+reviewer's overflow-first recommendation, forced by the measured
+behaviour of the reference router; our own estimator's overflow
+figures remain reported as before.

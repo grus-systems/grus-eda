@@ -13,3 +13,12 @@ tests/designs/picorv32/picorv32.floorplan.def
 tests/designs/picorv32/picorv32.placed.def
 tests/designs/picorv32/picorv32.routed.spef
 tests/designs/picorv32/picorv32.sta.reference.json
+
+# aes generated artifacts over 1 MB (regenerate with tests/designs/aes/generate_ref.sh)
+tests/designs/aes/aes.synth.v
+tests/designs/aes/aes.synth.json
+tests/designs/aes/aes.floorplan.def
+tests/designs/aes/aes.placed.def
+tests/designs/aes/aes.orient.def
+tests/designs/aes/aes.util65.def
+tests/designs/aes/aes.routed.spef
