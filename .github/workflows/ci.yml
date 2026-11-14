@@ -5,16 +5,17 @@ on:
     branches: [dev]
   pull_request:
 
-# Generation runs on the org Mac mini (Colima + the LibreLane
-# container live there); the test suite runs on the Intel runner
-# (label `intel`, repo-registered) so the mini's queue stays free
-# for the other repositories. Generated inputs cross over as a
-# workflow artifact. The sky130A PDK is pre-installed under
-# ~/.ciel on both runners.
+# Both jobs run on the Intel runner (org runner, label
+# `intel`): it has a native Docker daemon for the LibreLane
+# container, the sky130A PDK under ~/.ciel, and a mise-installed
+# Rust toolchain. Keeping this repo's CI off the org Mac mini
+# leaves that queue for the repositories that need macOS/ARM64.
+# Generated inputs cross between the jobs as a workflow
+# artifact.
 
 jobs:
   generate:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: [self-hosted, Linux, X64, intel]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -27,24 +28,15 @@ jobs:
 
       - name: Generate picorv32 reference inputs
         if: ${{ hashFiles('tests/designs/picorv32/picorv32.routed.spef') == '' }}
-        run: |
-          mise exec docker-cli@latest colima@latest lima@latest -- colima status >/dev/null 2>&1 \
-            || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
-          tests/designs/picorv32/generate_ref.sh
+        run: tests/designs/picorv32/generate_ref.sh
 
       - name: Generate aes reference inputs
         if: ${{ hashFiles('tests/designs/aes/aes.util65.def') == '' }}
-        run: |
-          mise exec docker-cli@latest colima@latest lima@latest -- colima status >/dev/null 2>&1 \
-            || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
-          tests/designs/aes/generate_ref.sh
+        run: tests/designs/aes/generate_ref.sh
 
       - name: Generate jpeg reference inputs
         if: ${{ hashFiles('tests/designs/jpeg/jpeg.util65.def') == '' }}
-        run: |
-          mise exec docker-cli@latest colima@latest lima@latest -- colima status >/dev/null 2>&1 \
-            || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
-          tests/designs/jpeg/generate_ref.sh
+        run: tests/designs/jpeg/generate_ref.sh
 
       - name: Upload generated reference inputs
         uses: actions/upload-artifact@v4
@@ -71,8 +63,10 @@ jobs:
             tests/designs/jpeg/jpeg.floorplan.def
             tests/designs/jpeg/jpeg.placed.def
             tests/designs/jpeg/jpeg.orient.def
+            tests/designs/jpeg/jpeg.orient.pins.txt
             tests/designs/jpeg/jpeg.util65.def
             tests/designs/jpeg/jpeg.routed.spef
+            tests/designs/jpeg/jpeg.sta.reference.json
 
   test:
     needs: generate
