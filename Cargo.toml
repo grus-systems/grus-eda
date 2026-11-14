@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/grus-core", "crates/grus-eda"]
 
 [workspace.package]
-version = "0.1.29"
+version = "0.1.30"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -15,5 +15,4 @@ memmap2 = "0.9"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

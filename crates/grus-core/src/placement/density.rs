@@ -577,14 +577,14 @@ impl DensitySolver {
         // 3. Compute charge rho(u, v) = (movable_area + target_density * fixed_area) / A_b - rho_bar
         let inv_bin_area = 1.0f32 / bin_area;
         let mut sum_raw_rho = 0.0f64;
-        for i in 0..grid_size {
-            let raw = (self.movable_area[i] + target_density * self.fixed_area[i]) * inv_bin_area;
-            self.rho[i] = raw;
+        for ((rho, &movable), &fixed) in self.rho.iter_mut().zip(&self.movable_area).zip(&self.fixed_area) {
+            let raw = (movable + target_density * fixed) * inv_bin_area;
+            *rho = raw;
             sum_raw_rho += raw as f64;
         }
         let mean_rho = (sum_raw_rho / grid_size as f64) as f32;
-        for i in 0..grid_size {
-            self.rho[i] -= mean_rho;
+        for rho in self.rho.iter_mut() {
+            *rho -= mean_rho;
         }
 
         // 4. Solve Poisson equation
