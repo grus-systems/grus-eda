@@ -68,3 +68,43 @@ The existing harness is `compare_design_with_opensta` in
   generated inputs present), read the whole diff, verify the mutation
   claim, and record the comparison in `docs/results.md` (WNS/TNS, max
   per-field diffs, runtime, cold/warm cache stated honestly).
+
+## Round 2 — maintainer feedback (2026-11-15)
+
+Round 1 (a delegated job) added the
+`Rc::RoutedSpef` variant and the test below, then correctly stopped as
+blocked: its worktree has no PDK, so the measurement could not run. That
+change is **not** in HEAD (the maintainer held it back so `dev` never
+carries a knowingly-red test); recreate it identically as part of this
+round: enum variant `RoutedSpef` loading `<design>.rcx.spef`, plus
+`test_gcd_routed_spef_matches_opensta` with golden key `routed_spef` and
+`Tol::GCD_SPEF`.
+
+Maintainer measurement on the Intel host (PDK present), round-1 code:
+the test fails **before any STA runs** — our SPEF reader cannot parse
+the routed SPEF at all. Panic: `routed SPEF: SPEF line 671: NAME_MAP
+entry \`*PORTS\` has no name`. Root cause, confirmed against the file
+and the code: in `gcd.rcx.spef` the `*NAME_MAP` section (entries
+`*3`..`*655`) is followed by a `*PORTS` section header; in
+`crates/grus-core/src/readers/spef.rs` the `in_name_map` state is only
+cleared by a later section arm, and the entry arm treats any line
+starting with `*` as a NAME_MAP entry, so `*PORTS` hits the F6
+"entry has no name" error.
+
+Fix direction: a NAME_MAP entry is a first token of the form
+`*<digits>`; any other line whose first token starts with `*` is a new
+section header — it must end the NAME_MAP section and be handled as
+that section (and the `*PORTS` body lines that follow must not be
+misparsed). Keep the F6 strictness: a `*<digits>` entry with no name
+token must still error.
+
+Verification you can do locally this round: parsing needs no PDK. Add
+spef.rs unit tests that (a) load the committed
+`tests/designs/gcd/gcd.rcx.spef` with `load_spef` and assert the parse
+succeeds with 269 nets and a spot-checked mapped name resolves
+(e.g. net `clk`); (b) a synthetic NAME_MAP followed by `*PORTS` parses;
+(c) a malformed `*123` entry without a name still errors. The numeric
+STA comparison still cannot run in your worktree; the maintainer
+re-runs `test_gcd_routed_spef_matches_opensta` on Intel after your fix
+and reports the failure table back if the numbers then miss. Do not
+widen tolerances.
