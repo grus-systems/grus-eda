@@ -1357,6 +1357,65 @@ mod tests {
         );
     }
 
+    /// jpeg starts at the ORFS target density 0.6. If GP does not converge, the density steps down
+    /// (0.55, then 0.5) and the density used is printed. As for aes, the HPWL gap is printed, not
+    /// asserted, until it is recorded in docs/results.md.
+    #[test]
+    fn test_jpeg_place_and_legalize() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let floorplan_def_path = require(design_dir("jpeg").join("jpeg.floorplan.def"));
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb");
+        let mut design_db = parse_def(&floorplan_def_path, &tech_db, None)
+            .expect("Failed to parse floorplan DEF");
+
+        let mut used = None;
+        for density in [0.60f32, 0.55, 0.50] {
+            let config = NesterovConfig { target_density: density, ..NesterovConfig::default() };
+            let res = run_nesterov_placement(&design_db, &tech_db, &config);
+            println!(
+                "jpeg GP at target density {density:.2}: converged={}, iterations={}, final_overflow={:.4}, final_hpwl_um={:.1}",
+                res.converged, res.iterations, res.final_overflow, res.final_hpwl_um
+            );
+            let converged = res.converged;
+            used = Some((density, res));
+            if converged {
+                break;
+            }
+        }
+        let (density, gp_res) = used.expect("at least one target density is tried");
+        println!("jpeg GP: target density used {density:.2}, converged={}", gp_res.converged);
+
+        let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
+            .expect("Legalization must succeed");
+        verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
+
+        let ref_path = require(design_dir("jpeg").join("jpeg.reference.json"));
+        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
+            .expect("Parse jpeg.reference.json");
+        let ref_hpwl_dbu = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
+        let gap = (leg_res.final_hpwl_dbu - ref_hpwl_dbu) as f64 / ref_hpwl_dbu as f64;
+        println!(
+            "jpeg HPWL: reference={} dbu, ours={} dbu, gap={:+.2}%",
+            ref_hpwl_dbu, leg_res.final_hpwl_dbu, gap * 100.0
+        );
+
+        let out_def_path = std::env::temp_dir().join("grus_jpeg_legalized_test.def");
+        write_def(&design_db, &tech_db, &floorplan_def_path, &out_def_path)
+            .expect("Failed to write legalized DEF");
+        let reloaded_db = parse_def(&out_def_path, &tech_db, None)
+            .expect("Failed to re-parse written DEF");
+        verify_legality(&reloaded_db, &tech_db).expect("Reloaded DEF must pass verify_legality");
+        assert_eq!(
+            reloaded_db.compute_hpwl_dbu(&tech_db),
+            leg_res.final_hpwl_dbu,
+            "Reloaded DEF HPWL must match legalized HPWL"
+        );
+    }
+
     /// picorv32 does not converge within the iteration limit (docs/results.md), so this test asserts
     /// only that placement completes and the legalized result is legal; the outcome is printed.
     #[test]

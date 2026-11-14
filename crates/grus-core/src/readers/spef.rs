@@ -169,4 +169,11 @@ mod tests {
         let spef = load_spef(&path).expect("aes.routed.spef must parse");
         assert!(!spef.nets.is_empty(), "aes.routed.spef has no nets");
     }
+
+    #[test]
+    fn test_jpeg_routed_spef_present() {
+        let path = require(design_dir("jpeg").join("jpeg.routed.spef"));
+        let spef = load_spef(&path).expect("jpeg.routed.spef must parse");
+        assert!(!spef.nets.is_empty(), "jpeg.routed.spef has no nets");
+    }
 }

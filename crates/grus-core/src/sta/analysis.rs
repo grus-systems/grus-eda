@@ -541,6 +541,9 @@ mod tests {
         /// Not yet measured on aes: starts at the gcd values until the first aes run sets them.
         const AES_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
         const AES_SPEF: Tol = Tol::GCD_SPEF;
+        /// Not yet measured on jpeg: starts at the gcd values until the first jpeg run sets them.
+        const JPEG_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
+        const JPEG_SPEF: Tol = Tol::GCD_SPEF;
     }
 
     fn within_tolerance(ours: f32, reference: f64, rel_tol: f64, abs_tol: f64) -> (bool, f64) {
@@ -597,6 +600,21 @@ mod tests {
     #[ignore = "systematic wire-delay bias on aes SPEF (arrivals ~2% low, slews ~11% low); measured table in docs/results.md, revisit at review step 6"]
     fn test_aes_placed_spef_matches_opensta() {
         compare_design_with_opensta("aes", "placed_spef", Rc::Spef, Tol::AES_SPEF);
+    }
+
+    #[test]
+    fn test_jpeg_zero_wire_matches_opensta() {
+        compare_design_with_opensta("jpeg", "zero_wire", Rc::None, Tol::STRICT);
+    }
+
+    #[test]
+    fn test_jpeg_placement_rc_matches_opensta() {
+        compare_design_with_opensta("jpeg", "placement_rc", Rc::Placement, Tol::JPEG_PLACEMENT);
+    }
+
+    #[test]
+    fn test_jpeg_placed_spef_matches_opensta() {
+        compare_design_with_opensta("jpeg", "placed_spef", Rc::Spef, Tol::JPEG_SPEF);
     }
 
 
