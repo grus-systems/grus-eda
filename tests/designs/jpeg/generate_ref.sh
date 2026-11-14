@@ -22,7 +22,13 @@ fi
 # If running on the host outside Docker, invoke this script inside the container
 if [ ! -f /.dockerenv ] && [ ! -f /nix/var/nix/profiles/default/bin/openroad ]; then
     echo "==> Running reference generation inside container ${CONTAINER_IMAGE}..."
-    docker_cmd="mise exec docker-cli@latest colima@latest lima@latest -- docker"
+    # Prefer a native Docker daemon (Linux hosts); fall back to the
+    # Colima route used on macOS.
+    if docker info >/dev/null 2>&1; then
+        docker_cmd="docker"
+    else
+        docker_cmd="mise exec docker-cli@latest colima@latest lima@latest -- docker"
+    fi
 
     ${docker_cmd} run --rm \
         -v "${REPO_ROOT}:/work" \
@@ -791,7 +797,7 @@ proc collect_endpoints_json {} {
     array set max_slew {}
     set pins {}
 
-    set paths_max [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 1000]
+    set paths_max [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 100000]
     foreach pe $paths_max {
         set name [get_full_name [$pe pin]]
         set v [$pe vertex]
@@ -807,7 +813,7 @@ proc collect_endpoints_json {} {
     array set min_slack {}
     array set min_slew {}
 
-    set paths_min [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 1000]
+    set paths_min [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 100000]
     foreach pe $paths_min {
         set name [get_full_name [$pe pin]]
         set v [$pe vertex]
@@ -819,8 +825,21 @@ proc collect_endpoints_json {} {
 
     set sorted_pins [lsort -dictionary $pins]
     set entries {}
+    set missing_min 0
     foreach name $sorted_pins {
-        lappend entries "      {\"pin\": \"$name\", \"max_arr_ns\": $max_arr($name), \"max_req_ns\": $max_req($name), \"max_slack_ns\": $max_slack($name), \"max_slew_ns\": $max_slew($name), \"min_arr_ns\": $min_arr($name), \"min_req_ns\": $min_req($name), \"min_slack_ns\": $min_slack($name), \"min_slew_ns\": $min_slew($name)}"
+        # An endpoint can have a max path but no min path (for example a
+        # register whose data pin is constant in the min corner). Emit
+        # null for the missing corner instead of aborting the dump, and
+        # count the cases so the generation log shows them.
+        if {[info exists min_arr($name)] == 0} {
+            incr missing_min
+            lappend entries "      {\"pin\": \"$name\", \"max_arr_ns\": $max_arr($name), \"max_req_ns\": $max_req($name), \"max_slack_ns\": $max_slack($name), \"max_slew_ns\": $max_slew($name), \"min_arr_ns\": null, \"min_req_ns\": null, \"min_slack_ns\": null, \"min_slew_ns\": null}"
+        } else {
+            lappend entries "      {\"pin\": \"$name\", \"max_arr_ns\": $max_arr($name), \"max_req_ns\": $max_req($name), \"max_slack_ns\": $max_slack($name), \"max_slew_ns\": $max_slew($name), \"min_arr_ns\": $min_arr($name), \"min_req_ns\": $min_req($name), \"min_slack_ns\": $min_slack($name), \"min_slew_ns\": $min_slew($name)}"
+        }
+    }
+    if {$missing_min > 0} {
+        puts "NOTE: $missing_min endpoints have no min-corner path (null in JSON)"
     }
     return [join $entries ",\n"]
 }

@@ -22,7 +22,13 @@ fi
 # If running on the host outside Docker, invoke this script inside the container
 if [ ! -f /.dockerenv ] && [ ! -f /nix/var/nix/profiles/default/bin/openroad ]; then
     echo "==> Running reference generation inside container ${CONTAINER_IMAGE}..."
-    docker_cmd="mise exec docker-cli@latest colima@latest lima@latest -- docker"
+    # Prefer a native Docker daemon (Linux hosts); fall back to the
+    # Colima route used on macOS.
+    if docker info >/dev/null 2>&1; then
+        docker_cmd="docker"
+    else
+        docker_cmd="mise exec docker-cli@latest colima@latest lima@latest -- docker"
+    fi
 
     ${docker_cmd} run --rm \
         -v "${REPO_ROOT}:/work" \
