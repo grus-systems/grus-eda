@@ -85,6 +85,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: reference-inputs
+          # upload-artifact strips the common ancestor
+          # (tests/designs), so extract back under it.
+          path: tests/designs
 
       - name: Put cargo and mise on PATH
         run: |
