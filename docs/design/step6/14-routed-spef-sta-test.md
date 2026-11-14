@@ -83,7 +83,7 @@ round: enum variant `RoutedSpef` loading `<design>.rcx.spef`, plus
 Maintainer measurement on the Intel host (PDK present), round-1 code:
 the test fails **before any STA runs** — our SPEF reader cannot parse
 the routed SPEF at all. Panic: `routed SPEF: SPEF line 671: NAME_MAP
-entry \`*PORTS\` has no name`. Root cause, confirmed against the file
+entry `*PORTS` has no name`. Root cause, confirmed against the file
 and the code: in `gcd.rcx.spef` the `*NAME_MAP` section (entries
 `*3`..`*655`) is followed by a `*PORTS` section header; in
 `crates/grus-core/src/readers/spef.rs` the `in_name_map` state is only
