@@ -23,3 +23,14 @@ tests/designs/aes/aes.placed.def
 tests/designs/aes/aes.orient.def
 tests/designs/aes/aes.util65.def
 tests/designs/aes/aes.routed.spef
+
+# jpeg generated artifacts over 1 MB (regenerate with tests/designs/jpeg/generate_ref.sh)
+tests/designs/jpeg/jpeg.synth.v
+tests/designs/jpeg/jpeg.synth.json
+tests/designs/jpeg/jpeg.floorplan.def
+tests/designs/jpeg/jpeg.placed.def
+tests/designs/jpeg/jpeg.orient.def
+tests/designs/jpeg/jpeg.orient.pins.txt
+tests/designs/jpeg/jpeg.util65.def
+tests/designs/jpeg/jpeg.routed.spef
+tests/designs/jpeg/jpeg.sta.reference.json
