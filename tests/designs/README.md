@@ -68,7 +68,9 @@ All golden files are strictly under 1 MB and generated from a single canonical r
 | `gcd.synth.json` | 693 KB | Yosys JSON representation (`write_json`) of the exact same synthesis netlist. |
 | `gcd.floorplan.def` | 71 KB | Initialized floorplan DEF: placed I/O pins, fixed tap/endcaps (151 instances), PDN stripes, logic cells unplaced. |
 | `gcd.placed.def` | 75 KB | Legalized placement DEF (OpenROAD global placement + detailed placement without filler cells, 384 components). |
-| `gcd.routed.spef` | 164 KB | IEEE 1481 SPEF parasitics extracted from `gcd.placed.def`. |
+| `gcd.routed.spef` | 164 KB | IEEE 1481 SPEF from `estimate_parasitics -placement` on `gcd.placed.def` (step 5). **Placement estimate, not a routed extraction**, despite the name. |
+| `gcd.routed.def` | 219 KB | `gcd.placed.def` after global and detailed routing (met1–met5; step 5b). |
+| `gcd.rcx.spef` | 211 KB | **Routed extraction**: IEEE 1481 SPEF from OpenROAD RCX (`extract_parasitics -lef_res`) on the routed shapes in step 5b. 269 `*D_NET`s, 3,544 coupling-capacitor entries. `*DATE` is normalised, so regeneration is bit-identical. Used by the `routed_spef` mode of `gcd.sta.reference.json` (step 9b). |
 | `gcd.orient.def` | 76 KB | `gcd.placed.def` with the logic cells cycled through all 8 orientations (cells may leave the die). Checks pin transforms only. |
 | `gcd.orient.pins.txt` | 18 KB | OpenROAD `dbITerm::getAvgXY` of every signal instance pin in `gcd.orient.def`. |
 | `gcd.util{25,45,65,78}.def` | 48 KB ea | Placed DEF fixtures at 25%, 45%, 65%, and 78% core utilization (step 7e of `generate_ref.sh`) for E1 congestion ranking verification. |

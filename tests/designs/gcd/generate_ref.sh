@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Reproduction script for gcd reference artifacts in grus-eda.
 # Generates gcd.synth.v, gcd.synth.json, gcd.floorplan.def, gcd.placed.def,
-# gcd.routed.spef, gcd.orient.def, gcd.orient.pins.txt, and gcd.reference.json using LibreLane, Yosys, OpenROAD, and OpenSTA
-# inside the canonical container ghcr.io/librelane/librelane:3.0.16.
+# gcd.routed.spef (placement estimate), gcd.routed.def, gcd.drc.rpt, gcd.rcx.spef (routed extraction),
+# gcd.orient.def, gcd.orient.pins.txt, gcd.reference.json, and gcd.sta.reference.json using LibreLane,
+# Yosys, OpenROAD, and OpenSTA inside the canonical container ghcr.io/librelane/librelane:3.0.16.
 
 set -euo pipefail
 
@@ -94,7 +95,8 @@ write_def /work/tests/designs/gcd/gcd.placed.def
 exit
 EOF
 
-# 5. Extract SPEF parasitics
+# 5. Placement-estimate SPEF (estimate_parasitics -placement). Despite the file name, this is
+#    not a routed extraction; the routed extraction is step 5b.
 openroad -no_init -no_splash << 'EOF'
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
@@ -105,6 +107,40 @@ set_wire_rc -layer met2
 estimate_parasitics -placement -spef_file /work/tests/designs/gcd/gcd.routed.spef
 exit
 EOF
+
+# 5b. Routed SPEF: global + detailed routing of gcd.placed.def, then RC extraction on the routed
+#     shapes. Writes gcd.routed.def, gcd.drc.rpt and gcd.rcx.spef. The routing flow is the one
+#     LibreLane's own OpenROAD steps run in this image.
+openroad -no_init -no_splash << 'EOF'
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+set_routing_layers -signal met1-met5 -clock met3-met5
+global_route -guide_file /work/tests/designs/gcd/runs/canonical/gcd.guide -congestion_iterations 100
+detailed_route -output_drc /work/tests/designs/gcd/gcd.drc.rpt -verbose 0
+write_def /work/tests/designs/gcd/gcd.routed.def
+define_process_corner -ext_model_index 0 X
+extract_parasitics -ext_model_file /pdk/sky130A/libs.tech/openlane/rules.openrcx.sky130A.nom.calibre -lef_res
+write_spef /work/tests/designs/gcd/gcd.rcx.spef
+exit
+EOF
+
+# write_spef puts the wall-clock time in the *DATE line; pin it so regeneration is bit-identical.
+sed -i 's/^\*DATE .*/*DATE "normalized"/' "${SCRIPT_DIR}/gcd.rcx.spef"
+if [ "$(grep -c '^\*DATE "normalized"$' "${SCRIPT_DIR}/gcd.rcx.spef")" -ne 1 ]; then
+    echo "Error: expected exactly one *DATE line in gcd.rcx.spef to normalize." >&2
+    exit 1
+fi
+
+# A golden taken from a dirty route is worthless. The DRC report is empty when the route is clean.
+if [ -s "${SCRIPT_DIR}/gcd.drc.rpt" ]; then
+    drc_count="$(wc -l < "${SCRIPT_DIR}/gcd.drc.rpt")"
+    echo "Error: detailed routing reported ${drc_count} DRC line(s) in gcd.drc.rpt; refusing to continue." >&2
+    exit 1
+fi
+echo "DRC violations: 0 (gcd.drc.rpt is empty)"
 
 # The Tcl below is fed to openroad on stdin, where the interactive shell treats `!` as
 # history expansion. Write negations as `== 0`, never `![...]`.
@@ -686,7 +722,7 @@ EOF
 #    sta::worst_slack / sta::total_negative_slack already return user units (ns); do not convert them.
 #    Endpoints are collected max-first: calling find_timing_paths -min before iterating the -max
 #    PathEnds invalidates them and segfaults OpenROAD 2026-02-17.
-cat << 'EOF' > "${RUN_DIR}/dump_sta_ref.tcl"
+cat << 'EOF' > "${RUN_DIR}/collect_endpoints.tcl"
 proc collect_endpoints_json {} {
     array set max_arr {}
     array set max_req {}
@@ -727,6 +763,13 @@ proc collect_endpoints_json {} {
     }
     return [join $entries ",\n"]
 }
+EOF
+
+# The routed mode runs in its own OpenROAD process (below) so that its read_spef starts from a
+# clean parasitics state. This process writes the first three modes and leaves the JSON open;
+# the routed process appends the fourth mode and closes it.
+cat << 'EOF' > "${RUN_DIR}/dump_sta_ref.tcl"
+source /work/tests/designs/gcd/runs/canonical/collect_endpoints.tcl
 
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
@@ -784,12 +827,45 @@ puts $fp "    \"tns_min_ns\": $spef_tns_min,"
 puts $fp "    \"endpoints\": \["
 puts $fp $spef_endpoints
 puts $fp "    \]"
-puts $fp "  }"
-puts $fp "}"
+puts $fp "  },"
 close $fp
-puts "Generated gcd.sta.reference.json via live OpenROAD/OpenSTA queries"
+puts "Wrote the first three modes of gcd.sta.reference.json"
 exit
 EOF
 openroad -no_init -no_splash "${RUN_DIR}/dump_sta_ref.tcl"
+
+# 9b. Routed SPEF mode (gcd.rcx.spef from step 5b). Same DEF and SDC; only the parasitics differ.
+cat << 'EOF' > "${RUN_DIR}/dump_sta_routed_ref.tcl"
+source /work/tests/designs/gcd/runs/canonical/collect_endpoints.tcl
+
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+
+read_spef /work/tests/designs/gcd/gcd.rcx.spef
+set routed_wns_max [format "%.6f" [sta::worst_slack -max]]
+set routed_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set routed_wns_min [format "%.6f" [sta::worst_slack -min]]
+set routed_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set routed_endpoints [collect_endpoints_json]
+
+set fp [open "/work/tests/designs/gcd/gcd.sta.reference.json" "a"]
+puts $fp "  \"routed_spef\": {"
+puts $fp "    \"wns_max_ns\": $routed_wns_max,"
+puts $fp "    \"tns_max_ns\": $routed_tns_max,"
+puts $fp "    \"wns_min_ns\": $routed_wns_min,"
+puts $fp "    \"tns_min_ns\": $routed_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $routed_endpoints
+puts $fp "    \]"
+puts $fp "  }"
+puts $fp "}"
+close $fp
+puts "Appended routed_spef mode to gcd.sta.reference.json"
+exit
+EOF
+openroad -no_init -no_splash "${RUN_DIR}/dump_sta_routed_ref.tcl"
 
 echo "==> Successfully generated all gcd reference artifacts!"
