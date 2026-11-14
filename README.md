@@ -58,7 +58,7 @@ Not goals: sign-off, detailed routing, or beating OpenROAD on result quality.
 | stage | what | checked against | done when |
 |---|---|---|---|
 | E0 | readers: Liberty (NLDM tables), LEF (technology and cells), DEF, Yosys JSON (preferred) and gate-level Verilog | OpenROAD and OpenSTA reports on the same files | cell, net, pin and row counts match on every test design |
-| E1 | global-routing congestion estimate (overflow per GCell, from placed DEF) | OpenROAD `global_route` | overflow ranks the test variants in the same order |
+| E1 | global-routing congestion estimate (usage ratio per GCell edge, from placed DEF) | OpenROAD `global_route` GCell usage map | per-edge usage-ratio map vs OpenROAD: Spearman ρ ≥ 0.60 and ≥ negative-control null + 0.15, hot-set (ratio ≥ 0.9) overlap ≥ 0.50; the gcd rank-order test stays as a smoke test |
 | E2 | global placement (wirelength plus a density penalty) and Abacus legalization with local refinement | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% |
 | E3 | static timing (edge-triggered DFFs first): arrival, slew, setup and hold — first without wires, then with placement-based RC estimation (HPWL/Steiner) and SPEF | OpenSTA | worst slack and every endpoint's arrival within 1% or 5 ps |
 
