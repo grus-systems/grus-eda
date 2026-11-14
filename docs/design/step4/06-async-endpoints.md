@@ -53,7 +53,7 @@ our STA does not.
   widen the tolerance and do **not** ignore the test yourself: report the measured diffs per
   field and leave the tolerance call to the maintainer (aes precedent: systematic bias is
   `#[ignore]`d with a recorded table, never fitted).
-- `cargo clippy --all-targets -D warnings` clean. No other test may change its pass/fail state
+- `cargo clippy --all-targets -- -D warnings` clean. No other test may change its pass/fail state
   (the maintainer runs the full suite on acceptance).
 - Final message: the step-1 numbers, the per-mode max-diff lines, and the exact commit the
   work is based on.

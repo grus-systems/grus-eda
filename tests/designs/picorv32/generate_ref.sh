@@ -29,7 +29,11 @@ if [ ! -f /.dockerenv ] && [ ! -f /nix/var/nix/profiles/default/bin/openroad ]; 
         docker_cmd="mise exec docker-cli@latest colima@latest lima@latest -- docker"
     fi
 
+    # Run as the invoking user so generated files are owned by them, not root:
+    # CI checkouts (and any later cleanup) run as the runner user and cannot
+    # remove root-owned files.
     ${docker_cmd} run --rm \
+        -u "$(id -u):$(id -g)" \
         -v "${REPO_ROOT}:/work" \
         -v "${PDK_HOST_ROOT}:/pdk" \
         -e PDK_ROOT=/pdk \
