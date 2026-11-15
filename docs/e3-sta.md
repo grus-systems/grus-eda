@@ -287,9 +287,13 @@ Enabled with `grus-eda sta --spef <file>`. Implemented 2026-11-10.
 
 **Stage 1: reader and RC tree.**
 1. Units: `*C_UNIT` to pF, `*R_UNIT` to kohm (so `R * C` is ns), `*T_UNIT` must be `1 NS`. `*NAME_MAP`
-   references (`*12`, `*12:3`) are resolved; backslash escapes are removed.
-2. Per `*D_NET`: `*CAP` lines with one node are ground capacitors; with two nodes (coupling) they are lumped to
-   ground on the first node. `*RES` lines are resistors. `*CONN` is not needed: pin nodes are found by name
+   references (`*12`, `*12:3`) are resolved; backslash escapes are removed. A `*NAME_MAP` section ends at the
+   next section header (`*PORTS`); only `*<digits>` lines are entries, and one without a name is an error.
+2. Per `*D_NET`: `*CAP` lines with one node are ground capacitors; a coupling cap (two nodes) is listed once,
+   in its first node's net. The full value is grounded on the first node. Measured against OpenSTA on the gcd
+   routed SPEF (ticket 14): half the value is also grounded on the second node, in the net that owns that node
+   (resistor endpoints first, file order; then cap first-nodes; the owner may be the listing net). A second
+   node with no owner gets nothing. Total `D_NET` capacitance stays the header value. `*RES` lines are resistors. `*CONN` is not needed: pin nodes are found by name
    (`cell:pin`, or the port name).
 3. The tree is a BFS spanning tree from the driver pin; self-loops and parallel resistors are dropped. A net
    that is absent from the SPEF has no parasitics. A pin without a node, or not connected to the driver by

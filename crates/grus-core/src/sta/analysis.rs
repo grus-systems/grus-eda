@@ -813,6 +813,11 @@ mod tests {
     }
 
     #[test]
+    fn test_gcd_routed_spef_matches_opensta() {
+        compare_design_with_opensta("gcd", "routed_spef", Rc::RoutedSpef, Tol::GCD_SPEF);
+    }
+
+    #[test]
     fn test_aes_zero_wire_matches_opensta() {
         compare_design_with_opensta("aes", "zero_wire", Rc::None, Tol::STRICT);
     }
@@ -952,6 +957,7 @@ mod tests {
         None,
         Placement,
         Spef,
+        RoutedSpef,
     }
 
     fn compare_design_with_opensta(design_name: &str, golden_key: &str, rc_mode: Rc, tol: Tol) {
@@ -976,6 +982,10 @@ mod tests {
             }
             Rc::Spef => {
                 let spef = crate::readers::load_spef(&gcd.join(format!("{design_name}.routed.spef"))).expect("SPEF");
+                Some(crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics"))
+            }
+            Rc::RoutedSpef => {
+                let spef = crate::readers::load_spef(&gcd.join(format!("{design_name}.rcx.spef"))).expect("SPEF");
                 Some(crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics"))
             }
         };
