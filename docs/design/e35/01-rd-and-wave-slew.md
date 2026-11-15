@@ -31,12 +31,13 @@ For the 7 shielded rows (rd at the zero-error scale, slopes taken at the referen
 | arc | `rd_root / delay_slope` | `rd_root / slew_slope` |
 |---|---|---|
 | `_06058_` B->Y fall / rise | 2.90 / 3.22 | 2.13 / 2.23 |
+| `_06198_` C->X rise (omitted from the first version of this table; shield 0.926) | 3.59 | not recorded |
 | `_11506_` Q rise / fall | 3.07 / 2.46 | 2.14 / 1.91 |
 | `_09979_` Q fall | 2.57 | 1.99 |
 | `_04923_` A->Y fall | 2.81 | 2.13 |
 | `_06198_` C->X fall | 2.94 | 2.22 |
 
-The delay-slope ratio is 2.46-3.22 and splits by transition; the slew-slope ratio is 1.91-2.23 and does not.
+The delay-slope ratio is 2.46-3.59 and splits by transition (falls 2.46-2.94, rises 3.07-3.59); the slew-slope ratio is 1.91-2.23 and does not.
 
 `rd = k x (slew slope)` with `k` fixed, same 76 rows:
 
@@ -75,12 +76,12 @@ over-estimates Ceff and delay and by that happens to cancel the missing waveform
 ### 1d. The waveform slew
 
 OpenSTA's driver waveform slew (column 12) vs the table slew (column 11):
-- unshielded rows (`ceff/total >= 0.99`): ratio 0.965-0.985 (a constant ~3% below the table slew, not understood: possibly a threshold convention);
+- unshielded rows (`ceff/total >= 0.99`, 61 rows): ratio min 0.965, median 0.973, max 1.016 (12 rows above 0.985, mostly high input slew or large load); on average ~3% below the table slew, not understood and not a constant;
 - shielded rows: ratio grows with shielding: 1.07-1.13 at `ceff/total` 0.89-0.94, 1.24 at 0.85, 1.46 at 0.725.
   This is close to `table_slew(total) / table_slew(ceff)`.
 
 Candidates against the 76 rows, `k = 2.0`, ours vs OpenSTA waveform slew:
-- table slew at Ceff (shipped): median 2.69%, max 30.3% (`_11506_` fall);
+- table slew at Ceff (evaluated at k = 2.0; at the shipped `RD_SCALE` 4.5 it is 2.65% / 19.83%): median 2.69%, max 30.3% (`_11506_` fall);
 - table slew at total load (`w1`): median 2.79%, max 11.2%; on shielded rows within -0.4..-3% for rises, -2..-5.6% for falls, one outlier `_06200_` fall -11.2%;
 - 0.97 x `w1`: median 0.57%, max 13.9% (better on unshielded rows, worse on shielded);
 - a direct simulation of the fitted ramp source behind `rd` into the pi model was tried and is **wrong by 3x**: at large loads
@@ -138,3 +139,15 @@ New instrument: `tests/designs/collect_dcalc.sh` (committed; runs OpenSTA `repor
 - **Waveform slew structure** (`test_dmp_wave_slew_scan`, ratio of OpenSTA's driver waveform slew to the table slew at the total load, median by shielding `Ceff/total`): picorv32 0.973 (>= 0.99), 0.991 (0.97-0.99), 1.008 (0.90-0.97), 1.035 (0.80-0.90), 1.039 (< 0.80); aes 0.978, 0.993, 1.004 in the three bins it covers; gcd 0.974, 0.997. The two designs agree bin by bin, so this is a transferable, smooth relation, not a per-design fit: the waveform slew is ~0.975 x table slew at the total load when unshielded and rises to ~1.04 x when strongly shielded. (Against the table slew at Ceff the ratio reaches 1.32 below 0.8.) An experiment applying a piecewise-linear factor of our own `Ceff/total` through these bin medians **did not improve the endpoints** (aes placed 524 -> 548, picorv32 placed 2 -> 30 under the same tolerance, routed 53 -> 21): the per-stage waveform slew is characterised, but it is not what limits the endpoint residual.
 - **Second review** (external reviewer, record not included): **hold**. S2: `table_slew(total)` for every pi net is not justified (the unshielded rows are 0.97-0.98 x, and the measured aes class medians say so); S2: loosening the picorv32 tolerances on an unexplained 2% is not acceptable; S2: the figures were not independently reproducible from asserting tests; S3: stale comment on the sweep test (fixed).
 - **Decision**: **no model or tolerance change lands.** Reverted from the tree: `RD_SCALE` stays 4.5, the propagated slew stays the table slew at Ceff, `Tol::PICORV32_SPEF` unchanged. Kept: the instruments (`collect_dcalc.sh`, the three tables, `test_dmp_rd_rule_sweep`, `test_dmp_rd_root_scan`, `test_dmp_wave_slew_scan`). The standing facts for the next attempt: (a) the Ceff-consistent `RD_SCALE` is ~3 (picorv32 280 shielded rows: 3.01, cv 12%; aes worst Ceff 2.68%), and 4.5 is an arrival-driven compromise; (b) the waveform slew relation above; (c) the endpoint residual with a Ceff-correct driver is **not** explained by the per-stage driver slew, so the next question is what else differs between our and OpenSTA's stage delay along the failing endpoints (candidates: the wire-delay/slew degradation at the sinks, which is outside the DMP solve) — answer with a per-stage comparison on the worst picorv32 routed path (driver delay, wire delay, sink slew, each against `report_checks -fields {slew cap}` output), not with more constants.
+
+## 7. External design review of Sections 1-6 (2026-11-15)
+
+The review tool worked again. Verdict **changes** (S1 0, S2 6, S3 1), full text not included in this repository. Dispositions:
+
+- S2 Section 1a vs 1b contradiction: **accepted**; the 1b table had left out `_06198_` C->X rise (3.59, shield 0.926); fixed above (rises 3.07-3.59, falls 2.46-2.94).
+- S2 unshielded ratio range: **accepted**; replaced by min/median/max 0.965 / 0.973 / 1.016 and "not a constant".
+- S2 `dt -> 0` also invalidates the Ceff solve: **accepted, and the useful finding of the review**. `fit_ramp` collapses to `dt ~ 0` whenever `ln4 * rd * c >= table_slew(c)`; for a single pole `dD/dC = ln2 * Rd` and `dS/dC = ln4 * Rd`, i.e. `RD_SCALE = 1/ln2 = 1.44`. Measured: that single-pole value is much worse than 3 (`delay_slope x 1.4427` on 7054 picorv32 rows: Ceff median/max 0.90 / 26.72% overall, 6.00 / 26.72% shielded; on aes 0.72 / 8.99%), so the Liberty tables are not single-pole-RC consistent and the fit needs ~2x the single-pole `rd`, which puts the large-load arcs in the `dt -> 0` regime (`_11506_` fall: step-response slew 8.7 ns vs 3.17 ns table). Not yet counted: how many rows hit `dt -> 0` at `RD_SCALE` 3 and 4.5 (needs a counter in `fit_ramp`, next). A 3-parameter formulation (rd bounded and solved with `(t0, dt)` and the input slew) is the structural candidate; it has not been tried.
+- S2 `RD_SCALE` 3.0 error distribution on all 7054 rows, and the 280-row statistic not computed by a test: **accepted**. Distribution (`test_dmp_rd_rule_sweep`, median / max |error| %): `RD_SCALE` 3.0: all rows Ceff 0.70 / 6.79, delay 0.08 / 11.32, slew 0.32 / 6.75; shielded (535) Ceff 0.58 / 6.79, delay 0.33 / 6.03, slew 0.54 / 6.75. `RD_SCALE` 4.5: all Ceff 0.60 / 17.10, delay 0.06 / 15.21, slew 0.23 / 17.01; shielded Ceff 1.39 / 17.10, delay 0.80 / 15.21, slew 1.27 / 17.01. `RD_SCALE` 2.0: shielded Ceff 2.94 / 10.27. The 3.01 / 12% statistic came from a Python pass over `test_dmp_rd_root_scan` output with a `shield < 0.95` filter (281 rows, 8 with input slew > 1.5 ns: the text said 280 / 7 — the sample is 281 / 8); moving that computation into the test is still to do.
+- S2 independent evaluation covers placement-estimate aes only: **accepted**; ibex and routed aes remain to be generated (open).
+- S2 spread of the waveform ratio: **accepted**, p10 / median / p90 of wave / table(total) by `ceff/total` bin, picorv32: [0, 0.8) 1.034 / 1.039 / 1.059; [0.8, 0.9) 1.015 / 1.035 / 1.068; [0.9, 0.97) 0.996 / 1.008 / 1.030; [0.97, 0.99) 0.981 / 0.991 / 1.007; [0.99, 1.01) 0.966 / 0.973 / 0.987; aes [0.99, 1.01): 0.966 / 0.978 / 1.000. The outlier rows (e.g. `_06200_` fall) are high input slew or large load; stratifying by input slew is still to do.
+- S3 label and scope: **accepted**, fixed above.

@@ -1235,7 +1235,7 @@ mod tests {
             if which == 0 { (hi.0 - lo.0) / (2.0 * h) } else { (hi.1 - lo.1) / (2.0 * h) }
         };
         let mut rules: Vec<(String, Rule)> = Vec::new();
-        for scale in [3.0, 4.5] {
+        for scale in [std::f64::consts::LOG2_E, 2.0, 3.0, 4.5] {
             rules.push((format!("delay_slope x {scale}"), Box::new(move |t, c| (scale * slope(t, c, 0)).max(1e-6))));
         }
         for k in [1.8, 1.9, 2.0, 2.1, 2.2] {

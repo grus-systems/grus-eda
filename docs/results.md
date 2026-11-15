@@ -668,3 +668,8 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
 - **Why this stage is hard**: the load is 2.26 pF while the Liberty `dfxtp_2` tables stop at 0.303 pF (a 7x extrapolation; our `eval_nldm` extrapolates linearly like OpenSTA's tables, and the arc's row in `dcalc_routed_all.txt` is consistent with that: Ceff +1.71% at `RD_SCALE` 4.5, -0.41% at 3.0).
 - **Next**: the remaining question is Ceff accuracy at extreme loads (more than about 5x the table range), where `rd` comes from an extrapolated slope: collect the arcs of that regime (nets over ~1 pF in picorv32, aes, ibex), evaluate the `RD_SCALE`/waveform-slew candidates on them only, and decide whether those nets need their own treatment.
 
+### 2026-11-15 — E3.5: external design review of the e35 record; the single-pole `RD_SCALE` is worse than 3
+
+- **What was run**: an external design review of the e35 record; `test_dmp_rd_rule_sweep` with the rules `delay_slope x {1/ln2, 2, 3, 4.5}`.
+- **Result**: verdict changes (0 / 6 / 1), all findings accepted and recorded in `docs/design/e35/01-rd-and-wave-slew.md` Section 7 (doc corrections; the 1b table had omitted one row). New measurement: the single-pole `rd = delay slope / ln2` gives Ceff up to 26.72% on picorv32 (shielded median 6.00%) and 8.99% on aes, far worse than `RD_SCALE` 3 (6.79% / 2.68%) — the tables are not single-pole consistent. `RD_SCALE` 3.0 and 4.5 error distributions on all 7054 rows are in that section. Still open from the review: count rows where `fit_ramp` hits `dt -> 0`, a 3-parameter DMP formulation, ibex and routed aes, the 281-row statistic computed in a test.
+
