@@ -959,6 +959,198 @@ mod tests {
         }
     }
 
+    /// One data row of `dcalc_routed_ref.txt`: OpenSTA `report_dcalc` on the routed SPEF.
+    struct DcalcRow {
+        line: usize,
+        from: String,
+        to: String,
+        sense: String,
+        sense_kind: TimingSense,
+        out: String,
+        out_pol: usize,
+        input_slew: f64,
+        /// OpenSTA's far capacitor C1 (ours: `PiModel::c2`).
+        far_c1: f64,
+        rpi: f64,
+        /// OpenSTA's near capacitor C2 (ours: `PiModel::c1`).
+        near_c2: f64,
+        ceff: f64,
+        delay: f64,
+        slew: f64,
+        driver_slew: f64,
+    }
+
+    fn parse_dcalc_rows(text: &str) -> Vec<DcalcRow> {
+        let mut rows = Vec::new();
+        for (i, raw) in text.lines().enumerate() {
+            let line = i + 1;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = trimmed.split_whitespace().collect();
+            assert_eq!(f.len(), 12, "dcalc_routed_ref.txt line {line}: expected 12 columns, got {}", f.len());
+            let num = |s: &str| -> f64 { s.parse().unwrap_or_else(|_| panic!("dcalc_routed_ref.txt line {line}: bad number {s:?}")) };
+            let sense_kind = match f[2] {
+                "positive_unate" => TimingSense::PositiveUnate,
+                "negative_unate" => TimingSense::NegativeUnate,
+                "non_unate" => TimingSense::NonUnate,
+                other => panic!("dcalc_routed_ref.txt line {line}: unknown arc sense {other:?}"),
+            };
+            let out_pol = match f[3] {
+                "rise" => RISE,
+                "fall" => FALL,
+                other => panic!("dcalc_routed_ref.txt line {line}: unknown output transition {other:?}"),
+            };
+            rows.push(DcalcRow {
+                line,
+                from: f[0].to_string(),
+                to: f[1].to_string(),
+                sense: f[2].to_string(),
+                sense_kind,
+                out: f[3].to_string(),
+                out_pol,
+                input_slew: num(f[4]),
+                far_c1: num(f[5]),
+                rpi: num(f[6]),
+                near_c2: num(f[7]),
+                ceff: num(f[8]),
+                delay: num(f[9]),
+                slew: num(f[10]),
+                driver_slew: num(f[11]),
+            });
+        }
+        rows
+    }
+
+    /// Graph arcs from `src` to `dst` that a `report_dcalc` row can refer to: same Liberty sense, and
+    /// the same transition filter `build_graph` applies to combinational arcs. Register `CLK -> Q`
+    /// arcs are launches, not edges, so both lists are searched.
+    fn matching_arcs(lib: &LibDb, graph: &TimingGraph, src: PinId, dst: PinId, row: &DcalcRow) -> Vec<u32> {
+        let combinational = graph.edges_from[src.0 as usize]
+            .iter()
+            .map(|&i| graph.edges[i as usize])
+            .filter(|e| e.dst == dst)
+            .map(|e| e.lib_arc);
+        let launches = graph.launches.iter().filter(|l| l.clk == src && l.q == dst).map(|l| l.lib_arc);
+        combinational
+            .chain(launches)
+            .filter(|&a| {
+                let arc = &lib.arcs[a as usize];
+                let transition_ok = !((arc.timing_type == TimingType::CombinationalRise && row.out_pol != RISE)
+                    || (arc.timing_type == TimingType::CombinationalFall && row.out_pol != FALL));
+                arc.timing_sense == row.sense_kind && transition_ok
+            })
+            .collect()
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        assert!(!v.is_empty(), "median of no values");
+        v.sort_by(f64::total_cmp);
+        let n = v.len();
+        if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+    }
+
+    /// Ticket 17 (E3.5, step 7): our pi model and DMP solution against every row of OpenSTA's
+    /// `report_dcalc` on the routed SPEF. Measurement only: prints one row per arc and a summary; no
+    /// error magnitude is asserted. Errors are ours minus OpenSTA, in percent of OpenSTA's value.
+    #[test]
+    fn test_dmp_matches_opensta_report_dcalc_routed() {
+        use crate::sta::dmp::solve_dmp;
+        const QUANTITIES: [&str; 7] = ["C1far", "Rpi", "C2near", "Ceff", "delay", "slew", "drv_slew"];
+        let lib_dir = sky130_hd();
+        let dir = design_dir("picorv32");
+        let text = std::fs::read_to_string(dir.join("dcalc_routed_ref.txt")).expect("dcalc_routed_ref.txt");
+        let rows = parse_dcalc_rows(&text);
+        let data_lines = text.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).count();
+        assert_eq!(rows.len(), data_lines, "parsed rows vs data lines");
+        assert!(rows.len() >= 60, "dcalc_routed_ref.txt has {} rows; expected at least 60", rows.len());
+
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(&dir.join("picorv32.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join("picorv32.sdc")).expect("SDC");
+        let spef = crate::readers::load_spef(&dir.join("picorv32.rcx.spef")).expect("SPEF");
+        let par = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
+        let cx = Context { design: &design, lib: &lib, sdc: &sdc, parasitics: Some(&par), pi_models: Vec::new() };
+        let graph = build_graph(&cx, &mut SkipReport::default());
+        let find_pin = |name: &str| (0..design.num_pins()).map(|i| PinId(i as u32)).find(|&p| cx.pin_name(p) == name);
+        let pct = |ours: f64, reference: f64| (ours - reference) / reference.abs() * 100.0;
+
+        println!(
+            "{:<52} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9}",
+            "key (from -> to sense out)", "C1far%", "Rpi%", "C2near%", "Ceff%", "delay%", "slew%", "drvslew%"
+        );
+        let mut matched_errors: Vec<[f64; 7]> = Vec::new();
+        let mut unmodelled = 0usize;
+        for row in &rows {
+            let key = format!("{} -> {} {} {}", row.from, row.to, row.sense, row.out);
+            let (Some(src), Some(dst)) = (find_pin(&row.from), find_pin(&row.to)) else {
+                println!("UNMODELLED {key} (line {}): pin not in design", row.line);
+                unmodelled += 1;
+                continue;
+            };
+            let arc_index = match matching_arcs(&lib, &graph, src, dst, row).as_slice() {
+                [] => {
+                    println!("UNMODELLED {key} (line {}): no graph arc with this sense and transition", row.line);
+                    unmodelled += 1;
+                    continue;
+                }
+                [one] => *one,
+                many => {
+                    println!("UNMODELLED {key} (line {}): {} matching arcs, ambiguous", row.line, many.len());
+                    unmodelled += 1;
+                    continue;
+                }
+            };
+            let arc = &lib.arcs[arc_index as usize];
+            let net = design.pin_nets[dst.0 as usize].expect("output pin has a net");
+            let caps: Vec<f32> = design.net_pins(net).iter().map(|&p| cx.sink_cap(p, row.out_pol)).collect();
+            let pi = par.net(net).unwrap_or_else(|| panic!("{key}: no routed parasitics for its net")).pi_model(&caps);
+            let (Some(delay_table), Some(slew_table)) = delay_tables(arc, row.out_pol) else {
+                panic!("{key}: no NLDM tables for this transition")
+            };
+            let slew_in = row.input_slew as f32;
+            let table = |c: f64| {
+                (
+                    eval_nldm_delay_or_slew(delay_table, slew_in, c as f32) as f64,
+                    eval_nldm_delay_or_slew(slew_table, slew_in, c as f32) as f64,
+                )
+            };
+            let result = solve_dmp(&pi, RD_SCALE, &table);
+            let errors = [
+                pct(pi.c2, row.far_c1),
+                pct(pi.rpi, row.rpi),
+                pct(pi.c1, row.near_c2),
+                pct(result.ceff, row.ceff),
+                pct(result.delay, row.delay),
+                pct(result.slew, row.slew),
+                pct(result.slew, row.driver_slew),
+            ];
+            println!(
+                "{key:<52} {:>+8.2} {:>+8.2} {:>+8.2} {:>+8.2} {:>+8.2} {:>+8.2} {:>+9.2}",
+                errors[0], errors[1], errors[2], errors[3], errors[4], errors[5], errors[6]
+            );
+            matched_errors.push(errors);
+        }
+
+        let matched = matched_errors.len();
+        assert_eq!(matched + unmodelled, rows.len(), "every row is matched or unmodelled");
+        println!("summary: rows {} matched {matched} unmodelled {unmodelled}", rows.len());
+        assert!(matched > 0, "no row matched a graph arc");
+        for (q, name) in QUANTITIES.iter().enumerate() {
+            let abs: Vec<f64> = matched_errors.iter().map(|e| e[q].abs()).collect();
+            let max = abs.iter().copied().fold(0.0, f64::max);
+            println!("summary {name}: median |err| {:.2}%  max |err| {:.2}%", median(abs.clone()), max);
+        }
+    }
+
     /// Endpoint timing of one estimator, pin name, max arrival (ns), max slack (ns), plus WNS/TNS (max path).
     struct Timing {
         endpoints: Vec<(String, f64, f64)>,
