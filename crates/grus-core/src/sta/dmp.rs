@@ -88,21 +88,20 @@ fn rc_slew(dt: f64, tau: f64) -> f64 {
 /// True when no ramp can reproduce the table slew with this `rd`: even a step through `rd` is slower than
 /// the table slew, so [`fit_ramp`] returns its floor `dt`. The ramp model is outside its domain there.
 pub fn ramp_fit_degenerate(rd: f64, c: f64, slew: f64) -> bool {
-    let tau = rd * c;
-    rc_slew(1e-9 * tau.max(1e-12), tau) >= slew
+    fit_ramp_duration(rd, c, slew).1
 }
 
-/// Ramp parameters `(t0, dt)` such that a capacitor `c` behind `rd` has its 50% point at `delay`
-/// and a 20%-80% slew of `slew`. The input 50% point is time 0.
-fn fit_ramp(rd: f64, c: f64, delay: f64, slew: f64) -> (f64, f64) {
+/// Fits the saturated-ramp duration `dt` so that driving capacitor `c` through `rd` produces
+/// 20%-80% output slew `slew`. Returns `(dt, degenerate)` where `degenerate` is true when even a
+/// step input through `rd` (`dt -> 0`) is at least as slow as `slew`.
+pub fn fit_ramp_duration(rd: f64, c: f64, slew: f64) -> (f64, bool) {
     let tau = rd * c;
     // The slew grows monotonically with the ramp duration; at dt -> 0 it is the step response.
     let mut lo = 1e-9 * tau.max(1e-12);
-    let mut hi = (slew * 4.0).max(lo * 2.0) + tau * 8.0;
     if rc_slew(lo, tau) >= slew {
-        let t0 = delay - rc_crossing(0.5, lo, tau);
-        return (t0, lo);
+        return (lo, true);
     }
+    let mut hi = (slew * 4.0).max(lo * 2.0) + tau * 8.0;
     while hi - lo > 1e-6 {
         let mid = 0.5 * (lo + hi);
         if rc_slew(mid, tau) < slew {
@@ -111,8 +110,68 @@ fn fit_ramp(rd: f64, c: f64, delay: f64, slew: f64) -> (f64, f64) {
             hi = mid;
         }
     }
-    let dt = 0.5 * (lo + hi);
-    (delay - rc_crossing(0.5, dt, tau), dt)
+    (0.5 * (lo + hi), false)
+}
+
+/// Ramp parameters `(t0, dt)` such that a capacitor `c` behind `rd` has its 50% point at `delay`
+/// and a 20%-80% slew of `slew`. The input 50% point is time 0.
+fn fit_ramp(rd: f64, c: f64, delay: f64, slew: f64) -> (f64, f64) {
+    let (dt, _) = fit_ramp_duration(rd, c, slew);
+    (delay - rc_crossing(0.5, dt, rd * c), dt)
+}
+
+/// 20%-80% transition time of the driving-point voltage `V1(t)` when a saturated ramp of duration
+/// `dt` behind `rd` drives the pi model `(c1, rpi, c2)` (`c1` near, `c2` far).
+pub fn pi_waveform_slew(pi: &PiModel, rd: f64, dt: f64) -> f64 {
+    let total = pi.total();
+    if rd * total <= 1e-15 {
+        return 0.6 * dt;
+    }
+    if pi.c2 <= 1e-12 || pi.rpi <= 1e-12 {
+        return rc_slew(dt, rd * total);
+    }
+    let c1 = pi.c1.max(1e-6 * total);
+    let (c2, rpi) = (pi.c2, pi.rpi);
+    let b1 = rd * (c1 + c2) + rpi * c2;
+    let b2 = rd * rpi * c1 * c2;
+    let disc = (b1 * b1 - 4.0 * b2).max(0.0).sqrt();
+    let tau1 = 0.5 * (b1 + disc);
+    let tau2 = (b2 / tau1).max(1e-18);
+    let tz = rpi * c2;
+    let denom = (tau1 - tau2).max(1e-18);
+    let k1 = (tau1 - tz) / denom;
+    let k2 = (tz - tau2) / denom;
+    let v1 = |u: f64| -> f64 {
+        if u <= 0.0 {
+            return 0.0;
+        }
+        if dt <= 1e-12 * b1 {
+            return 1.0 - k1 * (-u / tau1).exp() - k2 * (-u / tau2).exp();
+        }
+        if u <= dt {
+            return u / dt + (k1 * tau1 * (-u / tau1).exp_m1() + k2 * tau2 * (-u / tau2).exp_m1()) / dt;
+        }
+        let post = |k: f64, tau: f64| -> f64 {
+            if dt <= tau {
+                k * (tau / dt) * (-u / tau).exp() * (dt / tau).exp_m1()
+            } else {
+                k * (tau / dt) * ((-(u - dt) / tau).exp() - (-u / tau).exp())
+            }
+        };
+        1.0 - post(k1, tau1) - post(k2, tau2)
+    };
+    let crossing = |level: f64| -> f64 {
+        let (mut lo, mut hi) = (0.0, dt + 40.0 * b1);
+        for _ in 0..80 {
+            if hi - lo <= 1e-7 {
+                break;
+            }
+            let mid = 0.5 * (lo + hi);
+            if v1(mid) < level { lo = mid } else { hi = mid }
+        }
+        0.5 * (lo + hi)
+    };
+    crossing(0.8) - crossing(0.2)
 }
 
 /// Trapezoid steps of the charge integrator: [`pi_charge_numeric`] runs this many steps, and
@@ -290,14 +349,25 @@ fn pi_charge_numeric(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> f64 {
 /// Table of a driver arc: `table(c)` returns the table `(delay, slew)` at load `c`.
 pub type DriverTable<'a> = &'a dyn Fn(f64) -> (f64, f64);
 
+fn delay_slope(table: DriverTable, c: f64) -> f64 {
+    let h = 0.05 * c;
+    ((table(c + h).0 - table(c - h).0) / (2.0 * h)).max(1e-6)
+}
+
+/// True when `pi` has no effective shielding or `table(total).1 < 2 ln(5/4) * dslope(total) * total`,
+/// where OpenSTA falls back to the unshielded lumped load rather than solving the pi ramp equation.
+fn is_lumped_bailout(pi: &PiModel, table: DriverTable) -> bool {
+    if pi.c2 <= 0.0 || pi.rpi <= 1e-9 {
+        return true;
+    }
+    let total = pi.total();
+    table(total).1 < 2.0 * 1.25f64.ln() * delay_slope(table, total) * total
+}
+
 /// Solves for the effective capacitance. `rd_scale` converts the local delay-vs-capacitance slope of the
 /// table into the driver resistance.
 pub fn solve_dmp(pi: &PiModel, rd_scale: f64, table: DriverTable) -> DmpResult {
-    solve_dmp_with(pi, &|table, c| {
-        let h = 0.05 * c;
-        let slope = (table(c + h).0 - table(c - h).0) / (2.0 * h);
-        (rd_scale * slope).max(1e-6)
-    }, table)
+    solve_dmp_with(pi, &|table, c| (rd_scale * delay_slope(table, c)).max(1e-6), table)
 }
 
 /// [`solve_dmp`] with the driver-resistance rule as a parameter: `rd_of(table, c)` is the resistance
@@ -312,7 +382,7 @@ pub fn solve_dmp_with(
         let (delay, slew) = table(c);
         DmpResult { ceff: c, delay, slew }
     };
-    if pi.c2 <= 0.0 || pi.rpi <= 1e-9 {
+    if is_lumped_bailout(pi, table) {
         return lumped(total);
     }
     // f(c) > 0 when the pi load takes more charge than a capacitor `c` would: c is too small.
@@ -339,6 +409,23 @@ pub fn solve_dmp_with(
         }
     }
     lumped(0.5 * (lo + hi))
+}
+
+/// Driving-point 20%-80% waveform slew (`V1(t)`) for a solved DMP point `r`.
+///
+/// OpenSTA distinguishes the table slew at `Ceff` (`r.slew`, reported in `report_dcalc`)
+/// from the driving-point waveform slew propagated to downstream stages (`OpenSTA#227`).
+/// Uses `rd_w = ln(2) * d(delay)/dC(Ceff)` and falls back to `r.slew` on lumped or
+/// extreme-load bailout points (`table(total).1 < 2 ln(5/4) * dslope(total) * total`).
+pub fn driver_waveform_slew(pi: &PiModel, r: &DmpResult, table: DriverTable) -> f64 {
+    if is_lumped_bailout(pi, table) {
+        return r.slew;
+    }
+    let total = pi.total();
+    let c = r.ceff.max(1e-6 * total);
+    let rd_w = std::f64::consts::LN_2 * delay_slope(table, c);
+    let (dt, _) = fit_ramp_duration(rd_w, c, r.slew);
+    pi_waveform_slew(pi, rd_w, dt)
 }
 
 #[cfg(test)]
@@ -545,6 +632,66 @@ mod tests {
                 assert!(rc_crossing_closed(level, dt, tau).is_none());
                 let reference = rc_crossing_reference(level, dt, tau);
                 assert!((rc_crossing(level, dt, tau) - reference).abs() <= 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn pi_waveform_slew_matches_limits_and_ode_simulation() {
+        // Zero rpi reduces to the single-pole lumped rc_slew.
+        let pi_lumped = PiModel { c1: 0.2, rpi: 0.0, c2: 0.8 };
+        for (rd, dt) in [(0.5, 0.0), (0.5, 0.3), (2.0, 1.5)] {
+            let got = pi_waveform_slew(&pi_lumped, rd, dt);
+            let want = rc_slew(dt, rd * 1.0);
+            assert!((got - want).abs() <= 1e-6, "lumped rd {rd} dt {dt}: got {got} want {want}");
+        }
+
+        // General pi model matches a fine-step backward-Euler/trapezoid ODE trajectory of V1(t).
+        for pi in [
+            PiModel { c1: 0.114533, rpi: 0.497066, c2: 2.118645 },
+            PiModel { c1: 0.01, rpi: 5.0, c2: 0.04 },
+            PiModel { c1: 0.2152, rpi: 0.5469, c2: 1.8 },
+        ] {
+            for (rd, dt) in [(1.5, 0.0), (1.3, 3.6), (0.8, 0.05), (9.9, 0.0)] {
+                let got = pi_waveform_slew(&pi, rd, dt);
+                let total = pi.total();
+                let c1 = pi.c1.max(1e-6 * total);
+                let (c2, rpi) = (pi.c2, pi.rpi);
+                let (g, gp) = (1.0 / rd, 1.0 / rpi);
+                let (a11, a12) = (-(g + gp) / c1, gp / c1);
+                let (a21, a22) = (gp / c2, -gp / c2);
+                let t_end = dt + 10.0 * (rd * total + rpi * c2);
+                let steps = 100_000usize;
+                let h = t_end / steps as f64;
+                let vs = |t: f64| if dt <= 1e-12 { 1.0 } else { (t / dt).clamp(0.0, 1.0) };
+                let (m11, m12, m21, m22) = (1.0 - 0.5 * h * a11, -0.5 * h * a12, -0.5 * h * a21, 1.0 - 0.5 * h * a22);
+                let det = m11 * m22 - m12 * m21;
+                let (mut v1, mut v2) = (0.0, 0.0);
+                let (mut t20, mut t80) = (None, None);
+                for k in 1..=steps {
+                    let t_prev = h * (k - 1) as f64;
+                    let t = h * k as f64;
+                    let rhs1 = v1 + 0.5 * h * (a11 * v1 + a12 * v2) + 0.5 * h * (vs(t_prev) + vs(t)) * g / c1;
+                    let rhs2 = v2 + 0.5 * h * (a21 * v1 + a22 * v2);
+                    let n1 = (rhs1 * m22 - m12 * rhs2) / det;
+                    let n2 = (m11 * rhs2 - m21 * rhs1) / det;
+                    if t20.is_none() && n1 >= 0.2 {
+                        let frac = (0.2 - v1) / (n1 - v1);
+                        t20 = Some(t_prev + frac * h);
+                    }
+                    if t80.is_none() && n1 >= 0.8 {
+                        let frac = (0.8 - v1) / (n1 - v1);
+                        t80 = Some(t_prev + frac * h);
+                        break;
+                    }
+                    v1 = n1;
+                    v2 = n2;
+                }
+                let sim = t80.unwrap() - t20.unwrap();
+                assert!(
+                    (got - sim).abs() <= 1e-3 * sim.max(1e-3),
+                    "pi {pi:?} rd {rd} dt {dt}: closed {got} sim {sim}"
+                );
             }
         }
     }

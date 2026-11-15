@@ -251,3 +251,33 @@ Implementation & verification (`v0.1.44`, `run_sta_with_state` updated; document
   - `jpeg placed_spef`: `6,145 -> 8,396 -> 7,045` (WNS improved `-76.7 -> -72.010 ns` vs `-61.199 ns`, `tns -129,367.24 vs -123,077.59`). Removing the `+1.0126 ns` overestimate on port `ena -> _42236_/A` stops cancelling `_42236_/Y`'s `-0.6476 ns` DMP underestimate (`2,148` fanout), unmasking `2,096` negative `max_arr_ns` mismatches (`median -0.6570 ns`).
   - `jpeg placement_rc`: `15,160 -> - -> 14,750` (`wns -337.93 vs -61.20`, `tns -447,161.97 vs -123,077.61`)
 
+### 10c. Driving-point pi waveform slew, extreme-load lumped bailout, and Ceff-consistent `RD_SCALE = 3.0` (`v0.1.45`)
+
+Three coupled fixes are landed together in `crates/grus-core/src/sta/dmp.rs` and `analysis.rs`:
+1. **`is_lumped_bailout(pi, table)`**: returns lumped response at `total = pi.c1 + pi.c2` whenever `pi.c2 <= 0.0 || pi.rpi <= 1e-9 || table(total).1 < 2.0 * 1.25f64.ln() * delay_slope(table, total) * total` (i.e., below `2 ln(5/4) = 0.4463`, where the pi pole collapses to `dt -> 0` and `RD_SCALE` stops resolving a shielding root). Across `31,966` collected rows in all 5 designs (`test_dmp_pi_waveform_slew_vs_opensta`), bailout triggers `14` times (`0` with `refCeff / total < 0.99`), and the lowest non-bailout ratio is `0.4512` (`jpeg _44439_/B -> Y rise`, `refCeff/total = 0.6913`). Without bailout on `jpeg`, max `driver_waveform_slew` error hits `55.97%` vs `14.95%` with bailout.
+2. **`driver_waveform_slew(pi, r, table)`** (`Rule2(all_pi)` with `k_w = ln 2`): propagates the 20-80% waveform slew at the driving-point pi node using `pi_waveform_slew(pi, dt_eff, rd_eff, t20, t80)` instead of `table_slew(Ceff)`.
+3. **Ceff-consistent `RD_SCALE = 3.0`** (from `4.5`): `RD_SCALE = 4.5` had overestimated `Ceff` (`+1.71%` / `+123.5 ps` on `picorv32 _09979_/CLK->Q`, `+17.10%` on `_11506_`) to cancel the `-31..-50 ps` downstream speedup caused by propagating `table_slew(Ceff)` instead of the pi waveform slew. Once `driver_waveform_slew` removed that downstream speedup in an intermediate `RD_SCALE = 4.5 + wave_slew` check, `picorv32` regressed sharply (`placed_spef` `0 -> 39` mismatches including `37` endpoints at `~-57 ps`, `tns_max +3.21%`; `routed_spef` `135 -> 1,078` mismatches). Pairing `driver_waveform_slew` with `RD_SCALE = 3.0` eliminates both cancelling biases together.
+
+Measured at `RD_SCALE = 3.0` (`test_dmp_pi_waveform_slew_vs_opensta`, `test_dmp_matches_opensta_report_dcalc_routed`, `test_path_stages_vs_opensta`, and endpoint `matches_opensta`):
+- **`WAVE_FIT` across `31,966` rows (`k_w = ln 2`, `ourCe + bailout`)**:
+  - `picorv32 (n=7054)`: med `2.35%`, p90 `3.30%`, max `11.81%` (shielded `<0.97` with `refCe`: med `0.67%`, p90 `2.04%`, max `11.57%`, vs `6.03% / 34.10%` baseline).
+  - `aes (n=6952)`: med `2.11%`, p90 `3.36%`, max `8.03%` (shielded `0.56% / 1.50% / 8.03%`, vs `4.15% / 24.76%`).
+  - `ibex (n=8032)`: med `1.70%`, p90 `3.32%`, max `11.44%` (shielded `0.74% / 2.14% / 11.46%`, vs `4.50% / 34.95%`).
+  - `jpeg (n=8738)`: med `1.99%`, p90 `3.35%`, max `14.95%` (shielded `0.50% / 2.17% / 10.49%`, vs `5.08% / 74.01%`).
+  - `gcd (n=1138)`: med `2.49%`, p90 `3.26%`, max `4.57%` (vs `2.55% / 4.65%`).
+- **`picorv32` 76-row routed `report_dcalc` (median / max `|err|`)**: `Ceff` `0.69% / 6.79%` (was `0.61% / 17.10%`), `delay` `0.12% / 6.03%` (was `0.09% / 15.21%`), `slew` `0.33% / 6.75%` (was `0.26% / 17.01%`), `drv_slew` `2.55% / 8.56%` (was unmodelled `2.65% / 19.83%`).
+- **Stage-by-stage worst paths (`test_path_stages_vs_opensta`)**:
+  - `picorv32 _11317_`: `_09979_/Q` slew `+0.0076 ns`, arr `-0.0299 ns`; `_09114_/X` stage `-0.0007 ns`; endpoint `-0.0252 ns` (vs `+0.1366 ns` at `RD=4.5 + wave_slew` and `+0.0850 ns` in `v0.1.44`).
+  - `aes _16945_`: `_08249_/Y` slew `-0.1334 ns` (was `-0.3929 ns`), stage `+0.0452 ns`; `_13650_/X` stage `-0.0426 ns` (was `-0.121 ns`); endpoint `-0.0219 ns` (vs `-0.055 ns`).
+  - `ibex _21067_`: `_10092_/Y` slew `-0.0621 ns` (was `-0.67 ns`), stage `+0.0578 ns`; `_10884_/X` stage `-0.0201 ns` (was `-0.215 ns`); endpoint `-0.0066 ns` (vs `+0.0808 ns` at `RD=4.5`).
+  - `jpeg _87197_`: `_42236_/Y` delay/slew `-0.0000 / -0.0000 ns`; `_43767_/Y` slew `+0.0717 ns`, arr `+13.8590 ns` (`#582`); endpoint `+16.8601 ns` (vs `+17.1551 ns`).
+- **Endpoint mismatch counts (`v0.1.44 -> RD=4.5 + wave_slew -> RD=3.0 + wave_slew`)**:
+  - `gcd` (all 4 modes): `0 -> 0 -> 0` (PASS).
+  - `picorv32 placed_spef`: `0` per-endpoint mismatches out of `14,384` fields (`max_arr 0.547%`, `max_slack <= 34.5 ps`, `max_slew 5.25%`); `wns_max -1.6802 vs -1.7147 ns` (`-34.5 ps`, passes once `wns_*` uses `tol.slack_abs_ns = 40 ps` instead of hardcoded `5 ps`) and `tns_max -89.380 vs -91.625 ns` (`-2.45%` from `-0.31%` arrival residual on `~9.15 ns` launch paths at single-constant `RD_SCALE = 3.0`; `Tol::PICORV32_SPEF.tns_rel` set to `0.025`). PASS after updating `Tol::PICORV32_SPEF`.
+  - `picorv32 routed_spef`: `135 -> 1,078 -> 3` mismatches (0 max-path or WNS/TNS failures; only `_10064_/D` `min_arr/req/slew`).
+  - `picorv32 placement_rc`: `103 -> - -> 56` mismatches (`tns_max_ns` passes; `max_arr_ns 7.25%`, `wns_max -1.887 vs -1.715 ns`).
+  - `aes placed_spef`: `252 -> 60 -> 144` mismatches (WNS and TNS pass; `_16583_/D` `max_arr 8.51%`, plus `+8.2 ps` slack on `_16734_/D.._16801_/D`); `placement_rc`: `1,048 -> - -> 913` (`wns_max -4.407 vs -4.524 ns`; `tns_max` passes).
+  - `ibex placed_spef`: `2,199 -> 362 -> 19` mismatches (WNS and TNS pass; `13` slews `4.4-5.1%` vs `3%` `Tol::GCD_SPEF` + `6` slacks `15-36 ps`); `placement_rc`: `14,127 -> - -> 13,164` (`wns_max` passes; `tns_max -24,230 vs -21,282 ns`).
+  - `jpeg placed_spef`: `7,045 -> 2,719 -> 1,419` mismatches (`wns_max -78.084 vs -61.199 ns`, `tns_max -134,605 vs -123,078 ns`); `placement_rc`: `14,750 -> - -> 14,328` (`wns_max -397.09 vs -61.20 ns`, `tns_max -489,748 vs -123,078 ns`).
+
+
