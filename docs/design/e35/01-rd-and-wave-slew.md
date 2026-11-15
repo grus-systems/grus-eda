@@ -107,3 +107,16 @@ Candidates against the 76 rows, `k = 2.0`, ours vs OpenSTA waveform slew:
    constant currently compensates for the missing waveform slew? Or should 1 and 2 land together?
 3. Is `table_slew(total)` a defensible first model of the waveform slew, or is there a better closed form (consider that the V1 simulation fails because of the `dt -> 0` floor)?
 4. What would you collect next to separate "fitted constant" from "structural error"?
+
+## 4. Review and disposition (2026-11-15)
+
+external reviewer was unavailable (the review tool failed; not investigated further). The review was run with a second external reviewer instead. The full review text is not included in this repository. Verdict: **agree with changes**. All seven findings are accepted:
+
+- S2 slew-slope rule is an empirical hypothesis, not a derivation (7 shielded arcs). Stated as such; the ideal single-pole RC reference (delay-50% slope `ln2 R`, 20-80 slew slope `ln4 R`) is the baseline any derivation must explain the measured 1.9-2.2 ratio against.
+- S2 Ceff max 2.38% does not meet the 2% criterion. E3.5 is **not** closed; the "accept as noise" wording in Section 2.1 is withdrawn.
+- S2 the 1.03 waveform-slew factor was chosen on the same endpoint set it improves (it may compensate path-level error). Recorded as an exploration result only, no factor is fixed; `table_slew(total)` is a provisional baseline.
+- S2 steps 1 and 2 are one acceptance unit; the `rd` replacement is held back (it raises endpoint mismatches 136 -> 2612 alone).
+- S2 next measurement: same cell and transition with only the load varied, rise/fall, several input slews and shielding degrees; separate the data used to choose constants from independent evaluation data (for example fit on picorv32, evaluate on gcd/aes/ibex).
+- S3 per-arc error tables and the endpoint field breakdown are missing from this document; the committed probe patch regenerates them, and the next round records them in `docs/results.md`.
+
+**Decision**: no model change is made. The next unit is the data collection above (a `report_dcalc` collection script committed with its output, on gcd and aes/ibex for the independent set, plus a load-sweep series on picorv32 cells), which needs the Docker/OpenSTA instrument.
