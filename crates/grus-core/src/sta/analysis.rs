@@ -1369,9 +1369,19 @@ mod tests {
     /// listed pin). Asserts only that paths were parsed.
     #[test]
     fn test_path_stages_vs_opensta_picorv32_routed() {
+        compare_path_stages("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "paths_routed.txt");
+    }
+
+    /// Same comparison on aes with its placement-estimate SPEF (`aes.routed.spef`).
+    #[test]
+    fn test_path_stages_vs_opensta_aes_placed() {
+        compare_path_stages("aes", "aes.placed.def", "aes.routed.spef", "paths_placed.txt");
+    }
+
+    fn compare_path_stages(design_name: &str, def_file: &str, spef_file: &str, paths_file: &str) {
         let lib_dir = sky130_hd();
-        let dir = design_dir("picorv32");
-        let text = std::fs::read_to_string(dir.join("paths_routed.txt")).expect("paths_routed.txt (collect_paths.sh)");
+        let dir = design_dir(design_name);
+        let text = std::fs::read_to_string(dir.join(paths_file)).unwrap_or_else(|e| panic!("{paths_file}: {e}"));
         let paths = parse_paths(&text);
         assert!(paths.len() >= 3, "parsed {} paths", paths.len());
         let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
@@ -1382,9 +1392,9 @@ mod tests {
             &mut interner,
         )
         .expect("LEF");
-        let design = parse_def(&dir.join("picorv32.placed.def"), &tech, Some(&lib)).expect("DEF");
-        let sdc = load_sdc(&dir.join("picorv32.sdc")).expect("SDC");
-        let spef = crate::readers::load_spef(&dir.join("picorv32.rcx.spef")).expect("SPEF");
+        let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
+        let spef = crate::readers::load_spef(&dir.join(spef_file)).expect("SPEF");
         let par = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
         let (_, state) = run_sta_with_state(&design, &lib, &sdc, Some(&par)).expect("STA");
         let cx = Context { design: &design, lib: &lib, sdc: &sdc, parasitics: Some(&par), pi_models: Vec::new() };
