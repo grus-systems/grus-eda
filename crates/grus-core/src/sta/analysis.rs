@@ -784,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failing: max arrival 9% off because the Steiner trees are not FLUTE's; see docs/results.md"]
+    #[ignore = "known failing: max arrival 9% off at picorv32 scale (the E3.5 scale question; E3.4 closed the tree question); see docs/results.md"]
     fn test_picorv32_placement_rc_matches_opensta() {
         compare_design_with_opensta("picorv32", "placement_rc", Rc::Placement, Tol::PICORV32_PLACEMENT);
     }
@@ -792,6 +792,12 @@ mod tests {
     #[test]
     fn test_picorv32_placed_spef_matches_opensta() {
         compare_design_with_opensta("picorv32", "placed_spef", Rc::Spef, Tol::PICORV32_SPEF);
+    }
+
+    #[test]
+    #[ignore = "known failing: 136 fields at Tol::PICORV32_SPEF against the routed golden; see docs/results.md step 7"]
+    fn test_picorv32_routed_spef_matches_opensta() {
+        compare_design_with_opensta("picorv32", "routed_spef", Rc::RoutedSpef, Tol::PICORV32_SPEF);
     }
 
     #[test]
@@ -1132,6 +1138,63 @@ mod tests {
             score("(f) ours, placed SPEF, vs OpenSTA placed_spef golden", &ours_placed, &placed_golden),
         ];
         print_scores("gcd, our SPEF-mode residuals against each parasitics' own OpenSTA golden", &residuals);
+    }
+
+    /// `(routed_spef, placed_spef)` blocks of `picorv32.sta.reference.json`; see `gcd_golden_pair`.
+    fn picorv32_golden_pair() -> (Timing, Timing) {
+        let reference: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(design_dir("picorv32").join("picorv32.sta.reference.json")).expect("golden file"),
+        )
+        .expect("golden JSON");
+        (timing_from_golden(&reference["routed_spef"]), timing_from_golden(&reference["placed_spef"]))
+    }
+
+    /// Ticket 16: scores picorv32's estimators against OpenSTA on the routed parasitics (`routed_spef`
+    /// golden), as `measure_gcd_estimators_against_routed_truth` does for gcd. Measurement only: the
+    /// tables are printed with `--nocapture`; endpoint presence and count are the only assertions.
+    #[test]
+    fn measure_picorv32_estimators_against_routed_truth() {
+        use crate::sta::parasitics::estimate_placement_parasitics_with_tree;
+        use crate::sta::{WireRc, spef_parasitics};
+        use crate::congestion::rsmt::build_precise_rsmt_points;
+
+        let lib_dir = sky130_hd();
+        let dir = design_dir("picorv32");
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(&dir.join("picorv32.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join("picorv32.sdc")).expect("SDC");
+        let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
+
+        let (routed_truth, placed_golden) = picorv32_golden_pair();
+
+        let sta = |parasitics: &crate::sta::NetParasitics| {
+            timing_from_report(&run_sta(&design, &lib, &sdc, Some(parasitics)).expect("STA"))
+        };
+        let load = |file: &str| {
+            let spef = crate::readers::load_spef(&dir.join(file)).expect("SPEF");
+            spef_parasitics(&design, &spef).expect("SPEF parasitics")
+        };
+
+        let exact = estimate_placement_parasitics_with_tree(&design, &tech, rc, build_precise_rsmt_points);
+        let placed = load("picorv32.routed.spef");
+        let routed = load("picorv32.rcx.spef");
+
+        let vs_truth = vec![
+            score("(a) ours, placement RC, exact tree (build_precise_rsmt_points; shipped)", &sta(&exact), &routed_truth),
+            score("(b) ours, placed SPEF (OpenROAD tree and RC)", &sta(&placed), &routed_truth),
+            score("(c) OpenSTA placed SPEF golden", &placed_golden, &routed_truth),
+        ];
+        print_scores("picorv32, timing error against OpenSTA on routed_spef (max path)", &vs_truth);
+
+        let residuals = vec![score("(d) ours, routed SPEF, vs OpenSTA routed_spef golden", &sta(&routed), &routed_truth)];
+        print_scores("picorv32, our routed-SPEF residual against its own OpenSTA golden", &residuals);
     }
 
     enum Rc {
