@@ -16,7 +16,7 @@ searchable through the API used; OpenROAD discussion pages were only seen as sea
 
 | # | Behaviour | Conclusion |
 |---|---|---|
-| 1 | Ceff 54% of total at 9.1 ns input slew, 2.23 pF load (jpeg `_43767_`) | **No report found** |
+| 1 | Ceff 54% of total at 9.1 ns input slew, 2.23 pF load (jpeg `_43767_`) | **No prior report found; filed as [parallaxsw/OpenSTA#582](https://github.com/parallaxsw/OpenSTA/issues/582)** (`tests/designs/repro_extreme_ceff/`, `7bfa26b`) |
 | 2 | Driver waveform slew > table slew | **Spec (documented by the maintainer)**; the size of the gap is not explained |
 | 3 | Port-driven net wire delay = ln2 x Elmore (ideal) / 0.40-0.45 x Elmore (with `set_input_transition`) | **No report found** |
 
@@ -81,12 +81,9 @@ defects; check that PR's tests and the maintainers' answer before filing. Note a
 ("Issues without test cases are unlikely to get a response", OpenSTA README): the placed jpeg DEF/SPEF and a one-arc
 Tcl script would be needed, and building it needs the pinned image, which this note did not run.
 
-### Draft issue (not posted)
+### Issue posted: [parallaxsw/OpenSTA#582](https://github.com/parallaxsw/OpenSTA/issues/582)
 
-> **dmp_ceff_elmore: Ceff = 54% of total load for a 9.1 ns input slew, 2.23 pF load (Rpi 0.497 kohm, C2 2.12 pF)**
-> sky130_fd_sc_hd, `report_dcalc -max`, A->Y fall. Liberty tables end at 0.303 pF / 1.5 ns. Result: Ceff 1.196 pF,
-> delay 17.65 ns, driver waveform slew 32.0 ns (table slew 10.5 ns). Rpi*C2 is about 1 ns, which cannot shield a
-> 10-30 ns edge. Is this the intended behaviour outside the characterised range? Reproducer: <attach one-arc Tcl + DEF/SPEF>.
+Posted on 2026-11-15 with a standalone reproducer (`tests/designs/repro_extreme_ceff/`, commit `7bfa26b`): one `sky130_fd_sc_hd__nor2_2`, an explicit pi-model SPEF (`C2=0.114533`, `Rpi=0.497066`, `C1=2.118645`), and an input-slew sweep from `0.05` to `9.142787 ns` in OpenSTA 2.7.0 (`Ceff` drops from 74% to 54% of total load as input slew grows), asking whether this behaviour outside the Liberty table range (`0.303 pF` / `1.5 ns`) is intended and which reported quantities are meaningful there.
 
 ## Not confirmed
 
