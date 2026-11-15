@@ -1213,7 +1213,7 @@ mod tests {
     }
 
     /// Measurement (E3.5, `docs/design/e35`): driver-resistance rules against the `report_dcalc` tables of
-    /// `collect_dcalc.sh`. Constants are fitted on picorv32 and scored on gcd. Prints; asserts only that the
+    /// `collect_dcalc.sh`. Constants are fitted on picorv32 and scored on aes (gcd has no shielded rows). Prints; asserts only that the
     /// rows matched. Shielded = OpenSTA's Ceff is below 97% of the total load.
     #[test]
     fn test_dmp_rd_rule_sweep() {
@@ -1234,6 +1234,7 @@ mod tests {
         let sets = [
             ("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "dcalc_routed_all.txt"),
             ("gcd", "gcd.placed.def", "gcd.rcx.spef", "dcalc_routed_all.txt"),
+            ("aes", "aes.placed.def", "aes.routed.spef", "dcalc_placed_all.txt"),
         ];
         for (design, def, spef, file) in sets {
             for (name, rule) in &rules {
@@ -1278,6 +1279,43 @@ mod tests {
                 println!(
                     "SWEEP {design} {name:<22} rows {matched} (unmodelled {unmodelled}) shielded {} | all Ceff {} delay {} slew {} | shielded Ceff {} delay {} slew {}",
                     shielded[0].len(), stat(&all[0]), stat(&all[1]), stat(&all[2]), stat(&shielded[0]), stat(&shielded[1]), stat(&shielded[2])
+                );
+            }
+        }
+    }
+
+    /// Measurement (E3.5): OpenSTA's driver waveform slew divided by the table slew at the total load and at
+    /// OpenSTA's Ceff, by shielding class (`ceff / total`), per design. Prints `WAVE` lines; asserts only that rows exist.
+    #[test]
+    fn test_dmp_wave_slew_scan() {
+        let sets = [
+            ("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "dcalc_routed_all.txt"),
+            ("aes", "aes.placed.def", "aes.routed.spef", "dcalc_placed_all.txt"),
+            ("gcd", "gcd.placed.def", "gcd.rcx.spef", "dcalc_routed_all.txt"),
+        ];
+        let bins = [(0.0, 0.8), (0.8, 0.9), (0.9, 0.97), (0.97, 0.99), (0.99, 1.01)];
+        for (design, def, spef, file) in sets {
+            let mut total_ratio: Vec<Vec<f64>> = vec![Vec::new(); bins.len()];
+            let mut ceff_ratio: Vec<Vec<f64>> = vec![Vec::new(); bins.len()];
+            for_each_dcalc_row(design, def, spef, file, &mut |row, pi, table| {
+                let total = pi.c1 + pi.c2;
+                let shield = row.ceff / total;
+                let Some(b) = bins.iter().position(|&(lo, hi)| shield >= lo && shield < hi) else { return };
+                total_ratio[b].push(row.driver_slew / table(total).1);
+                ceff_ratio[b].push(row.driver_slew / table(row.ceff).1);
+            });
+            for (b, &(lo, hi)) in bins.iter().enumerate() {
+                if total_ratio[b].is_empty() {
+                    continue;
+                }
+                let spread = |v: &Vec<f64>| {
+                    let mut s = v.clone();
+                    s.sort_by(f64::total_cmp);
+                    format!("p10 {:.4} median {:.4} p90 {:.4}", s[s.len() / 10], median(s.clone()), s[9 * s.len() / 10])
+                };
+                println!(
+                    "WAVE {design} shield [{lo:.2},{hi:.2}) n {} | wave/table(total) {} | wave/table(ceff) {}",
+                    total_ratio[b].len(), spread(&total_ratio[b]), spread(&ceff_ratio[b])
                 );
             }
         }
