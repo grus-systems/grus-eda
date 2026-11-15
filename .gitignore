@@ -49,3 +49,4 @@ tests/designs/ibex/ibex.orient.pins.txt
 tests/designs/ibex/ibex.util65.def
 tests/designs/ibex/ibex.routed.spef
 tests/designs/ibex/ibex.sta.reference.json
+tests/designs/*/pins_*.txt

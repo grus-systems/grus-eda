@@ -2,13 +2,14 @@
 # Dumps OpenSTA's worst setup paths (every stage with slew, cap, delay, arrival) for one design on one SPEF,
 # in the pinned LibreLane image.
 #
-# usage: tests/designs/collect_paths.sh <design> <placed.def> <spef> <out.txt> [paths]
+# usage: tests/designs/collect_paths.sh <design> <placed.def> <spef> <out.txt> [paths] [report_checks_args]
 #   paths   number of worst paths, one per endpoint (default 5)
+#   report_checks_args   extra Tcl arguments for report_checks, for example "-from [all_inputs]"
 # Output (relative to tests/designs/<design>) is OpenSTA's `report_checks -format full` text as printed, with
 # `-fields {slew cap fanout input_pins} -digits 6`.
 set -euo pipefail
 
-DESIGN="$1"; DEF="$2"; SPEF="$3"; OUT="$4"; PATHS="${5:-5}"
+DESIGN="$1"; DEF="$2"; SPEF="$3"; OUT="$4"; PATHS="${5:-5}"; EXTRA="${6:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 IMAGE="ghcr.io/librelane/librelane:3.0.16"
@@ -30,7 +31,7 @@ read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
 read_def ${D}/${DEF}
 read_sdc ${D}/${DESIGN}.sdc
 read_spef ${D}/${SPEF}
-report_checks -path_delay max -group_path_count ${PATHS} -unique_paths_to_endpoint -fields {slew cap fanout input_pins} -digits 6 -format full
+report_checks -path_delay max ${EXTRA} -group_path_count ${PATHS} -unique_paths_to_endpoint -fields {slew cap fanout input_pins} -digits 6 -format full
 exit
 EOF
 openroad -no_init -no_splash "${RUN_DIR}/paths.tcl" > "${RUN_DIR}/paths.log" 2>&1

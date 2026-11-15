@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Collects OpenSTA `report_dcalc` rows for many arcs of one design, on one SPEF, in the pinned LibreLane image.
 #
-# usage: tests/designs/collect_dcalc.sh <design> <placed.def> <spef> <out.txt> [stride] [fanout_always]
+# usage: tests/designs/collect_dcalc.sh <design> <placed.def> <spef> <out.txt> [stride] [fanout_always] [only]
 #   <design>        directory name under tests/designs (gcd, picorv32, ...); its <design>.sdc is read
 #   <placed.def>    DEF path relative to tests/designs/<design>
 #   <spef>          SPEF path relative to tests/designs/<design>
 #   <out.txt>       output path relative to tests/designs/<design>
 #   stride          keep one of every `stride` (input pin, output pin) pairs (default 1 = all)
 #   fanout_always   keep every pair whose output net has at least this many pins (default 6)
+#   only            space-separated instance names; when given, only the pairs of those instances are collected
+#                   (stride and fanout_always are then ignored)
 #
 # The arc sense is inferred from the transitions report_dcalc prints (in^->out^ and inv->outv: positive_unate; the
 # opposite pairing: negative_unate; one input edge with both output edges: non_unate). Pairs that mix senses (several
@@ -16,7 +18,7 @@
 #   from_pin to_pin arc_sense out_transition input_slew_ns C1_far_pF Rpi_kohm C2_near_pF Ceff_pF delay_ns slew_ns driver_waveform_slew_ns
 set -euo pipefail
 
-DESIGN="$1"; DEF="$2"; SPEF="$3"; OUT="$4"; STRIDE="${5:-1}"; FANOUT="${6:-6}"
+DESIGN="$1"; DEF="$2"; SPEF="$3"; OUT="$4"; STRIDE="${5:-1}"; FANOUT="${6:-6}"; ONLY="${7:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 IMAGE="ghcr.io/librelane/librelane:3.0.16"
@@ -40,9 +42,11 @@ read_sdc ${D}/${DESIGN}.sdc
 read_spef ${D}/${SPEF}
 set stride ${STRIDE}
 set fanout_always ${FANOUT}
+set only {${ONLY}}
 set pair 0
 set kept 0
 foreach inst [get_cells *] {
+  if {[llength \$only] > 0 && [lsearch -exact \$only [get_name \$inst]] < 0} { continue }
   set outs [get_pins -of_objects \$inst -filter "direction==output"]
   set ins [get_pins -of_objects \$inst -filter "direction==input"]
   foreach p \$outs {
@@ -51,7 +55,7 @@ foreach inst [get_cells *] {
     set fanout [llength [get_pins -of_objects \$net]]
     foreach a \$ins {
       incr pair
-      if {\$fanout < \$fanout_always && (\$pair % \$stride) != 0} { continue }
+      if {[llength \$only] == 0 && \$fanout < \$fanout_always && (\$pair % \$stride) != 0} { continue }
       incr kept
       puts "ARC [get_full_name \$a] [get_full_name \$p]"
       if {[catch {report_dcalc -from \$a -to \$p -max -digits 6} err]} { puts "ERR \$err" }

@@ -1161,7 +1161,8 @@ mod tests {
         }
     }
 
-    type RowVisitor<'a> = dyn FnMut(&DcalcRow, &crate::sta::dmp::PiModel, crate::sta::dmp::DriverTable) + 'a;
+    /// `visit(row, pi, table, table_at)`: `table(c)` is the arc at the row's input slew, `table_at(slew, c)` at any input slew.
+    type RowVisitor<'a> = dyn FnMut(&DcalcRow, &crate::sta::dmp::PiModel, crate::sta::dmp::DriverTable, &dyn Fn(f64, f64) -> (f64, f64)) + 'a;
 
     /// Calls `visit(row, pi, table)` for every row of `file` (a `collect_dcalc.sh` table of `design`, read on
     /// the DEF and SPEF named) that matches exactly one graph arc; returns `(matched, unmodelled)`.
@@ -1216,7 +1217,13 @@ mod tests {
                     eval_nldm_delay_or_slew(slew_table, slew_in, c as f32) as f64,
                 )
             };
-            visit(row, &pi, &table);
+            let table_at = |slew: f64, c: f64| {
+                (
+                    eval_nldm_delay_or_slew(delay_table, slew as f32, c as f32) as f64,
+                    eval_nldm_delay_or_slew(slew_table, slew as f32, c as f32) as f64,
+                )
+            };
+            visit(row, &pi, &table, &table_at);
             matched += 1;
         }
         (matched, unmodelled)
@@ -1252,6 +1259,8 @@ mod tests {
             ("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "dcalc_routed_all.txt"),
             ("gcd", "gcd.placed.def", "gcd.rcx.spef", "dcalc_routed_all.txt"),
             ("aes", "aes.placed.def", "aes.routed.spef", "dcalc_placed_all.txt"),
+            ("ibex", "ibex.placed.def", "ibex.routed.spef", "dcalc_placed_all.txt"),
+            ("jpeg", "jpeg.placed.def", "jpeg.routed.spef", "dcalc_placed_all.txt"),
         ];
         for (design, def, spef, file) in sets {
             for (name, rule) in &rules {
@@ -1260,7 +1269,7 @@ mod tests {
                 let mut shielded: [Vec<f64>; 3] = Default::default();
                 let mut worst: Vec<(f64, String)> = Vec::new();
                 let mut degenerate = 0usize;
-                let (matched, unmodelled) = for_each_dcalc_row(design, def, spef, file, &mut |row, pi, table| {
+                let (matched, unmodelled) = for_each_dcalc_row(design, def, spef, file, &mut |row, pi, table, _table_at| {
                     let r = solve_dmp_with(pi, &|t, c| rule(t, c), table);
                     if crate::sta::dmp::ramp_fit_degenerate(rule(table, r.ceff), r.ceff, r.slew) {
                         degenerate += 1;
@@ -1378,6 +1387,17 @@ mod tests {
         compare_path_stages("aes", "aes.placed.def", "aes.routed.spef", "paths_placed.txt");
     }
 
+    /// Same comparison on ibex and jpeg with their placement-estimate SPEFs.
+    #[test]
+    fn test_path_stages_vs_opensta_ibex_placed() {
+        compare_path_stages("ibex", "ibex.placed.def", "ibex.routed.spef", "paths_placed.txt");
+    }
+
+    #[test]
+    fn test_path_stages_vs_opensta_jpeg_placed() {
+        compare_path_stages("jpeg", "jpeg.placed.def", "jpeg.routed.spef", "paths_placed.txt");
+    }
+
     fn compare_path_stages(design_name: &str, def_file: &str, spef_file: &str, paths_file: &str) {
         let lib_dir = sky130_hd();
         let dir = design_dir(design_name);
@@ -1421,6 +1441,155 @@ mod tests {
         }
     }
 
+    /// Measurement (E3.5): our DMP result against `report_dcalc` on arcs far outside the Liberty table range
+    /// (`dcalc_extreme_placed.txt`, collected for the instances that carry the worst jpeg and ibex paths).
+    /// Prints one `EXTREME` line per row with the table-range ratios; asserts only that rows matched.
+    #[test]
+    fn test_dmp_extreme_rows_vs_opensta() {
+        use crate::sta::dmp::solve_dmp;
+        let mut matched_total = 0;
+        for (design, def, spef) in [("jpeg", "jpeg.placed.def", "jpeg.routed.spef"), ("ibex", "ibex.placed.def", "ibex.routed.spef")] {
+            let (matched, unmodelled) = for_each_dcalc_row(design, def, spef, "dcalc_extreme_placed.txt", &mut |row, pi, table, table_at| {
+                let r = solve_dmp(pi, RD_SCALE, table);
+                // rd from the slope at the input slew clamped to the Liberty range (1.5 ns), scale 3.
+                let clamped = row.input_slew.min(1.5);
+                let rc = crate::sta::dmp::solve_dmp_with(
+                    pi,
+                    &|_, c| {
+                        let h = 0.05 * c;
+                        (3.0 * (table_at(clamped, c + h).0 - table_at(clamped, c - h).0) / (2.0 * h)).max(1e-6)
+                    },
+                    table,
+                );
+                let (mut lo, mut hi) = (1e-3f64, 1e4f64);
+                for _ in 0..70 {
+                    let mid = (lo * hi).sqrt();
+                    let r = crate::sta::dmp::solve_dmp_with(pi, &|_, _| mid, table);
+                    if r.ceff > row.ceff { hi = mid } else { lo = mid }
+                }
+                let rd_root = (lo * hi).sqrt();
+                let h = 0.05 * row.ceff;
+                let (dsl, ssl) = ((table(row.ceff + h).0 - table(row.ceff - h).0) / (2.0 * h), (table(row.ceff + h).1 - table(row.ceff - h).1) / (2.0 * h));
+                println!("EXTREME-RD {design} {} -> {} {}: tin {:.2} rd_root {:.3} dslope {:.3} sslope {:.3} rd/dslope {:.2} rd/sslope {:.2} delay/Ceff {:.2}", row.from, row.to, row.out, row.input_slew, rd_root, dsl, ssl, rd_root / dsl, rd_root / ssl, row.delay / row.ceff);
+                println!("EXTREME-CLAMP {design} {} -> {} {}: ref Ceff {:.4} | clamped-slope rd: Ceff {:.4} ({:+.1}%) delay {:+.1}%", row.from, row.to, row.out, row.ceff, rc.ceff, (rc.ceff / row.ceff - 1.0) * 100.0, (rc.delay / row.delay - 1.0) * 100.0);
+                let total = pi.c1 + pi.c2;
+                println!(
+                    "EXTREME {design} {} -> {} {} tin {:.2} total {:.3} shield {:.3} | ref Ceff {:.4} delay {:.3} slew {:.3} wave {:.3} | ours Ceff {:.4} delay {:.3} slew {:.3} | Ceff {:+.1}% delay {:+.1}% slew vs wave {:+.1}%",
+                    row.from, row.to, row.out, row.input_slew, total, row.ceff / total,
+                    row.ceff, row.delay, row.slew, row.driver_slew, r.ceff, r.delay, r.slew,
+                    (r.ceff / row.ceff - 1.0) * 100.0, (r.delay / row.delay - 1.0) * 100.0, (r.slew / row.driver_slew - 1.0) * 100.0
+                );
+            });
+            println!("EXTREME {design}: matched {matched} unmodelled {unmodelled}");
+            matched_total += matched;
+        }
+        assert!(matched_total > 10);
+    }
+
+    /// Measurement (E3.5 wire delay): for every cell-driven net, OpenSTA's per-sink wire delay (sink arrival minus
+    /// driver arrival, from `collect_pins.sh`) against our Elmore delay, binned by Elmore delay and by the driver's slew.
+    /// Prints `WIREDELAY` lines (median and p10/p90 of ref delay / Elmore and ref slew degrade / Elmore) per bin.
+    #[test]
+    fn test_wire_delay_vs_elmore() {
+        let sets = [
+            ("aes", "aes.placed.def", "aes.routed.spef", "pins_placed.txt"),
+            ("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "pins_routed.txt"),
+            ("ibex", "ibex.placed.def", "ibex.routed.spef", "pins_placed.txt"),
+            ("jpeg", "jpeg.placed.def", "jpeg.routed.spef", "pins_placed.txt"),
+        ];
+        let e_bins = [(0.0, 0.001), (0.001, 0.01), (0.01, 0.1), (0.1, 1.0), (1.0, 100.0)];
+        let mut total_rows = 0usize;
+        for (design_name, def_file, spef_file, pins_file) in sets {
+            let dir = design_dir(design_name);
+            let Ok(text) = std::fs::read_to_string(dir.join(pins_file)) else {
+                println!("WIREDELAY {design_name}: no {pins_file}, skipped (collect_pins.sh)");
+                continue;
+            };
+            let lib_dir = sky130_hd();
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(&lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"), &lib_dir.join("lef/sky130_fd_sc_hd.lef"), &mut interner).expect("LEF");
+            let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
+            let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
+            let spef = crate::readers::load_spef(&dir.join(spef_file)).expect("SPEF");
+            let par = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
+            let cx = Context { design: &design, lib: &lib, sdc: &sdc, parasitics: Some(&par), pi_models: Vec::new() };
+            // pin name -> [slew_max rise, fall, arrival_max rise, fall]
+            let mut ref_pins: std::collections::HashMap<&str, [f64; 4]> = std::collections::HashMap::new();
+            for line in text.lines() {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                if w.len() < 5 {
+                    continue;
+                }
+                let n = |i: usize| w[i].parse::<f64>().unwrap_or(f64::NAN);
+                ref_pins.insert(w[0], [n(1), n(2), n(3), n(4)]);
+            }
+            let by_name: std::collections::HashMap<String, PinId> =
+                (0..design.num_pins()).map(|i| PinId(i as u32)).map(|p| (cx.pin_name(p), p)).collect();
+            let _ = by_name;
+            // [bin] -> (delay ratios, slew-degrade ratios)
+            let mut by_e: Vec<(Vec<f64>, Vec<f64>)> = vec![(Vec::new(), Vec::new()); e_bins.len()];
+            let mut by_slew: Vec<(Vec<f64>, Vec<f64>)> = vec![(Vec::new(), Vec::new()); 4];
+            let slew_bins = [(0.0, 0.1), (0.1, 0.5), (0.5, 2.0), (2.0, 100.0)];
+            let mut triples: Vec<(f64, f64, f64)> = Vec::new();
+            for n in 0..design.num_nets() {
+                let net = NetId(n as u32);
+                let pins = design.net_pins(net);
+                let Some(&drv) = pins.first() else { continue };
+                if design.pin_cells[drv.0 as usize].is_none() || !design.pin_is_driver[drv.0 as usize] {
+                    continue;
+                }
+                let Some(wire) = cx.wire_delays(net) else { continue };
+                let Some(drv_ref) = ref_pins.get(cx.pin_name(drv).as_str()) else { continue };
+                for (i, &sink) in pins.iter().enumerate().skip(1) {
+                    let Some(sink_ref) = ref_pins.get(cx.pin_name(sink).as_str()) else { continue };
+                    for pol in [RISE, FALL] {
+                        let (drv_slew, drv_arr) = (drv_ref[pol], drv_ref[2 + pol]);
+                        let (sink_slew, sink_arr) = (sink_ref[pol], sink_ref[2 + pol]);
+                        let elmore = wire[pol][i] as f64;
+                        if !(drv_arr.is_finite() && sink_arr.is_finite() && drv_slew.is_finite() && sink_slew.is_finite()) || elmore <= 1e-7 {
+                            continue;
+                        }
+                        let delay = sink_arr - drv_arr;
+                        let degrade = (sink_slew * sink_slew - drv_slew * drv_slew).max(0.0).sqrt();
+                        let b = e_bins.iter().position(|&(lo, hi)| elmore >= lo && elmore < hi).unwrap();
+                        by_e[b].0.push(delay / elmore);
+                        by_e[b].1.push(degrade / elmore);
+                        let sb = slew_bins.iter().position(|&(lo, hi)| drv_slew >= lo && drv_slew < hi).unwrap();
+                        by_slew[sb].0.push(delay / elmore);
+                        by_slew[sb].1.push(degrade / elmore);
+                        triples.push((drv_slew, elmore, sink_slew));
+                        total_rows += 1;
+                    }
+                }
+            }
+            let spread = |v: &Vec<f64>| {
+                let mut s = v.clone();
+                s.sort_by(f64::total_cmp);
+                format!("p10 {:.3} median {:.3} p90 {:.3}", s[s.len() / 10], median(s.clone()), s[9 * s.len() / 10])
+            };
+            for k in [1.386, 1.5, 1.6, 1.7, 1.8, 2.0] {
+                // Relative error of the predicted sink slew hypot(driver slew, k * Elmore), all sinks and big-wire sinks.
+                let rel = |sel: &dyn Fn(&&(f64, f64, f64)) -> bool| {
+                    let v: Vec<f64> = triples.iter().filter(sel).map(|&(d, e, sk)| ((d * d + (k * e) * (k * e)).sqrt() - sk) / sk).collect();
+                    if v.is_empty() { "n/a".to_string() } else { format!("n {} median {:+.4} mean abs {:.4}", v.len(), median(v.clone()), v.iter().map(|x| x.abs()).sum::<f64>() / v.len() as f64) }
+                };
+                println!("WIREFIT {design_name} k {k}: all [{}] elmore>0.01ns [{}]", rel(&|_| true), rel(&|t| t.1 > 0.01));
+            }
+            for (b, &(lo, hi)) in e_bins.iter().enumerate() {
+                if by_e[b].0.len() >= 5 {
+                    println!("WIREDELAY {design_name} elmore [{lo},{hi}) n {} | ref delay / elmore {} | ref slew degrade / elmore {}", by_e[b].0.len(), spread(&by_e[b].0), spread(&by_e[b].1));
+                }
+            }
+            for (b, &(lo, hi)) in slew_bins.iter().enumerate() {
+                if by_slew[b].0.len() >= 5 {
+                    println!("WIRESLEW {design_name} driver slew [{lo},{hi}) n {} | ref delay / elmore {} | ref slew degrade / elmore {}", by_slew[b].0.len(), spread(&by_slew[b].0), spread(&by_slew[b].1));
+                }
+            }
+        }
+        assert!(total_rows > 100, "only {total_rows} sink rows");
+    }
+
     /// Measurement (E3.5): OpenSTA's driver waveform slew divided by the table slew at the total load and at
     /// OpenSTA's Ceff, by shielding class (`ceff / total`), per design. Prints `WAVE` lines; asserts only that rows exist.
     #[test]
@@ -1428,13 +1597,15 @@ mod tests {
         let sets = [
             ("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "dcalc_routed_all.txt"),
             ("aes", "aes.placed.def", "aes.routed.spef", "dcalc_placed_all.txt"),
+            ("ibex", "ibex.placed.def", "ibex.routed.spef", "dcalc_placed_all.txt"),
+            ("jpeg", "jpeg.placed.def", "jpeg.routed.spef", "dcalc_placed_all.txt"),
             ("gcd", "gcd.placed.def", "gcd.rcx.spef", "dcalc_routed_all.txt"),
         ];
         let bins = [(0.0, 0.8), (0.8, 0.9), (0.9, 0.97), (0.97, 0.99), (0.99, 1.01)];
         for (design, def, spef, file) in sets {
             let mut total_ratio: Vec<Vec<f64>> = vec![Vec::new(); bins.len()];
             let mut ceff_ratio: Vec<Vec<f64>> = vec![Vec::new(); bins.len()];
-            for_each_dcalc_row(design, def, spef, file, &mut |row, pi, table| {
+            for_each_dcalc_row(design, def, spef, file, &mut |row, pi, table, _table_at| {
                 let total = pi.c1 + pi.c2;
                 let shield = row.ceff / total;
                 let Some(b) = bins.iter().position(|&(lo, hi)| shield >= lo && shield < hi) else { return };
@@ -1465,7 +1636,7 @@ mod tests {
     fn test_dmp_rd_root_scan() {
         use crate::sta::dmp::solve_dmp_with;
         let mut found = 0usize;
-        for_each_dcalc_row("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "dcalc_routed_all.txt", &mut |row, pi, table| {
+        for_each_dcalc_row("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "dcalc_routed_all.txt", &mut |row, pi, table, _table_at| {
             let total = pi.c1 + pi.c2;
             if row.ceff >= 0.97 * total {
                 return;
