@@ -5,7 +5,7 @@ and known gaps. Done criteria are in `README.md` (Stages) and the Section 1 tabl
 The measurement log, including failed runs, is `docs/results.md`. Per-test E3 detail is in
 `docs/e3-sta.md` Section 4; open E3 tasks are in its Section 5.
 
-Last updated: 2026-11-14.
+Last updated: 2026-11-15.
 
 | Stage | Designs covered | Tolerance actually used | Status | Known gaps |
 |---|---|---|---|---|
