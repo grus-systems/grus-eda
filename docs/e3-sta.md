@@ -334,6 +334,7 @@ Done criterion for every E3 step: worst slack, and arrival and required time of 
 | picorv32 placement RC | `#[ignore]`, fails | arrival 9% off (E3.4 closed 2026-11-15: OpenROAD's tree is FLUTE's and tree choice is not the cause at gcd scale; the picorv32 gap belongs to the narrowed E3.5 scale question) |
 | Steiner length vs OpenROAD SPEF (gcd, picorv32) | pass | 2- and 3-point nets match exactly; the optimal tree is never longer than OpenROAD's (asserted) |
 | DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` 6% (one arc is 5.5% high) |
+| DMP vs `report_dcalc` (76 rows, routed SPEF) | measurement (step 7) | pi exact (max 0.43%); `Ceff` median 0.61%, max +17.1% on the largest load; driver waveform slew unmodelled (median gap 2.65%) |
 
 ## 5. Open Work
 
@@ -374,17 +375,22 @@ reference tool), write the rule in `docs/` before the code, record every compari
   placed SPEF 0.92 ps (p95 2.21, max 7.00); zero fields outside `max(5 ps, 1%)` in both modes. At gcd scale the
   fitted `RD_SCALE` produces no measurable error, so the step-4 wire-mode failures on aes/jpeg/ibex are not
   explained by the DMP constant alone.
-- **Still open**: the `report_dcalc` table on picorv32 (at least 30 arcs, several cells, both transitions,
-  shielded and unshielded; `report_dcalc -from <in> -to <out> -max -digits 6` prints the pi model, `Ceff`,
-  `Delay`, `Slew` and `Driver waveform slew` per arc) has not been collected, and `RD_SCALE` is still fitted, not
+- **Still open**: `RD_SCALE` is still fitted, not
   derived — one value fits arrival (about 4.5-5) but not `Ceff` (about 3), and its doc comment misdescribes the
   value (the F4 item in `docs/review-2026-11-11.md`). The open question is now the scale question: why the
   wire-mode error grows by one to two orders of magnitude from gcd to aes/jpeg/ibex. The picorv32 routed SPEF
   (step 7, ticket 16) has since separated the two at that scale: the estimator side is ~1.4 ns median (ours and
   OpenROAD's alike), and the engine residual is 6.2 ps median with a slack tail (726 of 1,798 endpoints outside
-  the strict criterion; a ~13%-low slew family on one register bank is its visible face). That tail is the
-  remaining E3.5 substance, with the `report_dcalc` table as its instrument. OpenSTA's `DmpCeff` source (GPL)
-  must not be read; work from the DMP paper and the measurements.
+  the strict criterion; a ~13%-low slew family on one register bank is its visible face). The `report_dcalc`
+  table for that tail was collected in step 7 (ticket 17: 76 rows on the routed SPEF, all matched; data in
+  `tests/designs/picorv32/dcalc_routed_ref.txt`). Its verdict: the pi model is exact (C1/Rpi to print
+  precision, C2 within 0.43%), so the RC reduction is not the cause; the DMP solve's `Ceff`/delay/slew error
+  grows with load (median `Ceff` +0.61%, but +17.1%/+15.2%/+17.0% on the largest load, the ~2 pF CLK->Q net of
+  `_11506_`, whose path family carries ticket 16's late arrivals; combinational arcs stay within +3.6%); and
+  the driver waveform slew OpenSTA propagates is unmodelled (our slew is the table slew; median gap 2.65%,
+  up to 19.8% on the largest loads), which is the systematic part of the endpoint slew tail. What remains:
+  a load-dependent fix or derivation for the DMP solve, and a decision on modelling the waveform slew.
+  OpenSTA's `DmpCeff` source (GPL) must not be read; work from the DMP paper and the measurements.
 - **Done when**: `Ceff` within 2% and driver slew within 2% of `report_dcalc` on all collected arcs; picorv32
   SPEF passes with the plain criterion (slack 5 ps, slew 1%, TNS 1%); `RD_SCALE` is gone or derived.
 
