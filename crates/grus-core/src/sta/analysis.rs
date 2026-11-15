@@ -463,6 +463,16 @@ fn constraint_table(arc: &crate::lib_db::LibTimingArc, pol: usize) -> Option<&Nl
 
 /// Zero-wire STA when `parasitics` is `None`; otherwise wire capacitance and Elmore wire delay are added.
 pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&NetParasitics>) -> Result<StaReport> {
+    run_sta_with_state(design, lib, sdc, parasitics).map(|(report, _)| report)
+}
+
+/// [`run_sta`] that also returns the per-pin timing state (the tests compare it pin by pin).
+fn run_sta_with_state(
+    design: &DesignDb,
+    lib: &LibDb,
+    sdc: &Sdc,
+    parasitics: Option<&NetParasitics>,
+) -> Result<(StaReport, Vec<PinTimingState>)> {
     let mut cx = Context { design, lib, sdc, parasitics, pi_models: Vec::new() };
     cx.pi_models = (0..design.num_nets())
         .map(|n| {
@@ -586,7 +596,7 @@ pub fn run_sta(design: &DesignDb, lib: &LibDb, sdc: &Sdc, parasitics: Option<&Ne
     for category in report.skipped.nonzero() {
         eprintln!("warning: STA skipped {category}; the report does not model these");
     }
-    Ok(report)
+    Ok((report, state))
 }
 
 struct Worst {
@@ -1280,6 +1290,112 @@ mod tests {
                     "SWEEP {design} {name:<22} rows {matched} (unmodelled {unmodelled}) shielded {} | all Ceff {} delay {} slew {} | shielded Ceff {} delay {} slew {}",
                     shielded[0].len(), stat(&all[0]), stat(&all[1]), stat(&all[2]), stat(&shielded[0]), stat(&shielded[1]), stat(&shielded[2])
                 );
+            }
+        }
+    }
+
+    /// One stage line of an OpenSTA `report_checks` path: a cell output (`Q`, `X`, ...) or a cell input pin.
+    struct PathStage {
+        pin: String,
+        pol: usize,
+        slew: f64,
+        delay: f64,
+        arrival: f64,
+        is_output: bool,
+        fanout_cap: Option<f64>,
+    }
+
+    /// Parses every `Path Type: max` block of `collect_paths.sh` output into `(endpoint, stages)`.
+    fn parse_paths(text: &str) -> Vec<(String, Vec<PathStage>)> {
+        let mut paths = Vec::new();
+        let mut cur: Option<(String, Vec<PathStage>)> = None;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("Endpoint: ") {
+                cur = Some((rest.split_whitespace().next().unwrap().to_string(), Vec::new()));
+            } else if line.contains("data arrival time") {
+                if let Some(p) = cur.take() {
+                    paths.push(p);
+                }
+            } else if let Some((_, stages)) = cur.as_mut() {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                // A stage line ends with `^|v <pin> (<cell>)`; an output line has fanout and cap in front of slew/delay/time.
+                let n = w.len();
+                if n < 5 || !(w[n - 3] == "^" || w[n - 3] == "v") || !w[n - 2].contains('/') {
+                    continue;
+                }
+                let num = |s: &str| s.parse::<f64>().ok();
+                let (fanout_cap, tail) = if n == 8 && num(w[0]).is_some_and(|f| f.fract() == 0.0) {
+                    (num(w[1]), &w[2..])
+                } else {
+                    (None, &w[0..])
+                };
+                let t = tail.len();
+                if t < 6 {
+                    continue;
+                }
+                let (Some(slew), Some(delay), Some(arrival)) = (num(tail[t - 6]), num(tail[t - 5]), num(tail[t - 4])) else {
+                    continue;
+                };
+                let pin = w[n - 2].to_string();
+                let out = pin.rsplit('/').next().map(|p| matches!(p, "Q" | "X" | "Y" | "Q_N" | "Z")).unwrap_or(false);
+                stages.push(PathStage {
+                    pin,
+                    pol: if w[n - 3] == "^" { RISE } else { FALL },
+                    slew,
+                    delay,
+                    arrival,
+                    is_output: out,
+                    fanout_cap,
+                });
+            }
+        }
+        paths
+    }
+
+    /// Measurement (E3.5): our per-pin arrival and slew against OpenSTA's worst paths on the picorv32 routed
+    /// SPEF (`collect_paths.sh`), stage by stage. Prints `STAGE` lines: for each pin on a path, OpenSTA's
+    /// slew and arrival, ours, and the error added by this stage (change in arrival error since the previous
+    /// listed pin). Asserts only that paths were parsed.
+    #[test]
+    fn test_path_stages_vs_opensta_picorv32_routed() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("picorv32");
+        let text = std::fs::read_to_string(dir.join("paths_routed.txt")).expect("paths_routed.txt (collect_paths.sh)");
+        let paths = parse_paths(&text);
+        assert!(paths.len() >= 3, "parsed {} paths", paths.len());
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(&dir.join("picorv32.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join("picorv32.sdc")).expect("SDC");
+        let spef = crate::readers::load_spef(&dir.join("picorv32.rcx.spef")).expect("SPEF");
+        let par = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
+        let (_, state) = run_sta_with_state(&design, &lib, &sdc, Some(&par)).expect("STA");
+        let cx = Context { design: &design, lib: &lib, sdc: &sdc, parasitics: Some(&par), pi_models: Vec::new() };
+        let by_name: std::collections::HashMap<String, PinId> =
+            (0..design.num_pins()).map(|i| PinId(i as u32)).map(|p| (cx.pin_name(p), p)).collect();
+        for (endpoint, stages) in &paths {
+            println!("PATH to {endpoint}");
+            let mut prev_err = 0.0;
+            for st in stages {
+                let Some(&pin) = by_name.get(&st.pin) else { continue };
+                let ps = &state[pin.0 as usize];
+                let (our_arr, our_slew) = (ps.arrival_max[st.pol] as f64, ps.slew_max[st.pol] as f64);
+                let err = our_arr - st.arrival;
+                println!(
+                    "STAGE {:<14} {} {:<6} cap {:>9} | ref slew {:>9.4} arr {:>9.4} delay {:>8.4} | ours slew {:>9.4} arr {:>9.4} | arr err {:>+8.4} stage {:>+8.4} slew err {:>+8.4}",
+                    st.pin,
+                    if st.pol == RISE { "^" } else { "v" },
+                    if st.is_output { "out" } else { "in" },
+                    st.fanout_cap.map_or(String::new(), |c| format!("{c:.4}")),
+                    st.slew, st.arrival, st.delay, our_slew, our_arr, err, err - prev_err, our_slew - st.slew
+                );
+                prev_err = err;
             }
         }
     }
