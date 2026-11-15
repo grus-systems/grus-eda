@@ -1,0 +1,405 @@
+OpenSTA 2.7.0 GITDIR-NOT Copyright (c) 2025, Parallax Software, Inc.
+License GPLv3: GNU GPL version 3 <http://gnu.org/licenses/gpl.html>
+
+This is free software, and you are free to change and redistribute it
+under certain conditions; type `show_copying' for details. 
+This program comes with ABSOLUTELY NO WARRANTY; for details type `show_warranty'.
+SWEEP input_slew 0.05
+Library: sky130_fd_sc_hd__tt_025C_1v80
+Cell: sky130_fd_sc_hd__nor2_2
+Arc sense: negative_unate
+Arc type: combinational
+A ^ -> Y v
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=1.650030
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 0.050000
+|       total_output_net_capacitance = 1.650030
+|        0.055359     0.141917
+v      --------------------
+0.023051 | 0.112902     0.251133
+0.053133 | 0.123716     0.261933
+Table value = 2.669004
+PVT scale factor = 1.000000
+Delay = 2.669004
+
+------- input_net_transition = 0.050000
+|       total_output_net_capacitance = 1.650030
+|        0.055359     0.141917
+v      --------------------
+0.023051 | 0.130333     0.314934
+0.053133 | 0.130236     0.315484
+Table value = 3.541862
+PVT scale factor = 1.000000
+Slew = 3.541862
+Driver waveform slew = 4.985177
+
+.............................................
+
+A v -> Y ^
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=2.121501
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 0.050000
+|       total_output_net_capacitance = 2.121501
+|        0.055359     0.141917
+v      --------------------
+0.023051 | 0.475619     1.106500
+0.053133 | 0.485230     1.125588
+Table value = 15.746061
+PVT scale factor = 1.000000
+Delay = 15.746061
+
+------- input_net_transition = 0.050000
+|       total_output_net_capacitance = 2.121501
+|        0.055359     0.141917
+v      --------------------
+0.023051 | 0.596344     1.464268
+0.053133 | 0.594212     1.472376
+Table value = 21.530807
+PVT scale factor = 1.000000
+Slew = 21.530807
+Driver waveform slew = 23.025177
+
+.............................................
+
+SWEEP input_slew 0.5
+Library: sky130_fd_sc_hd__tt_025C_1v80
+Cell: sky130_fd_sc_hd__nor2_2
+Arc sense: negative_unate
+Arc type: combinational
+A ^ -> Y v
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=1.439701
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 0.500000
+|       total_output_net_capacitance = 1.439701
+|        0.055359     0.141917
+v      --------------------
+0.282311 | 0.208788     0.347652
+0.650743 | 0.298580     0.484836
+Table value = 2.930562
+PVT scale factor = 1.000000
+Delay = 2.930562
+
+------- input_net_transition = 0.500000
+|       total_output_net_capacitance = 1.439701
+|        0.055359     0.141917
+v      --------------------
+0.282311 | 0.156453     0.318173
+0.650743 | 0.241773     0.377003
+Table value = 2.542981
+PVT scale factor = 1.000000
+Slew = 2.542981
+Driver waveform slew = 5.258577
+
+.............................................
+
+A v -> Y ^
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=2.120475
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 0.500000
+|       total_output_net_capacitance = 2.120475
+|        0.055359     0.141917
+v      --------------------
+0.282311 | 0.573348     1.207496
+0.650743 | 0.710545     1.350818
+Table value = 15.870404
+PVT scale factor = 1.000000
+Delay = 15.870404
+
+------- input_net_transition = 0.500000
+|       total_output_net_capacitance = 2.120475
+|        0.055359     0.141917
+v      --------------------
+0.282311 | 0.593608     1.470705
+0.650743 | 0.601426     1.467151
+Table value = 21.363894
+PVT scale factor = 1.000000
+Slew = 21.363894
+Driver waveform slew = 22.893559
+
+.............................................
+
+SWEEP input_slew 1.5
+Library: sky130_fd_sc_hd__tt_025C_1v80
+Cell: sky130_fd_sc_hd__nor2_2
+Arc sense: negative_unate
+Arc type: combinational
+A ^ -> Y v
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=1.381220
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 1.500000
+|       total_output_net_capacitance = 1.381220
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.298580     0.484836
+1.500000 | 0.405274     0.696446
+Table value = 4.865338
+PVT scale factor = 1.000000
+Delay = 4.865338
+
+------- input_net_transition = 1.500000
+|       total_output_net_capacitance = 1.381220
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.241773     0.377003
+1.500000 | 0.388718     0.576995
+Table value = 3.272672
+PVT scale factor = 1.000000
+Slew = 3.272672
+Driver waveform slew = 8.354276
+
+.............................................
+
+A v -> Y ^
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=2.104033
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 1.500000
+|       total_output_net_capacitance = 2.104033
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.710545     1.350818
+1.500000 | 1.018162     1.670248
+Table value = 16.451916
+PVT scale factor = 1.000000
+Delay = 16.451916
+
+------- input_net_transition = 1.500000
+|       total_output_net_capacitance = 2.104033
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.601426     1.467151
+1.500000 | 0.702221     1.489093
+Table value = 19.326117
+PVT scale factor = 1.000000
+Slew = 19.326117
+Driver waveform slew = 21.760969
+
+.............................................
+
+SWEEP input_slew 2.5
+Library: sky130_fd_sc_hd__tt_025C_1v80
+Cell: sky130_fd_sc_hd__nor2_2
+Arc sense: negative_unate
+Arc type: combinational
+A ^ -> Y v
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=1.427257
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 2.500000
+|       total_output_net_capacitance = 1.427257
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.298580     0.484836
+1.500000 | 0.405274     0.696446
+Table value = 7.103869
+PVT scale factor = 1.000000
+Delay = 7.103869
+
+------- input_net_transition = 2.500000
+|       total_output_net_capacitance = 1.427257
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.241773     0.377003
+1.500000 | 0.388718     0.576995
+Table value = 4.535823
+PVT scale factor = 1.000000
+Slew = 4.535823
+Driver waveform slew = 11.486826
+
+.............................................
+
+A v -> Y ^
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=2.080776
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 2.500000
+|       total_output_net_capacitance = 2.080776
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.710545     1.350818
+1.500000 | 1.018162     1.670248
+Table value = 16.964426
+PVT scale factor = 1.000000
+Delay = 16.964426
+
+------- input_net_transition = 2.500000
+|       total_output_net_capacitance = 2.080776
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.601426     1.467151
+1.500000 | 0.702221     1.489093
+Table value = 17.060745
+PVT scale factor = 1.000000
+Slew = 17.060745
+Driver waveform slew = 20.705532
+
+.............................................
+
+SWEEP input_slew 4
+Library: sky130_fd_sc_hd__tt_025C_1v80
+Cell: sky130_fd_sc_hd__nor2_2
+Arc sense: negative_unate
+Arc type: combinational
+A ^ -> Y v
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=1.347281
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 4.000000
+|       total_output_net_capacitance = 1.347281
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.298580     0.484836
+1.500000 | 0.405274     0.696446
+Table value = 9.674969
+PVT scale factor = 1.000000
+Delay = 9.674969
+
+------- input_net_transition = 4.000000
+|       total_output_net_capacitance = 1.347281
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.241773     0.377003
+1.500000 | 0.388718     0.576995
+Table value = 5.962099
+PVT scale factor = 1.000000
+Slew = 5.962099
+Driver waveform slew = 16.266333
+
+.............................................
+
+A v -> Y ^
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=2.019529
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 4.000000
+|       total_output_net_capacitance = 2.019529
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.710545     1.350818
+1.500000 | 1.018162     1.670248
+Table value = 17.509985
+PVT scale factor = 1.000000
+Delay = 17.509985
+
+------- input_net_transition = 4.000000
+|       total_output_net_capacitance = 2.019529
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.601426     1.467151
+1.500000 | 0.702221     1.489093
+Table value = 13.587287
+PVT scale factor = 1.000000
+Slew = 13.587287
+Driver waveform slew = 19.496386
+
+.............................................
+
+SWEEP input_slew 6
+Library: sky130_fd_sc_hd__tt_025C_1v80
+Cell: sky130_fd_sc_hd__nor2_2
+Arc sense: negative_unate
+Arc type: combinational
+A ^ -> Y v
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=1.211779
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 6.000000
+|       total_output_net_capacitance = 1.211779
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.298580     0.484836
+1.500000 | 0.405274     0.696446
+Table value = 12.287917
+PVT scale factor = 1.000000
+Delay = 12.287917
+
+------- input_net_transition = 6.000000
+|       total_output_net_capacitance = 1.211779
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.241773     0.377003
+1.500000 | 0.388718     0.576995
+Table value = 7.437948
+PVT scale factor = 1.000000
+Slew = 7.437948
+Driver waveform slew = 22.390112
+
+.............................................
+
+A v -> Y ^
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=1.085814
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 6.000000
+|       total_output_net_capacitance = 1.085814
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.710545     1.350818
+1.500000 | 1.018162     1.670248
+Table value = 11.156314
+PVT scale factor = 1.000000
+Delay = 11.156314
+
+------- input_net_transition = 6.000000
+|       total_output_net_capacitance = 1.085814
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.601426     1.467151
+1.500000 | 0.702221     1.489093
+Table value = 5.629775
+PVT scale factor = 1.000000
+Slew = 5.629775
+Driver waveform slew = 19.105747
+
+.............................................
+
+SWEEP input_slew 9.142787
+Library: sky130_fd_sc_hd__tt_025C_1v80
+Cell: sky130_fd_sc_hd__nor2_2
+Arc sense: negative_unate
+Arc type: combinational
+A ^ -> Y v
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=1.196373
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 9.142787
+|       total_output_net_capacitance = 1.196373
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.298580     0.484836
+1.500000 | 0.405274     0.696446
+Table value = 17.650038
+PVT scale factor = 1.000000
+Delay = 17.650038
+
+------- input_net_transition = 9.142787
+|       total_output_net_capacitance = 1.196373
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.241773     0.377003
+1.500000 | 0.388718     0.576995
+Table value = 10.485897
+PVT scale factor = 1.000000
+Slew = 10.485897
+Driver waveform slew = 32.019138
+
+.............................................
+
+A v -> Y ^
+Pi model C2=0.114533 Rpi=0.497066 C1=2.118645, Ceff=2.233178
+P = 1.000000 V = 1.800000 T = 25.000000
+------- input_net_transition = 9.142787
+|       total_output_net_capacitance = 2.233178
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.710545     1.350818
+1.500000 | 1.018162     1.670248
+Table value = 22.868074
+PVT scale factor = 1.000000
+Delay = 22.868074
+
+------- input_net_transition = 9.142787
+|       total_output_net_capacitance = 2.233178
+|        0.055359     0.141917
+v      --------------------
+0.650743 | 0.601426     1.467151
+1.500000 | 0.702221     1.489093
+Table value = 3.552783
+PVT scale factor = 1.000000
+Slew = 3.552783
+Driver waveform slew = 3.552783
+
+.............................................
+
