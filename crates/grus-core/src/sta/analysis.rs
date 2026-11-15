@@ -1238,6 +1238,13 @@ mod tests {
         for scale in [std::f64::consts::LOG2_E, 2.0, 3.0, 4.5] {
             rules.push((format!("delay_slope x {scale}"), Box::new(move |t, c| (scale * slope(t, c, 0)).max(1e-6))));
         }
+        let ln4 = 4f64.ln();
+        for scale in [3.0, 4.5, 6.0] {
+            rules.push((
+                format!("min(delay_slope x {scale}, slew/(ln4 C))"),
+                Box::new(move |t, c| (scale * slope(t, c, 0)).min(t(c).1 / (ln4 * c)).max(1e-6)),
+            ));
+        }
         for k in [1.8, 1.9, 2.0, 2.1, 2.2] {
             rules.push((format!("slew_slope x {k}"), Box::new(move |t, c| (k * slope(t, c, 1)).max(1e-6))));
         }
@@ -1252,8 +1259,12 @@ mod tests {
                 let mut all: [Vec<f64>; 3] = Default::default();
                 let mut shielded: [Vec<f64>; 3] = Default::default();
                 let mut worst: Vec<(f64, String)> = Vec::new();
+                let mut degenerate = 0usize;
                 let (matched, unmodelled) = for_each_dcalc_row(design, def, spef, file, &mut |row, pi, table| {
                     let r = solve_dmp_with(pi, &|t, c| rule(t, c), table);
+                    if crate::sta::dmp::ramp_fit_degenerate(rule(table, r.ceff), r.ceff, r.slew) {
+                        degenerate += 1;
+                    }
                     let errs = [
                         (r.ceff - row.ceff) / row.ceff * 100.0,
                         (r.delay - row.delay) / row.delay * 100.0,
@@ -1287,7 +1298,7 @@ mod tests {
                     println!("WORST {design} {name}: {line}");
                 }
                 println!(
-                    "SWEEP {design} {name:<22} rows {matched} (unmodelled {unmodelled}) shielded {} | all Ceff {} delay {} slew {} | shielded Ceff {} delay {} slew {}",
+                    "SWEEP {design} {name:<22} rows {matched} (unmodelled {unmodelled}) dt0 {degenerate} shielded {} | all Ceff {} delay {} slew {} | shielded Ceff {} delay {} slew {}",
                     shielded[0].len(), stat(&all[0]), stat(&all[1]), stat(&all[2]), stat(&shielded[0]), stat(&shielded[1]), stat(&shielded[2])
                 );
             }
@@ -1462,9 +1473,16 @@ mod tests {
             let (up, dn) = (table(c + h), table(c - h));
             let (dsl, ssl) = ((up.0 - dn.0) / (2.0 * h), (up.1 - dn.1) / (2.0 * h));
             let (d0, s0) = table(c);
+            let near = pi.c1.max(1e-4 * total);
+            let secant = |a: f64, b: f64, q: usize| {
+                let (ta, tb) = (table(a), table(b));
+                if q == 0 { (tb.0 - ta.0) / (b - a) } else { (tb.1 - ta.1) / (b - a) }
+            };
             println!(
-                "ROOT {} {} {} tin {:.4} shield {:.4} total {:.4} rpi {:.4} rd {:.4} dslope {:.4} sslope {:.4} delay {:.4} slew {:.4}",
-                row.from, row.to, row.out, row.input_slew, row.ceff / total, total, pi.rpi, rd, dsl, ssl, d0, s0
+                "ROOT {} {} {} tin {:.4} shield {:.4} total {:.4} rpi {:.4} rd {:.4} dslope {:.4} sslope {:.4} delay {:.4} slew {:.4} dsec_ct {:.4} ssec_ct {:.4} dsec_nt {:.4} ssec_nt {:.4} dsec_half {:.4} ssec_half {:.4}",
+                row.from, row.to, row.out, row.input_slew, row.ceff / total, total, pi.rpi, rd, dsl, ssl, d0, s0,
+                secant(c, total, 0), secant(c, total, 1), secant(near, total, 0), secant(near, total, 1),
+                secant(0.5 * total, total, 0), secant(0.5 * total, total, 1)
             );
             found += 1;
         });

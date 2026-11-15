@@ -85,6 +85,13 @@ fn rc_slew(dt: f64, tau: f64) -> f64 {
     rc_crossing(0.8, dt, tau) - rc_crossing(0.2, dt, tau)
 }
 
+/// True when no ramp can reproduce the table slew with this `rd`: even a step through `rd` is slower than
+/// the table slew, so [`fit_ramp`] returns its floor `dt`. The ramp model is outside its domain there.
+pub fn ramp_fit_degenerate(rd: f64, c: f64, slew: f64) -> bool {
+    let tau = rd * c;
+    rc_slew(1e-9 * tau.max(1e-12), tau) >= slew
+}
+
 /// Ramp parameters `(t0, dt)` such that a capacitor `c` behind `rd` has its 50% point at `delay`
 /// and a 20%-80% slew of `slew`. The input 50% point is time 0.
 fn fit_ramp(rd: f64, c: f64, delay: f64, slew: f64) -> (f64, f64) {
