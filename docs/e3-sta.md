@@ -330,6 +330,7 @@ Done criterion for every E3 step: worst slack, and arrival and required time of 
 | gcd SPEF | pass | slew 3% |
 | gcd placement RC | pass | arrival 2%, slew 5% (Steiner, E3.4) |
 | picorv32 SPEF | pass | arrival floor 6 ps, setup slack 40 ps, slew 10%, TNS 2% (E3.5) |
+| picorv32 routed SPEF | `#[ignore]`, fails | 136 fields at `Tol::PICORV32_SPEF` (step 7, ticket 16) |
 | picorv32 placement RC | `#[ignore]`, fails | arrival 9% off (E3.4 closed 2026-11-15: OpenROAD's tree is FLUTE's and tree choice is not the cause at gcd scale; the picorv32 gap belongs to the narrowed E3.5 scale question) |
 | Steiner length vs OpenROAD SPEF (gcd, picorv32) | pass | 2- and 3-point nets match exactly; the optimal tree is never longer than OpenROAD's (asserted) |
 | DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` 6% (one arc is 5.5% high) |
@@ -378,9 +379,12 @@ reference tool), write the rule in `docs/` before the code, record every compari
   `Delay`, `Slew` and `Driver waveform slew` per arc) has not been collected, and `RD_SCALE` is still fitted, not
   derived — one value fits arrival (about 4.5-5) but not `Ceff` (about 3), and its doc comment misdescribes the
   value (the F4 item in `docs/review-2026-11-11.md`). The open question is now the scale question: why the
-  wire-mode error grows by one to two orders of magnitude from gcd to aes/jpeg/ibex. The named next measurement
-  is a routed SPEF for picorv32 (the ticket-13 pattern), which separates estimator error from engine error at
-  that scale. OpenSTA's `DmpCeff` source (GPL) must not be read; work from the DMP paper and the measurements.
+  wire-mode error grows by one to two orders of magnitude from gcd to aes/jpeg/ibex. The picorv32 routed SPEF
+  (step 7, ticket 16) has since separated the two at that scale: the estimator side is ~1.4 ns median (ours and
+  OpenROAD's alike), and the engine residual is 6.2 ps median with a slack tail (726 of 1,798 endpoints outside
+  the strict criterion; a ~13%-low slew family on one register bank is its visible face). That tail is the
+  remaining E3.5 substance, with the `report_dcalc` table as its instrument. OpenSTA's `DmpCeff` source (GPL)
+  must not be read; work from the DMP paper and the measurements.
 - **Done when**: `Ceff` within 2% and driver slew within 2% of `report_dcalc` on all collected arcs; picorv32
   SPEF passes with the plain criterion (slack 5 ps, slew 1%, TNS 1%); `RD_SCALE` is gone or derived.
 
