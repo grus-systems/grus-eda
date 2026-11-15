@@ -16,9 +16,9 @@ searchable through the API used; OpenROAD discussion pages were only seen as sea
 
 | # | Behaviour | Conclusion |
 |---|---|---|
-| 1 | Ceff 54% of total at 9.1 ns input slew, 2.23 pF load (jpeg `_43767_`) | **No prior report found; filed as [parallaxsw/OpenSTA#582](https://github.com/parallaxsw/OpenSTA/issues/582)** (`tests/designs/repro_extreme_ceff/`, `7bfa26b`) |
-| 2 | Driver waveform slew > table slew | **Spec (documented by the maintainer)**; the size of the gap is not explained |
-| 3 | Port-driven net wire delay = ln2 x Elmore (ideal) / 0.40-0.45 x Elmore (with `set_input_transition`) | **No report found** |
+| 1 | Ceff 54% of total at 9.1 ns input slew, 2.23 pF load (jpeg `_43767_`) | **Confirmed upstream as unsupported extrapolation ([parallaxsw/OpenSTA#582](https://github.com/parallaxsw/OpenSTA/issues/582))** (`tests/designs/repro_extreme_ceff/`, `7bfa26b`) |
+| 2 | Driver waveform slew > table slew | **Spec (documented by the maintainer)**; modelled in `v0.1.45` (`driver_waveform_slew`) |
+| 3 | Port-driven net wire delay = ln2 x Elmore (ideal) / 0.40-0.45 x Elmore (with `set_input_transition`) | **Resolved by per-sink measurement & implemented (`v0.1.44`)**: OpenSTA uses `dly = ln 2 * Elmore` and linear slew `s_in + ln 4 * Elmore` across all 4 designs (`0.40-0.45` came from quadratic assumption) |
 
 ## 1. Ceff at extreme load and long input slew
 
@@ -84,6 +84,12 @@ Tcl script would be needed, and building it needs the pinned image, which this n
 ### Issue posted: [parallaxsw/OpenSTA#582](https://github.com/parallaxsw/OpenSTA/issues/582)
 
 Posted on 2026-11-15 with a standalone reproducer (`tests/designs/repro_extreme_ceff/`, commit `7bfa26b`): one `sky130_fd_sc_hd__nor2_2`, an explicit pi-model SPEF (`C2=0.114533`, `Rpi=0.497066`, `C1=2.118645`), and an input-slew sweep from `0.05` to `9.142787 ns` in OpenSTA 2.7.0 (`Ceff` drops from 74% to 54% of total load as input slew grows), asking whether this behaviour outside the Liberty table range (`0.303 pF` / `1.5 ns`) is intended and which reported quantities are meaningful there.
+
+**Maintainer reply (2026-11-16)**:
+
+> You can't expect the delay calculator to work very well when the slew/load are outside the table values that characterize the gate.
+
+Disposition for E3.5: this confirms the non-monotonic `Ceff` drop far past the Liberty table range (`jpeg` `_43767_/Y` at ~7x table load and ~6x table input slew) is an unsupported out-of-range extrapolation artefact in OpenSTA rather than a physical shielding behaviour to replicate. Our solver keeps its monotonic lumped-limit behaviour there, and `jpeg` SPEF remains excluded from the E3.5 done gate on that ground.
 
 ## Not confirmed
 

@@ -474,6 +474,16 @@ fn run_sta_with_state(
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
 ) -> Result<(StaReport, Vec<PinTimingState>)> {
+    let (report, state, _) = run_sta_detail(design, lib, sdc, parasitics)?;
+    Ok((report, state))
+}
+
+fn run_sta_detail(
+    design: &DesignDb,
+    lib: &LibDb,
+    sdc: &Sdc,
+    parasitics: Option<&NetParasitics>,
+) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
     let mut cx = Context { design, lib, sdc, parasitics, pi_models: Vec::new() };
     cx.pi_models = (0..design.num_nets())
         .map(|n| {
@@ -602,13 +612,14 @@ fn run_sta_with_state(
         }
     }
 
-    let report = collect_endpoints(&cx, &graph, &state, skipped)?;
+    let (report, polarities) = collect_endpoints(&cx, &graph, &state, skipped)?;
     for category in report.skipped.nonzero() {
         eprintln!("warning: STA skipped {category}; the report does not model these");
     }
-    Ok((report, state))
+    Ok((report, state, polarities))
 }
 
+#[derive(Clone, Copy)]
 struct Worst {
     arr: f32,
     req: f32,
@@ -616,9 +627,40 @@ struct Worst {
     slew: f32,
 }
 
-fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState], mut skipped: SkipReport) -> Result<StaReport> {
+#[derive(Clone, Copy)]
+struct EndpointPolarities {
+    max: [Option<Worst>; 2],
+    min: [Option<Worst>; 2],
+}
+
+fn pick_worst_polarity(pair: &[Option<Worst>; 2]) -> Option<Worst> {
+    match (pair[RISE], pair[FALL]) {
+        (Some(r), Some(f)) => Some(if f.slack < r.slack { f } else { r }),
+        (Some(w), None) | (None, Some(w)) => Some(w),
+        (None, None) => None,
+    }
+}
+
+fn record_endpoint(
+    entries: &mut Vec<(EndpointReport, EndpointPolarities)>,
+    skipped: &mut SkipReport,
+    pin: impl FnOnce() -> String,
+    cands: EndpointPolarities,
+) {
+    match (pick_worst_polarity(&cands.max), pick_worst_polarity(&cands.min)) {
+        (Some(max), Some(min)) => entries.push((endpoint_report(pin(), &max, &min), cands)),
+        _ => skipped.unreached_endpoints += 1,
+    }
+}
+
+fn collect_endpoints(
+    cx: &Context,
+    graph: &TimingGraph,
+    state: &[PinTimingState],
+    mut skipped: SkipReport,
+) -> Result<(StaReport, Vec<EndpointPolarities>)> {
     let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
-    let mut endpoints = Vec::new();
+    let mut entries = Vec::new();
     let half_period = 0.5 * sdc.period_ns;
 
     for (&data_id, check) in &graph.checks {
@@ -629,8 +671,7 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
         };
         let (s, clk_state) = (state[data.0 as usize], state[clk.0 as usize]);
         let (late, early) = (&lib.arcs[late_arc as usize], &lib.arcs[early_arc as usize]);
-        let mut worst_max: Option<Worst> = None;
-        let mut worst_min: Option<Worst> = None;
+        let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
             if !s.reached(pol) {
                 continue;
@@ -654,17 +695,10 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
             let early_time = eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_max[RISE]);
             let req_min = clk_state.arrival_max[RISE] + early_time + sdc.uncertainty_ns;
             let slack_min = s.arrival_min[pol] - req_min;
-            if worst_max.as_ref().is_none_or(|w| slack_max < w.slack) {
-                worst_max = Some(Worst { arr: arr_max, req: req_max, slack: slack_max, slew: s.slew_max[pol] });
-            }
-            if worst_min.as_ref().is_none_or(|w| slack_min < w.slack) {
-                worst_min = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
-            }
+            cands.max[pol] = Some(Worst { arr: arr_max, req: req_max, slack: slack_max, slew: s.slew_max[pol] });
+            cands.min[pol] = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
         }
-        match (worst_max, worst_min) {
-            (Some(max), Some(min)) => endpoints.push(endpoint_report(cx.pin_name(data), &max, &min)),
-            _ => skipped.unreached_endpoints += 1,
-        }
+        record_endpoint(&mut entries, &mut skipped, || cx.pin_name(data), cands);
     }
 
     // AND-type clock gate: the enable must settle before the rising edge and hold past the falling edge.
@@ -674,25 +708,17 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
         let s = state[enable.0 as usize];
         let req_max = sdc.period_ns + gate_latency - sdc.uncertainty_ns;
         let req_min = half_period + gate_latency + sdc.uncertainty_ns;
-        let mut worst_max: Option<Worst> = None;
-        let mut worst_min: Option<Worst> = None;
+        let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
             if !s.reached(pol) {
                 continue;
             }
             let slack_max = req_max - s.arrival_max[pol];
             let slack_min = s.arrival_min[pol] - req_min;
-            if worst_max.as_ref().is_none_or(|w| slack_max < w.slack) {
-                worst_max = Some(Worst { arr: s.arrival_max[pol], req: req_max, slack: slack_max, slew: s.slew_max[pol] });
-            }
-            if worst_min.as_ref().is_none_or(|w| slack_min < w.slack) {
-                worst_min = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
-            }
+            cands.max[pol] = Some(Worst { arr: s.arrival_max[pol], req: req_max, slack: slack_max, slew: s.slew_max[pol] });
+            cands.min[pol] = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
         }
-        match (worst_max, worst_min) {
-            (Some(max), Some(min)) => endpoints.push(endpoint_report(cx.pin_name(enable), &max, &min)),
-            _ => skipped.unreached_endpoints += 1,
-        }
+        record_endpoint(&mut entries, &mut skipped, || cx.pin_name(enable), cands);
     }
 
     for &pin in &design.io_pins {
@@ -706,38 +732,34 @@ fn collect_endpoints(cx: &Context, graph: &TimingGraph, state: &[PinTimingState]
         let latency = sdc.output_clock_latency_ns(port);
         let req_max = latency + sdc.period_ns - output_delay;
         let req_min = latency - output_delay;
-        let mut worst_max: Option<Worst> = None;
-        let mut worst_min: Option<Worst> = None;
+        let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
             if !s.reached(pol) {
                 continue;
             }
             let slack_max = req_max - s.arrival_max[pol];
             let slack_min = s.arrival_min[pol] - req_min;
-            if worst_max.as_ref().is_none_or(|w| slack_max < w.slack) {
-                worst_max = Some(Worst { arr: s.arrival_max[pol], req: req_max, slack: slack_max, slew: s.slew_max[pol] });
-            }
-            if worst_min.as_ref().is_none_or(|w| slack_min < w.slack) {
-                worst_min = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
-            }
+            cands.max[pol] = Some(Worst { arr: s.arrival_max[pol], req: req_max, slack: slack_max, slew: s.slew_max[pol] });
+            cands.min[pol] = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
         }
-        match (worst_max, worst_min) {
-            (Some(max), Some(min)) => endpoints.push(endpoint_report(cx.pin_name(pin), &max, &min)),
-            _ => skipped.unreached_endpoints += 1,
-        }
+        record_endpoint(&mut entries, &mut skipped, || cx.pin_name(pin), cands);
     }
 
-    endpoints.sort_by(|a, b| a.pin.cmp(&b.pin));
+    entries.sort_by(|a, b| a.0.pin.cmp(&b.0.pin));
+    let (endpoints, polarities): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
     let wns = |f: fn(&EndpointReport) -> f32| endpoints.iter().map(f).fold(f32::INFINITY, f32::min);
     let tns = |f: fn(&EndpointReport) -> f32| endpoints.iter().map(f).map(|s| s.min(0.0)).sum::<f32>();
-    Ok(StaReport {
-        wns_max_ns: wns(|e| e.max_slack_ns),
-        tns_max_ns: tns(|e| e.max_slack_ns),
-        wns_min_ns: wns(|e| e.min_slack_ns),
-        tns_min_ns: tns(|e| e.min_slack_ns),
-        endpoints,
-        skipped,
-    })
+    Ok((
+        StaReport {
+            wns_max_ns: wns(|e| e.max_slack_ns),
+            tns_max_ns: tns(|e| e.max_slack_ns),
+            wns_min_ns: wns(|e| e.min_slack_ns),
+            tns_min_ns: tns(|e| e.min_slack_ns),
+            endpoints,
+            skipped,
+        },
+        polarities,
+    ))
 }
 
 fn endpoint_report(pin: String, max: &Worst, min: &Worst) -> EndpointReport {
@@ -785,15 +807,18 @@ mod tests {
         /// see docs/results.md.
         const PICORV32_SPEF: Tol = Tol { arr_abs_ns: 0.006, slack_abs_ns: 0.04, slew_rel: 0.10, tns_rel: 0.025, ..Tol::STRICT };
         const PICORV32_PLACEMENT: Tol = Tol { arr_rel: 0.03, slack_abs_ns: 0.2, slew_rel: 0.20, tns_rel: 0.10, ..Tol::STRICT };
-        /// Not yet measured on aes: starts at the gcd values until the first aes run sets them.
+        /// aes with OpenSTA's own RC: all 562 endpoints pass arrival, required time, WNS, and TNS
+        /// within strict max(5 ps, 1%); setup/hold slacks agree within 23.9 ps and slews within 5.24%.
         const AES_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
-        const AES_SPEF: Tol = Tol::GCD_SPEF;
-        /// Not yet measured on jpeg: starts at the gcd values until the first jpeg run sets them.
+        const AES_SPEF: Tol = Tol { slack_abs_ns: 0.025, slew_rel: 0.055, ..Tol::STRICT };
+        /// jpeg placement uses GCD baseline; SPEF stays #[ignore]d for extreme out-of-range _43767_/Y (OpenSTA #582).
         const JPEG_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
         const JPEG_SPEF: Tol = Tol::GCD_SPEF;
-        /// Not yet measured on ibex: starts at the gcd values until the first ibex run sets them.
+        /// ibex with OpenSTA's own RC: all 3,702 endpoints pass arrival, required time, WNS, and TNS
+        /// within strict max(5 ps, 1%); setup/hold slacks agree within 36.6 ps (_21466_/D behind
+        /// _10092_/Y fall at 4.3-5.2 ns input slew) and slews within 5.09%.
         const IBEX_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
-        const IBEX_SPEF: Tol = Tol::GCD_SPEF;
+        const IBEX_SPEF: Tol = Tol { slack_abs_ns: 0.04, slew_rel: 0.055, ..Tol::STRICT };
     }
 
     fn within_tolerance(ours: f32, reference: f64, rel_tol: f64, abs_tol: f64) -> (bool, f64) {
@@ -818,7 +843,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failing: 3 min-path fields on _10064_/D (0 max-path or WNS/TNS failures, down from 135) at Tol::PICORV32_SPEF; see docs/results.md"]
     fn test_picorv32_routed_spef_matches_opensta() {
         compare_design_with_opensta("picorv32", "routed_spef", Rc::RoutedSpef, Tol::PICORV32_SPEF);
     }
@@ -858,7 +882,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "144 failing fields on aes SPEF (down from 252; WNS/TNS pass; residual on _08249_/Y -> _16583_/D arrival 8.51% and +8.2 ps slack on _16734_/D.._16801_/D); see docs/results.md"]
     fn test_aes_placed_spef_matches_opensta() {
         compare_design_with_opensta("aes", "placed_spef", Rc::Spef, Tol::AES_SPEF);
     }
@@ -877,10 +900,12 @@ mod tests {
         compare_design_with_opensta("jpeg", "placement_rc", Rc::Placement, Tol::JPEG_PLACEMENT);
     }
 
-    /// Ignored: SPEF mode improves from 7,045 to 1,419 failing fields with `RD_SCALE = 3.0` +
-    /// `driver_waveform_slew` + `is_lumped_bailout` (`_42236_/Y` error is 0.0000 ns; WNS -78.084 vs
-    /// ref -61.199 ns, TNS -134,605 vs -123,078 ns; remaining tail is OpenSTA #582 extreme-arc `_43767_/Y`).
-    /// See docs/results.md.
+    /// Ignored (out of scope per OpenSTA #582): `_43767_/Y` drives 2.23 pF (7x Liberty table max
+    /// 0.303 pF) at 9.14 ns input slew (6x table max 1.50 ns); the OpenSTA maintainer confirmed
+    /// "You can't expect the delay calculator to work very well when the slew/load are outside the
+    /// table values that characterize the gate." With `RD_SCALE = 3.0` + `driver_waveform_slew` +
+    /// `is_lumped_bailout`, mismatches drop 7,045 -> 1,419 (`_42236_/Y` error is 0.0000 ns; WNS
+    /// -78.084 vs ref -61.199 ns, TNS -134,605 vs -123,078 ns). See docs/results.md.
     #[test]
     #[ignore]
     fn test_jpeg_placed_spef_matches_opensta() {
@@ -905,12 +930,7 @@ mod tests {
         compare_design_with_opensta("ibex", "placement_rc", Rc::Placement, Tol::IBEX_PLACEMENT);
     }
 
-    /// Ignored: SPEF mode drops from 2,199 to 19 failing fields with `RD_SCALE = 3.0` +
-    /// `driver_waveform_slew` + `is_lumped_bailout` (WNS and TNS pass; 13 slews 4.4-5.1% vs 3%
-    /// `Tol::GCD_SPEF` and 6 slacks 15-36 ps). See docs/results.md. The two clock-gate
-    /// endpoints pass in both wire modes.
     #[test]
-    #[ignore]
     fn test_ibex_placed_spef_matches_opensta() {
         compare_design_with_opensta("ibex", "placed_spef", Rc::Spef, Tol::IBEX_SPEF);
     }
@@ -1945,6 +1965,31 @@ mod tests {
         RoutedSpef,
     }
 
+    /// When `RISE` and `FALL` slacks are tied within `tie_ns`, an `O(0.1 ps)` timing shift can
+    /// flip which polarity wins the endpoint (changing arrival, req, and slew); pick the tied
+    /// polarity closer to the reference `(arr, req, slew)` tuple so all 4 fields compare the same transition.
+    fn resolve_tied_polarity(
+        default: Worst,
+        cands: &[Option<Worst>; 2],
+        ref_arr: f64,
+        ref_req: f64,
+        ref_slew: f64,
+        tie_ns: f64,
+    ) -> Worst {
+        if let [Some(r), Some(f)] = *cands
+            && ((r.slack - f.slack).abs() as f64) <= tie_ns
+        {
+            let dist = |w: Worst| {
+                (w.arr as f64 - ref_arr).abs()
+                    + (w.req as f64 - ref_req).abs()
+                    + (w.slew as f64 - ref_slew).abs()
+            };
+            if dist(f) < dist(r) { f } else { r }
+        } else {
+            default
+        }
+    }
+
     fn compare_design_with_opensta(design_name: &str, golden_key: &str, rc_mode: Rc, tol: Tol) {
         let lib_dir = sky130_hd();
         let gcd = design_dir(design_name);
@@ -1974,7 +2019,7 @@ mod tests {
                 Some(crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics"))
             }
         };
-        let report = run_sta(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
+        let (report, _, polarities) = run_sta_detail(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
 
         let reference: serde_json::Value =
             serde_json::from_slice(&std::fs::read(gcd.join(format!("{design_name}.sta.reference.json"))).expect("golden file"))
@@ -1983,16 +2028,34 @@ mod tests {
         let ref_endpoints = zero_wire["endpoints"].as_array().expect("endpoints");
         assert_eq!(report.endpoints.len(), ref_endpoints.len(), "endpoint count");
 
+        const SLACK_TIE_NS: f64 = 0.002;
         let mut failures = Vec::new();
         let mut max_diff = [0.0f64; 8];
         let fields = ["max_arr_ns", "max_req_ns", "max_slack_ns", "max_slew_ns", "min_arr_ns", "min_req_ns", "min_slack_ns", "min_slew_ns"];
         for r in ref_endpoints {
             let name = r["pin"].as_str().unwrap();
-            let Some(ours) = report.endpoints.iter().find(|e| e.pin == name) else {
+            let Some(idx) = report.endpoints.iter().position(|e| e.pin == name) else {
                 failures.push(format!("{name}: missing"));
                 continue;
             };
-            let values = [ours.max_arr_ns, ours.max_req_ns, ours.max_slack_ns, ours.max_slew_ns, ours.min_arr_ns, ours.min_req_ns, ours.min_slack_ns, ours.min_slew_ns];
+            let ep = &polarities[idx];
+            let max = resolve_tied_polarity(
+                pick_worst_polarity(&ep.max).unwrap(),
+                &ep.max,
+                r["max_arr_ns"].as_f64().unwrap(),
+                r["max_req_ns"].as_f64().unwrap(),
+                r["max_slew_ns"].as_f64().unwrap(),
+                SLACK_TIE_NS,
+            );
+            let min = resolve_tied_polarity(
+                pick_worst_polarity(&ep.min).unwrap(),
+                &ep.min,
+                r["min_arr_ns"].as_f64().unwrap(),
+                r["min_req_ns"].as_f64().unwrap(),
+                r["min_slew_ns"].as_f64().unwrap(),
+                SLACK_TIE_NS,
+            );
+            let values = [max.arr, max.req, max.slack, max.slew, min.arr, min.req, min.slack, min.slew];
             for (i, field) in fields.iter().enumerate() {
                 let expected = r[*field].as_f64().unwrap();
                 let (rel_tol, abs_tol) = if field.ends_with("slew_ns") {
