@@ -953,6 +953,187 @@ mod tests {
         }
     }
 
+    /// Endpoint timing of one estimator, pin name, max arrival (ns), max slack (ns), plus WNS/TNS (max path).
+    struct Timing {
+        endpoints: Vec<(String, f64, f64)>,
+        wns_ns: f64,
+        tns_ns: f64,
+    }
+
+    fn timing_from_report(report: &StaReport) -> Timing {
+        Timing {
+            endpoints: report
+                .endpoints
+                .iter()
+                .map(|e| (e.pin.clone(), e.max_arr_ns as f64, e.max_slack_ns as f64))
+                .collect(),
+            wns_ns: report.wns_max_ns as f64,
+            tns_ns: report.tns_max_ns as f64,
+        }
+    }
+
+    fn timing_from_golden(block: &serde_json::Value) -> Timing {
+        Timing {
+            endpoints: block["endpoints"]
+                .as_array()
+                .expect("endpoints")
+                .iter()
+                .map(|e| (e["pin"].as_str().unwrap().to_string(), e["max_arr_ns"].as_f64().unwrap(), e["max_slack_ns"].as_f64().unwrap()))
+                .collect(),
+            wns_ns: block["wns_max_ns"].as_f64().unwrap(),
+            tns_ns: block["tns_max_ns"].as_f64().unwrap(),
+        }
+    }
+
+    /// One row of the measurement table. Errors are ours minus the reference, in ps (WNS/TNS signed).
+    struct Score {
+        label: &'static str,
+        arr_err_ps: Vec<f64>,
+        arr_fail: usize,
+        slack_fail: usize,
+        either_fail: usize,
+        wns_err_ps: f64,
+        tns_err_ps: f64,
+    }
+
+    /// The strict criterion `max(5 ps, 1%)` of the reference value, in ns.
+    fn strict_ok(err_ns: f64, reference_ns: f64) -> bool {
+        err_ns.abs() <= 0.005f64.max(0.01 * reference_ns.abs())
+    }
+
+    fn score(label: &'static str, ours: &Timing, reference: &Timing) -> Score {
+        assert_eq!(ours.endpoints.len(), reference.endpoints.len(), "{label}: endpoint count");
+        let (mut arr_err_ps, mut arr_fail, mut slack_fail, mut either_fail) = (Vec::new(), 0, 0, 0);
+        for (pin, ref_arr, ref_slack) in &reference.endpoints {
+            let (_, our_arr, our_slack) = ours
+                .endpoints
+                .iter()
+                .find(|(p, _, _)| p == pin)
+                .unwrap_or_else(|| panic!("{label}: endpoint {pin} missing"));
+            let arr_ok = strict_ok(our_arr - ref_arr, *ref_arr);
+            let slack_ok = strict_ok(our_slack - ref_slack, *ref_slack);
+            arr_err_ps.push((our_arr - ref_arr).abs() * 1000.0);
+            arr_fail += usize::from(!arr_ok);
+            slack_fail += usize::from(!slack_ok);
+            either_fail += usize::from(!(arr_ok && slack_ok));
+        }
+        Score {
+            label,
+            arr_err_ps,
+            arr_fail,
+            slack_fail,
+            either_fail,
+            wns_err_ps: (ours.wns_ns - reference.wns_ns) * 1000.0,
+            tns_err_ps: (ours.tns_ns - reference.tns_ns) * 1000.0,
+        }
+    }
+
+    /// Nearest-rank quantile of an ascending list.
+    fn nearest_rank(sorted: &[f64], q: f64) -> f64 {
+        sorted[((q * sorted.len() as f64).ceil() as usize).max(1) - 1]
+    }
+
+    fn print_scores(title: &str, rows: &[Score]) {
+        println!("\n{title}");
+        println!(
+            "{:<72} {:>3} {:>22} {:>22} {:>22} {:>22} {:>22} {:>6} {:>6} {:>6}",
+            "configuration", "n", "arr_err_med_ps", "arr_err_p95_ps", "arr_err_max_ps", "wns_err_ps", "tns_err_ps", "arr_f", "slk_f", "any_f"
+        );
+        for row in rows {
+            let mut sorted = row.arr_err_ps.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "{:<72} {:>3} {:>22} {:>22} {:>22} {:>22} {:>22} {:>6} {:>6} {:>6}",
+                row.label,
+                sorted.len(),
+                nearest_rank(&sorted, 0.5),
+                nearest_rank(&sorted, 0.95),
+                nearest_rank(&sorted, 1.0),
+                row.wns_err_ps,
+                row.tns_err_ps,
+                row.arr_fail,
+                row.slack_fail,
+                row.either_fail
+            );
+        }
+    }
+
+    /// `(routed_spef, placed_spef)` blocks of `gcd.sta.reference.json`: OpenSTA on the placed DEF with
+    /// OpenRCX's routed parasitics and with OpenROAD's placement estimate.
+    fn gcd_golden_pair() -> (Timing, Timing) {
+        let reference: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(design_dir("gcd").join("gcd.sta.reference.json")).expect("golden file"),
+        )
+        .expect("golden JSON");
+        (timing_from_golden(&reference["routed_spef"]), timing_from_golden(&reference["placed_spef"]))
+    }
+
+    /// Ticket 15, configuration (d): OpenSTA's placed-SPEF golden scored against its routed-SPEF golden.
+    /// Golden-vs-golden, so it needs no PDK and no STA run; it isolates the estimator difference.
+    #[test]
+    fn measure_gcd_placed_golden_against_routed_golden() {
+        let (routed_truth, placed_golden) = gcd_golden_pair();
+        print_scores(
+            "gcd, OpenSTA golden-vs-golden (no STA run)",
+            &[score("(d) OpenSTA placed SPEF golden vs routed_spef golden", &placed_golden, &routed_truth)],
+        );
+    }
+
+    /// Ticket 15 (review step 6, part 3): scores both placement tree builders and both SPEF modes
+    /// against OpenSTA on the routed parasitics (`routed_spef` golden). Measurement only: prints
+    /// tables with `--nocapture`; the numbers are recorded by the maintainer, not asserted here.
+    #[test]
+    fn measure_gcd_estimators_against_routed_truth() {
+        use crate::sta::parasitics::estimate_placement_parasitics_with_tree;
+        use crate::sta::{WireRc, spef_parasitics};
+        use crate::congestion::rsmt::{build_precise_rsmt_points, build_rsmt_points};
+
+        let lib_dir = sky130_hd();
+        let gcd = design_dir("gcd");
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(&gcd.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&gcd.join("gcd.sdc")).expect("SDC");
+        let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
+
+        let (routed_truth, placed_golden) = gcd_golden_pair();
+
+        let sta =|parasitics: &crate::sta::NetParasitics| {
+            timing_from_report(&run_sta(&design, &lib, &sdc, Some(parasitics)).expect("STA"))
+        };
+        let load = |file: &str| {
+            let spef = crate::readers::load_spef(&gcd.join(file)).expect("SPEF");
+            spef_parasitics(&design, &spef).expect("SPEF parasitics")
+        };
+
+        let greedy = estimate_placement_parasitics_with_tree(&design, &tech, rc, build_rsmt_points);
+        let exact = estimate_placement_parasitics_with_tree(&design, &tech, rc, build_precise_rsmt_points);
+        let placed = load("gcd.routed.spef");
+        let routed = load("gcd.rcx.spef");
+        let ours_placed = sta(&placed);
+        let ours_routed = sta(&routed);
+
+        let vs_truth = vec![
+            score("(a) ours, placement RC, greedy tree (build_rsmt_points)", &sta(&greedy), &routed_truth),
+            score("(b) ours, placement RC, exact tree (build_precise_rsmt_points; shipped)", &sta(&exact), &routed_truth),
+            score("(c) ours, placed SPEF (OpenROAD tree and RC)", &ours_placed, &routed_truth),
+            score("(d) OpenSTA placed SPEF golden", &placed_golden, &routed_truth),
+        ];
+        print_scores("gcd, timing error against OpenSTA on routed_spef (max path, 53 endpoints)", &vs_truth);
+
+        let residuals = vec![
+            score("(e) ours, routed SPEF, vs OpenSTA routed_spef golden", &ours_routed, &routed_truth),
+            score("(f) ours, placed SPEF, vs OpenSTA placed_spef golden", &ours_placed, &placed_golden),
+        ];
+        print_scores("gcd, our SPEF-mode residuals against each parasitics' own OpenSTA golden", &residuals);
+    }
+
     enum Rc {
         None,
         Placement,

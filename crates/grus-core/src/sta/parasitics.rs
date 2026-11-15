@@ -99,13 +99,26 @@ impl NetParasitics {
 }
 
 pub fn estimate_placement_parasitics(design: &DesignDb, tech: &TechDb, rc: WireRc) -> NetParasitics {
+    estimate_placement_parasitics_with_tree(design, tech, rc, build_precise_rsmt_points)
+}
+
+/// The tree builder is a parameter so the measurement can compare the greedy and exact trees against
+/// routed truth; the shipped estimate is always `build_precise_rsmt_points`.
+pub(crate) fn estimate_placement_parasitics_with_tree(
+    design: &DesignDb,
+    tech: &TechDb,
+    rc: WireRc,
+    segments: TreeBuilder,
+) -> NetParasitics {
     let nets = (0..design.num_nets())
-        .map(|n| build_net_tree(design, tech, rc, NetId(n as u32)))
+        .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), segments))
         .collect();
     NetParasitics { nets }
 }
 
-fn build_net_tree(design: &DesignDb, tech: &TechDb, rc: WireRc, net: NetId) -> Option<NetRcTree> {
+pub(crate) type TreeBuilder = fn(&[Pt]) -> Vec<(Pt, Pt)>;
+
+fn build_net_tree(design: &DesignDb, tech: &TechDb, rc: WireRc, net: NetId, segments: TreeBuilder) -> Option<NetRcTree> {
     design.net_driver(net)?;
     let pins: &[PinId] = design.net_pins(net);
     if pins.len() < 2 {
@@ -131,7 +144,7 @@ fn build_net_tree(design: &DesignDb, tech: &TechDb, rc: WireRc, net: NetId) -> O
     let pin_point: Vec<usize> = pin_pts.iter().map(|&p| intern(p, &mut points)).collect();
     let mut adjacency: Vec<Vec<usize>> = Vec::new();
     let mut edges: Vec<(usize, usize)> = Vec::new();
-    for (a, b) in build_precise_rsmt_points(&pin_pts) {
+    for (a, b) in segments(&pin_pts) {
         edges.push((intern(a, &mut points), intern(b, &mut points)));
     }
     adjacency.resize(points.len(), Vec::new());
