@@ -34,8 +34,10 @@ Instructions for AI coding agents working in this repository.
 - Status, tolerances and open tasks for E3 are in `docs/e3-sta.md` Sections 4-6 (open tasks `E3.4`-`E3.6`, each with
   why, reference, approach and done criterion). `docs/results.md` is the log of every comparison, including failures.
 - Before running tests that use `picorv32`, generate its inputs (`docs/e3-sta.md` Section 6).
-- Licensing: OpenSTA and OpenROAD source (GPL) must not be read or copied into this repository; use the published
-  papers and the tools' output instead. Check the license of any third-party code or table before adding it.
+- Licensing: OpenROAD is BSD 3-Clause; since the user's decision of 2026-11-15 its source may be read (the
+  pinned revision is the reference), but its code must not be copied into this repository — implementations
+  here are our own. OpenSTA is GPL: its source must not be read or copied; use the published papers and the
+  tool's output instead. Check the license of any third-party code or table before adding it.
 
 ## 4. Working Style & Communication
 
