@@ -52,6 +52,14 @@ log is [`../results.md`](../results.md).
 | [step7/16-picorv32-routed-spef.md](step7/16-picorv32-routed-spef.md) | Ticket 16: a routed SPEF for picorv32 — E3.5 scale evidence and the coupling cross-check |
 | [step7/17-dcalc-routed-table.md](step7/17-dcalc-routed-table.md) | Ticket 17: DMP vs `report_dcalc` on the picorv32 routed SPEF (76 rows) |
 
+## E3.5 — driver model, waveform slew and extreme-load investigation (in progress)
+
+| File | What |
+|---|---|
+| [e35/01-rd-and-wave-slew.md](e35/01-rd-and-wave-slew.md) | Working record: `RD_SCALE` sweeps, waveform slew, ramp-fit degeneracy, stage-by-stage and wire-delay measurements |
+| [e35/opensta-known-issues.md](e35/opensta-known-issues.md) | Upstream OpenSTA issue/PR search (`#227`, `#468`, `#582`) |
+| [e35/probe.patch](e35/probe.patch) | Measurement-only env-var probe patch (not committed to source) |
+
 ## E3.6 — DMP solve speed (done)
 
 | File | What |
