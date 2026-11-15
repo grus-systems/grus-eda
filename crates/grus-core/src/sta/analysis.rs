@@ -1486,29 +1486,42 @@ mod tests {
         assert!(matched_total > 10);
     }
 
-    /// Measurement (E3.5 wire delay): for every cell-driven net, OpenSTA's per-sink wire delay (sink arrival minus
-    /// driver arrival, from `collect_pins.sh`) against our Elmore delay, binned by Elmore delay and by the driver's slew.
-    /// Prints `WIREDELAY` lines (median and p10/p90 of ref delay / Elmore and ref slew degrade / Elmore) per bin.
-    #[test]
-    fn test_wire_delay_vs_elmore() {
+    fn format_spread(v: &[f64], decimals: usize) -> String {
+        let mut s = v.to_vec();
+        s.sort_by(f64::total_cmp);
+        format!(
+            "p10 {:.decimals$} median {:.decimals$} p90 {:.decimals$}",
+            s[s.len() / 10],
+            median(s.clone()),
+            s[9 * s.len() / 10],
+        )
+    }
+
+    fn for_each_pins_design(
+        tag: &str,
+        mut visit: impl FnMut(&str, &Context, &std::collections::HashMap<&str, [f64; 4]>),
+    ) {
         let sets = [
             ("aes", "aes.placed.def", "aes.routed.spef", "pins_placed.txt"),
             ("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "pins_routed.txt"),
             ("ibex", "ibex.placed.def", "ibex.routed.spef", "pins_placed.txt"),
             ("jpeg", "jpeg.placed.def", "jpeg.routed.spef", "pins_placed.txt"),
         ];
-        let e_bins = [(0.0, 0.001), (0.001, 0.01), (0.01, 0.1), (0.1, 1.0), (1.0, 100.0)];
-        let mut total_rows = 0usize;
         for (design_name, def_file, spef_file, pins_file) in sets {
             let dir = design_dir(design_name);
             let Ok(text) = std::fs::read_to_string(dir.join(pins_file)) else {
-                println!("WIREDELAY {design_name}: no {pins_file}, skipped (collect_pins.sh)");
+                println!("{tag} {design_name}: no {pins_file}, skipped (collect_pins.sh)");
                 continue;
             };
             let lib_dir = sky130_hd();
             let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
             let mut interner = StringInterner::new();
-            let tech = load_tech_db(&lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"), &lib_dir.join("lef/sky130_fd_sc_hd.lef"), &mut interner).expect("LEF");
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF");
             let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
             let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
             let spef = crate::readers::load_spef(&dir.join(spef_file)).expect("SPEF");
@@ -1524,9 +1537,19 @@ mod tests {
                 let n = |i: usize| w[i].parse::<f64>().unwrap_or(f64::NAN);
                 ref_pins.insert(w[0], [n(1), n(2), n(3), n(4)]);
             }
-            let by_name: std::collections::HashMap<String, PinId> =
-                (0..design.num_pins()).map(|i| PinId(i as u32)).map(|p| (cx.pin_name(p), p)).collect();
-            let _ = by_name;
+            visit(design_name, &cx, &ref_pins);
+        }
+    }
+
+    /// Measurement (E3.5 wire delay): for every cell-driven net, OpenSTA's per-sink wire delay (sink arrival minus
+    /// driver arrival, from `collect_pins.sh`) against our Elmore delay, binned by Elmore delay and by the driver's slew.
+    /// Prints `WIREDELAY` lines (median and p10/p90 of ref delay / Elmore and ref slew degrade / Elmore) per bin.
+    #[test]
+    fn test_wire_delay_vs_elmore() {
+        let e_bins = [(0.0, 0.001), (0.001, 0.01), (0.01, 0.1), (0.1, 1.0), (1.0, 100.0)];
+        let mut total_rows = 0usize;
+        for_each_pins_design("WIREDELAY", |design_name, cx, ref_pins| {
+            let design = cx.design;
             // [bin] -> (delay ratios, slew-degrade ratios)
             let mut by_e: Vec<(Vec<f64>, Vec<f64>)> = vec![(Vec::new(), Vec::new()); e_bins.len()];
             let mut by_slew: Vec<(Vec<f64>, Vec<f64>)> = vec![(Vec::new(), Vec::new()); 4];
@@ -1563,11 +1586,6 @@ mod tests {
                     }
                 }
             }
-            let spread = |v: &Vec<f64>| {
-                let mut s = v.clone();
-                s.sort_by(f64::total_cmp);
-                format!("p10 {:.3} median {:.3} p90 {:.3}", s[s.len() / 10], median(s.clone()), s[9 * s.len() / 10])
-            };
             for k in [1.386, 1.5, 1.6, 1.7, 1.8, 2.0] {
                 // Relative error of the predicted sink slew hypot(driver slew, k * Elmore), all sinks and big-wire sinks.
                 let rel = |sel: &dyn Fn(&&(f64, f64, f64)) -> bool| {
@@ -1578,15 +1596,15 @@ mod tests {
             }
             for (b, &(lo, hi)) in e_bins.iter().enumerate() {
                 if by_e[b].0.len() >= 5 {
-                    println!("WIREDELAY {design_name} elmore [{lo},{hi}) n {} | ref delay / elmore {} | ref slew degrade / elmore {}", by_e[b].0.len(), spread(&by_e[b].0), spread(&by_e[b].1));
+                    println!("WIREDELAY {design_name} elmore [{lo},{hi}) n {} | ref delay / elmore {} | ref slew degrade / elmore {}", by_e[b].0.len(), format_spread(&by_e[b].0, 3), format_spread(&by_e[b].1, 3));
                 }
             }
             for (b, &(lo, hi)) in slew_bins.iter().enumerate() {
                 if by_slew[b].0.len() >= 5 {
-                    println!("WIRESLEW {design_name} driver slew [{lo},{hi}) n {} | ref delay / elmore {} | ref slew degrade / elmore {}", by_slew[b].0.len(), spread(&by_slew[b].0), spread(&by_slew[b].1));
+                    println!("WIRESLEW {design_name} driver slew [{lo},{hi}) n {} | ref delay / elmore {} | ref slew degrade / elmore {}", by_slew[b].0.len(), format_spread(&by_slew[b].0, 3), format_spread(&by_slew[b].1, 3));
                 }
             }
-        }
+        });
         assert!(total_rows > 100, "only {total_rows} sink rows");
     }
 
@@ -1993,5 +2011,267 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    struct ReproSweepRow {
+        input_slew: f64,
+        out_pol: usize,
+        near_c2: f64,
+        rpi: f64,
+        far_c1: f64,
+        ceff: f64,
+        delay: f64,
+        slew: f64,
+        driver_slew: f64,
+    }
+
+    fn parse_repro_sweep(text: &str) -> Vec<ReproSweepRow> {
+        let mut rows = Vec::new();
+        let mut cur_tin: Option<f64> = None;
+        let mut cur_pol: Option<usize> = None;
+        let mut cur_pi: Option<(f64, f64, f64, f64)> = None;
+        let mut cur_delay: Option<f64> = None;
+        let mut cur_slew: Option<f64> = None;
+
+        let parse_kv = |token: &str, prefix: &str| -> f64 {
+            let val = token.trim_end_matches(',').strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("expected prefix {prefix:?} in {token:?}"));
+            val.parse().unwrap_or_else(|_| panic!("bad float in {token:?}"))
+        };
+
+        for (line_no, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if let Some(rest) = line.strip_prefix("SWEEP input_slew ") {
+                cur_tin = Some(rest.trim().parse().unwrap_or_else(|_| panic!("line {}: bad input_slew {rest:?}", line_no + 1)));
+                cur_pol = None;
+            } else if line == "A ^ -> Y v" {
+                cur_pol = Some(FALL);
+                cur_pi = None;
+                cur_delay = None;
+                cur_slew = None;
+            } else if line == "A v -> Y ^" {
+                cur_pol = Some(RISE);
+                cur_pi = None;
+                cur_delay = None;
+                cur_slew = None;
+            } else if let Some(rest) = line.strip_prefix("Pi model ") {
+                let f: Vec<&str> = rest.split_whitespace().collect();
+                assert_eq!(f.len(), 4, "line {}: bad Pi model line {line:?}", line_no + 1);
+                cur_pi = Some((
+                    parse_kv(f[0], "C2="),
+                    parse_kv(f[1], "Rpi="),
+                    parse_kv(f[2], "C1="),
+                    parse_kv(f[3], "Ceff="),
+                ));
+            } else if let Some(rest) = line.strip_prefix("Delay = ") {
+                cur_delay = Some(rest.trim().parse().unwrap_or_else(|_| panic!("line {}: bad Delay {rest:?}", line_no + 1)));
+            } else if let Some(rest) = line.strip_prefix("Slew = ") {
+                cur_slew = Some(rest.trim().parse().unwrap_or_else(|_| panic!("line {}: bad Slew {rest:?}", line_no + 1)));
+            } else if let Some(rest) = line.strip_prefix("Driver waveform slew = ") {
+                let driver_slew: f64 = rest.trim().parse().unwrap_or_else(|_| panic!("line {}: bad Driver waveform slew {rest:?}", line_no + 1));
+                let (near_c2, rpi, far_c1, ceff) = cur_pi.take().expect("Pi model before Driver waveform slew");
+                rows.push(ReproSweepRow {
+                    input_slew: cur_tin.expect("SWEEP input_slew before sub-block"),
+                    out_pol: cur_pol.take().expect("transition before Driver waveform slew"),
+                    near_c2,
+                    rpi,
+                    far_c1,
+                    ceff,
+                    delay: cur_delay.take().expect("Delay before Driver waveform slew"),
+                    slew: cur_slew.take().expect("Slew before Driver waveform slew"),
+                    driver_slew,
+                });
+            }
+        }
+        rows
+    }
+
+    /// Measurement (E3.5, OpenSTA #582): compares our NLDM extrapolation and `solve_dmp` (`RD_SCALE = 4.5`
+    /// and `3.0`) against OpenSTA's 7-point input-slew sweep in `tests/designs/repro_extreme_ceff/sweep_reference.txt`.
+    #[test]
+    fn test_repro_extreme_ceff_sweep_vs_opensta() {
+        use crate::sta::dmp::{PiModel, solve_dmp, solve_dmp_with};
+
+        let dir = design_dir("repro_extreme_ceff");
+        let text = std::fs::read_to_string(dir.join("sweep_reference.txt")).expect("sweep_reference.txt");
+        let rows = parse_repro_sweep(&text);
+        assert_eq!(rows.len(), 14, "expected 7 input slews x 2 transitions = 14 rows, got {}", rows.len());
+
+        let spef = crate::readers::load_spef(&dir.join("top.spef")).expect("top.spef");
+        let y_net = spef.nets.get("y").expect("SPEF net y");
+        let cap_at = |node: &str| y_net.caps.iter().find(|(n, _)| n == node).map(|&(_, c)| c).expect("SPEF cap");
+        let (spef_near, spef_far) = (cap_at("u1:Y"), cap_at("y"));
+        let spef_rpi = y_net.resistors.iter().find(|(a, b, _)| a == "u1:Y" && b == "y").map(|&(_, _, r)| r).expect("SPEF resistor");
+
+        let lib_dir = sky130_hd();
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let cell = lib
+            .cells
+            .iter()
+            .find(|c| lib.strings.resolve(c.name) == "sky130_fd_sc_hd__nor2_2")
+            .expect("sky130_fd_sc_hd__nor2_2");
+        let arcs: Vec<&crate::lib_db::LibTimingArc> = lib
+            .cell_arcs(cell)
+            .iter()
+            .filter(|a| {
+                lib.strings.resolve(lib.pins[a.related_pin.0 as usize].name) == "A"
+                    && lib.strings.resolve(lib.pins[a.target_pin.0 as usize].name) == "Y"
+                    && a.timing_type == TimingType::Combinational
+            })
+            .collect();
+        assert_eq!(arcs.len(), 1, "expected exactly 1 A->Y combinational arc on nor2_2");
+        let arc = arcs[0];
+        assert_eq!(arc.timing_sense, TimingSense::NegativeUnate);
+
+        println!(
+            "REPRO_SWEEP {:>8} {:>4} | {:>12} {:>8} {:>8} {:>8} | {:>22} | {:>22} | {:>10}",
+            "tin", "out", "refCeff(%tot)", "refDly", "refSlw", "refWave",
+            "RD4.5 Ceff(%) Dly(%) Slw(%)", "RD3.0 Ceff(%) Dly(%) Slw(%)", "rdRoot/dSl"
+        );
+        let pct = |ours: f64, reference: f64| (ours - reference) / reference.abs() * 100.0;
+        for row in &rows {
+            assert!((spef_near as f64 - row.near_c2).abs() < 1e-6);
+            assert!((spef_far as f64 - row.far_c1).abs() < 1e-6);
+            assert!((spef_rpi as f64 - row.rpi).abs() < 1e-6);
+            let pi = PiModel { c1: row.near_c2, rpi: row.rpi, c2: row.far_c1 };
+            let total = pi.total();
+
+            let (Some(delay_table), Some(slew_table)) = delay_tables(arc, row.out_pol) else {
+                panic!("missing NLDM tables");
+            };
+            let tin = row.input_slew as f32;
+            let table = |c: f64| {
+                (
+                    eval_nldm_delay_or_slew(delay_table, tin, c as f32) as f64,
+                    eval_nldm_delay_or_slew(slew_table, tin, c as f32) as f64,
+                )
+            };
+
+            let (tbl_dly, tbl_slw) = table(row.ceff);
+            let rel_d = (tbl_dly - row.delay).abs() / row.delay.abs();
+            let rel_s = (tbl_slw - row.slew).abs() / row.slew.abs();
+            assert!(
+                rel_d < 1e-4 && rel_s < 1e-4,
+                "NLDM mismatch at tin={} out={}: ours=({tbl_dly}, {tbl_slw}) ref=({}, {}), rel=({rel_d:.3e}, {rel_s:.3e})",
+                row.input_slew, row.out_pol, row.delay, row.slew
+            );
+
+            let r45 = solve_dmp(&pi, RD_SCALE, &table);
+            let r30 = solve_dmp(&pi, 3.0, &table);
+
+            let (mut lo, mut hi) = (1e-3f64, 1e4f64);
+            for _ in 0..70 {
+                let mid = (lo * hi).sqrt();
+                let r = solve_dmp_with(&pi, &|_, _| mid, &table);
+                if r.ceff > row.ceff { hi = mid } else { lo = mid }
+            }
+            let rd_root = (lo * hi).sqrt();
+            let h = 0.05 * row.ceff;
+            let (dsl, _ssl) = (
+                (table(row.ceff + h).0 - table(row.ceff - h).0) / (2.0 * h),
+                (table(row.ceff + h).1 - table(row.ceff - h).1) / (2.0 * h),
+            );
+            let ratio = rd_root / dsl;
+            let ratio_str = if rd_root < 1.05e-3 {
+                "<lo_bnd".to_string()
+            } else if rd_root > 0.95e4 {
+                ">hi_bnd".to_string()
+            } else {
+                format!("{ratio:>10.3}")
+            };
+
+            println!(
+                "REPRO_SWEEP {:>8.4} {:>4} | {:>6.4}({:>4.0}%) {:>8.4} {:>8.4} {:>8.4} | {:>6.4}({:>+5.1}%) {:>+5.1}% {:>+5.1}% | {:>6.4}({:>+5.1}%) {:>+5.1}% {:>+5.1}% | {:>10}",
+                row.input_slew,
+                if row.out_pol == RISE { "rise" } else { "fall" },
+                row.ceff, row.ceff / total * 100.0, row.delay, row.slew, row.driver_slew,
+                r45.ceff, pct(r45.ceff, row.ceff), pct(r45.delay, row.delay), pct(r45.slew, row.slew),
+                r30.ceff, pct(r30.ceff, row.ceff), pct(r30.delay, row.delay), pct(r30.slew, row.slew),
+                ratio_str
+            );
+        }
+    }
+
+    /// Measurement (E3.5 port-driven nets): compares OpenSTA's per-sink wire delay and sink slew
+    /// (from `collect_pins.sh`, minus SDC `input_clock_latency_ns + input_delay_ns`) against Elmore,
+    /// `ln(2)*Elmore`, and `0.5 * (hypot(drv_slew, ln(4)*Elmore) - drv_slew)`.
+    #[test]
+    fn test_port_wire_delay_vs_opensta() {
+        let mut total_rows = 0usize;
+        for_each_pins_design("PORTWIRE", |design_name, cx, ref_pins| {
+            let (design, sdc) = (cx.design, cx.sdc);
+            let mut r_elmore = Vec::new();
+            let mut r_ln2 = Vec::new();
+            let mut r_half_ramp = Vec::new();
+            let mut r_degrade = Vec::new();
+            let mut max_half_slew_diff = 0.0f64;
+
+            for n in 0..design.num_nets() {
+                let net = NetId(n as u32);
+                let pins = design.net_pins(net);
+                let Some(&drv) = pins.first() else { continue };
+                if design.pin_cells[drv.0 as usize].is_some() || !design.pin_is_driver[drv.0 as usize] {
+                    continue;
+                }
+                let port_name = cx.port_name(drv);
+                if sdc.clock_port.as_deref() == Some(port_name) {
+                    continue;
+                }
+                let Some(wire) = cx.wire_delays(net) else { continue };
+                let drv_arr = (sdc.input_clock_latency_ns(port_name) + sdc.input_delay_ns(port_name)) as f64;
+                let drv_slew = sdc.input_transition_ns(port_name) as f64;
+
+                let mut net_elmore = Vec::new();
+                let mut net_half = Vec::new();
+                let mut net_max_slew_diff = 0.0f64;
+                for (i, &sink) in pins.iter().enumerate().skip(1) {
+                    let Some(sink_ref) = ref_pins.get(cx.pin_name(sink).as_str()) else { continue };
+                    for pol in [RISE, FALL] {
+                        let (sink_slew, sink_arr) = (sink_ref[pol], sink_ref[2 + pol]);
+                        let elmore = wire[pol][i] as f64;
+                        if !(sink_arr.is_finite() && sink_slew.is_finite()) || elmore <= 1e-7 {
+                            continue;
+                        }
+                        let ref_delay = sink_arr - drv_arr;
+                        let ref_degrade = (sink_slew * sink_slew - drv_slew * drv_slew).max(0.0).sqrt();
+                        let pred_half = 0.5 * (drv_slew.hypot(WIRE_SLEW_FACTOR as f64 * elmore) - drv_slew);
+                        let half_slew_diff = (ref_delay - 0.5 * (sink_slew - drv_slew)).abs();
+                        r_elmore.push(ref_delay / elmore);
+                        r_ln2.push(ref_delay / (std::f64::consts::LN_2 * elmore));
+                        if pred_half > 1e-12 {
+                            r_half_ramp.push(ref_delay / pred_half);
+                            net_half.push(ref_delay / pred_half);
+                        }
+                        r_degrade.push(ref_degrade / elmore);
+                        max_half_slew_diff = max_half_slew_diff.max(half_slew_diff);
+                        net_elmore.push(ref_delay / elmore);
+                        net_max_slew_diff = net_max_slew_diff.max(half_slew_diff);
+                        total_rows += 1;
+                    }
+                }
+                if !net_elmore.is_empty() {
+                    println!(
+                        "PORTWIRE_NET {design_name} {port_name:<16} tin {:.3} n {:>4} | dly/elm {} | dly/half_pred {} | max|dly - (s_out-s_in)/2| {:.2e}",
+                        drv_slew,
+                        net_elmore.len(),
+                        format_spread(&net_elmore, 4),
+                        if net_half.is_empty() { "n/a".to_string() } else { format_spread(&net_half, 4) },
+                        net_max_slew_diff,
+                    );
+                }
+            }
+            if !r_elmore.is_empty() {
+                println!(
+                    "PORTWIRE {design_name} n {} | dly/elmore {} | dly/(ln2*elmore) {} | dly/half_pred {} | degrade/elmore {} | max|dly-(s_out-s_in)/2| {:.2e}",
+                    r_elmore.len(),
+                    format_spread(&r_elmore, 4),
+                    format_spread(&r_ln2, 4),
+                    format_spread(&r_half_ramp, 4),
+                    format_spread(&r_degrade, 4),
+                    max_half_slew_diff,
+                );
+            }
+        });
+        assert!(total_rows > 100, "only {total_rows} port-driven sink rows");
     }
 }

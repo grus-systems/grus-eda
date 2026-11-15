@@ -180,3 +180,52 @@ Inputs for ibex and jpeg were generated with `tests/designs/{ibex,jpeg}/generate
 - **Extreme arcs** (`test_dmp_extreme_rows_vs_opensta`, `RD_SCALE` 4.5): where OpenSTA shows no shielding (`ceff/total` 1.0) we are within 2-4%; **where OpenSTA reports strong shielding at a long edge time we do not shield at all**: jpeg `_43767_` A->Y fall (input slew 9.1 ns, total 2.23 pF, Rpi 0.497 kohm, C2 2.12 pF): OpenSTA Ceff 1.196 pF (shield 0.54), delay 17.65 ns, waveform slew 32.0 ns (table slew 10.5); ours Ceff 2.185 pF, delay 31.8 ns (+80%); B->Y fall: Ceff +125%. No `rd` reproduces that Ceff (the zero-error `rd` search hits its lower bound), and clamping the slope's input slew to the table range makes no difference. Physically a 1 ns RC (Rpi x C2) cannot shield a 10-30 ns edge, so this looks like an implementation-specific behaviour of the reference at extreme loads and slews, not something the published method gives. ibex `_10092_` fall (input slew 4-5 ns, shield 0.96): Ceff +2.5 to +3.1%, but the waveform slew is 2.34 against a table slew of 1.66 ns (x1.41).
 - **Port-driven nets are a separate small question**: ibex `rst_ni` (1664 sinks, ideal port, no `set_input_transition`): OpenSTA wire delay is exactly `ln 2 x Elmore` (ratio 1.4427), our slew degrade matches; that one net costs 0.80 ns on all 1655 RESET_B endpoints. aes `ld` and jpeg `rst` (ports with `set_input_transition 0.15`) have a reference delay of about 0.45 and 0.40 of the (1.386-based) Elmore; applying `ln 2 x Elmore` to ports, or the single-pole ramp delay to all nets, helps ibex (placed SPEF mismatching fields 8855 -> 2199) but hurts aes (480 -> 704-849), jpeg (6147 -> 8396-8504) and picorv32 (0 -> 3), so no rule was adopted (the experiments were reverted). Needs per-sink data on port nets (the pin dump has no port arrival; derive it from the SDC input delay).
 - **What this changes**: the DMP question is now narrow and well located: (a) the waveform slew of fall arcs with long input slews (above the 1.5 ns table range), where the reference is 30-40% above the table slew even at mild shielding; (b) extreme loads (above ~1 pF, 3x the table range and more) with long edges, where the reference shields and we do not. The residuals in the table-range regime are small (Ceff within about 3-7%), and the wire model is not involved.
+
+## 10. OpenSTA #582 input-slew sweep and per-sink port wire-delay measurement (2026-11-15, M4)
+
+Two read-only measurement tests were added in `crates/grus-core/src/sta/analysis.rs`: `test_repro_extreme_ceff_sweep_vs_opensta` and `test_port_wire_delay_vs_opensta`. Production STA/DMP behaviour (`RD_SCALE = 4.5`) was unchanged.
+
+### 10a. `repro_extreme_ceff` 7-point input-slew sweep
+
+Inputs: `tests/designs/repro_extreme_ceff/{top.v,top.spef,sweep_reference.txt}` (`sky130_fd_sc_hd__nor2_2`, `A -> Y`, `C1 = 0.114533 pF`, `Rpi = 0.497066 kohm`, `C2 = 2.118645 pF`, total `2.233178 pF`, fixed input slew swept across 7 values `0.05..9.142787 ns`, 14 transition rows).
+
+First check: our NLDM lookup `eval_nldm_delay_or_slew` evaluated at `(tin, refCeff)` matches OpenSTA's `refDly` and `refSlw` within relative tolerance `1e-4` on all 14 rows, confirming NLDM table extrapolation is not the source of divergence.
+
+| `tin` (ns) | `out` | `refCeff` (%tot) | `refDly` (ns) | `refSlw` (ns) | `refWave` (ns) | `RD=4.5` Ceff (%err) / Dly / Slw | `RD=3.0` Ceff (%err) / Dly / Slw | `rdRoot/dSl` |
+|---:|:---:|---:|---:|---:|---:|---|---|---:|
+| 0.0500 | fall | 1.6500 (74%) | 2.6690 | 3.5419 | 4.9852 | 1.8977 (+15.0%) / +14.8% / +15.0% | 1.7316 (+4.9%) / +4.9% / +4.9% | 2.582 |
+| 0.0500 | rise | 2.1215 (95%) | 15.7461 | 21.5308 | 23.0252 | 2.1519 (+1.4%) / +1.4% / +1.4% | 2.1174 (-0.2%) / -0.2% / -0.2% | 3.123 |
+| 0.5000 | fall | 1.4397 (64%) | 2.9306 | 2.5430 | 5.2586 | 1.9541 (+35.7%) / +33.8% / +34.1% | 1.8175 (+26.2%) / +24.9% / +25.1% | 1.577 |
+| 0.5000 | rise | 2.1205 (95%) | 15.8704 | 21.3639 | 22.8936 | 2.1518 (+1.5%) / +1.5% / +1.5% | 2.1171 (-0.2%) / -0.2% / -0.2% | 3.099 |
+| 1.5000 | fall | 1.3812 (62%) | 4.8653 | 3.2727 | 8.3543 | 2.0690 (+49.8%) / +47.6% / +45.7% | 1.9921 (+44.2%) / +42.2% / +40.6% | `<lo_bnd` |
+| 1.5000 | rise | 2.1040 (94%) | 16.4519 | 19.3261 | 21.7610 | 2.1533 (+2.3%) / +2.3% / +2.3% | 2.1194 (+0.7%) / +0.7% / +0.7% | 2.607 |
+| 2.5000 | fall | 1.4273 (64%) | 7.1039 | 4.5358 | 11.4868 | 2.1145 (+48.2%) / +46.4% / +43.9% | 2.0609 (+44.4%) / +42.7% / +40.5% | `<lo_bnd` |
+| 2.5000 | rise | 2.0808 (93%) | 16.9644 | 17.0607 | 20.7055 | 2.1547 (+3.6%) / +3.4% / +3.5% | 2.1216 (+2.0%) / +1.8% / +1.9% | 2.131 |
+| 4.0000 | fall | 1.3473 (60%) | 9.6750 | 5.9621 | 16.2663 | 2.1474 (+59.4%) / +57.3% / +53.4% | 2.1106 (+56.7%) / +54.7% / +50.9% | `<lo_bnd` |
+| 4.0000 | rise | 2.0195 (90%) | 17.5100 | 13.5873 | 19.4964 | 2.1567 (+6.8%) / +6.2% / +6.5% | 2.1246 (+5.2%) / +4.8% / +5.0% | 1.443 |
+| 6.0000 | fall | 1.2118 (54%) | 12.2879 | 7.4379 | 22.3901 | 2.1688 (+79.0%) / +76.2% / +69.8% | 2.1428 (+76.8%) / +74.2% / +67.9% | `<lo_bnd` |
+| 6.0000 | rise | 1.0858 (49%) | 11.1563 | 5.6298 | 19.1057 | 2.1592 (+98.9%) / +79.4% / +81.3% | 2.1283 (+96.0%) / +77.2% / +79.0% | `<lo_bnd` |
+| 9.1428 | fall | 1.1964 (54%) | 17.6500 | 10.4859 | 32.0191 | 2.1851 (+82.6%) / +80.0% / +72.5% | 2.1673 (+81.2%) / +78.5% / +71.2% | `<lo_bnd` |
+| 9.1428 | rise | 2.2332 (100%) | 22.8681 | 3.5528 | 3.5528 | 2.1628 (-3.2%) / -2.7% / -1.8% | 2.1337 (-4.5%) / -3.8% / -2.5% | `>hi_bnd` |
+
+Observations:
+- On `fall`, as `tin` rises from `0.05` to `9.1428 ns`, OpenSTA's `refCeff` drops from `74%` (`1.6500 pF`) to `54%` (`1.1964 pF`); for `tin >= 1.5 ns`, the inverse-`rd` bisection hits its lower bound (`rd_root < 1.05e-3`, `<lo_bnd`). Meanwhile our `solve_dmp` moves `Ceff` upward toward the total capacitance (`1.8977 -> 2.1851 pF` at `RD_SCALE = 4.5`, `1.7316 -> 2.1673 pF` at `3.0`) because slower edges shield less across the ~1 ns pi filter. Note also that even at `tin = 0.05` and `0.50 ns` (both inside the 1.5 ns Liberty table range, though load is ~7x the table cap range), OpenSTA reports `refWave` (`4.9852`, `5.2586`) well above `refSlw` (`3.5419`, `2.5430`).
+- On `rise`, `refCeff` stays at `95%..90%` across `tin = 0.05..4.0 ns` (where `RD = 3.0` is within `-0.2%..+5.2%` and `RD = 4.5` is within `+1.4%..+6.8%`), drops discontinuously at `tin = 6.0 ns` to `1.0858 pF` (`49%`, `<lo_bnd`), and then snaps to `2.2332 pF` (`100%`, `>hi_bnd`, with `refWave == refSlw == 3.5528 ns`) at `tin = 9.1428 ns`, where extrapolated `rise_transition` table slew falls from `21.5308 ns` at `0.05 ns` down to `3.5528 ns` at `9.1428 ns`.
+
+### 10b. Per-sink port-driven wire delay and sink slew (`test_port_wire_delay_vs_opensta`)
+
+Compared OpenSTA's per-sink wire arrival (minus SDC `input_clock_latency_ns + input_delay_ns`) and sink slew from `collect_pins.sh` across all non-clock primary input port nets with `elmore > 1e-7 ns` (12,574 rise/fall sink observations across 4 designs):
+
+| Design | `n` | `dly / elmore` (p10 / med / p90) | `dly / (ln2 * elmore)` (p10 / med / p90) | `dly / half_pred` (p10 / med / p90) | `degrade / elmore` (p10 / med / p90) | `max \|dly - (s_out - s_in)/2\|` (ns) |
+|---|---:|---|---|---|---|---:|
+| `aes` (`tin = 0.150`) | 1040 | 0.6915 / 0.6931 / 0.6949 | 0.9977 / 1.0000 / 1.0025 | 1.4631 / 35.0192 / 3865.2683 | 1.8493 / 7.2931 / 86.2272 | `5.26e-7` |
+| `picorv32` (`tin = 0.150`) | 424 | 0.6929 / 0.6931 / 0.6934 | 0.9997 / 1.0000 / 1.0003 | 1.9023 / 5.2581 / 377.5166 | 2.1372 / 3.4136 / 26.9708 | `5.03e-7` |
+| `ibex` (`tin = 0.000`) | 4228 | 0.6929 / 0.6931 / 0.6931 | 0.9996 / 1.0000 / 1.0000 | 0.9996 / 1.0000 / 1.0000 | 1.3863 / 1.3863 / 1.3863 | `1.17e-6` |
+| `jpeg` (`tin = 0.150`) | 6882 | 0.6931 / 0.6931 / 0.6931 | 1.0000 / 1.0000 / 1.0000 | 1.0174 / 1.0287 / 1.0547 | 1.4100 / 1.4249 / 1.4583 | `1.00e-6` |
+
+(Here `half_pred = 0.5 * (hypot(s_in, ln(4) * Elmore) - s_in)` and `degrade = sqrt(max(0, s_out^2 - s_in^2))`.)
+
+Findings:
+- **Exact port-driven wire rule across all 4 designs (both `tin = 0` and `tin = 0.150 ns`)**: OpenSTA computes primary-input port-driven wire delay as `dly = ln(2) * Elmore` (median `dly / (ln2 * elmore) = 1.0000` on every design, including `aes ld` `0.6931`, `ibex rst_ni` `0.6931`, `jpeg ena` `0.6931`, `jpeg rst` `0.6931`) and adds wire slew **linearly**, `s_out = s_in + 2 * dly = s_in + ln(4) * Elmore` (`max |dly - (s_out - s_in)/2| <= 1.17e-6 ns`, at the `collect_pins.sh` 6-decimal formatting floor).
+- **Correction to Section 9**: Section 9 noted `0.45` and `0.40` of Elmore on `aes ld` and `jpeg rst` because that earlier check inferred Elmore from `degrade = sqrt(s_out^2 - s_in^2) / 1.386` (assuming quadratic slew addition) rather than direct Elmore. Because OpenSTA adds slew linearly on port nets, `degrade / elmore` inflates when `s_in > 0` (`tin = 0.150 ns`), explaining both the `0.40..0.45` illusion on `aes ld` / `jpeg rst` and why the earlier experiment of changing `dly` alone without changing port sink slew from quadratic to linear hurt `aes` and `jpeg`. Both rules belong together exclusively on primary-input port-driven nets (`pin_cells[drv].is_none()`), leaving cell-driven nets unchanged (`dly = Elmore`, `s_out = hypot(s_in, ln(4) * Elmore)`).
+

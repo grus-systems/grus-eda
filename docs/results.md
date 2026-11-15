@@ -698,3 +698,18 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
 - **New fact from the sweep** (`sweep_reference.txt`, same load, input slew 0.05 to 9.14 ns): Ceff falls from 1.650 pF (74% of the 2.233 pF total) to 1.196 pF (54%) as the input slew grows, i.e. a slower edge is shielded more, opposite to what a ~1 ns RC (Rpi x C2) should give; delay 2.67 to 17.65 ns, table slew 3.54 to 10.49 ns, waveform slew 4.99 to 32.02 ns.
 - **Posted** (on the user's instruction, from the user's GitHub account): https://github.com/parallaxsw/OpenSTA/issues/582, with the reproducer inline and the questions "is this intended outside the Liberty range, and which quantities are meaningful there". No private information in the text. Not tried on OpenSTA master.
 
+### 2026-11-15 — E3.5: solver comparison on the OpenSTA #582 input-slew sweep and per-sink port wire-delay measurement
+
+- **What was run** (`docs/design/e35/01-rd-and-wave-slew.md`, Section 10; production STA/DMP behaviour unchanged):
+  - `cargo test --release -p grus-core test_repro_extreme_ceff_sweep_vs_opensta -- --nocapture` (passed, 14 rows in 0.23 s).
+  - `cargo test --release -p grus-core test_port_wire_delay_vs_opensta -- --nocapture` (passed, 12,574 sink observations in 1.09 s).
+  - `cargo test --release -p grus-core test_wire_delay_vs_elmore` (passed in 1.22 s) and `cargo clippy --all-targets -- -D warnings` (passed).
+  - `cargo test --release` (full suite: `153 passed; 0 failed; 10 ignored` in 43.05 s).
+- **Sweep comparison (`repro_extreme_ceff`, `nor2_2` A->Y, total 2.2332 pF, `tin = 0.05..9.1428 ns`)**:
+  - `eval_nldm_delay_or_slew` at `(tin, refCeff)` matches OpenSTA's `Delay` and `Slew` within `< 1e-4` relative tolerance on all 14 rows.
+  - `fall`: OpenSTA `refCeff` falls from `1.6500 pF` (`74%`) at `0.05 ns` to `1.1964 pF` (`54%`) at `9.1428 ns` (`rd_root < 1.05e-3` for `tin >= 1.5 ns`), whereas `solve_dmp` moves upward toward total load (`1.8977..2.1851 pF` at `RD_SCALE = 4.5`; `1.7316..2.1673 pF` at `3.0`).
+  - `rise`: OpenSTA `refCeff` stays `95%..90%` for `tin = 0.05..4.0 ns` (`RD = 3.0` within `-0.2%..+5.2%`), drops discontinuously to `1.0858 pF` (`49%`) at `6.0 ns`, and snaps to `2.2332 pF` (`100%`, `refWave == refSlw == 3.5528 ns`) at `9.1428 ns` where extrapolated `rise_transition` table slew falls to `3.5528 ns`.
+- **Per-sink port wire-delay measurement (`aes` n=1040, `picorv32` n=424, `ibex` n=4228, `jpeg` n=6882)**:
+  - Across all 4 designs (`tin = 0` and `0.150 ns`), OpenSTA uses `dly = ln(2) * Elmore` (median `dly / (ln2 * elmore) = 1.0000` on every design; p10..p90 `0.9977..1.0025` on `aes`, `0.9997..1.0003` on `picorv32`, `0.9996..1.0000` on `ibex`, `1.0000..1.0000` on `jpeg`) and linear slew addition `s_out = s_in + 2 * dly = s_in + ln(4) * Elmore` (`max |dly - (s_out - s_in)/2|` = `5.26e-7`, `5.03e-7`, `1.17e-6`, `1.00e-6 ns`). This resolves Section 9's `0.45`/`0.40` discrepancy on `aes`/`jpeg`, which had inferred Elmore from quadratic slew degradation rather than comparing directly against Elmore.
+
+
