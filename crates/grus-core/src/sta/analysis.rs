@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 pub const RISE: usize = 0;
 pub const FALL: usize = 1;
 
-/// ln(0.8 / 0.2): a single-pole RC rises from the 20% to the 80% threshold in ln(4) time constants.
 /// Converts the table's delay-vs-load slope into the driver resistance of the DMP ramp model.
-/// Fitted against OpenSTA `report_dcalc` effective capacitances (see docs/results.md).
+/// Fitted, not derived: a compromise that makes the picorv32 endpoints match. The scale that reproduces OpenSTA's
+/// `report_dcalc` effective capacitance is about 3 (docs/design/e35), and the single-pole value 1/ln 2 is much worse.
 const RD_SCALE: f64 = 4.5;
 
 const WIRE_SLEW_FACTOR: f32 = std::f32::consts::LN_2 * 2.0;
