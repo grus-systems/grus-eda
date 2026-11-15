@@ -1,6 +1,6 @@
 # E3: Static Timing Analysis (STA) — Implementation Spec
 
-This document breaks E3 into implementation steps `E3.1`–`E3.3` (done) and open tasks `E3.4`–`E3.6` (Section 5), with the data structures, NLDM extrapolation code, and RC and driver-model equations an implementing agent needs. Section 4 is the current status; Section 6 says how to generate the test inputs.
+This document breaks E3 into implementation steps `E3.1`–`E3.3` (done) and the Section 5 tasks `E3.4` (closed 2026-11-15), `E3.5` (open, narrowed) and `E3.6` (done), with the data structures, NLDM extrapolation code, and RC and driver-model equations an implementing agent needs. Section 4 is the current status; Section 6 says how to generate the test inputs.
 
 > `docs/status.md` is the cross-stage status source (E0–E3). Section 4 below keeps the per-test E3 breakdown.
 
@@ -330,7 +330,7 @@ Done criterion for every E3 step: worst slack, and arrival and required time of 
 | gcd SPEF | pass | slew 3% |
 | gcd placement RC | pass | arrival 2%, slew 5% (Steiner, E3.4) |
 | picorv32 SPEF | pass | arrival floor 6 ps, setup slack 40 ps, slew 10%, TNS 2% (E3.5) |
-| picorv32 placement RC | `#[ignore]`, fails | arrival 9% off (OpenROAD's tree is not the shortest one, E3.4) |
+| picorv32 placement RC | `#[ignore]`, fails | arrival 9% off (E3.4 closed 2026-11-15: OpenROAD's tree is FLUTE's and tree choice is not the cause at gcd scale; the picorv32 gap belongs to the narrowed E3.5 scale question) |
 | Steiner length vs OpenROAD SPEF (gcd, picorv32) | pass | 2- and 3-point nets match exactly; the optimal tree is never longer than OpenROAD's (asserted) |
 | DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` 6% (one arc is 5.5% high) |
 
@@ -340,37 +340,47 @@ Each task is independent. Rules that apply to all: AGENTS.md Section 2 (a stage 
 reference tool), write the rule in `docs/` before the code, record every comparison (including failures) in
 `docs/results.md`, and prove each new test can fail by breaking the code on purpose.
 
-### E3.4: Find out which Steiner tree OpenROAD builds, and reproduce it (first part done: measurement and exact solver, merged 2026-11-10) (`congestion/rsmt.rs`, `sta/parasitics.rs`)
-- **Why**: picorv32 placement RC is 9% off in arrival and gcd placement RC needs a 2% arrival tolerance, because
-  nets of four or more pins have a different tree than OpenROAD's.
-- **What is known (2026-11-10, `docs/results.md`, E3.4 entry)**: OpenROAD's tree is **not** the minimum-length tree.
-  An exact solver (`build_precise_rsmt_points`, optimal up to 9 points) is never longer than OpenROAD's tree and is
-  shorter on most nets of 4-9 points, so "FLUTE, optimal up to 9 pins" is not what `estimate_parasitics -placement`
-  uses. Two-point and three-point nets match exactly. Hypothesis (unmeasured): a timing-driven tree that trades wire
-  length for source-to-sink path length (Prim-Dijkstra style, with the net driver as the root).
-- **Reference**: the per-net SPEF (`*routed.spef`) holds the exact tree: nodes in `*CAP`, segments in `*RES`
-  (segment length = `R / r0`). Rebuild each net's tree from it and study it: is every sink's path a shortest path from
-  the driver? Is the length between the minimum and the MST length? Where are the Steiner points? Run
-  `cargo test --release -p grus-core test_steiner_length -- --nocapture` for the per-degree match table.
-- **Approach**: from the measurements, form a hypothesis about the tree-building rule, implement it from the published
-  paper (for Prim-Dijkstra: Alpert et al. 1995 and "Prim-Dijkstra Revisited", 2018), and test it on every net of
-  gcd and picorv32. Do **not** read OpenROAD or OpenSTA source (GPL) and do not copy lookup tables. The exact solver
-  is kept as a building block; it must not change E1 (E1's ranking test fails with it).
-- **Done when**: tree length equals OpenROAD's on at least 99% of the nets of up to 9 points on gcd and picorv32 and
-  the rule is written here; the picorv32 placement-RC test passes with arrival `max(5 ps, 1%)` (remove its
-  `#[ignore]`) and the gcd placement-RC arrival tolerance returns to 1%. If the rule cannot be found, record the
-  evidence and stop: SPEF mode (OpenROAD's own tree) already reproduces OpenROAD's results.
+### E3.4: Which Steiner tree OpenROAD builds — CLOSED 2026-11-15 (step 6, ticket 15)
+- **Outcome**: our placement estimator is the same construction as OpenROAD's and scores the same against routed
+  truth; the remaining placement-RC error is the placement-estimation abstraction itself, not the tree. Closed on
+  the done criterion's evidence branch ("record the evidence and stop"), with the rule now known as well.
+- **The rule (read 2026-11-15)**: OpenROAD is BSD 3-Clause, and with the user's permission the maintainer read the
+  estimator in the pinned source (rev `e794373`, `src/rsz/src/EstimateWireParasitics.cc`). Per net it builds a
+  FLUTE Steiner tree rooted at the driver (`stt` builder), makes each branch a pi model (capacitance split
+  half/half between the branch ends, 1 mOhm links for zero-length branches and pin connections), and prices length
+  with a single per-corner scalar resistance/capacitance pair set by the flow — in our generation scripts
+  `set_wire_rc -layer met2`, the same layer our estimator reads (`WireRc::from_layer(.., "met2")`) — weighted by
+  each branch's horizontal/vertical extent. Our shipped estimator differs only in the tree builder (the exact RSMT
+  solver instead of FLUTE) and in applying the one pair without the directional split. OpenSTA source (GPL) was
+  not read; see the licensing note in `AGENTS.md` Section 3b.
+- **Scoring (gcd, 53 endpoints, max path; ticket 15)**: median |arrival error| against OpenSTA on the routed
+  (OpenRCX) parasitics — OpenROAD's own placement estimate (golden against golden) 149.9 ps (p95 313.2, max 360.2;
+  WNS error +91.1 ps); ours, exact tree (shipped) 156.4 ps; ours, greedy tree 155.1 ps; ours on OpenROAD's placed
+  SPEF 150.3 ps. Every configuration fails the strict `max(5 ps, 1%)` criterion against routed truth on 53 of 53
+  endpoints: at gcd arrival magnitudes (~2.5-2.7 ns) the criterion is ~27 ps, an order of magnitude below the
+  estimator-vs-routed gap, so no placement estimator meets it — including the reference tool's own. Tree choice
+  moves the median by less than 5 ps, so per-net tree-length equality is not pursued. The gcd placement-RC test
+  keeps comparing against the placed golden (estimator agreement), where it passes.
+- **Earlier framing corrected**: the 2026-11-10 entry concluded "not FLUTE" from tree *length* comparisons.
+  OpenROAD's tree is FLUTE's; length was the wrong lens (FLUTE's tree is not length-minimal either — the exact
+  solver is never longer and is shorter on most 4-9 point nets). The Prim-Dijkstra hypothesis is dead. The shipped
+  placement estimate has used the exact solver since `c81a428`; the greedy builder (`build_rsmt_points`) is E1's
+  tree, not STA's, and the two score within 1.3 ps of each other here.
 
-### E3.5: A derived driver model (`sta/dmp.rs`)
-- **Why**: `RD_SCALE` is fitted. One value fits arrival (about 4.5-5) but not `Ceff` (about 3), and OpenSTA's
-  driver waveform slew is missing. This is what forces the loosened picorv32 SPEF tolerances.
-- **Reference**: `report_dcalc -from <in> -to <out> -max -digits 6` prints the pi model, `Ceff`, `Delay`, `Slew`
-  and `Driver waveform slew` per arc. Collect a table of at least 30 arcs on picorv32 (several cells, both
-  transitions, shielded and unshielded). Run it through `target/probe`-style Tcl in the LibreLane container.
-- **Approach**: find a principled `Rd` and a waveform-slew rule that reproduce the table, from the DMP paper
-  and the measurements. The fit currently cannot reproduce the table slew with a physical ramp for large `Rd`
-  (step-response slew `1.39 Rd C` exceeds the table slew), which suggests the model structure, not the constant,
-  needs revisiting. Do **not** read OpenSTA's `DmpCeff` source (GPL).
+### E3.5: A derived driver model (`sta/dmp.rs`) — OPEN, narrowed 2026-11-15 (step 6, ticket 15)
+- **What the routed SPEF settled**: on identical parasitics our delay engine agrees with OpenSTA far inside the
+  strict criterion. gcd residuals (ticket 15): routed SPEF median |arrival error| 1.18 ps (p95 2.83, max 8.56);
+  placed SPEF 0.92 ps (p95 2.21, max 7.00); zero fields outside `max(5 ps, 1%)` in both modes. At gcd scale the
+  fitted `RD_SCALE` produces no measurable error, so the step-4 wire-mode failures on aes/jpeg/ibex are not
+  explained by the DMP constant alone.
+- **Still open**: the `report_dcalc` table on picorv32 (at least 30 arcs, several cells, both transitions,
+  shielded and unshielded; `report_dcalc -from <in> -to <out> -max -digits 6` prints the pi model, `Ceff`,
+  `Delay`, `Slew` and `Driver waveform slew` per arc) has not been collected, and `RD_SCALE` is still fitted, not
+  derived — one value fits arrival (about 4.5-5) but not `Ceff` (about 3), and its doc comment misdescribes the
+  value (the F4 item in `docs/review-2026-11-11.md`). The open question is now the scale question: why the
+  wire-mode error grows by one to two orders of magnitude from gcd to aes/jpeg/ibex. The named next measurement
+  is a routed SPEF for picorv32 (the ticket-13 pattern), which separates estimator error from engine error at
+  that scale. OpenSTA's `DmpCeff` source (GPL) must not be read; work from the DMP paper and the measurements.
 - **Done when**: `Ceff` within 2% and driver slew within 2% of `report_dcalc` on all collected arcs; picorv32
   SPEF passes with the plain criterion (slack 5 ps, slew 1%, TNS 1%); `RD_SCALE` is gone or derived.
 
@@ -388,8 +398,8 @@ reference tool), write the rule in `docs/` before the code, record every compari
   suite green (58 passed). Entry: `docs/results.md`, 2026-11-13.
 
 ### Not scheduled
-- Coupling capacitors, resistor loops and `*NAME_MAP` are implemented but **untested against OpenSTA**: the SPEFs
-  here are placement estimates. Needs a routed SPEF (for example from OpenROAD global/detailed routing on gcd).
+- Resistor loops are implemented but **untested against OpenSTA**. Coupling capacitors and `*NAME_MAP` were in
+  this state until step 6: both are now verified on the gcd routed SPEF (tickets 13-14).
 - `set_clock_uncertainty` is applied to register checks only, not output ports (gcd and picorv32 do not use it).
 - Latches are skipped with a warning (out of E3 scope).
 
