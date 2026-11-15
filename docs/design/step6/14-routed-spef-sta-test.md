@@ -108,3 +108,58 @@ STA comparison still cannot run in your worktree; the maintainer
 re-runs `test_gcd_routed_spef_matches_opensta` on Intel after your fix
 and reports the failure table back if the numbers then miss. Do not
 widen tolerances.
+
+## Round 3 — maintainer feedback (2026-11-15)
+
+Round 2 landed the parse fix; the maintainer's Intel measurement then
+produced the failure table this ticket asked for, and a model
+experiment that identifies the defect. **The round-2 change set is
+still not in HEAD** (same holding pattern as round 1: `dev` never
+carries a knowingly-red test). Recreate it exactly (job
+`20261114-152316-14-routed-spef-sta-test-7b2e`: `Rc::RoutedSpef` + the
+test, the NAME_MAP boundary fix, the three spef.rs unit tests, the
+e3-sta.md NAME_MAP note, version 0.1.38), then add the coupling fix
+below.
+
+**Failure table (round-2 code, Intel, `Tol::GCD_SPEF`)**: 156 failing
+fields over 50 of 53 endpoints; `max_arr` low in 39 of 40 cases
+(median -57 ps, worst `_395_/D` -146 ps); `min_arr` 43 fields;
+slew only 4 fields. Per-net analysis: failing endpoints' nets carry a
+median 45% of their capacitance as coupling caps; the three passing
+endpoints' nets have no second-node coupling at all. OpenSTA path
+detail for `_395_/D` shows wire delays near zero and the error
+concentrated in cell delays, i.e. in the load (Ceff) each driver sees.
+
+**Model experiment (maintainer, Intel, same test)**: a coupling cap
+`(a, b, v)` is listed once, in `a`'s net section. Four treatments of
+`b`'s side were measured: (1) round-2 rule, ground `v` at `a` only:
+156 failing fields. (2) ground `v` at `a` and `v` at `b` in `b`'s net:
+158 failing, overshooting almost symmetrically (`_395_/D` +141 ps).
+(3) split `v/2` at both: 76 failing, min side nearly clean, max side
+still low. (4) **ground `v` at `a` (unchanged) and `v/2` at `b` in
+`b`'s owning net: the test passes — 0 failing fields.** A control with
+`*CONN`-based ownership at full credit reproduced (2) bit-for-bit, so
+the 1/2 is a real factor, not a coverage gap: every second node in gcd
+is already owned via resistor endpoints or cap first-nodes.
+
+**Implement exactly the measured rule** in `parse_spef`
+(`crates/grus-core/src/readers/spef.rs`): during the parse, record
+every 4-field `*CAP` entry's second node and value. After all nets are
+parsed, build node ownership: resistor endpoints first (file order,
+first wins), then cap first-nodes. For each coupling cap, if the
+second node has an owner, push an extra ground cap `(second node,
+v/2)` into the owning net's `caps` — including when the owner is the
+listing net itself. If the second node has no owner, credit nothing
+(the existing sample test's `*1:2` node is such a case; its
+expectations do not change). Do not change `total_cap_pf` (the header
+value stays ground + first-node coupling). Keep all F6 strictness.
+
+Tests to add: a synthetic two-net SPEF where net B's resistor endpoint
+is net A's coupling second node — assert B gains a ground cap of `v/2`
+at that node and A keeps `v` at the first node; the round-2 gcd parse
+test (269 nets) must still pass. Update `docs/e3-sta.md` section 3
+Stage 1 item 2: the coupling sentence now states the measured rule
+(full value grounded on the first node, half value grounded on the
+second node in its owning net; measured against OpenSTA on the gcd
+routed SPEF, ticket 14). The maintainer re-runs the full suite on
+Intel for acceptance, including the mutation check.
