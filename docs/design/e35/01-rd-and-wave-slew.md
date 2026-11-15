@@ -229,3 +229,25 @@ Findings:
 - **Exact port-driven wire rule across all 4 designs (both `tin = 0` and `tin = 0.150 ns`)**: OpenSTA computes primary-input port-driven wire delay as `dly = ln(2) * Elmore` (median `dly / (ln2 * elmore) = 1.0000` on every design, including `aes ld` `0.6931`, `ibex rst_ni` `0.6931`, `jpeg ena` `0.6931`, `jpeg rst` `0.6931`) and adds wire slew **linearly**, `s_out = s_in + 2 * dly = s_in + ln(4) * Elmore` (`max |dly - (s_out - s_in)/2| <= 1.17e-6 ns`, at the `collect_pins.sh` 6-decimal formatting floor).
 - **Correction to Section 9**: Section 9 noted `0.45` and `0.40` of Elmore on `aes ld` and `jpeg rst` because that earlier check inferred Elmore from `degrade = sqrt(s_out^2 - s_in^2) / 1.386` (assuming quadratic slew addition) rather than direct Elmore. Because OpenSTA adds slew linearly on port nets, `degrade / elmore` inflates when `s_in > 0` (`tin = 0.150 ns`), explaining both the `0.40..0.45` illusion on `aes ld` / `jpeg rst` and why the earlier experiment of changing `dly` alone without changing port sink slew from quadratic to linear hurt `aes` and `jpeg`. Both rules belong together exclusively on primary-input port-driven nets (`pin_cells[drv].is_none()`), leaving cell-driven nets unchanged (`dly = Elmore`, `s_out = hypot(s_in, ln(4) * Elmore)`).
 
+Implementation & verification (`v0.1.44`, `run_sta_with_state` updated; documented in `docs/e3-sta.md` Step E3.2 item 6):
+- **Assertion & intentional-failure check (`test_port_wire_delay_vs_opensta`)**: added `run_sta_with_state` pin-state assertions across all 4 designs (`sta_dly_med < 0.002`, `sta_dly_p90 < 0.01`, `sta_slw_med < 0.002`, `sta_slw_p90 < 0.005`; `1.0%` p90 delay threshold accommodates 6-decimal `collect_pins.sh` arrival rounding and `f32` arrival subtraction on `aes`'s 520 sub-0.1 ps 1-sink port wires). With a temporary `let is_port = false;`, the test fails loudly on `aes` (`sta dly err med 0.44270 p90 0.44590 | sta slew err med 0.12424 p90 0.27621`). With `is_port = design.pin_cells[p].is_none()`, all 4 designs pass:
+  - `aes` (`n = 1040`): `sta dly err med 0.00001 p90 0.00606`, `sta slew err med 0.00000 p90 0.00000`
+  - `picorv32` (`n = 424`): `sta dly err med 0.00001 p90 0.00065`, `sta slew err med 0.00000 p90 0.00000`
+  - `ibex` (`n = 4228`): `sta dly err med 0.00000 p90 0.00046`, `sta slew err med 0.00000 p90 0.00019`
+  - `jpeg` (`n = 6882`): `sta dly err med 0.00000 p90 0.00000`, `sta slew err med 0.00000 p90 0.00000`
+- **Stage-0 port path errors** (`test_path_stages_vs_opensta`):
+  - `ibex rst_ni -> _20763_/RESET_B`: arr `+0.8028 -> +0.0000 ns`, slew `+0.0000 -> +0.0000 ns`
+  - `aes ld -> _08219_/A` (`paths_from_inputs_placed.txt`): arr `-0.0000 ns`, slew `+0.0000 ns`
+  - `jpeg rst -> _84822_/SET_B`: arr `+0.0331 -> -0.0000 ns`, slew `-0.0877 -> -0.0000 ns`
+  - `jpeg ena -> _42236_/A`: arr `+1.0126 -> +0.0000 ns`, slew `-0.1475 -> +0.0000 ns`
+- **Endpoint mismatch counts (`before -> old delay-only -> delay + linear slew`)**:
+  - `gcd` (all 4 modes): `0 -> 0 -> 0` (pass)
+  - `picorv32 placed_spef`: `0 -> 3 -> 0` (pass)
+  - `picorv32 routed_spef`: `136 -> 143 -> 135` (`wns_max -3.233 vs -3.148 ns`)
+  - `aes placed_spef`: `480 -> 849 -> 252` (`-47.5%`; `wns -4.426 vs -4.524`, `tns -586.84 vs -596.79`)
+  - `aes placement_rc`: `1,048` mismatches (`wns -4.322 vs -4.524`, `tns -583.21 vs -596.79`)
+  - `ibex placed_spef`: `8,855 -> 2,199 -> 2,199` (`-75.2%`; `wns -14.202 vs -14.417`, `tns -20,917.54 vs -21,281.98`)
+  - `ibex placement_rc`: `14,257 -> - -> 14,127` (`wns -14.064 vs -14.417`, `tns -23,831.21 vs -21,281.88`)
+  - `jpeg placed_spef`: `6,145 -> 8,396 -> 7,045` (WNS improved `-76.7 -> -72.010 ns` vs `-61.199 ns`, `tns -129,367.24 vs -123,077.59`). Removing the `+1.0126 ns` overestimate on port `ena -> _42236_/A` stops cancelling `_42236_/Y`'s `-0.6476 ns` DMP underestimate (`2,148` fanout), unmasking `2,096` negative `max_arr_ns` mismatches (`median -0.6570 ns`).
+  - `jpeg placement_rc`: `15,160 -> - -> 14,750` (`wns -337.93 vs -61.20`, `tns -447,161.97 vs -123,077.61`)
+

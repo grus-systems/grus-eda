@@ -546,16 +546,25 @@ fn run_sta_with_state(
                 continue;
             }
             let wire = cx.wire_delays(net);
+            let is_port = design.pin_cells[p].is_none();
             for (i, &sink) in design.net_pins(net).iter().enumerate().skip(1) {
                 let mut sink_state = driver_state;
                 if let Some(wire) = &wire {
                     for pol in [RISE, FALL] {
-                        let delay = wire[pol][i];
-                        sink_state.arrival_max[pol] += delay;
-                        sink_state.arrival_min[pol] += delay;
-                        let degrade = WIRE_SLEW_FACTOR * delay;
-                        sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
-                        sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
+                        let elmore = wire[pol][i];
+                        let degrade = WIRE_SLEW_FACTOR * elmore;
+                        if is_port {
+                            let delay = std::f32::consts::LN_2 * elmore;
+                            sink_state.arrival_max[pol] += delay;
+                            sink_state.arrival_min[pol] += delay;
+                            sink_state.slew_max[pol] = driver_state.slew_max[pol] + degrade;
+                            sink_state.slew_min[pol] = driver_state.slew_min[pol] + degrade;
+                        } else {
+                            sink_state.arrival_max[pol] += elmore;
+                            sink_state.arrival_min[pol] += elmore;
+                            sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
+                            sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
+                        }
                     }
                 }
                 state[sink.0 as usize] = sink_state;
@@ -805,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failing: 136 fields at Tol::PICORV32_SPEF against the routed golden; see docs/results.md step 7"]
+    #[ignore = "known failing: 135 fields at Tol::PICORV32_SPEF against the routed golden; see docs/results.md"]
     fn test_picorv32_routed_spef_matches_opensta() {
         compare_design_with_opensta("picorv32", "routed_spef", Rc::RoutedSpef, Tol::PICORV32_SPEF);
     }
@@ -845,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "systematic wire-delay bias on aes SPEF (arrivals ~2% low, slews ~11% low); measured table in docs/results.md, revisit at review step 6"]
+    #[ignore = "252 failing fields on aes SPEF after port rule (fall waveform slew on _08249_/Y); measured table in docs/results.md, revisit at E3.5"]
     fn test_aes_placed_spef_matches_opensta() {
         compare_design_with_opensta("aes", "placed_spef", Rc::Spef, Tol::AES_SPEF);
     }
@@ -855,19 +864,19 @@ mod tests {
         compare_design_with_opensta("jpeg", "zero_wire", Rc::None, Tol::STRICT);
     }
 
-    /// Ignored: placement RC overestimates wire delay badly at jpeg scale (WNS ours -338.2
-    /// vs ref -61.2 ns; 15,160 failing fields over 4,435 of 4,467 endpoints). See
-    /// docs/results.md (step 4 part 2). The fitted wire model (E3.5) is revisited at review
-    /// step 6; thresholds are not fitted.
+    /// Ignored: placement RC overestimates wire delay badly at jpeg scale (WNS ours -337.9
+    /// vs ref -61.2 ns; 14,750 failing fields after port rule). See
+    /// docs/results.md. The fitted wire model (E3.5) is revisited in E3.5;
+    /// thresholds are not fitted.
     #[test]
     #[ignore]
     fn test_jpeg_placement_rc_matches_opensta() {
         compare_design_with_opensta("jpeg", "placement_rc", Rc::Placement, Tol::JPEG_PLACEMENT);
     }
 
-    /// Ignored: SPEF mode is closer (WNS ours -76.7 vs ref -61.2 ns) but still fails on 2,585
-    /// endpoints (6,145 fields); the DMP cell-delay model (E3.5) degrades with path depth at
-    /// jpeg scale. See docs/results.md (step 4 part 2). Same sunset as placement RC.
+    /// Ignored: SPEF mode is closer (WNS ours -72.0 vs ref -61.2 ns) but still fails 7,045 fields
+    /// (fixing port `ena` unmasks `_42236_/Y`'s -0.65 ns DMP error, alongside extreme-arc `_43767_`).
+    /// See docs/results.md. Same sunset as placement RC.
     #[test]
     #[ignore]
     fn test_jpeg_placed_spef_matches_opensta() {
@@ -883,22 +892,20 @@ mod tests {
         compare_design_with_opensta("ibex", "zero_wire", Rc::None, Tol::STRICT);
     }
 
-    /// Ignored: placement RC fails broadly at ibex scale (14,257 failing fields over 2,604 of
-    /// 3,702 endpoints; WNS ours -14.064 vs ref -14.417 ns, TNS -26,802 vs -21,282 ns). All 1,655
-    /// RESET_B and 9 SET_B async pins fail: the placement-RC slew at the reset pins is far over
-    /// the golden (e.g. 8.13 vs 2.92 ns), which also inflates the NLDM recovery time and so the
-    /// required times. Same fitted-model root cause as aes/jpeg; see docs/results.md (step 4
-    /// part 3). Sunset: review step 6; thresholds are not fitted.
+    /// Ignored: placement RC fails broadly at ibex scale (14,127 failing fields;
+    /// WNS ours -14.064 vs ref -14.417 ns, TNS -23,831 vs -21,282 ns after port rule). Same
+    /// fitted-model root cause as aes/jpeg; see docs/results.md.
+    /// Sunset: E3.5; thresholds are not fitted.
     #[test]
     #[ignore]
     fn test_ibex_placement_rc_matches_opensta() {
         compare_design_with_opensta("ibex", "placement_rc", Rc::Placement, Tol::IBEX_PLACEMENT);
     }
 
-    /// Ignored: SPEF mode fails broadly (8,855 failing fields over 3,479 of 3,702 endpoints;
-    /// WNS ours -14.202 vs ref -14.417 ns, TNS -20,918 vs -21,282 ns). Same fitted DMP-model
-    /// root cause as jpeg SPEF; see docs/results.md (step 4 part 3). The two clock-gate
-    /// endpoints pass in both wire modes. Sunset: review step 6; thresholds are not fitted.
+    /// Ignored: SPEF mode fails 2,199 fields after port `rst_ni` fix (down from 8,855;
+    /// WNS ours -14.202 vs ref -14.417 ns, TNS -20,918 vs -21,282 ns). Same DMP-model
+    /// root cause as aes/jpeg SPEF; see docs/results.md. The two clock-gate
+    /// endpoints pass in both wire modes. Sunset: E3.5; thresholds are not fitted.
     #[test]
     #[ignore]
     fn test_ibex_placed_spef_matches_opensta() {
@@ -1385,6 +1392,7 @@ mod tests {
     #[test]
     fn test_path_stages_vs_opensta_aes_placed() {
         compare_path_stages("aes", "aes.placed.def", "aes.routed.spef", "paths_placed.txt");
+        compare_path_stages("aes", "aes.placed.def", "aes.routed.spef", "paths_from_inputs_placed.txt");
     }
 
     /// Same comparison on ibex and jpeg with their placement-estimate SPEFs.
@@ -1396,6 +1404,7 @@ mod tests {
     #[test]
     fn test_path_stages_vs_opensta_jpeg_placed() {
         compare_path_stages("jpeg", "jpeg.placed.def", "jpeg.routed.spef", "paths_placed.txt");
+        compare_path_stages("jpeg", "jpeg.placed.def", "jpeg.routed.spef", "paths_from_inputs_placed.txt");
     }
 
     fn compare_path_stages(design_name: &str, def_file: &str, spef_file: &str, paths_file: &str) {
@@ -2192,18 +2201,21 @@ mod tests {
         }
     }
 
-    /// Measurement (E3.5 port-driven nets): compares OpenSTA's per-sink wire delay and sink slew
-    /// (from `collect_pins.sh`, minus SDC `input_clock_latency_ns + input_delay_ns`) against Elmore,
-    /// `ln(2)*Elmore`, and `0.5 * (hypot(drv_slew, ln(4)*Elmore) - drv_slew)`.
+    /// Verifies OpenSTA's primary-input port-driven wire delay (`ln(2) * Elmore`) and linear sink slew
+    /// (`s_in + ln(4) * Elmore = s_in + 2 * delay`) across all pins in `collect_pins.sh`, both against
+    /// the raw formulas and against `run_sta_with_state`'s port sink arrivals and slews.
     #[test]
     fn test_port_wire_delay_vs_opensta() {
         let mut total_rows = 0usize;
         for_each_pins_design("PORTWIRE", |design_name, cx, ref_pins| {
             let (design, sdc) = (cx.design, cx.sdc);
+            let (_, state) = run_sta_with_state(design, cx.lib, sdc, cx.parasitics).expect("STA");
             let mut r_elmore = Vec::new();
             let mut r_ln2 = Vec::new();
             let mut r_half_ramp = Vec::new();
             let mut r_degrade = Vec::new();
+            let mut sta_dly_err = Vec::new();
+            let mut sta_slw_err = Vec::new();
             let mut max_half_slew_diff = 0.0f64;
 
             for n in 0..design.num_nets() {
@@ -2236,6 +2248,11 @@ mod tests {
                         let ref_degrade = (sink_slew * sink_slew - drv_slew * drv_slew).max(0.0).sqrt();
                         let pred_half = 0.5 * (drv_slew.hypot(WIRE_SLEW_FACTOR as f64 * elmore) - drv_slew);
                         let half_slew_diff = (ref_delay - 0.5 * (sink_slew - drv_slew)).abs();
+                        let ps = state[sink.0 as usize];
+                        let sta_dly = ps.arrival_max[pol] as f64 - drv_arr;
+                        let sta_slw = ps.slew_max[pol] as f64;
+                        sta_dly_err.push((sta_dly - ref_delay).abs() / ref_delay.abs().max(1e-9));
+                        sta_slw_err.push((sta_slw - sink_slew).abs() / sink_slew.abs().max(1e-9));
                         r_elmore.push(ref_delay / elmore);
                         r_ln2.push(ref_delay / (std::f64::consts::LN_2 * elmore));
                         if pred_half > 1e-12 {
@@ -2261,14 +2278,44 @@ mod tests {
                 }
             }
             if !r_elmore.is_empty() {
+                let p90 = |v: &[f64]| {
+                    let mut s = v.to_vec();
+                    s.sort_by(f64::total_cmp);
+                    s[9 * s.len() / 10]
+                };
+                let r_ln2_med = median(r_ln2.clone());
+                let sta_dly_med = median(sta_dly_err.clone());
+                let sta_dly_p90 = p90(&sta_dly_err);
+                let sta_slw_med = median(sta_slw_err.clone());
+                let sta_slw_p90 = p90(&sta_slw_err);
                 println!(
-                    "PORTWIRE {design_name} n {} | dly/elmore {} | dly/(ln2*elmore) {} | dly/half_pred {} | degrade/elmore {} | max|dly-(s_out-s_in)/2| {:.2e}",
+                    "PORTWIRE {design_name} n {} | dly/elmore {} | dly/(ln2*elmore) {} | dly/half_pred {} | degrade/elmore {} | max|dly-(s_out-s_in)/2| {:.2e} | sta dly err med {:.5} p90 {:.5} | sta slew err med {:.5} p90 {:.5}",
                     r_elmore.len(),
                     format_spread(&r_elmore, 4),
                     format_spread(&r_ln2, 4),
                     format_spread(&r_half_ramp, 4),
                     format_spread(&r_degrade, 4),
                     max_half_slew_diff,
+                    sta_dly_med,
+                    sta_dly_p90,
+                    sta_slw_med,
+                    sta_slw_p90,
+                );
+                assert!(
+                    (r_ln2_med - 1.0).abs() < 0.005,
+                    "{design_name}: median dly/(ln2*elmore) = {r_ln2_med}"
+                );
+                assert!(
+                    max_half_slew_diff < 1e-5,
+                    "{design_name}: max|dly-(s_out-s_in)/2| = {max_half_slew_diff:.3e}"
+                );
+                assert!(
+                    sta_dly_med < 0.002 && sta_dly_p90 < 0.01,
+                    "{design_name}: STA port delay rel err med={sta_dly_med:.5} p90={sta_dly_p90:.5}"
+                );
+                assert!(
+                    sta_slw_med < 0.002 && sta_slw_p90 < 0.005,
+                    "{design_name}: STA port slew rel err med={sta_slw_med:.5} p90={sta_slw_p90:.5}"
                 );
             }
         });
