@@ -332,7 +332,7 @@ impl Interp {
                 Ok(empty())
             }
             "set_clock_uncertainty" => {
-                self.sdc.uncertainty_ns = first_number(args)?.context("missing numeric value")?;
+                self.sdc.uncertainty_ns = single_number(args)?;
                 Ok(empty())
             }
             "set_input_delay" => {
@@ -517,23 +517,18 @@ fn positionals(args: &[Value]) -> Result<Vec<&Value>> {
     Ok(out)
 }
 
-fn first_number(args: &[Value]) -> Result<Option<f32>> {
-    Ok(positionals(args)?.into_iter().find_map(|v| match v {
-        Value::Str(s) => s.parse().ok(),
-        _ => None,
-    }))
+fn single_number(args: &[Value]) -> Result<f32> {
+    let [Value::Str(value)] = positionals(args)?.as_slice() else {
+        bail!("expected a single numeric value");
+    };
+    parse_f32(value)
 }
 
 fn value_and_ports(args: &[Value]) -> Result<(PortSel, f32)> {
-    let value = first_number(args)?.context("missing numeric value")?;
-    let sel = args
-        .iter()
-        .find_map(|a| match a {
-            Value::Ports(sel) => Some(sel.clone()),
-            _ => None,
-        })
-        .context("missing port selector")?;
-    Ok((sel, value))
+    let [Value::Str(value), Value::Ports(sel)] = positionals(args)?.as_slice() else {
+        bail!("expected a numeric value and a port selector");
+    };
+    Ok((sel.clone(), parse_f32(value)?))
 }
 
 /// Four-operator arithmetic with parentheses over decimal numbers. Values are f64; the caller
@@ -731,6 +726,22 @@ mod tests {
             "set_output_delay -min 1.0 -clock core_clk [all_outputs]",
             "set_clock_uncertainty -setup 0.1",
             "set_clock_uncertainty -hold 0.1",
+        ];
+        for snippet in cases {
+            let text = format!("{GCD}{snippet}\n");
+            assert!(parse_sdc(&text).is_err(), "accepted: {snippet}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_numeric_or_extra_positional_words() {
+        let cases = [
+            "set_load foo [all_outputs]",
+            "set_load foo 0.05 [all_outputs]",
+            "set_load 0.05 extra [all_outputs]",
+            "set_input_delay 1.0 -clock core_clk clk",
+            "set_clock_uncertainty foo 0.1",
+            "set_clock_uncertainty 0.1 [get_clocks core_clk]",
         ];
         for snippet in cases {
             let text = format!("{GCD}{snippet}\n");

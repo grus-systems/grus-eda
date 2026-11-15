@@ -106,3 +106,12 @@ format is yours, but every non-zero category must appear.
   that is a finding to record, not a reason to widen anything.
 - State explicitly in your report which `TimingType` variants can reach
   the catch-all arm after your change.
+
+## Follow-up closure (`v0.1.47`, 2026-11-16)
+
+- Added `SkipReport::unmapped_cells` in `crates/grus-core/src/sta/analysis.rs`
+  for instances where `design.cell_lib_ids[c]` is `None` (`gcd.placed.def`
+  has 93 `sky130_fd_sc_hd__tapvpwrvgnd_1` welltap cells with no Liberty entry).
+- Replaced the `first_number` / `.find_map` positional scan in
+  `crates/grus-core/src/sta/sdc.rs` with strict slice matching (`single_number`,
+  `value_and_ports`) so non-numeric or extra positional words fail to parse.

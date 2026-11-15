@@ -768,6 +768,23 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
   - `test_ibex_placed_spef_matches_opensta` (`Tol::IBEX_SPEF`, **PASS**): `max_arr 0.438%`, `max_req 0.015%`, `max_slew 4.43%`, `min_arr 0.104%`, `min_req 0.072%`, `min_slack 0.256%`, `min_slew 5.09%`; WNS and TNS within `1%`.
 - **Workspace verification (`v0.1.46`)**: `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`158 passed; 0 failed; 7 ignored`).
 
+### 2026-11-16 — F3 closure (`unmapped_cells` & SDC positional strictness) and doc index cleanup (`v0.1.47`)
+
+- **Closed the two remaining F3 silent spots (`docs/status.md`, `docs/design/step5/11-f3-sta-loud-failures.md`)**:
+  - `crates/grus-core/src/sta/analysis.rs`: added `SkipReport::unmapped_cells: usize` (also formatted by `SkipReport::nonzero()`) and incremented it in `build_graph` whenever `design.cell_lib_ids[c]` is `None`. Added unit test `test_skip_report_counts_unmapped_cells` (checking `gcd` baseline `93 -> 94`).
+  - `crates/grus-core/src/sta/sdc.rs`: replaced the `first_number()` / `.find_map` positional scan with strict slice matching (`single_number` for `set_clock_uncertainty` and `value_and_ports` for `set_input_delay` / `set_output_delay` / `set_input_transition` / `set_load`), rejecting non-numeric words, extra numbers, or bare port names. Added unit test `rejects_non_numeric_or_extra_positional_words`.
+- **Intentional-failure checks (`AGENTS.md` Section 7 Rule 7)**:
+  - Temporarily disabled `skipped.unmapped_cells += 1;` and reverted `single_number` / `value_and_ports` to `first_number` `.find_map`: `cargo test --release -p grus-core -- test_skip_report_counts_unmapped_cells rejects_non_numeric_or_extra_positional_words` failed `0 passed; 2 failed` (`left: 0, right: 93`; and `accepted: set_load foo 0.05 [all_outputs]`), then both fixes were restored.
+- **Measured `unmapped_cells` across all five designs (`grus-eda sta` zero-wire, 2026-11-16)**:
+  - `gcd`: `unmapped_cells=93` (`93` `sky130_fd_sc_hd__tapvpwrvgnd_1`).
+  - `picorv32`: `unmapped_cells=3150` (`3,150` `tapvpwrvgnd_1`).
+  - `aes`: `unmapped_cells=3685` (`3,685` `tapvpwrvgnd_1`).
+  - `ibex`: `unmapped_cells=4263` (`4,263` `tapvpwrvgnd_1`).
+  - `jpeg`: `unmapped_cells=14283` (`14,283` `tapvpwrvgnd_1`).
+  - In every case the count matches `sky130_fd_sc_hd__tapvpwrvgnd_1` welltap instances absent from `sky130_fd_sc_hd__tt_025C_1v80.lib` (`decap_3` is present in Liberty).
+- **Doc index cleanup**: marked Step 7 and E3.5 `(done)` in `docs/design/README.md`, clarified `picorv32` as an E3-only fixture (`tests/designs/picorv32/generate_ref.sh`) in `docs/status.md`, and marked F3 closed.
+- **Workspace verification (`v0.1.47`)**: `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`160 passed; 0 failed; 7 ignored`, `67.45s`).
+
 
 
 

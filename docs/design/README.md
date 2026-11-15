@@ -45,14 +45,14 @@ log is [`../results.md`](../results.md).
 | [step6/14-routed-spef-sta-test.md](step6/14-routed-spef-sta-test.md) | Ticket 14: our STA on the routed SPEF vs OpenSTA, gcd |
 | [step6/15-estimator-scoring-e34-e35-decision.md](step6/15-estimator-scoring-e34-e35-decision.md) | Ticket 15: score both estimators against routed truth; the E3.4/E3.5 decision |
 
-## Step 7 — E3.5 scale evidence (tickets 16–17 done; step in progress)
+## Step 7 — E3.5 scale evidence (done)
 
 | File | What |
 |---|---|
 | [step7/16-picorv32-routed-spef.md](step7/16-picorv32-routed-spef.md) | Ticket 16: a routed SPEF for picorv32 — E3.5 scale evidence and the coupling cross-check |
 | [step7/17-dcalc-routed-table.md](step7/17-dcalc-routed-table.md) | Ticket 17: DMP vs `report_dcalc` on the picorv32 routed SPEF (76 rows) |
 
-## E3.5 — driver model, waveform slew and extreme-load investigation (in progress)
+## E3.5 — driver model, waveform slew and extreme-load investigation (done)
 
 | File | What |
 |---|---|

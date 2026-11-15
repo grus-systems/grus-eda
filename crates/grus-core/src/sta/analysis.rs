@@ -112,6 +112,8 @@ pub struct EndpointReport {
 /// report is missing timing that the design has.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SkipReport {
+    /// Instances that have no Liberty cell mapping (`design.cell_lib_ids[c]` is `None`).
+    pub unmapped_cells: usize,
     /// Non-latch arcs that have no model, by `TimingType` name.
     pub unsupported_arcs: BTreeMap<String, usize>,
     /// Arcs whose related or target pin does not resolve on the instance.
@@ -133,6 +135,7 @@ impl SkipReport {
             out.push(format!("unsupported_arcs[{}]", by_type.join(", ")));
         }
         for (name, count) in [
+            ("unmapped_cells", self.unmapped_cells),
             ("unresolved_arcs", self.unresolved_arcs),
             ("incomplete_checks", self.incomplete_checks),
             ("unreached_endpoints", self.unreached_endpoints),
@@ -314,7 +317,10 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
     };
     for c in 0..design.num_cells() {
         let cell = CellId(c as u32);
-        let Some(lib_cell_id) = design.cell_lib_ids[c] else { continue };
+        let Some(lib_cell_id) = design.cell_lib_ids[c] else {
+            skipped.unmapped_cells += 1;
+            continue;
+        };
         let lib_cell = &cx.lib.cells[lib_cell_id.0 as usize];
         let enable = if lib_cell.is_latch {
             match latch_enable(cx, cell, lib_cell) {
@@ -933,6 +939,32 @@ mod tests {
     #[test]
     fn test_ibex_placed_spef_matches_opensta() {
         compare_design_with_opensta("ibex", "placed_spef", Rc::Spef, Tol::IBEX_SPEF);
+    }
+
+    #[test]
+    fn test_skip_report_counts_unmapped_cells() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("gcd");
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let mut design = parse_def(&dir.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join("gcd.sdc")).expect("SDC");
+
+        let baseline = run_sta(&design, &lib, &sdc, None).expect("baseline STA");
+        // gcd.placed.def includes 93 sky130_fd_sc_hd__tapvpwrvgnd_1 welltap instances that have no Liberty cell.
+        assert_eq!(baseline.skipped.unmapped_cells, 93);
+
+        let target = design.cell_lib_ids.iter().position(|id| id.is_some()).expect("mapped cell");
+        design.cell_lib_ids[target] = None;
+        let report = run_sta(&design, &lib, &sdc, None).expect("STA with unmapped cell");
+        assert_eq!(report.skipped.unmapped_cells, 94);
+        assert!(report.skipped.nonzero().contains(&"unmapped_cells=94".to_string()));
     }
 
 
