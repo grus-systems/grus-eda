@@ -280,9 +280,26 @@ fn pi_charge_numeric(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> f64 {
     q
 }
 
-/// Solves for the effective capacitance. `table(c)` returns the table `(delay, slew)` at load `c`;
-/// `rd_scale` converts the local delay-vs-capacitance slope of the table into the driver resistance.
-pub fn solve_dmp(pi: &PiModel, rd_scale: f64, table: &dyn Fn(f64) -> (f64, f64)) -> DmpResult {
+/// Table of a driver arc: `table(c)` returns the table `(delay, slew)` at load `c`.
+pub type DriverTable<'a> = &'a dyn Fn(f64) -> (f64, f64);
+
+/// Solves for the effective capacitance. `rd_scale` converts the local delay-vs-capacitance slope of the
+/// table into the driver resistance.
+pub fn solve_dmp(pi: &PiModel, rd_scale: f64, table: DriverTable) -> DmpResult {
+    solve_dmp_with(pi, &|table, c| {
+        let h = 0.05 * c;
+        let slope = (table(c + h).0 - table(c - h).0) / (2.0 * h);
+        (rd_scale * slope).max(1e-6)
+    }, table)
+}
+
+/// [`solve_dmp`] with the driver-resistance rule as a parameter: `rd_of(table, c)` is the resistance
+/// used when the load is the capacitor `c`. Lets the rule be measured against the reference tool.
+pub fn solve_dmp_with(
+    pi: &PiModel,
+    rd_of: &dyn Fn(DriverTable, f64) -> f64,
+    table: DriverTable,
+) -> DmpResult {
     let total = pi.total();
     let lumped = |c: f64| {
         let (delay, slew) = table(c);
@@ -294,9 +311,7 @@ pub fn solve_dmp(pi: &PiModel, rd_scale: f64, table: &dyn Fn(f64) -> (f64, f64))
     // f(c) > 0 when the pi load takes more charge than a capacitor `c` would: c is too small.
     let residual = |c: f64| {
         let (delay, slew) = table(c);
-        let h = 0.05 * c;
-        let slope = (table(c + h).0 - table(c - h).0) / (2.0 * h);
-        let rd = (rd_scale * slope).max(1e-6);
+        let rd = rd_of(table, c);
         let (t0, dt) = fit_ramp(rd, c, delay, slew);
         let tx = delay;
         pi_charge(pi, rd, t0, dt, tx) - 0.5 * c

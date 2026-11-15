@@ -1151,6 +1151,172 @@ mod tests {
         }
     }
 
+    type RowVisitor<'a> = dyn FnMut(&DcalcRow, &crate::sta::dmp::PiModel, crate::sta::dmp::DriverTable) + 'a;
+
+    /// Calls `visit(row, pi, table)` for every row of `file` (a `collect_dcalc.sh` table of `design`, read on
+    /// the DEF and SPEF named) that matches exactly one graph arc; returns `(matched, unmodelled)`.
+    fn for_each_dcalc_row(
+        design_name: &str,
+        def_file: &str,
+        spef_file: &str,
+        file: &str,
+        visit: &mut RowVisitor,
+    ) -> (usize, usize) {
+        let lib_dir = sky130_hd();
+        let dir = design_dir(design_name);
+        let text = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let rows = parse_dcalc_rows(&text);
+        assert!(!rows.is_empty(), "{file} has no rows");
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
+        let spef = crate::readers::load_spef(&dir.join(spef_file)).expect("SPEF");
+        let par = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
+        let cx = Context { design: &design, lib: &lib, sdc: &sdc, parasitics: Some(&par), pi_models: Vec::new() };
+        let graph = build_graph(&cx, &mut SkipReport::default());
+        let by_name: std::collections::HashMap<String, PinId> =
+            (0..design.num_pins()).map(|i| PinId(i as u32)).map(|p| (cx.pin_name(p), p)).collect();
+        let (mut matched, mut unmodelled) = (0usize, 0usize);
+        for row in &rows {
+            let (Some(&src), Some(&dst)) = (by_name.get(&row.from), by_name.get(&row.to)) else {
+                unmodelled += 1;
+                continue;
+            };
+            let candidates = matching_arcs(&lib, &graph, src, dst, row);
+            let [arc_index] = candidates.as_slice() else {
+                unmodelled += 1;
+                continue;
+            };
+            let arc = &lib.arcs[*arc_index as usize];
+            let net = design.pin_nets[dst.0 as usize].expect("output pin has a net");
+            let caps: Vec<f32> = design.net_pins(net).iter().map(|&p| cx.sink_cap(p, row.out_pol)).collect();
+            let pi = par.net(net).unwrap_or_else(|| panic!("no parasitics for the net of {}", row.to)).pi_model(&caps);
+            let (Some(delay_table), Some(slew_table)) = delay_tables(arc, row.out_pol) else { continue };
+            let slew_in = row.input_slew as f32;
+            let table = |c: f64| {
+                (
+                    eval_nldm_delay_or_slew(delay_table, slew_in, c as f32) as f64,
+                    eval_nldm_delay_or_slew(slew_table, slew_in, c as f32) as f64,
+                )
+            };
+            visit(row, &pi, &table);
+            matched += 1;
+        }
+        (matched, unmodelled)
+    }
+
+    /// Measurement (E3.5, `docs/design/e35`): driver-resistance rules against the `report_dcalc` tables of
+    /// `collect_dcalc.sh`. Constants are fitted on picorv32 and scored on gcd. Prints; asserts only that the
+    /// rows matched. Shielded = OpenSTA's Ceff is below 97% of the total load.
+    #[test]
+    fn test_dmp_rd_rule_sweep() {
+        use crate::sta::dmp::solve_dmp_with;
+        type Rule = Box<dyn Fn(&dyn Fn(f64) -> (f64, f64), f64) -> f64>;
+        let slope = |table: &dyn Fn(f64) -> (f64, f64), c: f64, which: usize| {
+            let h = 0.05 * c;
+            let (hi, lo) = (table(c + h), table(c - h));
+            if which == 0 { (hi.0 - lo.0) / (2.0 * h) } else { (hi.1 - lo.1) / (2.0 * h) }
+        };
+        let mut rules: Vec<(String, Rule)> = Vec::new();
+        for scale in [3.0, 4.5] {
+            rules.push((format!("delay_slope x {scale}"), Box::new(move |t, c| (scale * slope(t, c, 0)).max(1e-6))));
+        }
+        for k in [1.8, 1.9, 2.0, 2.1, 2.2] {
+            rules.push((format!("slew_slope x {k}"), Box::new(move |t, c| (k * slope(t, c, 1)).max(1e-6))));
+        }
+        let sets = [
+            ("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "dcalc_routed_all.txt"),
+            ("gcd", "gcd.placed.def", "gcd.rcx.spef", "dcalc_routed_all.txt"),
+        ];
+        for (design, def, spef, file) in sets {
+            for (name, rule) in &rules {
+                // [Ceff, delay, slew] absolute percent errors, all rows and shielded rows.
+                let mut all: [Vec<f64>; 3] = Default::default();
+                let mut shielded: [Vec<f64>; 3] = Default::default();
+                let mut worst: Vec<(f64, String)> = Vec::new();
+                let (matched, unmodelled) = for_each_dcalc_row(design, def, spef, file, &mut |row, pi, table| {
+                    let r = solve_dmp_with(pi, &|t, c| rule(t, c), table);
+                    let errs = [
+                        (r.ceff - row.ceff) / row.ceff * 100.0,
+                        (r.delay - row.delay) / row.delay * 100.0,
+                        (r.slew - row.slew) / row.slew * 100.0,
+                    ];
+                    let is_shielded = row.ceff < 0.97 * (pi.c1 + pi.c2);
+                    worst.push((
+                        errs[0],
+                        format!(
+                            "{} -> {} {} {}: Ceff {:+.2}% delay {:+.2}% slew {:+.2}% (ref Ceff/total {:.3}, total {:.4} pF, rpi {:.3}, in slew {:.3})",
+                            row.from, row.to, row.sense, row.out, errs[0], errs[1], errs[2], row.ceff / (pi.c1 + pi.c2), pi.c1 + pi.c2, pi.rpi, row.input_slew
+                        ),
+                    ));
+                    for (q, e) in errs.iter().enumerate() {
+                        all[q].push(e.abs());
+                        if is_shielded {
+                            shielded[q].push(e.abs());
+                        }
+                    }
+                });
+                assert!(matched > 0);
+                let stat = |v: &Vec<f64>| {
+                    if v.is_empty() {
+                        "n/a".to_string()
+                    } else {
+                        format!("{:.2}/{:.2}", median(v.clone()), v.iter().copied().fold(0.0, f64::max))
+                    }
+                };
+                worst.sort_by(|x, y| y.0.abs().total_cmp(&x.0.abs()));
+                for (_, line) in worst.iter().take(3) {
+                    println!("WORST {design} {name}: {line}");
+                }
+                println!(
+                    "SWEEP {design} {name:<22} rows {matched} (unmodelled {unmodelled}) shielded {} | all Ceff {} delay {} slew {} | shielded Ceff {} delay {} slew {}",
+                    shielded[0].len(), stat(&all[0]), stat(&all[1]), stat(&all[2]), stat(&shielded[0]), stat(&shielded[1]), stat(&shielded[2])
+                );
+            }
+        }
+    }
+
+    /// Measurement (E3.5): for every shielded row (OpenSTA Ceff below 97% of the total load) the driver
+    /// resistance that makes our Ceff equal OpenSTA's, with the table quantities it might be derived
+    /// from. Prints `ROOT` lines (one per row) for analysis; asserts only that rows were found.
+    #[test]
+    fn test_dmp_rd_root_scan() {
+        use crate::sta::dmp::solve_dmp_with;
+        let mut found = 0usize;
+        for_each_dcalc_row("picorv32", "picorv32.placed.def", "picorv32.rcx.spef", "dcalc_routed_all.txt", &mut |row, pi, table| {
+            let total = pi.c1 + pi.c2;
+            if row.ceff >= 0.97 * total {
+                return;
+            }
+            // Our Ceff grows with rd, so bisect rd (kohm) on a log scale.
+            let (mut lo, mut hi) = (1e-3f64, 1e3f64);
+            for _ in 0..60 {
+                let mid = (lo * hi).sqrt();
+                let r = solve_dmp_with(pi, &|_, _| mid, table);
+                if r.ceff > row.ceff { hi = mid } else { lo = mid }
+            }
+            let rd = (lo * hi).sqrt();
+            let c = row.ceff;
+            let h = 0.05 * c;
+            let (up, dn) = (table(c + h), table(c - h));
+            let (dsl, ssl) = ((up.0 - dn.0) / (2.0 * h), (up.1 - dn.1) / (2.0 * h));
+            let (d0, s0) = table(c);
+            println!(
+                "ROOT {} {} {} tin {:.4} shield {:.4} total {:.4} rpi {:.4} rd {:.4} dslope {:.4} sslope {:.4} delay {:.4} slew {:.4}",
+                row.from, row.to, row.out, row.input_slew, row.ceff / total, total, pi.rpi, rd, dsl, ssl, d0, s0
+            );
+            found += 1;
+        });
+        assert!(found > 100, "only {found} shielded rows");
+    }
+
     /// Endpoint timing of one estimator, pin name, max arrival (ns), max slack (ns), plus WNS/TNS (max path).
     struct Timing {
         endpoints: Vec<(String, f64, f64)>,

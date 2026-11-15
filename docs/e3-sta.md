@@ -391,7 +391,7 @@ reference tool), write the rule in `docs/` before the code, record every compari
   up to 19.8% on the largest loads), which is the systematic part of the endpoint slew tail. What remains:
   a load-dependent fix or derivation for the DMP solve, and a decision on modelling the waveform slew.
   OpenSTA's `DmpCeff` source (GPL) must not be read; work from the DMP paper and the measurements.
-- **2026-11-15 probe (`docs/design/e35/`)**: `rd = 2.0 x (table slew slope)` brings the worst Ceff error from 17.1% to 2.38% (delay 1.57%) on the 76 arcs, but is a fitted rule and must land together with a waveform-slew model (alone it worsens the routed endpoints). Held after review; next is a broader `report_dcalc` collection.
+- **2026-11-15 (`docs/design/e35/`, Section 5)**: the slew-slope rule seen on 76 arcs was overfit (worst Ceff 8.83% on 7054 picorv32 rows). Over 280 shielded rows the zero-error `rd` is 3.0 x the delay slope (so 4.5 is the wrong constant for Ceff), and with the propagated driver slew taken as the table slew at the total load the routed picorv32 endpoint mismatches drop 136 -> 53 (placed 0 -> 2). Candidate: `RD_SCALE = 3` plus that slew, landed together; held for an independent evaluation on aes/ibex and a review.
 - **Done when**: `Ceff` within 2% and driver slew within 2% of `report_dcalc` on all collected arcs; picorv32
   SPEF passes with the plain criterion (slack 5 ps, slew 1%, TNS 1%); `RD_SCALE` is gone or derived.
 

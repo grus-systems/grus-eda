@@ -1,6 +1,6 @@
 # E3.5 design: derive the driver resistance from the slew slope, and model the driver waveform slew
 
-Status: **proposal, measured on a probe, not implemented**. Probe patch: `probe.patch` (this folder; apply on
+Status: **Sections 1-3 are SUPERSEDED by Section 5 (the slew-slope rule was overfit to 7 arcs and is withdrawn); read Section 5 first.** Originally: proposal, measured on a probe, not implemented. Probe patch: `probe.patch` (this folder; apply on
 `172af57`, it adds env-var overrides `PROBE_RD`, `PROBE_SS`, `PROBE_WS`, `PROBE_ROOT`, `PROBE_W` to the
 measurement test and to `solve_dmp`; it is a measurement tool, not a candidate change). Every number below was
 produced on 2026-11-15 on the M4 Mac mini with the committed `dcalc_routed_ref.txt` (76 rows) and a
@@ -120,3 +120,13 @@ external reviewer was unavailable (the review tool failed; not investigated furt
 - S3 per-arc error tables and the endpoint field breakdown are missing from this document; the committed probe patch regenerates them, and the next round records them in `docs/results.md`.
 
 **Decision**: no model change is made. The next unit is the data collection above (a `report_dcalc` collection script committed with its output, on gcd and aes/ibex for the independent set, plus a load-sweep series on picorv32 cells), which needs the Docker/OpenSTA instrument.
+
+## 5. Update: the broad collection overturns the slew-slope rule (2026-11-15, later the same day)
+
+New instrument: `tests/designs/collect_dcalc.sh` (committed; runs OpenSTA `report_dcalc` over every (input, output) pin pair of a design in the pinned image, infers the arc sense from the printed transitions, skips mixed-sense pairs) and the data it wrote: `tests/designs/picorv32/dcalc_routed_all.txt` (7054 rows; stride 6 plus every pair on a net with >= 6 pins; 4300 pairs kept of 19783) and `tests/designs/gcd/dcalc_routed_all.txt` (1138 rows, all pairs). Rust side: `solve_dmp_with` (the `rd` rule as a parameter; `solve_dmp` is unchanged in behaviour), `test_dmp_rd_rule_sweep` and `test_dmp_rd_root_scan` in `analysis.rs`.
+
+- **gcd has no shielded rows** (OpenSTA Ceff >= 97% of total on all 1138), so it is not an independent test of shielding; it only shows the unshielded rows stay within ~2% under any rule. The independent evaluation set must come from designs with shielded nets (aes, ibex).
+- **`rd = 2.0 x slew slope` does not generalise**: on the 7054 picorv32 rows its worst Ceff error is 8.83% (the 76-row 2.38% was an artifact of which arcs were collected). Worst rows are falls with very large input slew (1.4-2.5 ns) and mild shielding, where it over-shields.
+- **The zero-error `rd` on the 280 well-conditioned shielded rows** (shield < 0.95; weaker shielding makes the root ill-determined) is `3.01 x delay slope` (p10-p90 2.61-3.34, cv 12%) versus `2.29 x slew slope` (cv 16%). So the **delay-slope rule is the better-centred one and the Ceff-consistent constant is ~3, not 4.5**; this agrees with the earlier note in `docs/e3-sta.md` ("one value fits arrival (4.5-5) but not Ceff (about 3)"). Rises 3.28, falls 2.92; input slew above 1.5 ns (7 rows) departs (1.6). The k = 2 slew-slope proposal is withdrawn.
+- **Endpoints, routed picorv32 (`RD_SCALE` 3.0 with the propagated slew = table slew at the *total* load, no fudge factor)**: 53 mismatching fields against 136 shipped. The factor on that slew: 1.00 -> 53, 1.01 -> 11, 1.02 -> 6, 1.03 -> 12 (a residual ~2% that is not understood and is not applied). Placed picorv32: 2 mismatches (baseline 0; the picorv32 SPEF test would fail on its 2% TNS tolerance: TNS -89.25 vs -91.62, WNS -1.679 vs -1.715). `RD_SCALE` 3.5 with 1.0: 64; with 1.03: 128. gcd placed/routed unaffected. aes/ibex/jpeg could not be run (artifacts not generated here).
+- **Current recommendation (to be reviewed, then implemented as one change)**: `RD_SCALE = 3.0` (a measured, Ceff-consistent constant with its spread documented, still fitted, not derived) **and** the propagated driver slew = table slew at the total load, with the F4 doc-comment fix. Both land together. Before that: generate aes and ibex inputs, collect their `report_dcalc` tables (independent evaluation set; the constant is fitted on picorv32 only), and re-run all ignored wire tests under the candidate.
