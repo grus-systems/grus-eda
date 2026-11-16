@@ -358,12 +358,12 @@ impl Interp {
                 Ok(empty())
             }
             "set_input_transition" => {
-                let rule = value_and_ports(args, &mut self.sdc.ignored_options)?;
+                let rule = value_and_ports(args, &PORT_VALUE_FLAGS, &mut self.sdc.ignored_options)?;
                 self.sdc.input_transitions.push(rule);
                 Ok(empty())
             }
             "set_load" => {
-                let rule = value_and_ports(args, &mut self.sdc.ignored_options)?;
+                let rule = value_and_ports(args, &PORT_VALUE_FLAGS, &mut self.sdc.ignored_options)?;
                 self.sdc.loads.push(rule);
                 Ok(empty())
             }
@@ -384,7 +384,7 @@ impl Interp {
     fn create_clock(&mut self, args: &[Value]) -> Result<()> {
         let name = flag_value(args, "-name")?.map(str::to_string);
         let period_ns = parse_f32(flag_value(args, "-period")?.context("missing -period")?)?;
-        match positionals(args, &mut self.sdc.ignored_options)?.as_slice() {
+        match positionals(args, &CLOCK_VALUE_FLAGS, &mut self.sdc.ignored_options)?.as_slice() {
             [] => {
                 let Some(name) = name else {
                     bail!("a virtual clock needs -name");
@@ -468,7 +468,7 @@ impl Interp {
     }
 
     fn delay_rule(&mut self, args: &[Value]) -> Result<DelayRule> {
-        let (sel, value_ns) = value_and_ports(args, &mut self.sdc.ignored_options)?;
+        let (sel, value_ns) = value_and_ports(args, &DELAY_VALUE_FLAGS, &mut self.sdc.ignored_options)?;
         let clock = match flag_value(args, "-clock")? {
             Some(name) => self.resolve_clock(name)?,
             None => ClockRef::Design,
@@ -535,12 +535,16 @@ fn parse_f32(text: &str) -> Result<f32> {
     text.parse().with_context(|| format!("`{text}` is not a number"))
 }
 
-/// Flags that take a value, so that their value is not mistaken for a positional argument.
-const VALUE_FLAGS: [&str; 5] = ["-clock", "-name", "-period", "-lib_cell", "-pin"];
-
 /// Value flags the parser drops without applying them; each occurrence is counted in
-/// `Sdc::ignored_options`. The rest of `VALUE_FLAGS` is read by the command that owns it.
+/// `Sdc::ignored_options`. The rest of the accepted flags is read by the command that owns it.
 const IGNORED_VALUE_FLAGS: [&str; 2] = ["-lib_cell", "-pin"];
+
+/// Value flags each command accepts, owned or ignored. A flag outside the command's set is an
+/// error: silently dropping it (the old shared `VALUE_FLAGS` behaviour) accepted SDC that
+/// OpenSTA rejects, e.g. `-clock` on `set_load`.
+const DELAY_VALUE_FLAGS: [&str; 3] = ["-clock", "-lib_cell", "-pin"];
+const PORT_VALUE_FLAGS: [&str; 2] = ["-lib_cell", "-pin"];
+const CLOCK_VALUE_FLAGS: [&str; 2] = ["-name", "-period"];
 
 /// The value after `flag`, or None when the flag is absent. A flag with no value is an error.
 fn flag_value<'a>(args: &'a [Value], flag: &str) -> Result<Option<&'a str>> {
@@ -561,13 +565,19 @@ fn is_negative_number(text: &str) -> bool {
 
 /// The arguments that are neither a value flag nor the value of one. Any other flag is an error:
 /// skipping it would drop a meaning-changing option such as `-max`, `-add_delay` or `-setup`.
-/// Ignored value flags are counted into `ignored`.
-fn positionals<'a>(args: &'a [Value], ignored: &mut BTreeMap<String, usize>) -> Result<Vec<&'a Value>> {
+/// `value_flags` is the set the calling command accepts; ignored ones are counted into `ignored`.
+fn positionals<'a>(args: &'a [Value], value_flags: &[&str], ignored: &mut BTreeMap<String, usize>) -> Result<Vec<&'a Value>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match &args[i] {
-            Value::Str(s) if VALUE_FLAGS.contains(&s.as_str()) => {
+            Value::Str(s) if value_flags.contains(&s.as_str()) => {
+                let Some(Value::Str(v)) = args.get(i + 1) else {
+                    bail!("{s} needs a value");
+                };
+                if v.starts_with('-') && !is_negative_number(v) {
+                    bail!("{s} needs a value, found `{v}`");
+                }
                 if IGNORED_VALUE_FLAGS.contains(&s.as_str()) {
                     *ignored.entry(s.clone()).or_default() += 1;
                 }
@@ -583,8 +593,8 @@ fn positionals<'a>(args: &'a [Value], ignored: &mut BTreeMap<String, usize>) -> 
     Ok(out)
 }
 
-fn value_and_ports(args: &[Value], ignored: &mut BTreeMap<String, usize>) -> Result<(PortSel, f32)> {
-    let [Value::Str(value), Value::Ports(sel)] = positionals(args, ignored)?.as_slice() else {
+fn value_and_ports(args: &[Value], value_flags: &[&str], ignored: &mut BTreeMap<String, usize>) -> Result<(PortSel, f32)> {
+    let [Value::Str(value), Value::Ports(sel)] = positionals(args, value_flags, ignored)?.as_slice() else {
         bail!("expected a numeric value and a port selector");
     };
     Ok((sel.clone(), parse_f32(value)?))
@@ -737,6 +747,24 @@ mod tests {
         assert_eq!(sdc.ignored_options["-lib_cell"], 1);
         assert_eq!(sdc.ignored_options["-pin"], 2);
         assert_eq!(sdc.commands, 7);
+    }
+
+    #[test]
+    fn rejects_flags_the_command_does_not_own() {
+        let cases = [
+            // `-clock` belongs to the delay commands; on `set_load` it must not be dropped.
+            "set_load 0.05 -clock core_clk [all_outputs]",
+            "set_input_transition 0.15 -name vclk [all_inputs]",
+            "set_input_delay 1.0 -name vclk -clock core_clk [all_inputs]",
+            "create_clock -name core_clk -period 5.0 -lib_cell buf [get_ports clk]",
+            // A value flag with no value, or whose value is another flag.
+            "set_input_delay 1.0 -clock core_clk [all_inputs -no_clocks] -pin",
+            "set_input_delay 1.0 -lib_cell -clock core_clk [all_inputs]",
+        ];
+        for snippet in cases {
+            let text = format!("{GCD}{snippet}\n");
+            assert!(parse_sdc(&text).is_err(), "accepted: {snippet}");
+        }
     }
 
     #[test]

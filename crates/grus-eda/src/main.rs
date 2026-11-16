@@ -464,8 +464,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("Wrote STA report JSON to {:?}", path);
             }
             if args.strict && !report.skipped.is_clean() {
-                eprintln!("strict: the run skipped inputs; see the summary above");
-                std::process::exit(1);
+                anyhow::bail!("strict: the run skipped inputs; see the summary above");
             }
         }
     }
@@ -657,5 +656,41 @@ mod tests {
         assert!(err_sta.is_err(), "contradictory --parasitics placement --spef must fail");
 
         let _ = std::fs::remove_file(&out_def);
+    }
+
+    #[test]
+    fn cli_sta_json_and_strict() {
+        let hd = sky130_hd();
+        let lib = require(hd.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
+        let tlef = require(hd.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef = require(hd.join("lef/sky130_fd_sc_hd.lef"));
+        let gcd = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/designs/gcd");
+        let def = gcd.join("gcd.placed.def");
+        let sdc = gcd.join("gcd.sdc");
+        let sta_argv = |extra: &[&str]| {
+            let mut argv = vec![
+                "grus-eda", "sta",
+                "--lib", lib.to_str().unwrap(),
+                "--tlef", tlef.to_str().unwrap(),
+                "--lef", lef.to_str().unwrap(),
+                "--def", def.to_str().unwrap(),
+                "--sdc", sdc.to_str().unwrap(),
+            ];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv).unwrap()
+        };
+
+        // gcd.placed.def has 93 unmapped welltap cells, so --strict must fail.
+        let json_path = std::env::temp_dir().join("grus_cli_test_sta.json");
+        run(sta_argv(&["--json", json_path.to_str().unwrap()])).expect("sta must succeed");
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).expect("report JSON")).expect("JSON parses");
+        assert_eq!(report["skipped"]["unmapped_cells"].as_u64().unwrap(), 93);
+        assert!(report["skipped"]["total_arcs"].as_u64().unwrap() > 0);
+
+        let err = run(sta_argv(&["--strict"]));
+        assert!(err.is_err(), "--strict must fail when cells were skipped");
+
+        let _ = std::fs::remove_file(&json_path);
     }
 }

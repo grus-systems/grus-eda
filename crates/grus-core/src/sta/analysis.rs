@@ -1186,8 +1186,11 @@ mod tests {
     }
 
     /// Independent recount of the latch arcs `build_graph` drops, tallied straight from the
-    /// Liberty arcs and the netlist: an unmodelled latch shape loses every arc; a modelled
-    /// (`dlxtn`) latch loses every arc that is not a setup/hold check and not an enable->Q open.
+    /// Liberty arcs and the netlist pins: a latch is modelled when it has a `setup_rising`
+    /// check whose related pin resolves (the `dlxtn` shape); an unmodelled latch loses every
+    /// arc, and a modelled one loses every arc that is not a setup/hold check and not an
+    /// enable->Q open. Written without `latch_enable` so it does not share the production
+    /// helper's logic.
     fn expected_latch_skips(cx: &Context, design: &DesignDb, lib: &LibDb) -> (usize, BTreeMap<String, usize>) {
         let mut cells = 0;
         let mut arcs: BTreeMap<String, usize> = BTreeMap::new();
@@ -1198,7 +1201,11 @@ mod tests {
                 continue;
             }
             let cell = CellId(c as u32);
-            let Some(enable) = latch_enable(cx, cell, lib_cell) else {
+            let enable = (lib_cell.arc_offset..lib_cell.arc_offset + lib_cell.arc_count as u32)
+                .map(|i| &lib.arcs[i as usize])
+                .find(|arc| arc.timing_type == TimingType::SetupRising)
+                .and_then(|arc| cx.cell_pin_for_lib_pin(cell, arc.related_pin));
+            let Some(enable) = enable else {
                 cells += 1;
                 for i in lib_cell.arc_offset..lib_cell.arc_offset + lib_cell.arc_count as u32 {
                     *arcs.entry(format!("{:?}", lib.arcs[i as usize].timing_type)).or_default() += 1;
@@ -1224,12 +1231,35 @@ mod tests {
     }
 
     /// R0: the skip summary counts latch cells and arcs per kind, with totals that an
-    /// independent recount from the Liberty and the netlist reproduces.
+    /// independent recount from the Liberty and the netlist reproduces. The literal maps are
+    /// the ground truth read off `sky130_fd_sc_hd__tt_025C_1v80.lib`: `dlxtp_1` has five arcs
+    /// (`setup_falling`, `hold_falling`, `min_pulse_width`->Other, `combinational`,
+    /// `rising_edge`) and is unmodelled; `dlxtn_1` drops only its `D -> Q` combinational arc
+    /// and the `min_pulse_width` arc.
     #[test]
     fn test_skip_report_counts_latch_arcs() {
-        for (design_name, def_file, sdc_file) in [
-            ("sta_edge", "non_dlxtn_latch/edge_latch.def", "non_dlxtn_latch/edge_latch.sdc"),
-            ("ibex", "ibex.placed.def", "ibex.sdc"),
+        for (design_name, def_file, sdc_file, want) in [
+            (
+                "sta_edge",
+                "non_dlxtn_latch/edge_latch.def",
+                "non_dlxtn_latch/edge_latch.sdc",
+                (
+                    1,
+                    BTreeMap::from([
+                        ("Combinational".to_string(), 1),
+                        ("HoldFalling".to_string(), 1),
+                        ("Other".to_string(), 1),
+                        ("RisingEdge".to_string(), 1),
+                        ("SetupFalling".to_string(), 1),
+                    ]),
+                ),
+            ),
+            (
+                "ibex",
+                "ibex.placed.def",
+                "ibex.sdc",
+                (0, BTreeMap::from([("Combinational".to_string(), 1), ("Other".to_string(), 1)])),
+            ),
         ] {
             let lib_dir = sky130_hd();
             let dir = design_dir(design_name);
@@ -1245,16 +1275,20 @@ mod tests {
             let sdc = load_sdc(&dir.join(sdc_file)).expect("SDC");
             let report = run_sta(&design, &lib, &sdc, None).expect("STA");
 
+            let (want_cells, want_arcs) = want;
+            assert_eq!(report.skipped.unmodelled_latch_cells, want_cells, "{design_name}");
+            assert_eq!(report.skipped.latch_arcs_dropped, want_arcs, "{design_name}");
+
             let cx = Context { design: &design, lib: &lib, sdc: &sdc, parasitics: None, pi_models: Vec::new() };
             let (cells, arcs) = expected_latch_skips(&cx, &design, &lib);
-            assert_eq!(report.skipped.unmodelled_latch_cells, cells, "{design_name}");
-            assert_eq!(report.skipped.latch_arcs_dropped, arcs, "{design_name}");
+            assert_eq!((cells, arcs), (want_cells, want_arcs), "{design_name}");
 
             let total_arcs: usize = (0..design.num_cells())
                 .filter_map(|c| design.cell_lib_ids[c])
                 .map(|id| lib.cells[id.0 as usize].arc_count as usize)
                 .sum();
             assert_eq!(report.skipped.total_arcs, total_arcs, "{design_name}");
+            assert!(report.skipped.arcs_skipped() <= report.skipped.total_arcs, "{design_name}");
             assert_eq!(
                 report.endpoints.len() + report.skipped.endpoints_skipped(),
                 report.skipped.total_endpoints,
@@ -1262,7 +1296,7 @@ mod tests {
             );
 
             let json = serde_json::to_value(&report).expect("report JSON");
-            assert_eq!(json["skipped"]["unmodelled_latch_cells"].as_u64().unwrap() as usize, cells);
+            assert_eq!(json["skipped"]["unmodelled_latch_cells"].as_u64().unwrap() as usize, want_cells);
             assert_eq!(json["skipped"]["total_arcs"].as_u64().unwrap() as usize, total_arcs);
             assert!(json["skipped"]["sdc_commands"].as_u64().unwrap() > 0);
         }

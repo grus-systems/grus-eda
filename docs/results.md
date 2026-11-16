@@ -964,3 +964,17 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
 - Verification: `cargo test --release -p grus-core -- sta::` — 61 passed / 0 failed /
   6 ignored; new tests `test_skip_report_counts_latch_arcs` (edge_latch + ibex) and
   `counts_ignored_lib_cell_and_pin_options`. Timing results unchanged (counting only).
+- **Hydrogen review (`subcon review`, 2026-11-16, verdict reject -> fixed)**: S1 —
+  `positionals` shared one `VALUE_FLAGS` list across commands, so `-clock`/`-name`/`-period`
+  on a command that does not read them (e.g. `set_load ... -clock core_clk`) was silently
+  dropped; flags are now per-command (`DELAY_VALUE_FLAGS`/`PORT_VALUE_FLAGS`/
+  `CLOCK_VALUE_FLAGS`) and anything else errors. S2 — a value flag with no value (or whose
+  "value" is another flag) was skipped via `i += 2`; `positionals` now requires a
+  non-flag string value. S2 — `expected_latch_skips` no longer calls `latch_enable`, and the
+  test asserts literal per-design counts plus `arcs_skipped() <= total_arcs`. S2 —
+  `--strict` returns `Err` from `run()` instead of `std::process::exit`, and
+  `cli_sta_json_and_strict` covers `--json`/`--strict` on gcd. S3 (empty-endpoint WNS
+  serializes as JSON `null`) left as-is: pre-existing degenerate case, out of R0 scope.
+  Verification after fixes: `cargo test --release -p grus-core -- sta::` 62 passed /
+  0 failed / 6 ignored; `cargo test --release -p grus-eda` 3 passed;
+  `cargo clippy --all-targets -- -D warnings` clean.
