@@ -162,7 +162,7 @@ To ensure `grus-eda sta` and OpenSTA evaluate the exact same boundary conditions
 - `set_output_delay <delay_ns> [-clock <clk>] <port_pattern_or_all_outputs>`
 - `set_input_transition <slew_ns> <port_pattern_or_all_inputs>` (or `set_driving_cell -lib_cell <cell> -pin <pin>`)
 - `set_load [-pin_load] <cap_pf> <port_pattern_or_all_outputs>`
-- `set_clock_uncertainty <unc_ns> <clk>`
+- `set_clock_uncertainty [-setup|-hold] <unc_ns> [get_clocks <clk>]` (no flag sets both; the clock list is validated but the design has a single clock)
 
 #### Dual Polarity Propagation & OpenSTA Worst-Slew Merge Rule (`propagate.rs`)
 1. **Startpoint Initialization**:
@@ -428,10 +428,17 @@ reference tool), write the rule in `docs/` before the code, record every compari
   suite green (58 passed). Entry: `docs/results.md`, 2026-11-13.
 
 ### Not scheduled
-- Resistor loops are implemented but **untested against OpenSTA**. Coupling capacitors and `*NAME_MAP` were in
-  this state until step 6: both are now verified on the gcd routed SPEF (tickets 13-14).
-- `set_clock_uncertainty` is applied to register checks only, not output ports (gcd and picorv32 do not use it).
-- Latches are skipped with a warning (out of E3 scope).
+- Resistor loops are implemented and **verified against OpenSTA** (Phase 3, `tests/designs/sta_edge/resistor_loop`):
+  a hand-written SPEF whose data net has parallel paths and a cycle agrees with OpenSTA on every endpoint
+  field and WNS/TNS within the strict tolerance. Note: OpenSTA resolves SPEF node names as `net:node`
+  (bare `n1`-style names are dropped with `STA-1656` warnings) — fixtures must follow that convention.
+- `set_clock_uncertainty` now accepts `[-setup|-hold] <ns> [get_clocks <name>]` and is applied to
+  register checks, clock-gate enables **and output ports** (Phase 3, `sta_edge/clock_uncertainty`; the
+  plain single-value form sets both setup and hold). Verified against OpenSTA on the fixture.
+- Latches outside the `dlxtn` shape (`setup_rising` on D) are still skipped with a warning — verified
+  divergence (`sta_edge/non_dlxtn_latch`, `#[ignore]`d): `dlxtp_1` uses `setup_falling`/`hold_falling`,
+  so the cell's arcs are ignored and 1 of 3 endpoints is reached. Extending the latch model is a
+  separate design decision.
 
 ## 6. Reproducing the Test Inputs
 

@@ -1,0 +1,30 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN edge_latch ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 20000 20000 ) ;
+ROW ROW_0 unithd 0 0 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_1 unithd 0 2720 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_2 unithd 0 5440 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_3 unithd 0 8160 N DO 43 BY 1 STEP 460 2720 ;
+TRACKS X 170 DO 100 STEP 340 LAYER met1 ;
+TRACKS Y 140 DO 100 STEP 340 LAYER met2 ;
+COMPONENTS 3 ;
+- u_buf sky130_fd_sc_hd__buf_2 + PLACED ( 4600 0 ) N ;
+- u_lt sky130_fd_sc_hd__dlxtp_1 + PLACED ( 9200 0 ) N ;
+- u_ff sky130_fd_sc_hd__dfxtp_1 + PLACED ( 13800 0 ) N ;
+END COMPONENTS
+PINS 3 ;
+- clk + NET clk + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 0 ) N ;
+- d_in + NET din + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 2720 ) N ;
+- y + NET y + DIRECTION OUTPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 18400 0 ) N ;
+END PINS
+NETS 5 ;
+- clk ( PIN clk ) ( u_lt GATE ) ( u_ff CLK ) + USE SIGNAL ;
+- din ( PIN d_in ) ( u_buf A ) + USE SIGNAL ;
+- n1 ( u_buf X ) ( u_lt D ) + USE SIGNAL ;
+- n2 ( u_lt Q ) ( u_ff D ) + USE SIGNAL ;
+- y ( u_ff Q ) ( PIN y ) + USE SIGNAL ;
+END NETS
+END DESIGN

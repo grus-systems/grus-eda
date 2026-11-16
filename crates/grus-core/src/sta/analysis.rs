@@ -853,7 +853,7 @@ fn collect_endpoints(
                 continue;
             };
             let late_time = eval_nldm_constraint(late_table, s.slew_max[pol], clk_state.slew_max[RISE]);
-            let closing_max = sdc.period_ns + clk_state.arrival_min[RISE] - late_time - sdc.uncertainty_ns;
+            let closing_max = sdc.period_ns + clk_state.arrival_min[RISE] - late_time - sdc.setup_uncertainty_ns;
             // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
             // is reported at the opening edge and the slack is what remains before the closing edge.
             let opening_max = half_period + clk_state.arrival_min[RISE];
@@ -866,7 +866,7 @@ fn collect_endpoints(
                 (opening_max, closing_max - arr_max)
             };
             let early_time = eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_max[RISE]);
-            let req_min = clk_state.arrival_max[RISE] + early_time + sdc.uncertainty_ns;
+            let req_min = clk_state.arrival_max[RISE] + early_time + sdc.hold_uncertainty_ns;
             let slack_min = s.arrival_min[pol] - req_min;
             cands.max[pol] = Some(Worst { arr: arr_max, req: req_max, slack: slack_max, slew: s.slew_max[pol] });
             cands.min[pol] = Some(Worst { arr: s.arrival_min[pol], req: req_min, slack: slack_min, slew: s.slew_min[pol] });
@@ -879,8 +879,8 @@ fn collect_endpoints(
     let gate_latency = sdc.clock_latency_ns;
     for &enable in &graph.gating_enables {
         let s = state[enable.0 as usize];
-        let req_max = sdc.period_ns + gate_latency - sdc.uncertainty_ns;
-        let req_min = half_period + gate_latency + sdc.uncertainty_ns;
+        let req_max = sdc.period_ns + gate_latency - sdc.setup_uncertainty_ns;
+        let req_min = half_period + gate_latency + sdc.hold_uncertainty_ns;
         let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
             if !s.reached(pol) {
@@ -903,8 +903,10 @@ fn collect_endpoints(
         let port = cx.port_name(pin);
         let output_delay = sdc.output_delay_ns(port);
         let latency = sdc.output_clock_latency_ns(port);
-        let req_max = latency + sdc.period_ns - output_delay;
-        let req_min = latency - output_delay;
+        // OpenSTA applies clock uncertainty to output-port required times too (setup subtracts,
+        // hold adds), the same terms the register checks carry.
+        let req_max = latency + sdc.period_ns - output_delay - sdc.setup_uncertainty_ns;
+        let req_min = latency - output_delay + sdc.hold_uncertainty_ns;
         let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
             if !s.reached(pol) {
@@ -2292,6 +2294,116 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    /// Phase 3 edge-case fixtures under `tests/designs/sta_edge/`: hand-written DEF/SDC(/SPEF) per
+    /// case, golden emitted by OpenSTA via the case's `generate_ref.sh`. The golden JSON reuses the
+    /// `sta.reference.json` endpoint schema under a single mode key.
+    fn compare_sta_edge(case: &str, def: &str, sdc: &str, spef: Option<&str>, golden_key: &str, tol: Tol) {
+        let lib_dir = sky130_hd();
+        let case_dir = design_dir("sta_edge").join(case);
+
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(&design_dir("sta_edge").join(def), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&case_dir.join(sdc)).expect("SDC");
+        let parasitics = spef.map(|s| {
+            let spef_doc = crate::readers::load_spef(&case_dir.join(s)).expect("SPEF");
+            crate::sta::spef_parasitics(&design, &spef_doc).expect("SPEF parasitics")
+        });
+        let (report, _, polarities) = run_sta_detail(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
+
+        let reference: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(case_dir.join(format!("{case}.reference.json"))).expect("golden file"))
+                .expect("golden JSON");
+        let golden = &reference[golden_key];
+        let ref_endpoints = golden["endpoints"].as_array().expect("endpoints");
+        assert_eq!(report.endpoints.len(), ref_endpoints.len(), "endpoint count");
+
+        const SLACK_TIE_NS: f64 = 0.002;
+        let mut failures = Vec::new();
+        let fields = ["max_arr_ns", "max_req_ns", "max_slack_ns", "max_slew_ns", "min_arr_ns", "min_req_ns", "min_slack_ns", "min_slew_ns"];
+        for r in ref_endpoints {
+            let name = r["pin"].as_str().unwrap();
+            let Some(idx) = report.endpoints.iter().position(|e| e.pin == name) else {
+                failures.push(format!("{name}: missing"));
+                continue;
+            };
+            let ep = &polarities[idx];
+            let max = resolve_tied_polarity(
+                pick_worst_polarity(&ep.max).unwrap(),
+                &ep.max,
+                r["max_arr_ns"].as_f64().unwrap(),
+                r["max_req_ns"].as_f64().unwrap(),
+                r["max_slew_ns"].as_f64().unwrap(),
+                SLACK_TIE_NS,
+            );
+            let min = resolve_tied_polarity(
+                pick_worst_polarity(&ep.min).unwrap(),
+                &ep.min,
+                r["min_arr_ns"].as_f64().unwrap(),
+                r["min_req_ns"].as_f64().unwrap(),
+                r["min_slew_ns"].as_f64().unwrap(),
+                SLACK_TIE_NS,
+            );
+            let values = [max.arr, max.req, max.slack, max.slew, min.arr, min.req, min.slack, min.slew];
+            for (i, field) in fields.iter().enumerate() {
+                let expected = r[*field].as_f64().unwrap();
+                let (rel_tol, abs_tol) = if field.ends_with("slew_ns") {
+                    (tol.slew_rel, 0.005)
+                } else if field.ends_with("slack_ns") {
+                    (tol.arr_rel, tol.slack_abs_ns)
+                } else {
+                    (tol.arr_rel, tol.arr_abs_ns)
+                };
+                if !within_tolerance(values[i], expected, rel_tol, abs_tol).0 {
+                    failures.push(format!("{name}.{field}: ours={} ref={expected}", values[i]));
+                }
+            }
+        }
+        for (ours, key) in [
+            (report.wns_max_ns, "wns_max_ns"),
+            (report.tns_max_ns, "tns_max_ns"),
+            (report.wns_min_ns, "wns_min_ns"),
+            (report.tns_min_ns, "tns_min_ns"),
+        ] {
+            let expected = golden[key].as_f64().unwrap();
+            let (rel, abs) = if key.starts_with("tns") { (tol.tns_rel, 0.005) } else { (tol.arr_rel, tol.slack_abs_ns) };
+            if !within_tolerance(ours, expected, rel, abs).0 {
+                failures.push(format!("{key}: ours={ours} ref={expected}"));
+            }
+        }
+        assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    /// Hand-written SPEF whose data net has resistor loops (parallel paths and a cycle): the reader
+    /// keeps a BFS spanning tree, OpenSTA keeps its own reduction. Both must agree on the endpoints.
+    #[test]
+    fn test_sta_edge_resistor_loop() {
+        compare_sta_edge("resistor_loop", "base.def", "edge.sdc", Some("edge.spef"), "spef", Tol::STRICT);
+    }
+
+    /// `set_clock_uncertainty -setup 0.2 [get_clocks core_clk]`: OpenSTA applies setup uncertainty
+    /// to register checks and to the output-port required time; ours now does both.
+    #[test]
+    fn test_sta_edge_clock_uncertainty() {
+        compare_sta_edge("clock_uncertainty", "base.def", "edge.sdc", None, "zero_wire", Tol::STRICT);
+    }
+
+    /// `dlxtp_1` is a positive latch (`setup_falling`/`hold_falling` on GATE); `latch_enable` only
+    /// knows the `dlxtn` shape (`setup_rising`), so the cell's arcs are ignored: 1 of OpenSTA's 3
+    /// endpoints is reached (`u_ff/D` and `u_lt/D` unreached). Extending the latch model is a
+    /// separate design decision; see docs/results.md.
+    #[test]
+    #[ignore = "dlxtp arcs ignored: ours reaches 1/3 endpoints vs OpenSTA (setup_falling latch shape unmodelled)"]
+    fn test_sta_edge_non_dlxtn_latch() {
+        compare_sta_edge("non_dlxtn_latch", "non_dlxtn_latch/edge_latch.def", "edge_latch.sdc", None, "zero_wire", Tol::STRICT);
     }
 
     struct ReproSweepRow {

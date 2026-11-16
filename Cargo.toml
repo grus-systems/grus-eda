@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/grus-core", "crates/grus-eda"]
 
 [workspace.package]
-version = "0.1.55"
+version = "0.1.56"
 edition = "2024"
 license = "Apache-2.0"
 

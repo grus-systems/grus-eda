@@ -41,7 +41,10 @@ pub struct Sdc {
     pub clock_name: Option<String>,
     pub clock_port: Option<String>,
     pub period_ns: f32,
-    pub uncertainty_ns: f32,
+    /// Setup-side clock uncertainty: subtracted from required times.
+    pub setup_uncertainty_ns: f32,
+    /// Hold-side clock uncertainty: added to required times.
+    pub hold_uncertainty_ns: f32,
     pub clock_latency_ns: f32,
     pub io_clock_latency_ns: f32,
     input_delays: Vec<DelayRule>,
@@ -332,7 +335,7 @@ impl Interp {
                 Ok(empty())
             }
             "set_clock_uncertainty" => {
-                self.sdc.uncertainty_ns = single_number(args)?;
+                self.set_clock_uncertainty(args)?;
                 Ok(empty())
             }
             "set_input_delay" => {
@@ -392,6 +395,50 @@ impl Interp {
                 self.sdc.period_ns = period_ns;
             }
             _ => bail!("unsupported create_clock argument"),
+        }
+        Ok(())
+    }
+
+    /// `set_clock_uncertainty [-setup|-hold] <ns> [get_clocks <name>]`. OpenSTA requires the clock
+    /// list; the single-value form is kept for hand-written SDCs and sets both checks. At most one
+    /// of `-setup`/`-hold` is accepted, matching OpenSTA, which treats a second flag as objects.
+    fn set_clock_uncertainty(&mut self, args: &[Value]) -> Result<()> {
+        let mut setup = false;
+        let mut hold = false;
+        let mut rest = Vec::with_capacity(args.len());
+        for arg in args {
+            match arg {
+                Value::Str(s) if s.as_str() == "-setup" || s.as_str() == "-hold" => {
+                    let slot = if s.as_str() == "-setup" { &mut setup } else { &mut hold };
+                    if *slot {
+                        bail!("duplicate {s}");
+                    }
+                    *slot = true;
+                }
+                value => rest.push(value),
+            }
+        }
+        if setup && hold {
+            bail!("set_clock_uncertainty takes at most one of -setup/-hold");
+        }
+        let value_ns = match rest.as_slice() {
+            [Value::Str(value)] => parse_f32(value)?,
+            [Value::Str(value), Value::Clocks(names)] => {
+                for name in names {
+                    self.resolve_clock(name)?;
+                }
+                parse_f32(value)?
+            }
+            _ => bail!("set_clock_uncertainty takes a value and optional [get_clocks ...]"),
+        };
+        match (setup, hold) {
+            (false, false) => {
+                self.sdc.setup_uncertainty_ns = value_ns;
+                self.sdc.hold_uncertainty_ns = value_ns;
+            }
+            (true, false) => self.sdc.setup_uncertainty_ns = value_ns,
+            (false, true) => self.sdc.hold_uncertainty_ns = value_ns,
+            (true, true) => unreachable!(),
         }
         Ok(())
     }
@@ -515,13 +562,6 @@ fn positionals(args: &[Value]) -> Result<Vec<&Value>> {
         }
     }
     Ok(out)
-}
-
-fn single_number(args: &[Value]) -> Result<f32> {
-    let [Value::Str(value)] = positionals(args)?.as_slice() else {
-        bail!("expected a single numeric value");
-    };
-    parse_f32(value)
 }
 
 fn value_and_ports(args: &[Value]) -> Result<(PortSel, f32)> {
@@ -724,8 +764,6 @@ mod tests {
             "set_input_delay -max 1.0 -clock core_clk [all_inputs]",
             "set_input_delay 1.0 -add_delay -clock core_clk [all_inputs]",
             "set_output_delay -min 1.0 -clock core_clk [all_outputs]",
-            "set_clock_uncertainty -setup 0.1",
-            "set_clock_uncertainty -hold 0.1",
         ];
         for snippet in cases {
             let text = format!("{GCD}{snippet}\n");
@@ -741,7 +779,9 @@ mod tests {
             "set_load 0.05 extra [all_outputs]",
             "set_input_delay 1.0 -clock core_clk clk",
             "set_clock_uncertainty foo 0.1",
-            "set_clock_uncertainty 0.1 [get_clocks core_clk]",
+            "set_clock_uncertainty 0.1 0.2",
+            "set_clock_uncertainty -setup -hold 0.1",
+            "set_clock_uncertainty 0.1 [get_clocks nope]",
         ];
         for snippet in cases {
             let text = format!("{GCD}{snippet}\n");
@@ -753,7 +793,22 @@ mod tests {
     fn keeps_negative_values_and_the_known_flags() {
         let sdc = parse_sdc(&format!("{GCD}set_input_delay -0.5 -clock core_clk [all_inputs -no_clocks]\n")).unwrap();
         assert_eq!(sdc.input_delay_ns("req_val"), -0.5);
-        assert!(parse_sdc(&format!("{GCD}set_clock_uncertainty 0.1\n")).is_ok());
+        let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty 0.1\n")).unwrap();
+        assert_eq!(sdc.setup_uncertainty_ns, 0.1);
+        assert_eq!(sdc.hold_uncertainty_ns, 0.1);
+    }
+
+    #[test]
+    fn clock_uncertainty_setup_hold_and_clock_list() {
+        let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty -setup 0.2 [get_clocks core_clk]\n")).unwrap();
+        assert_eq!(sdc.setup_uncertainty_ns, 0.2);
+        assert_eq!(sdc.hold_uncertainty_ns, 0.0);
+        let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty -hold 0.1 [get_clocks core_clk]\n")).unwrap();
+        assert_eq!(sdc.setup_uncertainty_ns, 0.0);
+        assert_eq!(sdc.hold_uncertainty_ns, 0.1);
+        let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty 0.3 [get_clocks core_clk]\n")).unwrap();
+        assert_eq!(sdc.setup_uncertainty_ns, 0.3);
+        assert_eq!(sdc.hold_uncertainty_ns, 0.3);
     }
 
     #[test]

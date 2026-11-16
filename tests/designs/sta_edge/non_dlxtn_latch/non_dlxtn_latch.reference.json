@@ -1,0 +1,14 @@
+{
+  "design": "sta_edge_non_dlxtn_latch",
+  "zero_wire": {
+    "wns_max_ns": 0.000000,
+    "tns_max_ns": 0.000000,
+    "wns_min_ns": 0.298585,
+    "tns_min_ns": 0.000000,
+    "endpoints": [
+      {"pin": "u_ff/D", "max_arr_ns": 1.426987, "max_req_ns": 4.942377, "max_slack_ns": 3.515390, "max_slew_ns": 0.033081, "min_arr_ns": 0.244362, "min_req_ns": -0.054223, "min_slack_ns": 0.298585, "min_slew_ns": 0.022320},
+      {"pin": "u_lt/D", "max_arr_ns": 1.156276, "max_req_ns": 1.156276, "max_slack_ns": 0.000000, "max_slew_ns": 0.021999, "min_arr_ns": 6.156276, "min_req_ns": 2.466444, "min_slack_ns": 3.689832, "min_slew_ns": 0.021999},
+      {"pin": "y", "max_arr_ns": 0.587329, "max_req_ns": 4.000000, "max_slack_ns": 3.412671, "max_slew_ns": 0.468686, "min_arr_ns": 0.439696, "min_req_ns": -1.000000, "min_slack_ns": 1.439696, "min_slew_ns": 0.230835}
+    ]
+  }
+}

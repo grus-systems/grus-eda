@@ -1,0 +1,13 @@
+{
+  "design": "sta_edge_resistor_loop",
+  "spef": {
+    "wns_max_ns": 3.412671,
+    "tns_max_ns": 0.000000,
+    "wns_min_ns": 1.161237,
+    "tns_min_ns": 0.000000,
+    "endpoints": [
+      {"pin": "u_ff/D", "max_arr_ns": 1.161182, "max_req_ns": 4.888017, "max_slack_ns": 3.726835, "max_slew_ns": 0.024402, "min_arr_ns": 1.127454, "min_req_ns": -0.033784, "min_slack_ns": 1.161237, "min_slew_ns": 0.028778},
+      {"pin": "y", "max_arr_ns": 0.587329, "max_req_ns": 4.000000, "max_slack_ns": 3.412671, "max_slew_ns": 0.468686, "min_arr_ns": 0.439696, "min_req_ns": -1.000000, "min_slack_ns": 1.439696, "min_slew_ns": 0.230835}
+    ]
+  }
+}

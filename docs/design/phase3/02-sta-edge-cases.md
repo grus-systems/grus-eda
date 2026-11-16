@@ -103,3 +103,21 @@ Fixture rules:
   verified / diverged / still open with a pointer to the fixture.
 - `cargo test --release -p grus-core sta::` and `cargo clippy --all-targets
   -- -D warnings` clean.
+
+## Outcomes (2026-11-16, run on the Mac mini in `librelane:3.0.16`)
+
+- **Case A `resistor_loop`: PASS, strict.** First SPEF draft used bare node
+  names (`n1`); OpenSTA dropped every resistor with `STA-1656 pin not found`
+  (nodes must be `net:node`, e.g. `n1:0`). Fixture corrected and regenerated;
+  all endpoint fields and WNS/TNS agree within `max(5 ps, 1%)`.
+- **Case B `clock_uncertainty`: PASS after a real fix.** The ticket assumed
+  the plain `set_clock_uncertainty <ns>` form; OpenSTA rejects it
+  (`STA-0567: requires two positional arguments`). The fixture uses
+  `set_clock_uncertainty -setup 0.2 [get_clocks core_clk]`, which the parser
+  rejected — extended per this ticket's escape clause, recorded here first:
+  `Sdc` now has `setup_uncertainty_ns`/`hold_uncertainty_ns` (plain form sets
+  both), and output-port `req_max`/`req_min` gained the uncertainty terms
+  OpenSTA applies (the predicted non-register-endpoint divergence was real).
+- **Case C `non_dlxtn_latch`: verified divergence, `#[ignore]`d.** `dlxtp_1`
+  uses `setup_falling`/`hold_falling`; ours reaches 1 of 3 endpoints.
+  Latch-model extension left as a separate decision.
