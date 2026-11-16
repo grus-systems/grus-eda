@@ -27,6 +27,19 @@ if [ ! -f /.dockerenv ] && [ ! -f /nix/var/nix/profiles/default/bin/openroad ]; 
 fi
 
 openroad -no_init -no_splash << 'EOF'
+proc count_violations {paths} {
+    array set seen {}
+    set n 0
+    foreach pe $paths {
+        set name [get_full_name [$pe pin]]
+        if {[sta::time_sta_ui [$pe slack]] < 0 && [info exists seen($name)] == 0} {
+            set seen($name) 1
+            incr n
+        }
+    }
+    return $n
+}
+
 proc collect_endpoints_json {} {
     array set max_arr {}
     array set max_req {}
@@ -79,6 +92,8 @@ set wns_max [format "%.6f" [sta::worst_slack -max]]
 set tns_max [format "%.6f" [sta::total_negative_slack -max]]
 set wns_min [format "%.6f" [sta::worst_slack -min]]
 set tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set viol_max [count_violations [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 100000]]
+set viol_min [count_violations [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 100000]]
 set endpoints [collect_endpoints_json]
 
 set fp [open "/work/tests/designs/sta_edge/propagated_clock/propagated_clock.reference.json" "w"]
@@ -89,6 +104,8 @@ puts $fp "    \"wns_max_ns\": $wns_max,"
 puts $fp "    \"tns_max_ns\": $tns_max,"
 puts $fp "    \"wns_min_ns\": $wns_min,"
 puts $fp "    \"tns_min_ns\": $tns_min,"
+puts $fp "    \"setup_violations\": $viol_max,"
+puts $fp "    \"hold_violations\": $viol_min,"
 puts $fp "    \"endpoints\": \["
 puts $fp $endpoints
 puts $fp "    \]"

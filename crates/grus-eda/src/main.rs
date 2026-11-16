@@ -448,13 +448,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             };
             let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
             println!(
-                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms",
+                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6} viol={}, hold wns={:.6} tns={:.6} viol={}, elapsed={:.2}ms",
                 mode,
                 report.endpoints.len(),
                 report.wns_max_ns,
                 report.tns_max_ns,
+                report.setup_violations,
                 report.wns_min_ns,
                 report.tns_min_ns,
+                report.hold_violations,
                 t0.elapsed().as_secs_f64() * 1000.0,
             );
             print_skip_summary(&report);

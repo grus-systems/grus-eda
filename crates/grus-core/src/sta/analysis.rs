@@ -222,6 +222,10 @@ pub struct StaReport {
     pub tns_max_ns: f32,
     pub wns_min_ns: f32,
     pub tns_min_ns: f32,
+    /// Endpoints whose worst setup (max) slack is negative.
+    pub setup_violations: u32,
+    /// Endpoints whose worst hold (min) slack is negative.
+    pub hold_violations: u32,
     pub endpoints: Vec<EndpointReport>,
     pub skipped: SkipReport,
 }
@@ -809,9 +813,13 @@ fn propagate_clock(
         return (clk, parity);
     };
     // The fall edge leaves the source half a period after the rise (50% duty cycle).
+    // The propagated slew starts at the clock port's `set_input_transition` (the port is
+    // an input): `set_input_transition 0.15 [all_inputs]` gives 0.15 at directly connected
+    // clock pins, while `set_clock_transition` does not reach the propagated network at
+    // all (measured on sta_edge/hold_violation and sta_edge/propagated_clock).
     let half_period = 0.5 * sdc.period_ns;
     let lat = sdc.clock_source_latency_ns;
-    let tr = sdc.clock_transition_ns;
+    let tr = sdc.input_transition_ns(cx.port_name(port));
     let p = port.0 as usize;
     clk[p].merge(RISE, lat, lat, tr, tr);
     clk[p].merge(FALL, lat + half_period, lat + half_period, tr, tr);
@@ -1375,6 +1383,8 @@ fn collect_endpoints(
             tns_max_ns: tns(|e| e.max_slack_ns),
             wns_min_ns: wns(|e| e.min_slack_ns),
             tns_min_ns: tns(|e| e.min_slack_ns),
+            setup_violations: endpoints.iter().filter(|e| e.max_slack_ns < 0.0).count() as u32,
+            hold_violations: endpoints.iter().filter(|e| e.min_slack_ns < 0.0).count() as u32,
             endpoints,
             skipped,
         },
@@ -2961,6 +2971,15 @@ mod tests {
                 failures.push(format!("{key}: ours={ours} ref={expected}"));
             }
         }
+        // Goldens that carry OpenSTA's violation counts must match exactly: a count is an
+        // integer, not a tolerance question.
+        for (ours, key) in [(report.setup_violations, "setup_violations"), (report.hold_violations, "hold_violations")] {
+            if let Some(expected) = golden.get(key)
+                && ours != expected.as_u64().unwrap() as u32
+            {
+                failures.push(format!("{key}: ours={ours} ref={}", expected.as_u64().unwrap()));
+            }
+        }
         assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
     }
 
@@ -2984,7 +3003,21 @@ mod tests {
     /// on clock edge 1; the golden comes from OpenSTA `report_checks`/endpoint collection.
     #[test]
     fn test_sta_edge_propagated_clock() {
-        compare_sta_edge("propagated_clock", "propagated_clock/propagated.def", "edge.sdc", None, "zero_wire", Tol::PROPAGATED_CLOCK);
+        compare_sta_edge("propagated_clock", "propagated_clock/propagated.def", "edge.sdc", None, "zero_wire", Tol::STRICT);
+    }
+
+    /// Real hold violations on the direct `d_in -> D` paths (zero data delay, `-min 0.0`
+    /// input delay, 0.1 ns hold uncertainty): 2 of 4 endpoints violate under both the ideal
+    /// clock and the propagated clock through `u_clkb`. The golden carries OpenSTA's
+    /// violation counts.
+    #[test]
+    fn test_sta_edge_hold_violation_ideal() {
+        compare_sta_edge("hold_violation", "hold_violation/hold.def", "ideal.sdc", None, "ideal", Tol::STRICT);
+    }
+
+    #[test]
+    fn test_sta_edge_hold_violation_propagated() {
+        compare_sta_edge("hold_violation", "hold_violation/hold.def", "propagated.sdc", None, "propagated", Tol::STRICT);
     }
 
     /// `dlxtp_1` is a positive latch (`setup_falling`/`hold_falling` on GATE); `latch_enable` only

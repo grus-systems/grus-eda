@@ -5,6 +5,8 @@
     "tns_max_ns": 0.000000,
     "wns_min_ns": -2.100000,
     "tns_min_ns": -2.100000,
+    "setup_violations": 0,
+    "hold_violations": 1,
     "endpoints": [
       {"pin": "u_and/B", "max_arr_ns": 0.700000, "max_req_ns": 5.100000, "max_slack_ns": 4.400000, "max_slew_ns": 0.150000, "min_arr_ns": 0.700000, "min_req_ns": 2.800000, "min_slack_ns": -2.100000, "min_slew_ns": 0.150000},
       {"pin": "u_and2/B", "max_arr_ns": 0.700000, "max_req_ns": 2.808518, "max_slack_ns": 2.108518, "max_slew_ns": 0.150000, "min_arr_ns": 5.700000, "min_req_ns": 0.506541, "min_slack_ns": 5.193459, "min_slew_ns": 0.150000},

@@ -1076,15 +1076,16 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
     clock uncertainty (OpenSTA `report_checks -path_delay max -to u_lt/D`: fall edge 2.50 +
     network 0.38 - unc 0.10 = 2.78).
   - AND-gate enable: setup vs the next rise, hold vs the fall, with the same parity shift.
-  - `set_clock_latency` without `-source` is ignored under propagation; `-source` latency and
-    `set_clock_transition` seed the source port and are also the reference for I/O delays
-    (OpenSTA reports "clock network delay (propagated) 0.20" at the input port).
-- **Comparison** (all 12 endpoints, zero wire): worst abs diff 22.8 ps (`u_ff5/D`
-  `max_arr_ns`), every field within `Tol::PROPAGATED_CLOCK` (abs 30 ps / slew 2% / TNS 2%).
-  WNS max 1.7872 vs 1.7897 ns, WNS min -2.1000 vs -2.1000 ns. The residual is a uniform
-  ~10-23 ps early bias on clock-referenced fields: per-cell NLDM differences accumulate over
-  the 4-stage tree (direct net, `clkbuf`, `clkinv`, `clkbuf2`, `and2` branches); data-path
-  fields not touching the clock match exactly or within ps.
+  - `set_clock_latency` without `-source` is ignored under propagation; `-source` latency is
+    the reference for I/O delays (OpenSTA reports "clock network delay (propagated) 0.20"
+    at the input port). The propagated slew seeds from the clock port's `set_input_transition`,
+    not `set_clock_transition` — corrected in R3 (see below); with `0.15 [all_inputs]` the
+    direct clock pins see 0.15 and `u_clkbuf/X` 0.07/0.05, matching OpenSTA `report_slews`.
+- **Comparison** (all 12 endpoints, zero wire): worst abs diff 22.8 ps at R2 commit time,
+  re-measured **0.34 ps** after the R3 slew fix (every field within `Tol::STRICT`).
+  WNS max 1.7897 vs 1.7897 ns, WNS min -2.1000 vs -2.1000 ns. The original residual was a
+  uniform ~10-23 ps early bias on clock-referenced fields — later identified as the wrong
+  propagated-clock source slew (see the R3 entry), not per-cell NLDM differences.
 - **Known approximations** (documented, not silent): the launch side of the hold/setup edge
   pairing assumes clock-edge parity 0 — an endpoint launched through an inverting clock path
   pairs a different edge and is not corrected; `unset_propagated_clock` after `set` is
@@ -1112,3 +1113,34 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
   `set_propagated_clock`/`unset_propagated_clock` flag rejection, virtual-clock rejection,
   and the `-source` vs plain latency split. Ideal-clock mode is regression-covered by every
   existing `sta_edge` and design test (parity paths are no-ops without the flag).
+
+## 2026-11-17 — R3: hold with propagated clocks (v0.1.61)
+
+- **Violation counts**: `StaReport` gains `setup_violations`/`hold_violations` (endpoints whose
+  worst slack is negative), printed by `sta` next to WNS/TNS and serialised in `--json`.
+  `compare_sta_edge` asserts them exactly when the golden carries the keys; the OpenSTA side
+  counts distinct endpoint pins with `slack < 0` over `find_timing_paths -endpoint_path_count 1`.
+- **Fixture** `sta_edge/hold_violation/`: `clk -> u_clkb (clkbuf_2) -> c1 -> u_ff0/u_ff1/u_ff2
+  CLK`; `d_in` drives `u_ff0/D` and `u_ff2/D` directly (zero data delay) and `u_ff0/Q ->
+  u_ff1/D`; `u_ff1/Q -> y`. `ideal.sdc` and `propagated.sdc` share the constraints
+  (`-min 0.0` input delay, 0.1 ns hold uncertainty) so both modes have real hold violations:
+  OpenSTA reports 2/4 endpoints violated, WNS min -0.0646 ns ideal / -0.1432 ns propagated.
+  Golden `hold_violation.reference.json` holds both modes, emitted by the committed
+  `generate_ref.sh` (two `openroad` runs inside the pinned LibreLane image).
+- **Root-cause fix (the R2 residual)**: the propagated clock's source slew is the clock
+  port's `set_input_transition`, not `set_clock_transition` and not zero. Evidence:
+  `report_slews` shows 0.15 at directly connected clock pins under
+  `set_input_transition 0.15 [all_inputs]` (propagated_clock) and 0.00 under
+  `set_input_transition [get_ports d_in]` only (hold_violation); `set_clock_transition`
+  values 0.1 and 1.0 leave arrival and slew unchanged, so it never reaches the propagated
+  network. Seeding `tr = input_transition_ns(clk_port)` made `propagated_clock` match
+  OpenSTA to **0.34 ps worst** (was 22.8 ps) and `hold_violation` to **0.0 ps** in both
+  modes — the earlier "per-cell NLDM residual" was this slew error all along.
+- **Min path**: the early/late split was already plumbed in R2 (`arrival_min`, `slew_min`,
+  `derate_early` on data and clock alike); this fixture is the first with real propagated
+  hold violations and it matches OpenSTA on violation count, WNS/TNS and every per-endpoint
+  min field exactly (zero wire, `Tol::STRICT`).
+- **Verification**: `cargo test --workspace` 184 passed / 0 failed / 7 ignored;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean. New tests
+  `test_sta_edge_hold_violation_{ideal,propagated}`; `test_sta_edge_propagated_clock` now
+  runs at `Tol::STRICT`.
