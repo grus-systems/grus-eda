@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, main]
   pull_request:
 
 concurrency:
@@ -132,3 +132,25 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  build:
+    # Release binary only; no PDK or generated inputs needed, so this runs
+    # in parallel with `generate`/`test` on the same self-hosted runner.
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Put cargo on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build release binary
+        run: cargo build --release -p grus-eda
+
+      - name: Upload grus-eda binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: grus-eda
+          if-no-files-found: error
+          retention-days: 30
+          path: target/release/grus-eda
