@@ -77,7 +77,7 @@ log is [`../results.md`](../results.md).
 | [f5-pass1-eval.md](f5-pass1-eval.md) | Design (follow-up 2): exact fast evaluation for legalizer pass 1 swaps |
 | [f5/04-implement-eval.md](f5/04-implement-eval.md) | Ticket 04: extrema cache for pass 1 swap evaluation |
 
-## Phase 2 continuation — STA and legalizer speed (in progress)
+## Phase 2 continuation — STA and legalizer speed (done, `v0.1.53`–`v0.1.55`)
 
 | File | What |
 |---|---|
@@ -86,6 +86,14 @@ log is [`../results.md`](../results.md).
 | [phase2/02-sta-call-audit.md](phase2/02-sta-call-audit.md) | Ticket 02: `driver_response` call audit |
 | [phase2/03-legalize-pass3.md](phase2/03-legalize-pass3.md) | Ticket 03: exact legalizer Pass 3 speedup |
 | [phase2/04-timinggraph-csr.md](phase2/04-timinggraph-csr.md) | Ticket 04: TimingGraph flat CSR (structural, last) |
+
+## Phase 3 — reference-tool checks and release gate (in progress)
+
+| File | What |
+|---|---|
+| [phase3/phase3.md](phase3/phase3.md) | Overview: scope, rules, generation host (over SSH) |
+| [phase3/01-picorv32-e1e2-goldens.md](phase3/01-picorv32-e1e2-goldens.md) | Ticket 01: picorv32 E1/E2 OpenROAD goldens and tests |
+| [phase3/02-sta-edge-cases.md](phase3/02-sta-edge-cases.md) | Ticket 02: STA edge cases vs OpenSTA (resistor loops, clock uncertainty, non-dlxtn latches) |
 
 ## F9 — machine-independent tests and CI (done)
 
