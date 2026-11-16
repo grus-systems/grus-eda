@@ -2050,7 +2050,17 @@ mod tests {
         let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
             .expect("Legalization must succeed");
         verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
-        println!("picorv32 legalized: final_hpwl_dbu={}", leg_res.final_hpwl_dbu);
+
+        let ref_path = require(design_dir("picorv32").join("picorv32.reference.json"));
+        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read picorv32.reference.json"))
+            .expect("Parse picorv32.reference.json");
+        let ref_hpwl_dbu = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
+        let gap = (leg_res.final_hpwl_dbu - ref_hpwl_dbu) as f64 / ref_hpwl_dbu as f64;
+        println!(
+            "picorv32 HPWL: reference={} dbu, ours={} dbu, gap={:+.2}%",
+            ref_hpwl_dbu, leg_res.final_hpwl_dbu, gap * 100.0
+        );
+        assert!(gap.abs() <= 0.05, "picorv32 legalized HPWL gap {:.2}% exceeds 5%", gap * 100.0);
     }
 
     #[test]

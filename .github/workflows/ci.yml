@@ -75,6 +75,7 @@ jobs:
             tests/designs/picorv32/picorv32.routed.def
             tests/designs/picorv32/picorv32.rcx.spef
             tests/designs/picorv32/picorv32.sta.reference.json
+            tests/designs/picorv32/picorv32.util65.def
             tests/designs/picorv32/pins_routed.txt
             tests/designs/aes/aes.synth.v
             tests/designs/aes/aes.synth.json

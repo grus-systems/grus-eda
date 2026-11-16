@@ -19,6 +19,8 @@ tests/designs/picorv32/picorv32.sta.reference.json
 tests/designs/picorv32/picorv32.routed.def
 tests/designs/picorv32/picorv32.rcx.spef
 tests/designs/picorv32/picorv32.drc.rpt
+tests/designs/picorv32/picorv32.orient.def
+tests/designs/picorv32/picorv32.util65.def
 
 # aes generated artifacts over 1 MB (regenerate with tests/designs/aes/generate_ref.sh)
 tests/designs/aes/aes.synth.v
