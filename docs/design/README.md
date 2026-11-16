@@ -77,6 +77,16 @@ log is [`../results.md`](../results.md).
 | [f5-pass1-eval.md](f5-pass1-eval.md) | Design (follow-up 2): exact fast evaluation for legalizer pass 1 swaps |
 | [f5/04-implement-eval.md](f5/04-implement-eval.md) | Ticket 04: extrema cache for pass 1 swap evaluation |
 
+## Phase 2 continuation — STA and legalizer speed (in progress)
+
+| File | What |
+|---|---|
+| [phase2-speed.md](phase2-speed.md) | Overview: measured baseline, corrected premises, ticket list |
+| [phase2/01-dmp-inner-solvers.md](phase2/01-dmp-inner-solvers.md) | Ticket 01: Brent/secant inner solvers in `sta/dmp.rs` |
+| [phase2/02-sta-call-audit.md](phase2/02-sta-call-audit.md) | Ticket 02: `driver_response` call audit |
+| [phase2/03-legalize-pass3.md](phase2/03-legalize-pass3.md) | Ticket 03: exact legalizer Pass 3 speedup |
+| [phase2/04-timinggraph-csr.md](phase2/04-timinggraph-csr.md) | Ticket 04: TimingGraph flat CSR (structural, last) |
+
 ## F9 — machine-independent tests and CI (done)
 
 | File | What |
