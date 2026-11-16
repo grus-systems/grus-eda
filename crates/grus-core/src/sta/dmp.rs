@@ -63,6 +63,10 @@ fn rc_crossing_closed(level: f64, dt: f64, tau: f64) -> Option<f64> {
 /// Time (from the ramp start) at which the RC response first reaches `level`, by bisection
 /// until the bracket is at most 1e-6 ns wide.
 fn rc_crossing_bisect(level: f64, dt: f64, tau: f64) -> f64 {
+    let g = |u: f64| rc_ramp_voltage(u, dt, tau) - level;
+    if let Some(root) = brent_checked(&g, 0.0, dt + tau * 40.0, 1e-6) {
+        return root;
+    }
     let (mut lo, mut hi) = (0.0, dt + tau * 40.0);
     while hi - lo > 1e-6 {
         let mid = 0.5 * (lo + hi);
@@ -73,6 +77,96 @@ fn rc_crossing_bisect(level: f64, dt: f64, tau: f64) -> f64 {
         }
     }
     0.5 * (lo + hi)
+}
+
+/// Brent's method (zbrent) at absolute tolerance `tol` on `[a, b]`, given
+/// `f(a)` and `f(b)` of opposite signs (or a zero endpoint, returned at
+/// once). Returns the midpoint of the final bracket, whose half-width is
+/// below `tol` — the same error bound the bisections this replaces had.
+/// Superlinear where bisection is linear, with bisection steps whenever
+/// interpolation stalls.
+fn brent_root(f: &dyn Fn(f64) -> f64, a: f64, b: f64, fa: f64, fb: f64, tol: f64) -> f64 {
+    let (mut a, mut b) = (a, b);
+    let mut c = a;
+    let mut fa = fa;
+    let mut fb = fb;
+    let mut fc = fa;
+    let (mut d, mut e) = (b - a, b - a);
+    for _ in 0..200 {
+        if (fb > 0.0 && fc > 0.0) || (fb < 0.0 && fc < 0.0) {
+            c = a;
+            fc = fa;
+            d = b - a;
+            e = d;
+        }
+        if fc.abs() < fb.abs() {
+            a = b;
+            b = c;
+            c = a;
+            fa = fb;
+            fb = fc;
+            fc = fa;
+        }
+        let tol1 = 2.0 * f64::EPSILON * b.abs() + 0.5 * tol;
+        let xm = 0.5 * (c - b);
+        if fb == 0.0 {
+            return b;
+        }
+        if xm.abs() <= tol1 {
+            // The root lies inside the final [b, c] bracket; its midpoint has
+            // half the bracket width as its error bound, matching what the
+            // bisections this replaces returned.
+            return 0.5 * (b + c);
+        }
+        if e.abs() >= tol1 && fa.abs() > fb.abs() {
+            let s = fb / fa;
+            let (mut p, mut q);
+            if a == c {
+                p = 2.0 * xm * s;
+                q = 1.0 - s;
+            } else {
+                q = fa / fc;
+                let r = fb / fc;
+                p = s * (2.0 * xm * q * (q - r) - (b - a) * (r - 1.0));
+                q = (q - 1.0) * (r - 1.0) * (s - 1.0);
+            }
+            if p > 0.0 {
+                q = -q;
+            }
+            p = p.abs();
+            if 2.0 * p < (3.0 * xm * q - (tol1 * q).abs()).min((e * q).abs()) {
+                e = d;
+                d = p / q;
+            } else {
+                d = xm;
+                e = d;
+            }
+        } else {
+            d = xm;
+            e = d;
+        }
+        a = b;
+        fa = fb;
+        b += if d.abs() > tol1 { d } else { tol1.copysign(xm) };
+        fb = f(b);
+    }
+    0.5 * (b + c)
+}
+
+/// `brent_root` at `tol` when `f(lo)` and `f(hi)` are finite with opposite
+/// signs (or a zero endpoint); otherwise `None`, so the caller can keep its
+/// original bisection as the fallback — that fallback is also the NaN guard
+/// (`dt == 0` makes `rc_ramp_voltage` return NaN, which bisection absorbs via
+/// `NaN < level == false`).
+fn brent_checked(f: &dyn Fn(f64) -> f64, lo: f64, hi: f64, tol: f64) -> Option<f64> {
+    let (flo, fhi) = (f(lo), f(hi));
+    if flo == 0.0 {
+        return Some(lo);
+    }
+    if fhi == 0.0 {
+        return Some(hi);
+    }
+    (flo.is_finite() && fhi.is_finite() && flo * fhi < 0.0).then(|| brent_root(f, lo, hi, flo, fhi, tol))
 }
 
 /// Time (from the ramp start) at which the RC response first reaches `level`.
@@ -102,6 +196,10 @@ pub fn fit_ramp_duration(rd: f64, c: f64, slew: f64) -> (f64, bool) {
         return (lo, true);
     }
     let mut hi = (slew * 4.0).max(lo * 2.0) + tau * 8.0;
+    let g = |x: f64| rc_slew(x, tau) - slew;
+    if let Some(root) = brent_checked(&g, lo, hi, 1e-6) {
+        return (root, false);
+    }
     while hi - lo > 1e-6 {
         let mid = 0.5 * (lo + hi);
         if rc_slew(mid, tau) < slew {
@@ -161,6 +259,10 @@ pub fn pi_waveform_slew(pi: &PiModel, rd: f64, dt: f64) -> f64 {
         1.0 - post(k1, tau1) - post(k2, tau2)
     };
     let crossing = |level: f64| -> f64 {
+        let g = |u: f64| v1(u) - level;
+        if let Some(root) = brent_checked(&g, 0.0, dt + 40.0 * b1, 1e-7) {
+            return root;
+        }
         let (mut lo, mut hi) = (0.0, dt + 40.0 * b1);
         for _ in 0..80 {
             if hi - lo <= 1e-7 {
@@ -393,13 +495,23 @@ pub fn solve_dmp_with(
         let tx = delay;
         pi_charge(pi, rd, t0, dt, tx) - 0.5 * c
     };
-    let (mut lo, mut hi) = (pi.c1.max(1e-4 * total), total);
-    if residual(hi) >= 0.0 {
+    let (lo, hi) = (pi.c1.max(1e-4 * total), total);
+    let r_hi = residual(hi);
+    if r_hi >= 0.0 {
         return lumped(total);
     }
-    if residual(lo) <= 0.0 {
+    let r_lo = residual(lo);
+    if r_lo <= 0.0 {
         return lumped(lo);
     }
+    // `residual` decreases in `c`, so `-residual` has the sign-change bracket
+    // [lo, hi] with g(lo) < 0 < g(hi); endpoint values are reused from the
+    // early-return checks above. Non-finite endpoints keep the old bisection.
+    if r_lo.is_finite() && r_hi.is_finite() {
+        let g = |c: f64| -residual(c);
+        return lumped(brent_root(&g, lo, hi, -r_lo, -r_hi, 1e-6 * total));
+    }
+    let (mut lo, mut hi) = (lo, hi);
     while hi - lo > 1e-6 * total {
         let mid = 0.5 * (lo + hi);
         if residual(mid) > 0.0 {
