@@ -5,6 +5,10 @@ on:
     branches: [dev]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Both jobs run on the org Mac mini (M4, labels macOS/ARM64):
 # the Intel runner (Late 2014) needs ~17 min for the jpeg
 # OpenROAD flow alone, and generated outputs were verified
