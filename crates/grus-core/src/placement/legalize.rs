@@ -678,6 +678,22 @@ fn build_cell_pin_nets(
     out
 }
 
+// Recomputes the cached x of every netted pin of `c` after the cell moved.
+// Passes 2 and 3 slide cells along x only, so the cached y/orientation inputs stay valid.
+fn refresh_cell_pin_x(
+    db: &DesignDb,
+    cell_pin_nets: &[Vec<(usize, PinId, PinGeom)>],
+    pin_x: &mut [i32],
+    c: usize,
+) {
+    let cx = db.cell_x_dbu[c];
+    let cy = db.cell_y_dbu[c];
+    let orient = db.cell_orient[c];
+    for &(_, pin, g) in &cell_pin_nets[c] {
+        pin_x[pin.0 as usize] = pin_pos_at_cell(g, cx, cy, orient).0;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn equal_width_swap_pass_fast(
     design_db: &mut DesignDb,
@@ -1171,6 +1187,13 @@ pub fn legalize_placement(
             sr.cells.sort_unstable_by_key(|&c| design_db.cell_x_dbu[c]);
         }
 
+        // Flat x-position cache for the x-only sweeps below; Pass 1 has already committed its
+        // swaps, and every later accept refreshes the moved cells' entries.
+        let mut pin_x = vec![0i32; design_db.num_pins()];
+        for (p, slot) in pin_x.iter_mut().enumerate() {
+            *slot = pin_geom.pin_pos(design_db, PinId(p as u32)).0;
+        }
+
         // Pass 2: Adjacent sub-row cell swaps (single net scan per pair since only x shifts)
         for sr in &mut sub_rows {
             let k = sr.cells.len();
@@ -1210,7 +1233,7 @@ pub fn legalize_placement(
                     let (mut min_b, mut max_b) = (i32::MAX, i32::MIN);
                     let (mut min_a, mut max_a) = (i32::MAX, i32::MIN);
                     for &pin in pins {
-                        let (px, _) = pin_geom.pin_pos(design_db, pin);
+                        let px = pin_x[pin.0 as usize];
                         min_b = min_b.min(px);
                         max_b = max_b.max(px);
                         let owner = design_db.pin_cells[pin.0 as usize];
@@ -1231,6 +1254,8 @@ pub fn legalize_placement(
                 if hpwl_x_after < hpwl_x_before {
                     design_db.cell_x_dbu[ca] = new_xa;
                     design_db.cell_x_dbu[cb] = new_xb;
+                    refresh_cell_pin_x(design_db, &cell_pin_nets, &mut pin_x, ca);
+                    refresh_cell_pin_x(design_db, &cell_pin_nets, &mut pin_x, cb);
                     sr.cells.swap(j, j + 1);
                 }
             }
@@ -1277,7 +1302,7 @@ pub fn legalize_placement(
                     let (mut o_lo, mut o_hi) = (i32::MAX, i32::MIN);
                     let (mut c_lo, mut c_hi) = (i32::MAX, i32::MIN);
                     for &pin in pins {
-                        let (px, _) = pin_geom.pin_pos(design_db, pin);
+                        let px = pin_x[pin.0 as usize];
                         if design_db.pin_cells[pin.0 as usize] == Some(c_id) {
                             c_lo = c_lo.min(px);
                             c_hi = c_hi.max(px);
@@ -1296,8 +1321,9 @@ pub fn legalize_placement(
                 candidates_buf.push(left_limit);
                 candidates_buf.push(right_limit);
                 if !other_xs_buf.is_empty() {
-                    other_xs_buf.sort_unstable();
-                    let med = other_xs_buf[other_xs_buf.len() / 2];
+                    let med_idx = other_xs_buf.len() / 2;
+                    other_xs_buf.select_nth_unstable(med_idx);
+                    let med = other_xs_buf[med_idx];
                     let snapped = snap_to_site(med - wc / 2, sr.orig_x_dbu, sr.step_x_dbu, left_limit, right_limit);
                     candidates_buf.push(snapped);
                 }
@@ -1327,7 +1353,10 @@ pub fn legalize_placement(
                         best_x = cand_x;
                     }
                 }
-                design_db.cell_x_dbu[c] = best_x;
+                if best_x != orig_x {
+                    design_db.cell_x_dbu[c] = best_x;
+                    refresh_cell_pin_x(design_db, &cell_pin_nets, &mut pin_x, c);
+                }
             }
         }
     }
