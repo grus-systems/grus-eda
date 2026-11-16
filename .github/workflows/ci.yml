@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [dev, main]
+    tags: ['v*']
   pull_request:
 
 concurrency:
@@ -134,10 +135,18 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build:
-    # Release binary only; no PDK or generated inputs needed. Runs on a
-    # GitHub-hosted runner so it does not queue behind the self-hosted
-    # generate/test jobs; macos-latest is arm64, matching the dev machines.
-    runs-on: macos-latest
+    # Release binaries for both macOS arches. GitHub-hosted runners so they
+    # do not queue behind the self-hosted generate/test jobs; macos-latest
+    # is arm64 and macos-13 is Intel, matching the dev machines.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -148,10 +157,41 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p grus-eda
 
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/grus-eda dist/
+          tar -czf "dist/grus-eda-${{ matrix.target }}.tar.gz" -C dist grus-eda
+          rm dist/grus-eda
+          (cd dist && shasum -a 256 "grus-eda-${{ matrix.target }}.tar.gz" > "grus-eda-${{ matrix.target }}.tar.gz.sha256")
+
       - name: Upload grus-eda binary
         uses: actions/upload-artifact@v4
         with:
-          name: grus-eda
+          name: grus-eda-${{ matrix.target }}
           if-no-files-found: error
           retention-days: 30
-          path: target/release/grus-eda
+          path: dist/*
+
+  release:
+    # Tag pushes (v*) turn the two build artifacts into a GitHub Release so
+    # the binaries can be installed with mise's github backend.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: grus-eda-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

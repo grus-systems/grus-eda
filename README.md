@@ -66,6 +66,25 @@ latch time borrowing. These stay with OpenROAD, OpenSTA, Magic and KLayout.
 A GPU path (Metal) may come after a stage's CPU version agrees with the reference
 tool. The GPU result must then equal the CPU result.
 
+## Install
+
+Tagged releases (`v*`) ship `grus-eda` binaries for `aarch64-apple-darwin`
+and `x86_64-apple-darwin` as `grus-eda-<target>.tar.gz` assets (plus `.sha256`).
+With [mise](https://mise.jdx.dev):
+
+```toml
+[tools."github:grus-systems/grus-eda"]
+version = "v0.1.56"
+
+[tools."github:grus-systems/grus-eda".platforms]
+macos-arm64 = { asset_pattern = "grus-eda-aarch64-apple-darwin.tar.gz" }
+macos-x64 = { asset_pattern = "grus-eda-x86_64-apple-darwin.tar.gz" }
+```
+
+The archive holds the `grus-eda` executable at its root, which mise puts on
+`PATH`. Assets can also be fetched directly from the
+[releases page](https://github.com/grus-systems/grus-eda/releases).
+
 ## Documentation
 
 - [`docs/status.md`](docs/status.md) — Current status per stage: designs covered, tolerances actually used, known gaps
