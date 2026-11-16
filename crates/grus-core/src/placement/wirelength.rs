@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use crate::design_db::{DesignDb, PlacementStatus};
 use crate::interner::{CellId, NetId, PinId};
 use crate::tech_db::{MacroClass, TechDb};
@@ -111,6 +112,144 @@ pub fn compute_hpwl_um(
 /// 2. Shifted Coordinates Inside B_e^\pm and Gradient: evaluates (x_p - x_max) inside B_e^+
 ///    and the gradient, completely eliminating catastrophic cancellation.
 /// 3. f64 Scalar Accumulator for global reductions.
+#[derive(Clone, Copy, Default)]
+struct PinWaCache {
+    p: usize,
+    xp: f64,
+    yp: f64,
+    t_x_plus: f64,
+    t_x_minus: f64,
+    ap_x: f64,
+    am_x: f64,
+    t_y_plus: f64,
+    t_y_minus: f64,
+    ap_y: f64,
+    am_y: f64,
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn eval_net_wa(
+    design_db: &DesignDb,
+    precomp: &WaWirelengthPrecomp,
+    cell_x_um: &[f32],
+    cell_y_um: &[f32],
+    net: usize,
+    inv_gamma: f64,
+    gamma_f64: f64,
+    pin_cache: &mut Vec<PinWaCache>,
+    mut emit_pin_grad: impl FnMut(usize, f32, f32),
+) -> f64 {
+    let pins = design_db.net_pins(NetId(net as u32));
+    if pins.len() <= 1 {
+        return 0.0;
+    }
+
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+
+    pin_cache.clear();
+    for &pin_id in pins {
+        let p = pin_id.0 as usize;
+        let (xp, yp) = match design_db.pin_cells[p] {
+            Some(cell_id) => {
+                let c = cell_id.0 as usize;
+                (
+                    cell_x_um[c] as f64 + precomp.pin_dx_um[p] as f64,
+                    cell_y_um[c] as f64 + precomp.pin_dy_um[p] as f64,
+                )
+            }
+            None => (precomp.pin_dx_um[p] as f64, precomp.pin_dy_um[p] as f64),
+        };
+        x_min = x_min.min(xp);
+        x_max = x_max.max(xp);
+        y_min = y_min.min(yp);
+        y_max = y_max.max(yp);
+        pin_cache.push(PinWaCache {
+            p,
+            xp,
+            yp,
+            ..Default::default()
+        });
+    }
+
+    let mut a_x_plus = 0.0f64;
+    let mut b_x_plus = 0.0f64;
+    let mut a_x_minus = 0.0f64;
+    let mut b_x_minus = 0.0f64;
+
+    let mut a_y_plus = 0.0f64;
+    let mut b_y_plus = 0.0f64;
+    let mut a_y_minus = 0.0f64;
+    let mut b_y_minus = 0.0f64;
+
+    for entry in pin_cache.iter_mut() {
+        let t_x_plus = entry.xp - x_max;
+        let t_x_minus = entry.xp - x_min;
+        let ap_x = (t_x_plus * inv_gamma).exp();
+        let am_x = (-t_x_minus * inv_gamma).exp();
+        a_x_plus += ap_x;
+        b_x_plus += t_x_plus * ap_x;
+        a_x_minus += am_x;
+        b_x_minus += t_x_minus * am_x;
+
+        let t_y_plus = entry.yp - y_max;
+        let t_y_minus = entry.yp - y_min;
+        let ap_y = (t_y_plus * inv_gamma).exp();
+        let am_y = (-t_y_minus * inv_gamma).exp();
+        a_y_plus += ap_y;
+        b_y_plus += t_y_plus * ap_y;
+        a_y_minus += am_y;
+        b_y_minus += t_y_minus * am_y;
+
+        entry.t_x_plus = t_x_plus;
+        entry.t_x_minus = t_x_minus;
+        entry.ap_x = ap_x;
+        entry.am_x = am_x;
+        entry.t_y_plus = t_y_plus;
+        entry.t_y_minus = t_y_minus;
+        entry.ap_y = ap_y;
+        entry.am_y = am_y;
+    }
+
+    let inv_a_x_plus = 1.0 / a_x_plus;
+    let inv_a_x_minus = 1.0 / a_x_minus;
+    let inv_a_y_plus = 1.0 / a_y_plus;
+    let inv_a_y_minus = 1.0 / a_y_minus;
+
+    let wx = (x_max - x_min) + b_x_plus * inv_a_x_plus - b_x_minus * inv_a_x_minus;
+    let wy = (y_max - y_min) + b_y_plus * inv_a_y_plus - b_y_minus * inv_a_y_minus;
+
+    let inv_gamma_a_x_plus_sq = inv_gamma * (inv_a_x_plus * inv_a_x_plus);
+    let inv_gamma_a_x_minus_sq = inv_gamma * (inv_a_x_minus * inv_a_x_minus);
+    let inv_gamma_a_y_plus_sq = inv_gamma * (inv_a_y_plus * inv_a_y_plus);
+    let inv_gamma_a_y_minus_sq = inv_gamma * (inv_a_y_minus * inv_a_y_minus);
+
+    for entry in pin_cache.iter() {
+        let grad_x_plus =
+            entry.ap_x * inv_gamma_a_x_plus_sq * ((gamma_f64 + entry.t_x_plus) * a_x_plus - b_x_plus);
+        let grad_x_minus = entry.am_x
+            * inv_gamma_a_x_minus_sq
+            * ((gamma_f64 - entry.t_x_minus) * a_x_minus + b_x_minus);
+
+        let grad_y_plus =
+            entry.ap_y * inv_gamma_a_y_plus_sq * ((gamma_f64 + entry.t_y_plus) * a_y_plus - b_y_plus);
+        let grad_y_minus = entry.am_y
+            * inv_gamma_a_y_minus_sq
+            * ((gamma_f64 - entry.t_y_minus) * a_y_minus + b_y_minus);
+
+        emit_pin_grad(
+            entry.p,
+            (grad_x_plus - grad_x_minus) as f32,
+            (grad_y_plus - grad_y_minus) as f32,
+        );
+    }
+
+    wx + wy
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compute_wa_wirelength_and_grad(
     design_db: &DesignDb,
@@ -125,6 +264,7 @@ pub fn compute_wa_wirelength_and_grad(
 ) -> f64 {
     let num_cells = design_db.num_cells();
     let num_pins = design_db.num_pins();
+    let num_nets = design_db.num_nets();
 
     assert_eq!(cell_x_um.len(), num_cells);
     assert_eq!(cell_y_um.len(), num_cells);
@@ -138,130 +278,65 @@ pub fn compute_wa_wirelength_and_grad(
     cell_grad_x.fill(0.0);
     cell_grad_y.fill(0.0);
 
-    let inv_gamma = 1.0f64 / (gamma as f64);
-    let mut total_wl: f64 = 0.0;
+    let gamma_f64 = gamma as f64;
+    let inv_gamma = 1.0f64 / gamma_f64;
 
-    for net in 0..design_db.num_nets() {
-        let pins = design_db.net_pins(NetId(net as u32));
-        if pins.len() <= 1 {
-            continue;
+    let total_wl = if num_nets < 1024 {
+        let mut total_wl: f64 = 0.0;
+        let mut pin_cache = Vec::new();
+        for net in 0..num_nets {
+            total_wl += eval_net_wa(
+                design_db,
+                precomp,
+                cell_x_um,
+                cell_y_um,
+                net,
+                inv_gamma,
+                gamma_f64,
+                &mut pin_cache,
+                |p, gx, gy| {
+                    pin_grad_x[p] = gx;
+                    pin_grad_y[p] = gy;
+                },
+            );
         }
-
-        let mut x_min = f64::INFINITY;
-        let mut x_max = f64::NEG_INFINITY;
-        let mut y_min = f64::INFINITY;
-        let mut y_max = f64::NEG_INFINITY;
-
-        for &pin_id in pins {
-            let p = pin_id.0 as usize;
-            let (xp, yp) = match design_db.pin_cells[p] {
-                Some(cell_id) => {
-                    let c = cell_id.0 as usize;
-                    (
-                        cell_x_um[c] as f64 + precomp.pin_dx_um[p] as f64,
-                        cell_y_um[c] as f64 + precomp.pin_dy_um[p] as f64,
-                    )
+        total_wl
+    } else {
+        const CHUNK: usize = 1024;
+        let mut net_wl = vec![0.0f64; num_nets];
+        let chunk_grads: Vec<Vec<(usize, f32, f32)>> = net_wl
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .map_init(Vec::new, |pin_cache, (chunk_idx, wl_slice)| {
+                let net_start = chunk_idx * CHUNK;
+                let mut grads = Vec::with_capacity(CHUNK * 4);
+                for (offset, wl_slot) in wl_slice.iter_mut().enumerate() {
+                    *wl_slot = eval_net_wa(
+                        design_db,
+                        precomp,
+                        cell_x_um,
+                        cell_y_um,
+                        net_start + offset,
+                        inv_gamma,
+                        gamma_f64,
+                        pin_cache,
+                        |p, gx, gy| grads.push((p, gx, gy)),
+                    );
                 }
-                None => (precomp.pin_dx_um[p] as f64, precomp.pin_dy_um[p] as f64),
-            };
-            x_min = x_min.min(xp);
-            x_max = x_max.max(xp);
-            y_min = y_min.min(yp);
-            y_max = y_max.max(yp);
+                grads
+            })
+            .collect();
+        for grads in chunk_grads {
+            for (p, gx, gy) in grads {
+                pin_grad_x[p] = gx;
+                pin_grad_y[p] = gy;
+            }
         }
-
-        let mut a_x_plus = 0.0f64;
-        let mut b_x_plus = 0.0f64;
-        let mut a_x_minus = 0.0f64;
-        let mut b_x_minus = 0.0f64;
-
-        let mut a_y_plus = 0.0f64;
-        let mut b_y_plus = 0.0f64;
-        let mut a_y_minus = 0.0f64;
-        let mut b_y_minus = 0.0f64;
-
-        for &pin_id in pins {
-            let p = pin_id.0 as usize;
-            let (xp, yp) = match design_db.pin_cells[p] {
-                Some(cell_id) => {
-                    let c = cell_id.0 as usize;
-                    (
-                        cell_x_um[c] as f64 + precomp.pin_dx_um[p] as f64,
-                        cell_y_um[c] as f64 + precomp.pin_dy_um[p] as f64,
-                    )
-                }
-                None => (precomp.pin_dx_um[p] as f64, precomp.pin_dy_um[p] as f64),
-            };
-
-            let t_x_plus = xp - x_max;
-            let t_x_minus = xp - x_min;
-            let ap_x = (t_x_plus * inv_gamma).exp();
-            let am_x = (-t_x_minus * inv_gamma).exp();
-            a_x_plus += ap_x;
-            b_x_plus += t_x_plus * ap_x;
-            a_x_minus += am_x;
-            b_x_minus += t_x_minus * am_x;
-
-            let t_y_plus = yp - y_max;
-            let t_y_minus = yp - y_min;
-            let ap_y = (t_y_plus * inv_gamma).exp();
-            let am_y = (-t_y_minus * inv_gamma).exp();
-            a_y_plus += ap_y;
-            b_y_plus += t_y_plus * ap_y;
-            a_y_minus += am_y;
-            b_y_minus += t_y_minus * am_y;
-        }
-
-        let inv_a_x_plus = 1.0 / a_x_plus;
-        let inv_a_x_minus = 1.0 / a_x_minus;
-        let inv_a_y_plus = 1.0 / a_y_plus;
-        let inv_a_y_minus = 1.0 / a_y_minus;
-
-        let wx = (x_max - x_min) + b_x_plus * inv_a_x_plus - b_x_minus * inv_a_x_minus;
-        let wy = (y_max - y_min) + b_y_plus * inv_a_y_plus - b_y_minus * inv_a_y_minus;
-        total_wl += wx + wy;
-
-        let gamma_f64 = gamma as f64;
-        let inv_gamma_a_x_plus_sq = inv_gamma * (inv_a_x_plus * inv_a_x_plus);
-        let inv_gamma_a_x_minus_sq = inv_gamma * (inv_a_x_minus * inv_a_x_minus);
-        let inv_gamma_a_y_plus_sq = inv_gamma * (inv_a_y_plus * inv_a_y_plus);
-        let inv_gamma_a_y_minus_sq = inv_gamma * (inv_a_y_minus * inv_a_y_minus);
-
-        for &pin_id in pins {
-            let p = pin_id.0 as usize;
-            let (xp, yp) = match design_db.pin_cells[p] {
-                Some(cell_id) => {
-                    let c = cell_id.0 as usize;
-                    (
-                        cell_x_um[c] as f64 + precomp.pin_dx_um[p] as f64,
-                        cell_y_um[c] as f64 + precomp.pin_dy_um[p] as f64,
-                    )
-                }
-                None => (precomp.pin_dx_um[p] as f64, precomp.pin_dy_um[p] as f64),
-            };
-
-            let t_x_plus = xp - x_max;
-            let t_x_minus = xp - x_min;
-            let ap_x = (t_x_plus * inv_gamma).exp();
-            let am_x = (-t_x_minus * inv_gamma).exp();
-
-            let grad_x_plus = ap_x * inv_gamma_a_x_plus_sq * ((gamma_f64 + t_x_plus) * a_x_plus - b_x_plus);
-            let grad_x_minus = am_x * inv_gamma_a_x_minus_sq * ((gamma_f64 - t_x_minus) * a_x_minus + b_x_minus);
-            pin_grad_x[p] = (grad_x_plus - grad_x_minus) as f32;
-
-            let t_y_plus = yp - y_max;
-            let t_y_minus = yp - y_min;
-            let ap_y = (t_y_plus * inv_gamma).exp();
-            let am_y = (-t_y_minus * inv_gamma).exp();
-
-            let grad_y_plus = ap_y * inv_gamma_a_y_plus_sq * ((gamma_f64 + t_y_plus) * a_y_plus - b_y_plus);
-            let grad_y_minus = am_y * inv_gamma_a_y_minus_sq * ((gamma_f64 - t_y_minus) * a_y_minus + b_y_minus);
-            pin_grad_y[p] = (grad_y_plus - grad_y_minus) as f32;
-        }
-    }
+        net_wl.iter().sum()
+    };
 
     // Cell gradient gathering across movable cells
-    for c in 0..num_cells {
+    let gather_cell = |c: usize, gx_out: &mut f32, gy_out: &mut f32| {
         if precomp.movable_cell_mask[c] {
             let mut gx = 0.0f32;
             let mut gy = 0.0f32;
@@ -270,12 +345,24 @@ pub fn compute_wa_wirelength_and_grad(
                 gx += pin_grad_x[p];
                 gy += pin_grad_y[p];
             }
-            cell_grad_x[c] = gx;
-            cell_grad_y[c] = gy;
+            *gx_out = gx;
+            *gy_out = gy;
         } else {
-            cell_grad_x[c] = 0.0;
-            cell_grad_y[c] = 0.0;
+            *gx_out = 0.0;
+            *gy_out = 0.0;
         }
+    };
+
+    if num_cells < 2048 {
+        for c in 0..num_cells {
+            gather_cell(c, &mut cell_grad_x[c], &mut cell_grad_y[c]);
+        }
+    } else {
+        cell_grad_x
+            .par_iter_mut()
+            .zip(cell_grad_y.par_iter_mut())
+            .enumerate()
+            .for_each(|(c, (gx, gy))| gather_cell(c, gx, gy));
     }
 
     total_wl

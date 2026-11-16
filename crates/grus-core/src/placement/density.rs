@@ -1,8 +1,184 @@
 use std::f32::consts::PI;
+use std::fmt;
+use std::sync::Arc;
+use rayon::prelude::*;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use crate::design_db::{DesignDb, Orient, PlacementStatus};
 use crate::tech_db::{MacroClass, TechDb};
+
+/// Reusable FFT plans, trigonometric tables, and scratch grids for `DensitySolver`.
+#[derive(Clone)]
+struct PoissonWorkspace {
+    m: usize,
+    fft_fwd: Arc<dyn Fft<f32>>,
+    fft_inv: Arc<dyn Fft<f32>>,
+    cos_tbl: Vec<f32>,
+    sin_tbl: Vec<f32>,
+    a: Vec<f32>,
+    b: Vec<f32>,
+    phi_hat: Vec<f32>,
+    ex_hat: Vec<f32>,
+    ey_hat: Vec<f32>,
+}
+
+impl fmt::Debug for PoissonWorkspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PoissonWorkspace").field("m", &self.m).finish_non_exhaustive()
+    }
+}
+
+impl PoissonWorkspace {
+    fn new(m: usize) -> Self {
+        assert!(m.is_power_of_two(), "M must be a power of two");
+        let mut planner = FftPlanner::new();
+        let fft_fwd = planner.plan_fft_forward(m);
+        let fft_inv = planner.plan_fft_inverse(m);
+        let inv_2m = PI / (2.0 * m as f32);
+        let mut cos_tbl = Vec::with_capacity(m);
+        let mut sin_tbl = Vec::with_capacity(m);
+        for u in 0..m {
+            let (s, c) = ((u as f32) * inv_2m).sin_cos();
+            sin_tbl.push(s);
+            cos_tbl.push(c);
+        }
+        let n2 = m * m;
+        Self {
+            m,
+            fft_fwd,
+            fft_inv,
+            cos_tbl,
+            sin_tbl,
+            a: vec![0.0; n2],
+            b: vec![0.0; n2],
+            phi_hat: vec![0.0; n2],
+            ex_hat: vec![0.0; n2],
+            ey_hat: vec![0.0; n2],
+        }
+    }
+}
+
+#[inline]
+fn dct1d_tbl(
+    x: &[f32],
+    out: &mut [f32],
+    fft_fwd: &dyn Fft<f32>,
+    cos_tbl: &[f32],
+    sin_tbl: &[f32],
+    buf: &mut [Complex<f32>],
+) {
+    let m = x.len();
+    let half = m / 2;
+    for k in 0..half {
+        buf[k] = Complex::new(x[2 * k], 0.0);
+        buf[m - 1 - k] = Complex::new(x[2 * k + 1], 0.0);
+    }
+    fft_fwd.process(buf);
+    for u in 0..m {
+        out[u] = buf[u].re * cos_tbl[u] + buf[u].im * sin_tbl[u];
+    }
+}
+
+#[inline]
+fn idct1d_tbl(
+    c: &[f32],
+    out: &mut [f32],
+    fft_inv: &dyn Fft<f32>,
+    cos_tbl: &[f32],
+    sin_tbl: &[f32],
+    buf: &mut [Complex<f32>],
+) {
+    let m = c.len();
+    let inv_m = 1.0f32 / m as f32;
+    buf[0] = Complex::new(c[0] * inv_m, 0.0);
+    for u in 1..m {
+        let cos_a = cos_tbl[u];
+        let sin_a = sin_tbl[u];
+        let re = (c[u] * cos_a + c[m - u] * sin_a) * inv_m;
+        let im = (c[u] * sin_a - c[m - u] * cos_a) * inv_m;
+        buf[u] = Complex::new(re, im);
+    }
+    fft_inv.process(buf);
+    let half = m / 2;
+    for k in 0..half {
+        out[2 * k] = buf[k].re;
+        out[2 * k + 1] = buf[m - 1 - k].re;
+    }
+}
+
+#[inline]
+fn idxst1d_tbl(
+    s: &[f32],
+    out: &mut [f32],
+    fft_inv: &dyn Fft<f32>,
+    cos_tbl: &[f32],
+    sin_tbl: &[f32],
+    buf: &mut [Complex<f32>],
+    c_scratch: &mut [f32],
+) {
+    let m = s.len();
+    c_scratch[0] = 0.0;
+    for u in 1..m {
+        c_scratch[u] = s[m - u];
+    }
+    idct1d_tbl(c_scratch, out, fft_inv, cos_tbl, sin_tbl, buf);
+    for n in (1..m).step_by(2) {
+        out[n] = -out[n];
+    }
+}
+
+/// Cache-friendly matrix transpose `dst[u * m + v] = src[v * m + u]`.
+fn transpose_square(src: &[f32], dst: &mut [f32], m: usize) {
+    const TILE: usize = 32;
+    if m < 128 {
+        for v in 0..m {
+            for u in 0..m {
+                dst[u * m + v] = src[v * m + u];
+            }
+        }
+        return;
+    }
+    dst.par_chunks_mut(TILE * m)
+        .enumerate()
+        .for_each(|(blk_u, dst_rows)| {
+            let u0 = blk_u * TILE;
+            let u1 = (u0 + TILE).min(m);
+            for v0 in (0..m).step_by(TILE) {
+                let v1 = (v0 + TILE).min(m);
+                for u in u0..u1 {
+                    let dst_row = &mut dst_rows[(u - u0) * m..];
+                    for v in v0..v1 {
+                        dst_row[v] = src[v * m + u];
+                    }
+                }
+            }
+        });
+}
+
+/// Apply `f(in_row, out_row, fft_buf, real_scratch)` across every length-`m` row.
+fn map_rows_1d(
+    src: &[f32],
+    dst: &mut [f32],
+    m: usize,
+    op: impl Fn(&[f32], &mut [f32], &mut [Complex<f32>], &mut [f32]) + Sync,
+) {
+    if m < 64 {
+        let mut buf = vec![Complex::new(0.0f32, 0.0f32); m];
+        let mut scratch = vec![0.0f32; m];
+        for (s_row, d_row) in src.chunks_exact(m).zip(dst.chunks_exact_mut(m)) {
+            op(s_row, d_row, &mut buf, &mut scratch);
+        }
+    } else {
+        src.par_chunks_exact(m)
+            .zip(dst.par_chunks_exact_mut(m))
+            .for_each_init(
+                || (vec![Complex::new(0.0f32, 0.0f32); m], vec![0.0f32; m]),
+                |(buf, scratch), (s_row, d_row)| {
+                    op(s_row, d_row, buf, scratch);
+                },
+            );
+    }
+}
 
 /// 1D unnormalized Forward DCT-II:
 /// out[u] = sum_{n=0}^{M-1} x[n] * cos(pi * u * (2n + 1) / (2M))
@@ -102,6 +278,7 @@ pub struct DensitySolver {
     pub phi: Vec<f32>,          // length m * m (electrostatic potential)
     pub e_x: Vec<f32>,          // length m * m (horizontal electric field -dphi/dx)
     pub e_y: Vec<f32>,          // length m * m (vertical electric field -dphi/dy)
+    ws: PoissonWorkspace,
 }
 
 impl DensitySolver {
@@ -142,6 +319,7 @@ impl DensitySolver {
             phi: vec![0.0; grid_size],
             e_x: vec![0.0; grid_size],
             e_y: vec![0.0; grid_size],
+            ws: PoissonWorkspace::new(m),
         }
     }
 
@@ -349,132 +527,99 @@ impl DensitySolver {
             phi: vec![0.0; grid_size],
             e_x: vec![0.0; grid_size],
             e_y: vec![0.0; grid_size],
+            ws: PoissonWorkspace::new(m),
         }
     }
 
     #[allow(clippy::needless_range_loop)]
     pub fn solve_poisson_from_rho(&mut self) {
         let m = self.m;
-        let mut planner = FftPlanner::new();
-        let fft_fwd = planner.plan_fft_forward(m);
-        let fft_inv = planner.plan_fft_inverse(m);
-        let mut buf = vec![Complex::new(0.0f32, 0.0f32); m];
+        let fft_fwd = &*self.ws.fft_fwd;
+        let fft_inv = &*self.ws.fft_inv;
+        let cos_tbl = &self.ws.cos_tbl;
+        let sin_tbl = &self.ws.sin_tbl;
+        let a = &mut self.ws.a;
+        let b = &mut self.ws.b;
+        let phi_hat = &mut self.ws.phi_hat;
+        let ex_hat = &mut self.ws.ex_hat;
+        let ey_hat = &mut self.ws.ey_hat;
 
-        let mut a = vec![0.0f32; m * m];
-
-        // 1. 2D DCT of self.rho -> a
-        // Row transform along u
-        for v in 0..m {
-            let row_start = v * m;
-            dct1d(
-                &self.rho[row_start..row_start + m],
-                &mut a[row_start..row_start + m],
-                &*fft_fwd,
-                &mut buf,
-            );
-        }
-
-        // Column transform along v
-        let mut col_in = vec![0.0f32; m];
-        let mut col_out = vec![0.0f32; m];
-        for u in 0..m {
-            for v in 0..m {
-                col_in[v] = a[v * m + u];
-            }
-            dct1d(&col_in, &mut col_out, &*fft_fwd, &mut buf);
-            for v in 0..m {
-                a[v * m + u] = col_out[v];
-            }
-        }
+        // 1. 2D DCT of self.rho -> a (rows along u, transpose, cols along v, transpose back)
+        map_rows_1d(&self.rho, a, m, |s, d, buf, _| {
+            dct1d_tbl(s, d, fft_fwd, cos_tbl, sin_tbl, buf);
+        });
+        transpose_square(a, b, m);
+        map_rows_1d(b, ex_hat, m, |s, d, buf, _| {
+            dct1d_tbl(s, d, fft_fwd, cos_tbl, sin_tbl, buf);
+        });
+        transpose_square(ex_hat, a, m);
 
         // 2. Frequency division
-        let mut phi_hat = vec![0.0f32; m * m];
-        let mut ex_hat = vec![0.0f32; m * m];
-        let mut ey_hat = vec![0.0f32; m * m];
-
         let wu_base = PI / (m as f32 * self.bin_w_um);
         let wv_base = PI / (m as f32 * self.bin_h_um);
 
-        for v in 0..m {
+        let eval_freq_row = |v: usize, a_row: &[f32], p_row: &mut [f32], x_row: &mut [f32], y_row: &mut [f32]| {
             let wv = v as f32 * wv_base;
             let wv2 = wv * wv;
             for u in 0..m {
-                let idx = v * m + u;
                 if u == 0 && v == 0 {
-                    phi_hat[idx] = 0.0;
-                    ex_hat[idx] = 0.0;
-                    ey_hat[idx] = 0.0;
+                    p_row[u] = 0.0;
+                    x_row[u] = 0.0;
+                    y_row[u] = 0.0;
                 } else {
                     let wu = u as f32 * wu_base;
                     let denom = wu * wu + wv2;
-                    let p = a[idx] / denom;
-                    phi_hat[idx] = p;
-                    ex_hat[idx] = wu * p;
-                    ey_hat[idx] = wv * p;
+                    let p = a_row[u] / denom;
+                    p_row[u] = p;
+                    x_row[u] = wu * p;
+                    y_row[u] = wv * p;
                 }
             }
+        };
+        if m < 64 {
+            for v in 0..m {
+                let s = v * m;
+                eval_freq_row(v, &a[s..s + m], &mut phi_hat[s..s + m], &mut ex_hat[s..s + m], &mut ey_hat[s..s + m]);
+            }
+        } else {
+            a.par_chunks_exact(m)
+                .zip(phi_hat.par_chunks_exact_mut(m))
+                .zip(ex_hat.par_chunks_exact_mut(m))
+                .zip(ey_hat.par_chunks_exact_mut(m))
+                .enumerate()
+                .for_each(|(v, (((ar, pr), xr), yr))| eval_freq_row(v, ar, pr, xr, yr));
         }
 
-        // 3. Inversion
+        // 3. Inversion (row pass -> transpose -> col pass -> transpose back)
         // phi: idct rows along u, idct cols along v
-        for v in 0..m {
-            let row_start = v * m;
-            idct1d(
-                &phi_hat[row_start..row_start + m],
-                &mut self.phi[row_start..row_start + m],
-                &*fft_inv,
-                &mut buf,
-            );
-        }
-        for u in 0..m {
-            for v in 0..m {
-                col_in[v] = self.phi[v * m + u];
-            }
-            idct1d(&col_in, &mut col_out, &*fft_inv, &mut buf);
-            for v in 0..m {
-                self.phi[v * m + u] = col_out[v];
-            }
-        }
+        map_rows_1d(phi_hat, a, m, |s, d, buf, _| {
+            idct1d_tbl(s, d, fft_inv, cos_tbl, sin_tbl, buf);
+        });
+        transpose_square(a, b, m);
+        map_rows_1d(b, a, m, |s, d, buf, _| {
+            idct1d_tbl(s, d, fft_inv, cos_tbl, sin_tbl, buf);
+        });
+        transpose_square(a, &mut self.phi, m);
 
         // e_x: idxst rows along u, idct cols along v
-        for v in 0..m {
-            let row_start = v * m;
-            idxst1d(
-                &ex_hat[row_start..row_start + m],
-                &mut self.e_x[row_start..row_start + m],
-                &*fft_inv,
-                &mut buf,
-            );
-        }
-        for u in 0..m {
-            for v in 0..m {
-                col_in[v] = self.e_x[v * m + u];
-            }
-            idct1d(&col_in, &mut col_out, &*fft_inv, &mut buf);
-            for v in 0..m {
-                self.e_x[v * m + u] = col_out[v];
-            }
-        }
+        map_rows_1d(ex_hat, a, m, |s, d, buf, scr| {
+            idxst1d_tbl(s, d, fft_inv, cos_tbl, sin_tbl, buf, scr);
+        });
+        transpose_square(a, b, m);
+        map_rows_1d(b, a, m, |s, d, buf, _| {
+            idct1d_tbl(s, d, fft_inv, cos_tbl, sin_tbl, buf);
+        });
+        transpose_square(a, &mut self.e_x, m);
 
         // e_y: idct rows along u, idxst cols along v
-        for v in 0..m {
-            let row_start = v * m;
-            idct1d(
-                &ey_hat[row_start..row_start + m],
-                &mut self.e_y[row_start..row_start + m],
-                &*fft_inv,
-                &mut buf,
-            );
-        }
-        for u in 0..m {
-            for v in 0..m {
-                col_in[v] = self.e_y[v * m + u];
-            }
-            idxst1d(&col_in, &mut col_out, &*fft_inv, &mut buf);
-            for v in 0..m {
-                self.e_y[v * m + u] = col_out[v];
-            }
-        }
+        map_rows_1d(ey_hat, a, m, |s, d, buf, _| {
+            idct1d_tbl(s, d, fft_inv, cos_tbl, sin_tbl, buf);
+        });
+        transpose_square(a, b, m);
+        map_rows_1d(b, a, m, |s, d, buf, scr| {
+            idxst1d_tbl(s, d, fft_inv, cos_tbl, sin_tbl, buf, scr);
+        });
+        transpose_square(a, &mut self.e_y, m);
     }
 
     pub fn compute_density_and_forces(
@@ -591,9 +736,9 @@ impl DensitySolver {
         self.solve_poisson_from_rho();
 
         // 5. Gather repulsive forces
-        for c in 0..num_cells {
+        let gather_force = |c: usize, fx_out: &mut f32, fy_out: &mut f32| {
             if !self.movable_cell_mask[c] {
-                continue;
+                return;
             }
 
             let orig_w = self.cell_w_um[c];
@@ -616,7 +761,7 @@ impl DensitySolver {
             let y1_clip = y1.min(core_yh);
 
             if x1_clip <= x0_clip || y1_clip <= y0_clip {
-                continue;
+                return;
             }
 
             let u_min = (((x0_clip - core_xl) / bin_w).floor() as isize)
@@ -651,8 +796,20 @@ impl DensitySolver {
                 }
             }
 
-            force_x[c] = scale * fx;
-            force_y[c] = scale * fy;
+            *fx_out = scale * fx;
+            *fy_out = scale * fy;
+        };
+
+        if num_cells < 2048 {
+            for c in 0..num_cells {
+                gather_force(c, &mut force_x[c], &mut force_y[c]);
+            }
+        } else {
+            force_x
+                .par_iter_mut()
+                .zip(force_y.par_iter_mut())
+                .enumerate()
+                .for_each(|(c, (fx, fy))| gather_force(c, fx, fy));
         }
 
         // 6. Compute potential energy psi = 0.5 * sum(rho * phi * bin_area)
@@ -955,5 +1112,77 @@ mod tests {
             }
         }
         assert!(left_count > 0 && right_count > 0, "Must have cells on both left and right of center");
+    }
+
+    #[test]
+    fn test_poisson_m64_parallel_matches_reference_1d_transforms() {
+        let m = 64;
+        let mut solver = DensitySolver::new_empty(m, 0.0, 0.0, 64.0, 64.0, 0.7);
+        let mut mean = 0.0f32;
+        for v in 0..m {
+            for u in 0..m {
+                let val = ((u as f32 * 0.23).sin() + (v as f32 * 0.37).cos()) * 0.5;
+                solver.rho[v * m + u] = val;
+                mean += val;
+            }
+        }
+        mean /= (m * m) as f32;
+        for r in &mut solver.rho {
+            *r -= mean;
+        }
+        solver.solve_poisson_from_rho();
+
+        let mut planner = FftPlanner::new();
+        let fft_fwd = planner.plan_fft_forward(m);
+        let fft_inv = planner.plan_fft_inverse(m);
+        let mut buf = vec![Complex::new(0.0f32, 0.0f32); m];
+        let mut a = vec![0.0f32; m * m];
+        for v in 0..m {
+            dct1d(&solver.rho[v * m..(v + 1) * m], &mut a[v * m..(v + 1) * m], &*fft_fwd, &mut buf);
+        }
+        let (mut col_in, mut col_out) = (vec![0.0f32; m], vec![0.0f32; m]);
+        for u in 0..m {
+            for v in 0..m {
+                col_in[v] = a[v * m + u];
+            }
+            dct1d(&col_in, &mut col_out, &*fft_fwd, &mut buf);
+            for v in 0..m {
+                a[v * m + u] = col_out[v];
+            }
+        }
+        let wu_base = PI / (m as f32 * solver.bin_w_um);
+        let wv_base = PI / (m as f32 * solver.bin_h_um);
+        let mut phi_hat = vec![0.0f32; m * m];
+        for v in 0..m {
+            let wv = v as f32 * wv_base;
+            for u in 0..m {
+                let idx = v * m + u;
+                if u != 0 || v != 0 {
+                    let wu = u as f32 * wu_base;
+                    phi_hat[idx] = a[idx] / (wu * wu + wv * wv);
+                }
+            }
+        }
+        let mut phi_ref = vec![0.0f32; m * m];
+        for v in 0..m {
+            idct1d(&phi_hat[v * m..(v + 1) * m], &mut phi_ref[v * m..(v + 1) * m], &*fft_inv, &mut buf);
+        }
+        for u in 0..m {
+            for v in 0..m {
+                col_in[v] = phi_ref[v * m + u];
+            }
+            idct1d(&col_in, &mut col_out, &*fft_inv, &mut buf);
+            for v in 0..m {
+                phi_ref[v * m + u] = col_out[v];
+            }
+        }
+
+        let max_err = solver
+            .phi
+            .iter()
+            .zip(&phi_ref)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-5, "Parallel Poisson phi max error too large: {}", max_err);
     }
 }

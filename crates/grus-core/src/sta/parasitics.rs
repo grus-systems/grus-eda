@@ -5,6 +5,7 @@ use crate::readers::spef::{Spef, SpefNet, unescape_spef_name};
 use crate::interner::{NetId, PinId};
 use crate::tech_db::TechDb;
 use anyhow::{Result, bail};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Unit-length wire parasitics of one routing layer, as OpenROAD's `set_wire_rc -layer` derives them
@@ -110,9 +111,17 @@ pub(crate) fn estimate_placement_parasitics_with_tree(
     rc: WireRc,
     segments: TreeBuilder,
 ) -> NetParasitics {
-    let nets = (0..design.num_nets())
-        .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), segments))
-        .collect();
+    let n_nets = design.num_nets();
+    let nets = if n_nets < 512 {
+        (0..n_nets)
+            .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), segments))
+            .collect()
+    } else {
+        (0..n_nets)
+            .into_par_iter()
+            .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), segments))
+            .collect()
+    };
     NetParasitics { nets }
 }
 
@@ -127,19 +136,31 @@ fn build_net_tree(design: &DesignDb, tech: &TechDb, rc: WireRc, net: NetId, segm
     let dbu_per_um = tech.dbu_per_micron as f32;
     let pin_pts: Vec<Pt> = pins
         .iter()
-        .map(|&p| {
-            let (x, y) = design.pin_pos_dbu(p, tech);
-            (x, y)
-        })
+        .map(|&p| design.pin_pos_dbu(p, tech))
         .collect();
 
-    let mut points: Vec<Pt> = Vec::new();
-    let mut index: HashMap<Pt, usize> = HashMap::new();
+    let mut points: Vec<Pt> = Vec::with_capacity(pin_pts.len() * 2);
+    let mut index: Option<HashMap<Pt, usize>> = None;
     let mut intern = |p: Pt, points: &mut Vec<Pt>| {
-        *index.entry(p).or_insert_with(|| {
-            points.push(p);
-            points.len() - 1
-        })
+        if let Some(map) = index.as_mut() {
+            return *map.entry(p).or_insert_with(|| {
+                points.push(p);
+                points.len() - 1
+            });
+        }
+        if let Some(pos) = points.iter().position(|&q| q == p) {
+            return pos;
+        }
+        points.push(p);
+        let id = points.len() - 1;
+        if points.len() >= 24 {
+            let mut map = HashMap::with_capacity(points.len() * 2);
+            for (idx, &pt) in points.iter().enumerate() {
+                map.insert(pt, idx);
+            }
+            index = Some(map);
+        }
+        id
     };
     let pin_point: Vec<usize> = pin_pts.iter().map(|&p| intern(p, &mut points)).collect();
     let mut adjacency: Vec<Vec<usize>> = Vec::new();
@@ -191,17 +212,21 @@ fn build_net_tree(design: &DesignDb, tech: &TechDb, rc: WireRc, net: NetId, segm
 /// sink pin capacitance is added later, exactly as for the placement estimate. Resistor loops are
 /// broken by a BFS spanning tree from the driver; self-loops and parallel resistors are dropped.
 pub fn spef_parasitics(design: &DesignDb, spef: &Spef) -> Result<NetParasitics> {
-    let mut nets = Vec::with_capacity(design.num_nets());
-    for n in 0..design.num_nets() {
+    let n_nets = design.num_nets();
+    let build_one = |n: usize| -> Result<Option<NetRcTree>> {
         let net = NetId(n as u32);
         let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
         let usable = design.net_driver(net).is_some() && design.net_pins(net).len() >= 2;
-        let tree = match (usable, spef.nets.get(&name)) {
-            (true, Some(spef_net)) => Some(spef_net_tree(design, net, &name, spef_net)?),
-            _ => None,
-        };
-        nets.push(tree);
-    }
+        match (usable, spef.nets.get(&name)) {
+            (true, Some(spef_net)) => Ok(Some(spef_net_tree(design, net, &name, spef_net)?)),
+            _ => Ok(None),
+        }
+    };
+    let nets: Vec<Option<NetRcTree>> = if n_nets < 512 {
+        (0..n_nets).map(build_one).collect::<Result<Vec<_>>>()?
+    } else {
+        (0..n_nets).into_par_iter().map(build_one).collect::<Result<Vec<_>>>()?
+    };
     Ok(NetParasitics { nets })
 }
 

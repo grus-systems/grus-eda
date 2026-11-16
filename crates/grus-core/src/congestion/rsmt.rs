@@ -1,7 +1,24 @@
+use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
+use rayon::prelude::*;
 use crate::congestion::gcell::{GCellGrid, GPoint, SteinerSegment};
 use crate::design_db::DesignDb;
 use crate::interner::NetId;
 use crate::tech_db::TechDb;
+
+#[derive(Default)]
+struct ExactRsmtScratch {
+    dist: Vec<u32>,
+    d: Vec<u32>,
+    d_split: Vec<u32>,
+    split_choice: Vec<(u16, u16)>,
+    from_u: Vec<u16>,
+}
+
+thread_local! {
+    static EXACT_RSMT_SCRATCH: RefCell<ExactRsmtScratch> = RefCell::new(ExactRsmtScratch::default());
+}
 
 /// Returns the wirelength of a Steiner segment in GCell grid units.
 #[inline]
@@ -112,13 +129,6 @@ pub(crate) fn exact_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
         }
     }
 
-    let mut dist = vec![vec![0u32; nv]; nv];
-    for i in 0..nv {
-        for j in 0..nv {
-            dist[i][j] = v_coords[i].0.abs_diff(v_coords[j].0) + v_coords[i].1.abs_diff(v_coords[j].1);
-        }
-    }
-
     let mut term_v = Vec::with_capacity(k);
     for p in unique {
         let idx = v_coords.iter().position(|v| v == p).unwrap();
@@ -127,118 +137,155 @@ pub(crate) fn exact_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
 
     let num_subsets = 1 << k;
     let inf = u32::MAX / 2;
-    let mut d = vec![vec![inf; nv]; num_subsets];
-    let mut d_split = vec![vec![inf; nv]; num_subsets];
-    let mut split_choice = vec![vec![(0usize, 0usize); nv]; num_subsets];
-    let mut from_u = vec![vec![0usize; nv]; num_subsets];
 
-    for i in 0..k {
-        let tv = term_v[i];
-        for v in 0..nv {
-            d[1 << i][v] = dist[tv][v];
-            d_split[1 << i][v] = dist[tv][v];
+    let edges = EXACT_RSMT_SCRATCH.with(|cell| {
+        let mut sc = cell.borrow_mut();
+        let dist_len = nv * nv;
+        if sc.dist.len() < dist_len {
+            sc.dist.resize(dist_len, 0);
         }
-    }
-
-    for mask in 1..num_subsets {
-        if (mask & (mask - 1)) == 0 {
-            continue;
+        let table_len = num_subsets * nv;
+        if sc.d.len() < table_len {
+            sc.d.resize(table_len, inf);
+            sc.d_split.resize(table_len, inf);
+            sc.split_choice.resize(table_len, (0, 0));
+            sc.from_u.resize(table_len, 0);
         }
 
-        let mut sub = (mask - 1) & mask;
-        while sub > (mask ^ sub) {
-            let s1 = sub;
-            let s2 = mask ^ sub;
+        let ExactRsmtScratch { dist, d, d_split, split_choice, from_u } = &mut *sc;
+        let dist = &mut dist[..dist_len];
+        let d = &mut d[..table_len];
+        let d_split = &mut d_split[..table_len];
+        let split_choice = &mut split_choice[..table_len];
+        let from_u = &mut from_u[..table_len];
+
+        for i in 0..nv {
+            let vi = v_coords[i];
+            let row = &mut dist[i * nv..(i + 1) * nv];
+            for j in 0..nv {
+                row[j] = vi.0.abs_diff(v_coords[j].0) + vi.1.abs_diff(v_coords[j].1);
+            }
+        }
+
+        d.fill(inf);
+        d_split.fill(inf);
+
+        for (i, &tv) in term_v.iter().enumerate() {
+            let base = (1 << i) * nv;
+            let dist_row = &dist[tv * nv..(tv + 1) * nv];
+            d[base..base + nv].copy_from_slice(dist_row);
+            d_split[base..base + nv].copy_from_slice(dist_row);
+        }
+
+        for mask in 1..num_subsets {
+            if (mask & (mask - 1)) == 0 {
+                continue;
+            }
+            let base = mask * nv;
+
+            let mut sub = (mask - 1) & mask;
+            while sub > (mask ^ sub) {
+                let s1 = sub;
+                let s2 = mask ^ sub;
+                let row1 = &d[s1 * nv..(s1 + 1) * nv];
+                let row2 = &d[s2 * nv..(s2 + 1) * nv];
+                for v in 0..nv {
+                    let val = row1[v] + row2[v];
+                    if val < d_split[base + v] {
+                        d_split[base + v] = val;
+                        split_choice[base + v] = (s1 as u16, s2 as u16);
+                    }
+                }
+                sub = (sub - 1) & mask;
+            }
+
+            let d_split_row = &d_split[base..base + nv];
             for v in 0..nv {
-                let val = d[s1][v] + d[s2][v];
-                if val < d_split[mask][v] {
-                    d_split[mask][v] = val;
-                    split_choice[mask][v] = (s1, s2);
+                let mut best_val = d_split_row[v];
+                let mut best_u = v;
+                // dist is symmetric (dist[v][u] == dist[u][v]), allowing stride-1 reads across u.
+                let dist_v = &dist[v * nv..(v + 1) * nv];
+                for u in 0..nv {
+                    let val = d_split_row[u] + dist_v[u];
+                    if val < best_val {
+                        best_val = val;
+                        best_u = u;
+                    }
+                }
+                d[base + v] = best_val;
+                from_u[base + v] = best_u as u16;
+            }
+        }
+
+        let mut edges: BTreeSet<(Pt, Pt)> = BTreeSet::new();
+
+        let mut add_path = |p1: Pt, p2: Pt| {
+            let (x1, y1) = p1;
+            let (x2, y2) = p2;
+            let ix1 = xs.binary_search(&x1).unwrap();
+            let iy1 = ys.binary_search(&y1).unwrap();
+            let ix2 = xs.binary_search(&x2).unwrap();
+            let iy2 = ys.binary_search(&y2).unwrap();
+
+            if ix1 != ix2 {
+                let (start, end) = (ix1.min(ix2), ix1.max(ix2));
+                for ix in start..end {
+                    let a = (xs[ix], ys[iy1]);
+                    let b = (xs[ix + 1], ys[iy1]);
+                    edges.insert((a.min(b), a.max(b)));
                 }
             }
-            sub = (sub - 1) & mask;
-        }
-
-        for v in 0..nv {
-            let mut best_val = d_split[mask][v];
-            let mut best_u = v;
-            for u in 0..nv {
-                let val = d_split[mask][u] + dist[u][v];
-                if val < best_val {
-                    best_val = val;
-                    best_u = u;
+            if iy1 != iy2 {
+                let (start, end) = (iy1.min(iy2), iy1.max(iy2));
+                for iy in start..end {
+                    let a = (xs[ix2], ys[iy]);
+                    let b = (xs[ix2], ys[iy + 1]);
+                    edges.insert((a.min(b), a.max(b)));
                 }
             }
-            d[mask][v] = best_val;
-            from_u[mask][v] = best_u;
+        };
+
+        #[allow(clippy::too_many_arguments)]
+        fn trace_dp(
+            mask: usize,
+            v: usize,
+            nv: usize,
+            pts: &[Pt],
+            v_coords: &[Pt],
+            split_choice: &[(u16, u16)],
+            from_u: &[u16],
+            add_path: &mut impl FnMut(Pt, Pt),
+        ) {
+            if (mask & (mask - 1)) == 0 {
+                let i = mask.trailing_zeros() as usize;
+                if pts[i] != v_coords[v] {
+                    add_path(v_coords[v], pts[i]);
+                }
+                return;
+            }
+            let u = from_u[mask * nv + v] as usize;
+            if u != v {
+                add_path(v_coords[v], v_coords[u]);
+            }
+            let (s1, s2) = split_choice[mask * nv + u];
+            trace_dp(s1 as usize, u, nv, pts, v_coords, split_choice, from_u, add_path);
+            trace_dp(s2 as usize, u, nv, pts, v_coords, split_choice, from_u, add_path);
         }
-    }
 
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    let mut edges: BTreeSet<(Pt, Pt)> = BTreeSet::new();
-
-    let mut add_path = |p1: Pt, p2: Pt| {
-        let (x1, y1) = p1;
-        let (x2, y2) = p2;
-        let ix1 = xs.binary_search(&x1).unwrap();
-        let iy1 = ys.binary_search(&y1).unwrap();
-        let ix2 = xs.binary_search(&x2).unwrap();
-        let iy2 = ys.binary_search(&y2).unwrap();
-
-        if ix1 != ix2 {
-            let (start, end) = (ix1.min(ix2), ix1.max(ix2));
-            for ix in start..end {
-                let a = (xs[ix], ys[iy1]);
-                let b = (xs[ix + 1], ys[iy1]);
-                edges.insert((a.min(b), a.max(b)));
+        let all = num_subsets - 1;
+        let all_base = all * nv;
+        let mut best_root = 0;
+        let mut min_total = inf;
+        for (v, &val) in d[all_base..all_base + nv].iter().enumerate() {
+            if val < min_total {
+                min_total = val;
+                best_root = v;
             }
         }
-        if iy1 != iy2 {
-            let (start, end) = (iy1.min(iy2), iy1.max(iy2));
-            for iy in start..end {
-                let a = (xs[ix2], ys[iy]);
-                let b = (xs[ix2], ys[iy + 1]);
-                edges.insert((a.min(b), a.max(b)));
-            }
-        }
-    };
 
-    fn trace_dp(
-        mask: usize,
-        v: usize,
-        pts: &[Pt],
-        v_coords: &[Pt],
-        split_choice: &[Vec<(usize, usize)>],
-        from_u: &[Vec<usize>],
-        add_path: &mut impl FnMut(Pt, Pt),
-    ) {
-        if (mask & (mask - 1)) == 0 {
-            let i = mask.trailing_zeros() as usize;
-            if pts[i] != v_coords[v] {
-                add_path(v_coords[v], pts[i]);
-            }
-            return;
-        }
-        let u = from_u[mask][v];
-        if u != v {
-            add_path(v_coords[v], v_coords[u]);
-        }
-        let (s1, s2) = split_choice[mask][u];
-        trace_dp(s1, u, pts, v_coords, split_choice, from_u, add_path);
-        trace_dp(s2, u, pts, v_coords, split_choice, from_u, add_path);
-    }
-
-    let all = num_subsets - 1;
-    let mut best_root = 0;
-    let mut min_total = inf;
-    for (v, &dist) in d[all].iter().enumerate().take(nv) {
-        if dist < min_total {
-            min_total = dist;
-            best_root = v;
-        }
-    }
-
-    trace_dp(all, best_root, unique, &v_coords, &split_choice, &from_u, &mut add_path);
+        trace_dp(all, best_root, nv, unique, &v_coords, split_choice, from_u, &mut add_path);
+        edges
+    });
 
     // Build BFS spanning tree to guarantee zero cycles and exact minimum length
     let mut adj: BTreeMap<Pt, Vec<Pt>> = BTreeMap::new();
@@ -359,17 +406,33 @@ pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
         }
     }
 
-    // Iterative L-flip Steiner refinement
+    // Iterative L-flip Steiner refinement.
+    // For tiny trees (<= 32 edges), a direct O(E^2) loop is fastest; for larger trees,
+    // track per-vertex best incident pair in a max-heap and only refresh the <= 4 touched
+    // vertices per flip, using monotonic edge sequence numbers to preserve exact tie-breaking.
+    if edges.len() <= 32 {
+        heuristic_lflip_small(&mut nodes, &mut edges);
+    } else {
+        heuristic_lflip_heap(&mut nodes, &mut edges);
+    }
+
+    let mut segs = Vec::with_capacity(edges.len());
+    for (a, b) in edges {
+        if nodes[a] != nodes[b] {
+            segs.push((nodes[a], nodes[b]));
+        }
+    }
+    segs
+}
+
+fn heuristic_lflip_small(nodes: &mut Vec<Pt>, edges: &mut Vec<(usize, usize)>) {
     loop {
         let mut best_candidate: Option<(u32, usize, usize, usize, usize, usize, Pt)> = None;
-        // (gain, e1_idx, e2_idx, u, v, w, s_pt)
-
         let num_edges = edges.len();
         for e1 in 0..num_edges {
             let (a1, b1) = edges[e1];
             for (e2_offset, &(a2, b2)) in edges[(e1 + 1)..num_edges].iter().enumerate() {
                 let e2 = e1 + 1 + e2_offset;
-
                 let shared = if a1 == a2 {
                     Some((a1, b1, b2))
                 } else if a1 == b2 {
@@ -381,26 +444,17 @@ pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
                 } else {
                     None
                 };
-
                 if let Some((u, v, w)) = shared {
                     let pu = nodes[u];
                     let pv = nodes[v];
                     let pw = nodes[w];
-
                     let s_pt = (median3(pu.0, pv.0, pw.0), median3(pu.1, pv.1, pw.1));
                     let gain = manhattan(pu, s_pt);
-
                     if gain > 0 {
                         let is_better = match best_candidate {
                             None => true,
                             Some((best_gain, best_e1, best_e2, ..)) => {
-                                if gain > best_gain {
-                                    true
-                                } else if gain == best_gain {
-                                    (e1, e2) < (best_e1, best_e2)
-                                } else {
-                                    false
-                                }
+                                gain > best_gain || (gain == best_gain && (e1, e2) < (best_e1, best_e2))
                             }
                         };
                         if is_better {
@@ -410,7 +464,6 @@ pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
                 }
             }
         }
-
         match best_candidate {
             None => break,
             Some((_gain, e1, e2, u, v, w, s_pt)) => {
@@ -421,16 +474,13 @@ pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
                         nodes.len() - 1
                     }
                 };
-
                 let candidates = [
                     (u.min(s_idx), u.max(s_idx)),
                     (v.min(s_idx), v.max(s_idx)),
                     (w.min(s_idx), w.max(s_idx)),
                 ];
-
                 edges.remove(e2);
                 edges.remove(e1);
-
                 for &(n1, n2) in &candidates {
                     if n1 != n2 && nodes[n1] != nodes[n2] && !edges.contains(&(n1, n2)) {
                         edges.push((n1, n2));
@@ -439,14 +489,171 @@ pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
             }
         }
     }
+}
 
-    let mut segs = Vec::with_capacity(edges.len());
-    for (a, b) in edges {
-        if nodes[a] != nodes[b] {
-            segs.push((nodes[a], nodes[b]));
+fn heuristic_lflip_heap(nodes: &mut Vec<Pt>, edges: &mut Vec<(usize, usize)>) {
+    let mut node_map: HashMap<Pt, usize> = HashMap::with_capacity(nodes.len() * 2);
+    for (idx, &p) in nodes.iter().enumerate() {
+        node_map.entry(p).or_insert(idx);
+    }
+
+    let mut edge_endpoints: Vec<(usize, usize)> = Vec::with_capacity(edges.len() * 2);
+    let mut edge_alive: Vec<bool> = Vec::with_capacity(edges.len() * 2);
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+
+    for &(a, b) in edges.iter() {
+        let eid = edge_endpoints.len();
+        edge_endpoints.push((a, b));
+        edge_alive.push(true);
+        adj[a].push(eid);
+        adj[b].push(eid);
+    }
+
+    let mut vertex_ver: Vec<u32> = vec![0; nodes.len()];
+    // (gain, Reverse(eid1), Reverse(eid2), ver, u, v, w, s_pt)
+    #[derive(Eq, PartialEq)]
+    struct HeapCand {
+        gain: u32,
+        seq1: Reverse<usize>,
+        seq2: Reverse<usize>,
+        ver: u32,
+        u: usize,
+        v: usize,
+        w: usize,
+        s_pt: Pt,
+    }
+    impl Ord for HeapCand {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            (self.gain, self.seq1, self.seq2)
+                .cmp(&(other.gain, other.seq1, other.seq2))
         }
     }
-    segs
+    impl PartialOrd for HeapCand {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let push_vertex_best = |u: usize,
+                            nodes: &[Pt],
+                            edge_endpoints: &[(usize, usize)],
+                            adj: &[Vec<usize>],
+                            vertex_ver: &[u32],
+                            heap: &mut BinaryHeap<HeapCand>| {
+        let inc = &adj[u];
+        if inc.len() < 2 {
+            return;
+        }
+        let pu = nodes[u];
+        let mut best: Option<(u32, usize, usize, usize, usize, Pt)> = None;
+        for i in 0..inc.len() {
+            let e_a = inc[i];
+            let (a1, b1) = edge_endpoints[e_a];
+            let other_a = if a1 == u { b1 } else { a1 };
+            let pa = nodes[other_a];
+            for &e_b in &inc[(i + 1)..] {
+                let (a2, b2) = edge_endpoints[e_b];
+                let other_b = if a2 == u { b2 } else { a2 };
+                let pb = nodes[other_b];
+                let s_pt = (median3(pu.0, pa.0, pb.0), median3(pu.1, pa.1, pb.1));
+                let gain = manhattan(pu, s_pt);
+                if gain == 0 {
+                    continue;
+                }
+                let (seq1, v, seq2, w) = if e_a < e_b {
+                    (e_a, other_a, e_b, other_b)
+                } else {
+                    (e_b, other_b, e_a, other_a)
+                };
+                let is_better = match best {
+                    None => true,
+                    Some((bg, bs1, bs2, ..)) => {
+                        gain > bg || (gain == bg && (seq1, seq2) < (bs1, bs2))
+                    }
+                };
+                if is_better {
+                    best = Some((gain, seq1, seq2, v, w, s_pt));
+                }
+            }
+        }
+        if let Some((gain, seq1, seq2, v, w, s_pt)) = best {
+            heap.push(HeapCand {
+                gain,
+                seq1: Reverse(seq1),
+                seq2: Reverse(seq2),
+                ver: vertex_ver[u],
+                u,
+                v,
+                w,
+                s_pt,
+            });
+        }
+    };
+
+    let mut heap = BinaryHeap::with_capacity(nodes.len());
+    for u in 0..nodes.len() {
+        push_vertex_best(u, nodes, &edge_endpoints, &adj, &vertex_ver, &mut heap);
+    }
+
+    while let Some(top) = heap.pop() {
+        let eid1 = top.seq1.0;
+        let eid2 = top.seq2.0;
+        if top.ver != vertex_ver[top.u] || !edge_alive[eid1] || !edge_alive[eid2] {
+            continue;
+        }
+        let (u, v, w, s_pt) = (top.u, top.v, top.w, top.s_pt);
+        let s_idx = match node_map.get(&s_pt) {
+            Some(&idx) => idx,
+            None => {
+                let idx = nodes.len();
+                nodes.push(s_pt);
+                node_map.insert(s_pt, idx);
+                adj.push(Vec::new());
+                vertex_ver.push(0);
+                idx
+            }
+        };
+
+        edge_alive[eid1] = false;
+        edge_alive[eid2] = false;
+        adj[u].retain(|&eid| eid != eid1 && eid != eid2);
+        adj[v].retain(|&eid| eid != eid1);
+        adj[w].retain(|&eid| eid != eid2);
+
+        let candidates = [
+            (u.min(s_idx), u.max(s_idx)),
+            (v.min(s_idx), v.max(s_idx)),
+            (w.min(s_idx), w.max(s_idx)),
+        ];
+        for &(n1, n2) in &candidates {
+            if n1 != n2
+                && nodes[n1] != nodes[n2]
+                && !adj[n1].iter().any(|&eid| edge_endpoints[eid] == (n1, n2))
+            {
+                let eid = edge_endpoints.len();
+                edge_endpoints.push((n1, n2));
+                edge_alive.push(true);
+                adj[n1].push(eid);
+                adj[n2].push(eid);
+            }
+        }
+
+        let dirty = [u, v, w, s_idx];
+        for (i, &z) in dirty.iter().enumerate() {
+            if dirty[..i].contains(&z) {
+                continue;
+            }
+            vertex_ver[z] += 1;
+            push_vertex_best(z, nodes, &edge_endpoints, &adj, &vertex_ver, &mut heap);
+        }
+    }
+
+    edges.clear();
+    for (eid, &ep) in edge_endpoints.iter().enumerate() {
+        if edge_alive[eid] {
+            edges.push(ep);
+        }
+    }
 }
 
 /// Constructs a Rectilinear Steiner Minimal Tree over GCell points (see `build_rsmt_points`).
@@ -482,10 +689,22 @@ pub fn decompose_design_nets(
     tech_db: &TechDb,
     grid: &GCellGrid,
 ) -> Vec<SteinerSegment> {
-    let mut all_segs = Vec::new();
-    for net_idx in 0..design_db.net_names.len() {
-        let net_id = NetId(net_idx as u32);
-        all_segs.extend(decompose_net(design_db, tech_db, grid, net_id));
+    let n = design_db.net_names.len();
+    if n < 512 {
+        let mut all_segs = Vec::new();
+        for net_idx in 0..n {
+            all_segs.extend(decompose_net(design_db, tech_db, grid, NetId(net_idx as u32)));
+        }
+        return all_segs;
+    }
+    let per_net: Vec<Vec<SteinerSegment>> = (0..n)
+        .into_par_iter()
+        .map(|net_idx| decompose_net(design_db, tech_db, grid, NetId(net_idx as u32)))
+        .collect();
+    let total: usize = per_net.iter().map(Vec::len).sum();
+    let mut all_segs = Vec::with_capacity(total);
+    for segs in per_net {
+        all_segs.extend(segs);
     }
     all_segs
 }
@@ -749,5 +968,61 @@ mod tests {
         let pts = [(10, 0), (0, 10), (20, 10), (10, 20)];
         assert_eq!(total_length(&build_precise_rsmt_points(&pts)), 40);
         assert!(total_length(&build_rsmt_points(&pts)) >= 40);
+    }
+
+    #[test]
+    fn test_heap_lflip_matches_quadratic_exactly() {
+        for seed in 0..8u64 {
+            let pts = points(seed + 100, 50);
+            let mut unique = pts;
+            unique.sort_unstable();
+            unique.dedup();
+            // Build the same initial MST edge list from `heuristic_rsmt_points` by copying Prim setup,
+            // then compare `heuristic_lflip_small` vs `heuristic_lflip_heap` directly.
+            let k = unique.len();
+            let mut visited = vec![false; k];
+            let mut min_dist = vec![u32::MAX; k];
+            let mut best_dy = vec![u32::MAX; k];
+            let mut parent = vec![0usize; k];
+            visited[0] = true;
+            for j in 1..k {
+                min_dist[j] = manhattan(unique[0], unique[j]);
+                best_dy[j] = (unique[0].1 - unique[j].1).unsigned_abs();
+            }
+            let mut mst_edges = Vec::with_capacity(k);
+            for _ in 1..k {
+                let mut best_v = 0;
+                let mut best_d = u32::MAX;
+                for v in 0..k {
+                    if !visited[v] && min_dist[v] < best_d {
+                        best_d = min_dist[v];
+                        best_v = v;
+                    }
+                }
+                visited[best_v] = true;
+                let u = parent[best_v];
+                mst_edges.push((u.min(best_v), u.max(best_v)));
+                for j in 0..k {
+                    if !visited[j] {
+                        let d = manhattan(unique[best_v], unique[j]);
+                        let dy = (unique[best_v].1 - unique[j].1).unsigned_abs();
+                        if d < min_dist[j]
+                            || (d == min_dist[j] && (dy < best_dy[j] || (dy == best_dy[j] && best_v < parent[j])))
+                        {
+                            min_dist[j] = d;
+                            best_dy[j] = dy;
+                            parent[j] = best_v;
+                        }
+                    }
+                }
+            }
+            let (mut n1, mut e1) = (unique.clone(), mst_edges.clone());
+            let (mut n2, mut e2) = (unique, mst_edges);
+            heuristic_lflip_small(&mut n1, &mut e1);
+            heuristic_lflip_heap(&mut n2, &mut e2);
+            let segs1: Vec<_> = e1.into_iter().filter(|&(a, b)| n1[a] != n1[b]).map(|(a, b)| (n1[a], n1[b])).collect();
+            let segs2: Vec<_> = e2.into_iter().filter(|&(a, b)| n2[a] != n2[b]).map(|(a, b)| (n2[a], n2[b])).collect();
+            assert_eq!(segs1, segs2, "seed {seed} mismatch between heap and quadratic L-flip");
+        }
     }
 }

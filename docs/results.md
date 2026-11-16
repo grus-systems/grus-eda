@@ -845,6 +845,29 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
   - Extracted `run(cli)` and added unit + end-to-end `gcd` tests (`cli_parsers_reject_out_of_range_and_nan`, `cli_end_to_end_gcd_flow_and_validation`).
   - **Intentional-failure check (Rule 7)**: temporarily making `check_top_name` a no-op caused `cargo test --release -p grus-eda cli_end_to_end_gcd_flow_and_validation` to fail (`0 passed; 1 failed`: `mismatched --top must fail`), then restored.
 
+### 2026-11-16 — Phase 2 CPU speedup & Rayon parallelization across placement, RSMT/congestion, and STA (`v0.1.51`)
+
+- **Bottleneck fixes & parallelism (`Cargo.toml`, `crates/grus-core/src/{placement,congestion,sta}/`)**:
+  - Added workspace `rayon = "1"` crate (`Cargo.toml`, `crates/grus-core/Cargo.toml`) while keeping numerical equivalence with the single-threaded baseline (`AGENTS.md` §2):
+  - `placement/legalize.rs`: bucketed Step 1 obstacles per row via `partition_point`; indexed Abacus Step 3 subrows by sorted `orig_y_dbu` bands (`band_max_free` + outward `dy^2` and `min_dx^2 + dy^2` exact pruning preserving `(cost, sr_idx)` tie-breaking) plus zero-allocation `trial_add_cell_x`; bucketed Step 4 subrow resync by `(cy, cx)` binary search instead of `4 * 15,000 * 46,548` scan; replaced `HashSet` per cell with sorted unique `cell_nets` merged via `merge_sorted_nets`; reduced Pass 2 & Pass 3 to single net scans (`x`-only delta); bucketed `verify_legality` per row in a single pass. Added `test_trial_add_cell_x_matches_cluster_push`.
+  - `placement/density.rs`: cached `PoissonWorkspace` (`fft_fwd`, `fft_inv`, `cos_tbl`/`sin_tbl`, reusable `m * m` matrices, `idxst1d_tbl` zero-alloc), parallelized row transforms & tiled `32x32` transposes (`m >= 64`/`128`), and parallelized Step 5 force gathering (`num_cells >= 2048`). Added `test_poisson_m64_parallel_matches_reference_1d_transforms`.
+  - `placement/wirelength.rs`: cached per-pin coordinates/`exp()` terms across the two passes inside `eval_net_wa` (`2x` fewer `exp()` calls) and parallelized net gradients (`CHUNK = 1024`, deterministic `net_wl` sequential sum) & cell gradient gather (`num_cells >= 2048`).
+  - `congestion/rsmt.rs` & `sta/parasitics.rs`: replaced `O(E^3)` full-edge-pair L-flip scan with `heuristic_lflip_heap` (per-vertex `BinaryHeap` over `adj` using monotonic edge sequence IDs for bit-exact tie-breaking on `edges.len() > 32`); flattened Dreyfus-Wagner DP tables in thread-local `EXACT_RSMT_SCRATCH` (`0` per-net heap allocs after warmup); parallelized `decompose_design_nets`, `estimate_placement_parasitics_with_tree`, and `spef_parasitics` (`>= 512` nets). Added `test_heap_lflip_matches_quadratic_exactly`.
+  - `sta/analysis.rs`: levelized timing graph (`topological_levels`, reverse `edges_to`, `pin_driver`), parallelized `pi_models`, `wire_delays`, `launches`, and each wave `level.len() >= 32` via `rayon`, and skipped duplicate `driver_response` calls whenever `slew_min == slew_max`.
+- **Intentional-failure check (`AGENTS.md` §7 Rule 7)**:
+  - Temporarily perturbing `trial_add_cell_x` return by `+ 460` caused `test_trial_add_cell_x_matches_cluster_push` to fail loudly (`left: 18860, right: 18400`), then restored.
+- **Measured `grus-eda` CLI speedup (`v0.1.51` vs `v0.1.49` baseline on Apple Silicon)**:
+  - `jpeg` (61,569 cells / 46,548 movable / 46,568 nets):
+    - `place`: `22.68 s` -> `7.94 s` (`GP`: `3.78 s -> 2.13 s` / earlier isolated run `1.61 s`, `legalize`: `18.78 s -> 5.81 s`, `final_hpwl = 1,018,912,430 dbu`, `-1.23%` vs ref).
+    - `congestion`: `4.39 s -> 0.078 s` (**`56x`**, exact `total_capacity = 796977, total_demand = 196800, overflow = 0.0`).
+    - `sta --parasitics placement`: `60.56 s -> 5.39 s` (**`11.2x`**, `wns = -525.095520 ns`).
+    - `sta --spef`: `27.54 s -> 5.52 s` (**`5.0x`**, bit-identical `wns = -78.083832 ns, tns = -134605.000000 ns`).
+  - `ibex` (16,644 cells): `place` `2.72 s -> 1.25 s`, `congestion` `0.23 s -> 0.019 s`, `sta placement` `8.35 s -> 1.18 s`, `sta spef` `6.36 s -> 1.18 s` (exact `wns = -14.411459 ns`).
+  - `aes` (12,839 cells): `place` `1.27 s -> 0.79 s`, `congestion` `0.05 s -> 0.010 s`, `sta placement` `5.81 s -> 1.28 s`, `sta spef` `5.21 s -> 1.20 s` (exact `wns = -4.502526 ns`).
+  - `gcd` (384 cells): `place` `0.03 s -> 7.44 ms` (`4,395,223 dbu` exact), `congestion` `0.01 s -> 0.34 ms`, `sta placement` `0.13 s -> 54.4 ms` (`1.669149 ns`), `sta spef` `0.12 s -> 108.6 ms` (`1.665178 ns`).
+- **Workspace verification (`v0.1.51`)**:
+  - `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`grus-core`: `165 passed; 0 failed; 5 ignored` in `53.52 s`; `grus-eda`: `2 passed; 0 failed` in `0.18 s`).
+
 
 
 

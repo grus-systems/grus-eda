@@ -6,6 +6,7 @@ use crate::design_db::DesignDb;
 use crate::interner::{CellId, NetId, PinDir, PinId};
 use crate::lib_db::{LibCell, LibDb, NldmTable, TimingSense, TimingType};
 use anyhow::{Result, bail};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -400,32 +401,53 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
     graph
 }
 
-/// Kahn topological order over net edges (driver -> sink) and combinational arcs.
+struct LevelizedGraph {
+    levels: Vec<Vec<PinId>>,
+    edges_to: Vec<Vec<(PinId, u32)>>,
+    pin_driver: Vec<Option<(u32, u32, PinId)>>,
+}
+
+/// Kahn topological levels over net edges (driver -> sink) and combinational arcs,
+/// plus reverse indices so every level is data-parallel with zero write contention.
 /// Register `CLK -> Q` arcs are not edges: they start new paths.
-fn topological_order(cx: &Context, graph: &TimingGraph) -> Result<Vec<PinId>> {
+fn topological_levels(cx: &Context, graph: &TimingGraph) -> Result<LevelizedGraph> {
     let design = cx.design;
     let n = design.num_pins();
     let mut indegree = vec![0u32; n];
-    for edge in &graph.edges {
-        indegree[edge.dst.0 as usize] += 1;
+    let mut edges_to: Vec<Vec<(PinId, u32)>> = vec![Vec::new(); n];
+    for (src_p, outgoing) in graph.edges_from.iter().enumerate() {
+        let src_pin = PinId(src_p as u32);
+        for &e in outgoing {
+            let edge = graph.edges[e as usize];
+            indegree[edge.dst.0 as usize] += 1;
+            edges_to[edge.dst.0 as usize].push((src_pin, edge.lib_arc));
+        }
     }
+    let mut pin_driver: Vec<Option<(u32, u32, PinId)>> = vec![None; n];
     for net in 0..design.num_nets() {
         if let Some(driver) = design.net_driver(NetId(net as u32)) {
-            for &sink in &design.net_pins(NetId(net as u32))[1..] {
+            for (i, &sink) in design.net_pins(NetId(net as u32)).iter().enumerate().skip(1) {
                 if sink != driver {
                     indegree[sink.0 as usize] += 1;
+                    pin_driver[sink.0 as usize] = Some((net as u32, i as u32, driver));
                 }
             }
         }
     }
+    let mut depth = vec![0u32; n];
     let mut order: Vec<PinId> = (0..n as u32).filter(|&p| indegree[p as usize] == 0).map(PinId).collect();
     let mut head = 0;
     while head < order.len() {
         let pin = order[head];
         head += 1;
         let p = pin.0 as usize;
+        let next_depth = depth[p] + 1;
         let mut release = |target: PinId, order: &mut Vec<PinId>| {
-            let d = &mut indegree[target.0 as usize];
+            let t = target.0 as usize;
+            if next_depth > depth[t] {
+                depth[t] = next_depth;
+            }
+            let d = &mut indegree[t];
             *d -= 1;
             if *d == 0 {
                 order.push(target);
@@ -445,7 +467,12 @@ fn topological_order(cx: &Context, graph: &TimingGraph) -> Result<Vec<PinId>> {
     if order.len() != n {
         bail!("combinational loop: {} of {} pins could not be levelized", n - order.len(), n);
     }
-    Ok(order)
+    let max_depth = depth.iter().copied().max().unwrap_or(0) as usize;
+    let mut levels = vec![Vec::new(); max_depth + 1];
+    for pin in order {
+        levels[depth[pin.0 as usize] as usize].push(pin);
+    }
+    Ok(LevelizedGraph { levels, edges_to, pin_driver })
 }
 
 fn polarities(sense: TimingSense) -> &'static [(usize, usize)] {
@@ -491,18 +518,35 @@ fn run_sta_detail(
     parasitics: Option<&NetParasitics>,
 ) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
     let mut cx = Context { design, lib, sdc, parasitics, pi_models: Vec::new() };
-    cx.pi_models = (0..design.num_nets())
-        .map(|n| {
-            let net = NetId(n as u32);
-            let tree = parasitics?.net(net)?;
-            let pins = design.net_pins(net);
-            let pi = |pol| tree.pi_model(&pins.iter().map(|&p| cx.sink_cap(p, pol)).collect::<Vec<_>>());
-            Some([pi(RISE), pi(FALL)])
-        })
-        .collect();
+    let build_pi = |n: usize| {
+        let net = NetId(n as u32);
+        let tree = parasitics?.net(net)?;
+        let pins = design.net_pins(net);
+        let pi = |pol| tree.pi_model(&pins.iter().map(|&p| cx.sink_cap(p, pol)).collect::<Vec<_>>());
+        Some([pi(RISE), pi(FALL)])
+    };
+    let n_nets = design.num_nets();
+    cx.pi_models = if parasitics.is_none() {
+        vec![None; n_nets]
+    } else if n_nets < 512 {
+        (0..n_nets).map(build_pi).collect()
+    } else {
+        (0..n_nets).into_par_iter().map(build_pi).collect()
+    };
+
+    let wire_delays_per_net: Vec<Option<[Vec<f32>; 2]>> = if parasitics.is_some() {
+        if n_nets < 512 {
+            (0..n_nets).map(|n| cx.wire_delays(NetId(n as u32))).collect()
+        } else {
+            (0..n_nets).into_par_iter().map(|n| cx.wire_delays(NetId(n as u32))).collect()
+        }
+    } else {
+        Vec::new()
+    };
+
     let mut skipped = SkipReport::default();
     let graph = build_graph(&cx, &mut skipped);
-    let order = topological_order(&cx, &graph)?;
+    let levelized = topological_levels(&cx, &graph)?;
     let mut state = vec![PinTimingState::UNREACHED; design.num_pins()];
 
     // Primary inputs: ideal drivers. The clock port is not a data startpoint.
@@ -526,94 +570,139 @@ fn run_sta_detail(
             state[clk.0 as usize].merge(pol, sdc.clock_latency_ns, sdc.clock_latency_ns, 0.0, 0.0);
         }
     }
-    for launch in &graph.launches {
-        let Some(q_net) = design.pin_nets[launch.q.0 as usize] else { continue };
-        let arc = &lib.arcs[launch.lib_arc as usize];
-        let clk_state = state[launch.clk.0 as usize];
-        for dst_pol in [RISE, FALL] {
-            let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) else { continue };
-            // A rising clock edge is the only launch edge, whatever the output transition.
-            let (delay, slew) = cx.driver_response(q_net, dst_pol, delay_table, slew_table, clk_state.slew_max[RISE]);
-            let arrival = clk_state.arrival_max[RISE] + delay;
-            state[launch.q.0 as usize].merge(dst_pol, arrival, arrival, slew, slew);
+
+    let eval_launch = |q: PinId, clk_state: PinTimingState, lib_arc: u32, offset_ns: f32| -> [(PinId, usize, f32, f32); 2] {
+        let q_net = design.pin_nets[q.0 as usize];
+        let arc = &lib.arcs[lib_arc as usize];
+        let mut res = [(q, RISE, f32::NEG_INFINITY, f32::NEG_INFINITY); 2];
+        if let Some(q_net) = q_net {
+            for dst_pol in [RISE, FALL] {
+                if let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) {
+                    let (delay, slew) = cx.driver_response(q_net, dst_pol, delay_table, slew_table, clk_state.slew_max[RISE]);
+                    res[dst_pol] = (q, dst_pol, clk_state.arrival_max[RISE] + offset_ns + delay, slew);
+                }
+            }
+        }
+        res
+    };
+    let launch_updates: Vec<_> = if graph.launches.len() < 64 {
+        graph.launches.iter().map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, 0.0)).collect()
+    } else {
+        graph.launches.par_iter().map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, 0.0)).collect()
+    };
+    for pair in launch_updates {
+        for (q, dst_pol, arrival, slew) in pair {
+            if arrival > f32::NEG_INFINITY {
+                state[q.0 as usize].merge(dst_pol, arrival, arrival, slew, slew);
+            }
         }
     }
     // A latch opens on the falling edge of a `dlxtn` enable, half a period after the ideal edge.
     let half_period = 0.5 * sdc.period_ns;
-    for open in &graph.latch_opens {
-        let Some(q_net) = design.pin_nets[open.q.0 as usize] else { continue };
-        let arc = &lib.arcs[open.lib_arc as usize];
-        let enable_state = state[open.enable.0 as usize];
-        for dst_pol in [RISE, FALL] {
-            let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) else { continue };
-            let (delay, slew) = cx.driver_response(q_net, dst_pol, delay_table, slew_table, enable_state.slew_max[RISE]);
-            let arrival = enable_state.arrival_max[RISE] + half_period + delay;
-            state[open.q.0 as usize].merge(dst_pol, arrival, arrival, slew, slew);
+    let latch_updates: Vec<_> = graph
+        .latch_opens
+        .iter()
+        .map(|open| eval_launch(open.q, state[open.enable.0 as usize], open.lib_arc, half_period))
+        .collect();
+    for pair in latch_updates {
+        for (q, dst_pol, arrival, slew) in pair {
+            if arrival > f32::NEG_INFINITY {
+                state[q.0 as usize].merge(dst_pol, arrival, arrival, slew, slew);
+            }
         }
     }
 
-    for &pin in &order {
-        let p = pin.0 as usize;
-        if design.pin_is_driver[p]
-            && let Some(net) = design.pin_nets[p]
-        {
-            let driver_state = state[p];
-            // The ideal clock port stays unreached; its sinks keep their seeded edge.
-            if !driver_state.reached(RISE) && !driver_state.reached(FALL) {
-                continue;
-            }
-            let wire = cx.wire_delays(net);
-            let is_port = design.pin_cells[p].is_none();
-            for (i, &sink) in design.net_pins(net).iter().enumerate().skip(1) {
-                let mut sink_state = driver_state;
-                if let Some(wire) = &wire {
-                    for pol in [RISE, FALL] {
-                        let elmore = wire[pol][i];
-                        let degrade = WIRE_SLEW_FACTOR * elmore;
-                        if is_port {
-                            let delay = std::f32::consts::LN_2 * elmore;
-                            sink_state.arrival_max[pol] += delay;
-                            sink_state.arrival_min[pol] += delay;
-                            sink_state.slew_max[pol] = driver_state.slew_max[pol] + degrade;
-                            sink_state.slew_min[pol] = driver_state.slew_min[pol] + degrade;
-                        } else {
-                            sink_state.arrival_max[pol] += elmore;
-                            sink_state.arrival_min[pol] += elmore;
-                            sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
-                            sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
+    for level in levelized.levels.iter().skip(1) {
+        let eval_pin = |state: &[PinTimingState], pin: PinId| -> Option<(usize, PinTimingState)> {
+            let p = pin.0 as usize;
+            let mut next = state[p];
+            let mut changed = false;
+
+            if !design.pin_is_driver[p]
+                && let Some((net_idx, pin_idx, drv)) = levelized.pin_driver[p]
+            {
+                let driver_state = state[drv.0 as usize];
+                if driver_state.reached(RISE) || driver_state.reached(FALL) {
+                    let mut sink_state = driver_state;
+                    if let Some(wire) = wire_delays_per_net.get(net_idx as usize).and_then(|w| w.as_ref()) {
+                        let is_port = design.pin_cells[drv.0 as usize].is_none();
+                        let i = pin_idx as usize;
+                        for pol in [RISE, FALL] {
+                            let elmore = wire[pol][i];
+                            let degrade = WIRE_SLEW_FACTOR * elmore;
+                            if is_port {
+                                let delay = std::f32::consts::LN_2 * elmore;
+                                sink_state.arrival_max[pol] += delay;
+                                sink_state.arrival_min[pol] += delay;
+                                sink_state.slew_max[pol] = driver_state.slew_max[pol] + degrade;
+                                sink_state.slew_min[pol] = driver_state.slew_min[pol] + degrade;
+                            } else {
+                                sink_state.arrival_max[pol] += elmore;
+                                sink_state.arrival_min[pol] += elmore;
+                                sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
+                                sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
+                            }
                         }
                     }
+                    next = sink_state;
+                    changed = true;
                 }
-                state[sink.0 as usize] = sink_state;
             }
-        }
-        for &e in &graph.edges_from[p] {
-            let edge = graph.edges[e as usize];
-            let arc = &lib.arcs[edge.lib_arc as usize];
-            let Some(out_net) = design.pin_nets[edge.dst.0 as usize] else { continue };
-            if graph.clock_net[out_net.0 as usize] {
-                continue;
+
+            let incoming = &levelized.edges_to[p];
+            if !incoming.is_empty()
+                && let Some(out_net) = design.pin_nets[p]
+                && !graph.clock_net[out_net.0 as usize]
+            {
+                for &(src_pin, lib_arc) in incoming {
+                    let arc = &lib.arcs[lib_arc as usize];
+                    let src = state[src_pin.0 as usize];
+                    for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
+                        if !src.reached(src_pol) {
+                            continue;
+                        }
+                        if (arc.timing_type == TimingType::CombinationalRise && dst_pol != RISE)
+                            || (arc.timing_type == TimingType::CombinationalFall && dst_pol != FALL)
+                        {
+                            continue;
+                        }
+                        let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) else { continue };
+                        let s_max = src.slew_max[src_pol];
+                        let s_min = src.slew_min[src_pol];
+                        let (late_delay, late_slew) = cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_max);
+                        let (early_delay, early_slew) = if s_min == s_max {
+                            (late_delay, late_slew)
+                        } else {
+                            cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_min)
+                        };
+                        next.merge(
+                            dst_pol,
+                            src.arrival_max[src_pol] + late_delay,
+                            src.arrival_min[src_pol] + early_delay,
+                            late_slew,
+                            early_slew,
+                        );
+                        changed = true;
+                    }
+                }
             }
-            let src = state[p];
-            for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
-                if !src.reached(src_pol) {
-                    continue;
+
+            changed.then_some((p, next))
+        };
+
+        if level.len() < 32 {
+            for &pin in level {
+                if let Some((p, next)) = eval_pin(&state, pin) {
+                    state[p] = next;
                 }
-                if (arc.timing_type == TimingType::CombinationalRise && dst_pol != RISE)
-                    || (arc.timing_type == TimingType::CombinationalFall && dst_pol != FALL)
-                {
-                    continue;
-                }
-                let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) else { continue };
-                let (late_delay, late_slew) = cx.driver_response(out_net, dst_pol, delay_table, slew_table, src.slew_max[src_pol]);
-                let (early_delay, early_slew) = cx.driver_response(out_net, dst_pol, delay_table, slew_table, src.slew_min[src_pol]);
-                state[edge.dst.0 as usize].merge(
-                    dst_pol,
-                    src.arrival_max[src_pol] + late_delay,
-                    src.arrival_min[src_pol] + early_delay,
-                    late_slew,
-                    early_slew,
-                );
+            }
+        } else {
+            let updates: Vec<(usize, PinTimingState)> = level
+                .par_iter()
+                .filter_map(|&pin| eval_pin(&state, pin))
+                .collect();
+            for (p, next) in updates {
+                state[p] = next;
             }
         }
     }

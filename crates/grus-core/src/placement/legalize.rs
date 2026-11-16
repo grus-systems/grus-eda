@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use anyhow::{bail, Context, Result};
 use crate::design_db::{DesignDb, Orient, PlacementStatus};
 use crate::interner::{CellId, NetId, PinId};
@@ -102,6 +101,65 @@ fn add_cell_to_clusters(
         );
         c_prev.cells.extend(c_last.cells);
     }
+}
+
+/// Simulate appending `cell` of width `w_i` at `x_gp` onto `sub_row.clusters` and return
+/// the resulting legal x coordinate without cloning `sub_row.clusters`.
+#[inline]
+fn trial_add_cell_x(w_i: i32, x_gp: i32, sub_row: &SubRow) -> i32 {
+    let mut cur_x = snap_to_site(
+        x_gp,
+        sub_row.orig_x_dbu,
+        sub_row.step_x_dbu,
+        sub_row.x_min_dbu,
+        sub_row.x_max_dbu - w_i,
+    );
+    let mut cur_w = w_i;
+    let mut cur_weight = 1.0f32;
+    let mut cur_q = x_gp as f32;
+
+    for c_prev in sub_row.clusters.iter().rev() {
+        if c_prev.x_dbu + c_prev.width_dbu <= cur_x {
+            break;
+        }
+        cur_q = c_prev.q_sum + (cur_q - cur_weight * (c_prev.width_dbu as f32));
+        cur_weight += c_prev.weight_sum;
+        cur_w += c_prev.width_dbu;
+        cur_x = snap_to_site(
+            (cur_q / cur_weight).round() as i32,
+            sub_row.orig_x_dbu,
+            sub_row.step_x_dbu,
+            sub_row.x_min_dbu,
+            sub_row.x_max_dbu - cur_w,
+        );
+    }
+    cur_x + cur_w - w_i
+}
+
+/// Merge two sorted unique net slices into `out` without duplicates.
+#[inline]
+fn merge_sorted_nets(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
+    out.clear();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
 }
 
 fn net_hpwl_dbu(db: &DesignDb, tech_db: &TechDb, net_idx: usize) -> i64 {
@@ -359,6 +417,7 @@ fn equal_width_swap_pass(
     let mut eval = Pass1Eval::default();
 
     let mut candidates: Vec<usize> = Vec::new();
+    let mut incident: Vec<usize> = Vec::new();
     for (i, &c1) in movable_cells.iter().enumerate() {
         let w1 = cell_w_dbu[c1];
         let x1 = design_db.cell_x_dbu[c1];
@@ -389,13 +448,8 @@ fn equal_width_swap_pass(
                 continue;
             }
 
-            // Collect incident nets
-            let mut incident: Vec<usize> = cell_nets[c1].to_vec();
-            for &net in &cell_nets[c2] {
-                if !incident.contains(&net) {
-                    incident.push(net);
-                }
-            }
+            // Collect incident nets without allocating per candidate pair.
+            merge_sorted_nets(&cell_nets[c1], &cell_nets[c2], &mut incident);
             if incident.is_empty() {
                 continue;
             }
@@ -475,43 +529,53 @@ pub fn legalize_placement(
     // Step 1: Collect row sub-segments by splitting around fixed obstacles
     let mut row_indices: Vec<usize> = (0..design_db.rows.len()).collect();
     row_indices.sort_by_key(|&r| design_db.rows[r].orig_y_dbu);
+    let row_orig_ys: Vec<i32> = row_indices
+        .iter()
+        .map(|&r_idx| design_db.rows[r_idx].orig_y_dbu)
+        .collect();
+
+    let mut row_obs: Vec<Vec<(i32, i32)>> = vec![Vec::new(); row_indices.len()];
+    for f in 0..num_cells {
+        if movable_mask[f] {
+            continue;
+        }
+        if design_db.cell_status[f] != PlacementStatus::Fixed
+            && design_db.cell_status[f] != PlacementStatus::Cover
+        {
+            continue;
+        }
+        let cy = design_db.cell_y_dbu[f];
+        let ch = cell_h_dbu[f];
+        let cx = design_db.cell_x_dbu[f];
+        let cw = cell_w_dbu[f];
+
+        // Row k vertically overlaps [cy, cy + ch) iff ry + site_height > cy && ry < cy + ch.
+        let min_ry = cy.saturating_sub(site_height);
+        let lo = row_orig_ys.partition_point(|&ry| ry <= min_ry);
+        let hi = row_orig_ys.partition_point(|&ry| ry < cy.saturating_add(ch));
+        for k in lo..hi {
+            let r = &design_db.rows[row_indices[k]];
+            let row_xl = r.orig_x_dbu;
+            let row_xh = r.orig_x_dbu + r.num_x * r.step_x_dbu;
+            let ox_l = snap_down(cx, r.orig_x_dbu, r.step_x_dbu).max(row_xl);
+            let ox_h = snap_up(cx + cw, r.orig_x_dbu, r.step_x_dbu).min(row_xh);
+            if ox_h > ox_l {
+                row_obs[k].push((ox_l, ox_h));
+            }
+        }
+    }
 
     let mut sub_rows = Vec::new();
-    for &r_idx in &row_indices {
+    for (k, &r_idx) in row_indices.iter().enumerate() {
         let r = &design_db.rows[r_idx];
         let row_xl = r.orig_x_dbu;
         let row_xh = r.orig_x_dbu + r.num_x * r.step_x_dbu;
-        let row_yl = r.orig_y_dbu;
-        let row_yh = r.orig_y_dbu + site_height;
-
-        // Collect non-movable cells overlapping this row
-        let mut obs_intervals = Vec::new();
-        for f in 0..num_cells {
-            if movable_mask[f] {
-                continue;
-            }
-            if design_db.cell_status[f] != PlacementStatus::Fixed
-                && design_db.cell_status[f] != PlacementStatus::Cover
-            {
-                continue;
-            }
-            let cy = design_db.cell_y_dbu[f];
-            let ch = cell_h_dbu[f];
-            if cy < row_yh && cy + ch > row_yl {
-                let cx = design_db.cell_x_dbu[f];
-                let cw = cell_w_dbu[f];
-                let ox_l = snap_down(cx, r.orig_x_dbu, r.step_x_dbu).max(row_xl);
-                let ox_h = snap_up(cx + cw, r.orig_x_dbu, r.step_x_dbu).min(row_xh);
-                if ox_h > ox_l {
-                    obs_intervals.push((ox_l, ox_h));
-                }
-            }
-        }
+        let obs_intervals = &mut row_obs[k];
 
         // Merge overlapping obstacle intervals
         obs_intervals.sort_unstable();
         let mut merged_obs: Vec<(i32, i32)> = Vec::new();
-        for (ox_l, ox_h) in obs_intervals {
+        for &(ox_l, ox_h) in obs_intervals.iter() {
             match merged_obs.last_mut() {
                 Some(last) if ox_l <= last.1 => {
                     last.1 = last.1.max(ox_h);
@@ -582,62 +646,154 @@ pub fn legalize_placement(
     let mut movable_cells: Vec<usize> = (0..num_cells).filter(|&c| movable_mask[c]).collect();
     movable_cells.sort_by_key(|&c| (x_gp_dbu[c], y_gp_dbu[c], c));
 
+    // Index sub_rows by sorted unique orig_y_dbu bands (preserving contiguous sub_row slices)
+    // and track each band's max free_width for fast Abacus search + O(1) resync.
+    let mut band_ys: Vec<i32> = Vec::new();
+    let mut band_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut band_max_free: Vec<i32> = Vec::new();
+    let mut subrow_band = vec![0usize; sub_rows.len()];
+    {
+        let mut i = 0;
+        while i < sub_rows.len() {
+            let y = sub_rows[i].orig_y_dbu;
+            let b_idx = band_ys.len();
+            let mut j = i;
+            let mut max_fw = 0;
+            while j < sub_rows.len() && sub_rows[j].orig_y_dbu == y {
+                max_fw = max_fw.max(sub_rows[j].free_width);
+                subrow_band[j] = b_idx;
+                j += 1;
+            }
+            band_ys.push(y);
+            band_ranges.push((i, j));
+            band_max_free.push(max_fw);
+            i = j;
+        }
+    }
+
     // Step 3: Abacus Single-Row Dynamic Clustering
+    let max_y_dist = 10 * site_height;
     for &cell in &movable_cells {
         let w_i = cell_w_dbu[cell];
         let x_gp = x_gp_dbu[cell];
         let y_gp = y_gp_dbu[cell];
 
-        // Search candidate sub-rows within +/- 10 rows that have capacity
-        let max_y_dist = 10 * site_height;
-        let mut best_subrow_idx = None;
+        // Search candidate sub-rows within +/- 10 rows first, then fall back to all rows.
+        let mut best_subrow_idx: Option<usize> = None;
         let mut best_disp = i64::MAX;
-        let mut best_trial_clusters = Vec::new();
 
-        let mut pass_candidates: Vec<usize> = sub_rows
-            .iter()
-            .enumerate()
-            .filter(|(_, sr)| sr.free_width >= w_i && (sr.orig_y_dbu - y_gp).abs() <= max_y_dist)
-            .map(|(idx, _)| idx)
-            .collect();
+        for &limited in &[true, false] {
+            let (band_lo, band_hi) = if limited {
+                let y_lo = y_gp as i64 - max_y_dist as i64;
+                let y_hi = y_gp as i64 + max_y_dist as i64;
+                (
+                    band_ys.partition_point(|&by| (by as i64) < y_lo),
+                    band_ys.partition_point(|&by| (by as i64) <= y_hi),
+                )
+            } else {
+                (0, band_ys.len())
+            };
 
-        if pass_candidates.is_empty() {
-            // Fallback to all sub-rows with capacity
-            pass_candidates = sub_rows
-                .iter()
-                .enumerate()
-                .filter(|(_, sr)| sr.free_width >= w_i)
-                .map(|(idx, _)| idx)
-                .collect();
-        }
+            let mid = band_ys
+                .partition_point(|&by| by < y_gp)
+                .clamp(band_lo, band_hi);
+            let mut left = mid;
+            let mut right = mid;
 
-        if pass_candidates.is_empty() {
-            bail!("Unable to place cell {}: no SubRow with remaining capacity {}", cell, w_i);
-        }
+            while left > band_lo || right < band_hi {
+                let pick_right = match (left > band_lo, right < band_hi) {
+                    (true, true) => {
+                        let dl = y_gp as i64 - band_ys[left - 1] as i64;
+                        let dr = band_ys[right] as i64 - y_gp as i64;
+                        dr <= dl
+                    }
+                    (false, true) => true,
+                    (true, false) => false,
+                    (false, false) => break,
+                };
+                let b = if pick_right {
+                    let b = right;
+                    right += 1;
+                    b
+                } else {
+                    left -= 1;
+                    left
+                };
 
-        for &sr_idx in &pass_candidates {
-            let sr = &sub_rows[sr_idx];
-            let mut trial_clusters = sr.clusters.clone();
-            add_cell_to_clusters(&mut trial_clusters, cell, w_i, x_gp, sr);
+                let dy = band_ys[b] as i64 - y_gp as i64;
+                let dy2 = dy * dy;
+                if dy2 > best_disp {
+                    // Outward search guarantees |dy'| >= |dy| for all remaining bands.
+                    break;
+                }
+                if band_max_free[b] < w_i {
+                    continue;
+                }
 
-            let c_last = trial_clusters.last().unwrap();
-            let x_legal = c_last.x_dbu + c_last.width_dbu - w_i;
-            let y_legal = sr.orig_y_dbu;
+                let (sr_start, sr_end) = band_ranges[b];
+                for (rel_idx, sr) in sub_rows[sr_start..sr_end].iter().enumerate() {
+                    let sr_idx = sr_start + rel_idx;
+                    if sr.free_width < w_i {
+                        continue;
+                    }
+                    let max_start = sr.x_max_dbu - w_i;
+                    let min_dx = if x_gp < sr.x_min_dbu {
+                        (sr.x_min_dbu - x_gp) as i64
+                    } else if x_gp > max_start {
+                        (x_gp - max_start) as i64
+                    } else {
+                        0
+                    };
+                    if min_dx * min_dx + dy2 > best_disp {
+                        continue;
+                    }
 
-            let dx = (x_legal - x_gp) as i64;
-            let dy = (y_legal - y_gp) as i64;
-            let disp = dx * dx + dy * dy;
+                    let x_legal = trial_add_cell_x(w_i, x_gp, sr);
+                    let dx = (x_legal - x_gp) as i64;
+                    let disp = dx * dx + dy2;
+                    if disp < best_disp
+                        || (disp == best_disp && best_subrow_idx.is_none_or(|best| sr_idx < best))
+                    {
+                        best_disp = disp;
+                        best_subrow_idx = Some(sr_idx);
+                    }
+                }
+            }
 
-            if disp < best_disp {
-                best_disp = disp;
-                best_subrow_idx = Some(sr_idx);
-                best_trial_clusters = trial_clusters;
+            if best_subrow_idx.is_some() {
+                break;
             }
         }
 
-        let chosen_idx = best_subrow_idx.unwrap();
-        sub_rows[chosen_idx].clusters = best_trial_clusters;
-        sub_rows[chosen_idx].free_width -= w_i;
+        let chosen_idx = best_subrow_idx.with_context(|| {
+            format!(
+                "Unable to place cell {}: no SubRow with remaining capacity {}",
+                cell, w_i
+            )
+        })?;
+        let sr = &mut sub_rows[chosen_idx];
+        let sr_meta = SubRow {
+            row_idx: sr.row_idx,
+            orig_x_dbu: sr.orig_x_dbu,
+            orig_y_dbu: sr.orig_y_dbu,
+            step_x_dbu: sr.step_x_dbu,
+            orient: sr.orient,
+            x_min_dbu: sr.x_min_dbu,
+            x_max_dbu: sr.x_max_dbu,
+            free_width: sr.free_width,
+            clusters: Vec::new(),
+            cells: Vec::new(),
+        };
+        add_cell_to_clusters(&mut sr.clusters, cell, w_i, x_gp, &sr_meta);
+        sr.free_width -= w_i;
+
+        let b = subrow_band[chosen_idx];
+        let (sr_start, sr_end) = band_ranges[b];
+        band_max_free[b] = sub_rows[sr_start..sr_end]
+            .iter()
+            .map(|s| s.free_width)
+            .max()
+            .unwrap_or(0);
     }
 
     // Unpack Abacus clusters into sub-row cell ordering and write positions to design_db
@@ -659,47 +815,55 @@ pub fn legalize_placement(
     verify_legality(design_db, tech_db).context("verify_legality failed right after Abacus")?;
 
     // Step 4: Post-Abacus Local Detailed Placement Refinement (4 Rounds)
-    // Precompute net-to-cells and cell-to-nets mappings
+    // Precompute sorted unique incident nets per cell for fast deterministic merging.
     let mut cell_nets: Vec<Vec<usize>> = vec![Vec::new(); num_cells];
     for (c, nets_entry) in cell_nets.iter_mut().enumerate() {
         let start = design_db.cell_pin_offsets[c] as usize;
         let end = design_db.cell_pin_offsets[c + 1] as usize;
-        let mut nets = HashSet::new();
         for &p in &design_db.cell_pin_ids[start..end] {
             if let Some(net) = design_db.pin_nets[p.0 as usize] {
-                nets.insert(net.0 as usize);
+                nets_entry.push(net.0 as usize);
             }
         }
-        *nets_entry = nets.into_iter().collect();
+        nets_entry.sort_unstable();
+        nets_entry.dedup();
     }
 
     let mut pass1_eval_fallbacks = 0usize;
+    let mut incident_buf: Vec<usize> = Vec::new();
+    let mut other_xs_buf: Vec<i32> = Vec::new();
+    let mut net_spans_buf: Vec<(i32, i32, i32, i32)> = Vec::new();
+    let mut candidates_buf: Vec<i32> = Vec::new();
     for _round in 0..4 {
         // Pass 1: Equal-width cell swaps
-        let mut band_ys: Vec<i32> = sub_rows.iter().map(|sr| sr.orig_y_dbu).collect();
-        band_ys.sort_unstable();
-        band_ys.dedup();
         pass1_eval_fallbacks +=
             equal_width_swap_pass(design_db, tech_db, &movable_cells, &cell_w_dbu, &cell_nets, &band_ys);
 
-        // Re-synchronize sub_row.cells according to current design_db positions
+        // Re-synchronize sub_row.cells by bucketing each movable cell into its exact sub_row.
         for sr in &mut sub_rows {
-            let row_y = sr.orig_y_dbu;
-            let sr_min = sr.x_min_dbu;
-            let sr_max = sr.x_max_dbu;
             sr.cells.clear();
-            for &c in &movable_cells {
-                if design_db.cell_y_dbu[c] == row_y
-                    && design_db.cell_x_dbu[c] >= sr_min
-                    && design_db.cell_x_dbu[c] + cell_w_dbu[c] <= sr_max
-                {
-                    sr.cells.push(c);
+        }
+        for &c in &movable_cells {
+            let cy = design_db.cell_y_dbu[c];
+            let cx = design_db.cell_x_dbu[c];
+            let cw = cell_w_dbu[c];
+            if let Ok(b) = band_ys.binary_search(&cy) {
+                let (sr_start, sr_end) = band_ranges[b];
+                let slice = &mut sub_rows[sr_start..sr_end];
+                let pos = slice.partition_point(|sr| sr.x_min_dbu <= cx);
+                if pos > 0 {
+                    let sr = &mut slice[pos - 1];
+                    if cx + cw <= sr.x_max_dbu {
+                        sr.cells.push(c);
+                    }
                 }
             }
-            sr.cells.sort_by_key(|&c| design_db.cell_x_dbu[c]);
+        }
+        for sr in &mut sub_rows {
+            sr.cells.sort_unstable_by_key(|&c| design_db.cell_x_dbu[c]);
         }
 
-        // Pass 2: Adjacent sub-row cell swaps
+        // Pass 2: Adjacent sub-row cell swaps (single net scan per pair since only x shifts)
         for sr in &mut sub_rows {
             let k = sr.cells.len();
             if k < 2 {
@@ -719,28 +883,47 @@ pub fn legalize_placement(
                     continue;
                 }
 
-                let mut incident: Vec<usize> = cell_nets[ca].to_vec();
-                for &net in &cell_nets[cb] {
-                    if !incident.contains(&net) {
-                        incident.push(net);
-                    }
-                }
-                if incident.is_empty() {
+                merge_sorted_nets(&cell_nets[ca], &cell_nets[cb], &mut incident_buf);
+                if incident_buf.is_empty() {
                     continue;
                 }
 
-                let hpwl_before: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
+                let dxa = new_xa - xa;
+                let dxb = new_xb - xb;
+                let ca_id = CellId(ca as u32);
+                let cb_id = CellId(cb as u32);
+                let mut hpwl_x_before = 0i64;
+                let mut hpwl_x_after = 0i64;
+                for &n in &incident_buf {
+                    let pins = design_db.net_pins(NetId(n as u32));
+                    if pins.len() <= 1 {
+                        continue;
+                    }
+                    let (mut min_b, mut max_b) = (i32::MAX, i32::MIN);
+                    let (mut min_a, mut max_a) = (i32::MAX, i32::MIN);
+                    for &pin in pins {
+                        let (px, _) = design_db.pin_pos_dbu(pin, tech_db);
+                        min_b = min_b.min(px);
+                        max_b = max_b.max(px);
+                        let owner = design_db.pin_cells[pin.0 as usize];
+                        let px_a = if owner == Some(ca_id) {
+                            px + dxa
+                        } else if owner == Some(cb_id) {
+                            px + dxb
+                        } else {
+                            px
+                        };
+                        min_a = min_a.min(px_a);
+                        max_a = max_a.max(px_a);
+                    }
+                    hpwl_x_before += (max_b - min_b) as i64;
+                    hpwl_x_after += (max_a - min_a) as i64;
+                }
 
-                design_db.cell_x_dbu[ca] = new_xa;
-                design_db.cell_x_dbu[cb] = new_xb;
-
-                let hpwl_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
-
-                if hpwl_after < hpwl_before {
+                if hpwl_x_after < hpwl_x_before {
+                    design_db.cell_x_dbu[ca] = new_xa;
+                    design_db.cell_x_dbu[cb] = new_xb;
                     sr.cells.swap(j, j + 1);
-                } else {
-                    design_db.cell_x_dbu[ca] = xa;
-                    design_db.cell_x_dbu[cb] = xb;
                 }
             }
         }
@@ -768,46 +951,71 @@ pub fn legalize_placement(
                     continue;
                 }
 
-                // Compute median x of other pins
-                let mut other_xs = Vec::new();
-                for &net in &cell_nets[c] {
-                    let pins = design_db.net_pins(NetId(net as u32));
-                    for &pin in pins {
-                        if design_db.pin_cells[pin.0 as usize] != Some(crate::interner::CellId(c as u32)) {
-                            let (px, _) = design_db.pin_pos_dbu(pin, tech_db);
-                            other_xs.push(px);
-                        }
-                    }
-                }
-
-                let mut candidates = vec![left_limit, right_limit];
-                if !other_xs.is_empty() {
-                    other_xs.sort_unstable();
-                    let med = other_xs[other_xs.len() / 2];
-                    let snapped = snap_to_site(med - wc / 2, sr.orig_x_dbu, sr.step_x_dbu, left_limit, right_limit);
-                    candidates.push(snapped);
-                }
-
-                candidates.sort_unstable();
-                candidates.dedup();
-
                 let incident = &cell_nets[c];
                 if incident.is_empty() {
                     continue;
                 }
-                let hpwl_before: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
+
+                // Collect non-cell x positions + per-net (other_lo, other_hi, c_lo, c_hi) in one scan
+                // so candidates evaluate without rescanning any net (y coordinates do not change).
+                other_xs_buf.clear();
+                net_spans_buf.clear();
+                let c_id = CellId(c as u32);
+                for &net in incident {
+                    let pins = design_db.net_pins(NetId(net as u32));
+                    if pins.len() <= 1 {
+                        continue;
+                    }
+                    let (mut o_lo, mut o_hi) = (i32::MAX, i32::MIN);
+                    let (mut c_lo, mut c_hi) = (i32::MAX, i32::MIN);
+                    for &pin in pins {
+                        let (px, _) = design_db.pin_pos_dbu(pin, tech_db);
+                        if design_db.pin_cells[pin.0 as usize] == Some(c_id) {
+                            c_lo = c_lo.min(px);
+                            c_hi = c_hi.max(px);
+                        } else {
+                            other_xs_buf.push(px);
+                            o_lo = o_lo.min(px);
+                            o_hi = o_hi.max(px);
+                        }
+                    }
+                    if c_lo <= c_hi {
+                        net_spans_buf.push((o_lo, o_hi, c_lo, c_hi));
+                    }
+                }
+
+                candidates_buf.clear();
+                candidates_buf.push(left_limit);
+                candidates_buf.push(right_limit);
+                if !other_xs_buf.is_empty() {
+                    other_xs_buf.sort_unstable();
+                    let med = other_xs_buf[other_xs_buf.len() / 2];
+                    let snapped = snap_to_site(med - wc / 2, sr.orig_x_dbu, sr.step_x_dbu, left_limit, right_limit);
+                    candidates_buf.push(snapped);
+                }
+
+                candidates_buf.sort_unstable();
+                candidates_buf.dedup();
+
+                let eval_x_span = |dx: i32| -> i64 {
+                    net_spans_buf
+                        .iter()
+                        .map(|&(o_lo, o_hi, c_lo, c_hi)| {
+                            (o_hi.max(c_hi + dx) - o_lo.min(c_lo + dx)) as i64
+                        })
+                        .sum()
+                };
 
                 let mut best_x = orig_x;
-                let mut best_hpwl = hpwl_before;
+                let mut best_span = eval_x_span(0);
 
-                for &cand_x in &candidates {
+                for &cand_x in &candidates_buf {
                     if cand_x == orig_x {
                         continue;
                     }
-                    design_db.cell_x_dbu[c] = cand_x;
-                    let h: i64 = incident.iter().map(|&n| net_hpwl_dbu(design_db, tech_db, n)).sum();
-                    if h < best_hpwl {
-                        best_hpwl = h;
+                    let h = eval_x_span(cand_x - orig_x);
+                    if h < best_span {
+                        best_span = h;
                         best_x = cand_x;
                     }
                 }
@@ -861,87 +1069,91 @@ pub fn verify_legality(design_db: &DesignDb, tech_db: &TechDb) -> Result<()> {
     let site_height = tech_db.site_height_dbu;
     let num_cells = design_db.num_cells();
 
-    // 1. Verify all movable cells are Placed and on valid rows
+    let mut row_order: Vec<usize> = (0..design_db.rows.len()).collect();
+    row_order.sort_by_key(|&r| design_db.rows[r].orig_y_dbu);
+    let row_orig_ys: Vec<i32> = row_order
+        .iter()
+        .map(|&r| design_db.rows[r].orig_y_dbu)
+        .collect();
+
+    // 1. Verify all movable cells are Placed and on valid rows, and bucket all non-spacer cells
+    // into overlapping rows in a single pass instead of scanning all cells per row.
+    let mut row_cells: Vec<Vec<(i32, i32, usize)>> = vec![Vec::new(); row_order.len()];
     for c in 0..num_cells {
         let macro_id = design_db.cell_macros[c];
         if macro_id.0 as usize >= tech_db.macros.len() {
             continue;
         }
         let mac = &tech_db.macros[macro_id.0 as usize];
-        if mac.class != MacroClass::Core && mac.class != MacroClass::CoreTie {
-            continue;
-        }
-        if design_db.cell_status[c] == PlacementStatus::Fixed
-            || design_db.cell_status[c] == PlacementStatus::Cover
-        {
-            continue;
-        }
-
-        if design_db.cell_status[c] != PlacementStatus::Placed {
-            bail!("Movable cell {} status is not Placed: {:?}", c, design_db.cell_status[c]);
-        }
-
         let cy = design_db.cell_y_dbu[c];
         let cx = design_db.cell_x_dbu[c];
         let orient = design_db.cell_orient[c];
-
-        let matched_row = design_db.rows.iter().find(|r| r.orig_y_dbu == cy);
-        let row = match matched_row {
-            Some(r) => r,
-            None => bail!("Cell {} y={} does not match any PlacementRow", c, cy),
+        let is_rot = matches!(orient, Orient::E | Orient::W | Orient::FE | Orient::FW);
+        let (cw, ch) = if is_rot {
+            (mac.height_dbu, mac.width_dbu)
+        } else {
+            (mac.width_dbu, mac.height_dbu)
         };
 
-        if orient != row.orient {
-            bail!("Cell {} orient {:?} does not match row orient {:?}", c, orient, row.orient);
+        let status = design_db.cell_status[c];
+        if (mac.class == MacroClass::Core || mac.class == MacroClass::CoreTie)
+            && status != PlacementStatus::Fixed
+            && status != PlacementStatus::Cover
+        {
+            if status != PlacementStatus::Placed {
+                bail!("Movable cell {} status is not Placed: {:?}", c, status);
+            }
+
+            let pos = row_orig_ys.partition_point(|&ry| ry < cy);
+            if pos >= row_orig_ys.len() || row_orig_ys[pos] != cy {
+                bail!("Cell {} y={} does not match any PlacementRow", c, cy);
+            }
+            // Match rows.iter().find() order when multiple rows share orig_y_dbu: stable sort keeps
+            // the earliest row index first.
+            let row = &design_db.rows[row_order[pos]];
+
+            if orient != row.orient {
+                bail!("Cell {} orient {:?} does not match row orient {:?}", c, orient, row.orient);
+            }
+
+            if (cx - row.orig_x_dbu) % row.step_x_dbu != 0 {
+                bail!(
+                    "Cell {} x={} is not snapped to row site grid (orig_x={}, step={})",
+                    c, cx, row.orig_x_dbu, row.step_x_dbu
+                );
+            }
+
+            let row_xh = row.orig_x_dbu + row.num_x * row.step_x_dbu;
+            if cx < row.orig_x_dbu || cx + cw > row_xh {
+                bail!(
+                    "Cell {} [{}, {}] exceeds row horizontal bounds [{}, {}]",
+                    c, cx, cx + cw, row.orig_x_dbu, row_xh
+                );
+            }
         }
 
-        if (cx - row.orig_x_dbu) % row.step_x_dbu != 0 {
-            bail!("Cell {} x={} is not snapped to row site grid (orig_x={}, step={})", c, cx, row.orig_x_dbu, row.step_x_dbu);
+        if mac.class == MacroClass::CoreSpacer {
+            continue;
         }
-
-        let is_rot = matches!(orient, Orient::E | Orient::W | Orient::FE | Orient::FW);
-        let cw = if is_rot { mac.height_dbu } else { mac.width_dbu };
-        let row_xh = row.orig_x_dbu + row.num_x * row.step_x_dbu;
-
-        if cx < row.orig_x_dbu || cx + cw > row_xh {
-            bail!("Cell {} [{}, {}] exceeds row horizontal bounds [{}, {}]", c, cx, cx + cw, row.orig_x_dbu, row_xh);
+        let min_ry = cy.saturating_sub(site_height);
+        let lo = row_orig_ys.partition_point(|&ry| ry <= min_ry);
+        let hi = row_orig_ys.partition_point(|&ry| ry < cy.saturating_add(ch));
+        for row_vec in &mut row_cells[lo..hi] {
+            row_vec.push((cx, cx + cw, c));
         }
     }
 
     // 2. Zero-overlap check across all rows
-    for row in &design_db.rows {
-        let row_yl = row.orig_y_dbu;
-        let row_yh = row.orig_y_dbu + site_height;
-
-        let mut row_cells = Vec::new();
-        for c in 0..num_cells {
-            let macro_id = design_db.cell_macros[c];
-            if macro_id.0 as usize >= tech_db.macros.len() {
-                continue;
-            }
-            let mac = &tech_db.macros[macro_id.0 as usize];
-            if mac.class == MacroClass::CoreSpacer {
-                continue;
-            }
-            let cy = design_db.cell_y_dbu[c];
-            let is_rot = matches!(design_db.cell_orient[c], Orient::E | Orient::W | Orient::FE | Orient::FW);
-            let (cw, ch) = if is_rot { (mac.height_dbu, mac.width_dbu) } else { (mac.width_dbu, mac.height_dbu) };
-
-            if cy < row_yh && cy + ch > row_yl {
-                let cx = design_db.cell_x_dbu[c];
-                row_cells.push((cx, cx + cw, c));
-            }
-        }
-
-        row_cells.sort_by_key(|&(x1, _, _)| x1);
-
-        for i in 0..row_cells.len().saturating_sub(1) {
-            let (x1_l, x1_h, c1) = row_cells[i];
-            let (x2_l, _, c2) = row_cells[i + 1];
+    for (k, cells) in row_cells.iter_mut().enumerate() {
+        cells.sort_unstable_by_key(|&(x1, _, _)| x1);
+        let row_yl = row_orig_ys[k];
+        for i in 0..cells.len().saturating_sub(1) {
+            let (x1_l, x1_h, c1) = cells[i];
+            let (x2_l, _, c2) = cells[i + 1];
             if x1_h > x2_l {
                 bail!(
                     "Overlap on row y={}: cell {} [{}, {}] overlaps cell {} [{}, {}] by {} DBU",
-                    row_yl, c1, x1_l, x1_h, c2, x2_l, row_cells[i + 1].1, x1_h - x2_l
+                    row_yl, c1, x1_l, x1_h, c2, x2_l, cells[i + 1].1, x1_h - x2_l
                 );
             }
         }
@@ -1477,5 +1689,45 @@ mod tests {
             .expect("Legalization must succeed");
         verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
         println!("picorv32 legalized: final_hpwl_dbu={}", leg_res.final_hpwl_dbu);
+    }
+
+    #[test]
+    fn test_trial_add_cell_x_matches_cluster_push() {
+        let mut sr = SubRow {
+            row_idx: 0,
+            orig_x_dbu: 460,
+            orig_y_dbu: 0,
+            step_x_dbu: 460,
+            orient: Orient::N,
+            x_min_dbu: 460,
+            x_max_dbu: 460 + 200 * 460,
+            free_width: 200 * 460,
+            clusters: Vec::new(),
+            cells: Vec::new(),
+        };
+
+        // Pseudo-random deterministic stream of cell widths (multiples of site) and x_gp targets
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        for c in 0..80usize {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let w_i = (((rng >> 16) % 5) as i32 + 1) * 460;
+            if w_i > sr.free_width {
+                continue;
+            }
+            // Bias some placements to collide and trigger multi-cluster cascading merges.
+            let x_gp = sr.orig_x_dbu + ((((rng >> 32) % 90) as i32) * 460);
+            let trial_x = trial_add_cell_x(w_i, x_gp, &sr);
+
+            let sr_meta = SubRow {
+                clusters: Vec::new(),
+                cells: Vec::new(),
+                ..sr
+            };
+            add_cell_to_clusters(&mut sr.clusters, c, w_i, x_gp, &sr_meta);
+            sr.free_width -= w_i;
+            let c_last = sr.clusters.last().unwrap();
+            let actual_x = c_last.x_dbu + c_last.width_dbu - w_i;
+            assert_eq!(trial_x, actual_x, "Mismatch at cell {} (x_gp={}, w={})", c, x_gp, w_i);
+        }
     }
 }
