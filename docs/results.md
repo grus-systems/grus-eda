@@ -1302,3 +1302,44 @@ reproduced or fixed:
   late/max driver behaviour into one slew (R1-era approximation, needs a
   fixture); RC shielding differences vs a real DMP driver response (same
   fixture dependency).
+
+### R6 second review round (same day)
+
+A follow-up read-only review of the parity fix plus the surrounding files
+returned reject again; dispositions:
+
+- **Fixed — clock-gate enables ignored launch parity** (S1): the
+  `gating_enables` endpoint now applies the same `c0` vs `par_max`/`par_min`
+  rule as register checks, per data polarity. Required times are computed per
+  polarity inside the loop. Existing fixtures are unchanged (their enables
+  launch at parity 0).
+- **Fixed — latch `opening_max` could sit one period early** (S1): under a
+  propagated clock the opening fall is now aligned to the closing edge's cycle
+  by whole periods (`floor((closing - first_fall) / period)`), instead of
+  always using the first fall arrival. The non-inverting case resolves to the
+  same value as before; the inverting-clock + parity-1-launch corner moves one
+  period later. No dedicated fixture yet — recorded as a residual.
+- **Fixed — `port_drive` early delay used `.max`** (S1): raw driving-cell
+  delays are now tracked as per-(output, source) min and max; `early` takes the
+  minimum derated value so `arrival_min` is not inflated on non-unate or
+  multi-input driving cells. Single-input `inv`/`buf` drivers are unaffected
+  (one arc per transition pair).
+- **Fixed — Liberty parser robustness** (S1/S2/S3 batch): NLDM tables pad a
+  missing axis symmetrically and validate `values.len() == index_1 * index_2`
+  (previously `index_2`-only or undersized tables could panic `eval_2d`);
+  arcs with missing/unresolvable `related_pin` are dropped instead of
+  fabricating self-loop arcs; unknown attribute statements inside
+  cell/pin/timing bodies are skipped whole so values cannot alias keywords
+  (`cell_footprint : latch;` no longer sets `is_latch`); unterminated bodies
+  now error instead of returning partial parses; `capacitive_load_unit`
+  accepts `pf`/`ff`/`nf`/`uf` explicitly and rejects the rest; `u16` id/count
+  casts are checked; `LibDb` defaults `time_unit_ns`/`cap_unit_pf` to 1.0;
+  `ff`/`latch` state-variable pins sharing a `pin()` name reuse the slot
+  instead of duplicating; redundant map rebuilds after parse removed.
+  `CACHE_VERSION` bumped to 3 for the parser changes.
+- **Deferred — documented limitations**: `gating_enables` cannot distinguish
+  AND from OR/NAND clock gates (identical positive-unate signature; needs cell
+  function info Liberty does not provide); multiple `timing()` arcs targeting
+  the same check pin still overwrite each other (`when`-conditional arcs are
+  skipped entirely, so this needs same-condition duplicates — scan `sdf*`
+  cells, unused by current fixtures).
