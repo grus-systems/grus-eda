@@ -810,6 +810,28 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
 - **Workspace verification (`v0.1.48`)**:
   - `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`162 passed; 0 failed; 5 ignored` in `69.49s`; remaining 5 ignores are the E3 placement-RC tests and OpenSTA #582 `jpeg_placed_spef`).
 
+### 2026-11-16 — E2 closed across all 5 designs: CG initial placement, unclamped BB step scaling, and two-phase penalty ramp (`v0.1.49`)
+
+- **Root causes identified in baseline Nesterov GP**:
+  - Unweighted 15-iteration Jacobi barycenter initialization left large designs collapsed near the core centroid (`jpeg`: `init_hpwl = 139,780 um` vs placed `1,031,640 um` because only 49 I/O pins serve 46,548 movable cells). With collapsed `init_hpwl` and huge stacked repulsion `||F||_1 = 1.42e9`, `lambda_0 = 0.05 * ||wl||_1 / ||F||_1 = 1.99e-8` started `~1e6x` below equilibrium, while `dhpwl_ref = 0.015 * init_hpwl` choked `mu_k` down to `~1.012`.
+  - Global step clamp `alpha_k <= 0.5 * step_scale / g_inf` allowed a single high-gradient cell to throttle the step size across all cells by `10x–88x` on `aes`, `ibex`, and `jpeg` (`jpeg` reached only `tau = 0.8154` at iter 300, causing Abacus legalization to blow up HPWL to `+424.18%`).
+  - Letting baseline run to `max_iters = 1000` confirmed the underlying WA + Poisson objective converges cleanly (`aes`: `330` iters, `+2.95%`; `ibex`: `384` iters, `-2.93%`; `jpeg`: `714` iters, `leg_hpwl = 974,081,165 dbu`, `-5.58%`).
+- **Fixes (`docs/e2-placement.md`, `crates/grus-core/src/placement/nesterov.rs`, `legalize.rs`)**:
+  - Replaced 15-step Jacobi barycenter init with up to 60 iterations of Jacobi-preconditioned Conjugate Gradient (`cg_initial_place`, `reg = 1e-6`, `r^T z < 1e-12`). Updated `test_gcd_nesterov_global_placement` `initial_overflow > 0.30` (since CG already lowers `gcd`'s `init_tau` from `0.8088` to `0.3997`).
+  - Changed `lambda_0` coefficient from `0.05` to `0.15`, bounded `alpha_k` relative to `[0.25 * alpha_{k-1}, 2.0 * alpha_{k-1}]` (`k >= 1`), scaled `dhpwl_ref = (0.015 * hpwl_cur.max(est_hpwl_um)).max(50.0)` with `est_hpwl_um = 0.05 * num_nets * (core_w + core_h)`, and applied a two-phase `mu_max` (`1.090` for `tau_k > 0.70` to clear center pileups, `1.055` afterwards).
+  - Enabled `< 300`-iteration convergence and `|HPWL gap| <= 5%` assertions on `test_aes_place_and_legalize`, `test_ibex_place_and_legalize`, `test_jpeg_place_and_legalize`, and `< 300`-iteration convergence on `test_picorv32_place_and_legalize` at target density `0.60`.
+- **Intentional-failure check (`AGENTS.md` Section 7 Rule 7)**:
+  - Temporarily reverting `dhpwl_ref` to `(0.015 * init_hpwl_um).max(50.0)` and `mu_max` to `1.05`: `cargo test --release -p grus-core --lib -- test_aes_place_and_legalize test_ibex_place_and_legalize test_jpeg_place_and_legalize` failed `1 passed; 2 failed` (`ibex`: `converged=false, iterations=300, final_overflow=0.1508`; `jpeg`: `converged=false, iterations=300, final_overflow=0.8032`), then both fixes were restored.
+- **What was run (`cargo test --release -p grus-core --lib placement:: -- --nocapture`, `17 passed; 0 failed` in `20.12s`)**:
+  - `gcd`: `converged=true`, `90` iters (`7.35 ms`), `init_ovf = 0.3997`, `final_ovf = 0.0983`, `final_hpwl = 4,395,223 dbu` vs ref `4,529,224 dbu` (**`-2.96%`**, `verify_legality` + DEF roundtrip PASS).
+  - `aes` (`0.60`): `converged=true`, `168` iters, `final_ovf = 0.0988`, `final_hpwl = 349,445,412 dbu` vs ref `336,178,240 dbu` (**`+3.95%`**, PASS).
+  - `picorv32` (`0.60`): `converged=true`, `227` iters, `final_ovf = 0.0990`, `gp_hpwl = 202,566.1 um`, `final_hpwl = 212,080,915 dbu` (PASS).
+  - `ibex` (`0.60`): `converged=true`, `214` iters, `final_ovf = 0.0977`, `final_hpwl = 418,297,128 dbu` vs ref `418,563,052 dbu` (**`-0.06%`**, PASS).
+  - `jpeg` (`0.60`): `converged=true`, `265` iters, `final_ovf = 0.0984`, `final_hpwl = 1,018,901,008 dbu` vs ref `1,031,640,516 dbu` (**`-1.23%`**, PASS).
+- **Workspace verification (`v0.1.49`)**:
+  - `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`162 passed; 0 failed; 5 ignored` in `63.02s`).
+
+
 
 
 

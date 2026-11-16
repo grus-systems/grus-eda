@@ -171,26 +171,25 @@ pub fn l2_dist_f64(ax: &[f32], ay: &[f32], bx: &[f32], by: &[f32]) -> f32 {
 ```
 
 1. **Initialization ($k = 0$)**:
-   - Start all movable cells at the core center $(x_{\text{center}} - 0.5 w_c,\; y_{\text{center}} - 0.5 h_c)$, and run 15 iterations of **star-model barycenter relaxation** pulling movable cells toward fixed I/O pins and fixed cells:
-     - In each iteration, compute each net $e$'s pin centroid $(\bar{x}_e, \bar{y}_e) = \frac{1}{|e|}\sum_{p \in e}(x_p, y_p)$, then update each movable cell $c$ toward the weighted average of $(\bar{x}_{e(p)} - \Delta x_p,\; \bar{y}_{e(p)} - \Delta y_p)$ across its incident nets (with damping `0.5 * old + 0.5 * target`), clamped to `[core_xl, core_xh - w_c] x [core_yl, core_yh - h_c]`.
-     - Add a small deterministic perturbation $\delta x_c = (((c \cdot 73) \bmod 29) as f32 - 14.0) \cdot 0.005 \cdot w_b$, $\delta y_c = (((c \cdot 37) \bmod 29) as f32 - 14.0) \cdot 0.005 \cdot h_b$ (clamped to core bounds) so no two cells start on identical coordinates.
+   - Start all movable cells at the core center $(x_{\text{center}} - 0.5 w_c,\; y_{\text{center}} - 0.5 h_c)$, and run up to 60 iterations of **Jacobi-preconditioned Conjugate Gradient (CG)** solving the regularized star quadratic wirelength minimization problem ($\sum_{|e| \ge 2} \frac{1}{|e| - 1} \sum_{p \in e} ((x_p - \bar{x}_e)^2 + (y_p - \bar{y}_e)^2) + 10^{-6}\|x - x_0\|_2^2$, stopping early when $r^T z < 10^{-12}$), clamping movable cells to `[core_xl, core_xh - w_c] x [core_yl, core_yh - h_c]`. Compared to 15 damped Jacobi barycenter steps, CG propagates I/O anchor geometry across multi-hop combinational paths (reducing `gcd` initial overflow $\tau_0 \approx 0.40$ and lowering `ibex` and `jpeg` legalized HPWL).
+   - Add a small deterministic perturbation $\delta x_c = (((c \cdot 73) \bmod 29) as f32 - 14.0) \cdot 0.005 \cdot w_b$, $\delta y_c = (((c \cdot 37) \bmod 29) as f32 - 14.0) \cdot 0.005 \cdot h_b$ (clamped to core bounds) so no two cells start on identical coordinates.
    - Set base wirelength smoothing $\gamma_{\text{base}} = 0.25 \cdot (w_b + h_b)$ and schedule $\gamma(\tau_k) = \gamma_{\text{base}} \cdot 10^{2.0 \cdot (\tau_k - 0.10)}$.
    - Evaluate initial wirelength gradient $\nabla W(x_0)$ and repulsive electric force $F(x_0)$, and set initial penalty multiplier:
-     $$\lambda_0 = 0.05 \cdot \frac{\|\nabla W(x_0)\|_1}{\|F(x_0)\|_1}$$
-   - Set $\Delta\text{HPWL}_{\text{ref}} = \max\bigl(50.0,\; 0.015 \cdot \text{HPWL}(x_0)\bigr)$, Nesterov parameter $t_0 = 1.0$, solution $u_0 = x_0$, and reference point $v_0 = x_0$.
+     $$\lambda_0 = 0.15 \cdot \frac{\|\nabla W(x_0)\|_1}{\|F(x_0)\|_1}$$
+   - Set Nesterov parameter $t_0 = 1.0$, solution $u_0 = x_0$, and reference point $v_0 = x_0$.
 2. **Iteration Step ($k = 0, \dots, \text{max\_iters} - 1$)**:
    - Evaluate density overflow $\tau_k$ and repulsive force $F(v_k)$ via `DensitySolver::compute_density_and_forces`, and evaluate $\nabla W(v_k)$ at $\gamma_k = \gamma(\tau_k)$.
    - If $\tau_k \le \tau_{\text{stop}}$ (default `0.10`), commit $v_k$ (clamped to core bounds) and terminate.
    - Compute the ePlace diagonally preconditioned gradient at reference point $v_k$:
      $$g_k[c] = \frac{\nabla_c W(v_k) - \lambda_k \, F_c(v_k)}{\max\bigl(1.0,\; \text{pin\_count}[c] + \lambda_k \, a_c\bigr)}$$
    - Compute Barzilai-Borwein step size $\alpha_k$:
-     $$\alpha_{\text{raw}} = \begin{cases} \dfrac{0.05 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_0\|_{\infty})} & \text{if } k == 0, \\[8pt] \dfrac{\|v_k - v_{k-1}\|_2}{\|g_k - g_{k-1}\|_2} & \text{if } k \ge 1, \end{cases}$$
-     and clamp $\alpha_k$ to $\bigl[\frac{0.001 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_k\|_{\infty})},\; \frac{0.5 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_k\|_{\infty})}\bigr]$ so no cell jumps more than half a bin width in a single iteration.
+     $$\alpha_k = \begin{cases} \dfrac{0.05 \cdot (w_b + h_b)}{\max(10^{-6},\; \|g_0\|_{\infty})} & \text{if } k == 0, \\[8pt] \text{clamp}\!\left(\dfrac{\|v_k - v_{k-1}\|_2}{\max(10^{-9},\; \|g_k - g_{k-1}\|_2)},\; 0.25\,\alpha_{k-1},\; 2.0\,\alpha_{k-1}\right) & \text{if } k \ge 1. \end{cases}$$
+     (Bounding relative to $\alpha_{k-1}$ rather than clamping globally by $0.5(w_b + h_b) / \|g_k\|_\infty$ avoids throttling the entire design when a single high-gradient cell has large $|g_k[c]|$.)
    - Update solution and Nesterov lookahead:
      $$u_{k+1} = \text{clamp}_{\text{core}}\bigl(v_k - \alpha_k \, g_k\bigr)$$
      $$t_{k+1} = \frac{1 + \sqrt{1 + 4 t_k^2}}{2}, \quad v_{k+1} = \text{clamp}_{\text{core}}\!\left(u_{k+1} + \frac{t_k - 1}{t_{k+1}}\bigl(u_{k+1} - u_k\bigr)\right)$$
-   - Update $\lambda_{k+1}$ using RePlAce Eq. 11 with $\Delta \text{HPWL} = \text{HPWL}(u_{k+1}) - \text{HPWL}(u_k)$:
-     $$\mu_k = \text{clamp}\!\left(1.05^{\,1.0 - \Delta\text{HPWL} / \Delta\text{HPWL}_{\text{ref}}},\; 0.95,\; 1.05\right), \quad \lambda_{k+1} = \mu_k \, \lambda_k$$
+   - Update $\lambda_{k+1}$ using RePlAce Eq. 11 with $\Delta \text{HPWL} = \text{HPWL}(u_{k+1}) - \text{HPWL}(u_k)$, dynamic wirelength scale $\text{hpwl\_est} = 0.05 \cdot N_{\text{nets}} \cdot (W_{\text{core}} + H_{\text{core}})$, $\Delta\text{HPWL}_{\text{ref}} = \max\bigl(50.0,\; 0.015 \cdot \max(\text{HPWL}(u_k),\; \text{hpwl\_est})\bigr)$, and two-phase upper multiplier $\mu_{\max} = 1.090$ when $\tau_k > 0.70$ else $1.055$:
+     $$\mu_k = \text{clamp}\!\left(\mu_{\max}^{\,1.0 - \Delta\text{HPWL} / \Delta\text{HPWL}_{\text{ref}}},\; 0.95,\; \mu_{\max}\right), \quad \lambda_{k+1} = \mu_k \, \lambda_k$$
    - Stop when overflow $\tau_k \le 0.10$ (or at `max_iters = 300`).
 
 #### Concrete Structs & Signatures (`crates/grus-core/src/placement/nesterov.rs`)
