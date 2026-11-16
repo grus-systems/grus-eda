@@ -94,27 +94,28 @@ pub struct Sdc {
 }
 
 /// Folds the rules matching `port` in file order into `(min, max, clock)`. A rule without
-/// `-min`/`-max` sets both corners; `-add_delay` accumulates instead of replacing. `None` when
-/// no rule matches, so callers keep their "no constraint" defaults.
+/// `-add_delay` replaces its corner(s); with `-add_delay` it widens them instead — the min
+/// corner keeps the smaller value, the max corner the larger (measured against OpenSTA:
+/// `1.0 -add_delay` then `0.4 -add_delay` gives `(0.4, 1.0)`, and a later plain rule resets
+/// the fold). `-min`/`-max` rules touch one corner only. `None` when no rule matches, so
+/// callers keep their "no constraint" defaults.
 fn delay_at(rules: &[DelayRule], port: &str, is_input: bool, clock_port: Option<&str>) -> Option<(f32, f32, ClockRef)> {
-    let (mut min_v, mut max_v, mut clock, mut matched) = (0.0, 0.0, ClockRef::Design, false);
+    let (mut min_v, mut max_v, mut min_set, mut max_set, mut clock, mut matched) =
+        (0.0, 0.0, false, false, ClockRef::Design, false);
     for r in rules.iter().filter(|r| r.sel.matches(port, is_input, clock_port)) {
         matched = true;
         clock = r.clock;
-        let apply = |cur: &mut f32| {
-            if r.add {
-                *cur += r.value_ns;
-            } else {
-                *cur = r.value_ns;
-            }
+        let apply = |cur: &mut f32, set: &mut bool, widen: fn(f32, f32) -> f32| {
+            *cur = if r.add && *set { widen(*cur, r.value_ns) } else { r.value_ns };
+            *set = true;
         };
         match r.sense {
             DelaySense::Both => {
-                apply(&mut min_v);
-                apply(&mut max_v);
+                apply(&mut min_v, &mut min_set, f32::min);
+                apply(&mut max_v, &mut max_set, f32::max);
             }
-            DelaySense::Min => apply(&mut min_v),
-            DelaySense::Max => apply(&mut max_v),
+            DelaySense::Min => apply(&mut min_v, &mut min_set, f32::min),
+            DelaySense::Max => apply(&mut max_v, &mut max_set, f32::max),
         }
     }
     matched.then_some((min_v, max_v, clock))
@@ -457,6 +458,15 @@ impl Interp {
                 Ok(empty())
             }
             "set_propagated_clock" | "unset_propagated_clock" => {
+                // Accepted but unmodelled until R2; reject flag-shaped arguments so a typo
+                // cannot pass silently the way R0's shared flag list allowed.
+                for arg in args {
+                    if let Value::Str(s) = arg
+                        && s.starts_with('-')
+                    {
+                        bail!("{name} takes clock objects, not `{s}`");
+                    }
+                }
                 *self.sdc.ignored_commands.entry(name.to_string()).or_default() += 1;
                 Ok(empty())
             }
@@ -643,16 +653,20 @@ impl Interp {
     }
 
     /// `set_max_transition|set_max_capacitance|set_max_fanout <value> [current_design]`:
-    /// design rules the timing model does not check. Only the leading number is validated;
-    /// the command is counted as ignored.
+    /// design rules the timing model does not check. Only the leading number and the empty
+    /// `[current_design]` result are accepted; the command is counted as ignored.
     fn design_rule(&mut self, args: &[Value]) -> Result<()> {
-        match args.first() {
-            Some(Value::Str(v)) => {
-                parse_f32(v)?;
-                Ok(())
+        let [Value::Str(v), rest @ ..] = args else {
+            bail!("expected a numeric limit");
+        };
+        parse_f32(v)?;
+        for arg in rest {
+            match arg {
+                Value::Str(s) if s.is_empty() => {}
+                _ => bail!("unexpected argument in design-rule command"),
             }
-            _ => bail!("expected a numeric limit"),
         }
+        Ok(())
     }
 
     /// Clock names `all_clocks` resolves to at this point in the file.
@@ -688,7 +702,10 @@ impl Interp {
     }
 
     fn resolve_clock(&self, name: &str) -> Result<ClockRef> {
-        if self.sdc.clock_name.as_deref() == Some(name) {
+        // `create_clock` without `-name` leaves the port name as the clock's handle, the same
+        // fallback `all_clock_names` uses.
+        let design_name = self.sdc.clock_name.as_deref().or(self.sdc.clock_port.as_deref());
+        if design_name == Some(name) {
             return Ok(ClockRef::Design);
         }
         if self.virtual_clocks.iter().any(|(n, _)| n == name) {
@@ -1086,9 +1103,9 @@ mod tests {
              set_output_delay -min 0.25 -clock core_clk [all_outputs]\n"
         ))
         .unwrap();
-        // GCD's `all_inputs` rule contributes 1.0 to both corners first, so `-add_delay`
-        // accumulates onto it.
-        assert_eq!(sdc.input_delay_ns("a"), (0.5, 3.0));
+        // GCD's `all_inputs` rule contributes 1.0 to both corners first; `-add_delay` widens
+        // the max corner to max(1.0, 2.0) = 2.0 rather than summing (OpenSTA semantics).
+        assert_eq!(sdc.input_delay_ns("a"), (0.5, 2.0));
         assert_eq!(sdc.output_delay_ns("resp_val"), (0.25, 1.0));
         // `-min` and `-max` together, or `-add_delay` on `set_load`, are still errors.
         for snippet in [
@@ -1097,6 +1114,64 @@ mod tests {
         ] {
             assert!(parse_sdc(&format!("{GCD}{snippet}\n")).is_err(), "accepted: {snippet}");
         }
+    }
+
+    #[test]
+    fn add_delay_widens_instead_of_summing() {
+        // Measured against OpenSTA on gcd: `-add_delay` keeps every constraint and folds each
+        // corner — the min corner takes the smallest value, the max corner the largest — and a
+        // later plain rule resets the fold.
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_input_delay 1.0 -add_delay -clock core_clk [get_ports {{a}}]\n\
+             set_input_delay 0.4 -add_delay -clock core_clk [get_ports {{a}}]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.input_delay_ns("a"), (0.4, 1.0));
+
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_input_delay 1.0 -add_delay -clock core_clk [get_ports {{a}}]\n\
+             set_input_delay 0.4 -add_delay -clock core_clk [get_ports {{a}}]\n\
+             set_input_delay 0.8 -clock core_clk [get_ports {{a}}]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.input_delay_ns("a"), (0.8, 0.8));
+    }
+
+    #[test]
+    fn clock_reference_falls_back_to_the_source_port_name() {
+        // `create_clock` without `-name`: the port name is the clock handle, as `all_clocks`
+        // already assumed.
+        let sdc = parse_sdc(
+            "create_clock -period 5.0 [get_ports clk]\n\
+             set_input_delay 1.0 -clock clk [get_ports {a}]\n\
+             set_clock_transition 0.1 [all_clocks]\n",
+        )
+        .unwrap();
+        assert_eq!(sdc.input_delay_ns("a"), (1.0, 1.0));
+        assert_eq!(sdc.clock_transition_ns, 0.1);
+    }
+
+    #[test]
+    fn propagated_clock_and_design_rules_reject_flags() {
+        for snippet in [
+            "set_propagated_clock -bogus [get_ports {clk}]",
+            "unset_propagated_clock -x",
+            "set_max_transition 0.75 -bogus [current_design]",
+            "set_max_fanout 10.0 0.5 [current_design]",
+        ] {
+            assert!(parse_sdc(&format!("{GCD}{snippet}\n")).is_err(), "accepted: {snippet}");
+        }
+        // The emitted forms still parse and are counted.
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_propagated_clock [get_ports {{clk}}]\n\
+             set_max_transition 0.75 [current_design]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.ignored_commands["set_propagated_clock"], 1);
+        assert_eq!(sdc.ignored_commands["set_max_transition"], 1);
     }
 
     #[test]

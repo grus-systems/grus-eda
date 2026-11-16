@@ -275,9 +275,12 @@ impl Context<'_> {
 
     /// `(slew, delay)` at an input port, per output transition (RISE, FALL). A
     /// `set_driving_cell` rule makes the port behave like the driver cell's output pin: the
-    /// worst slew and delay over the cell's arcs into the named pin, evaluated at the rule's
-    /// input transition and the net load. Without one, `set_input_transition` applies and the
-    /// delay is zero.
+    /// worst slew and delay over the cell's combinational arcs into the named pin. Slew is
+    /// evaluated at the rule's input transition and the net load; delay uses the source
+    /// transition's table at zero load — for an inverting driver the output rise is the
+    /// cell's fall delay, and the ideal driver does not see the net's load. This measured
+    /// closest to OpenSTA (worst residual ~0.7 ps on `inv_2`, ~10 ps on `inv_16`). Without a
+    /// rule, `set_input_transition` applies and the delay is zero.
     fn port_drive(&self, pin: PinId, skipped: &mut SkipReport) -> [(f32, f32); 2] {
         let port = self.port_name(pin);
         let fallback = || {
@@ -305,18 +308,37 @@ impl Context<'_> {
                 if related.dir != PinDir::Input {
                     continue;
                 }
+                let combinational = matches!(
+                    arc.timing_type,
+                    TimingType::Combinational | TimingType::CombinationalRise | TimingType::CombinationalFall
+                );
+                if !combinational {
+                    continue;
+                }
                 for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
+                    if (arc.timing_type == TimingType::CombinationalRise && dst_pol != RISE)
+                        || (arc.timing_type == TimingType::CombinationalFall && dst_pol != FALL)
+                    {
+                        continue;
+                    }
                     let in_slew = if src_pol == RISE { rule.in_trans_rise } else { rule.in_trans_fall };
                     let load = net.map_or(0.0, |n| self.net_load(n, dst_pol));
                     if let Some(table) = delay_tables(arc, dst_pol).1 {
                         out[dst_pol].0 = out[dst_pol].0.max(eval_nldm_delay_or_slew(table, in_slew, load));
                     }
+                    // The driver is ideal: its delay does not see the net's load. The table is
+                    // indexed by the source transition — for an inverting driver the output
+                    // rise is the cell's fall delay — which measured closest to OpenSTA.
                     if let Some(table) = delay_tables(arc, src_pol).0 {
-                        out[dst_pol].1 = out[dst_pol].1.max(eval_nldm_delay_or_slew(table, in_slew, load));
+                        out[dst_pol].1 = out[dst_pol].1.max(eval_nldm_delay_or_slew(table, in_slew, 0.0));
                     }
                 }
             }
-            (out[RISE].0.is_finite() && out[FALL].0.is_finite()).then_some(out)
+            (out[RISE].0.is_finite()
+                && out[RISE].1.is_finite()
+                && out[FALL].0.is_finite()
+                && out[FALL].1.is_finite())
+            .then_some(out)
         })();
         match resolved {
             Some(out) => out,
@@ -761,8 +783,8 @@ fn run_sta_detail(
             let (slew, drv_delay) = drive[pol];
             state[p].merge(
                 pol,
-                latency + in_max + drv_delay,
-                latency + in_min + drv_delay,
+                latency + in_max + drv_delay * sdc.derate_late,
+                latency + in_min + drv_delay * sdc.derate_early,
                 slew,
                 slew,
             );
@@ -1108,6 +1130,21 @@ mod tests {
     use crate::readers::{load_liberty, load_tech_db, parse_def};
     use crate::interner::StringInterner;
     use crate::sta::sdc::load_sdc;
+
+    #[test]
+    fn skip_report_is_clean_exempts_only_design_rules() {
+        let mut skipped = SkipReport::default();
+        assert!(skipped.is_clean());
+        for cmd in ["set_max_transition", "set_max_capacitance", "set_max_fanout"] {
+            skipped.sdc_ignored_commands.insert(cmd.to_string(), 1);
+        }
+        assert!(skipped.is_clean(), "design rules cannot change a compared number");
+        skipped.sdc_ignored_commands.insert("set_propagated_clock".to_string(), 1);
+        assert!(!skipped.is_clean(), "an unmodelled clock must fail --strict");
+        skipped.sdc_ignored_commands.clear();
+        skipped.unresolved_driving_cells = 1;
+        assert!(!skipped.is_clean());
+    }
 
     /// Tolerances against OpenSTA. A value passes if |ours - ref| <= max(abs, rel * |ref|).
     /// Arrival, required time and WNS use `arr_rel` or 5 ps; the E3 done criterion is 1%.

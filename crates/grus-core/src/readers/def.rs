@@ -1371,6 +1371,17 @@ END DESIGN
         assert!(msg.contains("u1/Q"), "{msg}");
     }
 
+    /// `NONDEFAULTRULES` only constrains detailed routing, which the timing database does not
+    /// read; the stock LibreLane DEF emits it and must parse.
+    #[test]
+    fn test_nondedefaultrules_is_skipped() {
+        let def = MINI_DEF.replace(
+            "COMPONENTS 1 ;",
+            "NONDEFAULTRULES\n  - abc\nEND NONDEFAULTRULES\nCOMPONENTS 1 ;",
+        );
+        parse_def_bytes(def.as_bytes(), &mini_tech(), None).expect("DEF with NONDEFAULTRULES must parse");
+    }
+
     /// Every truncation of the mini DEF must return `Ok` or `Err` without panicking, and only the
     /// full document (through `END DESIGN`) may parse, because the trailer is required.
     #[test]

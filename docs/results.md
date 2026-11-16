@@ -989,12 +989,17 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
   `set_max_transition`/`set_max_capacitance`/`set_max_fanout`.
 - **Reference**: `openroad` + `sta` in `ghcr.io/librelane/librelane:3.0.16`
   (`~/ll_gcd/probe/run_sta.tcl`, `PROBE_SDC`/`PROBE_SPEF`/`PROBE_OUT`).
-- **Modelled in R1**: `-min`/`-max`/`-add_delay` delay corners (per-sense fold in file order),
-  `-pin_load`, `set_clock_transition` (clock-pin slew), `set_timing_derate` (early/late on
-  propagated cell and wire delays), `set_driving_cell` (input-port slew and delay from the
-  driver cell's Liberty arcs, worst over arcs into the named pin, evaluated at the rule's
-  input transitions and the net load), `-clock` as bare name or `[get_clocks {...}]`, and
+- **Modelled in R1**: `-min`/`-max`/`-add_delay` delay corners, `-pin_load`,
+  `set_clock_transition` (clock-pin slew), `set_timing_derate` (early/late on propagated cell
+  and wire delays, and on the driving-cell delay), `set_driving_cell` (input-port slew and
+  delay from the driver cell's Liberty arcs, worst over combinational arcs into the named
+  pin), `-clock` as bare name or `[get_clocks {...}]`, and
   `set_propagated_clock`/`unset_propagated_clock` accepted and counted until R2.
+- **`-add_delay` semantics** (measured against OpenSTA `report_checks`, not assumed): it does
+  not sum. Each corner keeps the extreme of every `-add_delay` value seen since the last plain
+  rule — `1.0 -add_delay` then `0.4 -add_delay` yields min 0.4 / max 1.0, order-independent,
+  and a later plain rule resets the fold. `-min`/`-max` touch one corner only; OpenSTA rejects
+  `-min V -max V` in a single command, so one command per sense is the accepted form.
 - **Parse-only, counted**: `set_max_transition`/`set_max_capacitance`/`set_max_fanout` go to
   `sdc_ignored_commands`; they are shown in the skip summary but do not fail `--strict`
   (`SkipReport::is_clean` exempts exactly these three — they cannot change a compared number).
@@ -1006,22 +1011,35 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
 
   | Run | Worst abs diff | Tolerance | Result |
   |---|---|---|---|
-  | zero wire, stock SDC | 2.9 ps (`_411_/D` slack/arrival; `set_driving_cell` residual) | STRICT max(5 ps, 1%) | PASS |
-  | zero wire, `nom.spef` | 3.5 ps slack/arr, 6.1 ps slew (`resp_msg[3]`, 1.7%) | `GCD_SPEF` slew 3% | PASS |
-  | `no_derate`, `no_clktrans`, `no_drvcell`, `no_load`, `no_unc`, `no_clkdrv`, `clk_ideal` | <= 3.3 ps | STRICT | PASS |
-  | `drv16` (driving cell `buf_16`) | 11.2 ps slack | STRICT (rel 1% of ~3 ns) | PASS |
-  | `minmax` (`-min`/`-max` as separate commands, OpenSTA's accepted form) | 15.9 ps arrival (`_412_/D`, path re-selection under new delays) | STRICT max(5 ps, 1% of 2.6 ns = 26 ps) | PASS, 0 field failures |
+  | zero wire, stock SDC | 0.33 ps (`_411_/D`; after review fixes) | STRICT max(5 ps, 1%) | PASS |
+  | SPEF (`nom.spef`) | 3.5 ps slack/arr, 6.1 ps slew (`resp_msg[3]`, 1.7%) | `GCD_SPEF` slew 3% | PASS |
+  | `no_derate`, `no_clktrans`, `no_drvcell`, `no_load`, `no_unc`, `no_clkdrv`, `clk_ideal` | <= 0.33 ps | STRICT | PASS |
+  | `drv16` (driving cell `inv_16`) | 11.0 ps slack | STRICT (rel 1% of ~3 ns) | PASS |
+  | `minmax` (`-min`/`-max` as separate commands, OpenSTA's accepted form) | 8.6 ps slack | STRICT | PASS, 0 field failures |
+  | `addelay2` (synthetic: two `-add_delay` rules on `req_val`) | 7.8 ps hold slack (`_411_/D` min side) | STRICT max(5 ps, 1% of 0.55 ns = 5.5 ps) | **1 field over tol** — see notes |
 
 - **Notes**: OpenSTA rejects `set_input_delay -min V -max V` in one command ("requires two
   positional arguments"); the accepted form is one command per sense, which is what `minmax.sdc`
-  uses. The driving-cell delay uses the source-polarity delay table (for an inverting driver the
-  output-rise delay is `cell_fall`); the residual versus OpenSTA is ~3 ps on `inv_2` and ~11 ps
-  on `buf_16`, inside tolerance but not exact — recorded as a known approximation.
+  uses. The driving-cell delay uses the source-transition delay table at zero load (for an
+  inverting driver the output rise is `cell_fall`), derated like a cell arc; residuals are
+  ~0.7 ps on `inv_2` and ~10 ps on `inv_16` — inside tolerance, recorded as an approximation.
+  The `addelay2` hold-side residual is a synthetic double-`-add_delay` case that `write_sdc`
+  never emits (one rule per port); the max corner folds exactly like OpenSTA.
+- **Review fixes (Hydrogen, `subcon review`)**: `-add_delay` was summing — now folds per corner
+  as OpenSTA does (S1); `port_drive` now requires finite delay *and* slew per polarity and
+  filters to combinational arcs (S2); the driving-cell delay is derated early/late (S1);
+  `resolve_clock` falls back to the source port name when `create_clock` omits `-name` (S2);
+  `set_propagated_clock`/`unset_propagated_clock`/`set_max_*` reject flag-shaped or stray
+  arguments (S3); `NONDEFAULTRULES` skip and the `is_clean` design-rule exemption gained unit
+  tests (S2). The reviewer's `dst_pol`-for-delay suggestion was tested and rejected: it gave
+  +11 ps on `inv_2` and +18 ps on `inv_16` versus OpenSTA; `src_pol` at zero load measures
+  closest.
 - **Side fix**: the DEF reader now skips `NONDEFAULTRULES` (routing-only, not in the timing
   database); the stock LibreLane `gcd.def` previously failed to parse.
 - **Runtime**: debug binary, zero-wire `gcd` STA end-to-end 0.14 s wall (includes Liberty/DEF/SDC
   parse; not a cold-cache measurement).
-- **Verification**: `cargo test --workspace` 175 passed / 0 failed / 7 ignored;
-  `cargo clippy --workspace --all-targets -- -D warnings` clean. New SDC tests cover the emitted
-  `write_sdc` syntax, `-min`/`-max`/`-add_delay`, `-pin_load`, derate, clock transition,
-  driving cells and the ignored design-rule commands.
+- **Verification**: `cargo test --workspace` 180 passed / 0 failed / 7 ignored;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean. SDC tests cover the emitted
+  `write_sdc` syntax, `-min`/`-max`/`-add_delay` (incl. the OpenSTA fold), `-pin_load`, derate,
+  clock transition, driving cells, clock-name fallback, argument rejection on ignored commands,
+  and `NONDEFAULTRULES`; an analysis test pins the `is_clean` design-rule exemption.
