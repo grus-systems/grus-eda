@@ -1144,3 +1144,15 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
   `cargo clippy --workspace --all-targets -- -D warnings` clean. New tests
   `test_sta_edge_hold_violation_{ideal,propagated}`; `test_sta_edge_propagated_clock` now
   runs at `Tol::STRICT`.
+- **Review fixes (Hydrogen, `subcon review --target`, verdict reject)**: ideal-clock latch
+  borrow `opening_max` now subtracts `set_clock_uncertainty -setup` like the propagated
+  branch (S1); the data pass no longer lets a reached net driver overwrite the clock state
+  seeded on clock-net pins (`!graph.clock_net` guard on the sink transfer, S1); `clock_net`
+  marks are pruned to nets that can still reach a clock-edge consumer, so clock-fed
+  branches that only drive data logic (clock dividers, clock-as-data) are no longer
+  blocked or flagged as clock gates (S1); `latch_opens` only accepts `falling_edge` arcs
+  out of the enable pin (S2). Deferred with rationale: `port_drive` still collapses
+  driving-cell arcs to max delay/slew for both corners (pre-existing R1 approximation,
+  needs a fixture to measure); a `set_driving_cell` rule covering the clock port under
+  propagation is not modelled (no OpenSTA measurement yet); multi-driver nets remain
+  rejected upstream; empty-endpoint WNS serialises as JSON null (carried over).

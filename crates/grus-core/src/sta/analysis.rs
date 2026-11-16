@@ -531,7 +531,12 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
                     check.hold_arc = Some(lib_arc);
                 }
                 _ if lib_cell.is_latch => {
-                    if Some(src) == enable && design.pin_is_driver[dst.0 as usize] {
+                    // Only the falling-edge transparent arc launches Q; any other arc out
+                    // of the enable pin is dropped like the rest of the unmodelled latch arcs.
+                    if Some(src) == enable
+                        && arc.timing_type == TimingType::FallingEdge
+                        && design.pin_is_driver[dst.0 as usize]
+                    {
                         graph.latch_opens.push(LatchOpen { enable: src, q: dst, lib_arc });
                     } else {
                         *skipped.latch_arcs_dropped.entry(format!("{:?}", arc.timing_type)).or_default() += 1;
@@ -619,6 +624,47 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
         }
         for dst_net in next {
             mark_clock_net(dst_net, &mut graph, &mut clock_stack);
+        }
+    }
+    // The forward walk also marks clock-fed branches that never reach a clock pin (clock
+    // dividers, clock-as-data logic). Prune them: a marked net stays a clock net only when
+    // a combinational path from it reaches a pin that consumes a clock edge.
+    let mut useful = vec![false; design.num_nets()];
+    let consumer_nets = graph
+        .launches
+        .iter()
+        .map(|l| l.clk)
+        .chain(graph.checks.iter().filter_map(|(_, c)| c.clk))
+        .chain(graph.latch_opens.iter().map(|o| o.enable))
+        .filter_map(|pin| design.pin_nets[pin.0 as usize]);
+    for net in consumer_nets {
+        useful[net.0 as usize] = true;
+    }
+    loop {
+        let mut changed = false;
+        for edge in &graph.edges {
+            let (Some(src_net), Some(dst_net)) = (
+                design.pin_nets[edge.src.0 as usize],
+                design.pin_nets[edge.dst.0 as usize],
+            ) else {
+                continue;
+            };
+            if useful[dst_net.0 as usize]
+                && graph.clock_net[src_net.0 as usize]
+                && graph.clock_net[dst_net.0 as usize]
+                && !useful[src_net.0 as usize]
+            {
+                useful[src_net.0 as usize] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (net, is_useful) in useful.iter().enumerate() {
+        if !is_useful {
+            graph.clock_net[net] = false;
         }
     }
     // Under `set_propagated_clock` these nets are modelled by `propagate_clock` instead;
@@ -1111,6 +1157,9 @@ fn run_sta_detail(
 
             if !design.pin_is_driver[p]
                 && let Some((net_idx, pin_idx, drv)) = levelized.pin_driver[p]
+                // A pin on a clock net keeps the clock state the consumer seeding wrote;
+                // a reached data driver must not overwrite it with a data arrival.
+                && !graph.clock_net[net_idx as usize]
             {
                 let driver_state = state[drv.0 as usize];
                 if driver_state.reached(RISE) || driver_state.reached(FALL) {
@@ -1284,7 +1333,7 @@ fn collect_endpoints(
             let opening_max = if sdc.propagated_clock {
                 clk_state.arrival_min[FALL] - sdc.setup_uncertainty_ns
             } else {
-                half_period + clk_state.arrival_min[RISE]
+                half_period + clk_state.arrival_min[RISE] - sdc.setup_uncertainty_ns
             };
             let arr_max = s.arrival_max[pol];
             let (req_max, slack_max) = if !check.latch {
@@ -1464,11 +1513,6 @@ mod tests {
         /// _10092_/Y fall at 4.3-5.2 ns input slew) and slews within 5.09%.
         const IBEX_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
         const IBEX_SPEF: Tol = Tol { slack_abs_ns: 0.04, slew_rel: 0.055, ..Tol::STRICT };
-        /// Propagated clock on sta_edge/propagated_clock: the clock arrival accumulates
-        /// per-cell NLDM differences across a 4-stage tree (buf -> inv -> and gate -> FF/latch
-        /// clock pins), leaving a uniform ~10-23 ps early bias on every clock-referenced
-        /// field; worst observed 22.8 ps (u_ff5/D max_arr). See docs/results.md.
-        const PROPAGATED_CLOCK: Tol = Tol { arr_abs_ns: 0.03, slack_abs_ns: 0.03, slew_rel: 0.02, tns_rel: 0.02, ..Tol::STRICT };
     }
 
     fn within_tolerance(ours: f32, reference: f64, rel_tol: f64, abs_tol: f64) -> (bool, f64) {
