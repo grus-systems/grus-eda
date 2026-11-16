@@ -37,8 +37,8 @@ refinement round (4 rounds): **Pass 1 ~80 ms, Pass 2 ~355 ms, Pass 3
 |---|---|---|
 | [phase2/01-dmp-inner-solvers.md](phase2/01-dmp-inner-solvers.md) | `sta/dmp.rs`: replace the three nested bisections (`rc_crossing_bisect`, `fit_ramp_duration`, `pi_waveform_slew` crossing) and the `solve_dmp` residual loop with bracketed Brent/secant iterations at the same stop tolerances | level loop 3.9 s -> ~0.5–1 s on jpeg (target: STA total ~1–2 s) |
 | [phase2/02-sta-call-audit.md](phase2/02-sta-call-audit.md) | Measure `driver_response` call composition (arc type, polarity pair, slew variant); dedupe only what is provably identical; re-check the `< 32`-pin sequential threshold now that per-call cost is known | small; mostly a measurement ticket that may fold into 01 |
-| [phase2/03-legalize-pass3.md](phase2/03-legalize-pass3.md) | `placement/legalize.rs` Pass 3: replace the per-cell `sort_unstable` of `other_xs` with `select_nth_unstable` (identical median), plus audit Pass 2/3 inner scans. Output must stay **bit-identical** (`final_hpwl_dbu` unchanged on all 5 designs) | legalize ~4.0 s -> ~1.5–2.5 s on jpeg |
-| [phase2/04-timinggraph-csr.md](phase2/04-timinggraph-csr.md) | `sta/analysis.rs`: flatten `TimingGraph.edges_from`, `LevelizedGraph.edges_to`, `checks: BTreeMap` into CSR / sorted arrays | structural (Goal 3); measured build+levels is only ~15 ms, so this is last and optional |
+| [phase2/03-legalize-pass3.md](phase2/03-legalize-pass3.md) | `placement/legalize.rs` Pass 3: replace the per-cell `sort_unstable` of `other_xs` with `select_nth_unstable` (identical median), plus audit Pass 2/3 inner scans; exact incremental caches allowed per the Pass 1 `NetExtrema` precedent | legalize <= ~2.5 s on jpeg, `final_hpwl_dbu` bit-identical on all 5 designs |
+| [phase2/04-timinggraph-csr.md](phase2/04-timinggraph-csr.md) | `sta/analysis.rs`: flatten `TimingGraph.edges_from`, `LevelizedGraph.edges_to`/`levels`, `checks: BTreeMap` into CSR / sorted arrays | structural (Goal 3); measured build+levels is only ~15 ms, so this is last and optional |
 
 ## 3. Rules for this round
 

@@ -23,29 +23,40 @@ signatures and semantics.
 
 ## Acceptance
 
-- `cargo test --release -p grus-core sta::` — all previously passing tests pass,
-  including `dmp::tests::golden_regression_values_are_reproduced` and every
-  `*_matches_opensta` STA test (tolerances unchanged).
+- `cargo test --release -p grus-core sta::` — every non-`#[ignore]`d test that
+  passed before still passes, including
+  `dmp::tests::golden_regression_values_are_reproduced` and every
+  `*_matches_opensta` STA test (tolerances unchanged). The `#[ignore]`d jpeg
+  placement-RC / placed-SPEF tests stay ignored (they are known OpenSTA
+  disagreements, unrelated to this change).
 - `cargo clippy --all-targets -- -D warnings` clean.
-- jpeg `sta --parasitics placement` and `--spef`: report the new elapsed and
-  confirm `wns`/`tns`/endpoint fields are within the test tolerances (they must
-  be bit-identical or within f32 rounding of the pre-change run; record both).
-- Prove the new iteration can fail: temporarily perturb a Brent tolerance or
-  bracket and show a test goes red, then restore.
+- jpeg `sta --parasitics placement` and `--spef`: report the new elapsed, and
+  compare `wns`/`tns`/endpoint fields against the pre-change run — they must
+  agree within ~1e-5 relative (or a 0.01 ps floor on near-zero values), the
+  same bound as the Goal. Record both runs in `docs/results.md`.
+- Prove the new iteration can fail (`AGENTS.md` §7 rule 7): temporarily
+  perturb a Brent tolerance or bracket and show a test goes red, then restore.
 
 ## Notes
 
-- `rc_crossing_bisect` brackets `[0, dt + 40*tau]` to `1e-6` ns; `v(u)` is
-  smooth and monotone, `dv/du` has a closed form per branch — a safeguarded
-  Newton (bisection fallback) is acceptable and preferred over Brent here.
-- `fit_ramp_duration` bisects `dt` to `1e-6`; `rc_slew(dt, tau)` is monotone in
-  `dt` — Brent's method applies.
+- `rc_crossing_bisect` brackets `[0, dt + 40*tau]` to `1e-6` ns. Edge cases:
+  - `dt == 0.0`: `rc_ramp_voltage` divides by `dt` and yields NaN; today the
+    bisection hides it (`NaN < level` is false, so `hi` collapses). A
+    safeguarded Newton/Brent must special-case `dt <= 0.0` (the response is a
+    pure RC step: crossing is `-tau * ln(1 - level)`) or otherwise reproduce
+    the current answer exactly — `dmp.rs` tests call `rc_slew(0.0, 0.5)`.
+  - `v(u)` is only C^0 at `u = dt` (the derivative jumps), and `dv/du = 0` at
+    `u = 0`; a Newton step needs an interior start and a bisection fallback,
+    not blind Newton.
+- `fit_ramp_duration` bisects `dt` to `1e-6`; `rc_slew(dt, tau)` is monotone
+  in `dt` — Brent's method applies.
 - `pi_waveform_slew::crossing` bisects to `1e-7` over `[0, dt + 40*b1]`, 80
   iterations max — Brent applies; `v1` is monotone.
-- `solve_dmp_with` residual bisection (`hi - lo > 1e-6 * total`, ~20–26
-  residuals/call): the residual is monotone decreasing in `c` per the comment
-  at `residual`; Brent applies if sign-change bracket holds — verify, and keep
-  bisection if monotonicity cannot be confirmed cheaply.
+- `solve_dmp_with` residual loop: Brent needs only the sign-change bracket
+  that is already established (`residual(lo) > 0 > residual(hi)`); strict
+  monotonicity is NOT required and must not be assumed — the table is a
+  piecewise-linear f32 NLDM interpolation and `delay_slope` is a finite
+  difference.
 - `is_lumped_bailout` is evaluated twice per `driver_response` (once inside
   `solve_dmp_with`, once inside `driver_waveform_slew`); computing it once and
   passing it through is allowed if it does not change results.
