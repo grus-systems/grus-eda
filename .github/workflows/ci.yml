@@ -134,9 +134,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build:
-    # Release binary only; no PDK or generated inputs needed, so this runs
-    # in parallel with `generate`/`test` on the same self-hosted runner.
-    runs-on: [self-hosted, macOS, ARM64]
+    # Release binary only; no PDK or generated inputs needed. Runs on a
+    # GitHub-hosted runner so it does not queue behind the self-hosted
+    # generate/test jobs; macos-latest is arm64, matching the dev machines.
+    runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
