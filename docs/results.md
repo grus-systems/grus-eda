@@ -831,6 +831,21 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
 - **Workspace verification (`v0.1.49`)**:
   - `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`162 passed; 0 failed; 5 ignored` in `63.02s`).
 
+### 2026-11-16 — CLI (`grus-eda`) end-to-end validation across `gcd`, `aes`, `ibex`, and `jpeg` (`v0.1.50`)
+
+- **End-to-end binary measurements (`target/release/grus-eda`, `v0.1.49`)**:
+  - Ran `check-e0`, `place --def <floorplan.def> --out-def <out.def>`, `congestion --def <out.def> --layer-adjust 0.2`, `sta --def <out.def> --parasitics placement`, and `sta --def <placed.def> --spef <routed.spef>` sequentially (`rc = 0` on all 20 runs):
+    - `gcd` (384 cells / 233 movable): `check-e0` `0.50 s` (`42.9 ms` parse, cold mmap Liberty); `place` `0.03 s` (`GP 6.79 ms / 90 iters`, `leg 6.29 ms`, `4,395,223 dbu`); `congestion` `0.01 s` (`cap=6643, dem=782, ovf=0.0`); `sta placement` `0.13 s` (`wns=1.6691 ns`); `sta spef` `0.12 s` (`wns=1.6652 ns`).
+    - `aes` (12,839 cells / 8,780 movable): `check-e0` `0.07 s`; `place` `1.27 s` (`GP 513.64 ms / 168 iters`, `leg 721.68 ms`, `349,445,412 dbu`); `congestion` `0.05 s` (`cap=211254, dem=64696, ovf=0.0`); `sta placement` `5.81 s` (`wns=-4.9481 ns`); `sta spef` `5.21 s` (`wns=-4.5025 ns`).
+    - `ibex` (16,644 cells / 11,979 movable): `check-e0` `0.08 s`; `place` `2.72 s` (`GP 791.11 ms / 214 iters`, `leg 1889.50 ms`, `418,297,128 dbu`); `congestion` `0.23 s` (`cap=236364, dem=85609, ovf=0.0`); `sta placement` `8.35 s` (`wns=-14.5546 ns`); `sta spef` `6.36 s` (`wns=-14.4115 ns`).
+    - `jpeg` (61,569 cells / 46,548 movable): `check-e0` `0.28 s`; `place` `22.68 s` (`GP 3779.25 ms / 265 iters` = `14.26 ms/iter`, `leg 18778.31 ms` = `83%` of `place` runtime, `1,018,901,008 dbu`); `congestion` `4.39 s` (`cap=796959, dem=196616, ovf=0.0`); `sta placement` `60.56 s` (`wns=-504.9190 ns`); `sta spef` `27.54 s` (`wns=-78.0838 ns`).
+- **CLI hardening & regression tests (`crates/grus-eda/src/main.rs`)**:
+  - Wired `--top` in `check-e0` via `check_top_name` to verify `design_name` on Yosys JSON, Verilog, and DEF inputs; failed loudly when `--json`/`--verilog`/`--def` is given without both `--tlef` and `--lef`; used `tech_db.dbu_per_micron` instead of hardcoded `1000.0` in DEF HPWL formatting.
+  - Added `parse_target_density` (`(0.0, 1.0]`, rejecting `0.0`, `<0`, `>1`, `NaN`) on `place --target-density`, and aligned `Place` movable-cell printout to `Core | CoreTie`.
+  - Extracted `run(cli)` and added unit + end-to-end `gcd` tests (`cli_parsers_reject_out_of_range_and_nan`, `cli_end_to_end_gcd_flow_and_validation`).
+  - **Intentional-failure check (Rule 7)**: temporarily making `check_top_name` a no-op caused `cargo test --release -p grus-eda cli_end_to_end_gcd_flow_and_validation` to fail (`0 passed; 1 failed`: `mismatched --top must fail`), then restored.
+
+
 
 
 

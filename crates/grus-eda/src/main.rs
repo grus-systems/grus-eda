@@ -63,6 +63,15 @@ fn parse_unit_interval(s: &str) -> Result<f32, String> {
     }
 }
 
+fn parse_target_density(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("not a number: {e}"))?;
+    if v > 0.0 && v <= 1.0 {
+        Ok(v)
+    } else {
+        Err(format!("{v} must be in (0.0, 1.0]"))
+    }
+}
+
 #[derive(Args, Debug)]
 struct CongestionArgs {
     #[arg(long, help = "Path to technology LEF (.tlef) file")]
@@ -102,7 +111,12 @@ struct PlaceArgs {
     #[arg(long, help = "Path to output placed DEF (.def) file")]
     out_def: PathBuf,
 
-    #[arg(long, default_value_t = 0.60, help = "Target placement density (0.0 to 1.0)")]
+    #[arg(
+        long,
+        default_value_t = 0.60,
+        value_parser = parse_target_density,
+        help = "Target placement density in (0.0, 1.0]"
+    )]
     target_density: f32,
 }
 
@@ -140,8 +154,20 @@ struct StaArgs {
     spef: Option<PathBuf>,
 }
 
+fn check_top_name(expected: Option<&str>, kind: &str, actual: &str) -> anyhow::Result<()> {
+    if let Some(top) = expected
+        && actual != top
+    {
+        anyhow::bail!("{kind} design name {actual:?} does not match --top {top:?}");
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    run(Cli::parse())
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::CheckE0(args) => {
             println!("Loading Liberty from {:?}", args.lib);
@@ -162,6 +188,11 @@ fn main() -> anyhow::Result<()> {
                 lib_db.arcs.len(),
                 elapsed_ms
             );
+
+            let has_design = args.json.is_some() || args.verilog.is_some() || args.def.is_some();
+            if has_design && (args.tlef.is_none() || args.lef.is_none()) {
+                anyhow::bail!("--json, --verilog, and --def require both --tlef and --lef");
+            }
 
             if let (Some(tlef_path), Some(lef_path)) = (&args.tlef, &args.lef) {
                 println!("Loading LEF from {:?} and {:?}", tlef_path, lef_path);
@@ -186,6 +217,7 @@ fn main() -> anyhow::Result<()> {
                     println!("Loading Yosys JSON netlist from {:?}", json_path);
                     let t_json = std::time::Instant::now();
                     let db_json = grus_core::readers::parse_yosys_json(json_path, &tech_db, Some(&lib_db))?;
+                    check_top_name(args.top.as_deref(), "Yosys JSON", &db_json.design_name)?;
                     let elapsed_json_ms = t_json.elapsed().as_secs_f64() * 1000.0;
                     println!(
                         "Loaded Yosys JSON: design={}, cells={}, nets={}, io_pins={}, elapsed={:.2}ms",
@@ -201,6 +233,7 @@ fn main() -> anyhow::Result<()> {
                     println!("Loading Verilog netlist from {:?}", v_path);
                     let t_v = std::time::Instant::now();
                     let db_v = grus_core::readers::parse_verilog(v_path, &tech_db, Some(&lib_db))?;
+                    check_top_name(args.top.as_deref(), "Verilog", &db_v.design_name)?;
                     let elapsed_v_ms = t_v.elapsed().as_secs_f64() * 1000.0;
                     println!(
                         "Loaded Verilog: design={}, cells={}, nets={}, io_pins={}, elapsed={:.2}ms",
@@ -216,6 +249,7 @@ fn main() -> anyhow::Result<()> {
                     println!("Loading DEF from {:?}", def_path);
                     let t_def = std::time::Instant::now();
                     let db_def = grus_core::readers::parse_def(def_path, &tech_db, Some(&lib_db))?;
+                    check_top_name(args.top.as_deref(), "DEF", &db_def.design_name)?;
                     let hpwl_dbu = db_def.compute_hpwl_dbu(&tech_db);
                     let elapsed_def_ms = t_def.elapsed().as_secs_f64() * 1000.0;
                     println!(
@@ -226,7 +260,7 @@ fn main() -> anyhow::Result<()> {
                         db_def.tracks.len(),
                         db_def.num_nets(),
                         db_def.io_pins.len(),
-                        hpwl_dbu as f64 / 1000.0,
+                        hpwl_dbu as f64 / tech_db.dbu_per_micron.max(1) as f64,
                         hpwl_dbu,
                         elapsed_def_ms
                     );
@@ -288,16 +322,27 @@ fn main() -> anyhow::Result<()> {
             let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let mut design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
             let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
+            let movable_count = design_db
+                .cell_status
+                .iter()
+                .zip(design_db.cell_macros.iter())
+                .filter(|&(&status, &macro_id)| {
+                    matches!(
+                        status,
+                        grus_core::design_db::PlacementStatus::Unplaced
+                            | grus_core::design_db::PlacementStatus::Placed
+                    ) && matches!(
+                        tech_db.macros[macro_id.0 as usize].class,
+                        grus_core::tech_db::MacroClass::Core
+                            | grus_core::tech_db::MacroClass::CoreTie
+                    )
+                })
+                .count();
             println!(
                 "Loaded design {}: {} cells ({} movable), {} nets, {} rows, elapsed={:.2}ms",
                 design_db.design_name,
                 design_db.num_cells(),
-                design_db
-                    .cell_status
-                    .iter()
-                    .filter(|&&s| s == grus_core::design_db::PlacementStatus::Unplaced
-                        || s == grus_core::design_db::PlacementStatus::Placed)
-                    .count(),
+                movable_count,
                 design_db.num_nets(),
                 design_db.num_rows(),
                 elapsed_load
@@ -441,4 +486,127 @@ fn print_heatmap(grid_w: usize, grid_h: usize, ratios: &[f32]) {
         print!("{}", x % 10);
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn sky130_hd() -> PathBuf {
+        if let Some(root) = std::env::var_os("PDK_ROOT") {
+            return PathBuf::from(root).join("sky130A/libs.ref/sky130_fd_sc_hd");
+        }
+        let home = std::env::var_os("HOME").expect("HOME or PDK_ROOT must be set");
+        PathBuf::from(home).join(".ciel/sky130A/libs.ref/sky130_fd_sc_hd")
+    }
+
+    fn require(p: PathBuf) -> PathBuf {
+        assert!(p.exists(), "required test input missing: {}", p.display());
+        p
+    }
+
+    #[test]
+    fn cli_parsers_reject_out_of_range_and_nan() {
+        assert!(Cli::try_parse_from(["grus-eda", "congestion", "--tlef", "a", "--lef", "b", "--def", "c", "--layer-adjust", "1.5"]).is_err());
+        assert!(Cli::try_parse_from(["grus-eda", "congestion", "--tlef", "a", "--lef", "b", "--def", "c", "--layer-adjust", "NaN"]).is_err());
+        assert!(Cli::try_parse_from(["grus-eda", "congestion", "--tlef", "a", "--lef", "b", "--def", "c", "--gcell-tracks", "0"]).is_err());
+        assert!(Cli::try_parse_from(["grus-eda", "place", "--tlef", "a", "--lef", "b", "--def", "c", "--out-def", "d", "--target-density", "0"]).is_err());
+        assert!(Cli::try_parse_from(["grus-eda", "place", "--tlef", "a", "--lef", "b", "--def", "c", "--out-def", "d", "--target-density", "1.1"]).is_err());
+        assert!(Cli::try_parse_from(["grus-eda", "place", "--tlef", "a", "--lef", "b", "--def", "c", "--out-def", "d", "--target-density", "NaN"]).is_err());
+        assert!(Cli::try_parse_from(["grus-eda", "place", "--tlef", "a", "--lef", "b", "--def", "c", "--out-def", "d", "--target-density", "0.60"]).is_ok());
+    }
+
+    #[test]
+    fn cli_end_to_end_gcd_flow_and_validation() {
+        let hd = sky130_hd();
+        let lib = require(hd.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
+        let tlef = require(hd.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef = require(hd.join("lef/sky130_fd_sc_hd.lef"));
+        let gcd = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/designs/gcd");
+        let out_def = std::env::temp_dir().join("grus_cli_test_gcd_placed.def");
+
+        // 1. --top mismatches and missing --tlef/--lef must fail loudly
+        let err_missing_lef = run(Cli::try_parse_from([
+            "grus-eda", "check-e0", "--lib", lib.to_str().unwrap(),
+            "--def", gcd.join("gcd.placed.def").to_str().unwrap(),
+        ]).unwrap());
+        assert!(err_missing_lef.is_err(), "check-e0 with --def but no --tlef/--lef must fail");
+
+        let err_top = run(Cli::try_parse_from([
+            "grus-eda", "check-e0",
+            "--lib", lib.to_str().unwrap(),
+            "--tlef", tlef.to_str().unwrap(),
+            "--lef", lef.to_str().unwrap(),
+            "--json", gcd.join("gcd.synth.json").to_str().unwrap(),
+            "--top", "wrong_module",
+        ]).unwrap());
+        assert!(err_top.is_err(), "mismatched --top must fail");
+
+        // 2. E0: check-e0 across Liberty, LEF, JSON, Verilog, DEF with matching --top
+        run(Cli::try_parse_from([
+            "grus-eda", "check-e0",
+            "--lib", lib.to_str().unwrap(),
+            "--tlef", tlef.to_str().unwrap(),
+            "--lef", lef.to_str().unwrap(),
+            "--json", gcd.join("gcd.synth.json").to_str().unwrap(),
+            "--verilog", gcd.join("gcd.synth.v").to_str().unwrap(),
+            "--def", gcd.join("gcd.placed.def").to_str().unwrap(),
+            "--top", "gcd",
+        ]).unwrap()).expect("check-e0 must succeed");
+
+        // 3. E2: place -> out_def
+        run(Cli::try_parse_from([
+            "grus-eda", "place",
+            "--tlef", tlef.to_str().unwrap(),
+            "--lef", lef.to_str().unwrap(),
+            "--def", gcd.join("gcd.floorplan.def").to_str().unwrap(),
+            "--out-def", out_def.to_str().unwrap(),
+        ]).unwrap()).expect("place must succeed");
+
+        // 4. E1: congestion on newly placed DEF with --heatmap and --layer-adjust
+        run(Cli::try_parse_from([
+            "grus-eda", "congestion",
+            "--tlef", tlef.to_str().unwrap(),
+            "--lef", lef.to_str().unwrap(),
+            "--def", out_def.to_str().unwrap(),
+            "--layer-adjust", "0.2",
+            "--heatmap",
+        ]).unwrap()).expect("congestion must succeed");
+
+        // 5. E3: zero-wire, placement RC on placed out_def, and routed SPEF
+        let sdc_p = gcd.join("gcd.sdc");
+        let spef_p = gcd.join("gcd.routed.spef");
+        for extra in [
+            vec![],
+            vec!["--parasitics", "placement"],
+            vec!["--parasitics", "spef", "--spef", spef_p.to_str().unwrap()],
+        ] {
+            let mut argv = vec![
+                "grus-eda", "sta",
+                "--lib", lib.to_str().unwrap(),
+                "--tlef", tlef.to_str().unwrap(),
+                "--lef", lef.to_str().unwrap(),
+                "--def", out_def.to_str().unwrap(),
+                "--sdc", sdc_p.to_str().unwrap(),
+            ];
+            argv.extend(extra);
+            run(Cli::try_parse_from(argv).unwrap()).expect("sta must succeed");
+        }
+
+        // Reject contradictory --parasitics placement --spef
+        let err_sta = run(Cli::try_parse_from([
+            "grus-eda", "sta",
+            "--lib", lib.to_str().unwrap(),
+            "--tlef", tlef.to_str().unwrap(),
+            "--lef", lef.to_str().unwrap(),
+            "--def", out_def.to_str().unwrap(),
+            "--sdc", sdc_p.to_str().unwrap(),
+            "--parasitics", "placement",
+            "--spef", spef_p.to_str().unwrap(),
+        ]).unwrap());
+        assert!(err_sta.is_err(), "contradictory --parasitics placement --spef must fail");
+
+        let _ = std::fs::remove_file(&out_def);
+    }
 }
