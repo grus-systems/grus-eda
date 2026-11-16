@@ -249,7 +249,7 @@ fn number_value(s: &str, attribute: &str) -> Result<f32> {
 
 /// `time_unit` such as `1ns` or `100ps`, converted to ns. A bare number is taken as ns.
 fn parse_time_unit(s: &str) -> Result<f32> {
-    let clean = s.trim_matches('"').trim();
+    let clean = s.trim_matches('"').trim().to_ascii_lowercase();
     let (num_str, scale) = if let Some(num_str) = clean.strip_suffix("ps") {
         (num_str, 0.001)
     } else if let Some(num_str) = clean.strip_suffix("ns") {
@@ -257,7 +257,7 @@ fn parse_time_unit(s: &str) -> Result<f32> {
     } else if let Some(num_str) = clean.strip_suffix("us") {
         (num_str, 1000.0)
     } else {
-        (clean, 1.0)
+        (clean.as_str(), 1.0)
     };
     Ok(number_value(num_str, "time_unit")? * scale)
 }
@@ -343,6 +343,13 @@ fn parse_library_body(
                         "uf" => val * 1_000_000.0,
                         _ => bail!("unsupported capacitive_load_unit {unit_str:?}"),
                     };
+                    // Drain any remaining arguments through `)` so they cannot
+                    // leak into the library body's keyword matching.
+                    while let Some(t) = lexer.next_token() {
+                        if matches!(t, Token::RParen) {
+                            break;
+                        }
+                    }
                 }
             }
             Token::Ident("lu_table_template") => {
@@ -592,9 +599,9 @@ fn parse_cell_body(
             }
             Token::Ident("pin") => {
                 if matches!(lexer.next_token(), Some(Token::LParen)) {
-                    // Drain the header: `pin (A, B)` lists must not leak `,`/`B` into
-                    // the body parser. Only a single-name declaration is modelled;
-                    // anything else has its group skipped.
+                    // Drain the header: `pin (A, B)` is not valid Liberty (the `pin`
+                    // statement takes one name), so reject it loudly instead of
+                    // leaking `,`/`B` into the body parser.
                     let mut names = Vec::new();
                     while let Some(t) = lexer.next_token() {
                         match t {
@@ -625,7 +632,7 @@ fn parse_cell_body(
                                 &mut pending_arcs,
                             )?;
                         } else {
-                            lexer.skip_balanced_braces();
+                            bail!("unsupported pin declaration with {} names", names.len());
                         }
                     }
                 }

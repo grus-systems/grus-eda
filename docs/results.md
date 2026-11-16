@@ -1413,4 +1413,24 @@ A follow-up review returned `changes` (no S1); dispositions:
   `gating_enables` can still misclassify non-AND positive-unate cells such as
   clock muxes (Liberty carries no cell function); CRPR credits only when
   launch and capture share the exact clock net — multi-stage clock trees stay
-  pessimistic, which is the safe direction.
+  pessimistic, which is the safe direction; `gating_enables` endpoints get no
+  CRPR credit (same safe direction); data sinks on retained `clock_net` nets
+  stay unreached (clock-as-data is not a supported shape); `wns_*` is
+  `INFINITY` on an empty endpoint set.
+
+### R6 fifth review round (same day, verdict: changes)
+
+Another `changes` verdict (no S1); dispositions:
+
+- **Fixed — `pin (A, B)` now errors** (S2): multi-name pin declarations are
+  not valid Liberty; they bail instead of being silently skipped.
+- **Fixed — `capacitive_load_unit` drains to `)`** (S3): extra arguments can
+  no longer leak into library-body keyword matching.
+- **Fixed — `parse_time_unit` is case-insensitive** (S3).
+- **Deferred — acknowledged, not fixed**: `port_drive` still lacks dedicated
+  `set_driving_cell` test coverage and ignores `pi_models` (fixture
+  dependency, recorded above); `RegisterCheck` single-arc-per-kind and
+  missing late/early independence (same `when`-conditional limitation);
+  multi-stage-tree CRPR and `gating_enables` CRPR (pessimistic, safe);
+  `clock_net` data sinks (unsupported shape); ff/latch parser duplication
+  and `test_cache_roundtrip` cache isolation (test hygiene).
