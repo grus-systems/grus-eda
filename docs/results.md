@@ -910,3 +910,8 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
   - `cargo test --release`: `grus-core` 165 passed / 0 failed / 5 ignored; `grus-eda` 2 passed / 0 failed.
   - `cargo test --release -p grus-core sta::`: 56 passed / 0 failed / 5 ignored; `placement::legalize`: 10 passed / 0 failed.
   - `cargo clippy --all-targets -- -D warnings`: clean.
+
+### 2026-11-16 — Phase 2 ticket 04: TimingGraph / LevelizedGraph flat CSR (`v0.1.55`)
+
+- **`crates/grus-core/src/sta/analysis.rs`**: `TimingGraph.edges_from` (`Vec<Vec<u32>>`) is now CSR (`edges_from` flat edge-index array + `edges_from_offsets`), built by counting then scattering `edges` in cell/arc scan order (`ArcEdge` gained `src` for the count pass); `checks` (`BTreeMap<u32, RegisterCheck>`) is a `Vec<(u32, RegisterCheck)>` sorted by data pin id, built through a temporary `BTreeMap` so `entry()` updates are unchanged; `LevelizedGraph.levels` is `level_offsets` + `level_pins` (pins scattered in Kahn `order` sequence, same within-level order as before) and `edges_to` is a flat `(PinId, lib_arc)` CSR (`edges_to_offsets`). Accessors `TimingGraph::outgoing`, `LevelizedGraph::level`, `LevelizedGraph::incoming_to`; `run_sta`/`run_sta_with_state`/`StaReport` signatures and endpoint order (sorted by pin name) unchanged.
+- **Verification**: `cargo test --release -p grus-core sta::` — 56 passed / 0 failed / 5 ignored, reports identical to the OpenSTA goldens (the golden comparisons are the regression check; no reference-tool rerun needed for a representation-only change). `cargo clippy --all-targets -- -D warnings` clean. Build-time impact expected ~neutral (ticket estimated `build_graph` + `topological_levels` ~15 ms of ~4.5 s jpeg STA).

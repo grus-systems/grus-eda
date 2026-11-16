@@ -5,7 +5,7 @@ and known gaps. Done criteria are in `README.md` (Stages) and the Section 1 tabl
 The measurement log, including failed runs, is `docs/results.md`. Per-test E3 detail is in
 `docs/e3-sta.md` Section 4; open E3 tasks are in its Section 5.
 
-Last updated: 2026-11-16 (`v0.1.54` Phase 2 speed tickets 01-03: DMP Brent solvers, legalization pin-x cache, STA call audit; `jpeg` STA `~5.4 s -> ~1.14 s`, legalization `~4.04 s -> ~1.47 s`; see `docs/results.md`).
+Last updated: 2026-11-16 (`v0.1.55` Phase 2 ticket 04: `TimingGraph`/`LevelizedGraph` packed into flat CSR arrays; all `sta::` tests report-identical; see `docs/results.md`).
 
 | Stage | Designs covered | Tolerance actually used | Status | Known gaps |
 |---|---|---|---|---|
@@ -17,7 +17,7 @@ Last updated: 2026-11-16 (`v0.1.54` Phase 2 speed tickets 01-03: DMP Brent solve
 ## Remaining Follow-ups (2026-11-16)
 
 1. **Further CPU / Data-Oriented Speedups (Phase 2 continuation, pure Rust)**:
-   - Pack `TimingGraph` (`Vec<Vec<u32>>`, `BTreeMap`) into flat CSR arrays (`README.md` Goal 3; ticket `docs/design/phase2/04-timinggraph-csr.md`) — the remaining structural item; STA kernel and legalize Pass 1/2/3 speedups are done (`v0.1.53`/`v0.1.54`: jpeg STA `~1.14 s`, jpeg legalization `~1.47 s`).
+   - ~~Pack `TimingGraph` (`Vec<Vec<u32>>`, `BTreeMap`) into flat CSR arrays~~ — done `v0.1.55` (ticket `docs/design/phase2/04-timinggraph-csr.md`); STA kernel and legalize Pass 1/2/3 speedups are done (`v0.1.53`/`v0.1.54`: jpeg STA `~1.14 s`, jpeg legalization `~1.47 s`).
    - Evaluate `Accelerate` / Metal GPU only if needed.
 2. **Remaining Reference-Tool Checks & Release Gate (Phase 3, requires M4 / Docker)**:
    - Add `picorv32` E1/E2 OpenROAD goldens and validate edge cases (non-`dlxtn` latches, resistor loops, non-register `set_clock_uncertainty`) against OpenSTA/OpenROAD.

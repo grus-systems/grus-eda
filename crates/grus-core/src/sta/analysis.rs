@@ -23,6 +23,7 @@ const WIRE_SLEW_FACTOR: f32 = std::f32::consts::LN_2 * 2.0;
 /// Combinational arc between two pins of one cell instance.
 #[derive(Clone, Copy, Debug)]
 struct ArcEdge {
+    src: PinId,
     dst: PinId,
     lib_arc: u32,
 }
@@ -248,7 +249,10 @@ impl Context<'_> {
 
 struct TimingGraph {
     edges: Vec<ArcEdge>,
-    edges_from: Vec<Vec<u32>>,
+    /// CSR adjacency: outgoing edge indices of pin `p` are
+    /// `edges_from[edges_from_offsets[p]..edges_from_offsets[p + 1]]`.
+    edges_from: Vec<u32>,
+    edges_from_offsets: Vec<u32>,
     launches: Vec<LaunchArc>,
     latch_opens: Vec<LatchOpen>,
     /// Enable pins of AND-type clock gates, checked against the clock (see `gating_enables`).
@@ -256,7 +260,16 @@ struct TimingGraph {
     /// Per net: reached by a register clock pin or by a gated clock output. Such nets keep the ideal
     /// clock latency, so data arriving at a clock gate does not propagate onto them.
     clock_net: Vec<bool>,
-    checks: BTreeMap<u32, RegisterCheck>,
+    /// Register checks sorted by data pin id.
+    checks: Vec<(u32, RegisterCheck)>,
+}
+
+impl TimingGraph {
+    /// Indices into `edges` of the combinational arcs leaving `pin`, in scan order.
+    fn outgoing(&self, pin: PinId) -> &[u32] {
+        let p = pin.0 as usize;
+        &self.edges_from[self.edges_from_offsets[p] as usize..self.edges_from_offsets[p + 1] as usize]
+    }
 }
 
 /// Enable pin of a latch: the clock pin of its `setup_rising` check on D (`dlxtn`: GATE_N).
@@ -307,14 +320,16 @@ fn gating_enables(cx: &Context, graph: &TimingGraph) -> Vec<PinId> {
 
 fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
     let design = cx.design;
+    let mut checks: BTreeMap<u32, RegisterCheck> = BTreeMap::new();
     let mut graph = TimingGraph {
         edges: Vec::new(),
-        edges_from: vec![Vec::new(); design.num_pins()],
+        edges_from: Vec::new(),
+        edges_from_offsets: Vec::new(),
         launches: Vec::new(),
         latch_opens: Vec::new(),
         gating_enables: Vec::new(),
         clock_net: Vec::new(),
-        checks: BTreeMap::new(),
+        checks: Vec::new(),
     };
     for c in 0..design.num_cells() {
         let cell = CellId(c as u32);
@@ -349,13 +364,13 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
             };
             match arc.timing_type {
                 TimingType::SetupRising => {
-                    let check = graph.checks.entry(dst.0).or_default();
+                    let check = checks.entry(dst.0).or_default();
                     check.clk = Some(src);
                     check.latch = lib_cell.is_latch;
                     check.setup_arc = Some(lib_arc);
                 }
                 TimingType::HoldRising => {
-                    let check = graph.checks.entry(dst.0).or_default();
+                    let check = checks.entry(dst.0).or_default();
                     check.clk = Some(src);
                     check.latch = lib_cell.is_latch;
                     check.hold_arc = Some(lib_arc);
@@ -366,17 +381,16 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
                     }
                 }
                 TimingType::Combinational | TimingType::CombinationalRise | TimingType::CombinationalFall => {
-                    graph.edges_from[src.0 as usize].push(graph.edges.len() as u32);
-                    graph.edges.push(ArcEdge { dst, lib_arc });
+                    graph.edges.push(ArcEdge { src, dst, lib_arc });
                 }
                 TimingType::RisingEdge => graph.launches.push(LaunchArc { clk: src, q: dst, lib_arc }),
                 TimingType::RecoveryRising => {
-                    let check = graph.checks.entry(dst.0).or_default();
+                    let check = checks.entry(dst.0).or_default();
                     check.clk = Some(src);
                     check.recovery_arc = Some(lib_arc);
                 }
                 TimingType::RemovalRising => {
-                    let check = graph.checks.entry(dst.0).or_default();
+                    let check = checks.entry(dst.0).or_default();
                     check.clk = Some(src);
                     check.removal_arc = Some(lib_arc);
                 }
@@ -385,7 +399,7 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
         }
     }
     graph.clock_net = vec![false; design.num_nets()];
-    let register_clock_pins = graph.launches.iter().map(|l| l.clk).chain(graph.checks.values().filter_map(|c| c.clk));
+    let register_clock_pins = graph.launches.iter().map(|l| l.clk).chain(checks.values().filter_map(|c| c.clk));
     for pin in register_clock_pins {
         if let Some(net) = design.pin_nets[pin.0 as usize] {
             graph.clock_net[net.0 as usize] = true;
@@ -396,15 +410,52 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
             skipped.cell_driven_clock_nets += 1;
         }
     }
+    // CSR adjacency: count outgoing edges per pin, prefix-sum, then scatter edge
+    // indices in `edges` order, so each pin's list keeps the cell/arc scan order.
+    let n = design.num_pins();
+    let mut offsets = vec![0u32; n + 1];
+    for edge in &graph.edges {
+        offsets[edge.src.0 as usize + 1] += 1;
+    }
+    for i in 1..=n {
+        offsets[i] += offsets[i - 1];
+    }
+    graph.edges_from_offsets = offsets;
+    graph.edges_from = vec![0; graph.edges.len()];
+    let mut cursor = graph.edges_from_offsets[..n].to_vec();
+    for (i, edge) in graph.edges.iter().enumerate() {
+        let s = edge.src.0 as usize;
+        graph.edges_from[cursor[s] as usize] = i as u32;
+        cursor[s] += 1;
+    }
+    graph.checks = checks.into_iter().collect();
+
     let enables = gating_enables(cx, &graph);
     graph.gating_enables = enables;
     graph
 }
 
 struct LevelizedGraph {
-    levels: Vec<Vec<PinId>>,
-    edges_to: Vec<Vec<(PinId, u32)>>,
+    /// CSR levels: pins of level `l` are
+    /// `level_pins[level_offsets[l]..level_offsets[l + 1]]`.
+    level_offsets: Vec<u32>,
+    level_pins: Vec<PinId>,
+    /// CSR reverse adjacency of combinational arcs: incoming `(source pin, lib arc)`
+    /// pairs of pin `p` are `edges_to[edges_to_offsets[p]..edges_to_offsets[p + 1]]`.
+    edges_to: Vec<(PinId, u32)>,
+    edges_to_offsets: Vec<u32>,
     pin_driver: Vec<Option<(u32, u32, PinId)>>,
+}
+
+impl LevelizedGraph {
+    fn level(&self, l: usize) -> &[PinId] {
+        &self.level_pins[self.level_offsets[l] as usize..self.level_offsets[l + 1] as usize]
+    }
+
+    fn incoming_to(&self, pin: PinId) -> &[(PinId, u32)] {
+        let p = pin.0 as usize;
+        &self.edges_to[self.edges_to_offsets[p] as usize..self.edges_to_offsets[p + 1] as usize]
+    }
 }
 
 /// Kahn topological levels over net edges (driver -> sink) and combinational arcs,
@@ -414,13 +465,27 @@ fn topological_levels(cx: &Context, graph: &TimingGraph) -> Result<LevelizedGrap
     let design = cx.design;
     let n = design.num_pins();
     let mut indegree = vec![0u32; n];
-    let mut edges_to: Vec<Vec<(PinId, u32)>> = vec![Vec::new(); n];
-    for (src_p, outgoing) in graph.edges_from.iter().enumerate() {
-        let src_pin = PinId(src_p as u32);
-        for &e in outgoing {
+    // Count incoming combinational arcs per pin for the `edges_to` CSR.
+    let mut edges_to_offsets = vec![0u32; n + 1];
+    for src_p in 0..n {
+        for &e in graph.outgoing(PinId(src_p as u32)) {
             let edge = graph.edges[e as usize];
             indegree[edge.dst.0 as usize] += 1;
-            edges_to[edge.dst.0 as usize].push((src_pin, edge.lib_arc));
+            edges_to_offsets[edge.dst.0 as usize + 1] += 1;
+        }
+    }
+    for i in 1..=n {
+        edges_to_offsets[i] += edges_to_offsets[i - 1];
+    }
+    let mut edges_to = vec![(PinId(0), 0); edges_to_offsets[n] as usize];
+    let mut cursor = edges_to_offsets[..n].to_vec();
+    for src_p in 0..n {
+        let src_pin = PinId(src_p as u32);
+        for &e in graph.outgoing(src_pin) {
+            let edge = graph.edges[e as usize];
+            let d = edge.dst.0 as usize;
+            edges_to[cursor[d] as usize] = (src_pin, edge.lib_arc);
+            cursor[d] += 1;
         }
     }
     let mut pin_driver: Vec<Option<(u32, u32, PinId)>> = vec![None; n];
@@ -460,7 +525,7 @@ fn topological_levels(cx: &Context, graph: &TimingGraph) -> Result<LevelizedGrap
                 release(sink, &mut order);
             }
         }
-        for &e in &graph.edges_from[p] {
+        for &e in graph.outgoing(PinId(p as u32)) {
             release(graph.edges[e as usize].dst, &mut order);
         }
     }
@@ -468,11 +533,23 @@ fn topological_levels(cx: &Context, graph: &TimingGraph) -> Result<LevelizedGrap
         bail!("combinational loop: {} of {} pins could not be levelized", n - order.len(), n);
     }
     let max_depth = depth.iter().copied().max().unwrap_or(0) as usize;
-    let mut levels = vec![Vec::new(); max_depth + 1];
-    for pin in order {
-        levels[depth[pin.0 as usize] as usize].push(pin);
+    let num_levels = max_depth + 1;
+    // CSR levels: count pins per depth, prefix-sum, then scatter in `order` sequence.
+    let mut level_offsets = vec![0u32; num_levels + 1];
+    for pin in &order {
+        level_offsets[depth[pin.0 as usize] as usize + 1] += 1;
     }
-    Ok(LevelizedGraph { levels, edges_to, pin_driver })
+    for i in 1..=num_levels {
+        level_offsets[i] += level_offsets[i - 1];
+    }
+    let mut level_pins = vec![PinId(0); order.len()];
+    let mut cursor = level_offsets[..num_levels].to_vec();
+    for pin in order {
+        let d = depth[pin.0 as usize] as usize;
+        level_pins[cursor[d] as usize] = pin;
+        cursor[d] += 1;
+    }
+    Ok(LevelizedGraph { level_offsets, level_pins, edges_to, edges_to_offsets, pin_driver })
 }
 
 fn polarities(sense: TimingSense) -> &'static [(usize, usize)] {
@@ -564,7 +641,7 @@ fn run_sta_detail(
     }
 
     // Ideal clock: every register clock pin and latch enable sees an edge at the clock latency with zero slew.
-    let clock_pins = graph.launches.iter().map(|l| l.clk).chain(graph.checks.values().filter_map(|c| c.clk));
+    let clock_pins = graph.launches.iter().map(|l| l.clk).chain(graph.checks.iter().filter_map(|(_, c)| c.clk));
     for clk in clock_pins {
         for pol in [RISE, FALL] {
             state[clk.0 as usize].merge(pol, sdc.clock_latency_ns, sdc.clock_latency_ns, 0.0, 0.0);
@@ -612,7 +689,8 @@ fn run_sta_detail(
         }
     }
 
-    for level in levelized.levels.iter().skip(1) {
+    for lvl in 1..levelized.level_offsets.len() - 1 {
+        let level = levelized.level(lvl);
         let eval_pin = |state: &[PinTimingState], pin: PinId| -> Option<(usize, PinTimingState)> {
             let p = pin.0 as usize;
             let mut next = state[p];
@@ -649,7 +727,7 @@ fn run_sta_detail(
                 }
             }
 
-            let incoming = &levelized.edges_to[p];
+            let incoming = levelized.incoming_to(PinId(p as u32));
             if !incoming.is_empty()
                 && let Some(out_net) = design.pin_nets[p]
                 && !graph.clock_net[out_net.0 as usize]
@@ -758,7 +836,7 @@ fn collect_endpoints(
     let mut entries = Vec::new();
     let half_period = 0.5 * sdc.period_ns;
 
-    for (&data_id, check) in &graph.checks {
+    for &(data_id, check) in &graph.checks {
         let data = PinId(data_id);
         let (Some(clk), Some(late_arc), Some(early_arc)) = (check.clk, check.late_arc(), check.early_arc()) else {
             skipped.incomplete_checks += 1;
@@ -1093,7 +1171,8 @@ mod tests {
         ];
         for (src, dst, pol, slew_in, (far, rpi, near, ceff)) in cases {
             let (src, dst) = (find_pin(src), find_pin(dst));
-            let edge = graph.edges_from[src.0 as usize]
+            let edge = graph
+                .outgoing(src)
                 .iter()
                 .map(|&i| graph.edges[i as usize])
                 .find(|e| e.dst == dst)
@@ -1187,7 +1266,8 @@ mod tests {
     /// the same transition filter `build_graph` applies to combinational arcs. Register `CLK -> Q`
     /// arcs are launches, not edges, so both lists are searched.
     fn matching_arcs(lib: &LibDb, graph: &TimingGraph, src: PinId, dst: PinId, row: &DcalcRow) -> Vec<u32> {
-        let combinational = graph.edges_from[src.0 as usize]
+        let combinational = graph
+            .outgoing(src)
             .iter()
             .map(|&i| graph.edges[i as usize])
             .filter(|e| e.dst == dst)
