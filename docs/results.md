@@ -889,3 +889,24 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
 
 
 
+
+### 2026-11-16 — Phase 2 speed tickets 01/02/03: DMP Brent solvers, legalization pin-x cache, STA call audit (`v0.1.53`, `v0.1.54`)
+
+- **DMP inner solvers -> Brent (`v0.1.53`, `crates/grus-core/src/sta/dmp.rs`)**:
+  - Added zbrent `brent_root`/`brent_checked`; the original bisection loops remain as fallback when endpoints do not bracket a sign change (also the `dt == 0` NaN guard). Applied to `rc_crossing_bisect`, `fit_ramp_duration`, the `pi_waveform_slew` crossing, and the `solve_dmp_with` residual loop; same stop tolerances (`1e-6`/`1e-7` ns), no model or constant changes.
+  - `grus-eda sta --lib <sky130_fd_sc_hd__tt_025C_1v80.lib> --tlef <sky130_fd_sc_hd__nom.tlef> --lef <sky130_fd_sc_hd.lef> --def tests/designs/jpeg/jpeg.placed.def --sdc tests/designs/jpeg/jpeg.sdc` on Apple Silicon, release build:
+    - `--parasitics placement`: `~4.2-5.4 s -> ~1.14-1.15 s` (internal level loop `3.9-4.4 s -> ~0.9-1.0 s` over the same 448,726 `driver_response` calls); `setup wns=-397.091827 tns=-489748.000000` (pre-change `wns=-397.091156`; tns rel diff ~7e-7, inside the Brent tolerance band).
+    - `--spef tests/designs/jpeg/jpeg.routed.spef`: `~4.3 s -> ~1.27 s`; `setup wns=-78.083878 tns=-134605.000000` (was `-78.083832`; last-ulp drift only, tns identical).
+  - Intentional-failure check (`AGENTS.md` §7 rule 7): Brent tolerance `1e-6 -> 1e-1` fails `crossing_at_the_ramp_end_and_before_it_is_handled`, `resistive_shielding_lowers_ceff_between_c1_and_total`, `golden_regression_values_are_reproduced`; restored.
+- **Legalization passes 2/3 (`v0.1.54`, `crates/grus-core/src/placement/legalize.rs`)**:
+  - Passes 2 and 3 rescanned every pin of every incident net through `PinGeomCache::pin_pos` per cell/pair. Both passes move cells along x only, so a flat `pin_x[]` is rebuilt once per round before Pass 2 and refreshed on every accepted move (`refresh_cell_pin_x` via `pin_pos_at_cell`, the same math `pin_pos` uses for cell-owned pins). Pass 3's pooled "other pins" median used `sort_unstable`; only the middle element is consumed, so `select_nth_unstable(len/2)` yields the identical value.
+  - `grus-eda place` on `tests/designs/jpeg/jpeg.floorplan.def`: legalization + refinement `~4.04 s -> ~1.45-1.48 s` (ticket target `<= ~2.5 s` met); `final_hpwl=1,018,912,430 dbu` bit-identical, `avg_disp=1.58 um`, `max_disp=23.33 um` unchanged; total `place` `~3.4-3.7 s` (GP `~2.0 s`). Pass 1 measured `~80-98 ms`/round — no longer the bottleneck.
+- **STA call audit (ticket 02; temporary probe, removed before commit)**:
+  - jpeg placement-RC `driver_response` calls: **448,726, all unique** on the full key `(net, dst_pol, delay_table, slew_table, in_slew f32 bits)` -> `duplicate_extra=0`. Per the ticket's <1% rule, no dedup cache was implemented.
+  - Call sites: launches + latch opens 8,750 (1.95%), comb arcs at `s_max` 256,804 (57.2%), comb arcs at `s_min != s_max` extra call 183,172 (40.8%).
+  - Polarity pairs (src->dst): (R,R) 129,670 / (R,F) 99,068 / (F,R) 94,693 / (F,F) 125,295.
+  - Level-width histogram: jpeg 34 levels, min 468 / median 3,110 / max 222,109 — every level `>= 32`, so the `par_iter` branch always runs and the `< 32` sequential path is dead there; aes 28 levels min 32; gcd 20 levels with 11 `< 32` but only 1,998 `driver_response` calls total. Threshold kept at 32 — no design shows narrow levels dominating wall time.
+- **Verification (`v0.1.54` tree)**:
+  - `cargo test --release`: `grus-core` 165 passed / 0 failed / 5 ignored; `grus-eda` 2 passed / 0 failed.
+  - `cargo test --release -p grus-core sta::`: 56 passed / 0 failed / 5 ignored; `placement::legalize`: 10 passed / 0 failed.
+  - `cargo clippy --all-targets -- -D warnings`: clean.

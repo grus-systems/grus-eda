@@ -5,7 +5,7 @@ and known gaps. Done criteria are in `README.md` (Stages) and the Section 1 tabl
 The measurement log, including failed runs, is `docs/results.md`. Per-test E3 detail is in
 `docs/e3-sta.md` Section 4; open E3 tasks are in its Section 5.
 
-Last updated: 2026-11-16 (`v0.1.51` Phase 2 CPU/Rayon speedup across E1–E3; see `docs/results.md`).
+Last updated: 2026-11-16 (`v0.1.54` Phase 2 speed tickets 01-03: DMP Brent solvers, legalization pin-x cache, STA call audit; `jpeg` STA `~5.4 s -> ~1.14 s`, legalization `~4.04 s -> ~1.47 s`; see `docs/results.md`).
 
 | Stage | Designs covered | Tolerance actually used | Status | Known gaps |
 |---|---|---|---|---|
@@ -17,8 +17,8 @@ Last updated: 2026-11-16 (`v0.1.51` Phase 2 CPU/Rayon speedup across E1–E3; se
 ## Remaining Follow-ups (2026-11-16)
 
 1. **Further CPU / Data-Oriented Speedups (Phase 2 continuation, pure Rust)**:
-   - Pack `TimingGraph` (`Vec<Vec<u32>>`, `BTreeMap`) into flat CSR arrays (`README.md` Goal 3) and investigate further STA kernel speedups (DMP caching / NLDM lookup) to bring `jpeg` STA from `~5.4–5.5 s` (`v0.1.51`) down toward `1–2 s`.
-   - Further speed up `placement/legalize.rs` Pass 1 (`equal_width_swap_pass_fast`, currently `3.86 s` on `jpeg` in `v0.1.52`), and evaluate `Accelerate` / Metal GPU only if needed.
+   - Pack `TimingGraph` (`Vec<Vec<u32>>`, `BTreeMap`) into flat CSR arrays (`README.md` Goal 3; ticket `docs/design/phase2/04-timinggraph-csr.md`) — the remaining structural item; STA kernel and legalize Pass 1/2/3 speedups are done (`v0.1.53`/`v0.1.54`: jpeg STA `~1.14 s`, jpeg legalization `~1.47 s`).
+   - Evaluate `Accelerate` / Metal GPU only if needed.
 2. **Remaining Reference-Tool Checks & Release Gate (Phase 3, requires M4 / Docker)**:
    - Add `picorv32` E1/E2 OpenROAD goldens and validate edge cases (non-`dlxtn` latches, resistor loops, non-register `set_clock_uncertainty`) against OpenSTA/OpenROAD.
    - User decision on merging `dev -> main` (M4 CI run `43809018923` verified green on `v0.1.52`: `generate` `21m5s`, `test` `1m34s`, `grus-core` `165 passed; 0 failed; 5 ignored` in `29.57 s`, `grus-eda` `2 passed; 0 failed` in `0.14 s`, `clippy` 0 warnings).
