@@ -34,7 +34,7 @@ jobs:
             || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
 
       - name: Generate picorv32 reference inputs
-        if: ${{ hashFiles('tests/designs/picorv32/picorv32.routed.spef') == '' }}
+        if: ${{ hashFiles('tests/designs/picorv32/picorv32.rcx.spef') == '' }}
         run: tests/designs/picorv32/generate_ref.sh
 
       - name: Generate aes reference inputs
@@ -49,6 +49,13 @@ jobs:
         if: ${{ hashFiles('tests/designs/ibex/ibex.util65.def') == '' }}
         run: tests/designs/ibex/generate_ref.sh
 
+      - name: Collect per-pin OpenSTA dumps
+        run: |
+          [ -f tests/designs/aes/pins_placed.txt ] || tests/designs/collect_pins.sh aes aes.placed.def aes.routed.spef pins_placed.txt
+          [ -f tests/designs/picorv32/pins_routed.txt ] || tests/designs/collect_pins.sh picorv32 picorv32.placed.def picorv32.rcx.spef pins_routed.txt
+          [ -f tests/designs/ibex/pins_placed.txt ] || tests/designs/collect_pins.sh ibex ibex.placed.def ibex.routed.spef pins_placed.txt
+          [ -f tests/designs/jpeg/pins_placed.txt ] || tests/designs/collect_pins.sh jpeg jpeg.placed.def jpeg.routed.spef pins_placed.txt
+
       - name: Upload generated reference inputs
         uses: actions/upload-artifact@v4
         with:
@@ -61,7 +68,10 @@ jobs:
             tests/designs/picorv32/picorv32.floorplan.def
             tests/designs/picorv32/picorv32.placed.def
             tests/designs/picorv32/picorv32.routed.spef
+            tests/designs/picorv32/picorv32.routed.def
+            tests/designs/picorv32/picorv32.rcx.spef
             tests/designs/picorv32/picorv32.sta.reference.json
+            tests/designs/picorv32/pins_routed.txt
             tests/designs/aes/aes.synth.v
             tests/designs/aes/aes.synth.json
             tests/designs/aes/aes.floorplan.def
@@ -69,6 +79,7 @@ jobs:
             tests/designs/aes/aes.orient.def
             tests/designs/aes/aes.util65.def
             tests/designs/aes/aes.routed.spef
+            tests/designs/aes/pins_placed.txt
             tests/designs/jpeg/jpeg.synth.v
             tests/designs/jpeg/jpeg.synth.json
             tests/designs/jpeg/jpeg.floorplan.def
@@ -78,6 +89,7 @@ jobs:
             tests/designs/jpeg/jpeg.util65.def
             tests/designs/jpeg/jpeg.routed.spef
             tests/designs/jpeg/jpeg.sta.reference.json
+            tests/designs/jpeg/pins_placed.txt
             tests/designs/ibex/ibex.synth.v
             tests/designs/ibex/ibex.synth.json
             tests/designs/ibex/ibex.floorplan.def
@@ -87,6 +99,7 @@ jobs:
             tests/designs/ibex/ibex.util65.def
             tests/designs/ibex/ibex.routed.spef
             tests/designs/ibex/ibex.sta.reference.json
+            tests/designs/ibex/pins_placed.txt
 
   test:
     needs: generate

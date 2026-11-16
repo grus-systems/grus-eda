@@ -18,7 +18,7 @@ mkdir -p "${RUN_DIR}"
 
 if [ ! -f /.dockerenv ]; then
     if docker info >/dev/null 2>&1; then docker_cmd="docker"; else docker_cmd="mise exec docker-cli@latest colima@latest lima@latest -- docker"; fi
-    exec ${docker_cmd} run --rm -v "${REPO_ROOT}:/work" -v "${PDK_HOST_ROOT}:/pdk" -e PDK_ROOT=/pdk \
+    exec ${docker_cmd} run --rm -u "$(id -u):$(id -g)" -v "${REPO_ROOT}:/work" -v "${PDK_HOST_ROOT}:/pdk" -e PDK_ROOT=/pdk \
         "${IMAGE}" bash "/work/tests/designs/collect_pins.sh" "$@"
 fi
 
