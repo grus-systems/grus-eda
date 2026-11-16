@@ -22,6 +22,9 @@ concurrency:
 
 jobs:
   generate:
+    # Push events only: a pull request (from a fork, once this repository is
+    # public) must never run on the org's self-hosted machine.
+    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     steps:
@@ -109,6 +112,7 @@ jobs:
 
   test:
     needs: generate
+    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     steps:
