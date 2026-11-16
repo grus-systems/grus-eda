@@ -57,6 +57,27 @@ pub struct DrivingCell {
     pub in_trans_fall: f32,
 }
 
+/// Delay classes `set_timing_derate` selects with `-cell_delay`/`-net_delay`/`-cell_check`.
+pub const DERATE_CELL: usize = 0;
+pub const DERATE_NET: usize = 1;
+pub const DERATE_CHECK: usize = 2;
+
+/// One analysis corner of `set_timing_derate`: factors indexed by
+/// `[kind][clock_path][transition]` — `clock_path` is 0 for clock-network delays and 1 for
+/// data-path delays, `transition` is RISE (0) / FALL (1). A command overwrites only the
+/// subset its flags select; the rest keep their previous value (measured on OpenSTA:
+/// repeated commands are last-wins per category).
+#[derive(Clone, Copy, Debug)]
+pub struct DerateCorner {
+    pub factors: [[[f32; 2]; 2]; 3],
+}
+
+impl Default for DerateCorner {
+    fn default() -> Self {
+        Self { factors: [[[1.0; 2]; 2]; 3] }
+    }
+}
+
 /// The SDC subset the benchmark flow uses. Commands are applied in file order, so a later
 /// command overrides an earlier one on the same port.
 #[derive(Clone, Debug, Default)]
@@ -81,10 +102,10 @@ pub struct Sdc {
     pub io_clock_source_latency_ns: f32,
     /// Slew seeded on clock pins (`set_clock_transition`); zero without the command.
     pub clock_transition_ns: f32,
-    /// Early/late derating of propagated delays (`set_timing_derate`). `finish` normalizes an
-    /// unset corner (0.0) to 1.0, so 0.0 always means "never set".
-    pub derate_early: f32,
-    pub derate_late: f32,
+    /// Early/late derating of propagated delays (`set_timing_derate`), per delay kind,
+    /// clock/data path and transition. Unset entries stay at 1.0 (no derate).
+    pub derate_early: DerateCorner,
+    pub derate_late: DerateCorner,
     input_delays: Vec<DelayRule>,
     output_delays: Vec<DelayRule>,
     input_transitions: Vec<(PortSel, f32)>,
@@ -151,6 +172,14 @@ impl Sdc {
     /// sum (OpenSTA reports 1.20 ns for `set_clock_latency 1.0` + `-source 0.2`).
     pub fn design_clock_latency_ns(&self) -> f32 {
         self.clock_source_latency_ns + self.clock_latency_ns
+    }
+
+    /// Derate factor for one propagated delay. `late` selects the max-analysis corner,
+    /// `kind` is a `DERATE_*` constant, `clock_path` marks delays on the clock network,
+    /// and `transition` is RISE/FALL.
+    pub fn derate(&self, late: bool, kind: usize, clock_path: bool, transition: usize) -> f32 {
+        let corner = if late { &self.derate_late } else { &self.derate_early };
+        corner.factors[kind][usize::from(!clock_path)][transition]
     }
 
     /// `(min, max)` input delay in ns; both equal the plain value when no `-min`/`-max` was given.
@@ -690,34 +719,86 @@ impl Interp {
         Ok(())
     }
 
-    /// `set_timing_derate [-early e] [-late l]`: multiplies propagated cell and net delays in
-    /// the early/late analyses. Either flag may be absent; an unset corner keeps its value.
+    /// `set_timing_derate -early|-late [-rise|-fall] [-clock|-data]
+    /// [-net_delay|-cell_delay|-cell_check] <derate> [objects]`. Exactly one of `-early`/`-late`
+    /// is required and the derate value is positional. Each command overwrites only the
+    /// categories its flags select; a bare corner flag covers cell and net delays on both
+    /// clock and data paths and both transitions but not cell checks (measured on OpenSTA).
+    /// Cell checks respond to `-data` only, never `-clock`. A second positional word would
+    /// be the object scope, which the model cannot honour, so it is rejected.
     fn set_timing_derate(&mut self, args: &[Value]) -> Result<()> {
-        let (mut early, mut late) = (None, None);
-        let mut i = 0;
-        while i < args.len() {
-            let Value::Str(flag) = &args[i] else {
-                bail!("set_timing_derate takes -early/-late flags");
+        let mut late = None;
+        let mut rise = false;
+        let mut fall = false;
+        let mut clock = false;
+        let mut data = false;
+        let mut kinds = [false; 3];
+        let mut any_kind = false;
+        let mut derate = None;
+        for arg in args {
+            let Value::Str(word) = arg else {
+                bail!("set_timing_derate takes flag/value words");
             };
-            let slot = match flag.as_str() {
-                "-early" => &mut early,
-                "-late" => &mut late,
-                _ => bail!("unsupported option `{flag}`"),
-            };
-            match args.get(i + 1) {
-                Some(Value::Str(v)) if !v.starts_with('-') || is_negative_number(v) => *slot = Some(parse_f32(v)?),
-                _ => bail!("{flag} needs a value"),
+            match word.as_str() {
+                "-early" | "-late" => {
+                    if late.is_some() {
+                        bail!("set_timing_derate takes exactly one of -early/-late");
+                    }
+                    late = Some(word == "-late");
+                }
+                "-rise" => rise = true,
+                "-fall" => fall = true,
+                "-clock" => clock = true,
+                "-data" => data = true,
+                "-net_delay" => {
+                    kinds[DERATE_NET] = true;
+                    any_kind = true;
+                }
+                "-cell_delay" => {
+                    kinds[DERATE_CELL] = true;
+                    any_kind = true;
+                }
+                "-cell_check" => {
+                    kinds[DERATE_CHECK] = true;
+                    any_kind = true;
+                }
+                _ if word.starts_with('-') => bail!("unsupported option `{word}`"),
+                _ => {
+                    if derate.is_some() {
+                        bail!("set_timing_derate takes one derate value");
+                    }
+                    derate = Some(parse_f32(word)?);
+                }
             }
-            i += 2;
         }
-        if early.is_none() && late.is_none() {
-            bail!("set_timing_derate needs -early or -late");
+        let (Some(late), Some(value)) = (late, derate) else {
+            bail!("set_timing_derate needs -early or -late and a derate value");
+        };
+        let mut selected = kinds;
+        if !any_kind {
+            selected[DERATE_CELL] = true;
+            selected[DERATE_NET] = true;
         }
-        if let Some(e) = early {
-            self.sdc.derate_early = e;
-        }
-        if let Some(l) = late {
-            self.sdc.derate_late = l;
+        let corner = if late { &mut self.sdc.derate_late } else { &mut self.sdc.derate_early };
+        for (kind, &sel) in selected.iter().enumerate() {
+            if !sel {
+                continue;
+            }
+            for (clock_path, row) in corner.factors[kind].iter_mut().enumerate() {
+                let is_clock = clock_path == 0;
+                if kind == DERATE_CHECK && is_clock {
+                    continue;
+                }
+                if clock != data && is_clock != clock {
+                    continue;
+                }
+                for (transition, cell) in row.iter_mut().enumerate() {
+                    if rise != fall && (transition == 0) != rise {
+                        continue;
+                    }
+                    *cell = value;
+                }
+            }
         }
         Ok(())
     }
@@ -808,16 +889,9 @@ impl Interp {
         bail!("unknown clock `{name}`")
     }
 
-    fn finish(mut self) -> Result<Sdc> {
+    fn finish(self) -> Result<Sdc> {
         if self.sdc.period_ns <= 0.0 {
             bail!("SDC defines no clock period");
-        }
-        // `set_timing_derate` leaves an unset corner at the derived default 0.0; 1.0 is "no derate".
-        if self.sdc.derate_early == 0.0 {
-            self.sdc.derate_early = 1.0;
-        }
-        if self.sdc.derate_late == 0.0 {
-            self.sdc.derate_late = 1.0;
         }
         // The analysis uses one period for the design and the virtual I/O clock.
         for (name, period_ns) in &self.virtual_clocks {
@@ -1328,8 +1402,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sdc.clock_transition_ns, 0.15);
-        assert_eq!(sdc.derate_early, 0.95);
-        assert_eq!(sdc.derate_late, 1.05);
+        assert_eq!(sdc.derate_early.factors[DERATE_CELL][1][0], 0.95);
+        assert_eq!(sdc.derate_late.factors[DERATE_CELL][1][0], 1.05);
         assert_eq!(sdc.setup_uncertainty_ns, 0.25);
         assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0));
         assert_eq!(sdc.output_load_pf("resp_val"), 0.0334);
@@ -1338,6 +1412,46 @@ mod tests {
         assert_eq!(sdc.ignored_commands["set_max_transition"], 1);
         assert_eq!(sdc.ignored_commands["set_max_capacitance"], 1);
         assert_eq!(sdc.ignored_commands["set_max_fanout"], 1);
+    }
+
+    #[test]
+    fn timing_derate_selectors_and_last_wins() {
+        // OpenSTA shape: one corner flag per command, positional value, and each
+        // command overwrites only the categories its flags select. `-cell_check` is
+        // data-side only; `-rise`/`-fall` pick the transition entering the arc.
+        let sdc = parse_sdc(
+            "create_clock -name clk -period 2.0 [get_ports clk]\n\
+             set_timing_derate -early 0.9 -cell_delay\n\
+             set_timing_derate -late 1.1 -net_delay -data\n\
+             set_timing_derate -early 0.8 -cell_check\n\
+             set_timing_derate -late 1.2 -cell_delay -rise\n\
+             set_timing_derate -early 0.7 -cell_delay\n",
+        )
+        .unwrap();
+        let f = &sdc.derate_early.factors;
+        for row in f[DERATE_CELL] {
+            assert_eq!(row, [0.7, 0.7]);
+        }
+        for row in f[DERATE_NET] {
+            assert_eq!(row, [1.0, 1.0]);
+        }
+        assert_eq!(f[DERATE_CHECK], [[1.0, 1.0], [0.8, 0.8]]);
+        let l = &sdc.derate_late.factors;
+        assert_eq!(l[DERATE_CELL][0], [1.2, 1.0]);
+        assert_eq!(l[DERATE_CELL][1], [1.2, 1.0]);
+        assert_eq!(l[DERATE_NET][0], [1.0, 1.0]);
+        assert_eq!(l[DERATE_NET][1], [1.1, 1.1]);
+        assert_eq!(l[DERATE_CHECK], [[1.0, 1.0], [1.0, 1.0]]);
+        for bad in [
+            "set_timing_derate -early 0.9 -late 1.1\n",
+            "set_timing_derate -late 1.1 -early 0.9\n",
+            "set_timing_derate -early\n",
+            "set_timing_derate -early 0.9 0.5\n",
+            "set_timing_derate -early 0.9 [get_cells]\n",
+            "set_timing_derate 0.9\n",
+        ] {
+            assert!(parse_sdc(&format!("create_clock -name clk -period 2.0 [get_ports clk]\n{bad}")).is_err(), "accepted: {bad}");
+        }
     }
 
     #[test]

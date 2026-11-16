@@ -1,14 +1,14 @@
 use super::dmp::{PiModel, driver_waveform_slew, solve_dmp};
 use super::nldm::{eval_nldm_constraint, eval_nldm_delay_or_slew};
 use super::parasitics::NetParasitics;
-use super::sdc::Sdc;
+use super::sdc::{DERATE_CELL, DERATE_CHECK, DERATE_NET, Sdc};
 use crate::design_db::DesignDb;
 use crate::interner::{CellId, LibPinId, NetId, PinDir, PinId};
 use crate::lib_db::{LibCell, LibDb, NldmTable, TimingSense, TimingType};
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const RISE: usize = 0;
 pub const FALL: usize = 1;
@@ -807,6 +807,7 @@ fn sink_state_with_wire(
     wire: Option<&[Vec<f32>; 2]>,
     pin_idx: u32,
     is_port: bool,
+    clock_path: bool,
     sdc: &Sdc,
 ) -> PinTimingState {
     let mut sink_state = driver_state;
@@ -817,13 +818,13 @@ fn sink_state_with_wire(
         let degrade = WIRE_SLEW_FACTOR * elmore;
         if is_port {
             let delay = std::f32::consts::LN_2 * elmore;
-            sink_state.arrival_max[pol] += delay * sdc.derate_late;
-            sink_state.arrival_min[pol] += delay * sdc.derate_early;
+            sink_state.arrival_max[pol] += delay * sdc.derate(true, DERATE_NET, clock_path, pol);
+            sink_state.arrival_min[pol] += delay * sdc.derate(false, DERATE_NET, clock_path, pol);
             sink_state.slew_max[pol] = driver_state.slew_max[pol] + degrade;
             sink_state.slew_min[pol] = driver_state.slew_min[pol] + degrade;
         } else {
-            sink_state.arrival_max[pol] += elmore * sdc.derate_late;
-            sink_state.arrival_min[pol] += elmore * sdc.derate_early;
+            sink_state.arrival_max[pol] += elmore * sdc.derate(true, DERATE_NET, clock_path, pol);
+            sink_state.arrival_min[pol] += elmore * sdc.derate(false, DERATE_NET, clock_path, pol);
             sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
             sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
         }
@@ -885,7 +886,7 @@ fn propagate_clock(
                 if driver_state.reached(RISE) || driver_state.reached(FALL) {
                     let wire = wire_delays_per_net.get(net_idx as usize).and_then(|w| w.as_ref());
                     let is_port = design.pin_cells[drv.0 as usize].is_none();
-                    next = sink_state_with_wire(driver_state, wire, pin_idx, is_port, sdc);
+                    next = sink_state_with_wire(driver_state, wire, pin_idx, is_port, true, sdc);
                     next_par = parity[drv.0 as usize];
                     changed = true;
                 }
@@ -917,7 +918,7 @@ fn propagate_clock(
                         } else {
                             cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_min)
                         };
-                        let cand_min = src.arrival_min[src_pol] + early_delay * sdc.derate_early;
+                        let cand_min = src.arrival_min[src_pol] + early_delay * sdc.derate(false, DERATE_CELL, true, src_pol);
                         // The parity of a transition is the clock-edge index that produced it;
                         // keep the one belonging to the earliest arrival at this pin.
                         if cand_min < next.arrival_min[dst_pol] {
@@ -925,7 +926,7 @@ fn propagate_clock(
                         }
                         next.merge(
                             dst_pol,
-                            src.arrival_max[src_pol] + late_delay * sdc.derate_late,
+                            src.arrival_max[src_pol] + late_delay * sdc.derate(true, DERATE_CELL, true, src_pol),
                             cand_min,
                             late_slew,
                             early_slew,
@@ -957,6 +958,14 @@ fn delay_tables(arc: &crate::lib_db::LibTimingArc, dst_pol: usize) -> (Option<&N
         (arc.cell_rise.as_ref(), arc.rise_transition.as_ref())
     } else {
         (arc.cell_fall.as_ref(), arc.fall_transition.as_ref())
+    }
+}
+
+/// Transition a register check constrains: `*Falling` check types fire on the falling edge.
+fn check_transition(arc: &crate::lib_db::LibTimingArc) -> usize {
+    match arc.timing_type {
+        TimingType::SetupFalling | TimingType::HoldFalling => FALL,
+        _ => RISE,
     }
 }
 
@@ -1032,8 +1041,8 @@ fn run_sta_detail(
             let (slew, drv_delay) = drive[pol];
             state[p].merge(
                 pol,
-                latency + in_max + drv_delay * sdc.derate_late,
-                latency + in_min + drv_delay * sdc.derate_early,
+                latency + in_max + drv_delay * sdc.derate(true, DERATE_CELL, false, pol),
+                latency + in_min + drv_delay * sdc.derate(false, DERATE_CELL, false, pol),
                 slew,
                 slew,
             );
@@ -1041,6 +1050,7 @@ fn run_sta_detail(
     }
 
     let mut clock_parity: Option<Vec<[u8; 2]>> = None;
+    let mut clock_state: Option<Vec<PinTimingState>> = None;
     if sdc.propagated_clock {
         // Propagated clock: arrival at each consumer pin comes from the clock network
         // itself. `set_clock_latency` without `-source` is ideal network latency and does
@@ -1072,6 +1082,7 @@ fn run_sta_detail(
                 }
             }
         }
+        clock_state = Some(clk_state);
     } else {
         // Ideal clock: every register clock pin and latch enable sees an edge at the clock
         // latency (source + network). `set_clock_transition` is the clock pin's slew; without
@@ -1108,8 +1119,8 @@ fn run_sta_detail(
                     res[dst_pol] = (
                         q,
                         dst_pol,
-                        clk_state.arrival_max[edge_pol] + offset_ns + late_delay * sdc.derate_late,
-                        clk_state.arrival_min[edge_pol] + offset_ns + early_delay * sdc.derate_early,
+                        clk_state.arrival_max[edge_pol] + offset_ns + late_delay * sdc.derate(true, DERATE_CELL, false, edge_pol),
+                        clk_state.arrival_min[edge_pol] + offset_ns + early_delay * sdc.derate(false, DERATE_CELL, false, edge_pol),
                         late_slew,
                         early_slew,
                     );
@@ -1165,7 +1176,7 @@ fn run_sta_detail(
                 if driver_state.reached(RISE) || driver_state.reached(FALL) {
                     let wire = wire_delays_per_net.get(net_idx as usize).and_then(|w| w.as_ref());
                     let is_port = design.pin_cells[drv.0 as usize].is_none();
-                    next = sink_state_with_wire(driver_state, wire, pin_idx, is_port, sdc);
+                    next = sink_state_with_wire(driver_state, wire, pin_idx, is_port, false, sdc);
                     changed = true;
                 }
             }
@@ -1198,8 +1209,8 @@ fn run_sta_detail(
                         };
                         next.merge(
                             dst_pol,
-                            src.arrival_max[src_pol] + late_delay * sdc.derate_late,
-                            src.arrival_min[src_pol] + early_delay * sdc.derate_early,
+                            src.arrival_max[src_pol] + late_delay * sdc.derate(true, DERATE_CELL, false, src_pol),
+                            src.arrival_min[src_pol] + early_delay * sdc.derate(false, DERATE_CELL, false, src_pol),
                             late_slew,
                             early_slew,
                         );
@@ -1228,7 +1239,15 @@ fn run_sta_detail(
         }
     }
 
-    let (report, polarities) = collect_endpoints(&cx, &graph, &state, clock_parity.as_deref(), skipped)?;
+    let (report, polarities) = collect_endpoints(
+        &cx,
+        &graph,
+        &levelized,
+        clock_state.as_deref(),
+        &state,
+        clock_parity.as_deref(),
+        skipped,
+    )?;
     for category in report.skipped.nonzero() {
         eprintln!("warning: STA skipped {category}; the report does not model these");
     }
@@ -1269,9 +1288,66 @@ fn record_endpoint(
     }
 }
 
+/// Sentinel for `crpr_*` resolution: the pin's value is not provably launched by
+/// flip-flops clocked on a single net (port, latch, undriven or mixed sources), so no
+/// common-path credit is safe.
+const CRPR_BAD: i64 = -2;
+
+/// Follows `pin`'s net driver back to the pin that sources its value.
+fn crpr_sink_net(
+    levelized: &LevelizedGraph,
+    design: &DesignDb,
+    ff_clk: &HashMap<u32, PinId>,
+    latch_q: &HashSet<u32>,
+    memo: &mut [i64],
+    pin: PinId,
+) -> i64 {
+    match levelized.pin_driver[pin.0 as usize] {
+        Some((_, _, driver)) => crpr_driver_net(levelized, design, ff_clk, latch_q, memo, driver),
+        None => CRPR_BAD,
+    }
+}
+
+/// Follows a net-driving pin back through combinational arcs. Returns the `NetId` of the
+/// launch clock when every path ends at a flip-flop whose clock pin sits on that net,
+/// `CRPR_BAD` otherwise. Memoized per pin in `memo` (`-1` = unvisited).
+fn crpr_driver_net(
+    levelized: &LevelizedGraph,
+    design: &DesignDb,
+    ff_clk: &HashMap<u32, PinId>,
+    latch_q: &HashSet<u32>,
+    memo: &mut [i64],
+    pin: PinId,
+) -> i64 {
+    let p = pin.0 as usize;
+    if memo[p] != -1 {
+        return memo[p];
+    }
+    let result = if let Some(&clk) = ff_clk.get(&pin.0) {
+        design.pin_nets[clk.0 as usize].map_or(CRPR_BAD, |n| n.0 as i64)
+    } else if latch_q.contains(&pin.0) || design.pin_cells[p].is_none() {
+        CRPR_BAD
+    } else {
+        let mut net: i64 = -1;
+        for &(src, _) in levelized.incoming_to(pin) {
+            let r = crpr_sink_net(levelized, design, ff_clk, latch_q, memo, src);
+            if r == CRPR_BAD || (net != -1 && net != r) {
+                net = CRPR_BAD;
+                break;
+            }
+            net = r;
+        }
+        if net == -1 { CRPR_BAD } else { net }
+    };
+    memo[p] = result;
+    result
+}
+
 fn collect_endpoints(
     cx: &Context,
     graph: &TimingGraph,
+    levelized: &LevelizedGraph,
+    clock_state: Option<&[PinTimingState]>,
     state: &[PinTimingState],
     clock_parity: Option<&[[u8; 2]]>,
     mut skipped: SkipReport,
@@ -1289,6 +1365,15 @@ fn collect_endpoints(
     // propagated clock carries it; the ideal clock is parity 0 everywhere. The launch side
     // is assumed non-inverted: endpoints launched through an inverting clock path pair a
     // different edge and are not corrected here.
+    // Common-path pessimism removal (CRPR): when launch and capture clocks share a net,
+    // the shared prefix is counted late on the launch side and early on the capture side.
+    // OpenSTA credits the early/late spread at the last shared point — the net driver —
+    // back to both required times. Only a propagated clock carries that spread; the ideal
+    // clock seeds identical arrivals. The launch side must resolve to flip-flops on the
+    // capture clock's net, otherwise the credit is unsafe and stays zero.
+    let ff_clk: HashMap<u32, PinId> = graph.launches.iter().map(|l| (l.q.0, l.clk)).collect();
+    let latch_q: HashSet<u32> = graph.latch_opens.iter().map(|o| o.q.0).collect();
+    let mut crpr_memo = vec![-1i64; design.num_pins()];
     let edge_parity = |pin: PinId, pol: usize| -> usize {
         clock_parity
             .and_then(|p| p.get(pin.0 as usize).map(|e| e[pol]))
@@ -1314,6 +1399,22 @@ fn collect_endpoints(
         // (inverting path), otherwise the following one a period later.
         let par_rise = edge_parity(clk, RISE);
         let capture_extra = if par_rise == 0 { sdc.period_ns } else { 0.0 };
+        let credit = if sdc.propagated_clock
+            && let Some(capture_net) = design.pin_nets[clk.0 as usize]
+        {
+            let launch_net = crpr_sink_net(levelized, design, &ff_clk, &latch_q, &mut crpr_memo, data);
+            if launch_net == capture_net.0 as i64
+                && let (Some(clock_state), Some(driver)) =
+                    (clock_state, design.net_driver(capture_net))
+            {
+                let ds = clock_state[driver.0 as usize];
+                if ds.reached(RISE) { (ds.arrival_max[RISE] - ds.arrival_min[RISE]).max(0.0) } else { 0.0 }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
         let (late, early) = (&lib.arcs[late_arc as usize], &lib.arcs[early_arc as usize]);
         let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
@@ -1323,8 +1424,11 @@ fn collect_endpoints(
             let (Some(late_table), Some(early_table)) = (constraint_table(late, pol), constraint_table(early, pol)) else {
                 continue;
             };
-            let late_time = eval_nldm_constraint(late_table, s.slew_max[pol], clk_state.slew_max[RISE]);
-            let closing_max = capture_extra + clk_state.arrival_min[RISE] - late_time - sdc.setup_uncertainty_ns;
+            let late_time =
+                eval_nldm_constraint(late_table, s.slew_max[pol], clk_state.slew_max[RISE])
+                    * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
+            let closing_max =
+                capture_extra + clk_state.arrival_min[RISE] - late_time - sdc.setup_uncertainty_ns + credit;
             // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
             // is reported at the opening edge and the slack is what remains before the closing edge.
             // A propagated clock carries the real fall arrival at the enable (uncertainty applies,
@@ -1346,8 +1450,10 @@ fn collect_endpoints(
             // The hold (early) constraint pairs with the capture clock's early slew; the
             // setup (late) constraint uses the late slew. Under the ideal clock both are
             // the seeded transition and identical.
-            let early_time = eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[RISE]);
-            let req_min = clk_state.arrival_max[RISE] + early_time + sdc.hold_uncertainty_ns;
+            let early_time =
+                eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[RISE])
+                    * sdc.derate(false, DERATE_CHECK, false, check_transition(early));
+            let req_min = clk_state.arrival_max[RISE] + early_time + sdc.hold_uncertainty_ns - credit;
             // Hold pairs the capture edge with the next rising launch edge: when the capture
             // pin's first rise is on an odd clock edge, that launch edge is one period later.
             let arr_min = s.arrival_min[pol] + if par_rise == 1 { sdc.period_ns } else { 0.0 };
@@ -3062,6 +3168,21 @@ mod tests {
     #[test]
     fn test_sta_edge_hold_violation_propagated() {
         compare_sta_edge("hold_violation", "hold_violation/hold.def", "propagated.sdc", None, "propagated", Tol::STRICT);
+    }
+
+    /// `set_timing_derate` early/late plus the `-cell_check`, `-clock`/`-data` and
+    /// `-rise`/`-fall` selectors on the propagated-clock DEF, under both the ideal and the
+    /// propagated clock. Selector semantics were measured on OpenSTA: a bare corner covers
+    /// cell and net delays on both paths and transitions but not checks; `-rise`/`-fall`
+    /// select the transition entering each arc.
+    #[test]
+    fn test_sta_edge_timing_derate_ideal() {
+        compare_sta_edge("timing_derate", "timing_derate/timing_derate.def", "ideal.sdc", None, "ideal", Tol::STRICT);
+    }
+
+    #[test]
+    fn test_sta_edge_timing_derate_propagated() {
+        compare_sta_edge("timing_derate", "timing_derate/timing_derate.def", "propagated.sdc", None, "propagated", Tol::STRICT);
     }
 
     /// `dlxtp_1` is a positive latch (`setup_falling`/`hold_falling` on GATE); `latch_enable` only

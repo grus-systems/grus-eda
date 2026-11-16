@@ -1156,3 +1156,49 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
   needs a fixture to measure); a `set_driving_cell` rule covering the clock port under
   propagation is not modelled (no OpenSTA measurement yet); multi-driver nets remain
   rejected upstream; empty-endpoint WNS serialises as JSON null (carried over).
+
+## 2026-11-17 — R7: timing derate and CRPR (v0.1.62)
+
+- **OpenSTA syntax measured** (pinned `ghcr.io/librelane/librelane:3.0.16`, `openroad` Tcl
+  probes on `sta_edge` DEFs): `set_timing_derate -early|-late [-rise|-fall] [-clock|-data]
+  [-net_delay|-cell_delay|-cell_check] <derate> [objects]`. `-early`/`-late` are mutually
+  exclusive per command and the value is positional — `write_sdc` emits them as separate
+  commands, which the parser now requires too (`-early X -late Y` in one command is
+  rejected, matching OpenSTA's error). Repeated commands are last-wins per selected
+  category, order-independent. A bare corner flag covers cell+net delays on clock+data
+  paths and both transitions but **not** `-cell_check`; `-cell_check` is data-side only
+  (`-clock` never reaches check arcs, measured). `-rise`/`-fall` select the transition
+  **entering** the arc (source polarity), verified against `report_checks`: on the
+  inverting `clkinv` path a rise arrival launches fall-sourced arcs. `[objects]` scoping
+  is rejected (the model cannot honour it; R0-style loud failure).
+- **Corner application**: `-early` derates the early/min quantities and the setup
+  required time through the early capture-clock side; `-late` the max quantities and
+  hold required time — matching OpenSTA endpoint fields within ~1 ps on asymmetric
+  probes (`early 0.1 / late 5.0` included).
+- **CRPR**: with different early/late derates on a shared propagated clock, OpenSTA
+  removes the common-path pessimism — measured as a 21.6 ps residual on the only
+  register-to-register endpoint of the fixture before the fix. Implemented for the
+  case the fixture exercises: launch and capture clock pins on the **same net**. The
+  launch side is resolved by tracing the check pin's drivers back to flip-flop `Q`
+  pins (`crpr_sink_net`/`crpr_driver_net`, memoized); ports, latches, undriven pins and
+  mixed sources yield no credit (conservative). The credit is the `arrival_max -
+  arrival_min` spread at the clock net's driver pin — the last shared point — added to
+  the setup required time and subtracted from the hold required time. Divergent clock
+  trees (different nets sharing a prefix) get no credit; that needs path-parent
+  tracking and is recorded as a limitation.
+- **Fixture** `sta_edge/timing_derate/`: `hold.def` topology (`clk -> u_clkb -> c1 ->
+  3 FFs`, one register-to-register path `u_ff0 -> u_ff1`) — `propagated_clock.def` was
+  rejected for the ideal run because its inverting clock path hits the documented
+  ideal-mode launch-parity approximation (a full-period min-arrival shift, unrelated to
+  derate). `ideal.sdc`/`propagated.sdc` carry `write_sdc`-style `-early/-late` pairs plus
+  selector coverage (`-cell_check`, `-clock`/`-data`, `-cell_delay -rise/-fall`). Golden
+  `timing_derate.reference.json` emitted by the committed `generate_ref.sh`.
+- **Verification**: `test_sta_edge_timing_derate_{ideal,propagated}` pass — all
+  endpoints, WNS/TNS and violation counts within tolerance (propagated needed the CRPR
+  credit to match `u_ff1/D` required times exactly). `cargo test --workspace` 183
+  passed / 0 failed / 7 ignored; `cargo clippy --all-targets -- -D warnings` clean. New
+  `timing_derate_selectors_and_last_wins` SDC test covers mutual exclusion, positional
+  value, per-category last-wins, `-cell_check` data-only and object-scope rejection.
+- **Not covered**: `-net_delay` has no observable effect on zero-wire fixtures (wire
+  delay is zero); SPEF-backed derate runs are untested. `-cell_check` was verified on
+  register checks only.
