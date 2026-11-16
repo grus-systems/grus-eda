@@ -1263,3 +1263,42 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
   shapes — latch side is R5); `non_seq_*` arcs remain `Other`; Clear/Preset
   propagation deferred unless a future OpenSTA version models it (would need
   re-measurement, not assumption).
+
+### R6 review fixes (same day, `v0.1.64`)
+
+An external read-only review rejected the first R6 commit; every S1/S2 finding was
+reproduced or fixed:
+
+- **Launch-edge parity is now tracked through the data graph** (was S1). Each
+  arrival extreme on `PinTimingState` carries `par_max`/`par_min`: the clock-edge
+  index parity (mod 2) of the launch edge that produced it — 0 for primary inputs
+  and rising launches, the propagated clock's tracked parity for clock-launched
+  arcs, half-period/FALL convention under the ideal clock. Parity propagates
+  unchanged through combinational arcs and net wire delay. `collect_endpoints`
+  compares it against the capture pin's first-edge parity (`c0`): the setup
+  capture edge is the first edge of the check polarity strictly after the launch
+  edge, so the required time gains a period unless `c0 > launch_parity`; hold
+  shifts the min arrival by a period under the mirror condition. Before this fix
+  a `dfrtn_1 -> dfrtn_1` path (same-edge-1 launch and capture) reported
+  `u_ff1/D` max required 2.5178 ns vs OpenSTA's 6.5178 ns — a full period early,
+  with a false setup violation (design WNS -0.521 ns vs OpenSTA's +0.956 ns).
+  New fixture
+  `sta_edge/async_fall_chain/` covers exactly this pair plus a mixed-polarity
+  `dfrtn -> dfxtp` endpoint on the same clock net; both modes match OpenSTA
+  strictly on all fields.
+- **`topological_levels` released net sinks on any `pin_is_driver` pin** (was
+  S1). The indegree is charged against `design.net_driver(net)`, so release now
+  requires `net_driver(net) == pin` and skips the driver pin itself — an INOUT or
+  second driver can no longer double-release sinks and underflow indegrees.
+- **CRPR credited the capture edge's spread regardless of the launch
+  transition** (was S2). The launch trace now packs `net * 2 + launch_edge` and
+  credit is granted only when the launch edge polarity equals the check edge —
+  a falling launch no longer collects the rising transition's early/late spread.
+  Mixed launch edges on converging paths resolve to no credit (conservative).
+- **Ideal clock did not seed latch enables** (was S3). `latch_opens` enables are
+  now seeded like other clock consumers, so `-fall` derates and arrivals reach
+  the latch open consistently with the propagated mode.
+- **Deferred (documented, not fixed)**: `port_drive` collapses early/min and
+  late/max driver behaviour into one slew (R1-era approximation, needs a
+  fixture); RC shielding differences vs a real DMP driver response (same
+  fixture dependency).

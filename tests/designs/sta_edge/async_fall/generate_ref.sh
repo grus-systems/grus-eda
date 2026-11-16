@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Reference generation for the sta_edge/async_fall fixture: the hold.def topology
-# (clk -> clkbuf_2 -> three FFs on one clock net, one register-to-register path) under an
-# ideal clock (ideal.sdc) and a propagated clock (propagated.sdc), each carrying
-# set_async_fall early/late derates plus -cell_check/-clock/-data/-rise/-fall selectors.
+# Reference generation for the sta_edge/async_fall fixture: `dfrtn_1` inverting-clock
+# flip-flops with async reset under an ideal clock (ideal.sdc) and a propagated clock
+# (propagated.sdc). Exercises `setup_falling`/`hold_falling`/`falling_edge` launches
+# and `recovery_falling`/`removal_falling` checks on RESET_B.
 # Runs inside ghcr.io/librelane/librelane:3.0.16.
 set -euo pipefail
 
