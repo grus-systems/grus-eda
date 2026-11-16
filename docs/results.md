@@ -1223,3 +1223,43 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
   work) (S2). `-net_delay` is unverifiable on zero-wire fixtures — SPEF-backed derate
   runs are untested; latch and inverting driving-cell derate paths are modelled but
   not covered by the fixture golden (S2).
+
+## 2026-11-17 — Roadmap R6: asynchronous arcs (`dfrtp`/`dfrtn`, ideal + propagated)
+
+- **Scope measured on OpenSTA 3.0.16 (LibreLane container)**: `clear`/`preset` arcs
+  (`RESET_B -> Q`, `SET_B -> Q`) are **not propagated** into ordinary timing paths.
+  On `sta_edge/async_reset` (`dfrtp_1`), `find_timing_paths -from rst_n -through
+  u_ff0/Q` returns no path and `report_arrival u_ff0/Q` shows only clock-derived
+  arrival; OpenSTA checks recovery/removal (and min pulse width internally) on the
+  async pin only. grus-eda therefore keeps `Clear`/`Preset` arcs in the R0 skip
+  count instead of propagating them — propagating would diverge from the reference
+  tool. The roadmap's "downstream endpoints reached through a Clear/Preset arc"
+  clause is vacuous for this OpenSTA version: no such endpoints exist.
+- **Falling variants implemented**: `recovery_falling`/`removal_falling` added to
+  `TimingType` + Liberty parser; `SetupFalling`/`HoldFalling`/`FallingEdge` arcs
+  (previously all unsupported) now build checks/launches. `RegisterCheck.edge` and
+  `LaunchArc.edge` carry the check/launch clock polarity; `collect_endpoints` uses
+  the matching clock transition for arrival, slew, parity and CRPR spread. Under
+  the ideal clock (both transitions seeded at the latency) a falling edge sits half
+  a period later and has parity 1 — matching the propagated-clock convention
+  (`parity = [0, 1]` at the source port).
+- **Stale-cache bug found and fixed**: `TimingType` gained variants mid-enum, which
+  shifted discriminant values; the `.libcache` binary cache (`CACHE_VERSION = 1`)
+  then deserialized old `Other` arcs as `RemovalFalling`, producing bogus
+  self-pin removal checks (`CLK -> CLK`) on every FF. `CACHE_VERSION` bumped to 2;
+  caches deleted. This class of bug is why enum layout changes must bump the
+  cache version.
+- **Fixtures**: `sta_edge/async_reset/` (`dfrtp_1`, rising recovery/removal) and
+  `sta_edge/async_fall/` (`dfrtn_1` inverting clock — falling setup/hold on D,
+  `falling_edge` launch into a rising capture at `u_ff1/D`, falling
+  recovery/removal on `RESET_B`). Both run ideal and propagated; goldens emitted
+  by the committed `generate_ref.sh` in `ghcr.io/librelane/librelane:3.0.16`.
+- **Verification**: `test_sta_edge_async_{reset,fall}_{ideal,propagated}` — all
+  endpoints match OpenSTA within `Tol::STRICT` (async check pins included;
+  `u_ff0/RESET_B` max slack 3.586 vs 3.556 ns on the reset fixture is inside the
+  strict slew/arrival bands). `cargo test --workspace` 188 passed / 0 failed /
+  7 ignored; clippy clean.
+- **Not covered**: `dfbbn`/`dlrtp`/`dlrbp`/scan `sdf*` cells (set+reset or latch
+  shapes — latch side is R5); `non_seq_*` arcs remain `Other`; Clear/Preset
+  propagation deferred unless a future OpenSTA version models it (would need
+  re-measurement, not assumption).

@@ -1,0 +1,35 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN async_reset ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 20000 20000 ) ;
+ROW ROW_0 unithd 0 0 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_1 unithd 0 2720 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_2 unithd 0 5440 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_3 unithd 0 8160 N DO 43 BY 1 STEP 460 2720 ;
+TRACKS X 170 DO 100 STEP 340 LAYER met1 ;
+TRACKS Y 140 DO 100 STEP 340 LAYER met2 ;
+COMPONENTS 5 ;
+- u_clkb sky130_fd_sc_hd__clkbuf_2 + PLACED ( 4600 0 ) N ;
+- u_rst sky130_fd_sc_hd__clkbuf_2 + PLACED ( 4600 2720 ) N ;
+- u_ff0 sky130_fd_sc_hd__dfrtp_1 + PLACED ( 9200 0 ) N ;
+- u_ff1 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 13800 0 ) N ;
+- u_ff2 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 18400 0 ) N ;
+END COMPONENTS
+PINS 4 ;
+- clk + NET clk + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 0 ) N ;
+- rst_n + NET rst + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 2720 ) N ;
+- d_in + NET din + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 5440 ) N ;
+- y + NET y + DIRECTION OUTPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 8160 ) N ;
+END PINS
+NETS 7 ;
+- clk ( PIN clk ) ( u_clkb A ) + USE SIGNAL ;
+- c1 ( u_clkb X ) ( u_ff0 CLK ) ( u_ff1 CLK ) ( u_ff2 CLK ) + USE SIGNAL ;
+- rst ( PIN rst_n ) ( u_rst A ) + USE SIGNAL ;
+- rst_b ( u_rst X ) ( u_ff0 RESET_B ) + USE SIGNAL ;
+- din ( PIN d_in ) ( u_ff0 D ) ( u_ff2 D ) + USE SIGNAL ;
+- d1 ( u_ff0 Q ) ( u_ff1 D ) + USE SIGNAL ;
+- y ( u_ff1 Q ) ( PIN y ) + USE SIGNAL ;
+END NETS
+END DESIGN

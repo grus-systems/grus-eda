@@ -29,11 +29,14 @@ struct ArcEdge {
 }
 
 /// `CLK -> Q` arc of a flip-flop, the launch of every register-to-register path.
+/// `edge` is the clock transition that launches Q (RISE for `rising_edge`, FALL for
+/// `falling_edge` cells such as `dfrtn`).
 #[derive(Clone, Copy, Debug)]
 struct LaunchArc {
     clk: PinId,
     q: PinId,
     lib_arc: u32,
+    edge: usize,
 }
 
 /// Enable-to-output arc of a latch. The output launches when the latch opens, half a period after
@@ -48,10 +51,13 @@ struct LatchOpen {
 /// Timing checks of one constrained pin. D pins carry setup and hold; asynchronous set/reset pins
 /// carry recovery and removal, which take the same role (late and early bound) against the same clock.
 /// `latch` marks a latch D pin, whose setup arc closes the latch (see `collect_endpoints`).
+/// `edge` is the clock transition the check fires on: RISE for `*Rising` check types, FALL for
+/// `*Falling` (inverting-clock flip-flops such as `dfrtn`).
 #[derive(Clone, Copy, Debug, Default)]
 struct RegisterCheck {
     clk: Option<PinId>,
     latch: bool,
+    edge: usize,
     setup_arc: Option<u32>,
     hold_arc: Option<u32>,
     recovery_arc: Option<u32>,
@@ -542,16 +548,18 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
                 continue;
             };
             match arc.timing_type {
-                TimingType::SetupRising => {
+                TimingType::SetupRising | TimingType::SetupFalling => {
                     let check = checks.entry(dst.0).or_default();
                     check.clk = Some(src);
                     check.latch = lib_cell.is_latch;
+                    check.edge = check_transition(arc);
                     check.setup_arc = Some(lib_arc);
                 }
-                TimingType::HoldRising => {
+                TimingType::HoldRising | TimingType::HoldFalling => {
                     let check = checks.entry(dst.0).or_default();
                     check.clk = Some(src);
                     check.latch = lib_cell.is_latch;
+                    check.edge = check_transition(arc);
                     check.hold_arc = Some(lib_arc);
                 }
                 _ if lib_cell.is_latch => {
@@ -569,15 +577,22 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
                 TimingType::Combinational | TimingType::CombinationalRise | TimingType::CombinationalFall => {
                     graph.edges.push(ArcEdge { src, dst, lib_arc });
                 }
-                TimingType::RisingEdge => graph.launches.push(LaunchArc { clk: src, q: dst, lib_arc }),
-                TimingType::RecoveryRising => {
+                TimingType::RisingEdge | TimingType::FallingEdge => graph.launches.push(LaunchArc {
+                    clk: src,
+                    q: dst,
+                    lib_arc,
+                    edge: check_transition(arc),
+                }),
+                TimingType::RecoveryRising | TimingType::RecoveryFalling => {
                     let check = checks.entry(dst.0).or_default();
                     check.clk = Some(src);
+                    check.edge = check_transition(arc);
                     check.recovery_arc = Some(lib_arc);
                 }
-                TimingType::RemovalRising => {
+                TimingType::RemovalRising | TimingType::RemovalFalling => {
                     let check = checks.entry(dst.0).or_default();
                     check.clk = Some(src);
+                    check.edge = check_transition(arc);
                     check.removal_arc = Some(lib_arc);
                 }
                 _ => *skipped.unsupported_arcs.entry(format!("{:?}", arc.timing_type)).or_default() += 1,
@@ -985,10 +1000,15 @@ fn delay_tables(arc: &crate::lib_db::LibTimingArc, dst_pol: usize) -> (Option<&N
     }
 }
 
-/// Transition a register check constrains: `*Falling` check types fire on the falling edge.
+/// Clock transition a timing arc fires on or is derated by: every `*Falling` check/launch
+/// type pairs with the falling clock edge (the transition entering the arc at the clock pin).
 fn check_transition(arc: &crate::lib_db::LibTimingArc) -> usize {
     match arc.timing_type {
-        TimingType::SetupFalling | TimingType::HoldFalling => FALL,
+        TimingType::FallingEdge
+        | TimingType::SetupFalling
+        | TimingType::HoldFalling
+        | TimingType::RecoveryFalling
+        | TimingType::RemovalFalling => FALL,
         _ => RISE,
     }
 }
@@ -1147,10 +1167,20 @@ fn run_sta_detail(
         }
         res
     };
+    // The ideal clock seeds both transitions at the clock latency, so a falling launch edge
+    // sits half a period later — the same convention the latch open below uses. A propagated
+    // clock carries the real fall arrival and needs no offset.
+    let launch_offset = |edge: usize| {
+        if sdc.propagated_clock || edge == RISE { 0.0 } else { 0.5 * sdc.period_ns }
+    };
     let launch_updates: Vec<_> = if graph.launches.len() < 64 {
-        graph.launches.iter().map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, RISE, 0.0)).collect()
+        graph.launches.iter().map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge, launch_offset(l.edge))).collect()
     } else {
-        graph.launches.par_iter().map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, RISE, 0.0)).collect()
+        graph
+            .launches
+            .par_iter()
+            .map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge, launch_offset(l.edge)))
+            .collect()
     };
     for pair in launch_updates {
         for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
@@ -1398,7 +1428,9 @@ fn collect_endpoints(
         clock_parity
             .and_then(|p| p.get(pin.0 as usize).map(|e| e[pol]))
             .filter(|&v| v <= 1)
-            .unwrap_or(0) as usize
+            // No propagated parity (ideal clock or unreached pin): a fall edge sits on
+            // clock edge 1, a rise on edge 0 — the source-port convention.
+            .unwrap_or(pol as u8) as usize
     };
 
     for &(data_id, check) in &graph.checks {
@@ -1408,17 +1440,22 @@ fn collect_endpoints(
             continue;
         };
         let (s, clk_state) = (state[data.0 as usize], state[clk.0 as usize]);
+        // The check fires on `check.edge`: RISE for `*Rising` cells, FALL for inverting-clock
+        // cells (`dfrtn`). The ideal clock seeds both transitions at the latency, so a
+        // falling capture edge sits half a period later — the same offset the launch uses.
+        let edge = check.edge;
+        let edge_offset = if sdc.propagated_clock || edge == RISE { 0.0 } else { half_period };
         // A propagated clock can leave a clock pin unreached; the ideal seed always reaches.
         // A latch check also needs the fall edge: the borrow branch reads its arrival.
-        if !clk_state.reached(RISE) || (check.latch && sdc.propagated_clock && !clk_state.reached(FALL)) {
+        if !clk_state.reached(edge) || (check.latch && sdc.propagated_clock && !clk_state.reached(FALL)) {
             skipped.unreached_endpoints += 1;
             continue;
         }
-        // The setup capture edge is the first rising edge strictly after the launch edge.
-        // A launch on clock edge 0 captures the pin's first rise when it sits on edge 1
-        // (inverting path), otherwise the following one a period later.
-        let par_rise = edge_parity(clk, RISE);
-        let capture_extra = if par_rise == 0 { sdc.period_ns } else { 0.0 };
+        // The setup capture edge is the first edge of `edge` polarity strictly after the
+        // launch edge. A launch on clock edge 0 captures the pin's first edge when it sits
+        // on edge 1 (inverting path), otherwise the following one a period later.
+        let par_edge = edge_parity(clk, edge);
+        let capture_extra = if par_edge == 0 { sdc.period_ns } else { 0.0 };
         let credit = if sdc.propagated_clock
             && let Some(capture_net) = design.pin_nets[clk.0 as usize]
         {
@@ -1428,7 +1465,11 @@ fn collect_endpoints(
                     (clock_state, design.net_driver(capture_net))
             {
                 let ds = clock_state[driver.0 as usize];
-                if ds.reached(RISE) { (ds.arrival_max[RISE] - ds.arrival_min[RISE]).max(0.0) } else { 0.0 }
+                if ds.reached(edge) {
+                    (ds.arrival_max[edge] - ds.arrival_min[edge]).max(0.0)
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             }
@@ -1445,10 +1486,10 @@ fn collect_endpoints(
                 continue;
             };
             let late_time =
-                eval_nldm_constraint(late_table, s.slew_max[pol], clk_state.slew_max[RISE])
+                eval_nldm_constraint(late_table, s.slew_max[pol], clk_state.slew_max[edge])
                     * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
             let closing_max =
-                capture_extra + clk_state.arrival_min[RISE] - late_time - sdc.setup_uncertainty_ns + credit;
+                edge_offset + capture_extra + clk_state.arrival_min[edge] - late_time - sdc.setup_uncertainty_ns + credit;
             // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
             // is reported at the opening edge and the slack is what remains before the closing edge.
             // A propagated clock carries the real fall arrival at the enable (uncertainty applies,
@@ -1471,12 +1512,13 @@ fn collect_endpoints(
             // setup (late) constraint uses the late slew. Under the ideal clock both are
             // the seeded transition and identical.
             let early_time =
-                eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[RISE])
+                eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[edge])
                     * sdc.derate(false, DERATE_CHECK, false, check_transition(early));
-            let req_min = clk_state.arrival_max[RISE] + early_time + sdc.hold_uncertainty_ns - credit;
-            // Hold pairs the capture edge with the next rising launch edge: when the capture
-            // pin's first rise is on an odd clock edge, that launch edge is one period later.
-            let arr_min = s.arrival_min[pol] + if par_rise == 1 { sdc.period_ns } else { 0.0 };
+            let req_min = edge_offset + clk_state.arrival_max[edge] + early_time + sdc.hold_uncertainty_ns - credit;
+            // Hold pairs the capture edge with the next launch edge of the same polarity:
+            // when the capture pin's first edge is on an odd clock edge, that launch edge
+            // is one period later.
+            let arr_min = s.arrival_min[pol] + if par_edge == 1 { sdc.period_ns } else { 0.0 };
             let slack_min = arr_min - req_min;
             cands.max[pol] = Some(Worst { arr: arr_max, req: req_max, slack: slack_max, slew: s.slew_max[pol] });
             cands.min[pol] = Some(Worst { arr: arr_min, req: req_min, slack: slack_min, slew: s.slew_min[pol] });
@@ -3204,6 +3246,35 @@ mod tests {
     #[test]
     fn test_sta_edge_timing_derate_propagated() {
         compare_sta_edge("timing_derate", "timing_derate/timing_derate.def", "propagated.sdc", None, "propagated", Tol::STRICT);
+    }
+
+    /// dfrtp async reset: OpenSTA does not propagate `clear` arcs (RESET_B -> Q) into
+    /// ordinary timing paths — `find_timing_paths -from rst_n -through u_ff0/Q` is empty and
+    /// `report_arrival u_ff0/Q` shows only clock-derived arrival. OpenSTA only checks
+    /// recovery/removal on the RESET_B pin, so `u_ff0/RESET_B` is the sole async endpoint.
+    /// The Clear arc stays in the unsupported-arc skip count.
+    #[test]
+    fn test_sta_edge_async_reset_ideal() {
+        compare_sta_edge("async_reset", "async_reset/async_reset.def", "ideal.sdc", None, "ideal", Tol::STRICT);
+    }
+
+    #[test]
+    fn test_sta_edge_async_reset_propagated() {
+        compare_sta_edge("async_reset", "async_reset/async_reset.def", "propagated.sdc", None, "propagated", Tol::STRICT);
+    }
+
+    /// `dfrtn_1` is an inverting-clock flip-flop: `setup_falling`/`hold_falling` on D,
+    /// `falling_edge` launch on Q, `recovery_falling`/`removal_falling` on RESET_B.
+    /// The ideal clock seeds both transitions at the latency, so falling edges sit half a
+    /// period later and carry parity 1 — the same convention the propagated clock computes.
+    #[test]
+    fn test_sta_edge_async_fall_ideal() {
+        compare_sta_edge("async_fall", "async_fall/async_fall.def", "ideal.sdc", None, "ideal", Tol::STRICT);
+    }
+
+    #[test]
+    fn test_sta_edge_async_fall_propagated() {
+        compare_sta_edge("async_fall", "async_fall/async_fall.def", "propagated.sdc", None, "propagated", Tol::STRICT);
     }
 
     /// `dlxtp_1` is a positive latch (`setup_falling`/`hold_falling` on GATE); `latch_enable` only

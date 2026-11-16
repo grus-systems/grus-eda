@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
 const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
-const CACHE_VERSION: u32 = 1;
+// Bump when the serialized LibDb layout changes (e.g. new TimingType variants shift
+// discriminant values and old caches would deserialize `Other` arcs as real types).
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -217,6 +219,8 @@ fn parse_timing_type(s: &str) -> TimingType {
         "clear" => TimingType::Clear,
         "recovery_rising" => TimingType::RecoveryRising,
         "removal_rising" => TimingType::RemovalRising,
+        "recovery_falling" => TimingType::RecoveryFalling,
+        "removal_falling" => TimingType::RemovalFalling,
         _ => TimingType::Other,
     }
 }

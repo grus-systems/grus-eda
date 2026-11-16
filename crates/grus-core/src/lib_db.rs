@@ -26,6 +26,8 @@ pub enum TimingType {
     Clear,
     RemovalRising,
     RecoveryRising,
+    RemovalFalling,
+    RecoveryFalling,
     Other,
 }
 
