@@ -931,3 +931,36 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
 - **Case B `clock_uncertainty` — PASS after a real fix**: SDC `set_clock_uncertainty -setup 0.2 [get_clocks core_clk]`. OpenSTA golden showed setup uncertainty **does** apply to the output-port required time (`y` req_max 3.8 = 5.0 - 1.0 - 0.2); ours did not (`collect_endpoints` output branch had no uncertainty term) — the divergence the ticket predicted. Fixed: `Sdc` now carries `setup_uncertainty_ns`/`hold_uncertainty_ns` (plain `set_clock_uncertainty <ns>` sets both, preserving prior semantics), the parser accepts `[-setup|-hold] <ns> [get_clocks <name>]` with clock-name validation, and output-port `req_max`/`req_min` gained the same `∓/±` uncertainty terms as register checks and clock-gate enables. All 8 endpoint fields + WNS/TNS pass strict.
 - **Case C `non_dlxtn_latch` — verified divergence, `#[ignore]`d**: `sky130_fd_sc_hd__dlxtp_1` is a positive latch whose Liberty checks are `setup_falling`/`hold_falling` on GATE; `latch_enable` only models the `dlxtn` `setup_rising` shape, so the cell's arcs are ignored with the documented warning. Result: ours reaches **1 of 3** endpoints (`y` only; `u_ff/D` and `u_lt/D` unreached, `unreached_endpoints=1`) vs OpenSTA's 3. Extending the latch model is a separate design decision — recorded, not bolted on.
 - **Verification**: `cargo test --release -p grus-core sta::` — 59 passed / 0 failed / 6 ignored; `cargo clippy --all-targets -- -D warnings` clean.
+
+### 2026-11-16 — Roadmap R0: skip summary with shares, `--strict`, `--json` (`v0.1.58`)
+
+- `SkipReport` (`crates/grus-core/src/sta/analysis.rs`) now counts everything a run leaves
+  out, per kind and as a share: `unmodelled_latch_cells` (latch shapes outside `dlxtn`,
+  previously only an `eprintln` per cell), `latch_arcs_dropped` by `TimingType` (the `D -> Q`
+  `Combinational` path and every other unmodelled latch arc, previously silent), the existing
+  `unsupported_arcs`/`unresolved_arcs`/`incomplete_checks`/`unreached_endpoints`/
+  `cell_driven_clock_nets`/`unmapped_cells`, plus denominators `total_arcs` (arcs of all
+  Liberty-mapped instances; unmapped cells have no Liberty arcs to count) and
+  `total_endpoints` (checks + clock-gate enables + output ports). `arcs_skipped()` and
+  `endpoints_skipped()` give the totals; `is_clean()` drives `--strict`.
+- SDC: `-lib_cell` and `-pin` were accepted and silently dropped by `positionals`; they are
+  now counted in `Sdc::ignored_options`/`Sdc::commands` and reported as
+  `sdc_ignored_options`/`sdc_commands` in the same summary. Unsupported commands still fail
+  the parse (lenient mode is roadmap R1).
+- CLI (`grus-eda sta`): prints the skip summary after the STA line, `--json <path>` writes the
+  full `StaReport` (endpoints + skip summary) as JSON, `--strict` exits 1 when `is_clean()`
+  is false.
+- Observed, `tests/designs/sta_edge/non_dlxtn_latch` (one `dlxtp_1`, zero wire):
+  `skipped: 6/10 arcs (60.00%), 1/2 endpoints (50.00%)` —
+  `unsupported_arcs[Other=1]`, `latch_arcs_dropped[Combinational=1, HoldFalling=1, Other=1,
+  RisingEdge=1, SetupFalling=1]` (all 5 `dlxtp_1` arcs), `unmodelled_latch_cells=1`,
+  `unreached_endpoints=1`; `--strict` exits 1. The latch counts reproduce an independent
+  recount from the Liberty arcs and the DEF (`test_skip_report_counts_latch_arcs`).
+- Observed, `tests/designs/ibex` zero wire: `skipped: 5267/49427 arcs (10.66%),
+  7/3709 endpoints (0.19%)` — `unsupported_arcs[Clear=1655, Other=3601, Preset=9]`
+  (asynchronous arcs, roadmap R6), `latch_arcs_dropped[Combinational=1, Other=1]` (the `dlxtn`
+  `D -> Q` path and one unmodelled arc), `unmapped_cells=4263` (well taps),
+  `unreached_endpoints=7`, `cell_driven_clock_nets=1`.
+- Verification: `cargo test --release -p grus-core -- sta::` — 61 passed / 0 failed /
+  6 ignored; new tests `test_skip_report_counts_latch_arcs` (edge_latch + ibex) and
+  `counts_ignored_lib_cell_and_pin_options`. Timing results unchanged (counting only).

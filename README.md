@@ -8,6 +8,14 @@ its numbers agree with that tool's.
 > Private for now. It holds no design from other Grus repositories and must not:
 > every test design here is public (see `AGENTS.md`).
 
+> **Research prototype — read the skip summary.** `sta` uses an ideal clock (no
+> propagated clock tree), models only the `dlxtn` latch shape without the
+> `D -> Q` path or time borrowing, covers a subset of SDC, and skips asynchronous
+> `Clear`/`Preset` propagation. Every run prints what it left out as counts and
+> shares of the design's arcs and endpoints; `--strict` exits non-zero when
+> anything was skipped and `--json <path>` writes the same summary
+> machine-readably.
+
 ## Why
 
 The open-source flow (OpenROAD and the tools around it) is complete, but slow to

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,6 +51,12 @@ pub struct Sdc {
     output_delays: Vec<DelayRule>,
     input_transitions: Vec<(PortSel, f32)>,
     loads: Vec<(PortSel, f32)>,
+    /// Options the parser accepts but does not apply, counted by flag. `-lib_cell` and `-pin`
+    /// restrict a delay to one cell or pin; the model has no per-arc endpoint matching, so the
+    /// restriction is dropped and the delay applies to every selected port.
+    pub ignored_options: BTreeMap<String, usize>,
+    /// Top-level commands evaluated while parsing; the denominator for `ignored_options`.
+    pub commands: usize,
 }
 
 fn last_delay<'a>(rules: &'a [DelayRule], port: &str, is_input: bool, clock_port: Option<&str>) -> Option<&'a DelayRule> {
@@ -170,6 +176,9 @@ impl Interp {
                 Some(_) => {
                     let words = self.words(in_brackets)?;
                     result = self.run(words)?;
+                    if !in_brackets {
+                        self.sdc.commands += 1;
+                    }
                 }
             }
         }
@@ -349,12 +358,12 @@ impl Interp {
                 Ok(empty())
             }
             "set_input_transition" => {
-                let rule = value_and_ports(args)?;
+                let rule = value_and_ports(args, &mut self.sdc.ignored_options)?;
                 self.sdc.input_transitions.push(rule);
                 Ok(empty())
             }
             "set_load" => {
-                let rule = value_and_ports(args)?;
+                let rule = value_and_ports(args, &mut self.sdc.ignored_options)?;
                 self.sdc.loads.push(rule);
                 Ok(empty())
             }
@@ -375,7 +384,7 @@ impl Interp {
     fn create_clock(&mut self, args: &[Value]) -> Result<()> {
         let name = flag_value(args, "-name")?.map(str::to_string);
         let period_ns = parse_f32(flag_value(args, "-period")?.context("missing -period")?)?;
-        match positionals(args)?.as_slice() {
+        match positionals(args, &mut self.sdc.ignored_options)?.as_slice() {
             [] => {
                 let Some(name) = name else {
                     bail!("a virtual clock needs -name");
@@ -458,8 +467,8 @@ impl Interp {
         Ok(())
     }
 
-    fn delay_rule(&self, args: &[Value]) -> Result<DelayRule> {
-        let (sel, value_ns) = value_and_ports(args)?;
+    fn delay_rule(&mut self, args: &[Value]) -> Result<DelayRule> {
+        let (sel, value_ns) = value_and_ports(args, &mut self.sdc.ignored_options)?;
         let clock = match flag_value(args, "-clock")? {
             Some(name) => self.resolve_clock(name)?,
             None => ClockRef::Design,
@@ -529,6 +538,10 @@ fn parse_f32(text: &str) -> Result<f32> {
 /// Flags that take a value, so that their value is not mistaken for a positional argument.
 const VALUE_FLAGS: [&str; 5] = ["-clock", "-name", "-period", "-lib_cell", "-pin"];
 
+/// Value flags the parser drops without applying them; each occurrence is counted in
+/// `Sdc::ignored_options`. The rest of `VALUE_FLAGS` is read by the command that owns it.
+const IGNORED_VALUE_FLAGS: [&str; 2] = ["-lib_cell", "-pin"];
+
 /// The value after `flag`, or None when the flag is absent. A flag with no value is an error.
 fn flag_value<'a>(args: &'a [Value], flag: &str) -> Result<Option<&'a str>> {
     let Some(i) = args.iter().position(|a| matches!(a, Value::Str(s) if s == flag)) else {
@@ -548,12 +561,18 @@ fn is_negative_number(text: &str) -> bool {
 
 /// The arguments that are neither a value flag nor the value of one. Any other flag is an error:
 /// skipping it would drop a meaning-changing option such as `-max`, `-add_delay` or `-setup`.
-fn positionals(args: &[Value]) -> Result<Vec<&Value>> {
+/// Ignored value flags are counted into `ignored`.
+fn positionals<'a>(args: &'a [Value], ignored: &mut BTreeMap<String, usize>) -> Result<Vec<&'a Value>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match &args[i] {
-            Value::Str(s) if VALUE_FLAGS.contains(&s.as_str()) => i += 2,
+            Value::Str(s) if VALUE_FLAGS.contains(&s.as_str()) => {
+                if IGNORED_VALUE_FLAGS.contains(&s.as_str()) {
+                    *ignored.entry(s.clone()).or_default() += 1;
+                }
+                i += 2;
+            }
             Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => bail!("unsupported option `{s}`"),
             value => {
                 out.push(value);
@@ -564,8 +583,8 @@ fn positionals(args: &[Value]) -> Result<Vec<&Value>> {
     Ok(out)
 }
 
-fn value_and_ports(args: &[Value]) -> Result<(PortSel, f32)> {
-    let [Value::Str(value), Value::Ports(sel)] = positionals(args)?.as_slice() else {
+fn value_and_ports(args: &[Value], ignored: &mut BTreeMap<String, usize>) -> Result<(PortSel, f32)> {
+    let [Value::Str(value), Value::Ports(sel)] = positionals(args, ignored)?.as_slice() else {
         bail!("expected a numeric value and a port selector");
     };
     Ok((sel.clone(), parse_f32(value)?))
@@ -703,6 +722,21 @@ mod tests {
         assert_eq!(sdc.input_clock_latency_ns("instr_rdata_i"), 1.095);
         assert_eq!(sdc.output_delay_ns("instr_req_o"), 1.6);
         assert_eq!(sdc.output_clock_latency_ns("instr_req_o"), 1.095);
+    }
+
+    #[test]
+    fn counts_ignored_lib_cell_and_pin_options() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_input_delay 1.0 -lib_cell buf_2 -pin A -clock core_clk [all_inputs -no_clocks]\n\
+             set_output_delay 2.0 -pin out_pin -clock core_clk [all_outputs]\n"
+        ))
+        .unwrap();
+        // The restrictions are dropped, so the delays still apply to every selected port.
+        assert_eq!(sdc.input_delay_ns("req_val"), 1.0);
+        assert_eq!(sdc.output_delay_ns("resp_val"), 2.0);
+        assert_eq!(sdc.ignored_options["-lib_cell"], 1);
+        assert_eq!(sdc.ignored_options["-pin"], 2);
+        assert_eq!(sdc.commands, 7);
     }
 
     #[test]

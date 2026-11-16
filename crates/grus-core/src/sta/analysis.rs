@@ -110,14 +110,20 @@ pub struct EndpointReport {
     pub min_slew_ns: f32,
 }
 
-/// Inputs and checks the analysis left out, counted per category. A non-zero count means the
-/// report is missing timing that the design has.
+/// Inputs and checks the analysis left out, counted per category, with the totals they are a
+/// share of. A non-zero count means the report is missing timing that the design has.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SkipReport {
     /// Instances that have no Liberty cell mapping (`design.cell_lib_ids[c]` is `None`).
     pub unmapped_cells: usize,
-    /// Non-latch arcs that have no model, by `TimingType` name.
+    /// Latch instances outside the modelled `dlxtn` shape (`setup_rising` check on D): every one
+    /// of their arcs is dropped, counted per `TimingType` in `latch_arcs_dropped`.
+    pub unmodelled_latch_cells: usize,
+    /// Arcs that have no model on non-latch cells, by `TimingType` name.
     pub unsupported_arcs: BTreeMap<String, usize>,
+    /// Arcs that have no model on latch cells, by `TimingType` name. The `D -> Q` transparent
+    /// path (`Combinational`) and the check arcs of non-`dlxtn` shapes land here.
+    pub latch_arcs_dropped: BTreeMap<String, usize>,
     /// Arcs whose related or target pin does not resolve on the instance.
     pub unresolved_arcs: usize,
     /// Register checks without a clock or without a late/early arc pair.
@@ -126,18 +132,35 @@ pub struct SkipReport {
     pub unreached_endpoints: usize,
     /// Clock nets driven by a cell output (buffered or gated clock), which the ideal clock does not model.
     pub cell_driven_clock_nets: usize,
+    /// Arcs of all Liberty-mapped cell instances, the denominator for the arc share. Unmapped
+    /// cells have no Liberty arcs to count, so their arcs are outside this total.
+    pub total_arcs: usize,
+    /// Endpoint candidates (constrained pins, clock-gate enables, output ports), the denominator
+    /// for the endpoint share.
+    pub total_endpoints: usize,
+    /// SDC options accepted but not applied (`-lib_cell`, `-pin`), by flag.
+    pub sdc_ignored_options: BTreeMap<String, usize>,
+    /// Top-level SDC commands evaluated while parsing, the denominator for `sdc_ignored_options`.
+    pub sdc_commands: usize,
 }
 
 impl SkipReport {
-    /// Each non-zero category as `name=count`; unsupported arcs are listed by timing type.
+    /// Each non-zero category as `name=count`; arc maps are listed by timing type.
     pub fn nonzero(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if !self.unsupported_arcs.is_empty() {
-            let by_type: Vec<String> = self.unsupported_arcs.iter().map(|(t, n)| format!("{t}={n}")).collect();
-            out.push(format!("unsupported_arcs[{}]", by_type.join(", ")));
+        for (name, map) in [
+            ("unsupported_arcs", &self.unsupported_arcs),
+            ("latch_arcs_dropped", &self.latch_arcs_dropped),
+            ("sdc_ignored_options", &self.sdc_ignored_options),
+        ] {
+            if !map.is_empty() {
+                let by_kind: Vec<String> = map.iter().map(|(t, n)| format!("{t}={n}")).collect();
+                out.push(format!("{name}[{}]", by_kind.join(", ")));
+            }
         }
         for (name, count) in [
             ("unmapped_cells", self.unmapped_cells),
+            ("unmodelled_latch_cells", self.unmodelled_latch_cells),
             ("unresolved_arcs", self.unresolved_arcs),
             ("incomplete_checks", self.incomplete_checks),
             ("unreached_endpoints", self.unreached_endpoints),
@@ -148,6 +171,23 @@ impl SkipReport {
             }
         }
         out
+    }
+
+    /// Arcs dropped for any reason: unresolved pins, unmodelled timing, latch arcs.
+    pub fn arcs_skipped(&self) -> usize {
+        self.unresolved_arcs
+            + self.unsupported_arcs.values().sum::<usize>()
+            + self.latch_arcs_dropped.values().sum::<usize>()
+    }
+
+    /// Endpoint candidates that produced no check: incomplete pairs or unreached pins.
+    pub fn endpoints_skipped(&self) -> usize {
+        self.incomplete_checks + self.unreached_endpoints
+    }
+
+    /// True when the run left nothing out.
+    pub fn is_clean(&self) -> bool {
+        self.nonzero().is_empty()
     }
 }
 
@@ -338,14 +378,16 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
             continue;
         };
         let lib_cell = &cx.lib.cells[lib_cell_id.0 as usize];
+        skipped.total_arcs += lib_cell.arc_count as usize;
         let enable = if lib_cell.is_latch {
             match latch_enable(cx, cell, lib_cell) {
                 Some(enable) => Some(enable),
                 None => {
-                    eprintln!(
-                        "warning: latch cell {} has no setup_rising check on D (outside the modelled shape); its arcs are ignored",
-                        design.strings.resolve(design.cell_names[c])
-                    );
+                    skipped.unmodelled_latch_cells += 1;
+                    for i in lib_cell.arc_offset..lib_cell.arc_offset + lib_cell.arc_count as u32 {
+                        let timing = format!("{:?}", cx.lib.arcs[i as usize].timing_type);
+                        *skipped.latch_arcs_dropped.entry(timing).or_default() += 1;
+                    }
                     continue;
                 }
             }
@@ -378,6 +420,8 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
                 _ if lib_cell.is_latch => {
                     if Some(src) == enable && design.pin_is_driver[dst.0 as usize] {
                         graph.latch_opens.push(LatchOpen { enable: src, q: dst, lib_arc });
+                    } else {
+                        *skipped.latch_arcs_dropped.entry(format!("{:?}", arc.timing_type)).or_default() += 1;
                     }
                 }
                 TimingType::Combinational | TimingType::CombinationalRise | TimingType::CombinationalFall => {
@@ -833,6 +877,11 @@ fn collect_endpoints(
     mut skipped: SkipReport,
 ) -> Result<(StaReport, Vec<EndpointPolarities>)> {
     let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
+    skipped.total_endpoints = graph.checks.len()
+        + graph.gating_enables.len()
+        + design.io_pins.iter().filter(|&&p| design.pin_dirs[p.0 as usize] == PinDir::Output).count();
+    skipped.sdc_ignored_options = sdc.ignored_options.clone();
+    skipped.sdc_commands = sdc.commands;
     let mut entries = Vec::new();
     let half_period = 0.5 * sdc.period_ns;
 
@@ -1134,6 +1183,89 @@ mod tests {
         let report = run_sta(&design, &lib, &sdc, None).expect("STA with unmapped cell");
         assert_eq!(report.skipped.unmapped_cells, 94);
         assert!(report.skipped.nonzero().contains(&"unmapped_cells=94".to_string()));
+    }
+
+    /// Independent recount of the latch arcs `build_graph` drops, tallied straight from the
+    /// Liberty arcs and the netlist: an unmodelled latch shape loses every arc; a modelled
+    /// (`dlxtn`) latch loses every arc that is not a setup/hold check and not an enable->Q open.
+    fn expected_latch_skips(cx: &Context, design: &DesignDb, lib: &LibDb) -> (usize, BTreeMap<String, usize>) {
+        let mut cells = 0;
+        let mut arcs: BTreeMap<String, usize> = BTreeMap::new();
+        for c in 0..design.num_cells() {
+            let Some(lib_cell_id) = design.cell_lib_ids[c] else { continue };
+            let lib_cell = &lib.cells[lib_cell_id.0 as usize];
+            if !lib_cell.is_latch {
+                continue;
+            }
+            let cell = CellId(c as u32);
+            let Some(enable) = latch_enable(cx, cell, lib_cell) else {
+                cells += 1;
+                for i in lib_cell.arc_offset..lib_cell.arc_offset + lib_cell.arc_count as u32 {
+                    *arcs.entry(format!("{:?}", lib.arcs[i as usize].timing_type)).or_default() += 1;
+                }
+                continue;
+            };
+            for i in lib_cell.arc_offset..lib_cell.arc_offset + lib_cell.arc_count as u32 {
+                let arc = &lib.arcs[i as usize];
+                let (Some(src), Some(dst)) = (
+                    cx.cell_pin_for_lib_pin(cell, arc.related_pin),
+                    cx.cell_pin_for_lib_pin(cell, arc.target_pin),
+                ) else {
+                    continue; // unresolved arcs are counted in `unresolved_arcs` instead
+                };
+                let is_check = matches!(arc.timing_type, TimingType::SetupRising | TimingType::HoldRising);
+                let is_open = src == enable && design.pin_is_driver[dst.0 as usize];
+                if !is_check && !is_open {
+                    *arcs.entry(format!("{:?}", arc.timing_type)).or_default() += 1;
+                }
+            }
+        }
+        (cells, arcs)
+    }
+
+    /// R0: the skip summary counts latch cells and arcs per kind, with totals that an
+    /// independent recount from the Liberty and the netlist reproduces.
+    #[test]
+    fn test_skip_report_counts_latch_arcs() {
+        for (design_name, def_file, sdc_file) in [
+            ("sta_edge", "non_dlxtn_latch/edge_latch.def", "non_dlxtn_latch/edge_latch.sdc"),
+            ("ibex", "ibex.placed.def", "ibex.sdc"),
+        ] {
+            let lib_dir = sky130_hd();
+            let dir = design_dir(design_name);
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF");
+            let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
+            let sdc = load_sdc(&dir.join(sdc_file)).expect("SDC");
+            let report = run_sta(&design, &lib, &sdc, None).expect("STA");
+
+            let cx = Context { design: &design, lib: &lib, sdc: &sdc, parasitics: None, pi_models: Vec::new() };
+            let (cells, arcs) = expected_latch_skips(&cx, &design, &lib);
+            assert_eq!(report.skipped.unmodelled_latch_cells, cells, "{design_name}");
+            assert_eq!(report.skipped.latch_arcs_dropped, arcs, "{design_name}");
+
+            let total_arcs: usize = (0..design.num_cells())
+                .filter_map(|c| design.cell_lib_ids[c])
+                .map(|id| lib.cells[id.0 as usize].arc_count as usize)
+                .sum();
+            assert_eq!(report.skipped.total_arcs, total_arcs, "{design_name}");
+            assert_eq!(
+                report.endpoints.len() + report.skipped.endpoints_skipped(),
+                report.skipped.total_endpoints,
+                "{design_name}"
+            );
+
+            let json = serde_json::to_value(&report).expect("report JSON");
+            assert_eq!(json["skipped"]["unmodelled_latch_cells"].as_u64().unwrap() as usize, cells);
+            assert_eq!(json["skipped"]["total_arcs"].as_u64().unwrap() as usize, total_arcs);
+            assert!(json["skipped"]["sdc_commands"].as_u64().unwrap() > 0);
+        }
     }
 
 

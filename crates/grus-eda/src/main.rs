@@ -152,6 +152,12 @@ struct StaArgs {
 
     #[arg(long, help = "Path to extracted SPEF (.spef) file")]
     spef: Option<PathBuf>,
+
+    #[arg(long, help = "Write the full STA report (endpoints and skip summary) as JSON to this path")]
+    json: Option<PathBuf>,
+
+    #[arg(long, help = "Exit non-zero when any cell, arc, endpoint or SDC option was skipped")]
+    strict: bool,
 }
 
 fn check_top_name(expected: Option<&str>, kind: &str, actual: &str) -> anyhow::Result<()> {
@@ -441,10 +447,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 _ => None,
             };
             let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
-            let skipped = report.skipped.nonzero();
-            let skipped_note = if skipped.is_empty() { String::new() } else { format!(", skipped: {}", skipped.join(" ")) };
             println!(
-                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms{}",
+                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms",
                 mode,
                 report.endpoints.len(),
                 report.wns_max_ns,
@@ -452,11 +456,56 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 report.wns_min_ns,
                 report.tns_min_ns,
                 t0.elapsed().as_secs_f64() * 1000.0,
-                skipped_note
             );
+            print_skip_summary(&report);
+            if let Some(path) = &args.json {
+                let json = serde_json::to_string_pretty(&report)?;
+                std::fs::write(path, json)?;
+                println!("Wrote STA report JSON to {:?}", path);
+            }
+            if args.strict && !report.skipped.is_clean() {
+                eprintln!("strict: the run skipped inputs; see the summary above");
+                std::process::exit(1);
+            }
         }
     }
     Ok(())
+}
+
+/// Per-kind counts of everything the STA run left out, as a share of the design's arcs and
+/// endpoints plus the ignored SDC options. Printed at the end of every `sta` run.
+fn print_skip_summary(report: &grus_core::sta::StaReport) {
+    let s = &report.skipped;
+    if s.is_clean() {
+        println!("skipped: none");
+        return;
+    }
+    let share = |n: usize, total: usize| {
+        if total == 0 { "n/a".to_string() } else { format!("{:.2}%", 100.0 * n as f64 / total as f64) }
+    };
+    println!(
+        "skipped: {}/{} arcs ({}), {}/{} endpoints ({})",
+        s.arcs_skipped(),
+        s.total_arcs,
+        share(s.arcs_skipped(), s.total_arcs),
+        s.endpoints_skipped(),
+        s.total_endpoints,
+        share(s.endpoints_skipped(), s.total_endpoints),
+    );
+    if s.sdc_commands > 0 {
+        let ignored: usize = s.sdc_ignored_options.values().sum();
+        if ignored > 0 {
+            println!(
+                "  sdc: {} ignored option(s) of {} commands ({:.2}%)",
+                ignored,
+                s.sdc_commands,
+                100.0 * ignored as f64 / s.sdc_commands as f64
+            );
+        }
+    }
+    for category in s.nonzero() {
+        println!("  {category}");
+    }
 }
 
 fn print_heatmap(grid_w: usize, grid_h: usize, ratios: &[f32]) {
