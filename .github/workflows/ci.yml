@@ -135,17 +135,17 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build:
-    # Release binaries for both macOS arches. GitHub-hosted runners so they
-    # do not queue behind the self-hosted generate/test jobs; macos-latest
-    # is arm64 and macos-13 is Intel, matching the dev machines.
+    # Release binaries for macOS arm64 and Linux x86_64 (the grus-eda CLI is
+    # pure Rust). GitHub-hosted runners so they do not queue behind the
+    # self-hosted generate/test jobs.
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -163,7 +163,12 @@ jobs:
           cp target/release/grus-eda dist/
           tar -czf "dist/grus-eda-${{ matrix.target }}.tar.gz" -C dist grus-eda
           rm dist/grus-eda
-          (cd dist && shasum -a 256 "grus-eda-${{ matrix.target }}.tar.gz" > "grus-eda-${{ matrix.target }}.tar.gz.sha256")
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "grus-eda-${{ matrix.target }}.tar.gz" > "grus-eda-${{ matrix.target }}.tar.gz.sha256"
+          else
+            shasum -a 256 "grus-eda-${{ matrix.target }}.tar.gz" > "grus-eda-${{ matrix.target }}.tar.gz.sha256"
+          fi
 
       - name: Upload grus-eda binary
         uses: actions/upload-artifact@v4

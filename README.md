@@ -69,7 +69,7 @@ tool. The GPU result must then equal the CPU result.
 ## Install
 
 Tagged releases (`v*`) ship `grus-eda` binaries for `aarch64-apple-darwin`
-and `x86_64-apple-darwin` as `grus-eda-<target>.tar.gz` assets (plus `.sha256`).
+and `x86_64-unknown-linux-gnu` as `grus-eda-<target>.tar.gz` assets (plus `.sha256`).
 With [mise](https://mise.jdx.dev):
 
 ```toml
@@ -78,7 +78,7 @@ version = "v0.1.56"
 
 [tools."github:grus-systems/grus-eda".platforms]
 macos-arm64 = { asset_pattern = "grus-eda-aarch64-apple-darwin.tar.gz" }
-macos-x64 = { asset_pattern = "grus-eda-x86_64-apple-darwin.tar.gz" }
+linux-x64 = { asset_pattern = "grus-eda-x86_64-unknown-linux-gnu.tar.gz" }
 ```
 
 The archive holds the `grus-eda` executable at its root, which mise puts on
