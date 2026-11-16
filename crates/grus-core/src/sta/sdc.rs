@@ -71,11 +71,14 @@ pub struct Sdc {
     pub clock_latency_ns: f32,
     pub io_clock_latency_ns: f32,
     /// `set_propagated_clock` on the design clock: clock arrival is propagated through the
-    /// clock network instead of every clock pin seeing the ideal `clock_latency_ns`.
+    /// clock network instead of every clock pin seeing the ideal clock latency.
     pub propagated_clock: bool,
-    /// `set_clock_latency -source`: added on top of the propagated arrival. The plain
-    /// (network) latency is ignored once the clock is propagated.
+    /// `set_clock_latency -source` on the design clock: added on top of the propagated
+    /// arrival, and summed with the network latency when the clock is not propagated.
     pub clock_source_latency_ns: f32,
+    /// `set_clock_latency -source` on the virtual I/O clock; a virtual clock is never
+    /// propagated, so it always sums with `io_clock_latency_ns`.
+    pub io_clock_source_latency_ns: f32,
     /// Slew seeded on clock pins (`set_clock_transition`); zero without the command.
     pub clock_transition_ns: f32,
     /// Early/late derating of propagated delays (`set_timing_derate`). `finish` normalizes an
@@ -135,11 +138,19 @@ impl Sdc {
     fn latency_ns(&self, clock: ClockRef) -> f32 {
         match clock {
             // A propagated clock ignores the ideal network latency; `-source` latency is
-            // what remains, and it is what I/O delays are referenced against.
+            // what remains, and it is what I/O delays are referenced against. OpenSTA sums
+            // source and network latency when the clock is not propagated (measured:
+            // `set_clock_latency 1.0` + `-source 0.2` reports 1.20 ns ideal delay).
             ClockRef::Design if self.propagated_clock => self.clock_source_latency_ns,
-            ClockRef::Design => self.clock_latency_ns,
-            ClockRef::Virtual => self.io_clock_latency_ns,
+            ClockRef::Design => self.clock_source_latency_ns + self.clock_latency_ns,
+            ClockRef::Virtual => self.io_clock_latency_ns + self.io_clock_source_latency_ns,
         }
+    }
+
+    /// Latency every clock pin sees in ideal-clock mode: `-source` and network latencies
+    /// sum (OpenSTA reports 1.20 ns for `set_clock_latency 1.0` + `-source 0.2`).
+    pub fn design_clock_latency_ns(&self) -> f32 {
+        self.clock_source_latency_ns + self.clock_latency_ns
     }
 
     /// `(min, max)` input delay in ns; both equal the plain value when no `-min`/`-max` was given.
@@ -601,9 +612,15 @@ impl Interp {
                     self.sdc.clock_latency_ns = latency;
                 }
             }
-            // A virtual clock is never propagated, so source and network latency coincide
-            // for the I/O checks that read `io_clock_latency_ns`.
-            ClockRef::Virtual => self.sdc.io_clock_latency_ns = latency,
+            // A virtual clock is never propagated, so source and network latency sum for
+            // the I/O checks that read `io_clock_latency_ns`.
+            ClockRef::Virtual => {
+                if source {
+                    self.sdc.io_clock_source_latency_ns = latency;
+                } else {
+                    self.sdc.io_clock_latency_ns = latency;
+                }
+            }
         }
         Ok(())
     }

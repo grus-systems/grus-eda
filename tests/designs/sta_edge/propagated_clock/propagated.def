@@ -10,7 +10,7 @@ ROW ROW_2 unithd 0 5440 N DO 139 BY 1 STEP 460 2720 ;
 ROW ROW_3 unithd 0 8160 N DO 139 BY 1 STEP 460 2720 ;
 TRACKS X 170 DO 100 STEP 340 LAYER met1 ;
 TRACKS Y 140 DO 100 STEP 340 LAYER met2 ;
-COMPONENTS 13 ;
+COMPONENTS 15 ;
 - u_databuf sky130_fd_sc_hd__buf_2 + PLACED ( 4600 0 ) N ;
 - u_clkbuf sky130_fd_sc_hd__clkbuf_2 + PLACED ( 9200 0 ) N ;
 - u_clkinv sky130_fd_sc_hd__clkinv_2 + PLACED ( 13800 0 ) N ;
@@ -24,6 +24,8 @@ COMPONENTS 13 ;
 - u_ff4 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 50600 0 ) N ;
 - u_ff5 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 55200 0 ) N ;
 - u_ff6 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 59800 0 ) N ;
+- u_and2 sky130_fd_sc_hd__and2_1 + PLACED ( 61500 0 ) N ;
+- u_ff7 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 63200 0 ) N ;
 END COMPONENTS
 PINS 4 ;
 - clk + NET clk + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 0 ) N ;
@@ -31,16 +33,18 @@ PINS 4 ;
 - en + NET en + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 5440 ) N ;
 - y + NET y + DIRECTION OUTPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 63000 0 ) N ;
 END PINS
-NETS 10 ;
+NETS 12 ;
 - clk ( PIN clk ) ( u_ff0 CLK ) ( u_ff5 CLK ) ( u_clkbuf A ) ( u_and A ) + USE SIGNAL ;
 - c1 ( u_clkbuf X ) ( u_ff1 CLK ) ( u_ff6 CLK ) ( u_clkinv A ) ( u_clkbuf2 A ) + USE SIGNAL ;
-- c2 ( u_clkinv Y ) ( u_ff2 CLK ) + USE SIGNAL ;
+- c2 ( u_clkinv Y ) ( u_ff2 CLK ) ( u_and2 A ) + USE SIGNAL ;
 - c3 ( u_clkbuf2 X ) ( u_ff4 CLK ) + USE SIGNAL ;
 - c_and ( u_and X ) ( u_ff3 CLK ) ( u_lt GATE_N ) + USE SIGNAL ;
-- en ( PIN en ) ( u_and B ) + USE SIGNAL ;
+- c_and2 ( u_and2 X ) ( u_ff7 CLK ) + USE SIGNAL ;
+- en ( PIN en ) ( u_and B ) ( u_and2 B ) + USE SIGNAL ;
 - din ( PIN d_in ) ( u_databuf A ) + USE SIGNAL ;
-- d1 ( u_databuf X ) ( u_ff0 D ) ( u_ff1 D ) ( u_ff2 D ) ( u_ff3 D ) ( u_ff4 D ) ( u_lt D ) + USE SIGNAL ;
+- d1 ( u_databuf X ) ( u_ff0 D ) ( u_ff1 D ) ( u_ff2 D ) ( u_ff3 D ) ( u_ff4 D ) ( u_lt D ) ( u_ff7 D ) + USE SIGNAL ;
 - q_lt ( u_lt Q ) ( u_ff5 D ) ( u_ff6 D ) + USE SIGNAL ;
+- q7 ( u_ff7 Q ) + USE SIGNAL ;
 - y ( u_ff6 Q ) ( PIN y ) + USE SIGNAL ;
 END NETS
 END DESIGN

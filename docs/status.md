@@ -5,7 +5,7 @@ and known gaps. Done criteria are in `README.md` (Stages) and the Section 1 tabl
 The measurement log, including failed runs, is `docs/results.md`. Per-test E3 detail is in
 `docs/e3-sta.md` Section 4; open E3 tasks are in its Section 5.
 
-Last updated: 2026-11-16 (`v0.1.60` roadmap R2: `set_propagated_clock` propagates clock arrival and slew through buffers, inverting cells, an AND clock gate and a `dlxtn` latch enable for both transitions, with clock-edge parity correcting the setup/hold edge pairing; `set_clock_latency` without `-source` is ignored under propagation while `-source` latency seeds the port; the `sta_edge/propagated_clock` fixture matches OpenSTA on all 10 endpoints within 30 ps abs (worst 22.8 ps, a uniform per-cell NLDM residual over the 4-stage tree); ideal-clock mode is unchanged; see `docs/results.md`).
+Last updated: 2026-11-16 (`v0.1.60` roadmap R2: `set_propagated_clock` propagates clock arrival and slew through buffers, inverting cells, an AND clock gate and a `dlxtn` latch enable for both transitions, with clock-edge parity correcting the setup/hold edge pairing; `set_clock_latency` without `-source` is ignored under propagation while `-source` latency seeds the port; the `sta_edge/propagated_clock` fixture matches OpenSTA on all 12 endpoints within 30 ps abs (worst 22.8 ps, a uniform per-cell NLDM residual over the 4-stage tree); ideal-clock mode is unchanged; see `docs/results.md`).
 
 | Stage | Designs covered | Tolerance actually used | Status | Known gaps |
 |---|---|---|---|---|

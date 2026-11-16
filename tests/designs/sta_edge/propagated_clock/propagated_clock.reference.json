@@ -7,14 +7,16 @@
     "tns_min_ns": -2.100000,
     "endpoints": [
       {"pin": "u_and/B", "max_arr_ns": 0.700000, "max_req_ns": 5.100000, "max_slack_ns": 4.400000, "max_slew_ns": 0.150000, "min_arr_ns": 0.700000, "min_req_ns": 2.800000, "min_slack_ns": -2.100000, "min_slew_ns": 0.150000},
-      {"pin": "u_ff0/D", "max_arr_ns": 0.880755, "max_req_ns": 5.015811, "max_slack_ns": 4.135056, "max_slew_ns": 0.040855, "min_arr_ns": 0.854336, "min_req_ns": 0.279105, "min_slack_ns": 0.575231, "min_slew_ns": 0.061818},
-      {"pin": "u_ff1/D", "max_arr_ns": 0.880755, "max_req_ns": 5.157868, "max_slack_ns": 4.277113, "max_slew_ns": 0.040855, "min_arr_ns": 0.854336, "min_req_ns": 0.428907, "min_slack_ns": 0.425429, "min_slew_ns": 0.061818},
-      {"pin": "u_ff2/D", "max_arr_ns": 0.880755, "max_req_ns": 2.689544, "max_slack_ns": 1.808789, "max_slew_ns": 0.040855, "min_arr_ns": 5.854336, "min_req_ns": 2.965961, "min_slack_ns": 2.888375, "min_slew_ns": 0.061818},
-      {"pin": "u_ff3/D", "max_arr_ns": 0.880755, "max_req_ns": 5.143163, "max_slack_ns": 4.262408, "max_slew_ns": 0.040855, "min_arr_ns": 0.854336, "min_req_ns": 0.415962, "min_slack_ns": 0.438373, "min_slew_ns": 0.061818},
-      {"pin": "u_ff4/D", "max_arr_ns": 0.880755, "max_req_ns": 5.266813, "max_slack_ns": 4.386058, "max_slew_ns": 0.040855, "min_arr_ns": 0.854336, "min_req_ns": 0.542618, "min_slack_ns": 0.311717, "min_slew_ns": 0.061818},
+      {"pin": "u_and2/B", "max_arr_ns": 0.700000, "max_req_ns": 2.808518, "max_slack_ns": 2.108518, "max_slew_ns": 0.150000, "min_arr_ns": 5.700000, "min_req_ns": 0.506541, "min_slack_ns": 5.193459, "min_slew_ns": 0.150000},
+      {"pin": "u_ff0/D", "max_arr_ns": 0.885071, "max_req_ns": 5.014256, "max_slack_ns": 4.129185, "max_slew_ns": 0.044415, "min_arr_ns": 0.860312, "min_req_ns": 0.277584, "min_slack_ns": 0.582729, "min_slew_ns": 0.069193},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.885071, "max_req_ns": 5.156308, "max_slack_ns": 4.271237, "max_slew_ns": 0.044415, "min_arr_ns": 0.860312, "min_req_ns": 0.427369, "min_slack_ns": 0.432943, "min_slew_ns": 0.069193},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.885071, "max_req_ns": 2.693311, "max_slack_ns": 1.808240, "max_slew_ns": 0.044415, "min_arr_ns": 5.860312, "min_req_ns": 2.969381, "min_slack_ns": 2.890931, "min_slew_ns": 0.069193},
+      {"pin": "u_ff3/D", "max_arr_ns": 0.885071, "max_req_ns": 5.141602, "max_slack_ns": 4.256531, "max_slew_ns": 0.044415, "min_arr_ns": 0.860312, "min_req_ns": 0.414420, "min_slack_ns": 0.445892, "min_slew_ns": 0.069193},
+      {"pin": "u_ff4/D", "max_arr_ns": 0.885071, "max_req_ns": 5.265249, "max_slack_ns": 4.380178, "max_slew_ns": 0.044415, "min_arr_ns": 0.860312, "min_req_ns": 0.541070, "min_slack_ns": 0.319243, "min_slew_ns": 0.069193},
       {"pin": "u_ff5/D", "max_arr_ns": 3.270889, "max_req_ns": 5.060607, "max_slack_ns": 1.789718, "max_slew_ns": 0.046619, "min_arr_ns": 3.132651, "min_req_ns": 0.276265, "min_slack_ns": 2.856386, "min_slew_ns": 0.030296},
       {"pin": "u_ff6/D", "max_arr_ns": 3.270889, "max_req_ns": 5.209625, "max_slack_ns": 1.938736, "max_slew_ns": 0.046619, "min_arr_ns": 3.132651, "min_req_ns": 0.418942, "min_slack_ns": 2.713708, "min_slew_ns": 0.030296},
-      {"pin": "u_lt/D", "max_arr_ns": 0.880755, "max_req_ns": 2.781875, "max_slack_ns": 1.901120, "max_slew_ns": 0.040855, "min_arr_ns": 0.880755, "min_req_ns": 0.346445, "min_slack_ns": 0.534310, "min_slew_ns": 0.040855},
+      {"pin": "u_ff7/D", "max_arr_ns": 0.885071, "max_req_ns": 2.792326, "max_slack_ns": 1.907256, "max_slew_ns": 0.044415, "min_arr_ns": 5.860312, "min_req_ns": 3.066950, "min_slack_ns": 2.793363, "min_slew_ns": 0.069193},
+      {"pin": "u_lt/D", "max_arr_ns": 0.885071, "max_req_ns": 2.781875, "max_slack_ns": 1.896805, "max_slew_ns": 0.044415, "min_arr_ns": 0.885071, "min_req_ns": 0.345262, "min_slack_ns": 0.539809, "min_slew_ns": 0.044415},
       {"pin": "y", "max_arr_ns": 0.973959, "max_req_ns": 4.600000, "max_slack_ns": 3.626041, "max_slew_ns": 0.469312, "min_arr_ns": 0.826457, "min_req_ns": -0.200000, "min_slack_ns": 1.026457, "min_slew_ns": 0.229812}
     ]
   }
