@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Reference generation for the sta_edge/timing_derate fixture: the propagated_clock DEF
-# under an ideal clock (ideal.sdc) and a propagated clock (propagated.sdc), each carrying
+# Reference generation for the sta_edge/timing_derate fixture: the hold.def topology
+# (clk -> clkbuf_2 -> three FFs on one clock net, one register-to-register path) under an
+# ideal clock (ideal.sdc) and a propagated clock (propagated.sdc), each carrying
 # set_timing_derate early/late derates plus -cell_check/-clock/-data/-rise/-fall selectors.
 # Runs inside ghcr.io/librelane/librelane:3.0.16.
 set -euo pipefail

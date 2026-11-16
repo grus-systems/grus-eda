@@ -287,11 +287,15 @@ impl Context<'_> {
     /// cell's fall delay, and the ideal driver does not see the net's load. This measured
     /// closest to OpenSTA (worst residual ~0.7 ps on `inv_2`, ~10 ps on `inv_16`). Without a
     /// rule, `set_input_transition` applies and the delay is zero.
-    fn port_drive(&self, pin: PinId, skipped: &mut SkipReport) -> [(f32, f32); 2] {
+    /// `(slew, early_delay, late_delay)` per output transition. The delay is the worst
+    /// arc delay derated by its **source** transition — `-rise`/`-fall` derates select
+    /// the transition entering the arc, which differs from the output transition on
+    /// inverting drivers (measured on OpenSTA).
+    fn port_drive(&self, pin: PinId, skipped: &mut SkipReport) -> [(f32, f32, f32); 2] {
         let port = self.port_name(pin);
         let fallback = || {
             let t = self.sdc.input_transition_ns(port);
-            [(t, 0.0), (t, 0.0)]
+            [(t, 0.0, 0.0), (t, 0.0, 0.0)]
         };
         let Some(rule) = self.sdc.driving_cell(port, true) else {
             return fallback();
@@ -304,7 +308,10 @@ impl Context<'_> {
             let pin_idx = self.lib.cell_pins(cell).iter().position(|p| p.name == pin_sym)?;
             let target = LibPinId((cell.pin_offset + pin_idx as u32) as u16);
             let net = self.design.pin_nets[pin.0 as usize];
-            let mut out = [(f32::NEG_INFINITY, f32::NEG_INFINITY); 2];
+            let mut slew = [f32::NEG_INFINITY; 2];
+            // Worst raw delay per (output, source) transition pair; derating is applied
+            // per source transition below, before the cross-source maximum.
+            let mut delay = [[f32::NEG_INFINITY; 2]; 2];
             for i in cell.arc_offset..cell.arc_offset + cell.arc_count as u32 {
                 let arc = &self.lib.arcs[i as usize];
                 if arc.target_pin != target {
@@ -330,20 +337,37 @@ impl Context<'_> {
                     let in_slew = if src_pol == RISE { rule.in_trans_rise } else { rule.in_trans_fall };
                     let load = net.map_or(0.0, |n| self.net_load(n, dst_pol));
                     if let Some(table) = delay_tables(arc, dst_pol).1 {
-                        out[dst_pol].0 = out[dst_pol].0.max(eval_nldm_delay_or_slew(table, in_slew, load));
+                        slew[dst_pol] = slew[dst_pol].max(eval_nldm_delay_or_slew(table, in_slew, load));
                     }
                     // The driver is ideal: its delay does not see the net's load. The table is
                     // indexed by the source transition — for an inverting driver the output
                     // rise is the cell's fall delay — which measured closest to OpenSTA.
                     if let Some(table) = delay_tables(arc, src_pol).0 {
-                        out[dst_pol].1 = out[dst_pol].1.max(eval_nldm_delay_or_slew(table, in_slew, 0.0));
+                        delay[dst_pol][src_pol] =
+                            delay[dst_pol][src_pol].max(eval_nldm_delay_or_slew(table, in_slew, 0.0));
                     }
                 }
             }
+            let mut out = [(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY); 2];
+            for dst_pol in [RISE, FALL] {
+                let mut early = f32::NEG_INFINITY;
+                let mut late = f32::NEG_INFINITY;
+                for src_pol in [RISE, FALL] {
+                    let raw = delay[dst_pol][src_pol];
+                    if !raw.is_finite() {
+                        continue;
+                    }
+                    early = early.max(raw * self.sdc.derate(false, DERATE_CELL, false, src_pol));
+                    late = late.max(raw * self.sdc.derate(true, DERATE_CELL, false, src_pol));
+                }
+                out[dst_pol] = (slew[dst_pol], early, late);
+            }
             (out[RISE].0.is_finite()
                 && out[RISE].1.is_finite()
+                && out[RISE].2.is_finite()
                 && out[FALL].0.is_finite()
-                && out[FALL].1.is_finite())
+                && out[FALL].1.is_finite()
+                && out[FALL].2.is_finite())
             .then_some(out)
         })();
         match resolved {
@@ -1038,14 +1062,8 @@ fn run_sta_detail(
         let latency = sdc.input_clock_latency_ns(name);
         let drive = cx.port_drive(pin, &mut skipped);
         for pol in [RISE, FALL] {
-            let (slew, drv_delay) = drive[pol];
-            state[p].merge(
-                pol,
-                latency + in_max + drv_delay * sdc.derate(true, DERATE_CELL, false, pol),
-                latency + in_min + drv_delay * sdc.derate(false, DERATE_CELL, false, pol),
-                slew,
-                slew,
-            );
+            let (slew, drv_early, drv_late) = drive[pol];
+            state[p].merge(pol, latency + in_max + drv_late, latency + in_min + drv_early, slew, slew);
         }
     }
 
@@ -1141,15 +1159,17 @@ fn run_sta_detail(
             }
         }
     }
-    // A latch opens on the falling edge of a `dlxtn` enable. The ideal clock has one edge
-    // time for both transitions, so the fall is the rise plus half a period; a propagated
-    // clock carries the real fall arrival at the enable pin.
+    // A latch opens on the falling edge of a `dlxtn` enable. The ideal clock seeds both
+    // transitions identically, so the fall is the rise plus half a period; a propagated
+    // clock carries the real fall arrival at the enable pin. FALL is passed in both modes
+    // so `-fall` derates reach the arc; under the ideal clock the RISE/FALL arrivals are
+    // the same seeded value.
     let half_period = 0.5 * sdc.period_ns;
-    let (open_pol, open_offset) = if sdc.propagated_clock { (FALL, 0.0) } else { (RISE, half_period) };
+    let open_offset = if sdc.propagated_clock { 0.0 } else { half_period };
     let latch_updates: Vec<_> = graph
         .latch_opens
         .iter()
-        .map(|open| eval_launch(open.q, state[open.enable.0 as usize], open.lib_arc, open_pol, open_offset))
+        .map(|open| eval_launch(open.q, state[open.enable.0 as usize], open.lib_arc, FALL, open_offset))
         .collect();
     for pair in latch_updates {
         for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
@@ -3171,8 +3191,9 @@ mod tests {
     }
 
     /// `set_timing_derate` early/late plus the `-cell_check`, `-clock`/`-data` and
-    /// `-rise`/`-fall` selectors on the propagated-clock DEF, under both the ideal and the
-    /// propagated clock. Selector semantics were measured on OpenSTA: a bare corner covers
+    /// `-rise`/`-fall` selectors on the hold.def topology (one shared clock net, one
+    /// register-to-register path — the case same-net CRPR applies to), under both the
+    /// ideal and the propagated clock. Selector semantics were measured on OpenSTA: a bare corner covers
     /// cell and net delays on both paths and transitions but not checks; `-rise`/`-fall`
     /// select the transition entering each arc.
     #[test]

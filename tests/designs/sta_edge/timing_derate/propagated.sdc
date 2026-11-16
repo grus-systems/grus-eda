@@ -17,6 +17,8 @@ set_timing_derate -early 0.95
 set_timing_derate -late 1.05
 set_timing_derate -early 0.90 -cell_check
 set_timing_derate -late 1.10 -cell_check
+set_timing_derate -early 0.85 -cell_check -rise
+set_timing_derate -late 1.15 -cell_check -fall
 set_timing_derate -early 0.85 -clock -cell_delay
 set_timing_derate -late 1.15 -data -cell_delay
 set_timing_derate -early 0.80 -cell_delay -rise

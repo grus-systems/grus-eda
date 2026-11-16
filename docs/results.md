@@ -1202,3 +1202,24 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
 - **Not covered**: `-net_delay` has no observable effect on zero-wire fixtures (wire
   delay is zero); SPEF-backed derate runs are untested. `-cell_check` was verified on
   register checks only.
+- **Review fixes (Hydrogen, `subcon review --target`, verdict reject)**: ideal-clock
+  `dlxtn` latch launches now pass FALL (not RISE) as the edge polarity so `-fall`
+  derates reach the arc — the ideal clock seeds both transitions identically, so only
+  the derate index changes (S1). `port_drive` derates each driving-cell arc by its
+  **source** transition before the cross-source maximum and returns separate
+  early/late delays, fixing `-rise`/`-fall` derates on inverting `set_driving_cell`
+  drivers such as the `inv_2` stock `write_sdc` emits (S2). Stale comments claiming
+  the fixture uses the `propagated_clock` DEF corrected to the `hold.def` topology
+  (S3). The fixture SDCs gained `-cell_check -rise`/`-fall`; OpenSTA accepts every
+  selector combination probed (`-cell_check -clock` verified to have no effect,
+  `-cell_check -rise` ≡ plain, `-cell_check -fall` distinct) and the regenerated
+  golden still matches.
+- **Deferred with rationale**: same-net CRPR credits the full `arrival_max -
+  arrival_min` spread at the clock net driver, which can over-credit if
+  reconvergent clock logic upstream produces different early/late paths — proper
+  per-path common-point tracking is not implemented and the direction is optimistic,
+  recorded here as a known approximation (S2). `gating_enables` checks do not get
+  CRPR credit yet (needs an FF-driven enable fixture; belongs with the R4 clock-gating
+  work) (S2). `-net_delay` is unverifiable on zero-wire fixtures — SPEF-backed derate
+  runs are untested; latch and inverting driving-cell derate paths are modelled but
+  not covered by the fixture golden (S2).
