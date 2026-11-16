@@ -5,7 +5,7 @@ and known gaps. Done criteria are in `README.md` (Stages) and the Section 1 tabl
 The measurement log, including failed runs, is `docs/results.md`. Per-test E3 detail is in
 `docs/e3-sta.md` Section 4; open E3 tasks are in its Section 5.
 
-Last updated: 2026-11-16 (`v0.1.55` Phase 2 ticket 04: `TimingGraph`/`LevelizedGraph` packed into flat CSR arrays; all `sta::` tests report-identical; see `docs/results.md`).
+Last updated: 2026-11-16 (`v0.1.58` roadmap R0: `sta` reports every skipped cell/arc/endpoint/SDC option as counts and shares of the design, with `--strict` and `--json`; see `docs/results.md`).
 
 | Stage | Designs covered | Tolerance actually used | Status | Known gaps |
 |---|---|---|---|---|
