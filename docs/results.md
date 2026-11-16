@@ -978,3 +978,50 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
   Verification after fixes: `cargo test --release -p grus-core -- sta::` 62 passed /
   0 failed / 6 ignored; `cargo test --release -p grus-eda` 3 passed;
   `cargo clippy --all-targets -- -D warnings` clean.
+
+### 2026-11-16 — R1 — Stock LibreLane SDC (`write_sdc` output) parses unchanged and matches OpenSTA
+
+- **Inputs**: `gcd` from a stock LibreLane 3.0.16 run (`~/ll_gcd/runs/RUN_2026-11-16_11-43-52/`,
+  public OpenROAD-flow-scripts design). The emitted `final/sdc/gcd.sdc` contains
+  `create_clock`, `set_clock_transition`, `set_clock_uncertainty`, `set_input_delay` /
+  `set_output_delay` with `-clock [get_clocks {...}]` and `-add_delay`, `set_load -pin_load`,
+  `set_driving_cell -lib_cell/-pin/-input_transition_*`, `set_timing_derate -early/-late`, and
+  `set_max_transition`/`set_max_capacitance`/`set_max_fanout`.
+- **Reference**: `openroad` + `sta` in `ghcr.io/librelane/librelane:3.0.16`
+  (`~/ll_gcd/probe/run_sta.tcl`, `PROBE_SDC`/`PROBE_SPEF`/`PROBE_OUT`).
+- **Modelled in R1**: `-min`/`-max`/`-add_delay` delay corners (per-sense fold in file order),
+  `-pin_load`, `set_clock_transition` (clock-pin slew), `set_timing_derate` (early/late on
+  propagated cell and wire delays), `set_driving_cell` (input-port slew and delay from the
+  driver cell's Liberty arcs, worst over arcs into the named pin, evaluated at the rule's
+  input transitions and the net load), `-clock` as bare name or `[get_clocks {...}]`, and
+  `set_propagated_clock`/`unset_propagated_clock` accepted and counted until R2.
+- **Parse-only, counted**: `set_max_transition`/`set_max_capacitance`/`set_max_fanout` go to
+  `sdc_ignored_commands`; they are shown in the skip summary but do not fail `--strict`
+  (`SkipReport::is_clean` exempts exactly these three — they cannot change a compared number).
+- **Still rejected** (no `--lenient` flag; the stop policy is kept for now): a second
+  `create_clock`, `create_generated_clock`, `set_case_analysis`, `set_false_path`,
+  `set_multicycle_path`, clock wildcards and `get_pins` selectors — all out of the single-clock
+  ideal-clock model and left for the roadmap items that need them.
+- **Comparisons** (all 53 endpoints, per-pin arrival/required/slack/slew, min and max):
+
+  | Run | Worst abs diff | Tolerance | Result |
+  |---|---|---|---|
+  | zero wire, stock SDC | 2.9 ps (`_411_/D` slack/arrival; `set_driving_cell` residual) | STRICT max(5 ps, 1%) | PASS |
+  | zero wire, `nom.spef` | 3.5 ps slack/arr, 6.1 ps slew (`resp_msg[3]`, 1.7%) | `GCD_SPEF` slew 3% | PASS |
+  | `no_derate`, `no_clktrans`, `no_drvcell`, `no_load`, `no_unc`, `no_clkdrv`, `clk_ideal` | <= 3.3 ps | STRICT | PASS |
+  | `drv16` (driving cell `buf_16`) | 11.2 ps slack | STRICT (rel 1% of ~3 ns) | PASS |
+  | `minmax` (`-min`/`-max` as separate commands, OpenSTA's accepted form) | 15.9 ps arrival (`_412_/D`, path re-selection under new delays) | STRICT max(5 ps, 1% of 2.6 ns = 26 ps) | PASS, 0 field failures |
+
+- **Notes**: OpenSTA rejects `set_input_delay -min V -max V` in one command ("requires two
+  positional arguments"); the accepted form is one command per sense, which is what `minmax.sdc`
+  uses. The driving-cell delay uses the source-polarity delay table (for an inverting driver the
+  output-rise delay is `cell_fall`); the residual versus OpenSTA is ~3 ps on `inv_2` and ~11 ps
+  on `buf_16`, inside tolerance but not exact — recorded as a known approximation.
+- **Side fix**: the DEF reader now skips `NONDEFAULTRULES` (routing-only, not in the timing
+  database); the stock LibreLane `gcd.def` previously failed to parse.
+- **Runtime**: debug binary, zero-wire `gcd` STA end-to-end 0.14 s wall (includes Liberty/DEF/SDC
+  parse; not a cold-cache measurement).
+- **Verification**: `cargo test --workspace` 175 passed / 0 failed / 7 ignored;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean. New SDC tests cover the emitted
+  `write_sdc` syntax, `-min`/`-max`/`-add_delay`, `-pin_load`, derate, clock transition,
+  driving cells and the ignored design-rule commands.
