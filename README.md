@@ -27,27 +27,25 @@ hands over to the established tools for everything after.
    as a placed DEF) directly, so any stage can run standalone or hand over to
    OpenROAD at any boundary. Rust for memory safety without a garbage collector
    and a single static binary.
-   - Today: no parallelism; the code uses no threads.
-   - Target: data parallelism through rayon.
+   - Current (`v0.1.51`): CPU data parallelism through `rayon` across global placement (FFT Poisson & wirelength gradients), RSMT/parasitic extraction, and levelized STA.
 3. **Data-oriented design**: flat arrays per attribute (structure of arrays),
    graphs as index arrays instead of pointers, and `f32` arithmetic.
-   - Today: the netlist and floorplan are SoA with CSR lists (`design_db.rs`);
-     the placer and congestion estimate use `f32` on the CPU.
-   - Target: the STA timing graph in CSR with no allocation per object (today
-     it is `Vec<Vec<u32>>`, and the checks sit in a `BTreeMap`); the timing graph
-     levelized so that every level is one parallel pass (today: Kahn order, no
-     levels stored); `f32` on the GPU.
+   - Current (`v0.1.51`): the netlist and floorplan are SoA with CSR lists (`design_db.rs`);
+     the placer and congestion estimate use `f32` on the CPU; the timing graph is
+     Kahn-levelized (`topological_levels` + per-pin incoming lists) so each combinational
+     depth wave runs in parallel across threads.
+   - Future: packing the remaining `Vec<Vec<u32>>` / `BTreeMap` in `TimingGraph` into flat CSR arrays, and an optional Metal GPU path.
 4. **Known fast algorithms, not new ones**:
    - congestion: RSMT (Steiner tree) decomposition followed by pattern
      (L/Z-shape) and probabilistic routing on a GCell grid;
    - placement: analytical placement with an electrostatic density term solved by
      FFT (ePlace, DREAMPlace), plus an Abacus legalizer with local refinement;
    - timing: propagation in Kahn topological order with NLDM table lookup, as OpenSTA computes it.
-5. **Apple Silicon first**: all cores through rayon and NEON SIMD, then
-   Accelerate / Metal for the kernels that pay for it (the density FFT, the
-   wirelength gradient).
-   - Today: CPU only, single-threaded, no SIMD intrinsics, no Accelerate or Metal.
-   - Target: the list above.
+5. **Apple Silicon first**: all cores through `rayon`, plus Accelerate / Metal or
+   NEON intrinsics where profiling warrants them (the density FFT, the wirelength
+   gradient).
+   - Current (`v0.1.51`): multi-core CPU parallel via `rayon` with reusable zero-alloc transforms (`PoissonWorkspace`, thread-local DP scratch) and precomputed trig tables; no handwritten NEON intrinsics or Accelerate/Metal GPU path yet.
+   - Target: Accelerate / Metal for remaining kernels if needed.
 6. **Agreement before speed**: a stage gets faster only after it agrees with the
    reference tool, and the fast version must give the same answer as the simple one.
 

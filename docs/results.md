@@ -868,6 +868,18 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
 - **Workspace verification (`v0.1.51`)**:
   - `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`grus-core`: `165 passed; 0 failed; 5 ignored` in `53.52 s`; `grus-eda`: `2 passed; 0 failed` in `0.18 s`).
 
+### 2026-11-16 — `legalize.rs` Pass 1 zero-mutation cache + `README.md` / `docs/status.md` sync (`v0.1.52`)
+
+- **Pass 1 & geometry cache (`crates/grus-core/src/placement/legalize.rs`)**:
+  - Added `PinGeomCache` (`owner`, `w`, `h`, `ox`, `oy`, `fx`, `fy`) to eliminate repeated `TechDb` macro/macro-pin lookups across Pass 1, Pass 2, Pass 3, and `build_net_extrema_fast`.
+  - Precomputed sorted `(net, pin, PinGeom)` slices per cell (`build_cell_pin_nets`) and implemented read-only swap evaluation (`evaluate_trial_swap_ro`): rejected swaps (`> 98%`) execute without mutating or restoring `design_db`, without re-scanning cell pins per net, and without merging `cell_nets`.
+  - Sorted Pass 1 candidates directly as `(mi2, c2)` tuples and parallelized initial `build_net_extrema_fast` across nets (`>= 1024`).
+  - Added read-only equivalence + immutability check inside `test_cached_pass1_eval_falls_back_when_both_top2_pins_move`.
+- **Docs sync (`README.md`, `docs/status.md`)**:
+  - Updated `README.md` Goals 2, 3, and 5 ("Current (`v0.1.51`)") to match implemented `rayon` parallelism, Kahn-levelized STA, and cached Poisson/DP workspaces, plus `docs/status.md` header timestamp.
+- **Measured `jpeg` (`61,569` cells) `grus-eda place` (`v0.1.52`)**:
+  - `legalize_placement`: `5.81 s -> 3.86 s` (vs `v0.1.49` baseline `18.78 s`, **`4.9x`** overall speedup on legalization), total `place` `5.50 s` (`GP = 1.64 s`, `final_hpwl = 1,018,912,430 dbu`, `-1.23%`, bit-identical across all 5 designs: `gcd = 4,395,223`, `aes = 349,495,091`, `picorv32 = 212,135,994`, `ibex = 418,367,448`, `jpeg = 1,018,912,430`).
+
 
 
 
