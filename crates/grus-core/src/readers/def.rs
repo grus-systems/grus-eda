@@ -658,8 +658,10 @@ pub fn parse_def_bytes(
                     add_special_net(&mut db, tech_db, words, line)
                 })?;
             }
-            // Vias are not in the database: they come from the tech LEF's via definitions.
+            // Vias and non-default rules are not in the database: they come from the tech
+            // LEF and only constrain routing, which the STA model does not read.
             DefToken::Word("VIAS") => skip_section(&mut lexer, "VIAS")?,
+            DefToken::Word("NONDEFAULTRULES") => skip_section(&mut lexer, "NONDEFAULTRULES")?,
             DefToken::Word("NETS") => {
                 let declared = section_count(&mut lexer, "NETS")?;
                 let mut net_pins_list: Vec<Vec<PinId>> = Vec::new();

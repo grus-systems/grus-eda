@@ -3,7 +3,7 @@ use super::nldm::{eval_nldm_constraint, eval_nldm_delay_or_slew};
 use super::parasitics::NetParasitics;
 use super::sdc::Sdc;
 use crate::design_db::DesignDb;
-use crate::interner::{CellId, NetId, PinDir, PinId};
+use crate::interner::{CellId, LibPinId, NetId, PinDir, PinId};
 use crate::lib_db::{LibCell, LibDb, NldmTable, TimingSense, TimingType};
 use anyhow::{Result, bail};
 use rayon::prelude::*;
@@ -132,6 +132,9 @@ pub struct SkipReport {
     pub unreached_endpoints: usize,
     /// Clock nets driven by a cell output (buffered or gated clock), which the ideal clock does not model.
     pub cell_driven_clock_nets: usize,
+    /// `set_driving_cell` rules whose cell or pin does not resolve in the Liberty library; the
+    /// port falls back to `set_input_transition`.
+    pub unresolved_driving_cells: usize,
     /// Arcs of all Liberty-mapped cell instances, the denominator for the arc share. Unmapped
     /// cells have no Liberty arcs to count, so their arcs are outside this total.
     pub total_arcs: usize,
@@ -140,6 +143,8 @@ pub struct SkipReport {
     pub total_endpoints: usize,
     /// SDC options accepted but not applied (`-lib_cell`, `-pin`), by flag.
     pub sdc_ignored_options: BTreeMap<String, usize>,
+    /// SDC commands accepted but not applied to the timing model, by command name.
+    pub sdc_ignored_commands: BTreeMap<String, usize>,
     /// Top-level SDC commands evaluated while parsing, the denominator for `sdc_ignored_options`.
     pub sdc_commands: usize,
 }
@@ -152,6 +157,7 @@ impl SkipReport {
             ("unsupported_arcs", &self.unsupported_arcs),
             ("latch_arcs_dropped", &self.latch_arcs_dropped),
             ("sdc_ignored_options", &self.sdc_ignored_options),
+            ("sdc_ignored_commands", &self.sdc_ignored_commands),
         ] {
             if !map.is_empty() {
                 let by_kind: Vec<String> = map.iter().map(|(t, n)| format!("{t}={n}")).collect();
@@ -165,6 +171,7 @@ impl SkipReport {
             ("incomplete_checks", self.incomplete_checks),
             ("unreached_endpoints", self.unreached_endpoints),
             ("cell_driven_clock_nets", self.cell_driven_clock_nets),
+            ("unresolved_driving_cells", self.unresolved_driving_cells),
         ] {
             if count > 0 {
                 out.push(format!("{name}={count}"));
@@ -185,9 +192,25 @@ impl SkipReport {
         self.incomplete_checks + self.unreached_endpoints
     }
 
-    /// True when the run left nothing out.
+    /// True when the run left nothing out. SDC design-rule commands (`set_max_*`) are the one
+    /// exception: they never feed the timing model, so ignoring them cannot make a compared
+    /// number wrong. They stay visible in the summary; `--strict` only fails on skips that can.
     pub fn is_clean(&self) -> bool {
-        self.nonzero().is_empty()
+        const DESIGN_RULES: [&str; 3] = ["set_max_transition", "set_max_capacitance", "set_max_fanout"];
+        self.unmapped_cells == 0
+            && self.unmodelled_latch_cells == 0
+            && self.unresolved_arcs == 0
+            && self.incomplete_checks == 0
+            && self.unreached_endpoints == 0
+            && self.cell_driven_clock_nets == 0
+            && self.unresolved_driving_cells == 0
+            && self.unsupported_arcs.is_empty()
+            && self.latch_arcs_dropped.is_empty()
+            && self.sdc_ignored_options.is_empty()
+            && self
+                .sdc_ignored_commands
+                .keys()
+                .all(|k| DESIGN_RULES.contains(&k.as_str()))
     }
 }
 
@@ -248,6 +271,60 @@ impl Context<'_> {
     fn net_load(&self, net: NetId, pol: usize) -> f32 {
         let wire = self.parasitics.and_then(|par| par.net(net)).map_or(0.0, |t| t.total_wire_cap_pf);
         wire + self.design.net_pins(net).iter().map(|&pin| self.sink_cap(pin, pol)).sum::<f32>()
+    }
+
+    /// `(slew, delay)` at an input port, per output transition (RISE, FALL). A
+    /// `set_driving_cell` rule makes the port behave like the driver cell's output pin: the
+    /// worst slew and delay over the cell's arcs into the named pin, evaluated at the rule's
+    /// input transition and the net load. Without one, `set_input_transition` applies and the
+    /// delay is zero.
+    fn port_drive(&self, pin: PinId, skipped: &mut SkipReport) -> [(f32, f32); 2] {
+        let port = self.port_name(pin);
+        let fallback = || {
+            let t = self.sdc.input_transition_ns(port);
+            [(t, 0.0), (t, 0.0)]
+        };
+        let Some(rule) = self.sdc.driving_cell(port, true) else {
+            return fallback();
+        };
+        let resolved = (|| {
+            let cell_sym = self.lib.strings.get(&rule.cell)?;
+            let cell_id = *self.lib.cell_by_name.get(&cell_sym)?;
+            let cell = &self.lib.cells[cell_id.0 as usize];
+            let pin_sym = self.lib.strings.get(&rule.pin)?;
+            let pin_idx = self.lib.cell_pins(cell).iter().position(|p| p.name == pin_sym)?;
+            let target = LibPinId((cell.pin_offset + pin_idx as u32) as u16);
+            let net = self.design.pin_nets[pin.0 as usize];
+            let mut out = [(f32::NEG_INFINITY, f32::NEG_INFINITY); 2];
+            for i in cell.arc_offset..cell.arc_offset + cell.arc_count as u32 {
+                let arc = &self.lib.arcs[i as usize];
+                if arc.target_pin != target {
+                    continue;
+                }
+                let related = &self.lib.pins[arc.related_pin.0 as usize];
+                if related.dir != PinDir::Input {
+                    continue;
+                }
+                for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
+                    let in_slew = if src_pol == RISE { rule.in_trans_rise } else { rule.in_trans_fall };
+                    let load = net.map_or(0.0, |n| self.net_load(n, dst_pol));
+                    if let Some(table) = delay_tables(arc, dst_pol).1 {
+                        out[dst_pol].0 = out[dst_pol].0.max(eval_nldm_delay_or_slew(table, in_slew, load));
+                    }
+                    if let Some(table) = delay_tables(arc, src_pol).0 {
+                        out[dst_pol].1 = out[dst_pol].1.max(eval_nldm_delay_or_slew(table, in_slew, load));
+                    }
+                }
+            }
+            (out[RISE].0.is_finite() && out[FALL].0.is_finite()).then_some(out)
+        })();
+        match resolved {
+            Some(out) => out,
+            None => {
+                skipped.unresolved_driving_cells += 1;
+                fallback()
+            }
+        }
     }
 
     /// Driver delay and output slew for a NLDM arc. With an RC load the table is read at the
@@ -677,30 +754,53 @@ fn run_sta_detail(
         if design.pin_dirs[p] != PinDir::Input || sdc.clock_port.as_deref() == Some(name) {
             continue;
         }
-        let delay = sdc.input_clock_latency_ns(name) + sdc.input_delay_ns(name);
-        let slew = sdc.input_transition_ns(name);
+        let (in_min, in_max) = sdc.input_delay_ns(name);
+        let latency = sdc.input_clock_latency_ns(name);
+        let drive = cx.port_drive(pin, &mut skipped);
         for pol in [RISE, FALL] {
-            state[p].merge(pol, delay, delay, slew, slew);
+            let (slew, drv_delay) = drive[pol];
+            state[p].merge(
+                pol,
+                latency + in_max + drv_delay,
+                latency + in_min + drv_delay,
+                slew,
+                slew,
+            );
         }
     }
 
-    // Ideal clock: every register clock pin and latch enable sees an edge at the clock latency with zero slew.
+    // Ideal clock: every register clock pin and latch enable sees an edge at the clock latency.
+    // `set_clock_transition` is the clock pin's slew; without it the slew is zero.
     let clock_pins = graph.launches.iter().map(|l| l.clk).chain(graph.checks.iter().filter_map(|(_, c)| c.clk));
     for clk in clock_pins {
         for pol in [RISE, FALL] {
-            state[clk.0 as usize].merge(pol, sdc.clock_latency_ns, sdc.clock_latency_ns, 0.0, 0.0);
+            state[clk.0 as usize].merge(pol, sdc.clock_latency_ns, sdc.clock_latency_ns, sdc.clock_transition_ns, sdc.clock_transition_ns);
         }
     }
 
-    let eval_launch = |q: PinId, clk_state: PinTimingState, lib_arc: u32, offset_ns: f32| -> [(PinId, usize, f32, f32); 2] {
+    // A launch produces separate late/early arrivals: the clock edge time (`offset_ns`) is not
+    // derated, but the cell arc delay is, per `set_timing_derate`.
+    let eval_launch = |q: PinId, clk_state: PinTimingState, lib_arc: u32, offset_ns: f32| -> [(PinId, usize, f32, f32, f32, f32); 2] {
         let q_net = design.pin_nets[q.0 as usize];
         let arc = &lib.arcs[lib_arc as usize];
-        let mut res = [(q, RISE, f32::NEG_INFINITY, f32::NEG_INFINITY); 2];
+        let mut res = [(q, RISE, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY); 2];
         if let Some(q_net) = q_net {
             for dst_pol in [RISE, FALL] {
                 if let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) {
-                    let (delay, slew) = cx.driver_response(q_net, dst_pol, delay_table, slew_table, clk_state.slew_max[RISE]);
-                    res[dst_pol] = (q, dst_pol, clk_state.arrival_max[RISE] + offset_ns + delay, slew);
+                    let (late_delay, late_slew) = cx.driver_response(q_net, dst_pol, delay_table, slew_table, clk_state.slew_max[RISE]);
+                    let (early_delay, early_slew) = if clk_state.slew_min[RISE] == clk_state.slew_max[RISE] {
+                        (late_delay, late_slew)
+                    } else {
+                        cx.driver_response(q_net, dst_pol, delay_table, slew_table, clk_state.slew_min[RISE])
+                    };
+                    res[dst_pol] = (
+                        q,
+                        dst_pol,
+                        clk_state.arrival_max[RISE] + offset_ns + late_delay * sdc.derate_late,
+                        clk_state.arrival_min[RISE] + offset_ns + early_delay * sdc.derate_early,
+                        late_slew,
+                        early_slew,
+                    );
                 }
             }
         }
@@ -712,9 +812,9 @@ fn run_sta_detail(
         graph.launches.par_iter().map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, 0.0)).collect()
     };
     for pair in launch_updates {
-        for (q, dst_pol, arrival, slew) in pair {
-            if arrival > f32::NEG_INFINITY {
-                state[q.0 as usize].merge(dst_pol, arrival, arrival, slew, slew);
+        for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
+            if arr_max > f32::NEG_INFINITY {
+                state[q.0 as usize].merge(dst_pol, arr_max, arr_min, slew_max, slew_min);
             }
         }
     }
@@ -726,9 +826,9 @@ fn run_sta_detail(
         .map(|open| eval_launch(open.q, state[open.enable.0 as usize], open.lib_arc, half_period))
         .collect();
     for pair in latch_updates {
-        for (q, dst_pol, arrival, slew) in pair {
-            if arrival > f32::NEG_INFINITY {
-                state[q.0 as usize].merge(dst_pol, arrival, arrival, slew, slew);
+        for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
+            if arr_max > f32::NEG_INFINITY {
+                state[q.0 as usize].merge(dst_pol, arr_max, arr_min, slew_max, slew_min);
             }
         }
     }
@@ -754,13 +854,13 @@ fn run_sta_detail(
                             let degrade = WIRE_SLEW_FACTOR * elmore;
                             if is_port {
                                 let delay = std::f32::consts::LN_2 * elmore;
-                                sink_state.arrival_max[pol] += delay;
-                                sink_state.arrival_min[pol] += delay;
+                                sink_state.arrival_max[pol] += delay * sdc.derate_late;
+                                sink_state.arrival_min[pol] += delay * sdc.derate_early;
                                 sink_state.slew_max[pol] = driver_state.slew_max[pol] + degrade;
                                 sink_state.slew_min[pol] = driver_state.slew_min[pol] + degrade;
                             } else {
-                                sink_state.arrival_max[pol] += elmore;
-                                sink_state.arrival_min[pol] += elmore;
+                                sink_state.arrival_max[pol] += elmore * sdc.derate_late;
+                                sink_state.arrival_min[pol] += elmore * sdc.derate_early;
                                 sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
                                 sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
                             }
@@ -799,8 +899,8 @@ fn run_sta_detail(
                         };
                         next.merge(
                             dst_pol,
-                            src.arrival_max[src_pol] + late_delay,
-                            src.arrival_min[src_pol] + early_delay,
+                            src.arrival_max[src_pol] + late_delay * sdc.derate_late,
+                            src.arrival_min[src_pol] + early_delay * sdc.derate_early,
                             late_slew,
                             early_slew,
                         );
@@ -881,6 +981,7 @@ fn collect_endpoints(
         + graph.gating_enables.len()
         + design.io_pins.iter().filter(|&&p| design.pin_dirs[p.0 as usize] == PinDir::Output).count();
     skipped.sdc_ignored_options = sdc.ignored_options.clone();
+    skipped.sdc_ignored_commands = sdc.ignored_commands.clone();
     skipped.sdc_commands = sdc.commands;
     let mut entries = Vec::new();
     let half_period = 0.5 * sdc.period_ns;
@@ -950,12 +1051,12 @@ fn collect_endpoints(
         }
         let s = state[p];
         let port = cx.port_name(pin);
-        let output_delay = sdc.output_delay_ns(port);
+        let (delay_min, delay_max) = sdc.output_delay_ns(port);
         let latency = sdc.output_clock_latency_ns(port);
         // OpenSTA applies clock uncertainty to output-port required times too (setup subtracts,
-        // hold adds), the same terms the register checks carry.
-        let req_max = latency + sdc.period_ns - output_delay - sdc.setup_uncertainty_ns;
-        let req_min = latency - output_delay + sdc.hold_uncertainty_ns;
+        // hold adds), the same terms the register checks carry. Port delays are not derated.
+        let req_max = latency + sdc.period_ns - delay_max - sdc.setup_uncertainty_ns;
+        let req_min = latency - delay_min + sdc.hold_uncertainty_ns;
         let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
             if !s.reached(pol) {
@@ -2780,7 +2881,7 @@ mod tests {
                     continue;
                 }
                 let Some(wire) = cx.wire_delays(net) else { continue };
-                let drv_arr = (sdc.input_clock_latency_ns(port_name) + sdc.input_delay_ns(port_name)) as f64;
+                let drv_arr = (sdc.input_clock_latency_ns(port_name) + sdc.input_delay_ns(port_name).1) as f64;
                 let drv_slew = sdc.input_transition_ns(port_name) as f64;
 
                 let mut net_elmore = Vec::new();
