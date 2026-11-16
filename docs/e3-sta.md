@@ -218,6 +218,12 @@ generic text above disagree, this section wins.
    `arrival = 0.0` (rise edge at t=0) and **`slew = 0.0`** for both max and min, even though
    `set_input_transition 0.15 [all_inputs]` matches `clk`. Only `RisingEdge` arcs are used
    for `dfxtp`; `min_pulse_width` and other non-delay arcs are ignored.
+   `set_propagated_clock` switches to the propagated mode (`v0.1.60`, roadmap R2): a separate
+   pass walks clock nets through combinational arcs and computes arrival/slew per transition
+   at every consumer clock pin, tracking the clock-edge index parity so inverting paths pick
+   the right capture/hold edge; plain `set_clock_latency` is then ignored and `-source`
+   latency seeds the port. Validated on `tests/designs/sta_edge/propagated_clock/`; details
+   in `docs/results.md`.
 4. **Clock-to-Q.** `RisingEdge` arcs are `non_unate`: evaluate `CLK(RISE) → Q(RISE)` with
    `cell_rise`/`rise_transition` and `CLK(RISE) → Q(FALL)` with `cell_fall`/`fall_transition`,
    both at `in_slew = 0.0` and `out_cap = load(net(Q), pol)`. Check: `_384_/Q` rise

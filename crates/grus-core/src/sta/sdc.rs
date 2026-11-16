@@ -70,6 +70,12 @@ pub struct Sdc {
     pub hold_uncertainty_ns: f32,
     pub clock_latency_ns: f32,
     pub io_clock_latency_ns: f32,
+    /// `set_propagated_clock` on the design clock: clock arrival is propagated through the
+    /// clock network instead of every clock pin seeing the ideal `clock_latency_ns`.
+    pub propagated_clock: bool,
+    /// `set_clock_latency -source`: added on top of the propagated arrival. The plain
+    /// (network) latency is ignored once the clock is propagated.
+    pub clock_source_latency_ns: f32,
     /// Slew seeded on clock pins (`set_clock_transition`); zero without the command.
     pub clock_transition_ns: f32,
     /// Early/late derating of propagated delays (`set_timing_derate`). `finish` normalizes an
@@ -86,8 +92,8 @@ pub struct Sdc {
     /// endpoint matching, so the restriction is dropped and the delay applies to every
     /// selected port.
     pub ignored_options: BTreeMap<String, usize>,
-    /// Commands accepted but not applied to the timing model (`set_max_*`,
-    /// `set_propagated_clock`, a `set_clock_transition` on a virtual clock), by command name.
+    /// Commands accepted but not applied to the timing model (`set_max_*`, a
+    /// `set_clock_transition` on a virtual clock), by command name.
     pub ignored_commands: BTreeMap<String, usize>,
     /// Top-level commands evaluated while parsing; the denominator for `ignored_options`.
     pub commands: usize,
@@ -128,6 +134,9 @@ fn last_value(rules: &[(PortSel, f32)], port: &str, is_input: bool, clock_port: 
 impl Sdc {
     fn latency_ns(&self, clock: ClockRef) -> f32 {
         match clock {
+            // A propagated clock ignores the ideal network latency; `-source` latency is
+            // what remains, and it is what I/O delays are referenced against.
+            ClockRef::Design if self.propagated_clock => self.clock_source_latency_ns,
             ClockRef::Design => self.clock_latency_ns,
             ClockRef::Virtual => self.io_clock_latency_ns,
         }
@@ -458,16 +467,7 @@ impl Interp {
                 Ok(empty())
             }
             "set_propagated_clock" | "unset_propagated_clock" => {
-                // Accepted but unmodelled until R2; reject flag-shaped arguments so a typo
-                // cannot pass silently the way R0's shared flag list allowed.
-                for arg in args {
-                    if let Value::Str(s) = arg
-                        && s.starts_with('-')
-                    {
-                        bail!("{name} takes clock objects, not `{s}`");
-                    }
-                }
-                *self.sdc.ignored_commands.entry(name.to_string()).or_default() += 1;
+                self.propagated_clock(name, args)?;
                 Ok(empty())
             }
             _ => bail!("unsupported command `{name}`"),
@@ -560,17 +560,94 @@ impl Interp {
         Ok(())
     }
 
+    /// `set_clock_latency [-source] <ns> [get_clocks <name>]`. Without `-source` the value
+    /// is the ideal network latency, which a propagated clock ignores; `-source` latency is
+    /// added on top of the propagated arrival. `-early`/`-late` are refused: the model has a
+    /// single latency per clock.
     fn set_clock_latency(&mut self, args: &[Value]) -> Result<()> {
-        let [Value::Str(value), Value::Clocks(names)] = args else {
-            bail!("set_clock_latency takes a value and [get_clocks <name>]");
-        };
-        let [name] = names.as_slice() else {
-            bail!("set_clock_latency takes one clock");
+        let mut source = false;
+        let mut rest = Vec::with_capacity(args.len());
+        for arg in args {
+            match arg {
+                Value::Str(s) if s == "-source" => {
+                    if source {
+                        bail!("duplicate -source");
+                    }
+                    source = true;
+                }
+                Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => {
+                    bail!("unsupported option `{s}`")
+                }
+                value => rest.push(value),
+            }
+        }
+        let (value, clock) = match rest.as_slice() {
+            [Value::Str(value)] => (value, None),
+            [Value::Str(value), Value::Clocks(names)] => match names.as_slice() {
+                [name] => (value, Some(name.as_str())),
+                _ => bail!("set_clock_latency takes one clock"),
+            },
+            // `set_clock_latency 0.5 clk`: write_sdc emits the clock as a bare name.
+            [Value::Str(value), Value::Str(name)] => (value, Some(name.as_str())),
+            _ => bail!("set_clock_latency takes a value and optional clock names"),
         };
         let latency = parse_f32(value)?;
-        match self.resolve_clock(name)? {
-            ClockRef::Design => self.sdc.clock_latency_ns = latency,
+        let clock = clock.map(|n| self.resolve_clock(n)).transpose()?.unwrap_or(ClockRef::Design);
+        match clock {
+            ClockRef::Design => {
+                if source {
+                    self.sdc.clock_source_latency_ns = latency;
+                } else {
+                    self.sdc.clock_latency_ns = latency;
+                }
+            }
+            // A virtual clock is never propagated, so source and network latency coincide
+            // for the I/O checks that read `io_clock_latency_ns`.
             ClockRef::Virtual => self.sdc.io_clock_latency_ns = latency,
+        }
+        Ok(())
+    }
+
+    /// `set_propagated_clock|unset_propagated_clock <clock objects>`. Only the design clock
+    /// is modelled; unsetting a clock that was never propagated is a no-op. The virtual I/O
+    /// clock cannot be propagated: naming it in `set` is an error.
+    fn propagated_clock(&mut self, command: &str, args: &[Value]) -> Result<()> {
+        let mut names = Vec::new();
+        for arg in args {
+            match arg {
+                Value::Str(s) if s.starts_with('-') => bail!("{command} takes clock objects, not `{s}`"),
+                Value::Str(s) => names.extend(s.split_whitespace().map(str::to_string)),
+                Value::Clocks(ns) => names.extend(ns.iter().cloned()),
+                Value::Ports(PortSel::Ports(ns)) => names.extend(ns.iter().cloned()),
+                _ => bail!("{command} takes clock objects"),
+            }
+        }
+        if names.is_empty() {
+            bail!("{command} takes clock objects");
+        }
+        let mut design = false;
+        for clock in &names {
+            match self.resolve_clock(clock) {
+                Ok(ClockRef::Design) => design = true,
+                Ok(ClockRef::Virtual) if command == "set_propagated_clock" => {
+                    bail!("set_propagated_clock does not apply to the virtual clock `{clock}`")
+                }
+                Ok(ClockRef::Virtual) => {}
+                Err(e) => {
+                    // `get_ports {clk}` names the clock's source port; the clock handle is `-name`.
+                    if self.sdc.clock_port.as_deref() == Some(clock.as_str()) {
+                        design = true;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        if command == "set_propagated_clock" && !design {
+            bail!("set_propagated_clock needs the design clock");
+        }
+        if design {
+            self.sdc.propagated_clock = command == "set_propagated_clock";
         }
         Ok(())
     }
@@ -1163,15 +1240,53 @@ mod tests {
         ] {
             assert!(parse_sdc(&format!("{GCD}{snippet}\n")).is_err(), "accepted: {snippet}");
         }
-        // The emitted forms still parse and are counted.
+        // The emitted forms still parse; the propagated clock is modelled, `set_max_*` is counted.
         let sdc = parse_sdc(&format!(
             "{GCD}\
              set_propagated_clock [get_ports {{clk}}]\n\
              set_max_transition 0.75 [current_design]\n"
         ))
         .unwrap();
-        assert_eq!(sdc.ignored_commands["set_propagated_clock"], 1);
+        assert!(sdc.propagated_clock);
         assert_eq!(sdc.ignored_commands["set_max_transition"], 1);
+    }
+
+    #[test]
+    fn propagated_clock_flag_and_source_latency() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_clock_latency 1.0 [get_clocks core_clk]\n\
+             set_clock_latency -source 0.2 [get_clocks core_clk]\n\
+             set_propagated_clock [get_clocks core_clk]\n"
+        ))
+        .unwrap();
+        assert!(sdc.propagated_clock);
+        assert_eq!(sdc.clock_latency_ns, 1.0);
+        assert_eq!(sdc.clock_source_latency_ns, 0.2);
+
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_propagated_clock [get_clocks core_clk]\n\
+             unset_propagated_clock [get_clocks core_clk]\n"
+        ))
+        .unwrap();
+        assert!(!sdc.propagated_clock);
+
+        for snippet in [
+            // The virtual I/O clock cannot be propagated.
+            "set_propagated_clock [get_clocks vclk]",
+            // No design clock named at all.
+            "set_propagated_clock [get_clocks other]",
+            "set_clock_latency -early 0.1 [get_clocks core_clk]",
+            "set_clock_latency -source",
+        ] {
+            let text = if snippet.contains("vclk") {
+                format!("{GCD}create_clock -name vclk -period 5.0\n{snippet}\n")
+            } else {
+                format!("{GCD}{snippet}\n")
+            };
+            assert!(parse_sdc(&text).is_err(), "accepted: {snippet}");
+        }
     }
 
     #[test]

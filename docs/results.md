@@ -1043,3 +1043,58 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
   `write_sdc` syntax, `-min`/`-max`/`-add_delay` (incl. the OpenSTA fold), `-pin_load`, derate,
   clock transition, driving cells, clock-name fallback, argument rejection on ignored commands,
   and `NONDEFAULTRULES`; an analysis test pins the `is_clean` design-rule exemption.
+
+### 2026-11-16 — R2 — Propagated clock through buffers, an inverter, an AND gate and a latch (`v0.1.60`)
+
+- **Fixture**: `tests/designs/sta_edge/propagated_clock/` — hand-written public DEF using only
+  `sky130_fd_sc_hd` cells: `clk` port fans out to `u_ff0`/`u_ff5` clock pins directly and to
+  `u_clkbuf` (`clkbuf_2`), whose output `c1` feeds `u_ff1`/`u_ff6`, `u_clkinv` (`clkinv_2`,
+  inverting branch to `u_ff2`) and `u_clkbuf2` (`clkbuf_4`, to `u_ff4`); `u_and` (`and2_1`,
+  enable `en` on `B`) gates the clock to `u_ff3` and the `dlxtn_1` latch `u_lt/GATE_N`; `u_lt/Q`
+  launches `u_ff5`/`u_ff6`; `u_ff6/Q` drives output `y`. SDC: `set_propagated_clock`,
+  `set_clock_latency 1.0` (ideal, ignored) + `set_clock_latency -source 0.2`,
+  `set_clock_transition 0.1`, `set_clock_uncertainty 0.1`, I/O delays 0.5 ns. No stock
+  benchmark DEF has a buffered clock tree (gcd's `clk` net reaches every `CLK` pin directly —
+  0 `clkbuf`/`clk_gate` cells), so the fixture is synthetic, same pattern as the other
+  `sta_edge` cases. Golden `propagated_clock.reference.json` is emitted by OpenSTA inside
+  `ghcr.io/librelane/librelane:3.0.16` via the committed `generate_ref.sh`.
+- **Model**: `propagate_clock` walks the levelized combinational graph along clock nets only
+  (clock-net marking keeps clock arrival out of data paths) and computes per-transition
+  arrival and slew at every reached pin with the same NLDM/derate/net-load machinery as data
+  arcs. It also tracks, per pin and transition, the parity (mod 2) of the clock-edge index
+  that produced the earliest arrival — inverting cells flip it. Consumer pins (register `CLK`,
+  latch enables, clock-gate clock inputs) receive the propagated state; ideal mode is
+  unchanged when `set_propagated_clock` is absent.
+- **Edge semantics** (verified against OpenSTA `report_checks`, not assumed):
+  - Setup capture = the capture pin's first rise when it sits on clock edge 1 (odd parity,
+    e.g. `u_ff2/CLK` behind `clkinv`), otherwise that rise plus one period.
+  - Hold pairs the capture edge with the next rising launch edge: odd-parity capture shifts
+    the reported min arrival by one period (`u_ff2/D` min_arr 5.854 ns = launch on clock edge
+    2, matching OpenSTA exactly).
+  - Latch borrow required time = the propagated **fall** arrival at `GATE_N` **minus** setup
+    clock uncertainty (OpenSTA `report_checks -path_delay max -to u_lt/D`: fall edge 2.50 +
+    network 0.38 - unc 0.10 = 2.78).
+  - AND-gate enable: setup vs the next rise, hold vs the fall, with the same parity shift.
+  - `set_clock_latency` without `-source` is ignored under propagation; `-source` latency and
+    `set_clock_transition` seed the source port and are also the reference for I/O delays
+    (OpenSTA reports "clock network delay (propagated) 0.20" at the input port).
+- **Comparison** (all 10 endpoints, zero wire): worst abs diff 22.8 ps (`u_ff5/D`
+  `max_arr_ns`), every field within `Tol::PROPAGATED_CLOCK` (abs 30 ps / slew 2% / TNS 2%).
+  WNS max 1.7877 vs 1.7897 ns, WNS min -2.1000 vs -2.1000 ns. The residual is a uniform
+  ~10-23 ps early bias on clock-referenced fields: per-cell NLDM differences accumulate over
+  the 4-stage tree (direct net, `clkbuf`, `clkinv`, `clkbuf2`, `and2` branches); data-path
+  fields not touching the clock (`u_and/B` enable, `y` slew) match exactly or within ps.
+- **Known approximations** (documented, not silent): the launch side of the hold/setup edge
+  pairing assumes clock-edge parity 0 — an endpoint launched through an inverting clock path
+  pairs a different edge and is not corrected; `unset_propagated_clock` after `set` is
+  honoured; propagating the virtual I/O clock is rejected; clock nets the propagation cannot
+  reach (behind latches/unmapped cells) still count in `cell_driven_clock_nets`. The fixture
+  run still skips 9/39 arcs (`Other=7`, latch `Combinational=1`/`Other=1`) so `--strict`
+  fails on it — the skip accounting is honest, the comparison test does not use strict.
+- **Verification**: `cargo test --workspace` 182 passed / 0 failed / 7 ignored (all pre-existing
+  ignores); `cargo clippy --workspace --all-targets -- -D warnings` clean. New test
+  `test_sta_edge_propagated_clock` compares all 10 endpoints and WNS/TNS against the OpenSTA
+  golden; SDC tests cover `set_propagated_clock`/`unset_propagated_clock` flag rejection,
+  virtual-clock rejection, and the `-source` vs plain latency split. Ideal-clock mode is
+  regression-covered by every existing `sta_edge` and design test (parity paths are no-ops
+  without the flag).
