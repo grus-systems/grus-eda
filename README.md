@@ -102,3 +102,10 @@ The archive holds the `grus-eda` executable at its root, which mise puts on
 None on other Grus repositories. The reference tools come from the LibreLane
 container image (`ghcr.io/librelane/librelane:3.0.16`). Test designs are public
 (OpenROAD-flow-scripts sky130hd designs, picorv32).
+
+## License
+
+grus-eda is licensed under the [Apache License 2.0](LICENSE). The test designs
+under `tests/designs/` keep their own upstream licenses (BSD, ISC, Apache-2.0);
+see [`tests/designs/README.md`](tests/designs/README.md) for the provenance and
+license of each.
