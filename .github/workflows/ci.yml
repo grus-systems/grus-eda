@@ -23,10 +23,10 @@ concurrency:
 
 jobs:
   generate:
-    # Never on pull requests, and only while the repository is private: the
-    # org's self-hosted Mac mini must not run code from a public repository's
-    # forks, and its runner group does not serve public repositories.
-    if: github.event_name != 'pull_request' && github.event.repository.private
+    # Never on pull requests: this repository is public, and the org's
+    # self-hosted Mac mini must not run code from a fork's pull request. Pushes
+    # and manual runs come from people with write access only.
+    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     steps:
@@ -114,7 +114,7 @@ jobs:
 
   test:
     needs: generate
-    if: github.event_name != 'pull_request' && github.event.repository.private
+    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     steps:
