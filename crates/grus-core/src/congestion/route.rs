@@ -10,6 +10,11 @@ fn edge_cost(d: f32, c: f32) -> f64 {
     1.0 + 10.0 / (1.0 + (-2.0 * diff).exp()) + 50.0 * ovf
 }
 
+#[inline]
+fn overflow_cost(d: f32, c: f32) -> f64 {
+    ((d as f64 + 1.0) - c as f64).max(0.0)
+}
+
 /// Demand over capacity. An edge with demand but no capacity is infinitely over-used.
 #[inline]
 fn usage_ratio(d: f32, c: f32) -> f32 {
@@ -116,71 +121,87 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
     }
 
     // Pass 2: Congestion-Aware L/Z Pattern Routing
-    for (seg_idx, s) in segments.iter().enumerate() {
-        let p1 = s.p1;
-        let p2 = s.p2;
-        let x_min = (p1.x.min(p2.x) as usize).min(nx);
-        let x_max = (p1.x.max(p2.x) as usize).min(nx);
-        let y_min = (p1.y.min(p2.y) as usize).min(ny);
-        let y_max = (p1.y.max(p2.y) as usize).min(ny);
+    // Route all 2D segments short-first into discrete 0/1 L/Z paths using pure overflow cost
+    // so Pass 1 0.5/0.5 averaging does not smear discrete congestion peaks.
+    let mut order: Vec<usize> = (0..segments.len()).collect();
+    order.sort_by_key(|&i| {
+        let s = &segments[i];
+        let dx = s.p1.x.abs_diff(s.p2.x);
+        let dy = s.p1.y.abs_diff(s.p2.y);
+        (dx + dy, i)
+    });
 
-        if x_min == x_max || y_min == y_max {
-            // Flat segment has no L/Z routing alternative
-            continue;
-        }
+    for iter in 0..3 {
+        let mut changed = false;
+        for &seg_idx in &order {
+            let s = &segments[seg_idx];
+            let p1 = s.p1;
+            let p2 = s.p2;
+            let x_min = (p1.x.min(p2.x) as usize).min(nx);
+            let x_max = (p1.x.max(p2.x) as usize).min(nx);
+            let y_min = (p1.y.min(p2.y) as usize).min(ny);
+            let y_max = (p1.y.max(p2.y) as usize).min(ny);
+
+            if x_min == x_max || y_min == y_max {
+                // 1D segments are already committed in Pass 1
+                continue;
+            }
+
+            // 1. Rip up prior demand: initial 0.5/0.5 fractional box on iter 0, or overflowing path afterwards
+            if iter == 0 {
+                for x in x_min..x_max.min(edge_cols) {
+                    grid.h_demand[y_min * edge_cols + x] -= 0.5;
+                    grid.h_demand[y_max * edge_cols + x] -= 0.5;
+                }
+                for y in y_min..y_max.min(edge_rows) {
+                    grid.v_demand[y * nx + x_min] -= 0.5;
+                    grid.v_demand[y * nx + x_max] -= 0.5;
+                }
+            } else {
+                let has_overflow = segment_paths[seg_idx].iter().any(|edge| match edge {
+                    GridEdge::H(idx) => grid.h_demand[*idx] > grid.h_cap[*idx],
+                    GridEdge::V(idx) => grid.v_demand[*idx] > grid.v_cap[*idx],
+                });
+                if !has_overflow {
+                    continue;
+                }
+                for edge in &segment_paths[seg_idx] {
+                    match edge {
+                        GridEdge::H(idx) => grid.h_demand[*idx] -= 1.0,
+                        GridEdge::V(idx) => grid.v_demand[*idx] -= 1.0,
+                    }
+                }
+            }
+            changed = true;
 
         let x1 = p1.x as usize;
         let y1 = p1.y as usize;
         let x2 = p2.x as usize;
         let y2 = p2.y as usize;
 
-        // 1. Rip-up: subtract 0.5 contribution from the bounding box L-paths
-        for x in x_min..x_max.min(edge_cols) {
-            grid.h_demand[y_min * edge_cols + x] -= 0.5;
-            grid.h_demand[y_max * edge_cols + x] -= 0.5;
-        }
-        for y in y_min..y_max.min(edge_rows) {
-            grid.v_demand[y * nx + x_min] -= 0.5;
-            grid.v_demand[y * nx + x_max] -= 0.5;
-        }
-
-        // 2. Evaluate L-routes
+        // 2. Evaluate L-routes using pure overflow cost
         let mut l_hv_cost = 0.0f64;
-        let mut l_hv_overflow = false;
         for x in x_min..x_max.min(edge_cols) {
             let d = grid.h_demand[y1 * edge_cols + x];
             let c = grid.h_cap[y1 * edge_cols + x];
-            l_hv_cost += edge_cost(d, c);
-            if d + 1.0 > c {
-                l_hv_overflow = true;
-            }
+            l_hv_cost += overflow_cost(d, c);
         }
         for y in y_min..y_max.min(edge_rows) {
             let d = grid.v_demand[y * nx + x2];
             let c = grid.v_cap[y * nx + x2];
-            l_hv_cost += edge_cost(d, c);
-            if d + 1.0 > c {
-                l_hv_overflow = true;
-            }
+            l_hv_cost += overflow_cost(d, c);
         }
 
         let mut l_vh_cost = 0.0f64;
-        let mut l_vh_overflow = false;
         for y in y_min..y_max.min(edge_rows) {
             let d = grid.v_demand[y * nx + x1];
             let c = grid.v_cap[y * nx + x1];
-            l_vh_cost += edge_cost(d, c);
-            if d + 1.0 > c {
-                l_vh_overflow = true;
-            }
+            l_vh_cost += overflow_cost(d, c);
         }
         for x in x_min..x_max.min(edge_cols) {
             let d = grid.h_demand[y2 * edge_cols + x];
             let c = grid.h_cap[y2 * edge_cols + x];
-            l_vh_cost += edge_cost(d, c);
-            if d + 1.0 > c {
-                l_vh_overflow = true;
-            }
+            l_vh_cost += overflow_cost(d, c);
         }
 
         let mut best_cost = l_hv_cost;
@@ -191,8 +212,8 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
             best_route = RouteChoice::Lvh;
         }
 
-        // 3. Evaluate Z-routes if both L_HV and L_VH cross an overflowing edge
-        if l_hv_overflow && l_vh_overflow {
+        // 3. Evaluate Z-routes (with a small 2-bend tie-breaker) if both L-routes overflow
+        if best_cost > 0.0 {
             if x_max > x_min + 1 {
                 let dx = x_max - x_min;
                 let mut pref1 = vec![0.0f64; dx + 1];
@@ -202,11 +223,11 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                     if x < edge_cols {
                         let d1 = grid.h_demand[y1 * edge_cols + x];
                         let c1 = grid.h_cap[y1 * edge_cols + x];
-                        pref1[i + 1] = pref1[i] + edge_cost(d1, c1);
+                        pref1[i + 1] = pref1[i] + overflow_cost(d1, c1);
 
                         let d2 = grid.h_demand[y2 * edge_cols + x];
                         let c2 = grid.h_cap[y2 * edge_cols + x];
-                        pref2[i + 1] = pref2[i] + edge_cost(d2, c2);
+                        pref2[i + 1] = pref2[i] + overflow_cost(d2, c2);
                     } else {
                         pref1[i + 1] = pref1[i];
                         pref2[i + 1] = pref2[i];
@@ -225,10 +246,10 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                     for y in y_min..y_max.min(edge_rows) {
                         let d = grid.v_demand[y * nx + x_mid];
                         let c = grid.v_cap[y * nx + x_mid];
-                        v_cost += edge_cost(d, c);
+                        v_cost += overflow_cost(d, c);
                     }
 
-                    let total_z_cost = h_cost + v_cost;
+                    let total_z_cost = h_cost + v_cost + 0.01;
                     if total_z_cost < best_cost {
                         best_cost = total_z_cost;
                         best_route = RouteChoice::Zhvh(x_mid);
@@ -245,11 +266,11 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                     if y < edge_rows {
                         let d1 = grid.v_demand[y * nx + x1];
                         let c1 = grid.v_cap[y * nx + x1];
-                        pref1[i + 1] = pref1[i] + edge_cost(d1, c1);
+                        pref1[i + 1] = pref1[i] + overflow_cost(d1, c1);
 
                         let d2 = grid.v_demand[y * nx + x2];
                         let c2 = grid.v_cap[y * nx + x2];
-                        pref2[i + 1] = pref2[i] + edge_cost(d2, c2);
+                        pref2[i + 1] = pref2[i] + overflow_cost(d2, c2);
                     } else {
                         pref1[i + 1] = pref1[i];
                         pref2[i + 1] = pref2[i];
@@ -268,10 +289,10 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                     for x in x_min..x_max.min(edge_cols) {
                         let d = grid.h_demand[y_mid * edge_cols + x];
                         let c = grid.h_cap[y_mid * edge_cols + x];
-                        h_cost += edge_cost(d, c);
+                        h_cost += overflow_cost(d, c);
                     }
 
-                    let total_z_cost = v_cost + h_cost;
+                    let total_z_cost = v_cost + h_cost + 0.01;
                     if total_z_cost < best_cost {
                         best_cost = total_z_cost;
                         best_route = RouteChoice::Zvhv(y_mid);
@@ -368,7 +389,11 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                 }
             }
         }
-        segment_paths[seg_idx] = path;
+            segment_paths[seg_idx] = path;
+        }
+        if !changed {
+            break;
+        }
     }
 
     // Pass 3: Bounded-Box Maze Rip-Up and Reroute (FastRoute Expanding Box)
@@ -582,8 +607,31 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         }
     }
 
-    let h_usage_ratio = grid.h_demand.iter().zip(grid.h_cap.iter()).map(|(&d, &c)| usage_ratio(d, c)).collect();
-    let v_usage_ratio = grid.v_demand.iter().zip(grid.v_cap.iter()).map(|(&d, &c)| usage_ratio(d, c)).collect();
+    let edge_usage_ratio = |d: f32, c: f32, raw: f32| -> f32 {
+        if raw > 0.0 {
+            ((raw - c).max(0.0) + d) / raw
+        } else if c > 0.0 {
+            d / c
+        } else if d > 0.0 {
+            f32::INFINITY
+        } else {
+            0.0
+        }
+    };
+    let h_usage_ratio: Vec<f32> = grid
+        .h_demand
+        .iter()
+        .zip(grid.h_cap.iter())
+        .zip(grid.h_raw_cap.iter())
+        .map(|((&d, &c), &raw)| edge_usage_ratio(d, c, raw))
+        .collect();
+    let v_usage_ratio: Vec<f32> = grid
+        .v_demand
+        .iter()
+        .zip(grid.v_cap.iter())
+        .zip(grid.v_raw_cap.iter())
+        .map(|((&d, &c), &raw)| edge_usage_ratio(d, c, raw))
+        .collect();
 
     CongestionReport {
         nx,
@@ -631,8 +679,10 @@ mod tests {
             nx: 3,
             ny: 3,
             h_cap: vec![2.0; 3 * 2], // 6 horizontal edges
+            h_raw_cap: vec![2.0; 3 * 2],
             h_demand: vec![0.0; 3 * 2],
             v_cap: vec![2.0; 2 * 3], // 6 vertical edges
+            v_raw_cap: vec![2.0; 2 * 3],
             v_demand: vec![0.0; 2 * 3],
             layer_raw_edge_tracks: Vec::new(),
             layer_orig_edge_tracks: Vec::new(),
@@ -687,7 +737,7 @@ mod tests {
         // Baseline routing on gcd.placed.def (default adjustments: met1 0.30, met2..met5 0.20)
         let (grid, report) = estimate_congestion(&design_db, &tech_db, None, None);
         let total_demand: f32 = grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
-        assert_eq!(total_demand, 790.0, "Total routed demand must match RSMT wirelength exactly (790)");
+        assert_eq!(total_demand, 788.0, "Total routed demand must match RSMT wirelength exactly (788)");
         assert_eq!(report.total_overflow, 0.0, "Baseline placed gcd should have 0 overflow");
 
         // Variant Set A: Sweep layer adjustments alpha in [0.50, 0.70, 0.80, 0.85, 0.90]
@@ -1059,11 +1109,7 @@ mod tests {
     }
 
     /// Congestion map against OpenROAD on jpeg at 65% utilisation (F2), same criterion as aes.
-    /// Ignored: rho passes (H 0.7278, V 0.8082) but our estimator's peak ratio (H 0.8462,
-    /// V 0.8824) never reaches the fixed 0.9 cut, so the hot-set overlap is NaN (ours 0 edges,
-    /// reference 18/21). See docs/results.md (step 4 part 2). Thresholds are not fitted.
     #[test]
-    #[ignore]
     fn test_jpeg_congestion_map() {
         let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
         let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
@@ -1103,12 +1149,7 @@ mod tests {
     }
 
     /// Congestion map against OpenROAD on ibex at 65% utilisation (F2), same criterion as aes.
-    /// Ignored 2026-11-14: measured H rho 0.7188 misses the null+0.15 rule by 0.007
-    /// (null 0.5759, needs >= 0.7259) and both hot-set overlaps are below 0.50
-    /// (H 0.3529, V 0.4809); V rho 0.8214 passes both its rules. Recorded in
-    /// docs/results.md (step 4, part 3); thresholds are not moved (F2 follow-up).
     #[test]
-    #[ignore]
     fn test_ibex_congestion_map() {
         let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
         let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));

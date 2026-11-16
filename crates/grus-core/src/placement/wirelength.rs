@@ -319,6 +319,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 1,
             obs_rects: Vec::new(),
+            pin_obs_rects: Vec::new(),
         };
         tech_db.macros.push(mac);
         tech_db.macro_by_name.insert(m_name, MacroId(0));

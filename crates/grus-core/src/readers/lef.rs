@@ -420,6 +420,7 @@ fn parse_macro(
     let mut class = MacroClass::Core;
     let mut size_dbu = None;
     let mut obs_rects = Vec::new();
+    let mut pin_obs_rects = Vec::new();
     let dbu = tech_db.dbu_per_micron as f32;
     let mut closed = false;
 
@@ -456,7 +457,7 @@ fn parse_macro(
                     (h_um * dbu).round() as i32,
                 ));
             } else if w.eq_ignore_ascii_case("PIN") {
-                parse_pin(lexer, tech_db, interner)?;
+                parse_pin(lexer, tech_db, interner, &mut pin_obs_rects)?;
             } else if w.eq_ignore_ascii_case("OBS") {
                 parse_obs(lexer, tech_db, interner, &mut obs_rects)?;
             } else {
@@ -485,6 +486,7 @@ fn parse_macro(
         pin_offset,
         pin_count,
         obs_rects,
+        pin_obs_rects,
     });
 
     Ok(())
@@ -556,12 +558,14 @@ fn parse_pin(
     lexer: &mut LefLexer,
     tech_db: &mut TechDb,
     interner: &mut StringInterner,
+    pin_obs_rects: &mut Vec<(LayerId, RectDbu)>,
 ) -> Result<()> {
     let pin_name = required_word(lexer, "PIN name")?.to_string();
     let pin_sym = interner.intern(&pin_name);
     let mut dir = PinDir::Input;
     let mut is_power = false;
     let mut pin_layer = None;
+    let mut local_pin_rects: Vec<(LayerId, RectDbu)> = Vec::new();
 
     let mut sum_twice_center_x: i64 = 0;
     let mut sum_twice_center_y: i64 = 0;
@@ -597,6 +601,7 @@ fn parse_pin(
                     }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("PORT") {
+                let mut current_port_layer = None;
                 while let Some(port_tok) = lexer.next_token() {
                     if let Token::Word(pw) = port_tok {
                         if pw.eq_ignore_ascii_case("END") {
@@ -606,6 +611,7 @@ fn parse_pin(
                             let lname = required_word(lexer, "PIN PORT LAYER")?;
                             let lsym = interner.intern(lname);
                             let l_id = tech_db.layer_by_name.get(&lsym).copied();
+                            current_port_layer = l_id;
                             if pin_layer.is_none() && l_id.is_some() {
                                 pin_layer = l_id;
                             }
@@ -620,6 +626,18 @@ fn parse_pin(
                             let y1_dbu = (y1 * dbu).round() as i32;
                             let x2_dbu = (x2 * dbu).round() as i32;
                             let y2_dbu = (y2 * dbu).round() as i32;
+
+                            if let Some(layer_id) = current_port_layer {
+                                local_pin_rects.push((
+                                    layer_id,
+                                    RectDbu::new(
+                                        x1_dbu.min(x2_dbu),
+                                        y1_dbu.min(y2_dbu),
+                                        x1_dbu.max(x2_dbu),
+                                        y1_dbu.max(y2_dbu),
+                                    ),
+                                ));
+                            }
 
                             sum_twice_center_x += (x1_dbu + x2_dbu) as i64;
                             sum_twice_center_y += (y1_dbu + y2_dbu) as i64;
@@ -637,6 +655,11 @@ fn parse_pin(
     }
     if !closed {
         bail!("LEF: PIN {pin_name} is not terminated by END {pin_name} (truncated file?)");
+    }
+
+    if !local_pin_rects.is_empty() {
+        merge_connected_obs(&mut local_pin_rects);
+        pin_obs_rects.extend(local_pin_rects);
     }
 
     let (offset_x_dbu, offset_x_frac) = mean_center(sum_twice_center_x, rect_count);

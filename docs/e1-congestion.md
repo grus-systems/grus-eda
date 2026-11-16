@@ -29,11 +29,13 @@ pub struct GCellGrid {
     /// Horizontal boundary edges between (x, y) and (x + 1, y):
     /// indexed by `y * (nx - 1) + x`, length `ny * (nx - 1)`
     pub h_cap: Vec<f32>,
+    pub h_raw_cap: Vec<f32>,
     pub h_demand: Vec<f32>,
 
     /// Vertical boundary edges between (x, y) and (x, y + 1):
     /// indexed by `y * nx + x`, length `(ny - 1) * nx`
     pub v_cap: Vec<f32>,
+    pub v_raw_cap: Vec<f32>,
     pub v_demand: Vec<f32>,
 
     /// Per-layer totals (indexed by `LayerId(0..tech_db.layers.len())`) for direct
@@ -64,6 +66,8 @@ pub struct CongestionReport {
     pub top_05pct_overflow: f32,
     pub overflow_gcells: usize,
     pub gcell_usage_ratio: Vec<f32>, // length nx * ny, max(demand/cap) over adjacent edges
+    pub h_usage_ratio: Vec<f32>,     // length ny * (nx - 1)
+    pub v_usage_ratio: Vec<f32>,     // length (ny - 1) * nx
 }
 ```
 
@@ -103,10 +107,10 @@ pub struct CongestionReport {
        - Across the $ny - 1$ vertical edges in column $x$, the raw edge track count is `raw_tracks_x[x]`, contributing `(ny - 1) * raw_tracks_x[x]` to `layer_raw_edge_tracks[l]`.
 
 3. **Obstruction (`OBS`) Merging, `SPECIALNETS` Deduction & Layer Derating**:
-   - **Connected-Component Merging of Macro `OBS` in LEF (`readers/lef.rs`)**:
-     In `sky130_fd_sc_hd.lef`, a single internal `met1` jumper in cells like `dfxtp_2`, `xnor2_2`, and `xor2_2` is decomposed into 5–7 touching `RECT` statements (a main bar plus small via-enclosure pads). At the end of `parse_macro` in `readers/lef.rs`, merge any two `obs_rects` on the same `LayerId` that touch or overlap (`a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh`) into their bounding box union until fixed point.
-   - **Instance `OBS` 8-Orientation Transform**:
-     For every `Fixed` or `Placed` cell instance $c$ at `(cx, cy)` with macro size `(w, h)` and orientation `orient`, transform each macro `(layer, rect)` into DBU coordinates `(xl, yl, xh, yh)`:
+   - **Connected-Component Merging of Macro `OBS` and Macro Pin Geometry (`readers/lef.rs`)**:
+     In `sky130_fd_sc_hd.lef`, a single internal `met1` jumper in cells like `dfxtp_2`, `xnor2_2`, and `xor2_2` is decomposed into 5–7 touching `RECT` statements (a main bar plus small via-enclosure pads). At the end of `parse_macro` in `readers/lef.rs`, merge any two `obs_rects` on the same `LayerId` that touch or overlap (`a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh`) into their bounding box union until fixed point, and record signal/PG LEF `PIN` routing-layer geometry separately in `MacroDef::pin_obs_rects` so pin shapes also block GCell tracks.
+   - **Instance `OBS` + Pin 8-Orientation Transform**:
+     For every `Fixed` or `Placed` cell instance $c$ at `(cx, cy)` with macro size `(w, h)` and orientation `orient`, transform each macro `(layer, rect)` in `obs_rects` and `pin_obs_rects` into DBU coordinates `(xl, yl, xh, yh)`:
      - `N`: `(cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh)`
      - `S`: `(cx + w - r.xh, cy + h - r.yh, cx + w - r.xl, cy + h - r.yl)`
      - `W`: `(cx + h - r.yh, cy + r.xl, cx + h - r.yl, cy + r.xh)`
@@ -120,7 +124,7 @@ pub struct CongestionReport {
    - **Per-Edge 1D Cross-Track Interval Union & Track Deduction**:
      For each routing layer $l$ with pitch $P_l = \text{pitch\_dbu}(l)$ and layer adjustment $\alpha_l \in [0.0, 1.0]$ (default `sky130hd` adjustments: `met1: 0.30`, `met2..met5: 0.20`, overridable via uniform or per-layer adjustment):
      - If layer $l$ is `Horizontal`:
-       - Each obstacle `(xl, yl, xh, yh)` on layer $l$ maps to $gx_1 = \text{gcell\_x}(xl)$, $gx_2 = \text{gcell\_x}(xh)$, $gy_1 = \text{gcell\_y}(yl)$, $gy_2 = \text{gcell\_y}(yh)$.
+       - Each obstacle `(xl, yl, xh, yh)` on layer $l$ maps to $gx_1 = \text{gcell\_x}(xl)$, $gx_2 = \text{gcell\_x}((xh - 1).\max(xl))$, $gy_1 = \text{gcell\_y}(yl)$, $gy_2 = \text{gcell\_y}((yh - 1).\max(yl))$ (treating exclusive upper bounds cleanly at GCell boundaries).
        - For each row $y \in [gy_1, gy_2]$ and horizontal edge column $x \in [gx_1, \min(\max(gx_1, gx_2 - 1), nx - 2)]$, clip the obstacle's Y-span to row $y$: $[s, e] = [\max(yl, Y_y), \min(yh, Y_{y+1})]$. If $e > s$, record interval $(s, e)$ on edge $(x, y)$.
        - On each horizontal edge $(x, y)$, sort and merge overlapping/touching 1D intervals $(s_i, e_i)$, and compute blocked tracks:
          $$\text{blocked}(l, x, y) = \sum_{i} \frac{e_i - s_i + P_l - 1}{P_l}$$
@@ -130,8 +134,9 @@ pub struct CongestionReport {
        - Accumulate `orig` into `layer_orig_edge_tracks[l]`, `derated` into `layer_derated_edge_tracks[l]`, and add `derated as f32` to `h_cap[y * (nx - 1) + x]`.
      - If layer $l$ is `Vertical`:
        - Symmetric: for each column $x \in [gx_1, gx_2]$ and vertical edge row $y \in [gy_1, \min(\max(gy_1, gy_2 - 1), ny - 2)]$, clip the obstacle's X-span to $[X_x, X_{x+1})$, sort and merge 1D intervals on edge $(x, y)$, sum $\lceil (e_i - s_i) / P_l \rceil$, compute `orig` and `derated`, and add `derated as f32` to `v_cap[y * nx + x]`.
+     - Also record raw per-edge track totals in `h_raw_cap` and `v_raw_cap` so per-edge usage ratios match `dbGCellGrid`.
    - **Note on `met1` Internal Jumpers vs. Boost.Polygon Slicing**:
-     On `gcd.placed.def`, this formula matches OpenROAD's `dbGCellGrid` raw edge capacities on all 5 layers (`3624, 2600, 1812, 1300, 360`) and matches OpenROAD's `[INFO GRT-0053]` `Original` and `Derated` resources **to the exact integer** on `met2` (`2504 / 1996`), `met3` (`1781 / 1399`), `met4` (`1252 / 926`), and `met5` (`324 / 180`). On `met1`, OpenROAD's `Boost.Polygon` `get_rectangles` slices the via-pad T-shapes of `dfxtp_2` jumpers vertically before mapping to GCells, yielding `2705 / 1815` vs. our merged-jumper `2800 / 1876` (total derated capacity across `met1..met5` is `6377` vs. OpenROAD's `6316`, within `0.96%`).
+     On `gcd.placed.def`, this formula matches OpenROAD's `dbGCellGrid` raw edge capacities on all 5 layers (`3624, 2600, 1812, 1300, 360`) and matches OpenROAD's `[INFO GRT-0053]` `Original` and `Derated` resources **to the exact integer** on `met2` (`2504 / 1996`), `met3` (`1781 / 1399`), `met4` (`1252 / 926`), and `met5` (`324 / 180`). On `met1`, including `pin_obs_rects` and exclusive upper bounds gives `2748 / 1843` vs. OpenROAD's `2705 / 1815` (total derated capacity across `met1..met5` is `6344` vs. OpenROAD's `6316`, within `0.44%`).
 
 ---
 
@@ -149,8 +154,8 @@ pub struct CongestionReport {
      $$x_s = \text{median}(x_0, x_1, x_2), \quad y_s = \text{median}(y_0, y_1, y_2)$$
      Emit up to 3 non-zero-length segments connecting each $(x_i, y_i)$ to $(x_s, y_s)$.
    - **$k \ge 4$ (Prim's Rectilinear MST + L-Flip Steiner Refinement)**:
-     1. Run Prim's algorithm in $O(k^2)$ on the $k$ points using Manhattan distance $d(u, v) = |x_u - x_v| + |y_u - y_v|$ (using stack-allocated arrays for $k \le 64$, no heap allocation).
-     2. Refine adjacent MST edges sharing a common vertex $u$: if two edges $(u, v)$ and $(u, w)$ overlap in horizontal or vertical projection, insert the Steiner point $(x_s, y_s) = (\text{median}(x_u, x_v, x_w), \text{median}(y_u, y_v, y_w))$ to eliminate double-counted trunk wirelength (matching FLUTE within ~1–2% on degree 4–12 nets).
+     1. Run Prim's algorithm in $O(k^2)$ on the $k$ points using Manhattan distance $d(u, v) = |x_u - x_v| + |y_u - y_v|$ (using stack-allocated arrays for $k \le 64$, no heap allocation), breaking equal-distance ties toward smaller $|y_v - y_u|$ (preferring same-row horizontal standard-cell connections) and then smaller vertex index.
+     2. Refine adjacent MST edges sharing a common vertex $u$: if two edges $(u, v)$ and $(u, w)$ overlap in horizontal or vertical projection, insert the Steiner point $(x_s, y_s) = (\text{median}(x_u, x_v, x_w), \text{median}(y_u, y_v, y_w))$ to eliminate double-counted trunk wirelength (788 GCell units on `gcd` vs OpenROAD's 812 routed edge demand).
 
 ---
 
@@ -169,17 +174,22 @@ Initialize `h_demand` and `v_demand` to `0.0`. For each `SteinerSegment { p1, p2
     - Vertical legs at $x = x_{\min}$ and $x = x_{\max}$ for $y \in [y_{\min}, y_{\max})$ get `+0.5`.
 
 #### Pass 2: Congestion-Aware L/Z Pattern Routing
-Using the initial demand from Pass 1, define the edge cost for routing `+1.0` demand across an edge with current demand $d$ and capacity $c$:
-$$\text{cost}(d, c) = 1.0 + \frac{10.0}{1.0 + \exp\bigl(-2.0 \cdot (d + 1.0 - c)\bigr)} + 50.0 \cdot \max(0.0,\; d + 1.0 - c)$$
-Here the logistic term penalizes edges approaching saturation ($d + 1 \approx c$) while the linear overflow term ($50.0 \cdot \max(0, d + 1 - c)$) prevents sigmoid saturation when $d - c \gg 1$ and strongly prefers detouring into free neighboring channels over creating overflow.
+For Pass 2 pattern selection, score adding `+1.0` demand over current demand $d$ and capacity $c$ with **pure overflow cost**:
+$$\text{overflow\_cost}(d, c) = \max(0.0,\; d + 1.0 - c)$$
+Using pure overflow cost rather than a sub-capacity sigmoid avoids over-smoothing near-capacity peaks (usage ratios in $[0.90, 1.00]$) while routing around actual channel overflow.
 
-Iterate over all non-degenerate 2D `SteinerSegment`s `(p1, p2)`:
-1. Subtract the segment's Pass 1 `0.5` contribution from the two bounding-box L-paths (rip-up).
-2. Evaluate the two **L-shape** routes:
+Sort 2D `SteinerSegment`s short-first by `(dx + dy, seg_idx)` for deterministic rip-up-and-reroute across up to 3 iterations:
+1. **Rip-up**:
+   - On iteration `0`, subtract every 2D segment's Pass 1 `0.5` contribution from the two bounding-box L-paths so all 2D segments commit to concrete `0/1` paths instead of leaving `0.5/0.5` fractional averaging on non-overflowing edges.
+   - On iterations `1..2`, rip up (`-1.0`) and re-route only segments whose committed path traverses at least one overflowing edge (`d > c`), stopping early if none overflow.
+2. Evaluate the two **L-shape** routes under `overflow_cost(d, c)`:
    - $L_{\text{HV}}$: horizontal along $y = p_1.y$ from $p_1.x$ to $p_2.x$, then vertical along $x = p_2.x$ from $p_1.y$ to $p_2.y$.
    - $L_{\text{VH}}$: vertical along $x = p_1.x$ from $p_1.y$ to $p_2.y$, then horizontal along $y = p_2.y$ from $p_1.x$ to $p_2.x$.
-3. If both $L_{\text{HV}}$ and $L_{\text{VH}}$ traverse at least one edge with $d + 1.0 > c$, also evaluate **Z-shape** routes (horizontal-vertical-horizontal via intermediate column $x_{\text{mid}} \in (x_{\min}, x_{\max})$, and vertical-horizontal-vertical via intermediate row $y_{\text{mid}} \in (y_{\min}, y_{\max})$) in $O(\Delta x + \Delta y)$ time using prefix sums along the bounding box.
-4. Commit `+1.0` demand along the minimum-cost route and record the segment's committed edge list. (For flat horizontal or flat vertical segments from Pass 1, record their straight-line edge list.)
+3. If `best_cost > 0.0` (both L-routes overflow), also evaluate **Z-shape** routes (horizontal-vertical-horizontal via intermediate column $x_{\text{mid}} \in (x_{\min}, x_{\max})$, and vertical-horizontal-vertical via intermediate row $y_{\text{mid}} \in (y_{\min}, y_{\max})$) in $O(\Delta x + \Delta y)$ time using prefix sums along the bounding box, adding a `+0.01` bend tie-breaker so a 2-bend Z-route only replaces an L-route when it strictly reduces overflow.
+4. Commit `+1.0` demand along the minimum-cost route and record the segment's committed edge list. (Flat horizontal or vertical segments from Pass 1 already have their straight-line edge list recorded.)
+
+Pass 3 (bounded-box Dijkstra) retains the smooth congestion-avoidance edge cost:
+$$\text{cost}(d, c) = 1.0 + \frac{10.0}{1.0 + \exp\bigl(-2.0 \cdot (d + 1.0 - c)\bigr)} + 50.0 \cdot \max(0.0,\; d + 1.0 - c)$$
 
 #### Pass 3: Bounded-Box Maze Rip-Up and Reroute (FastRoute Expanding Box)
 Because RSMT Steiner point insertion decomposes many multi-pin nets into flat horizontal or vertical segments (`x1 == x2` or `y1 == y2`) and L/Z pattern routing is strictly confined to a segment's bounding box $[x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}]$, congested segments cannot utilize free tracks in adjacent GCell rows or columns without box expansion.
@@ -196,7 +206,8 @@ Run 3 rip-up-and-reroute iterations with expanding bounding-box margins $M \in [
 #### Congestion Report Aggregation
 After routing all nets:
 - For each horizontal edge $e_h \in [0, ny \cdot (nx - 1))$ and vertical edge $e_v \in [0, (ny - 1) \cdot nx)$:
-  $$\text{ovf}(d, c) = \max(0.0,\; d - c), \quad \text{ratio}(d, c) = \begin{cases} d / c & \text{if } c > 0.0, \\ \infty & \text{if } c == 0.0 \text{ and } d > 0.0, \\ 0.0 & \text{otherwise.} \end{cases}$$
+  $$\text{ovf}(d, c) = \max(0.0,\; d - c), \quad \text{usage\_ratio}(d, c, \text{raw}) = \begin{cases} (\max(0,\; \text{raw} - c) + d) / \text{raw} & \text{if } \text{raw} > 0.0, \\ d / c & \text{else if } c > 0.0, \\ \infty & \text{else if } d > 0.0, \\ 0.0 & \text{otherwise.} \end{cases}$$
+- `h_usage_ratio`, `v_usage_ratio`: per-edge `usage_ratio(d, c, raw)` matching OpenROAD's `dbGCellGrid` blockage+signal usage fraction over raw track supply (`*.gcell_usage.txt`).
 - `total_overflow`: sum of $\text{ovf}(d, c)$ across all horizontal and vertical edges (accumulated in `f64`, cast to `f32`).
 - `max_edge_overflow`: maximum $\text{ovf}(d, c)$ across all horizontal and vertical edges.
 - `top_05pct_overflow`: mean of the largest $k = \max(1, \lceil 0.005 \cdot N_{\text{edges}} \rceil)$ edge overflows sorted descending.

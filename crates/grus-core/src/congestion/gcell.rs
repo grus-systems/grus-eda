@@ -14,11 +14,13 @@ pub struct GCellGrid {
     /// Horizontal boundary edges between (x, y) and (x + 1, y):
     /// indexed by `y * (nx - 1) + x`, length `ny * (nx - 1)`
     pub h_cap: Vec<f32>,
+    pub h_raw_cap: Vec<f32>,
     pub h_demand: Vec<f32>,
 
     /// Vertical boundary edges between (x, y) and (x, y + 1):
     /// indexed by `y * nx + x`, length `(ny - 1) * nx`
     pub v_cap: Vec<f32>,
+    pub v_raw_cap: Vec<f32>,
     pub v_demand: Vec<f32>,
 
     /// Per-layer totals (indexed by `LayerId(0..tech_db.layers.len())`) for direct
@@ -130,8 +132,10 @@ impl GCellGrid {
         let num_v_edges = (ny.saturating_sub(1)) * nx;
 
         let h_cap = vec![0.0f32; num_h_edges];
+        let h_raw_cap = vec![0.0f32; num_h_edges];
         let h_demand = vec![0.0f32; num_h_edges];
         let v_cap = vec![0.0f32; num_v_edges];
+        let v_raw_cap = vec![0.0f32; num_v_edges];
         let v_demand = vec![0.0f32; num_v_edges];
 
         let num_layers = tech_db.routing_layers.len();
@@ -147,8 +151,10 @@ impl GCellGrid {
             nx,
             ny,
             h_cap,
+            h_raw_cap,
             h_demand,
             v_cap,
+            v_raw_cap,
             v_demand,
             layer_raw_edge_tracks: Vec::new(),
             layer_orig_edge_tracks: Vec::new(),
@@ -191,7 +197,7 @@ impl GCellGrid {
                     let cy = design_db.cell_y_dbu[c];
                     let orient = design_db.cell_orient[c];
 
-                    for &(obs_layer, r) in &mac.obs_rects {
+                    for &(obs_layer, r) in mac.obs_rects.iter().chain(mac.pin_obs_rects.iter()) {
                         if obs_layer == layer_id {
                             let (xl, yl, xh, yh) = match orient {
                                 Orient::N => (cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh),
@@ -265,12 +271,12 @@ impl GCellGrid {
 
                     for &(xl, yl, xh, yh) in &obstacles {
                         let gx1 = grid.gcell_x(xl);
-                        let gx2 = grid.gcell_x(xh);
+                        let gx2 = grid.gcell_x((xh - 1).max(xl));
                         let gy1 = grid.gcell_y(yl);
-                        let gy2 = grid.gcell_y(yh);
+                        let gy2 = grid.gcell_y((yh - 1).max(yl));
 
                         if gx1 < edge_cols {
-                            let max_x = gx1.max(if gx2 > 0 { gx2 - 1 } else { 0 }).min(edge_cols - 1);
+                            let max_x = gx1.max(gx2).min(edge_cols - 1);
                             for y in gy1..=gy2 {
                                 let (y0, y1) = grid.y_bounds(y, die_yh);
                                 let s = yl.max(y0);
@@ -322,6 +328,7 @@ impl GCellGrid {
                             layer_orig_edge_tracks[layer_idx] += orig;
                             layer_derated_edge_tracks[layer_idx] += derated;
                             grid.h_cap[edge_idx] += derated as f32;
+                            grid.h_raw_cap[edge_idx] += raw as f32;
                         }
                     }
                 }
@@ -361,12 +368,12 @@ impl GCellGrid {
 
                     for &(xl, yl, xh, yh) in &obstacles {
                         let gx1 = grid.gcell_x(xl);
-                        let gx2 = grid.gcell_x(xh);
+                        let gx2 = grid.gcell_x((xh - 1).max(xl));
                         let gy1 = grid.gcell_y(yl);
-                        let gy2 = grid.gcell_y(yh);
+                        let gy2 = grid.gcell_y((yh - 1).max(yl));
 
                         if gy1 < edge_rows {
-                            let max_y = gy1.max(if gy2 > 0 { gy2 - 1 } else { 0 }).min(edge_rows - 1);
+                            let max_y = gy1.max(gy2).min(edge_rows - 1);
                             for x in gx1..=gx2 {
                                 let (x0, x1) = grid.x_bounds(x, die_xh);
                                 let s = xl.max(x0);
@@ -418,6 +425,7 @@ impl GCellGrid {
                             layer_orig_edge_tracks[layer_idx] += orig;
                             layer_derated_edge_tracks[layer_idx] += derated;
                             grid.v_cap[edge_idx] += derated as f32;
+                            grid.v_raw_cap[edge_idx] += raw as f32;
                         }
                     }
                 }
@@ -547,14 +555,14 @@ mod tests {
         assert_eq!(grid.layer_orig_edge_tracks[5], ref_orig[4].as_u64().unwrap() as u32, "met5 orig edge tracks");
         assert_eq!(grid.layer_derated_edge_tracks[5], ref_derated[4].as_u64().unwrap() as u32, "met5 derated edge tracks");
 
-        // met1: our merged internal jumpers yield 2800 / 1876 vs OpenROAD's 2705 / 1815
-        assert_eq!(grid.layer_orig_edge_tracks[1], 2800, "met1 orig edge tracks");
-        assert_eq!(grid.layer_derated_edge_tracks[1], 1876, "met1 derated edge tracks");
+        // met1: our merged internal jumpers and PG pins yield 2748 / 1843 vs OpenROAD's 2705 / 1815
+        assert_eq!(grid.layer_orig_edge_tracks[1], 2748, "met1 orig edge tracks");
+        assert_eq!(grid.layer_derated_edge_tracks[1], 1843, "met1 derated edge tracks");
 
-        // Total derated capacity across all 5 layers within 1% of OpenROAD (6377 vs 6316 = 0.96%)
+        // Total derated capacity across all 5 layers within 1% of OpenROAD (6344 vs 6316 = 0.44%)
         let our_total_derated: u32 = grid.layer_derated_edge_tracks.iter().sum();
         let ref_total_derated: u32 = ref_derated.iter().map(|v| v.as_u64().unwrap() as u32).sum();
-        assert_eq!(our_total_derated, 6377);
+        assert_eq!(our_total_derated, 6344);
         assert_eq!(ref_total_derated, 6316);
         let pct_diff = ((our_total_derated as f64 - ref_total_derated as f64).abs() / ref_total_derated as f64) * 100.0;
         assert!(pct_diff < 1.0, "Total derated capacity diff {:.2}% must be < 1.0%", pct_diff);

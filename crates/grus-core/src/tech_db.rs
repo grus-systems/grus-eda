@@ -81,6 +81,7 @@ pub struct MacroDef {
     pub pin_offset: u32,
     pub pin_count: u16,
     pub obs_rects: Vec<(LayerId, RectDbu)>,
+    pub pin_obs_rects: Vec<(LayerId, RectDbu)>,
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]

@@ -785,6 +785,32 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
 - **Doc index cleanup**: marked Step 7 and E3.5 `(done)` in `docs/design/README.md`, clarified `picorv32` as an E3-only fixture (`tests/designs/picorv32/generate_ref.sh`) in `docs/status.md`, and marked F3 closed.
 - **Workspace verification (`v0.1.47`)**: `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`160 passed; 0 failed; 7 ignored`, `67.45s`).
 
+### 2026-11-16 — E1.3 closed: GCell blockage/ratio alignment, horizontal RSMT tie-break, and discrete overflow-cost Pass 2 routing (`v0.1.48`)
+
+- **Model & capacity fixes (`tech_db.rs`, `readers/lef.rs`, `congestion/gcell.rs`, `congestion/rsmt.rs`, `congestion/route.rs`)**:
+  - `readers/lef.rs` / `tech_db.rs` / `congestion/gcell.rs`: separated signal/PG macro pin rectangles (`MacroDef::pin_obs_rects`) from `OBS` (`obs_rects`) so macro pins also deduct routing tracks in `GCellGrid::build`, and clamped GCell obstacle spans using exclusive upper bounds `(xh - 1).max(xl)` / `(yh - 1).max(yl)`. On `gcd.placed.def`, `met1` original/derated edge capacity becomes `2748 / 1843` (`met2..met5` unchanged exact match; total derated `6344` vs OpenROAD `6316`, `0.44%`). Added `h_raw_cap` / `v_raw_cap` and aligned `CongestionReport::{h,v}_usage_ratio` to `((raw - c).max(0.0) + d) / raw` matching `dbGCellGrid`.
+  - `congestion/rsmt.rs` (`heuristic_rsmt_points`): broke equal-distance Prim MST ties toward smaller `|dy|` (same-row horizontal standard-cell connections) before smaller vertex index. On `gcd.placed.def`, total RSMT wirelength dropped from `790` to `788` GCell units (closer to optimal; `gcd` baseline demand matches `788.0`).
+  - `congestion/route.rs` (`route_segments`): sorted 2D segments short-first `(dx + dy, seg_idx)` and routed **all** 2D segments into concrete `0/1` L/Z paths across up to 3 Pass 2 iterations using pure `overflow_cost(d, c) = ((d + 1.0) - c).max(0.0)` (with `+0.01` 2-bend Z tie-breaker when `best_cost > 0.0`), reserving sigmoid `edge_cost` for Pass 3 bounded-box Dijkstra. Previously, skipping non-overflowing Pass 2 boxes left `0.5/0.5` fractional averaging on `jpeg`, while any sub-capacity Pass 2 sigmoid smoothed `0.90+` peaks below the hot-set cutoff (`ours=3` H / `2` V).
+- **Intentional-failure checks (`AGENTS.md` Section 7 Rule 7)**:
+  - Reverting the `|dy|` tie-breaker in `rsmt.rs` caused `cargo test --release -p grus-core --lib test_jpeg_congestion_map` to fail (`H: rho=0.8405, null=0.4687, hot(>=0.9) overlap=0.3889 (ours=68, ref=18) < 0.50`).
+  - Replacing Pass 2 `overflow_cost` with `edge_cost` caused `cargo test --release -p grus-core --lib -- test_jpeg_congestion_map test_ibex_congestion_map` to fail (`ibex H overlap=0.3978 < 0.50`, `V=0.4390`; `jpeg H overlap=0.3333 (ours=3, ref=18) < 0.50`, `V=0.5000 (ours=2, ref=21)`). Both fixes were restored.
+- **What was run (`cargo test --release -p grus-core --lib congestion:: -- --nocapture`, `14 passed; 0 failed` in `2.25s`)**:
+  - `gcd` capacities (`test_gcd_gcell_grid`): raw `[3624, 2600, 1812, 1300, 360]`, orig `[2748, 2504, 1781, 1252, 324]`, derated `[1843, 1996, 1399, 926, 180]`.
+  - `gcd` ranking smoke (`alpha ∈ {0.50, 0.70, 0.80, 0.85, 0.90}`): overflow `[0.0, 0.0, 7.0, 105.0, 211.0]`.
+  - `gcd` util sweep (`25, 45, 65, 78%`): `ovf_75 = [10.0, 82.0, 110.0, 176.0]`, `ovf_80 = [38.0, 143.0, 180.0, 228.0]`.
+  - `aes` (`util65`, `support=2970`, PASS):
+    - `H`: `rho = 0.8268` (`null = 0.6570`, `rho_shift = 0.6570`, `rho_perm_p95 = 0.0273`, gap `+0.1698 >= +0.15`), `hot(>=0.9) overlap = 0.7296` (`ours = 863, ref = 795`).
+    - `V`: `rho = 0.7767` (`null = 0.6117`, `rho_shift = 0.6117`, `rho_perm_p95 = 0.0418`, gap `+0.1650 >= +0.15`), `hot(>=0.9) overlap = 0.6613` (`ours = 800, ref = 626`).
+  - `ibex` (`util65`, `support=4970`, un-ignored & PASS):
+    - `H`: `rho = 0.8237` (`null = 0.5991`, `rho_shift = 0.5991`, `rho_perm_p95 = 0.0317`, gap `+0.2246 >= +0.15`), `hot(>=0.9) overlap = 0.6452` (`ours = 316, ref = 93`).
+    - `V`: `rho = 0.8174` (`null = 0.5403`, `rho_shift = 0.5403`, `rho_perm_p95 = 0.0305`, gap `+0.2770 >= +0.15`), `hot(>=0.9) overlap = 0.5636` (`ours = 448, ref = 236`).
+  - `jpeg` (`util65`, `support=16512`, un-ignored & PASS):
+    - `H`: `rho = 0.8423` (`null = 0.4695`, `rho_shift = 0.4695`, `rho_perm_p95 = 0.0115`, gap `+0.3728 >= +0.15`), `hot(>=0.9) overlap = 0.5000` (`ours = 73, ref = 18`).
+    - `V`: `rho = 0.8554` (`null = 0.2336`, `rho_shift = 0.2336`, `rho_perm_p95 = 0.0082`, gap `+0.6218 >= +0.15`), `hot(>=0.9) overlap = 0.5238` (`ours = 55, ref = 21`).
+- **Workspace verification (`v0.1.48`)**:
+  - `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`162 passed; 0 failed; 5 ignored` in `69.49s`; remaining 5 ignores are the E3 placement-RC tests and OpenSTA #582 `jpeg_placed_spef`).
+
+
 
 
 

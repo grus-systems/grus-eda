@@ -318,11 +318,13 @@ pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
     let mut nodes = unique.to_vec();
     let mut visited = vec![false; k];
     let mut min_dist = vec![u32::MAX; k];
+    let mut best_dy = vec![u32::MAX; k];
     let mut parent = vec![0usize; k];
 
     visited[0] = true;
     for j in 1..k {
         min_dist[j] = manhattan(nodes[0], nodes[j]);
+        best_dy[j] = (nodes[0].1 - nodes[j].1).unsigned_abs();
         parent[j] = 0;
     }
 
@@ -344,8 +346,13 @@ pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
         for j in 0..k {
             if !visited[j] {
                 let d = manhattan(nodes[v], nodes[j]);
-                if d < min_dist[j] || (d == min_dist[j] && v < parent[j]) {
+                let dy = (nodes[v].1 - nodes[j].1).unsigned_abs();
+                // Prefer same-row (smaller |dy|) connections on equal-distance Prim ties to match horizontal std-cell topology.
+                if d < min_dist[j]
+                    || (d == min_dist[j] && (dy < best_dy[j] || (dy == best_dy[j] && v < parent[j])))
+                {
                     min_dist[j] = d;
+                    best_dy[j] = dy;
                     parent[j] = v;
                 }
             }
@@ -682,7 +689,7 @@ mod tests {
         println!("OpenROAD GRT total edge demand: {}", ref_total_demand);
 
         // RSMT total edge length on gcd
-        assert_eq!(total_rsmt_wl, 790, "Total RSMT wirelength on gcd must be 790");
+        assert_eq!(total_rsmt_wl, 788, "Total RSMT wirelength on gcd must be 788");
         assert!(total_rsmt_wl > 0);
         // Compare with OpenROAD's global routing edge demand
         let diff = (total_rsmt_wl as f64 - ref_total_demand as f64).abs();
