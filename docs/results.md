@@ -879,6 +879,9 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
   - Updated `README.md` Goals 2, 3, and 5 ("Current (`v0.1.51`)") to match implemented `rayon` parallelism, Kahn-levelized STA, and cached Poisson/DP workspaces, plus `docs/status.md` header timestamp.
 - **Measured `jpeg` (`61,569` cells) `grus-eda place` (`v0.1.52`)**:
   - `legalize_placement`: `5.81 s -> 3.86 s` (vs `v0.1.49` baseline `18.78 s`, **`4.9x`** overall speedup on legalization), total `place` `5.50 s` (`GP = 1.64 s`, `final_hpwl = 1,018,912,430 dbu`, `-1.23%`, bit-identical across all 5 designs: `gcd = 4,395,223`, `aes = 349,495,091`, `picorv32 = 212,135,994`, `ibex = 418,367,448`, `jpeg = 1,018,912,430`).
+- **Workspace & M4 CI verification (`v0.1.52`)**:
+  - Local M1 Pro: `cargo clippy --all-targets -- -D warnings` (0 warnings) and `cargo test --release` (`grus-core`: `165 passed; 0 failed; 5 ignored` in `58.34 s`; `grus-eda`: `2 passed; 0 failed` in `0.16 s`).
+  - M4 CI runner (the self-hosted Mac mini, run `43809018923`): `generate` `21m5s` (PASS, `reference-inputs` uploaded), `test` `1m34s` (`grus-core` `165 passed; 0 failed; 5 ignored` in `29.57 s`; `grus-eda` `2 passed; 0 failed` in `0.14 s`; `clippy` 0 warnings).
 
 
 
