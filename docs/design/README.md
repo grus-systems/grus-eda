@@ -91,7 +91,7 @@ log is [`../results.md`](../results.md).
 
 | File | What |
 |---|---|
-| [phase3/phase3.md](phase3/phase3.md) | Overview: scope, rules, generation host (over SSH) |
+| [phase3/phase3.md](phase3/phase3.md) | Overview: scope, rules, generation host (self-hosted Mac mini) |
 | [phase3/01-picorv32-e1e2-goldens.md](phase3/01-picorv32-e1e2-goldens.md) | Ticket 01: picorv32 E1/E2 OpenROAD goldens and tests |
 | [phase3/02-sta-edge-cases.md](phase3/02-sta-edge-cases.md) | Ticket 02: STA edge cases vs OpenSTA (resistor loops, clock uncertainty, non-dlxtn latches) |
 

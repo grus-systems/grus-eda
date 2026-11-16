@@ -3,7 +3,7 @@
 Design for the "Remaining Reference-Tool Checks & Release Gate" item in
 `docs/status.md` (Remaining Follow-ups 2). Requires the M4 / Docker route
 (`ghcr.io/librelane/librelane:3.0.16`, Colima); generation runs on the
-self-hosted Mac mini (the self-hosted Mac mini over SSH), never on this
+self-hosted Mac mini (over SSH), never on this
 workstation. Implementation tickets live in [`phase3/`](.). Like
 Phase 2, this round is implemented by the maintainer directly.
 

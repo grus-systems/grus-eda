@@ -6,7 +6,7 @@ chains are open-coded in about 14; `test_sky130_liberty_integration`
 asserts a 10 ms warm-cache wall-clock bound (known flaky); the Liberty
 cache's primary location is next to the `.lib` file, i.e. inside the PDK
 installation; there is no CI. The org's self-hosted runner
-(the self-hosted Mac mini, Mac mini, PDK at `~/.ciel`, LibreLane image cached)
+(org Mac mini, PDK at `~/.ciel`, LibreLane image cached)
 already serves other grus-systems repositories.
 
 ## Part A: test support, cache location, wall-clock (code)
@@ -45,7 +45,7 @@ already serves other grus-systems repositories.
 `.github/workflows/ci.yml`:
 - Triggers: push to `dev`, pull requests.
 - `runs-on: [self-hosted, macOS, ARM64]` — the org runner on the Mac
-  mini, which has the PDK and the cargo toolchain for the runner user.
+  mini, which has the PDK and the cargo toolchain installed for the runner user.
 - Steps: checkout; put `$HOME/.cargo/bin` and the mise shims on `PATH`;
   if the picorv32 generated inputs are missing, start Colima (the
   command in AGENTS.md Section 2) and run
@@ -71,7 +71,7 @@ already serves other grus-systems repositories.
 
 ## Risks
 
-- The runner is shared (other repositories' CI runs there too); queueing delays are
+- The runner is shared with other repositories' CI; queueing delays are
   acceptable, interference is not expected (separate `_work` checkouts).
 - Colima inside CI: generation is needed only on a cold checkout (the
   files persist in the runner's `_work` between runs of the same job?
