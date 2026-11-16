@@ -2,7 +2,7 @@
 
 ## Goal
 
-Implement `docs/design/f5-pass1-eval.md` including the review resolutions
+Implement `docs/history/f5-pass1-eval.md` including the review resolutions
 in its Section 5 (external review),
 on top of the spatial index from ticket 02 (already in the tree as
 uncommitted changes the maintainer applied — work with the current state

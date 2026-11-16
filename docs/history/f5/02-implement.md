@@ -2,7 +2,7 @@
 
 ## Goal
 
-Implement `docs/design/f5-pass1-speed.md` including the review resolutions in
+Implement `docs/history/f5-pass1-speed.md` including the review resolutions in
 its Section 5 (external review): replace
 pass 1's all-pairs scan with a per-round spatial index (bands by sub-row y,
 entries `(x, movable index, cell)` sorted by `(x, movable index)`), candidates

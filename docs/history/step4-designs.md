@@ -1,6 +1,6 @@
 # Review step 4: aes, ibex, jpeg through all stages; F2 map correlation
 
-Step 4 of `docs/review-2026-11-11.md` Section 5. Today only gcd goes
+Step 4 of `docs/history/review-2026-11-11.md` Section 5. Today only gcd goes
 through E0–E3 and picorv32 through E3. This step adds three public
 designs from OpenROAD-flow-scripts (BSD 3-Clause; provenance recorded
 in `tests/designs/README.md` per design, as for gcd), runs every stage

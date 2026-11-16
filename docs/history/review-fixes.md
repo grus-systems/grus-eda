@@ -1,6 +1,6 @@
 # Review Fixes: F1, F7, F8 from the 2026-11-11 Project Review
 
-Plan for step 1 of `docs/review-2026-11-11.md` Section 5: the three small
+Plan for step 1 of `docs/history/review-2026-11-11.md` Section 5: the three small
 findings that make the status readable. This document records what the maintainer measured in the current code, the proposed
 fix for each finding, and the questions an external design review must answer before
 any implementation ticket is cut. Implementation follows the review; acceptance

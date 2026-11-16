@@ -21,7 +21,7 @@ No public API change.
 
 ## Acceptance
 
-- A short write-up appended to `docs/results.md` (or `docs/design/phase2/`)
+- A short write-up appended to `docs/results.md` (or `docs/history/phase2/`)
   with: calls per call site and per polarity pair; count of exact-duplicate
   keys if a hash probe is added temporarily; level width histogram per design
   (at least gcd, aes, jpeg).

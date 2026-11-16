@@ -2,7 +2,7 @@
 
 Repository: grus-eda (this repo). Work on `dev`. Follow
 `AGENTS.md` (English only, Conventional Commits, stage explicit
-paths). Design: `docs/design/step4-designs.md` including the
+paths). Design: `docs/history/step4-designs.md` including the
 review resolutions and the 2026-11-14 measurement note. The aes
 golden files are committed; the large generated inputs
 (`aes.synth.*`, `aes.*.def`, `aes.routed.spef`) are git-ignored

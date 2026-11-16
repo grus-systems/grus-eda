@@ -2,7 +2,7 @@
 
 ## Goal
 
-Implement Part A of `docs/design/f9-test-support-ci.md` including the
+Implement Part A of `docs/history/f9-test-support-ci.md` including the
 review resolutions at its end (external review):
 
 1. `crates/grus-core/src/test_support.rs` (`#[cfg(test)]`, registered in

@@ -2,7 +2,7 @@
 
 ## Context
 
-Review `docs/review-2026-11-11.md` Section 5, step 6: "A routed SPEF, then
+Review `docs/history/review-2026-11-11.md` Section 5, step 6: "A routed SPEF, then
 decide E3.4 and E3.5 against it (Section 3)."
 
 Every SPEF in this repository today is OpenROAD's **placement estimate**

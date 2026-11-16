@@ -1,9 +1,9 @@
-# Design documents (`docs/design/`)
+# History: design documents and tickets (`docs/history/`)
 
 Per-step design documents and implementation tickets. Each step has one overview
-document at this level and a folder with the numbered tickets; external review
-requests and their results live in the same folder and are records, not current
-guidance. Current status is in [`../status.md`](../status.md); the measurement
+document at this level and a folder with the numbered tickets; review resolutions are folded into the
+design documents (the review records themselves are not included). Everything here
+is a record of how the work was done, not current guidance. Current status is in [`../status.md`](../status.md); the measurement
 log is [`../results.md`](../results.md).
 
 ## Step 4 — three designs through all stages (done)

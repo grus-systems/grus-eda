@@ -2,7 +2,7 @@
 
 Design for the E3.6 task in `docs/e3-sta.md` Section 5 (speed: profile, then optimize).
 Decisions here are the maintainer's; the implementation ticket is
-`docs/design/e36/01-implement.md`.
+`docs/history/e36/01-implement.md`.
 
 ## 1. Baseline (measured 2026-11-13, M4 Mac mini, release build)
 

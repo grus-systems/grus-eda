@@ -3,7 +3,7 @@
 ## Goal
 
 Replace the ODE closed form from ticket 01 (`pi_charge_closed`, rejected at
-acceptance — see `docs/design/e36-dmp-speed.md` Section 7) with the closed form of
+acceptance — see `docs/history/e36-dmp-speed.md` Section 7) with the closed form of
 the **discrete** 200-step trapezoid recurrence (design Section 7.1), so the charge
 evaluation costs O(1) while reproducing the numeric integrator's results to
 floating-point summation accuracy. Everything else from ticket 01 stays:

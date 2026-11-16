@@ -2,7 +2,7 @@
 
 ## Context
 
-Review `docs/review-2026-11-11.md` Section 3, item 2: `estimate_parasitics
+Review `docs/history/review-2026-11-11.md` Section 3, item 2: `estimate_parasitics
 -placement` is itself an estimate; matching OpenROAD's Steiner tree makes
 us agree with an estimator, not with reality. With a routed SPEF (ticket
 13) both estimators can be scored against the truth, and "if the exact

@@ -14,7 +14,7 @@ pub const RISE: usize = 0;
 pub const FALL: usize = 1;
 
 /// Converts the table's delay-vs-load slope into the driver resistance of the DMP ramp model.
-/// Fitted (`3.01 x delay_slope`, CV 12% across shielded `picorv32` arcs; `docs/design/e35/01-rd-and-wave-slew.md`
+/// Fitted (`3.01 x delay_slope`, CV 12% across shielded `picorv32` arcs; `docs/history/e35/01-rd-and-wave-slew.md`
 /// Section 5) and paired with `driver_waveform_slew`; the single-pole value `1/ln 2` is much worse.
 const RD_SCALE: f64 = 3.0;
 
@@ -1462,7 +1462,7 @@ mod tests {
         (matched, unmodelled)
     }
 
-    /// Measurement (E3.5, `docs/design/e35`): driver-resistance rules against the `report_dcalc` tables of
+    /// Measurement (E3.5, `docs/history/e35`): driver-resistance rules against the `report_dcalc` tables of
     /// `collect_dcalc.sh`. Constants are fitted on picorv32 and scored on aes (gcd has no shielded rows). Prints; asserts only that the
     /// rows matched. Shielded = OpenSTA's Ceff is below 97% of the total load.
     #[test]

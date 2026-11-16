@@ -87,6 +87,8 @@ The archive holds the `grus-eda` executable at its root, which mise puts on
 
 ## Documentation
 
+Start at [`docs/README.md`](docs/README.md) for the reading order.
+
 - [`docs/status.md`](docs/status.md) — Current status per stage: designs covered, tolerances actually used, known gaps
 - [`docs/architecture.md`](docs/architecture.md) — Data-oriented design (SoA/CSR), decoupled pipeline, `f32` numeric model, and Apple Silicon strategy
 - [`docs/e0-readers.md`](docs/e0-readers.md) — E0: File formats, Yosys JSON vs. Verilog, and Liberty binary caching
@@ -94,8 +96,7 @@ The archive holds the `grus-eda` executable at its root, which mise puts on
 - [`docs/e2-placement.md`](docs/e2-placement.md) — E2: ePlace electrostatic placement, 2D DCT/FFT, and Abacus legalization
 - [`docs/e3-sta.md`](docs/e3-sta.md) — E3: STA in Kahn topological order, NLDM extrapolation, placement-based RC, SPEF, DMP driver model; status and open tasks E3.4–E3.6
 - [`docs/results.md`](docs/results.md) — Verification log against OpenROAD and OpenSTA
-- [`docs/design/`](docs/design/README.md) — Per-step design documents and implementation tickets (index)
-- [`docs/review-2026-11-11.md`](docs/review-2026-11-11.md) — Project review: findings to fix, and what replacing the existing tools would take
+- [`docs/history/`](docs/history/README.md) — Per-step design documents, implementation tickets, and the 2026-11-11 project review (records, not current guidance)
 
 ## Dependencies
 

@@ -2,7 +2,7 @@
 
 ## Background
 
-Review `docs/review-2026-11-11.md` §F6: "The repository rule is 'handle
+Review `docs/history/review-2026-11-11.md` §F6: "The repository rule is 'handle
 errors at system boundaries'. The DEF reader does the opposite: numbers
 are read with `.parse().unwrap_or(0)`, unknown keywords fall into
 `_ => {}`, a `ROW` with too few words becomes a row at (0, 0) with zero

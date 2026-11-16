@@ -2,7 +2,7 @@
 
 ## Background
 
-Review `docs/review-2026-11-11.md` §F3: our STA "silently drops what it
+Review `docs/history/review-2026-11-11.md` §F3: our STA "silently drops what it
 does not model". Parts of F3 are already fixed by later work (recovery /
 removal endpoints in step-4 ticket 06, latch `dlxtn` endpoints with a
 warning in ticket 10, the SDC Tcl subset with loud bails in ticket 09,

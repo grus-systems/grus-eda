@@ -122,5 +122,5 @@ with collect/eval timers inside pass 1, per round on picorv32:
 
 So the index removed only the scan share (~17%), and legalization stayed
 at ~1,000 ms. The follow-up that attacks the evaluation cost is
-`docs/design/f5-pass1-eval.md`. The acceptance target of 450 ms in
+`docs/history/f5-pass1-eval.md`. The acceptance target of 450 ms in
 Section 3 was set under the wrong model and is superseded there.

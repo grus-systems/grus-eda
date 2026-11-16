@@ -1,6 +1,6 @@
 # F9: machine-independent tests and CI
 
-Implements finding F9 of `docs/review-2026-11-11.md`. Surveyed state
+Implements finding F9 of `docs/history/review-2026-11-11.md`. Surveyed state
 (2026-11-14): `dirs_home()` is copied into 8 test modules and PDK path
 chains are open-coded in about 14; `test_sky130_liberty_integration`
 asserts a 10 ms warm-cache wall-clock bound (known flaky); the Liberty

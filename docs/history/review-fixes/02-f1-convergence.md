@@ -5,7 +5,7 @@ Make `NesterovResult` and the `place` CLI tell the truth: a run that hit
 the iteration limit is reported as not converged (DEF still written,
 exit 0), `iterations` counts gradient steps executed, and
 `final_overflow` describes the returned coordinates when the limit is
-hit. Design: `docs/design/review-fixes.md` F1 and the Review resolution
+hit. Design: `docs/history/review-fixes.md` F1 and the Review resolution
 section; review: the design review record (not included) Q1.
 
 ## Files
@@ -39,7 +39,7 @@ section; review: the design review record (not included) Q1.
   asserts `res.converged`.
 - `docs/results.md`: the E2 row of the summary table changes to state
   PASS on gcd only (picorv32 does not converge / is not yet an E2 test),
-  in the wording of `docs/review-2026-11-11.md` F1. No measured number
+  in the wording of `docs/history/review-2026-11-11.md` F1. No measured number
   in `docs/results.md` changes.
 - Bump `[workspace.package] version` patch in `Cargo.toml` (AGENTS.md
   Section 5) and refresh `Cargo.lock`.
@@ -55,7 +55,7 @@ section; review: the design review record (not included) Q1.
 - `cargo build --release -p grus-eda`
 
 ## Notes
-- Read first: `AGENTS.md`, `docs/design/review-fixes.md` (F1 + Review
+- Read first: `AGENTS.md`, `docs/history/review-fixes.md` (F1 + Review
   resolution), the design review record (not included) Q1 and Q5.
 - New regression tests, PDK-free, in `nesterov.rs` tests, named with the
   prefix `test_convergence_accounting`: build a synthetic design in code

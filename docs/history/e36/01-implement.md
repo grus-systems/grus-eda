@@ -2,7 +2,7 @@
 
 ## Goal
 
-Implement `docs/design/e36-dmp-speed.md` Sections 3a-3d **as amended by the review
+Implement `docs/history/e36-dmp-speed.md` Sections 3a-3d **as amended by the review
 resolutions in its Section 6** (external review):
 closed-form post-ramp crossing with a finite guard, tolerance-stopped bisections,
 closed-form `pi_charge` with the numeric integrator as fallback (trigger: non-finite

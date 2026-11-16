@@ -5,7 +5,7 @@ Remove or fix every CLI option that does not do what it says: delete the
 four dead STA options, make the required STA inputs required in clap,
 turn `--parasitics` into a typed enum, and fix the `--gcell-tracks`
 sentinel and the hard-coded `--layer-adjust` vector. Design:
-`docs/design/review-fixes.md` F7 and the Review resolution section;
+`docs/history/review-fixes.md` F7 and the Review resolution section;
 review: the design review record (not included) Q2 and Q3.
 
 ## Files
@@ -60,7 +60,7 @@ review: the design review record (not included) Q2 and Q3.
   is rejected by the parser (argument error, not a panic)
 
 ## Notes
-- Read first: `AGENTS.md`, `docs/design/review-fixes.md` (F7 + Review
+- Read first: `AGENTS.md`, `docs/history/review-fixes.md` (F7 + Review
   resolution), the design review record (not included) Q2 and Q3.
 - CLI-only ticket: do not change any algorithm in `grus-core`, any STA
   or congestion number, or any golden/reference file. `main.rs` is the
