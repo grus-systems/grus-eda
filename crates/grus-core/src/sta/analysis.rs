@@ -1527,30 +1527,31 @@ fn collect_endpoints(
         // edge is one period later. An extreme with no recorded parity falls back to edge
         // 0, the pre-tracking assumption.
         let c0 = edge_parity(clk, edge);
-        let credit = if sdc.propagated_clock
-            && let Some(capture_net) = design.pin_nets[clk.0 as usize]
-        {
+        // `trans` is the clock transition the credit is evaluated for: the check edge for
+        // the closing/setup required times, FALL for a latch's opening edge. The packed
+        // launch value must match both the capture net and the transition.
+        let mut credit_for = |trans: usize| -> f32 {
+            if !sdc.propagated_clock {
+                return 0.0;
+            }
+            let Some(capture_net) = design.pin_nets[clk.0 as usize] else {
+                return 0.0;
+            };
             let launch = crpr_sink_net(levelized, design, &ff_clk, &latch_q, &mut crpr_memo, data);
-            // The packed value is `net * 2 + launch_edge`: the shared spread is per clock
-            // transition, so credit requires the launch to use the check's transition.
-            if launch != CRPR_BAD
-                && launch / 2 == capture_net.0 as i64
-                && launch % 2 == edge as i64
-                && let (Some(clock_state), Some(driver)) =
-                    (clock_state, design.net_driver(capture_net))
-            {
-                let ds = clock_state[driver.0 as usize];
-                if ds.reached(edge) {
-                    (ds.arrival_max[edge] - ds.arrival_min[edge]).max(0.0)
-                } else {
-                    0.0
-                }
+            if launch == CRPR_BAD || launch / 2 != capture_net.0 as i64 || launch % 2 != trans as i64 {
+                return 0.0;
+            }
+            let (Some(clock_state), Some(driver)) = (clock_state, design.net_driver(capture_net)) else {
+                return 0.0;
+            };
+            let ds = clock_state[driver.0 as usize];
+            if ds.reached(trans) {
+                (ds.arrival_max[trans] - ds.arrival_min[trans]).max(0.0)
             } else {
                 0.0
             }
-        } else {
-            0.0
         };
+        let credit = credit_for(edge);
         let (late, early) = (&lib.arcs[late_arc as usize], &lib.arcs[early_arc as usize]);
         let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
@@ -1578,7 +1579,10 @@ fn collect_endpoints(
             let opening_max = if sdc.propagated_clock {
                 let closing = clk_state.arrival_min[edge] + capture_extra;
                 let periods = ((closing - clk_state.arrival_min[FALL]) / sdc.period_ns).floor().max(0.0);
-                clk_state.arrival_min[FALL] + periods * sdc.period_ns - sdc.setup_uncertainty_ns
+                // The opening fall pairs with a fall-polarity launch for CRPR, the same
+                // rule the closing edge applies to `edge`.
+                let opening_credit = if check.latch { credit_for(FALL) } else { 0.0 };
+                clk_state.arrival_min[FALL] + periods * sdc.period_ns - sdc.setup_uncertainty_ns + opening_credit
             } else {
                 half_period + clk_state.arrival_min[RISE] - sdc.setup_uncertainty_ns
             };
@@ -1643,15 +1647,13 @@ fn collect_endpoints(
                 )
             } else {
                 let lat = sdc.design_clock_latency_ns();
-                // Hold pairs the enable with the next rising launch edge, the same rule
-                // as the register checks: an odd-parity clock input shifts the reported
-                // min arrival by one period (OpenSTA reports u_and2/B min_arr = 5.7 ns
-                // behind clkinv).
-                let hold_shift = if c0 == 1 { sdc.period_ns } else { 0.0 };
+                // The ideal clock does not track clock-network inversions, so there is no
+                // parity to shift the hold arrival by; that correction exists only in the
+                // propagated branch above.
                 (
                     sdc.period_ns + lat - sdc.setup_uncertainty_ns,
                     half_period + lat + sdc.hold_uncertainty_ns,
-                    s.arrival_min[pol] + hold_shift,
+                    s.arrival_min[pol],
                 )
             };
             let slack_max = req_max - s.arrival_max[pol];
@@ -1956,8 +1958,16 @@ mod tests {
                 ) else {
                     continue; // unresolved arcs are counted in `unresolved_arcs` instead
                 };
-                let is_check = matches!(arc.timing_type, TimingType::SetupRising | TimingType::HoldRising);
-                let is_open = src == enable && design.pin_is_driver[dst.0 as usize];
+                let is_check = matches!(
+                    arc.timing_type,
+                    TimingType::SetupRising
+                        | TimingType::SetupFalling
+                        | TimingType::HoldRising
+                        | TimingType::HoldFalling
+                );
+                let is_open = src == enable
+                    && arc.timing_type == TimingType::FallingEdge
+                    && design.pin_is_driver[dst.0 as usize];
                 if !is_check && !is_open {
                     *arcs.entry(format!("{:?}", arc.timing_type)).or_default() += 1;
                 }

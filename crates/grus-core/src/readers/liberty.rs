@@ -279,20 +279,19 @@ pub fn parse_liberty_bytes(bytes: &[u8]) -> Result<LibDb> {
     let mut templates: HashMap<String, TemplateDef> = HashMap::new();
 
     // Top-level must start with library ( <name> ) { ... }
+    let mut saw_library = false;
     while let Some(tok) = lexer.next_token() {
-        if let Token::Ident("library") = tok
-            && let Some(Token::LParen) = lexer.next_token()
-                && let Some(name_tok) = lexer.next_token() {
-                    let lib_name = match name_tok {
-                        Token::Ident(s) | Token::Str(s) => s.to_string(),
-                        _ => "unnamed".to_string(),
-                    };
-                    db.library_name = lib_name;
-                    let _ = lexer.next_token(); // RParen
-                    if let Some(Token::LBrace) = lexer.next_token() {
-                        parse_library_body(&mut lexer, &mut db, &mut templates)?;
-                    }
-                }
+        if !matches!(tok, Token::Ident("library")) || !matches!(lexer.next_token(), Some(Token::LParen)) {
+            continue;
+        }
+        db.library_name = read_paren_header(&mut lexer).unwrap_or_else(|| "unnamed".to_string());
+        if let Some(Token::LBrace) = lexer.next_token() {
+            parse_library_body(&mut lexer, &mut db, &mut templates)?;
+            saw_library = true;
+        }
+    }
+    if !saw_library {
+        bail!("Liberty input has no `library (name) {{ ... }}` body");
     }
 
     db.strings.rebuild_map();
@@ -343,25 +342,32 @@ fn parse_library_body(
                 }
             }
             Token::Ident("lu_table_template") => {
-                if let Some(Token::LParen) = lexer.next_token()
-                    && let Some(Token::Ident(tpl_name) | Token::Str(tpl_name)) = lexer.next_token() {
-                        let tname = tpl_name.to_string();
-                        let _ = lexer.next_token(); // RParen
-                        if let Some(Token::LBrace) = lexer.next_token() {
-                            let tpl = parse_template_body(lexer, db)?;
-                            templates.insert(tname, tpl);
+                if matches!(lexer.next_token(), Some(Token::LParen)) {
+                    let tname = read_paren_header(lexer);
+                    if let Some(Token::LBrace) = lexer.next_token() {
+                        match tname {
+                            Some(tname) => {
+                                let tpl = parse_template_body(lexer, db)?;
+                                templates.insert(tname, tpl);
+                            }
+                            None => lexer.skip_balanced_braces(),
                         }
                     }
+                }
             }
             Token::Ident("cell") => {
-                if let Some(Token::LParen) = lexer.next_token()
-                    && let Some(Token::Ident(cell_name) | Token::Str(cell_name)) = lexer.next_token() {
-                        let cname_id = db.strings.intern(cell_name);
-                        let _ = lexer.next_token(); // RParen
-                        if let Some(Token::LBrace) = lexer.next_token() {
-                            parse_cell_body(lexer, db, cname_id, templates)?;
+                if matches!(lexer.next_token(), Some(Token::LParen)) {
+                    let cname = read_paren_header(lexer);
+                    if let Some(Token::LBrace) = lexer.next_token() {
+                        match cname {
+                            Some(cname) => {
+                                let cname_id = db.strings.intern(&cname);
+                                parse_cell_body(lexer, db, cname_id, templates)?;
+                            }
+                            None => lexer.skip_balanced_braces(),
                         }
                     }
+                }
             }
             Token::Ident(_) => {
                 // Check if this is a group with { ... } or attribute with ;
@@ -374,6 +380,21 @@ fn parse_library_body(
         bail!("unterminated Liberty library body (missing closing brace)");
     }
     Ok(())
+}
+
+/// Reads a `( name ... )` header up to the closing paren and returns the first
+/// identifier — the declared name — if one appears. Extra arguments are consumed
+/// so the following `{` stays aligned even for `()` or multi-argument headers.
+fn read_paren_header(lexer: &mut Lexer) -> Option<String> {
+    let mut name = None;
+    while let Some(tok) = lexer.next_token() {
+        match tok {
+            Token::RParen => break,
+            Token::Ident(s) | Token::Str(s) if name.is_none() => name = Some(s.to_string()),
+            _ => {}
+        }
+    }
+    name
 }
 
 fn skip_statement_or_group(lexer: &mut Lexer) {
@@ -410,16 +431,14 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
                         tpl.var2 = parse_axis_var(s);
                     }
             }
+            // Index values are stored raw: `index_*` may precede `variable_*`, so the
+            // unit scale is applied once the body closes and both are known.
             Token::Ident("index_1") => {
                 if let Some(Token::LParen) = lexer.next_token() {
-                    let scale = match tpl.var1 {
-                        TableAxisVar::TotalOutputNetCapacitance => db.cap_unit_pf,
-                        _ => db.time_unit_ns,
-                    };
                     while let Some(tok_arg) = lexer.next_token() {
                         match tok_arg {
                             Token::RParen => break,
-                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut tpl.index_1)?,
+                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, 1.0, &mut tpl.index_1)?,
                             _ => {}
                         }
                     }
@@ -427,14 +446,10 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
             }
             Token::Ident("index_2") => {
                 if let Some(Token::LParen) = lexer.next_token() {
-                    let scale = match tpl.var2 {
-                        TableAxisVar::TotalOutputNetCapacitance => db.cap_unit_pf,
-                        _ => db.time_unit_ns,
-                    };
                     while let Some(tok_arg) = lexer.next_token() {
                         match tok_arg {
                             Token::RParen => break,
-                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut tpl.index_2)?,
+                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, 1.0, &mut tpl.index_2)?,
                             _ => {}
                         }
                     }
@@ -448,6 +463,16 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
     }
     if !closed {
         bail!("unterminated Liberty template body (missing closing brace)");
+    }
+    let axis_unit = |v: TableAxisVar| match v {
+        TableAxisVar::TotalOutputNetCapacitance => db.cap_unit_pf,
+        _ => db.time_unit_ns,
+    };
+    for v in &mut tpl.index_1 {
+        *v *= axis_unit(tpl.var1);
+    }
+    for v in &mut tpl.index_2 {
+        *v *= axis_unit(tpl.var2);
     }
     Ok(tpl)
 }
@@ -918,11 +943,8 @@ fn parse_nldm_table(
     templates: &HashMap<String, TemplateDef>,
 ) -> Result<Option<NldmTable>> {
     let mut tpl_name = String::new();
-    if let Some(Token::LParen) = lexer.next_token() {
-        if let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-            tpl_name = s.to_string();
-        }
-        let _ = lexer.next_token(); // RParen
+    if matches!(lexer.next_token(), Some(Token::LParen)) {
+        tpl_name = read_paren_header(lexer).unwrap_or_default();
     }
 
     if let Some(Token::LBrace) = lexer.next_token() {
@@ -933,10 +955,14 @@ fn parse_nldm_table(
         let mut index_1 = Vec::new();
         let mut index_2 = Vec::new();
         let mut values = Vec::new();
+        let mut closed = false;
 
         while let Some(tok) = lexer.next_token() {
             match tok {
-                Token::RBrace => break,
+                Token::RBrace => {
+                    closed = true;
+                    break;
+                }
                 Token::Ident("index_1") => {
                     if let Some(Token::LParen) = lexer.next_token() {
                         let scale = match var1 {
@@ -983,8 +1009,35 @@ fn parse_nldm_table(
                 Token::LBrace => {
                     lexer.skip_balanced_braces();
                 }
+                // Unknown attributes are skipped whole so a value cannot alias a table
+                // keyword (e.g. `foo : cell_rise;`) and open a phantom table. NLDM entries
+                // carry no `;`, so the table's closing brace also terminates the skip.
+                Token::Ident(_) => {
+                    let mut hit_close = false;
+                    while let Some(t) = lexer.next_token() {
+                        match t {
+                            Token::Semi => break,
+                            Token::LBrace => {
+                                lexer.skip_balanced_braces();
+                                break;
+                            }
+                            Token::RBrace => {
+                                hit_close = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if hit_close {
+                        closed = true;
+                        break;
+                    }
+                }
                 _ => {}
             }
+        }
+        if !closed {
+            bail!("unterminated Liberty NLDM table body (missing closing brace)");
         }
 
         // Fallback to template indices if not specified on instance
@@ -1505,5 +1558,75 @@ library(test_fwd) {
     fn test_unknown_pin_direction_is_an_error() {
         let msg = sample_lib_error("direction : input;", "direction : sideways;");
         assert!(msg.contains("sideways"), "{msg}");
+    }
+
+    #[test]
+    fn test_empty_paren_nldm_table_does_not_truncate() {
+        // `cell_rise ()` carries no template name; the parser must still find the
+        // table body instead of consuming `{` as the missing `)` and dropping the
+        // rest of the file.
+        let text = r#"
+library (t) {
+  cell (c) {
+    pin (A) { direction : input; }
+    pin (Y) {
+      direction : output;
+      timing () {
+        related_pin : "A";
+        timing_type : combinational;
+        cell_rise () {
+          values ("0.02");
+        }
+      }
+    }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        assert_eq!(db.cells.len(), 1);
+        let cr = db.cell_arcs(&db.cells[0])[0].cell_rise.as_ref().expect("cell_rise must exist");
+        assert_eq!(cr.values, vec![0.02]);
+    }
+
+    #[test]
+    fn test_template_index_scaled_after_variables() {
+        // `index_*` may precede `variable_*`; the capacitance axis must still use
+        // `capacitive_load_unit`, not `time_unit`.
+        let text = r#"
+library (t) {
+  time_unit : "1ns";
+  capacitive_load_unit (1, nf);
+  lu_table_template (tpl) {
+    index_1 ("0.01");
+    index_2 ("0.001");
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+  }
+  cell (c) {
+    pin (A) { direction : input; }
+    pin (Y) {
+      direction : output;
+      timing () {
+        related_pin : "A";
+        timing_type : combinational;
+        cell_rise (tpl) {
+          values ("0.02");
+        }
+      }
+    }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        let cr = db.cell_arcs(&db.cells[0])[0].cell_rise.as_ref().expect("cell_rise must exist");
+        assert_eq!(cr.index_1, vec![0.01]);
+        assert_eq!(cr.index_2, vec![1.0]);
+    }
+
+    #[test]
+    fn test_liberty_without_library_body_is_an_error() {
+        assert!(parse_liberty_bytes(b"").is_err());
+        assert!(parse_liberty_bytes(b"library (foo);").is_err());
+        assert!(parse_liberty_bytes(b"not a liberty file").is_err());
     }
 }

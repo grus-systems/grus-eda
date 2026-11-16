@@ -1343,3 +1343,46 @@ returned reject again; dispositions:
   the same check pin still overwrite each other (`when`-conditional arcs are
   skipped entirely, so this needs same-condition duplicates — scan `sdf*`
   cells, unused by current fixtures).
+
+### R6 third review round (same day)
+
+A further read-only review of the parser hardening and parity changes returned
+reject again; dispositions:
+
+- **Fixed — empty-paren NLDM table headers truncated the library** (S1):
+  `cell_rise () { ... }` made `parse_nldm_table` consume `{` as the missing
+  `)`, return `Ok(None)`, and let the table's `}` close the enclosing `timing`
+  body early — silently dropping the rest of the file. All `( name ... )`
+  headers (`library`, `cell`, `lu_table_template`, NLDM tables) now read to
+  the closing paren via `read_paren_header`, and nameless `cell`/`template`
+  bodies are skipped whole instead of desynchronising the library loop.
+- **Fixed — template `index_*` scaled before `variable_*` was known** (S2):
+  `lu_table_template` bodies may declare `index_1`/`index_2` before
+  `variable_1`/`variable_2`; the capacitance axis was then scaled by
+  `time_unit` instead of `capacitive_load_unit`. Indices are now stored raw
+  and scaled once the body closes. Covered by
+  `test_template_index_scaled_after_variables`.
+- **Fixed — empty or headless Liberty input returned `Ok`** (S2): inputs with
+  no `library (name) { ... }` body now bail. Covered by
+  `test_liberty_without_library_body_is_an_error`.
+- **Fixed — latch `opening_max` omitted FALL-edge CRPR credit** (S2): the
+  credit computation is now a `credit_for(trans)` closure; the propagated
+  opening fall gets the same shared-path spread credit when the launch edge
+  polarity is FALL. No dedicated fixture covers propagated-clock latch +
+  asymmetric derate yet — recorded as a residual below.
+- **Fixed — dead `c0 == 1` hold shift in ideal `gating_enables`** (S3): the
+  ideal clock has no parity, so the branch was unreachable; removed and the
+  comment now states clock-network inversions are propagated-clock only.
+- **Fixed — `parse_nldm_table` lacked close/skip guards** (S3): the body loop
+  now tracks `closed` and bails on EOF, and unknown attributes are skipped
+  whole (stopping at `;`, a nested group, or the table's `}` — NLDM entries
+  carry no semicolons, so `skip_statement_or_group` alone would have run past
+  the closing brace).
+- **Fixed — `expected_latch_skips` drifted from `build_graph`** (S3): the
+  independent recount now matches on `SetupFalling`/`HoldFalling` checks and
+  requires `FallingEdge` for open arcs.
+- **Deferred — `port_drive` ignores `pi_models` on RC nets** (S2): with
+  parasitics, a `set_driving_cell` port's slew is still evaluated at the
+  lumped `net_load` instead of the DMP pi-model response. Same fixture
+  dependency as the existing `port_drive` early/late deferral (needs a
+  `set_driving_cell` + SPEF design); recorded, not fixed.
