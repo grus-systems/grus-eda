@@ -1386,3 +1386,31 @@ reject again; dispositions:
   lumped `net_load` instead of the DMP pi-model response. Same fixture
   dependency as the existing `port_drive` early/late deferral (needs a
   `set_driving_cell` + SPEF design); recorded, not fixed.
+
+### R6 fourth review round (same day, verdict: changes)
+
+A follow-up review returned `changes` (no S1); dispositions:
+
+- **Fixed — `skip_statement_or_group` ran past `}`** (S2): it now returns
+  whether it consumed the enclosing group's closing brace, and the library,
+  cell, pin, timing, and template body loops treat that as their own close.
+  An unknown attribute without a trailing `;` before `}` no longer
+  desynchronises the parse.
+- **Fixed — `pin (A, B)` multi-name headers** (S2): the header is drained to
+  `)`; only single-name declarations are modelled, anything else has its
+  group skipped instead of leaking `,`/`B` into the body parser.
+- **Fixed — `parse_template_body` keyword aliasing** (S2): unknown
+  attributes are skipped whole with the same `}`-aware rule.
+- **Fixed — `port_drive` reported max slew for both extremes** (S2): slew
+  min/max are now tracked independently per output transition. The
+  `pi_models` part of the same finding stays deferred (above).
+- **Fixed — unterminated `/* */` comment emitted a token** (S3): the lexer
+  now consumes to EOF.
+- **Fixed — `opening_max` computed for non-latch checks** (S3): guarded by
+  `check.latch`.
+- **Deferred — documented limitations**: multiple conditional check arcs on
+  one pin still overwrite each other (needs `when`-conditional modelling);
+  `gating_enables` can still misclassify non-AND positive-unate cells such as
+  clock muxes (Liberty carries no cell function); CRPR credits only when
+  launch and capture share the exact clock net — multi-stage clock trees stay
+  pessimistic, which is the safe direction.

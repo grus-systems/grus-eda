@@ -71,6 +71,10 @@ impl<'a> Lexer<'a> {
                 }
                 if self.pos + 1 < self.src.len() {
                     self.pos += 2;
+                } else {
+                    // Unterminated comment: consume to EOF so its last byte is
+                    // not emitted as an identifier token.
+                    self.pos = self.src.len();
                 }
             } else {
                 break;
@@ -369,9 +373,10 @@ fn parse_library_body(
                     }
                 }
             }
-            Token::Ident(_) => {
-                // Check if this is a group with { ... } or attribute with ;
-                skip_statement_or_group(lexer);
+            // Check if this is a group with { ... } or attribute with ;
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
             }
             _ => {}
         }
@@ -397,17 +402,23 @@ fn read_paren_header(lexer: &mut Lexer) -> Option<String> {
     name
 }
 
-fn skip_statement_or_group(lexer: &mut Lexer) {
+/// Skips an unknown attribute's value tokens up to `;` or a `{...}` group.
+/// Returns `true` when the skip ran into the enclosing group's closing `}` —
+/// the caller must treat its own block as closed. Without this an
+/// unterminated attribute would consume the `}` and desynchronize the parse.
+fn skip_statement_or_group(lexer: &mut Lexer) -> bool {
     while let Some(tok) = lexer.next_token() {
         match tok {
-            Token::Semi => break,
+            Token::Semi => return false,
             Token::LBrace => {
                 lexer.skip_balanced_braces();
-                break;
+                return false;
             }
+            Token::RBrace => return true,
             _ => {}
         }
     }
+    false
 }
 
 fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
@@ -457,6 +468,12 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
             }
             Token::LBrace => {
                 lexer.skip_balanced_braces();
+            }
+            // Unknown attributes are skipped whole so a value cannot alias a template
+            // keyword (`custom : index_1;`) and corrupt the axis indices.
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
             }
             _ => {}
         }
@@ -574,11 +591,21 @@ fn parse_cell_body(
                 }
             }
             Token::Ident("pin") => {
-                if let Some(Token::LParen) = lexer.next_token()
-                    && let Some(Token::Ident(pin_name) | Token::Str(pin_name)) = lexer.next_token() {
-                        let pin_sym = db.strings.intern(pin_name);
-                        let _ = lexer.next_token(); // RParen
-                        if let Some(Token::LBrace) = lexer.next_token() {
+                if matches!(lexer.next_token(), Some(Token::LParen)) {
+                    // Drain the header: `pin (A, B)` lists must not leak `,`/`B` into
+                    // the body parser. Only a single-name declaration is modelled;
+                    // anything else has its group skipped.
+                    let mut names = Vec::new();
+                    while let Some(t) = lexer.next_token() {
+                        match t {
+                            Token::RParen => break,
+                            Token::Ident(s) | Token::Str(s) => names.push(s.to_string()),
+                            _ => {}
+                        }
+                    }
+                    if let Some(Token::LBrace) = lexer.next_token() {
+                        if names.len() == 1 {
+                            let pin_sym = db.strings.intern(&names[0]);
                             // An `ff`/`latch` state variable may already occupy this name;
                             // reuse its slot so the pin is declared once, in place.
                             let global_id = match local_pin_names.get(&pin_sym) {
@@ -597,23 +624,23 @@ fn parse_cell_body(
                                 templates,
                                 &mut pending_arcs,
                             )?;
+                        } else {
+                            lexer.skip_balanced_braces();
                         }
                     }
-            }
-            Token::Ident("test_cell")
-            | Token::Ident("pg_pin")
-            | Token::Ident("leakage_power")
-            | Token::Ident("internal_power")
-            | Token::Ident("dynamic_current") => {
-                skip_statement_or_group(lexer);
+                }
             }
             Token::LBrace => {
                 lexer.skip_balanced_braces();
             }
-            // An unknown attribute's value tokens must not reach the keyword arms:
-            // `cell_footprint : latch;` would otherwise set `is_latch`.
-            Token::Ident(_) => {
-                skip_statement_or_group(lexer);
+            // `test_cell`, `pg_pin`, `leakage_power`, `internal_power`,
+            // `dynamic_current` and any other unknown attribute are skipped whole so
+            // their values cannot alias keywords (`cell_footprint : latch;` would
+            // otherwise set `is_latch`). One arm only: a guard that fails must not
+            // fall through to a second skip.
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
             }
             _ => {}
         }
@@ -760,8 +787,9 @@ fn parse_pin_body(
                 lexer.skip_balanced_braces();
             }
             // Skip unknown pin attributes whole so their values cannot alias keywords.
-            Token::Ident(_) => {
-                skip_statement_or_group(lexer);
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
             }
             _ => {}
         }
@@ -892,8 +920,9 @@ fn parse_timing_body(
             }
             // Unknown timing attributes (including `when` conditionals, whose arcs this
             // parser does not model) are skipped with their values.
-            Token::Ident(_) => {
-                skip_statement_or_group(lexer);
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
             }
             _ => {}
         }

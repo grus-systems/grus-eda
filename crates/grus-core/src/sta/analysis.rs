@@ -310,15 +310,16 @@ impl Context<'_> {
     /// cell's fall delay, and the ideal driver does not see the net's load. This measured
     /// closest to OpenSTA (worst residual ~0.7 ps on `inv_2`, ~10 ps on `inv_16`). Without a
     /// rule, `set_input_transition` applies and the delay is zero.
-    /// `(slew, early_delay, late_delay)` per output transition. The delay is the worst
-    /// arc delay derated by its **source** transition — `-rise`/`-fall` derates select
-    /// the transition entering the arc, which differs from the output transition on
-    /// inverting drivers (measured on OpenSTA).
-    fn port_drive(&self, pin: PinId, skipped: &mut SkipReport) -> [(f32, f32, f32); 2] {
+    /// `(slew_max, slew_min, early_delay, late_delay)` per output transition. The delay is
+    /// the worst arc delay derated by its **source** transition — `-rise`/`-fall` derates
+    /// select the transition entering the arc, which differs from the output transition on
+    /// inverting drivers (measured on OpenSTA). Slew extremes are taken across source
+    /// transitions independently of the delay pairing.
+    fn port_drive(&self, pin: PinId, skipped: &mut SkipReport) -> [(f32, f32, f32, f32); 2] {
         let port = self.port_name(pin);
         let fallback = || {
             let t = self.sdc.input_transition_ns(port);
-            [(t, 0.0, 0.0), (t, 0.0, 0.0)]
+            [(t, t, 0.0, 0.0), (t, t, 0.0, 0.0)]
         };
         let Some(rule) = self.sdc.driving_cell(port, true) else {
             return fallback();
@@ -331,7 +332,8 @@ impl Context<'_> {
             let pin_idx = self.lib.cell_pins(cell).iter().position(|p| p.name == pin_sym)?;
             let target = LibPinId((cell.pin_offset + pin_idx as u32) as u16);
             let net = self.design.pin_nets[pin.0 as usize];
-            let mut slew = [f32::NEG_INFINITY; 2];
+            let mut slew_max = [f32::NEG_INFINITY; 2];
+            let mut slew_min = [f32::INFINITY; 2];
             // Worst and best raw delay per (output, source) transition pair; derating is
             // applied per source transition below, before the cross-source extreme. The
             // early delay takes the minimum: `arrival_min` must not be inflated by a
@@ -363,7 +365,9 @@ impl Context<'_> {
                     let in_slew = if src_pol == RISE { rule.in_trans_rise } else { rule.in_trans_fall };
                     let load = net.map_or(0.0, |n| self.net_load(n, dst_pol));
                     if let Some(table) = delay_tables(arc, dst_pol).1 {
-                        slew[dst_pol] = slew[dst_pol].max(eval_nldm_delay_or_slew(table, in_slew, load));
+                        let s = eval_nldm_delay_or_slew(table, in_slew, load);
+                        slew_max[dst_pol] = slew_max[dst_pol].max(s);
+                        slew_min[dst_pol] = slew_min[dst_pol].min(s);
                     }
                     // The driver is ideal: its delay does not see the net's load. The table is
                     // indexed by the source transition — for an inverting driver the output
@@ -375,7 +379,7 @@ impl Context<'_> {
                     }
                 }
             }
-            let mut out = [(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY); 2];
+            let mut out = [(f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY); 2];
             for dst_pol in [RISE, FALL] {
                 let mut early = f32::INFINITY;
                 let mut late = f32::NEG_INFINITY;
@@ -387,14 +391,16 @@ impl Context<'_> {
                         early = early.min(delay_min[dst_pol][src_pol] * self.sdc.derate(false, DERATE_CELL, false, src_pol));
                     }
                 }
-                out[dst_pol] = (slew[dst_pol], early, late);
+                out[dst_pol] = (slew_max[dst_pol], slew_min[dst_pol], early, late);
             }
             (out[RISE].0.is_finite()
                 && out[RISE].1.is_finite()
                 && out[RISE].2.is_finite()
+                && out[RISE].3.is_finite()
                 && out[FALL].0.is_finite()
                 && out[FALL].1.is_finite()
-                && out[FALL].2.is_finite())
+                && out[FALL].2.is_finite()
+                && out[FALL].3.is_finite())
             .then_some(out)
         })();
         match resolved {
@@ -1111,9 +1117,9 @@ fn run_sta_detail(
         let latency = sdc.input_clock_latency_ns(name);
         let drive = cx.port_drive(pin, &mut skipped);
         for pol in [RISE, FALL] {
-            let (slew, drv_early, drv_late) = drive[pol];
+            let (slew_max, slew_min, drv_early, drv_late) = drive[pol];
             // An input delay is referenced to the clock's rising edge: launch parity 0.
-            state[p].merge(pol, latency + in_max + drv_late, latency + in_min + drv_early, slew, slew, 0, 0);
+            state[p].merge(pol, latency + in_max + drv_late, latency + in_min + drv_early, slew_max, slew_min, 0, 0);
         }
     }
 
@@ -1576,13 +1582,14 @@ fn collect_endpoints(
             // closing rise; falls recur every period, so align by whole periods — the first
             // fall alone sits one period early when the closing edge was shifted (inverting
             // clock, parity-1 launch).
-            let opening_max = if sdc.propagated_clock {
+            let opening_max = if !check.latch {
+                0.0 // only read on the latch branch below
+            } else if sdc.propagated_clock {
                 let closing = clk_state.arrival_min[edge] + capture_extra;
                 let periods = ((closing - clk_state.arrival_min[FALL]) / sdc.period_ns).floor().max(0.0);
                 // The opening fall pairs with a fall-polarity launch for CRPR, the same
                 // rule the closing edge applies to `edge`.
-                let opening_credit = if check.latch { credit_for(FALL) } else { 0.0 };
-                clk_state.arrival_min[FALL] + periods * sdc.period_ns - sdc.setup_uncertainty_ns + opening_credit
+                clk_state.arrival_min[FALL] + periods * sdc.period_ns - sdc.setup_uncertainty_ns + credit_for(FALL)
             } else {
                 half_period + clk_state.arrival_min[RISE] - sdc.setup_uncertainty_ns
             };
