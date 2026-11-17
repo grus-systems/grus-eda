@@ -1728,3 +1728,43 @@ extrapolation case, unrelated to parasitics.
   (jpeg OpenSTA #582 only). `cell_driven_clock_nets` still counts every
   cell-driven clock net under ideal — the parity walk propagates edge phase,
   not delays/slews.
+
+### 2026-11-17 — DMP residual root-cause: extreme-slew Ceff is a model-formulation gap, not a parameter
+
+- **Question**: the aes/ibex `placed_spef`/`placement_rc` residual (17 and 3
+  endpoint fields, slack ~16-37 ps, slew ~5%) concentrates on a handful of
+  driver stages at input slew 4-5.2 ns — beyond the Liberty table range. Is
+  the gap a tunable parameter (`RD_SCALE`, ramp fit, charge quadrature) or a
+  model-formulation difference?
+- **Method**: dumped `report_dcalc` rows for all five designs (23,722 rows)
+  and, for each, bisected the *constant* `rd` that makes our `solve_dmp`
+  reproduce OpenSTA's `Ceff` (`rd_root`), alongside `delay_slope`/`slew_slope`
+  at the reported `Ceff`. Diagnostic-only; no production change.
+- **Findings**:
+  - The pi model is exact: OpenSTA's `C1`/`Rpi`/`C2` match ours to <0.5% on
+    every row, so the RC reduction is not the cause.
+  - `rd = 3.0 * d(delay)/dC` is confirmed, not fitted noise: on the 64
+    well-conditioned shielded rows (`Ceff/total < 0.9`) `rd_root/dsl` has
+    median 2.94 (rise 2.96 / fall 2.94). Our delay table is linear in `C`,
+    so the slope is step-size independent.
+  - The residual is **fall-transition-specific and slew-driven**: at ref
+    `Ceff` our residual `pi_charge - 0.5*Ceff` is ~0 for rise rows but
+    +0.6..0.9% for fall rows, so our `Ceff` lands 1.5-2.6% high and delay
+    ~1.8% high (the ~16-37 ps slack, ~5% slew endpoint errors).
+  - The ramp duration is not the lever: sweeping `dt` 0..2 ns at fixed `rd`
+    moves the charge residual by <0.001 — `fit_ramp`'s degenerate `dt -> 0`
+    on fall arcs is not the cause.
+  - **Decisive**: on the clean `repro_extreme_ceff` 7-point slew sweep,
+    `rd_root` hits the search bounds — no `rd` reproduces OpenSTA's `Ceff`
+    for `fall` at input slew >= 1.5 ns (`<lo_bnd`) or `rise` at slew 6 ns.
+    OpenSTA's `Ceff` drops to 54-74% of total (fall) and is non-monotonic on
+    rise (2.10 -> 1.09 -> snaps to total at 9.14 ns). Our pi+ramp model's
+    minimum `Ceff` stays above OpenSTA's — the charge-equivalence
+    formulation itself cannot represent that regime.
+- **Conclusion**: the aes/ibex residual is the same phenomenon as OpenSTA
+  #582 — out-of-table NLDM extrapolation where OpenSTA's own `Ceff` is
+  non-monotonic and hits internal bailouts. `RD_SCALE = 3.0` is correct
+  wherever the model is conditioned; the remaining error is honest
+  extrapolation divergence, already covered by `AES_SPEF`/`IBEX_SPEF`
+  tolerances. No parameter change is justified; matching would require
+  curve-fitting OpenSTA's acknowledged-unsupported behaviour.
