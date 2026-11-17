@@ -19,6 +19,10 @@ enum Commands {
     #[command(name = "check-e0")]
     CheckE0(CheckE0Args),
 
+    /// Generate a floorplan DEF from a gate-level netlist (Yosys JSON or Verilog)
+    #[command(name = "floorplan")]
+    Floorplan(FloorplanArgs),
+
     /// E1: Estimate global-routing congestion directly from placed DEF
     Congestion(CongestionArgs),
 
@@ -95,6 +99,42 @@ struct CongestionArgs {
 
     #[arg(long, help = "Print ASCII routing congestion heatmap")]
     heatmap: bool,
+}
+
+#[derive(Args, Debug)]
+struct FloorplanArgs {
+    #[arg(long, help = "Path to technology LEF (.tlef) file")]
+    tlef: PathBuf,
+
+    #[arg(long, help = "Path to standard cell LEF (.lef) file")]
+    lef: PathBuf,
+
+    #[arg(long, help = "Path to Liberty (.lib) file (optional; fills cell library ids)")]
+    lib: Option<PathBuf>,
+
+    #[arg(long, help = "Path to Yosys netlist JSON (.json) file")]
+    json: Option<PathBuf>,
+
+    #[arg(long, help = "Path to gate-level Verilog (.v) file")]
+    verilog: Option<PathBuf>,
+
+    #[arg(long, help = "Top-level module name")]
+    top: Option<String>,
+
+    #[arg(long, help = "Path to output floorplan DEF (.def) file")]
+    out: PathBuf,
+
+    #[arg(long, help = "Explicit die area `xl,yl,xh,yh` in microns (overrides --utilization)")]
+    die_area: Option<String>,
+
+    #[arg(long, help = "Target standard-cell utilization for auto die sizing (default 0.60)")]
+    utilization: Option<f64>,
+
+    #[arg(long, default_value_t = 10.0, help = "Core-to-die margin in microns (default 10.0)")]
+    margin_um: f64,
+
+    #[arg(long, help = "Row site name (default: the tech LEF site)")]
+    site: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -323,6 +363,77 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if args.heatmap {
                 print_heatmap(grid.nx, grid.ny, &report.gcell_usage_ratio);
             }
+        }
+        Commands::Floorplan(args) => {
+            if args.json.is_some() == args.verilog.is_some() {
+                anyhow::bail!("floorplan needs exactly one of --json or --verilog");
+            }
+            let mut interner = grus_core::interner::StringInterner::new();
+            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let lib_db = match &args.lib {
+                Some(path) => Some(grus_core::readers::load_liberty(path)?),
+                None => None,
+            };
+            let mut db = if let Some(json_path) = &args.json {
+                grus_core::readers::parse_yosys_json(json_path, &tech_db, lib_db.as_ref())?
+            } else {
+                grus_core::readers::parse_verilog(
+                    args.verilog.as_ref().unwrap(),
+                    &tech_db,
+                    lib_db.as_ref(),
+                )?
+            };
+            check_top_name(args.top.as_deref(), "netlist", &db.design_name)?;
+
+            let dbu = tech_db.dbu_per_micron.max(1) as f64;
+            let to_dbu = |um: f64, what: &str| -> anyhow::Result<i32> {
+                let v = (um * dbu).round();
+                if !v.is_finite() || v < i32::MIN as f64 || v > i32::MAX as f64 {
+                    anyhow::bail!("{what} value {um} microns is out of DBU range");
+                }
+                Ok(v as i32)
+            };
+            let die_area = match &args.die_area {
+                Some(spec) => {
+                    let parts: Vec<&str> = spec.split(',').collect();
+                    if parts.len() != 4 {
+                        anyhow::bail!("--die-area must be `xl,yl,xh,yh` in microns, got {spec:?}");
+                    }
+                    let mut v = [0i32; 4];
+                    for (i, p) in parts.iter().enumerate() {
+                        let um: f64 = p
+                            .trim()
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("--die-area: bad number {p:?}: {e}"))?;
+                        v[i] = to_dbu(um, "--die-area")?;
+                    }
+                    Some(grus_core::tech_db::RectDbu::new(v[0], v[1], v[2], v[3]))
+                }
+                None => None,
+            };
+            let spec = grus_core::floorplan::FloorplanSpec {
+                die_area,
+                utilization: args.utilization.unwrap_or(0.60),
+                margin_dbu: to_dbu(args.margin_um, "--margin")?,
+                site_name: args
+                    .site
+                    .clone()
+                    .unwrap_or_else(|| tech_db.site_name.clone()),
+            };
+            grus_core::floorplan::generate_floorplan(&mut db, &tech_db, &spec)?;
+            grus_core::readers::write_def_full(&db, &tech_db, &args.out)?;
+            println!(
+                "Floorplan: design={}, cells={}, nets={}, io_pins={}, die={}x{} dbu, rows={}, site={}, wrote {:?}",
+                db.design_name,
+                db.num_cells(),
+                db.num_nets(),
+                db.io_pins.len(),
+                db.die_area.width(),
+                db.die_area.height(),
+                db.num_rows(),
+                spec.site_name,
+                args.out
+            );
         }
         Commands::Place(args) => {
             println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);

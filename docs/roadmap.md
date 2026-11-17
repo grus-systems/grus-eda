@@ -297,19 +297,36 @@ Remaining:
   `test_write_spef_round_trip_{parasitics,sta}` lock the internal
   round-trip (per-pin Elmore < 1e-9 ns; endpoint report identical).
 
-### N5. Netlist ingest + floorplan generation
+### N5. Netlist ingest + floorplan generation — DONE (v0.1.76)
 
-- `place`/`sta` only accept DEF produced elsewhere. Add a `floorplan`
-  stage (or flags on `place`): read a gate-level netlist (Yosys JSON or
-  Verilog) plus a floorplan spec (die area / target utilization,
-  site/row generation, edge pin assignment) and emit a floorplan DEF,
-  making `synth -> estimate` self-contained.
-- Gotcha: Yosys JSON lists the same wire bit under multiple `netnames`
-  aliases; the converter must dedupe by bit id or it silently connects a
-  pin to several nets (shows up as a bogus combinational loop at
-  levelization). Reproducible with any yosys-synthesized public design.
-- Done when: a public synthesised netlist produces a legal floorplan DEF
-  whose downstream `place`/`sta` runs match the DEF-fed path.
+- `grus-eda floorplan` reads a gate-level netlist (Yosys JSON or
+  Verilog; the existing E0 readers already dedupe Yosys wire bits by
+  bit id, so the alias gotcha is handled) plus a floorplan spec and
+  emits a complete floorplan DEF: `--utilization` (default 0.60) or
+  `--die-area xl,yl,xh,yh` (microns), `--margin-um` (default 10),
+  `--site` (default: tech LEF site). Rows alternate N/FS at site
+  pitch; inputs go on the left edge, outputs on the right, names
+  sorted naturally so buses read in order.
+- `readers/def.rs::write_def_full` serializes a whole DesignDb (no
+  template): header, DIEAREA, ROWs, COMPONENTS, PINS, NETS. TRACKS/
+  GCELLGRID/VIAS/SPECIALNETS are omitted — they constrain detailed
+  routing/power, which the database does not model. Names go through
+  `escape_def_name`, which escapes only the lexer delimiters and `\`
+  itself; `[N]` bus-bit syntax stays literal so external readers see
+  the same names OpenROAD-flow-scripts emits. The DEF lexer was
+  extended to treat `\x` as an escaped character inside a word so
+  names containing `(`, `)`, `;`, `#`, or whitespace round-trip.
+- Verified: `gcd.synth.json` -> floorplan DEF -> `place` converges
+  (233 cells, 24 rows) -> `sta` reports the same 53 endpoints as the
+  DEF-fed path (setup wns 1.757771, zero violations). OpenROAD
+  `read_def` accepts the emitted DEFs with matching counts — gcd
+  (54 pins, 233 components, 269 nets), aes (388 pins, 8780
+  components, 9039 nets), ibex (264 pins, 11979 components, 12137
+  nets). `aes.synth.v` -> 8780 cells / 9039 nets round-trips through
+  `parse_def`. `floorplan::tests` lock the DEF round-trip
+  connectivity, edge assignment, and bad-spec rejection;
+  `readers::def::tests::test_escaped_names_roundtrip_through_lexer`
+  locks name escaping through the lexer.
 
 ### N6. Multi-corner analysis (optional, previously out of scope)
 

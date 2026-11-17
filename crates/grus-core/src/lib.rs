@@ -1,5 +1,6 @@
 pub mod congestion;
 pub mod design_db;
+pub mod floorplan;
 pub mod interner;
 pub mod lib_db;
 pub mod placement;
@@ -12,6 +13,7 @@ mod test_support;
 
 pub use congestion::*;
 pub use design_db::*;
+pub use floorplan::*;
 pub use interner::*;
 pub use lib_db::*;
 pub use placement::*;

@@ -70,6 +70,13 @@ impl<'a> DefLexer<'a> {
             let start = self.pos;
             while self.pos < len {
                 let c = bytes[self.pos];
+                if c == b'\\' && self.pos + 1 < len {
+                    // An escaped character belongs to the name even when it
+                    // is a delimiter; unescape_def_name strips the backslash
+                    // once the full word is known.
+                    self.pos += 2;
+                    continue;
+                }
                 if c.is_ascii_whitespace() || c == b';' || c == b'(' || c == b')' || c == b'#' {
                     break;
                 }
@@ -93,6 +100,23 @@ pub fn unescape_def_name(s: &str) -> String {
         } else {
             out.push(c);
         }
+    }
+    out
+}
+
+/// Inverse of `unescape_def_name`: prefixes characters that would delimit
+/// a DEF word with `\`. Only the escape character, ASCII whitespace, `;`,
+/// `(`, `)`, and `#` (a comment opener in this lexer) need escaping.
+/// Everything else — including `[N]` bus-bit syntax and `$`/`/` — is written
+/// literally so external DEF readers see the same names OpenROAD-flow-scripts
+/// emits for synthesized netlists.
+pub fn escape_def_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' || c.is_ascii_whitespace() || matches!(c, ';' | '(' | ')' | '#') {
+            out.push('\\');
+        }
+        out.push(c);
     }
     out
 }
@@ -864,6 +888,114 @@ pub fn write_def(
     Ok(())
 }
 
+/// Serializes a complete DEF — header, DIEAREA, ROWs, COMPONENTS, PINS, NETS —
+/// with no template. Used by floorplan generation where no DEF exists yet.
+/// TRACKS/GCELLGRID/VIAS/SPECIALNETS are omitted: they constrain detailed
+/// routing and power, which this database does not model.
+pub fn write_def_full(db: &DesignDb, tech_db: &TechDb, out_def_path: &Path) -> Result<()> {
+    let name = |sym: crate::interner::SymbolId| escape_def_name(db.strings.resolve(sym));
+    let mut out = String::with_capacity(1 << 20);
+    out.push_str("VERSION 5.8 ;\nDIVIDERCHAR \"/\" ;\nBUSBITCHARS \"[]\" ;\n");
+    out.push_str(&format!("DESIGN {} ;\n", escape_def_name(&db.design_name)));
+    out.push_str(&format!("UNITS DISTANCE MICRONS {} ;\n", db.dbu_per_micron));
+    out.push_str(&format!(
+        "DIEAREA ( {} {} ) ( {} {} ) ;\n",
+        db.die_area.xl, db.die_area.yl, db.die_area.xh, db.die_area.yh
+    ));
+    for (i, r) in db.rows.iter().enumerate() {
+        out.push_str(&format!(
+            "ROW ROW_{} {} {} {} {} DO {} BY 1 STEP {} 0 ;\n",
+            i,
+            name(r.site_name),
+            r.orig_x_dbu,
+            r.orig_y_dbu,
+            orient_str(r.orient),
+            r.num_x,
+            r.step_x_dbu
+        ));
+    }
+
+    out.push_str(&format!("COMPONENTS {} ;\n", db.num_cells()));
+    for c in 0..db.num_cells() {
+        let macro_name = tech_db
+            .strings
+            .resolve(tech_db.macros[db.cell_macros[c].0 as usize].name);
+        match db.cell_status[c] {
+            PlacementStatus::Unplaced => {
+                out.push_str(&format!(
+                    "    - {} {} + UNPLACED ;\n",
+                    name(db.cell_names[c]),
+                    escape_def_name(macro_name)
+                ));
+            }
+            status => {
+                out.push_str(&format!(
+                    "    - {} {} + {} ( {} {} ) {} ;\n",
+                    name(db.cell_names[c]),
+                    escape_def_name(macro_name),
+                    match status {
+                        PlacementStatus::Placed => "PLACED",
+                        PlacementStatus::Fixed => "FIXED",
+                        PlacementStatus::Cover => "COVER",
+                        PlacementStatus::Unplaced => unreachable!(),
+                    },
+                    db.cell_x_dbu[c],
+                    db.cell_y_dbu[c],
+                    orient_str(db.cell_orient[c])
+                ));
+            }
+        }
+    }
+    out.push_str("END COMPONENTS\n");
+
+    out.push_str(&format!("PINS {} ;\n", db.io_pins.len()));
+    for &pin in &db.io_pins {
+        let p = pin.0 as usize;
+        let mut line = format!("    - {}", name(db.pin_names[p]));
+        if let Some(net) = db.pin_nets[p] {
+            line.push_str(&format!(" + NET {}", name(db.net_names[net.0 as usize])));
+        }
+        line.push_str(&format!(
+            " + DIRECTION {} + USE SIGNAL + PORT + PLACED ( {} {} ) N ;\n",
+            match db.pin_dirs[p] {
+                PinDir::Input => "INPUT",
+                PinDir::Output => "OUTPUT",
+                PinDir::Inout | PinDir::Internal => "INOUT",
+            },
+            db.pin_offset_x_dbu[p],
+            db.pin_offset_y_dbu[p]
+        ));
+        out.push_str(&line);
+    }
+    out.push_str("END PINS\n");
+
+    out.push_str(&format!("NETS {} ;\n", db.num_nets()));
+    for n in 0..db.num_nets() {
+        let mut line = format!("    - {}", name(db.net_names[n]));
+        let start = db.net_pin_offsets[n] as usize;
+        let end = db.net_pin_offsets[n + 1] as usize;
+        for &pin in &db.net_pin_ids[start..end] {
+            let p = pin.0 as usize;
+            match db.pin_cells[p] {
+                Some(cell) => line.push_str(&format!(
+                    " ( {} {} )",
+                    name(db.cell_names[cell.0 as usize]),
+                    name(db.pin_names[p])
+                )),
+                None => line.push_str(&format!(" ( PIN {} )", name(db.pin_names[p]))),
+            }
+        }
+        line.push_str(" + USE SIGNAL ;\n");
+        out.push_str(&line);
+    }
+    out.push_str("END NETS\nEND DESIGN\n");
+
+    let mut file = File::create(out_def_path)
+        .with_context(|| format!("Failed to create DEF at {:?}", out_def_path))?;
+    file.write_all(out.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1512,39 @@ END DESIGN
             "NONDEFAULTRULES\n  - abc\nEND NONDEFAULTRULES\nCOMPONENTS 1 ;",
         );
         parse_def_bytes(def.as_bytes(), &mini_tech(), None).expect("DEF with NONDEFAULTRULES must parse");
+    }
+
+    /// Every name written by `escape_def_name` must come back unchanged
+    /// after the lexer splits words and `unescape_def_name` strips escapes.
+    /// `[`/`]` stay literal so `name[N]` bus-bit syntax survives, matching
+    /// what OpenROAD-flow-scripts emits for synthesized netlists.
+    #[test]
+    fn test_escaped_names_roundtrip_through_lexer() {
+        for raw in [
+            "a(b)",
+            "a;b",
+            "a#b",
+            "a b",
+            "a\\b",
+            "name[0]",
+            "req_msg[3]",
+            "dpath.a$in0",
+            "x+y,z",
+        ] {
+            let esc = escape_def_name(raw);
+            let def = MINI_DEF.replace(
+                "- n1 ( PIN clk ) ( u1 A ) + USE SIGNAL ;",
+                &format!("- {esc} ( PIN clk ) ( u1 A ) + USE SIGNAL ;"),
+            );
+            let db = parse_def_bytes(def.as_bytes(), &mini_tech(), None).unwrap_or_else(|e| {
+                panic!("DEF with escaped name {esc:?} (raw {raw:?}) failed: {e:#}")
+            });
+            assert_eq!(
+                db.strings.resolve(db.net_names[0]),
+                raw,
+                "net name {raw:?} did not round-trip"
+            );
+        }
     }
 
     /// Every truncation of the mini DEF must return `Ok` or `Err` without panicking, and only the
