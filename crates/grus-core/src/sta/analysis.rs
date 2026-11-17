@@ -2874,7 +2874,9 @@ mod tests {
     /// `picorv32.propagated.sdc` marks `core_clk` propagated on the unbuffered clock net:
     /// routed RC now sets a per-pin launch/capture edge, so clock skew appears (hold WNS
     /// drops to -2.48 ns, TNS -1053.67 ns vs the ideal-clock golden's clean min side).
-    /// Golden from `tests/designs/generate_prop_ref.sh picorv32` (OpenSTA, same inputs).
+    /// Golden from `tests/designs/generate_prop_ref.sh picorv32` (OpenSTA, same inputs);
+    /// its `clock_pins` array asserts per-pin arrival/slew independently of the endpoint
+    /// tolerance (max abs diff 8e-6 ns).
     #[test]
     fn test_picorv32_propagated_clock_matches_opensta() {
         compare_design_files(
@@ -2912,7 +2914,8 @@ mod tests {
 
     /// `gcd.propagated.sdc` marks `core_clk` propagated: the clock net's routed RC now sets a
     /// per-pin launch/capture edge (WNS drops 1.573 -> 1.412 ns vs the ideal-clock golden).
-    /// Golden from `generate_prop_ref.sh` (OpenSTA on the same placed DEF + rcx SPEF).
+    /// Golden from `generate_prop_ref.sh` (OpenSTA on the same placed DEF + rcx SPEF); its
+    /// `clock_pins` array asserts per-pin arrival/slew (max abs diff 1e-6 ns).
     #[test]
     fn test_gcd_propagated_clock_matches_opensta() {
         compare_design_files(
@@ -4973,7 +4976,7 @@ mod tests {
                 Some(crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics"))
             }
         };
-        let (report, _, polarities) =
+        let (report, state, polarities) =
             run_sta_detail(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
 
         let reference: serde_json::Value =
@@ -5041,6 +5044,129 @@ mod tests {
                     failures.push(format!("{name}.{field}: ours={} ref={expected}", values[i]));
                 }
             }
+        }
+
+        // Propagated-clock goldens also carry per-clock-pin arrival/slew — what
+        // `set_propagated_clock` actually computes — asserted independently of the
+        // endpoint tolerance so a systematic clock-network error cannot hide under
+        // the (looser) data-path bounds. `state[clk]` holds the clock arrival because
+        // consumer clock pins are seeded from `clk_state` before data propagation.
+        // A propagated run requires a non-empty `clock_pins` array: without it this
+        // check would be silently disabled, so a missing or empty one is a hard error.
+        if sdc.propagated_clock {
+            let clock_pins = zero_wire
+                .get("clock_pins")
+                .and_then(|c| c.as_array())
+                .filter(|c| !c.is_empty())
+                .expect("propagated-clock golden has no non-empty `clock_pins` array");
+            let cx = Context {
+                design: &design,
+                lib: &lib,
+                sdc: &sdc,
+                parasitics: parasitics.as_ref(),
+                pi_models: Vec::new(),
+            };
+            let by_name: std::collections::HashMap<String, PinId> = (0..design.num_pins())
+                .map(|i| PinId(i as u32))
+                .map(|p| (cx.pin_name(p), p))
+                .collect();
+            // Every clock consumer our graph models must appear in the golden, or the
+            // collector missed a pin and this check would not cover it.
+            let graph = build_graph(&cx, &mut SkipReport::default());
+            // The golden's pin set must equal our modeled clock-consumer set exactly:
+            // a modeled consumer absent from the golden means the collector skipped a
+            // pin, and a golden pin we do not model means it enumerated something
+            // outside the timing graph — neither may pass silently. Per-pin values are
+            // compared below regardless of set membership.
+            let mut golden_names = std::collections::HashSet::new();
+            let mut golden_entries_with_pin = 0usize;
+            for e in clock_pins {
+                if let Some(p) = e["pin"].as_str() {
+                    golden_entries_with_pin += 1;
+                    golden_names.insert(p.to_owned());
+                }
+            }
+            let modeled_consumers = graph
+                .launches
+                .iter()
+                .map(|l| l.clk)
+                .chain(graph.checks.iter().filter_map(|(_, c)| c.clk))
+                .chain(graph.latch_opens.iter().map(|o| o.enable))
+                .chain(graph.gating_enables.iter().map(|g| g.clk_pin))
+                .map(|p| cx.pin_name(p))
+                .collect::<std::collections::HashSet<_>>();
+            assert!(
+                !modeled_consumers.is_empty(),
+                "{design_name} {golden_key}: no modeled clock consumers to check"
+            );
+            for name in &modeled_consumers {
+                if !golden_names.contains(name.as_str()) {
+                    failures.push(format!(
+                        "{name}: modeled clock consumer missing from golden `clock_pins`"
+                    ));
+                }
+            }
+            for name in &golden_names {
+                if !modeled_consumers.contains(name) {
+                    failures.push(format!(
+                        "{name}: golden `clock_pins` entry is not a modeled clock consumer"
+                    ));
+                }
+            }
+            if golden_names.len() != golden_entries_with_pin {
+                failures.push("golden `clock_pins` contains duplicate `pin` entries".to_string());
+            }
+            // (field, transition, is_arrival, is_max). Clock arrival/slew match OpenSTA to
+            // ~8e-6 ns (f32 noise); 1 ps is ~100x that margin yet far below any real skew
+            // defect, so a systematic clock-network error cannot slip under it.
+            const CLK_ABS_NS: f64 = 0.001;
+            let clk_fields: [(&str, usize, bool, bool); 8] = [
+                ("arr_rise_max_ns", RISE, true, true),
+                ("arr_rise_min_ns", RISE, true, false),
+                ("arr_fall_max_ns", FALL, true, true),
+                ("arr_fall_min_ns", FALL, true, false),
+                ("slew_rise_max_ns", RISE, false, true),
+                ("slew_rise_min_ns", RISE, false, false),
+                ("slew_fall_max_ns", FALL, false, true),
+                ("slew_fall_min_ns", FALL, false, false),
+            ];
+            let mut clk_max = 0.0f64;
+            let mut clk_checked = 0usize;
+            for entry in clock_pins {
+                let Some(name) = entry["pin"].as_str() else {
+                    failures.push("clock_pins entry missing `pin`".to_string());
+                    continue;
+                };
+                let Some(&pin) = by_name.get(name) else {
+                    failures.push(format!("{name}: clock pin missing"));
+                    continue;
+                };
+                let s = state[pin.0 as usize];
+                for &(field, pol, is_arr, is_max) in &clk_fields {
+                    let Some(expected) = entry[field].as_f64() else {
+                        failures.push(format!(
+                            "{name}.{field}: missing or non-numeric golden value"
+                        ));
+                        continue;
+                    };
+                    let ours = match (is_arr, is_max) {
+                        (true, true) => s.arrival_max[pol],
+                        (true, false) => s.arrival_min[pol],
+                        (false, true) => s.slew_max[pol],
+                        (false, false) => s.slew_min[pol],
+                    } as f64;
+                    let diff = (ours - expected).abs();
+                    clk_max = clk_max.max(diff);
+                    if diff > CLK_ABS_NS {
+                        failures.push(format!("{name}.{field}: ours={ours} ref={expected}"));
+                    }
+                    clk_checked += 1;
+                }
+            }
+            println!(
+                "{design_name} {golden_key} clock_pins checked={clk_checked} modeled_consumers={} max_abs_diff={clk_max:.6} ns",
+                modeled_consumers.len()
+            );
         }
         println!(
             "{design_name} {golden_key} max relative diff per field: {:?}",

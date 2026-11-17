@@ -1835,8 +1835,10 @@ the `sta_edge` fixtures. `tests/designs/<design>/<design>.propagated.sdc` adds
 load constraints to each design's committed `.sdc`; `generate_prop_ref.sh` emits
 `<design>.propagated.reference.json` from OpenSTA 3.0.16 on `.placed.def` +
 `.rcx.spef` (no flow re-run; gcd's DEF/SPEF are committed, picorv32's are
-git-ignored and come from `picorv32/generate_ref.sh`). `compare_design_with_opensta` was
-generalised to `compare_design_files` so a test can name its own SDC and golden.
+git-ignored and come from `picorv32/generate_ref.sh`). The golden carries the
+endpoint aggregates plus a `clock_pins` array of per-clock-pin arrival/slew.
+`compare_design_with_opensta` was generalised to `compare_design_files` so a
+test can name its own SDC and golden.
 
 - **gcd** (`test_gcd_propagated_clock_matches_opensta`, `GCD_SPEF`): clean pass.
   53 endpoints; max relative diffs arr 0.38%, req 0.009%, slack 0.43%, slew 2.8%,
@@ -1846,11 +1848,21 @@ generalised to `compare_design_files` so a test can name its own SDC and golden.
   `PICORV32_PROPAGATED`): 1,798 endpoints, hold side now violates (WNS -2.476 ns,
   TNS -1053.67 ns vs ideal's clean min side) because clock skew is real on the
   unbuffered net. 14,381/14,384 endpoint fields pass; WNS/TNS match.
-- **Clock arrival is exact**: per-pin propagated clock-network delay equals
-  `ln2 * elmore + source_latency` and matches OpenSTA `report_checks` to ~5 ps at
-  all sampled pins (`_11496_` 1.303 vs 1.30, `_10754_` 1.789 vs 1.79, `_11498_`
-  0.631 vs 0.63, `_10876_` 4.196 vs 4.20, `_10849_` 1.265 vs 1.26 ns). Required
-  times match to a median ~0.3 ps over all endpoints.
+- **Clock-pin arrival/slew is asserted per pin**: the golden's `clock_pins`
+  array holds OpenSTA `get_property` `arrival_{max,min}_{rise,fall}` and
+  `slew_{max,min}_{rise,fall}` for every `is_clock` pin of `all_registers`
+  sequential cells (gcd 35, picorv32 1,597 — the only clock consumers in these
+  designs; neither has clock-gate cells). `compare_design_files` requires a
+  non-empty `clock_pins` array whenever the SDC is propagated (a missing or
+  empty one is a hard error, so the check cannot be silently disabled), and
+  cross-checks that every clock consumer our timing graph models appears in
+  the golden — our modeled set equals the golden's exactly (35 / 1,597). It
+  then checks all eight fields per pin against our per-pin state at a 1 ps
+  absolute bound (~100x the f32 noise floor), independent of the endpoint
+  tolerance. Measured max abs diff: gcd 1e-6 ns, picorv32 8e-6 ns —
+  the propagated clock network itself is exact, so the endpoint residuals
+  below are purely data-path. (Earlier spot checks via `report_checks` had
+  shown ~5 ps agreement at sampled pins; the golden now makes it exhaustive.)
 - **Three outliers on clock-independent paths**: `_11496_`/`_10754_`
   `max_arr_ns`/`max_req_ns` (~0.10-0.12 ns) and `_11498_` `max_slew_ns` (12.6%).
   OpenSTA `report_checks` shows all three worst paths are `resetn`-launched
@@ -1864,8 +1876,7 @@ generalised to `compare_design_files` so a test can name its own SDC and golden.
   the known E3.5 cell-stage gap: the paths traverse cells seeing 1.8-3.5 ns
   slews and `_11496_`'s required time reads its setup constraint at 2.36 ns
   clock slew (OpenSTA #582 regime). Neither effect is a clock-arrival defect —
-  the propagated clock's own per-pin arrival is verified above. `PICORV32_PROPAGATED`
-  widens only `arr_rel` (0.01 -> 0.03) and `slew_rel` (0.10 -> 0.15) over
-  `PICORV32_SPEF`; slack, TNS and WNS keep their tighter bounds, and clock-pin
-  arrival is independently covered by the strict `sta_edge` propagated fixtures
-  and the clean `gcd` pass.
+  the per-pin `clock_pins` assertion above covers the clock network directly.
+  `PICORV32_PROPAGATED` widens only `arr_rel` (0.01 -> 0.03) and `slew_rel`
+  (0.10 -> 0.15) over `PICORV32_SPEF`; slack, TNS and WNS keep their tighter
+  bounds.

@@ -91,6 +91,45 @@ proc collect_endpoints_json {} {
     return [join $entries ",\n"]
 }
 
+proc fmt_prop {pin prop} {
+    if {[catch {format %.6f [get_property $pin $prop]} r]} { return "null" }
+    return $r
+}
+
+# Per-clock-pin propagated arrival/slew, independent of any data path: this is what
+# `set_propagated_clock` actually computes, so it is asserted separately from the
+# endpoint aggregates. Covers `is_clock` pins on `all_registers` (sequential cells —
+# the only clock consumers in gcd and picorv32, which have no clock-gate cells). A
+# design with clock gating would need this extended; OpenSTA's arrival queries
+# segfault on pins outside the timing graph, so gate pins are not a
+# `get_pins -hierarchical` scan. (`all_latches`/`all_cells` do not exist in this
+# OpenSTA build; `all_registers` is the sequential-cell enumeration.)
+proc collect_clock_pins_json {} {
+    set names {}
+    array set v {}
+    foreach cell [all_registers] {
+        foreach p [get_pins -of $cell] {
+            if {[get_property $p is_clock] == 1} {
+                set name [get_full_name $p]
+                lappend names $name
+                set v($name,arm) [fmt_prop $p arrival_max_rise]
+                set v($name,armn) [fmt_prop $p arrival_min_rise]
+                set v($name,afm) [fmt_prop $p arrival_max_fall]
+                set v($name,afmn) [fmt_prop $p arrival_min_fall]
+                set v($name,srm) [fmt_prop $p slew_max_rise]
+                set v($name,srmn) [fmt_prop $p slew_min_rise]
+                set v($name,sfm) [fmt_prop $p slew_max_fall]
+                set v($name,sfmn) [fmt_prop $p slew_min_fall]
+            }
+        }
+    }
+    set entries {}
+    foreach name [lsort -dictionary $names] {
+        lappend entries "      {\"pin\": \"$name\", \"arr_rise_max_ns\": $v($name,arm), \"arr_rise_min_ns\": $v($name,armn), \"arr_fall_max_ns\": $v($name,afm), \"arr_fall_min_ns\": $v($name,afmn), \"slew_rise_max_ns\": $v($name,srm), \"slew_rise_min_ns\": $v($name,srmn), \"slew_fall_max_ns\": $v($name,sfm), \"slew_fall_min_ns\": $v($name,sfmn)}"
+    }
+    return [join $entries ",\n"]
+}
+
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
@@ -103,6 +142,7 @@ set prop_tns_max [format "%.6f" [sta::total_negative_slack -max]]
 set prop_wns_min [format "%.6f" [sta::worst_slack -min]]
 set prop_tns_min [format "%.6f" [sta::total_negative_slack -min]]
 set prop_endpoints [collect_endpoints_json]
+set prop_clock_pins [collect_clock_pins_json]
 
 set fp [open "/work/tests/designs/$DESIGN/$DESIGN.propagated.reference.json" "w"]
 puts $fp "{"
@@ -114,6 +154,9 @@ puts $fp "    \"wns_min_ns\": $prop_wns_min,"
 puts $fp "    \"tns_min_ns\": $prop_tns_min,"
 puts $fp "    \"endpoints\": \["
 puts $fp $prop_endpoints
+puts $fp "    \],"
+puts $fp "    \"clock_pins\": \["
+puts $fp $prop_clock_pins
 puts $fp "    \]"
 puts $fp "  }"
 puts $fp "}"
