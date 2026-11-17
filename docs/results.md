@@ -1544,3 +1544,51 @@ outputs so the propagated clock sees both edge polarities.
   README and `docs/e1-congestion.md` record the 0.45 floor. The relaxation is
   acknowledged as fitted to the four measured designs; it still rejects
   empty or misplaced hot sets.
+
+### 2026-11-18 — R5 — latch `D -> Q` propagation and time borrowing
+
+Model derived from OpenSTA probes (`report_checks`/`find_timing_paths` on a
+hand-written `dlxtn`/`dlxtp` fixture inside `ghcr.io/librelane/librelane:3.0.16`,
+period 5.0 ns, uncertainty 0.1 ns, arrival sweeps at the latch `D`):
+
+- **Endpoint required time** for a latch `D` inside the transparent window is
+  `min(arrival, closing_required)` where `closing_required` is the normal
+  setup required time of that transition — the closing edge minus uncertainty
+  and the transition's own setup arc value. Arrivals before the opening edge
+  keep normal required time; arrivals inside the window get `req = arr`
+  (zero slack); arrivals past the close edge violate with `req` clamped at the
+  cap. OpenSTA reports the transition with the worst slack, so the per-
+  transition `min` matches `u_lp/D` (rise `-0.92` reported over fall `-0.80`).
+- **Startpoint launch** through `D -> Q` is `min(arrival(tr), close_edge -
+  uncertainty - setup(tr))` — the same per-transition cap. Arrival before the
+  opening edge instead launches through the enable's clock-to-Q arc at the open
+  edge (the pre-R5 behaviour, kept).
+- **Transparent arcs propagate the same transition** at both ends: OpenSTA's
+  `report_checks` shows `v` at `D` -> `v` at `Q`/`Q_N` even where the Liberty
+  arc is `negative_unate` (`dlxb*`/`dlrb*` `D -> Q_N`), so the borrow edge
+  clamps and delays each polarity against the same-polarity arrival.
+- **Polarity**: `latch_enable` reads the check arc type — `setup_rising`
+  (`dlxtn`/`GATE_N`, opens on FALL) vs `setup_falling` (`dlxtp`/`GATE`, opens
+  on RISE) — instead of assuming FALL; `LatchOpen`/`LatchInfo` carry
+  `open_pol`, and the open-edge offset convention (half period for FALL under
+  the ideal clock) applies symmetrically.
+
+Fixture `tests/designs/sta_edge/latch_borrow/` instantiates every
+`sky130_fd_sc_hd` latch shape (`dlxtn/dlxtp`, `dlxbn/dlxbp`, `dlrtn/dlrtp`,
+`dlrbn/dlrbp`, `lpflow_inputisolatch`) fed by `buf_2` delays chosen so `D`
+arrivals land before, inside and after the borrow windows; latch `Q`/`Q_N`
+drive `dfxtp` `D` pins and `RESET_B` pins carry recovery/removal checks. Both
+`ideal` (port clock) and `propagated` (`set_propagated_clock` through `u_clkb`)
+modes match OpenSTA **strictly on all 31 endpoints** (11 latch `D`, 4 latch
+`RESET_B`, 15 FF `D`, output `y`), max and min, arr/req/slack/slew/WNS/TNS/
+violation counts. `generate_ref.sh` reproduces the golden inside the pinned
+container. The older `non_dlxtn_latch` fixture (`dlxtp`) now passes strict and
+is un-ignored; `test_skip_report_counts_latch_arcs` recounts drops: only
+`min_pulse_width` arcs remain per latch cell.
+
+Recorded restriction: a latch `D -> Q` cycle (latch feeding another latch's `D`
+through combinational logic only, or a latch `D` looped back) is a
+combinational cycle and levelisation rejects it with an error — no
+phase-iterative fixed point is invented. OpenSTA resolves such loops with
+iterative relaxation; none of the public fixtures or sky130hd designs exercised
+one, so the restriction is a documented gap, not silently approximated.

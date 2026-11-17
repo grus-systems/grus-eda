@@ -115,15 +115,18 @@ The items below close these gaps, in the order proposed at the end.
 
 ### R5. Latches
 
-- Today latch endpoints are collected, but the `D -> Q` transparent path and time
-  borrowing are not modelled, and only `dlxtn` is understood (`dlxtp` and other shapes are
-  skipped; the `non_dlxtn_latch` edge case is a recorded, `#[ignore]`d divergence).
-- Adding `D -> Q` edges creates cycles in latch loops, and the levelisation today stops on
-  any cycle. The design must say how loops are handled (a phase-aware, iterative
-  borrowing relaxation, or a documented restriction to acyclic latch use).
-- Done when: fixtures covering every `sky130_fd_sc_hd` latch shape match OpenSTA on the
-  latch pins and on the downstream endpoints reached through `D -> Q` (arrival, required
-  time, slack, slew, and borrowed time; setup and hold) within the default tolerance.
+- Done (`sta_edge/latch_borrow`, strict PASS in ideal and propagated modes on all 31
+  endpoints incl. the latch `D` and `RESET_B` pins). The transparent `D -> Q` path
+  borrows up to the closing edge minus the per-transition setup constraint, and data
+  already waiting at the opening edge launches through the clock-to-Q arc. The model
+  covers every `sky130_fd_sc_hd` latch shape (`dlxt[n/p]`, `dlxb[n/p]`, `dlrt[n/p]`,
+  `dlrb[n/p]`, `lpflow_inputisolatch`) in both polarities, ideal and propagated clocks,
+  and setup and hold.
+- Restriction recorded in `docs/results.md`: latch loops are *not* phase-iterated —
+  a `D -> Q` cycle is a combinational cycle and levelisation rejects it as an error,
+  matching the tool's honest-failure rule instead of inventing a fixed point.
+- Remaining skip counts: `min_pulse_width` arcs and `Clear`/`Preset` arcs (OpenSTA
+  3.0.16 does not propagate them, R6) are counted in `latch_arcs_dropped`.
 
 ### R6. Asynchronous arcs
 

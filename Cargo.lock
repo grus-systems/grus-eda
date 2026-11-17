@@ -163,7 +163,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "grus-core"
-version = "0.1.67"
+version = "0.1.68"
 dependencies = [
  "anyhow",
  "bincode",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "grus-eda"
-version = "0.1.67"
+version = "0.1.68"
 dependencies = [
  "anyhow",
  "clap",
