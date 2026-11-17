@@ -1795,3 +1795,33 @@ extrapolation case, unrelated to parasitics.
   extrapolation divergence plus an unmodelled ~ps-level OpenSTA waveform
   detail. No parameter change is justified; `slew_rel` 5.5% continues to
   cover it. Diagnostic-only; no production change.
+
+### 2026-11-18 — Propagated-clock slew merge: `ss_n40C_1v35` residual resolved
+
+- **Root cause** (supersedes the "corner-specific NLDM residual" note in the
+  R8 entry above): the ~6 ps `u_ff5/D`/`u_ff6/D` `max_arr_ns` gap was not an
+  NLDM interpolation difference. OpenSTA `report_dcalc` on the pinned image
+  showed the latch enable pin `u_lt/GATE_N` sees input slew `0.114658 ns`,
+  while our propagated clock carried only the `u_and` *clock-input* (`A -> X`)
+  arc's output slew `0.105098 ns`. The gate's *enable-input* (`B -> X`) arc
+  produces the larger falling slew, and OpenSTA merges every incoming arc's
+  slew at each vertex — clock and data arcs alike. Our `propagate_clock`
+  propagated only clock-reached arcs, so the enable arc never contributed.
+- **Fix**: new `propagate_slew` pass computes unified `slew_max`/`slew_min`
+  for every pin in one levelized traversal (arrival-independent, so slew needs
+  no arrival). It merges combinational arcs, register clock-to-Q arcs and
+  latch enable-to-Q arcs uniformly, including latch `D -> Q` borrow edges and
+  sequential-arc sources indexed by output pin. `propagate_clock` now uses the
+  unified slews for its delay lookups and its returned states take the unified
+  slew fields. Computed only under `set_propagated_clock`; ideal-clock runs are
+  unaffected.
+- **Verification**: `u_lt/GATE_N` slew is now `0.114658 ns` and `u_lt/Q` /
+  `u_ff5/D` `max_arr_ns` `5.3778677 ns`, matching OpenSTA `5.377868 ns` to
+  ~1e-7 — the residual is gone on `ss_n40C_1v35` (and the same merge applies
+  to every corner). New regression test
+  `test_propagated_clock_gate_merges_enable_arc_slew` asserts the merged slew
+  equals the max over `u_and`'s input arcs (enable arc dominates) and that the
+  latch enable sees the driver pin's slew; verified it fails without the fix.
+  `cargo test --workspace --release`: 211 + 3 pass, 0 fail; the two `jpeg`
+  ignores are unchanged (OpenSTA #582). All propagated-clock `sta_edge`
+  fixtures still match strictly.

@@ -1322,6 +1322,194 @@ fn sink_state_with_wire(
     sink_state
 }
 
+/// Slew-only counterpart of [`sink_state_with_wire`]: the wire degradation applied to a
+/// driver's slew at one sink, without touching arrival fields.
+fn slew_sink(
+    driver: PinTimingState,
+    wire: Option<&[Vec<f32>; 2]>,
+    pin_idx: u32,
+    is_port: bool,
+) -> PinTimingState {
+    let mut sink = driver;
+    let Some(wire) = wire else { return sink };
+    let i = pin_idx as usize;
+    for pol in [RISE, FALL] {
+        let degrade = WIRE_SLEW_FACTOR * wire[pol][i];
+        if is_port {
+            sink.slew_max[pol] = driver.slew_max[pol] + degrade;
+            sink.slew_min[pol] = driver.slew_min[pol] + degrade;
+        } else {
+            sink.slew_max[pol] = driver.slew_max[pol].hypot(degrade);
+            sink.slew_min[pol] = driver.slew_min[pol].hypot(degrade);
+        }
+    }
+    sink
+}
+
+/// Accumulate one arc's output slew into a pin's slew bounds: the larger-input-slew
+/// result feeds `slew_max`, the smaller feeds `slew_min` (same pairing as `merge`).
+fn merge_slew(state: &mut PinTimingState, pol: usize, out_max: f32, out_min: f32) {
+    state.slew_max[pol] = state.slew_max[pol].max(out_max);
+    state.slew_min[pol] = state.slew_min[pol].min(out_min);
+}
+
+fn slew_reached(state: &PinTimingState, pol: usize) -> bool {
+    state.slew_max[pol] > f32::NEG_INFINITY
+}
+
+/// Unified `slew_max`/`slew_min` for every pin. OpenSTA merges the slew of *every*
+/// incoming arc at a vertex — clock and data arcs alike — so a clock gate's enable
+/// arc can dominate the slew its clock output pin (and downstream clock pins) see.
+/// Propagating only clock-reached arcs, as `propagate_clock` does for arrival, loses
+/// that merge. Slew is arrival-independent (each arc's output slew is a function of
+/// the source slew and the net load only), so one levelized pass over all arcs —
+/// combinational, register clock-to-Q and latch enable-to-Q — reproduces it exactly.
+/// Only the slew fields of the returned states are meaningful.
+fn propagate_slew(
+    cx: &Context,
+    levelized: &LevelizedGraph,
+    graph: &TimingGraph,
+    wire_delays_per_net: &[Option<[Vec<f32>; 2]>],
+    state: &[PinTimingState],
+) -> Vec<PinTimingState> {
+    let design = cx.design;
+    let sdc = cx.sdc;
+    let n = design.num_pins();
+    let mut slew = vec![PinTimingState::UNREACHED; n];
+
+    // Register clock-to-Q and latch enable-to-Q arcs are not in the combinational
+    // `edges_to` CSR; index them by output pin so the levelized pass merges their
+    // slew like any other incoming arc. The usize is the fixed source polarity
+    // (the launching clock edge / the latch's opening edge).
+    let mut seq_in: Vec<Vec<(PinId, u32, usize)>> = vec![Vec::new(); n];
+    for l in &graph.launches {
+        seq_in[l.q.0 as usize].push((l.clk, l.lib_arc, l.edge));
+    }
+    for o in &graph.latch_opens {
+        seq_in[o.q.0 as usize].push((o.enable, o.lib_arc, o.open_pol));
+    }
+
+    // Input ports seed slew. Data inputs take the slew the data pass already computed
+    // (`port_drive`, which honours `set_driving_cell`); the clock port takes
+    // `set_input_transition`, matching `propagate_clock`'s source seed.
+    for &pin in &design.io_pins {
+        let p = pin.0 as usize;
+        if design.pin_dirs[p] != PinDir::Input {
+            continue;
+        }
+        if sdc.clock_port.as_deref() == Some(cx.port_name(pin)) {
+            let tr = sdc.input_transition_ns(cx.port_name(pin));
+            for pol in [RISE, FALL] {
+                slew[p].slew_max[pol] = tr;
+                slew[p].slew_min[pol] = tr;
+            }
+        } else {
+            slew[p].slew_max = state[p].slew_max;
+            slew[p].slew_min = state[p].slew_min;
+        }
+    }
+
+    // Output slew of one arc for `dst_pol` at both input-slew bounds.
+    let arc_slew = |out_net: NetId,
+                    arc: &crate::lib_db::LibTimingArc,
+                    dst_pol: usize,
+                    s_max: f32,
+                    s_min: f32|
+     -> Option<(f32, f32)> {
+        let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) else {
+            return None;
+        };
+        let (_, out_max) = cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_max);
+        let out_min = if s_min == s_max {
+            out_max
+        } else {
+            cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_min)
+                .1
+        };
+        Some((out_max, out_min))
+    };
+
+    for lvl in 1..levelized.level_offsets.len() - 1 {
+        for &pin in levelized.level(lvl) {
+            let p = pin.0 as usize;
+            let mut next = slew[p];
+            let mut changed = false;
+
+            // Net loads take their driver's slew through the wire model.
+            if !design.pin_is_driver[p]
+                && let Some((net_idx, pin_idx, drv)) = levelized.pin_driver[p]
+            {
+                let ds = slew[drv.0 as usize];
+                if slew_reached(&ds, RISE) || slew_reached(&ds, FALL) {
+                    let wire = wire_delays_per_net
+                        .get(net_idx as usize)
+                        .and_then(|w| w.as_ref());
+                    let is_port = design.pin_cells[drv.0 as usize].is_none();
+                    next = slew_sink(ds, wire, pin_idx, is_port);
+                    changed = true;
+                }
+            }
+
+            // Driver pins merge the slew of every incoming arc. Combinational arcs
+            // come through `incoming_to`; sequential arcs through `seq_in`.
+            if let Some(out_net) = design.pin_nets[p] {
+                for &(src_pin, lib_arc) in levelized.incoming_to(pin) {
+                    let arc = &cx.lib.arcs[lib_arc as usize];
+                    let src = slew[src_pin.0 as usize];
+                    // Latch `D -> Q` borrow edges propagate the same transition at
+                    // both ends, mirroring the data pass.
+                    let borrow = graph.latch_borrow.contains_key(&(src_pin.0, p as u32));
+                    let legs: &[(usize, usize)] = if borrow {
+                        &[(RISE, RISE), (FALL, FALL)]
+                    } else {
+                        polarities(arc.timing_sense)
+                    };
+                    for &(src_pol, dst_pol) in legs {
+                        let s_max = src.slew_max[src_pol];
+                        let s_min = src.slew_min[src_pol];
+                        if s_max == f32::NEG_INFINITY {
+                            continue;
+                        }
+                        if (arc.timing_type == TimingType::CombinationalRise && dst_pol != RISE)
+                            || (arc.timing_type == TimingType::CombinationalFall && dst_pol != FALL)
+                        {
+                            continue;
+                        }
+                        if let Some((out_max, out_min)) =
+                            arc_slew(out_net, arc, dst_pol, s_max, s_min)
+                        {
+                            merge_slew(&mut next, dst_pol, out_max, out_min);
+                            changed = true;
+                        }
+                    }
+                }
+                for &(src_pin, lib_arc, src_pol) in &seq_in[p] {
+                    let arc = &cx.lib.arcs[lib_arc as usize];
+                    let src = slew[src_pin.0 as usize];
+                    let s_max = src.slew_max[src_pol];
+                    let s_min = src.slew_min[src_pol];
+                    if s_max == f32::NEG_INFINITY {
+                        continue;
+                    }
+                    for dst_pol in [RISE, FALL] {
+                        if let Some((out_max, out_min)) =
+                            arc_slew(out_net, arc, dst_pol, s_max, s_min)
+                        {
+                            merge_slew(&mut next, dst_pol, out_max, out_min);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            if changed {
+                slew[p] = next;
+            }
+        }
+    }
+    slew
+}
+
 /// Arrival of the propagated clock at every pin the clock source reaches through
 /// combinational arcs and net wiring, per transition. Kept in a separate state so clock
 /// timing can never leak into data endpoints: a pin is filled only when the clock itself
@@ -1337,6 +1525,7 @@ fn propagate_clock(
     cx: &Context,
     levelized: &LevelizedGraph,
     wire_delays_per_net: &[Option<[Vec<f32>; 2]>],
+    unified_slew: &[PinTimingState],
 ) -> (Vec<PinTimingState>, Vec<[u8; 2]>) {
     let design = cx.design;
     let sdc = cx.sdc;
@@ -1407,8 +1596,15 @@ fn propagate_clock(
                         else {
                             continue;
                         };
-                        let s_max = src.slew_max[src_pol];
-                        let s_min = src.slew_min[src_pol];
+                        // Delay lookups use the unified slew: a clock gate's enable
+                        // arc can dominate the slew at its output pin, and that slew
+                        // is what downstream clock arcs must see as their input slew.
+                        let src_slew = unified_slew[src_pin.0 as usize];
+                        let s_max = src_slew.slew_max[src_pol];
+                        let s_min = src_slew.slew_min[src_pol];
+                        if s_max == f32::NEG_INFINITY {
+                            continue;
+                        }
                         let (late_delay, late_slew) =
                             cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_max);
                         let (early_delay, early_slew) = if s_min == s_max {
@@ -1649,7 +1845,18 @@ fn run_sta_detail(
         // Propagated clock: arrival at each consumer pin comes from the clock network
         // itself. `set_clock_latency` without `-source` is ideal network latency and does
         // not apply; `-source` latency and `set_clock_transition` seed the source port.
-        let (clk_state, clk_parity) = propagate_clock(&cx, &levelized, &wire_delays_per_net);
+        // Slew comes from the unified pass: OpenSTA merges clock and data arcs at
+        // every vertex, so a clock gate's enable arc can dominate the slew its output
+        // pin (and downstream clock pins) see. `propagate_clock` uses those slews for
+        // delay lookups; the returned states carry arrival, and their slew fields are
+        // overwritten with the unified values below.
+        let unified_slew = propagate_slew(&cx, &levelized, &graph, &wire_delays_per_net, &state);
+        let (mut clk_state, clk_parity) =
+            propagate_clock(&cx, &levelized, &wire_delays_per_net, &unified_slew);
+        for (c, u) in clk_state.iter_mut().zip(unified_slew.iter()) {
+            c.slew_max = u.slew_max;
+            c.slew_min = u.slew_min;
+        }
         clock_parity = Some(clk_parity);
         let consumers = graph
             .launches
@@ -6091,5 +6298,97 @@ mod tests {
                 "{design}: driver_waveform_slew med={med:.4} p90={p90:.4} max={max:.4}"
             );
         }
+    }
+
+    /// Regression for the propagated-clock slew merge. `u_and` is a clock gate whose
+    /// clock input is `A` and whose enable input is `B`; its `B -> X` falling arc
+    /// produces a larger output slew than `A -> X`. OpenSTA merges every incoming arc
+    /// at a vertex, so `u_and/X` — and the `u_lt/GATE_N` pin it drives — must see the
+    /// enable-dominated slew, not the clock-arc-only slew `propagate_clock` used to
+    /// compute. The ss_n40C_1v35 corner is where the ~6 ps launch-side residual showed.
+    #[test]
+    fn test_propagated_clock_gate_merges_enable_arc_slew() {
+        let home = std::env::var("HOME").unwrap();
+        let lib_dir = std::path::Path::new(&home).join(".ciel/sky130A/libs.ref/sky130_fd_sc_hd");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__ss_n40C_1v35.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(
+            &design_dir("sta_edge").join("propagated_clock/propagated.def"),
+            &tech,
+            Some(&lib),
+        )
+        .expect("DEF");
+        let sdc = load_sdc(&design_dir("sta_edge").join("propagated_clock/edge.sdc")).expect("SDC");
+        let (_report, state, _pol) = run_sta_detail(&design, &lib, &sdc, None).expect("STA");
+        let cx = Context {
+            design: &design,
+            lib: &lib,
+            sdc: &sdc,
+            parasitics: None,
+            pi_models: vec![None; design.num_nets()],
+        };
+        let mut skipped = SkipReport::default();
+        let graph = build_graph(&cx, &mut skipped);
+        let levelized = topological_levels(&cx, &graph).expect("levelized");
+        let wire = vec![None; design.num_nets()];
+        let unified = propagate_slew(&cx, &levelized, &graph, &wire, &state);
+        let find_pin = |name: &str| {
+            (0..design.num_pins())
+                .map(|i| PinId(i as u32))
+                .find(|&p| cx.pin_name(p) == name)
+                .unwrap_or_else(|| panic!("pin {name}"))
+        };
+        let x = find_pin("u_and/X");
+        let gate_n = find_pin("u_lt/GATE_N");
+        let x_net = design.pin_nets[x.0 as usize].unwrap();
+
+        // The merged falling slew at u_and/X is the max over its input arcs' output
+        // slews; the clock (A) arc alone must be smaller, proving the enable arc won.
+        let mut arc_slews = Vec::new();
+        let mut clock_only = f32::NEG_INFINITY;
+        for &(src_pin, lib_arc) in levelized.incoming_to(x) {
+            let arc = &lib.arcs[lib_arc as usize];
+            let src = unified[src_pin.0 as usize];
+            for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
+                if dst_pol != FALL {
+                    continue;
+                }
+                let (Some(dt), Some(st)) = delay_tables(arc, dst_pol) else {
+                    continue;
+                };
+                let out = cx
+                    .driver_response(x_net, dst_pol, dt, st, src.slew_max[src_pol])
+                    .1;
+                arc_slews.push(out);
+                if cx.pin_name(src_pin) == "u_and/A" {
+                    clock_only = clock_only.max(out);
+                }
+            }
+        }
+        let merged = arc_slews.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            merged > clock_only,
+            "enable arc should dominate: merged={merged} clock_only={clock_only}"
+        );
+        assert!(
+            (unified[x.0 as usize].slew_max[FALL] - merged).abs() < 1e-6,
+            "u_and/X slew {} != merged arc slew {merged}",
+            unified[x.0 as usize].slew_max[FALL]
+        );
+        // Zero wire: the latch enable pin sees its clock-net driver's slew unchanged.
+        assert!(
+            (state[gate_n.0 as usize].slew_max[FALL] - unified[x.0 as usize].slew_max[FALL]).abs()
+                < 1e-6,
+            "u_lt/GATE_N slew {} != u_and/X slew {}",
+            state[gate_n.0 as usize].slew_max[FALL],
+            unified[x.0 as usize].slew_max[FALL]
+        );
     }
 }
