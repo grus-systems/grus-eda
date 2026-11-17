@@ -1862,17 +1862,40 @@ pub fn run_sta(
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
 ) -> Result<StaReport> {
-    run_sta_with_state(design, lib, sdc, parasitics).map(|(report, _)| report)
+    run_sta_inner(design, lib, sdc, parasitics, true).map(|(report, _)| report)
+}
+
+/// [`run_sta`] without the per-category skip warnings on stderr; the caller
+/// merges or reports the [`SkipReport`] itself.
+pub fn run_sta_quiet(
+    design: &DesignDb,
+    lib: &LibDb,
+    sdc: &Sdc,
+    parasitics: Option<&NetParasitics>,
+) -> Result<StaReport> {
+    run_sta_inner(design, lib, sdc, parasitics, false).map(|(report, _)| report)
+}
+
+fn run_sta_inner(
+    design: &DesignDb,
+    lib: &LibDb,
+    sdc: &Sdc,
+    parasitics: Option<&NetParasitics>,
+    emit_warnings: bool,
+) -> Result<(StaReport, Vec<PinTimingState>)> {
+    let (report, state, _) = run_sta_detail(design, lib, sdc, parasitics, emit_warnings)?;
+    Ok((report, state))
 }
 
 /// [`run_sta`] that also returns the per-pin timing state (the tests compare it pin by pin).
+#[cfg(test)]
 fn run_sta_with_state(
     design: &DesignDb,
     lib: &LibDb,
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
 ) -> Result<(StaReport, Vec<PinTimingState>)> {
-    let (report, state, _) = run_sta_detail(design, lib, sdc, parasitics)?;
+    let (report, state, _) = run_sta_detail(design, lib, sdc, parasitics, true)?;
     Ok((report, state))
 }
 
@@ -1881,6 +1904,7 @@ fn run_sta_detail(
     lib: &LibDb,
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
+    emit_warnings: bool,
 ) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
     let mut cx = Context {
         design,
@@ -2313,14 +2337,16 @@ fn run_sta_detail(
         clock_parity.as_deref(),
         skipped,
     )?;
-    for category in report.skipped.nonzero() {
-        // Deferred check arcs are a documented, counted deferral shown in the report —
-        // not an unrecognised gap, and `min_pulse_width` alone would warn on every
-        // flop design. They stay in `nonzero()`/the summary and JSON.
-        if category.starts_with("recognized_check_arcs") {
-            continue;
+    if emit_warnings {
+        for category in report.skipped.nonzero() {
+            // Deferred check arcs are a documented, counted deferral shown in the report —
+            // not an unrecognised gap, and `min_pulse_width` alone would warn on every
+            // flop design. They stay in `nonzero()`/the summary and JSON.
+            if category.starts_with("recognized_check_arcs") {
+                continue;
+            }
+            eprintln!("warning: STA skipped {category}; the report does not model these");
         }
-        eprintln!("warning: STA skipped {category}; the report does not model these");
     }
     Ok((report, state, polarities))
 }
@@ -2890,6 +2916,98 @@ fn endpoint_report(pin: String, max: &Worst, min: &Worst) -> EndpointReport {
     }
 }
 
+/// Merges a setup-corner and a hold-corner [`StaReport`] into one worst-case
+/// report: `max_*` fields and setup violations come from `setup`, `min_*`
+/// fields and hold violations from `hold`. Endpoint sets must match —
+/// different Liberty coverage would silently drop checks.
+pub fn merge_corner_reports(setup: StaReport, hold: StaReport) -> Result<StaReport> {
+    let setup_pins: HashSet<&str> = setup.endpoints.iter().map(|e| e.pin.as_str()).collect();
+    let hold_pins: HashSet<&str> = hold.endpoints.iter().map(|e| e.pin.as_str()).collect();
+    if setup_pins != hold_pins {
+        let only_setup: Vec<_> = setup_pins.difference(&hold_pins).collect();
+        let only_hold: Vec<_> = hold_pins.difference(&setup_pins).collect();
+        bail!(
+            "corner libraries produced different endpoint sets: {} only in setup, {} only in hold",
+            only_setup.len(),
+            only_hold.len()
+        );
+    }
+    let hold_by_pin: HashMap<&str, &EndpointReport> =
+        hold.endpoints.iter().map(|e| (e.pin.as_str(), e)).collect();
+    let endpoints: Vec<EndpointReport> = setup
+        .endpoints
+        .iter()
+        .map(|e| {
+            let h = hold_by_pin[e.pin.as_str()];
+            EndpointReport {
+                pin: e.pin.clone(),
+                max_arr_ns: e.max_arr_ns,
+                max_req_ns: e.max_req_ns,
+                max_slack_ns: e.max_slack_ns,
+                max_slew_ns: e.max_slew_ns,
+                min_arr_ns: h.min_arr_ns,
+                min_req_ns: h.min_req_ns,
+                min_slack_ns: h.min_slack_ns,
+                min_slew_ns: h.min_slew_ns,
+            }
+        })
+        .collect();
+    let wns = |f: fn(&EndpointReport) -> f32| endpoints.iter().map(f).fold(f32::INFINITY, f32::min);
+    let tns =
+        |f: fn(&EndpointReport) -> f32| endpoints.iter().map(f).map(|s| s.min(0.0)).sum::<f32>();
+    Ok(StaReport {
+        wns_max_ns: wns(|e| e.max_slack_ns),
+        tns_max_ns: tns(|e| e.max_slack_ns),
+        wns_min_ns: wns(|e| e.min_slack_ns),
+        tns_min_ns: tns(|e| e.min_slack_ns),
+        setup_violations: endpoints.iter().filter(|e| e.max_slack_ns < 0.0).count() as u32,
+        hold_violations: endpoints.iter().filter(|e| e.min_slack_ns < 0.0).count() as u32,
+        endpoints,
+        skipped: merge_skip_reports(setup.skipped, hold.skipped),
+    })
+}
+
+/// Element-wise max of two [`SkipReport`]s: either corner may skip an input
+/// the other models, so the merged report keeps the larger count per category.
+fn merge_skip_reports(a: SkipReport, b: SkipReport) -> SkipReport {
+    fn merge_map(
+        a: BTreeMap<String, usize>,
+        b: BTreeMap<String, usize>,
+    ) -> BTreeMap<String, usize> {
+        let mut out = a;
+        for (k, v) in b {
+            out.entry(k).and_modify(|e| *e = (*e).max(v)).or_insert(v);
+        }
+        out
+    }
+    let mut skipped_endpoints = a.skipped_endpoints;
+    for e in b.skipped_endpoints {
+        if !skipped_endpoints.iter().any(|x| {
+            x.pin == e.pin && x.kind == e.kind && x.reason == e.reason && x.related == e.related
+        }) {
+            skipped_endpoints.push(e);
+        }
+    }
+    SkipReport {
+        unmapped_cells: a.unmapped_cells.max(b.unmapped_cells),
+        unmodelled_latch_cells: a.unmodelled_latch_cells.max(b.unmodelled_latch_cells),
+        unsupported_arcs: merge_map(a.unsupported_arcs, b.unsupported_arcs),
+        recognized_check_arcs: merge_map(a.recognized_check_arcs, b.recognized_check_arcs),
+        latch_arcs_dropped: merge_map(a.latch_arcs_dropped, b.latch_arcs_dropped),
+        unresolved_arcs: a.unresolved_arcs.max(b.unresolved_arcs),
+        incomplete_checks: a.incomplete_checks.max(b.incomplete_checks),
+        unreached_endpoints: a.unreached_endpoints.max(b.unreached_endpoints),
+        skipped_endpoints,
+        cell_driven_clock_nets: a.cell_driven_clock_nets.max(b.cell_driven_clock_nets),
+        unresolved_driving_cells: a.unresolved_driving_cells.max(b.unresolved_driving_cells),
+        total_arcs: a.total_arcs.max(b.total_arcs),
+        total_endpoints: a.total_endpoints.max(b.total_endpoints),
+        sdc_ignored_options: merge_map(a.sdc_ignored_options, b.sdc_ignored_options),
+        sdc_ignored_commands: merge_map(a.sdc_ignored_commands, b.sdc_ignored_commands),
+        sdc_commands: a.sdc_commands.max(b.sdc_commands),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3234,9 +3352,9 @@ mod tests {
                 .expect("SPEF");
             let parasitics_s = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
             let (rp, _, _) =
-                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_p)).expect("placement STA");
+                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_p), true).expect("placement STA");
             let (rs, _, _) =
-                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_s)).expect("SPEF STA");
+                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_s), true).expect("SPEF STA");
             assert_eq!(
                 rp.endpoints.len(),
                 rs.endpoints.len(),
@@ -5238,7 +5356,7 @@ mod tests {
             }
         };
         let (report, state, polarities) =
-            run_sta_detail(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
+            run_sta_detail(&design, &lib, &sdc, parasitics.as_ref(), true).expect("STA");
 
         let reference: serde_json::Value =
             serde_json::from_slice(&std::fs::read(gcd.join(golden_file)).expect("golden file"))
@@ -5488,7 +5606,7 @@ mod tests {
             crate::sta::spef_parasitics(&design, &spef_doc).expect("SPEF parasitics")
         });
         let (report, _, polarities) =
-            run_sta_detail(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
+            run_sta_detail(&design, &lib, &sdc, parasitics.as_ref(), true).expect("STA");
 
         let reference: serde_json::Value = serde_json::from_slice(
             &std::fs::read(case_dir.join(format!("{case}.reference.json"))).expect("golden file"),
@@ -6816,7 +6934,7 @@ mod tests {
         )
         .expect("DEF");
         let sdc = load_sdc(&design_dir("sta_edge").join("propagated_clock/edge.sdc")).expect("SDC");
-        let (_report, state, _pol) = run_sta_detail(&design, &lib, &sdc, None).expect("STA");
+        let (_report, state, _pol) = run_sta_detail(&design, &lib, &sdc, None, true).expect("STA");
         let cx = Context {
             design: &design,
             lib: &lib,
@@ -6901,5 +7019,108 @@ mod tests {
             }
         }
         panic!("pin {pin:?} not levelized")
+    }
+
+    fn endpoint(pin: &str, max_slack: f32, min_slack: f32) -> EndpointReport {
+        EndpointReport {
+            pin: pin.to_string(),
+            max_arr_ns: 0.0,
+            max_req_ns: 0.0,
+            max_slack_ns: max_slack,
+            max_slew_ns: 0.0,
+            min_arr_ns: 0.0,
+            min_req_ns: 0.0,
+            min_slack_ns: min_slack,
+            min_slew_ns: 0.0,
+        }
+    }
+
+    fn report(endpoints: Vec<EndpointReport>) -> StaReport {
+        let wns_max = endpoints
+            .iter()
+            .map(|e| e.max_slack_ns)
+            .fold(f32::INFINITY, f32::min);
+        let tns_max = endpoints
+            .iter()
+            .map(|e| e.max_slack_ns)
+            .map(|s| s.min(0.0))
+            .sum();
+        let wns_min = endpoints
+            .iter()
+            .map(|e| e.min_slack_ns)
+            .fold(f32::INFINITY, f32::min);
+        let tns_min = endpoints
+            .iter()
+            .map(|e| e.min_slack_ns)
+            .map(|s| s.min(0.0))
+            .sum();
+        StaReport {
+            wns_max_ns: wns_max,
+            tns_max_ns: tns_max,
+            wns_min_ns: wns_min,
+            tns_min_ns: tns_min,
+            setup_violations: endpoints.iter().filter(|e| e.max_slack_ns < 0.0).count() as u32,
+            hold_violations: endpoints.iter().filter(|e| e.min_slack_ns < 0.0).count() as u32,
+            endpoints,
+            skipped: SkipReport::default(),
+        }
+    }
+
+    #[test]
+    fn test_merge_corner_reports_max_from_setup_min_from_hold() {
+        let setup = report(vec![endpoint("a/Q", 0.5, 0.1), endpoint("b/Q", -0.2, 0.3)]);
+        let hold = report(vec![endpoint("a/Q", 0.9, -0.4), endpoint("b/Q", 0.1, 0.2)]);
+        let merged = merge_corner_reports(setup, hold).expect("merge");
+
+        assert_eq!(merged.wns_max_ns, -0.2);
+        assert_eq!(merged.wns_min_ns, -0.4);
+        assert_eq!(merged.setup_violations, 1);
+        assert_eq!(merged.hold_violations, 1);
+        assert_eq!(merged.endpoints.len(), 2);
+        let a = merged
+            .endpoints
+            .iter()
+            .find(|e| e.pin == "a/Q")
+            .expect("a/Q");
+        assert_eq!(a.max_slack_ns, 0.5);
+        assert_eq!(a.min_slack_ns, -0.4);
+    }
+
+    #[test]
+    fn test_merge_corner_reports_rejects_different_endpoint_sets() {
+        let setup = report(vec![endpoint("a/Q", 0.5, 0.1)]);
+        let hold = report(vec![endpoint("b/Q", 0.9, -0.4)]);
+        assert!(merge_corner_reports(setup, hold).is_err());
+    }
+
+    #[test]
+    fn test_merge_skip_reports_element_wise_max() {
+        let a = SkipReport {
+            unmapped_cells: 3,
+            unsupported_arcs: BTreeMap::from([("Clear".to_string(), 5)]),
+            skipped_endpoints: vec![SkippedEndpoint {
+                pin: "x/Q".to_string(),
+                kind: EndpointKind::Check,
+                reason: SkipReason::NoClock,
+                related: Some("clk".to_string()),
+            }],
+            ..Default::default()
+        };
+        let b = SkipReport {
+            unmapped_cells: 7,
+            unsupported_arcs: BTreeMap::from([("Clear".to_string(), 2), ("Preset".to_string(), 1)]),
+            skipped_endpoints: vec![SkippedEndpoint {
+                pin: "x/Q".to_string(),
+                kind: EndpointKind::Check,
+                reason: SkipReason::NoClock,
+                related: Some("clk".to_string()),
+            }],
+            ..Default::default()
+        };
+        let merged = merge_skip_reports(a, b);
+        assert_eq!(merged.unmapped_cells, 7);
+        assert_eq!(merged.unsupported_arcs["Clear"], 5);
+        assert_eq!(merged.unsupported_arcs["Preset"], 1);
+        assert_eq!(merged.skipped_endpoints.len(), 1);
     }
 }

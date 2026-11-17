@@ -169,8 +169,11 @@ enum ParasiticsMode {
 
 #[derive(Args, Debug)]
 struct StaArgs {
-    #[arg(long, help = "Path to Liberty (.lib) file")]
+    #[arg(long, help = "Path to Liberty (.lib) file (setup corner)")]
     lib: PathBuf,
+
+    #[arg(long, help = "Path to Liberty (.lib) file for hold checks (default: same as --lib)")]
+    lib_hold: Option<PathBuf>,
 
     #[arg(long, help = "Path to technology LEF (.tlef) file")]
     tlef: PathBuf,
@@ -544,21 +547,36 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 (parasitics, spef) => anyhow::bail!("unsupported --parasitics {:?} with --spef {:?}", parasitics, spef),
             };
             let lib_db = grus_core::readers::load_liberty(&args.lib)?;
+            let lib_hold_db = match &args.lib_hold {
+                Some(path) => Some(grus_core::readers::load_liberty(path)?),
+                None => None,
+            };
             let mut interner = grus_core::interner::StringInterner::new();
             let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let design = grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?;
+            let design_hold = match &lib_hold_db {
+                Some(lib) => Some(grus_core::readers::parse_def(&args.def, &tech_db, Some(lib))?),
+                None => None,
+            };
             let sdc = grus_core::sta::load_sdc(&args.sdc)?;
             let t0 = std::time::Instant::now();
-            let parasitics = match (mode, &args.spef) {
-                ("placement RC", _) => {
-                    let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
-                    Some(grus_core::sta::estimate_placement_parasitics(&design, &tech_db, rc))
+            let compute_parasitics = |d: &grus_core::design_db::DesignDb| -> anyhow::Result<Option<grus_core::sta::NetParasitics>> {
+                match (mode, &args.spef) {
+                    ("placement RC", _) => {
+                        let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                        Ok(Some(grus_core::sta::estimate_placement_parasitics(d, &tech_db, rc)))
+                    }
+                    (_, Some(spef_path)) => {
+                        let spef = grus_core::readers::load_spef(spef_path)?;
+                        Ok(Some(grus_core::sta::spef_parasitics(d, &spef)?))
+                    }
+                    _ => Ok(None),
                 }
-                (_, Some(spef_path)) => {
-                    let spef = grus_core::readers::load_spef(spef_path)?;
-                    Some(grus_core::sta::spef_parasitics(&design, &spef)?)
-                }
-                _ => None,
+            };
+            let parasitics = compute_parasitics(&design)?;
+            let parasitics_hold = match &design_hold {
+                Some(d) => compute_parasitics(d)?,
+                None => None,
             };
             if let Some(p) = &parasitics
                 && p.pd_check_failed_nets > 0
@@ -576,7 +594,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 std::fs::write(path, spef_text)?;
                 println!("Wrote SPEF to {:?}", path);
             }
-            let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
+            let report = match (&lib_hold_db, &design_hold, &parasitics_hold) {
+                (Some(hold_lib), Some(hold_design), Some(hold_parasitics)) => {
+                    let setup = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
+                    let hold = grus_core::sta::run_sta_quiet(hold_design, hold_lib, &sdc, Some(hold_parasitics))?;
+                    grus_core::sta::merge_corner_reports(setup, hold)?
+                }
+                _ => grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?,
+            };
             println!(
                 "STA ({}): endpoints={}, setup wns={:.6} tns={:.6} viol={}, hold wns={:.6} tns={:.6} viol={}, elapsed={:.2}ms",
                 mode,

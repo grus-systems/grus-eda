@@ -328,11 +328,20 @@ Remaining:
   `readers::def::tests::test_escaped_names_roundtrip_through_lexer`
   locks name escaping through the lexer.
 
-### N6. Multi-corner analysis (optional, previously out of scope)
+### N6. Multi-corner analysis — DONE
 
-- Separate min/max libraries for setup and hold; single-corner-per-run
-  already works. Convenience plus correct worst-case across corners.
-- Recorded out of scope in R9; revisit only if a public design needs it.
+- `sta --lib-hold <lib>` runs setup checks against `--lib` and hold checks
+  against `--lib-hold`, then merges the two reports into one worst-case
+  `StaReport` (`merge_corner_reports`). The DEF is parsed once per library so
+  `cell_lib_ids` resolve against the right `LibDb`; placement parasitics are
+  recomputed per design view.
+- Verified on `gcd.placed.def` with `ss_100C_1v60` (setup) + `ff_100C_1v95`
+  (hold): OpenROAD gives setup WNS -0.46 (ss) and hold WNS 0.31 (ff); ours
+  gives -0.730449 and 0.311508. The hold slack matches to ~0.5%; the setup
+  gap is the same STA-vs-OpenSTA divergence seen in single-corner runs.
+- `run_sta_quiet` suppresses duplicate skip warnings on the second corner run.
+- Endpoint sets must match across corners or the merge bails — different
+  Liberty coverage would silently drop checks.
 
 ### N7. Power reporting (new stage, scope-gated)
 
