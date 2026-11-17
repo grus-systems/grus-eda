@@ -1880,3 +1880,27 @@ test can name its own SDC and golden.
   `PICORV32_PROPAGATED` widens only `arr_rel` (0.01 -> 0.03) and `slew_rel`
   (0.10 -> 0.15) over `PICORV32_SPEF`; slack, TNS and WNS keep their tighter
   bounds.
+
+### 2026-11-17 — Ideal clock tracks inversion on the propagated_clock topology (empirical check)
+
+Ran `grus-eda sta` on `tests/designs/sta_edge/propagated_clock/propagated.def`
+with an ideal-clock SDC (`edge.sdc` minus `set_propagated_clock`, zero-wire) and
+compared all 12 endpoints against a fresh OpenSTA `find_timing_paths`
+reference on the same DEF/SDC/lib/lef in ideal mode (no committed golden —
+this fixture's golden is propagated-mode only).
+
+- **All 12 endpoints match within 1e-6 ns** (worst abs diff; the reference
+  was printed at `%.6f` ns so this is print-rounding level). Setup WNS
+  `1.6175045`, hold WNS `-2.1` / 1 violation — identical to OpenSTA.
+- The topology exercises the `v0.1.71` parity walk across an inverting buffer
+  (`clkinv` -> `c2` -> `u_ff2`/`u_ff7`), AND-type clock gates on **both** a
+  non-inverting path (`u_and` -> `c_and` -> `u_ff3`/`u_lt`) and an inverting
+  path (`u_and2` -> `c_and2` -> `u_ff7`), and a transparent latch (`u_lt`).
+- Inverting endpoints reproduce the expected half-period capture-edge shift
+  (`u_ff2`/`u_ff7` max req `3.5026` vs non-inverting `6.0026`) and the
+  full-period min-arrival shift (`6.8603` vs `1.8603`). The two gate-enable
+  checks get correctly distinct required times (`u_and/B` `6.1` vs
+  `u_and2/B` `3.6`), so enable-edge selection also follows the parity.
+
+This complements the committed `sta_edge/clock_gate` ideal golden (strict
+PASS), which covers inversion but not the clock-gate + latch combination.
