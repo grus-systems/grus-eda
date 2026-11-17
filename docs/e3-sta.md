@@ -222,8 +222,10 @@ generic text above disagree, this section wins.
    pass walks clock nets through combinational arcs and computes arrival/slew per transition
    at every consumer clock pin, tracking the clock-edge index parity so inverting paths pick
    the right capture/hold edge; plain `set_clock_latency` is then ignored and `-source`
-   latency seeds the port. Validated on `tests/designs/sta_edge/propagated_clock/`; details
-   in `docs/results.md`.
+   latency seeds the port. Validated on `tests/designs/sta_edge/propagated_clock/` and on
+   the real designs `gcd`/`picorv32` (`<design>.propagated.sdc` +
+   `generate_prop_ref.sh` goldens; clock-network delay matches OpenSTA to ~5 ps);
+   details in `docs/results.md`.
    The ideal clock still tracks edge *phase* through cell-driven clock nets (`v0.1.71`):
    a parity-only walk over the same graph places each consumer transition on its
    clock-edge parity (`latency + parity * period/2`), so `nand`/`nor`/`inv` stages on the

@@ -2784,6 +2784,20 @@ mod tests {
             tns_rel: 0.025,
             ..Tol::STRICT
         };
+        /// picorv32 propagated clock shares `PICORV32_SPEF` and widens only arrival and
+        /// slew. The propagated clock itself is verified: per-pin clock-network delay
+        /// matches OpenSTA to ~5 ps and 14,381/14,384 endpoint fields pass. The three
+        /// outliers — `_11496_`/`_10754_` arrival+required (~0.10-0.12 ns) and `_11498_`
+        /// slew (12.6%) — are `resetn`-launched data paths through 1.8-3.5 ns-slew cells
+        /// plus a setup constraint read at 2.4 ns clock slew, i.e. the clock-independent
+        /// E3.5 cell-stage gap (OpenSTA #582 regime). Propagated mode re-selects the worst
+        /// path against the ideal-clock golden, exposing a gap the ideal comparison had
+        /// masked by comparing different launch endpoints. See docs/results.md.
+        const PICORV32_PROPAGATED: Tol = Tol {
+            arr_rel: 0.03,
+            slew_rel: 0.15,
+            ..Tol::PICORV32_SPEF
+        };
         const PICORV32_PLACEMENT: Tol = Tol {
             arr_rel: 0.03,
             slack_abs_ns: 0.2,
@@ -2857,6 +2871,22 @@ mod tests {
         );
     }
 
+    /// `picorv32.propagated.sdc` marks `core_clk` propagated on the unbuffered clock net:
+    /// routed RC now sets a per-pin launch/capture edge, so clock skew appears (hold WNS
+    /// drops to -2.48 ns, TNS -1053.67 ns vs the ideal-clock golden's clean min side).
+    /// Golden from `tests/designs/generate_prop_ref.sh picorv32` (OpenSTA, same inputs).
+    #[test]
+    fn test_picorv32_propagated_clock_matches_opensta() {
+        compare_design_files(
+            "picorv32",
+            "picorv32.propagated.sdc",
+            "picorv32.propagated.reference.json",
+            "propagated_routed_spef",
+            Rc::RoutedSpef,
+            Tol::PICORV32_PROPAGATED,
+        );
+    }
+
     #[test]
     fn test_gcd_zero_wire_matches_opensta() {
         compare_design_with_opensta("gcd", "zero_wire", Rc::None, Tol::STRICT);
@@ -2878,6 +2908,21 @@ mod tests {
     #[test]
     fn test_gcd_routed_spef_matches_opensta() {
         compare_design_with_opensta("gcd", "routed_spef", Rc::RoutedSpef, Tol::GCD_SPEF);
+    }
+
+    /// `gcd.propagated.sdc` marks `core_clk` propagated: the clock net's routed RC now sets a
+    /// per-pin launch/capture edge (WNS drops 1.573 -> 1.412 ns vs the ideal-clock golden).
+    /// Golden from `generate_prop_ref.sh` (OpenSTA on the same placed DEF + rcx SPEF).
+    #[test]
+    fn test_gcd_propagated_clock_matches_opensta() {
+        compare_design_files(
+            "gcd",
+            "gcd.propagated.sdc",
+            "gcd.propagated.reference.json",
+            "propagated_routed_spef",
+            Rc::RoutedSpef,
+            Tol::GCD_SPEF,
+        );
     }
 
     #[test]
@@ -4869,6 +4914,26 @@ mod tests {
     }
 
     fn compare_design_with_opensta(design_name: &str, golden_key: &str, rc_mode: Rc, tol: Tol) {
+        compare_design_files(
+            design_name,
+            &format!("{design_name}.sdc"),
+            &format!("{design_name}.sta.reference.json"),
+            golden_key,
+            rc_mode,
+            tol,
+        );
+    }
+
+    /// `compare_design_with_opensta` with explicit SDC and golden files, for constraint
+    /// variants such as `gcd.propagated.sdc` that share the design's DEF and SPEF.
+    fn compare_design_files(
+        design_name: &str,
+        sdc_file: &str,
+        golden_file: &str,
+        golden_key: &str,
+        rc_mode: Rc,
+        tol: Tol,
+    ) {
         let lib_dir = sky130_hd();
         let gcd = design_dir(design_name);
 
@@ -4887,7 +4952,7 @@ mod tests {
             Some(&lib),
         )
         .expect("DEF");
-        let sdc = load_sdc(&gcd.join(format!("{design_name}.sdc"))).expect("SDC");
+        let sdc = load_sdc(&gcd.join(sdc_file)).expect("SDC");
         let parasitics = match rc_mode {
             Rc::None => None,
             Rc::Placement => {
@@ -4911,11 +4976,9 @@ mod tests {
         let (report, _, polarities) =
             run_sta_detail(&design, &lib, &sdc, parasitics.as_ref()).expect("STA");
 
-        let reference: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(gcd.join(format!("{design_name}.sta.reference.json")))
-                .expect("golden file"),
-        )
-        .expect("golden JSON");
+        let reference: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(gcd.join(golden_file)).expect("golden file"))
+                .expect("golden JSON");
         let zero_wire = &reference[golden_key];
         let ref_endpoints = zero_wire["endpoints"].as_array().expect("endpoints");
         assert_eq!(
