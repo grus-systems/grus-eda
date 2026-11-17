@@ -94,12 +94,12 @@ struct PinTimingState {
     arrival_min: [f32; 2],
     slew_max: [f32; 2],
     slew_min: [f32; 2],
-    /// Clock-edge index parity (mod 2) of the launch edge that produced `arrival_max` /
-    /// `arrival_min` at this pin and transition. `u8::MAX` while unreached. Setup/hold
-    /// required times shift by a period unless the capture edge is the first edge of its
-    /// polarity strictly after this launch edge, so the extremes must carry their own
-    /// launch parity: a pin driven by flip-flops on different clock polarities can source
-    /// its max and min arrivals from different edges.
+    /// Bitmask of the launch-edge parities (bit `p` = clock-edge index parity `p`)
+    /// that produced `arrival_max` / `arrival_min` at this pin and transition; 0 while
+    /// unreached. Setup/hold required times shift by a period depending on the launch
+    /// parity, so the extremes must keep every parity that ties them: equal arrivals
+    /// from different clock-edge parities keep both bits and the endpoint resolves the
+    /// worst slack across them.
     par_max: [u8; 2],
     par_min: [u8; 2],
 }
@@ -110,8 +110,8 @@ impl PinTimingState {
         arrival_min: [f32::INFINITY; 2],
         slew_max: [f32::NEG_INFINITY; 2],
         slew_min: [f32::INFINITY; 2],
-        par_max: [u8::MAX; 2],
-        par_min: [u8::MAX; 2],
+        par_max: [0; 2],
+        par_min: [0; 2],
     };
 
     fn reached(&self, pol: usize) -> bool {
@@ -130,13 +130,19 @@ impl PinTimingState {
         par_min: u8,
     ) {
         // Slews are merged independently of which arc wins the arrival (OpenSTA GraphDelayCalc).
+        // The parity arguments are masks: a strictly better arrival replaces the mask,
+        // an equal one unions it so endpoint checks see every tying launch parity.
         if arr_max > self.arrival_max[pol] {
             self.arrival_max[pol] = arr_max;
             self.par_max[pol] = par_max;
+        } else if arr_max == self.arrival_max[pol] {
+            self.par_max[pol] |= par_max;
         }
         if arr_min < self.arrival_min[pol] {
             self.arrival_min[pol] = arr_min;
             self.par_min[pol] = par_min;
+        } else if arr_min == self.arrival_min[pol] {
+            self.par_min[pol] |= par_min;
         }
         self.slew_max[pol] = self.slew_max[pol].max(slew_max);
         self.slew_min[pol] = self.slew_min[pol].min(slew_min);
@@ -1354,8 +1360,8 @@ fn propagate_clock(
     let lat = sdc.clock_source_latency_ns;
     let tr = sdc.input_transition_ns(cx.port_name(port));
     let p = port.0 as usize;
-    clk[p].merge(RISE, lat, lat, tr, tr, 0, 0);
-    clk[p].merge(FALL, lat + half_period, lat + half_period, tr, tr, 1, 1);
+    clk[p].merge(RISE, lat, lat, tr, tr, 1, 1);
+    clk[p].merge(FALL, lat + half_period, lat + half_period, tr, tr, 2, 2);
     parity[p] = [0, 1];
 
     for lvl in 1..levelized.level_offsets.len() - 1 {
@@ -1424,8 +1430,8 @@ fn propagate_clock(
                             cand_min,
                             late_slew,
                             early_slew,
-                            src_par[src_pol],
-                            src_par[src_pol],
+                            1 << src_par[src_pol],
+                            1 << src_par[src_pol],
                         );
                         changed = true;
                     }
@@ -1577,7 +1583,7 @@ fn run_sta_detail(
                 latency + in_min + drv_early,
                 slew_max,
                 slew_min,
-                0,
+                1,
                 0,
             );
         }
@@ -1639,8 +1645,8 @@ fn run_sta_detail(
                     ideal_latency,
                     sdc.clock_transition_ns,
                     sdc.clock_transition_ns,
-                    pol as u8,
-                    pol as u8,
+                    1 << pol,
+                    1 << pol,
                 );
             }
         }
@@ -1762,7 +1768,7 @@ fn run_sta_detail(
         let par = launch_parity(l.clk, l.edge);
         for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
             if arr_max > f32::NEG_INFINITY {
-                state[q.0 as usize].merge(dst_pol, arr_max, arr_min, slew_max, slew_min, par, par);
+                state[q.0 as usize].merge(dst_pol, arr_max, arr_min, slew_max, slew_min, 1 << par, 1 << par);
             }
         }
     }
@@ -1796,7 +1802,7 @@ fn run_sta_detail(
         let par = launch_parity(open.enable, open.open_pol);
         for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
             if arr_max > f32::NEG_INFINITY {
-                state[q.0 as usize].merge(dst_pol, arr_max, arr_min, slew_max, slew_min, par, par);
+                state[q.0 as usize].merge(dst_pol, arr_max, arr_min, slew_max, slew_min, 1 << par, 1 << par);
             }
         }
     }
@@ -2192,59 +2198,71 @@ fn collect_endpoints(
             let late_time =
                 eval_nldm_constraint(late_table, s.slew_max[pol], clk_state.slew_max[edge])
                     * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
-            let g_max = if s.par_max[pol] <= 1 {
-                s.par_max[pol] as usize
-            } else {
-                0
-            };
-            let capture_extra = if c0 <= g_max { sdc.period_ns } else { 0.0 };
-            let closing_max = edge_offset + capture_extra + clk_state.arrival_min[edge]
-                - late_time
-                - sdc.setup_uncertainty_ns
-                + credit;
-            // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
-            // is reported at the opening edge and the slack is what remains before the closing edge.
-            // A propagated clock carries the real fall arrival at the enable (uncertainty applies,
-            // as OpenSTA's `report_checks` shows); the ideal clock approximates it as half a
-            // period after the rise. The opening fall is the latest fall arrival before the
-            // closing rise; falls recur every period, so align by whole periods — the first
-            // fall alone sits one period early when the closing edge was shifted (inverting
-            // clock, parity-1 launch).
-            // The latch's opening edge is the opposite polarity of the setup check
-            // edge (`dlxtn`: setup at rise, opens on fall; `dlxtp`: setup at fall,
-            // opens on rise). Under the ideal clock an opening fall sits half a
-            // period after the seeded rise; a propagated clock reads the real
-            // arrival, aligned by whole periods to the closing edge — the latest
-            // opening edge strictly before it.
-            let opening_max = if !check.latch {
-                0.0 // only read on the latch branch below
-            } else if sdc.propagated_clock {
-                let closing = clk_state.arrival_min[edge] + capture_extra;
-                let open_pol = 1 - edge;
-                let periods = ((closing - clk_state.arrival_min[open_pol]) / sdc.period_ns)
-                    .floor()
-                    .max(0.0);
-                clk_state.arrival_min[open_pol] + periods * sdc.period_ns - sdc.setup_uncertainty_ns
-                    + credit_for(open_pol)
-            } else {
-                half_period * (1 - edge) as f32 + clk_state.arrival_min[RISE]
+            // Equal arrivals from different launch-edge parities tie `arrival_max`;
+            // each tying parity can shift the capture edge by a period, so evaluate
+            // the required time per parity bit and keep the worst slack. An empty
+            // mask cannot occur on a reached pin; parity 0 is the fallback anyway.
+            let max_mask = if s.par_max[pol] == 0 { 1 } else { s.par_max[pol] };
+            let mut max_pick: Option<(f32, f32)> = None;
+            for g in 0..2usize {
+                if max_mask & (1 << g) == 0 {
+                    continue;
+                }
+                let capture_extra = if c0 <= g { sdc.period_ns } else { 0.0 };
+                let closing_max = edge_offset + capture_extra + clk_state.arrival_min[edge]
+                    - late_time
                     - sdc.setup_uncertainty_ns
-            };
-            let arr_max = s.arrival_max[pol];
-            let (req_max, slack_max) = if !check.latch {
-                (closing_max, closing_max - arr_max)
-            } else if arr_max <= opening_max {
-                // The data waits for the latch to open; the margin is the time until
-                // the opening edge.
-                (opening_max, opening_max - arr_max)
-            } else {
-                // OpenSTA latch model: arrival inside the transparent window borrows
-                // time, so the required time equals the arrival (zero slack) until the
-                // borrow cap — the closing required time of this transition (closing
-                // edge minus uncertainty and the transition's setup constraint).
-                let req = arr_max.min(closing_max);
-                (req, req - arr_max)
-            };
+                    + credit;
+                // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
+                // is reported at the opening edge and the slack is what remains before the closing edge.
+                // A propagated clock carries the real fall arrival at the enable (uncertainty applies,
+                // as OpenSTA's `report_checks` shows); the ideal clock approximates it as half a
+                // period after the rise. The opening fall is the latest fall arrival before the
+                // closing rise; falls recur every period, so align by whole periods — the first
+                // fall alone sits one period early when the closing edge was shifted (inverting
+                // clock, parity-1 launch).
+                // The latch's opening edge is the opposite polarity of the setup check
+                // edge (`dlxtn`: setup at rise, opens on fall; `dlxtp`: setup at fall,
+                // opens on rise). Under the ideal clock an opening fall sits half a
+                // period after the seeded rise; a propagated clock reads the real
+                // arrival, aligned by whole periods to the closing edge — the latest
+                // opening edge strictly before it.
+                let opening_max = if !check.latch {
+                    0.0 // only read on the latch branch below
+                } else if sdc.propagated_clock {
+                    let closing = clk_state.arrival_min[edge] + capture_extra;
+                    let open_pol = 1 - edge;
+                    let periods = ((closing - clk_state.arrival_min[open_pol]) / sdc.period_ns)
+                        .floor()
+                        .max(0.0);
+                    clk_state.arrival_min[open_pol]
+                        + periods * sdc.period_ns
+                        - sdc.setup_uncertainty_ns
+                        + credit_for(open_pol)
+                } else {
+                    half_period * (1 - edge) as f32 + clk_state.arrival_min[RISE]
+                        - sdc.setup_uncertainty_ns
+                };
+                let arr_max = s.arrival_max[pol];
+                let (req, slack) = if !check.latch {
+                    (closing_max, closing_max - arr_max)
+                } else if arr_max <= opening_max {
+                    // The data waits for the latch to open; the margin is the time until
+                    // the opening edge.
+                    (opening_max, opening_max - arr_max)
+                } else {
+                    // OpenSTA latch model: arrival inside the transparent window borrows
+                    // time, so the required time equals the arrival (zero slack) until the
+                    // borrow cap — the closing required time of this transition (closing
+                    // edge minus uncertainty and the transition's setup constraint).
+                    let req = arr_max.min(closing_max);
+                    (req, req - arr_max)
+                };
+                if max_pick.is_none_or(|(_, sl)| slack < sl) {
+                    max_pick = Some((req, slack));
+                }
+            }
+            let (req_max, slack_max) = max_pick.unwrap();
             // The hold (early) constraint pairs with the capture clock's early slew; the
             // setup (late) constraint uses the late slew. Under the ideal clock both are
             // the seeded transition and identical.
@@ -2257,15 +2275,23 @@ fn collect_endpoints(
             // Hold pairs the capture edge with the next launch edge of the same polarity:
             // the arrival shifts one period when the launch edge parity precedes the
             // capture pin's first edge of this polarity.
-            let g_min = if s.par_min[pol] <= 1 {
-                s.par_min[pol] as usize
-            } else {
-                0
-            };
-            let arr_min = s.arrival_min[pol] + if c0 > g_min { sdc.period_ns } else { 0.0 };
-            let slack_min = arr_min - req_min;
+            // Same parity tie on the early side: the hold arrival shifts one period
+            // per tying launch parity; keep the smallest resulting slack.
+            let min_mask = if s.par_min[pol] == 0 { 1 } else { s.par_min[pol] };
+            let mut min_pick: Option<(f32, f32)> = None;
+            for g in 0..2usize {
+                if min_mask & (1 << g) == 0 {
+                    continue;
+                }
+                let arr = s.arrival_min[pol] + if c0 > g { sdc.period_ns } else { 0.0 };
+                let slack = arr - req_min;
+                if min_pick.is_none_or(|(_, sl)| slack < sl) {
+                    min_pick = Some((arr, slack));
+                }
+            }
+            let (arr_min, slack_min) = min_pick.unwrap();
             cands.max[pol] = Some(Worst {
-                arr: arr_max,
+                arr: s.arrival_max[pol],
                 req: req_max,
                 slack: slack_max,
                 slew: s.slew_max[pol],
@@ -2308,22 +2334,28 @@ fn collect_endpoints(
             if !s.reached(pol) {
                 continue;
             }
+            // Tying launch parities can shift the setup capture edge and the hold
+            // arrival by a period; evaluate each parity bit and keep the worst.
+            let par_bits = |mask: u8| if mask == 0 { 1 } else { mask & 0b11 };
             let (req_max, req_min, arr_min) = if sdc.propagated_clock {
-                let g_max = if s.par_max[pol] <= 1 {
-                    s.par_max[pol] as usize
-                } else {
-                    0
-                };
-                let g_min = if s.par_min[pol] <= 1 {
-                    s.par_min[pol] as usize
-                } else {
-                    0
-                };
-                let cap = c.arrival_min[setup_edge] + if pe <= g_max { sdc.period_ns } else { 0.0 };
+                let req_max = (0..2usize)
+                    .filter(|g| par_bits(s.par_max[pol]) & (1 << g) != 0)
+                    .map(|g| {
+                        c.arrival_min[setup_edge]
+                            + if pe <= g { sdc.period_ns } else { 0.0 }
+                            - sdc.setup_uncertainty_ns
+                    })
+                    .fold(f32::INFINITY, f32::min);
+                let arr_min = (0..2usize)
+                    .filter(|g| par_bits(s.par_min[pol]) & (1 << g) != 0)
+                    .map(|g| {
+                        s.arrival_min[pol] + if g < pe { sdc.period_ns } else { 0.0 }
+                    })
+                    .fold(f32::INFINITY, f32::min);
                 (
-                    cap - sdc.setup_uncertainty_ns,
+                    req_max,
                     c.arrival_max[hold_edge] + sdc.hold_uncertainty_ns,
-                    s.arrival_min[pol] + if g_min < pe { sdc.period_ns } else { 0.0 },
+                    arr_min,
                 )
             } else {
                 let lat = sdc.design_clock_latency_ns();
@@ -2339,15 +2371,16 @@ fn collect_endpoints(
                 // The same parity rule as the propagated branch, evaluated on the ideal
                 // clock's degenerate parity: a falling check edge has parity 1, so the
                 // min arrival moves one period later exactly as OpenSTA reports.
-                let g_min = if s.par_min[pol] <= 1 {
-                    s.par_min[pol] as usize
-                } else {
-                    0
-                };
+                let arr_min = (0..2usize)
+                    .filter(|g| par_bits(s.par_min[pol]) & (1 << g) != 0)
+                    .map(|g| {
+                        s.arrival_min[pol] + if g < pe { sdc.period_ns } else { 0.0 }
+                    })
+                    .fold(f32::INFINITY, f32::min);
                 (
                     setup_base + lat - sdc.setup_uncertainty_ns,
                     hold_base + lat + sdc.hold_uncertainty_ns,
-                    s.arrival_min[pol] + if g_min < pe { sdc.period_ns } else { 0.0 },
+                    arr_min,
                 )
             };
             let slack_max = req_max - s.arrival_max[pol];
@@ -4895,6 +4928,28 @@ mod tests {
         assert_eq!(kind_of("(A&B&C)"), None);
         assert_eq!(kind_of("(A)"), None);
         assert_eq!(kind_of("(A&!B)"), None);
+    }
+
+    /// Equal arrivals from different launch-edge parities must keep both parity bits:
+    /// the endpoint required time shifts by a period per parity, so dropping one would
+    /// report the wrong slack (external review S1).
+    #[test]
+    fn test_parity_mask_keeps_tied_arrivals() {
+        let mut s = PinTimingState::UNREACHED;
+        s.merge(RISE, 1.0, 0.5, 0.1, 0.1, 0b01, 0b01);
+        // Same max arrival, opposite parity: both bits survive.
+        s.merge(RISE, 1.0, 0.4, 0.1, 0.1, 0b10, 0b10);
+        assert_eq!(s.par_max[RISE], 0b11);
+        // The better min arrival replaces its mask entirely.
+        assert_eq!(s.par_min[RISE], 0b10);
+        // A strictly better max replaces the mask; an equal max unions again. The
+        // equal min arrival also unions its parity bit.
+        s.merge(RISE, 1.2, 0.4, 0.1, 0.1, 0b10, 0b01);
+        assert_eq!(s.par_max[RISE], 0b10);
+        assert_eq!(s.par_min[RISE], 0b11);
+        s.merge(RISE, 1.2, 0.45, 0.1, 0.1, 0b01, 0b10);
+        assert_eq!(s.par_max[RISE], 0b11);
+        assert_eq!(s.par_min[RISE], 0b11);
     }
 
     /// The ideal clock cannot see that `nand2`/`nor2` invert the gated clock, so the
