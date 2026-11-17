@@ -224,6 +224,12 @@ generic text above disagree, this section wins.
    the right capture/hold edge; plain `set_clock_latency` is then ignored and `-source`
    latency seeds the port. Validated on `tests/designs/sta_edge/propagated_clock/`; details
    in `docs/results.md`.
+   The ideal clock still tracks edge *phase* through cell-driven clock nets (`v0.1.71`):
+   a parity-only walk over the same graph places each consumer transition on its
+   clock-edge parity (`latency + parity * period/2`), so `nand`/`nor`/`inv` stages on the
+   clock network shift capture/hold/launch edges exactly as OpenSTA's ideal mode does —
+   validated on `sta_edge/clock_gate` (strict, all 13 endpoints). Delays and slews are
+   still not propagated; `cell_driven_clock_nets` keeps counting those nets.
 4. **Clock-to-Q.** `RisingEdge` arcs are `non_unate`: evaluate `CLK(RISE) → Q(RISE)` with
    `cell_rise`/`rise_transition` and `CLK(RISE) → Q(FALL)` with `cell_fall`/`fall_transition`,
    both at `in_slew = 0.0` and `out_cap = load(net(Q), pol)`. Check: `_384_/Q` rise

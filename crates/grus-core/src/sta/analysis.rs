@@ -1447,6 +1447,60 @@ fn propagate_clock(
     (clk, parity)
 }
 
+/// Edge parity (source clock-edge index mod 2) of every pin transition under
+/// the ideal clock. The clock network is traversed exactly like
+/// `propagate_clock` but with no timing: every reached transition keeps the
+/// parity of the source edge that produces it, so a pin behind an odd number
+/// of inverting cells sees its rise on clock edge 1. `u8::MAX` = unreached;
+/// consumers fall back to the source-port convention (rise 0, fall 1).
+/// Ties (a transition reachable from both parities, e.g. non-unate logic)
+/// resolve to the first candidate in levelized order — the same
+/// earliest-wins policy `propagate_clock` applies to equal arrivals.
+fn ideal_clock_parity(cx: &Context, levelized: &LevelizedGraph) -> Vec<[u8; 2]> {
+    let design = cx.design;
+    let mut par = vec![[u8::MAX; 2]; design.num_pins()];
+    let Some(port) = cx.sdc.clock_port.as_deref().and_then(|name| {
+        design
+            .io_pins
+            .iter()
+            .copied()
+            .find(|&p| cx.port_name(p) == name)
+    }) else {
+        return par;
+    };
+    par[port.0 as usize] = [0, 1];
+    for lvl in 1..levelized.level_offsets.len() - 1 {
+        for &pin in levelized.level(lvl) {
+            let p = pin.0 as usize;
+            let mut next = par[p];
+            if !design.pin_is_driver[p]
+                && let Some((_, _, drv)) = levelized.pin_driver[p]
+            {
+                let d = par[drv.0 as usize];
+                if d[RISE] != u8::MAX || d[FALL] != u8::MAX {
+                    next = d;
+                }
+            }
+            for &(src_pin, lib_arc) in levelized.incoming_to(pin) {
+                let arc = &cx.lib.arcs[lib_arc as usize];
+                let src_par = par[src_pin.0 as usize];
+                for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
+                    if (arc.timing_type == TimingType::CombinationalRise && dst_pol != RISE)
+                        || (arc.timing_type == TimingType::CombinationalFall && dst_pol != FALL)
+                    {
+                        continue;
+                    }
+                    if src_par[src_pol] != u8::MAX && next[dst_pol] == u8::MAX {
+                        next[dst_pol] = src_par[src_pol];
+                    }
+                }
+            }
+            par[p] = next;
+        }
+    }
+    par
+}
+
 fn polarities(sense: TimingSense) -> &'static [(usize, usize)] {
     match sense {
         TimingSense::PositiveUnate => &[(RISE, RISE), (FALL, FALL)],
@@ -1589,7 +1643,7 @@ fn run_sta_detail(
         }
     }
 
-    let mut clock_parity: Option<Vec<[u8; 2]>> = None;
+    let clock_parity: Option<Vec<[u8; 2]>>;
     let mut clock_state: Option<Vec<PinTimingState>> = None;
     if sdc.propagated_clock {
         // Propagated clock: arrival at each consumer pin comes from the clock network
@@ -1624,42 +1678,52 @@ fn run_sta_detail(
         }
         clock_state = Some(clk_state);
     } else {
-        // Ideal clock: every register clock pin and latch enable sees an edge at the clock
-        // latency (source + network). `set_clock_transition` is the clock pin's slew; without
-        // it the slew is zero.
+        // Ideal clock: every register clock pin, latch enable and clock-gate
+        // clock pin sees an edge at the clock latency (source + network), but
+        // the edge's phase still follows the clock network: `ideal_clock_parity`
+        // tracks inverting cells so a transition produced by clock-edge parity
+        // `p` is seeded half a period later per unit of `p` (rise on edge 0 at
+        // the latency, fall on edge 1 half a period on). `set_clock_transition`
+        // is the clock pin's slew; without it the slew is zero.
+        let ideal_par = ideal_clock_parity(&cx, &levelized);
+        clock_parity = Some(ideal_par.clone());
         let ideal_latency = sdc.design_clock_latency_ns();
-        // Latch enables are seeded too: the latch open below reads the enable's state.
-        // Clock-gate clock pins stay unseeded — the gate check uses the summed latency.
+        let half_period = 0.5 * sdc.period_ns;
         let clock_pins = graph
             .launches
             .iter()
             .map(|l| l.clk)
             .chain(graph.checks.iter().filter_map(|(_, c)| c.clk))
-            .chain(graph.latch_opens.iter().map(|o| o.enable));
+            .chain(graph.latch_opens.iter().map(|o| o.enable))
+            .chain(graph.gating_enables.iter().map(|g| g.clk_pin));
         for clk in clock_pins {
             for pol in [RISE, FALL] {
-                // Ideal clock: edge `pol` is clock-edge index `pol` (rise 0, fall 1).
+                // Unreached pins keep the source-port convention: transition
+                // `pol` sits on clock-edge parity `pol`.
+                let p = ideal_par[clk.0 as usize][pol];
+                let edge_par = if p <= 1 { p as usize } else { pol };
                 state[clk.0 as usize].merge(
                     pol,
-                    ideal_latency,
-                    ideal_latency,
+                    ideal_latency + edge_par as f32 * half_period,
+                    ideal_latency + edge_par as f32 * half_period,
                     sdc.clock_transition_ns,
                     sdc.clock_transition_ns,
-                    1 << pol,
-                    1 << pol,
+                    1 << edge_par,
+                    1 << edge_par,
                 );
             }
         }
     }
 
-    // A launch produces separate late/early arrivals: the clock edge time (`offset_ns`) is not
+    // A launch produces separate late/early arrivals: the clock edge time is not
     // derated, but the cell arc delay is, per `set_timing_derate`. `edge_pol` selects which
     // clock transition launches: RISE for flip-flops, FALL for the opening of a `dlxtn` latch.
+    // The clock edge's phase is already inside `clk_state`'s arrivals (real under a
+    // propagated clock, parity-seeded under the ideal clock).
     let eval_launch = |q: PinId,
                        clk_state: PinTimingState,
                        lib_arc: u32,
-                       edge_pol: usize,
-                       offset_ns: f32|
+                       edge_pol: usize|
      -> [(PinId, usize, f32, f32, f32, f32); 2] {
         let q_net = design.pin_nets[q.0 as usize];
         let arc = &lib.arcs[lib_arc as usize];
@@ -1701,10 +1765,8 @@ fn run_sta_detail(
                         q,
                         dst_pol,
                         clk_state.arrival_max[edge_pol]
-                            + offset_ns
                             + late_delay * sdc.derate(true, DERATE_CELL, false, edge_pol),
                         clk_state.arrival_min[edge_pol]
-                            + offset_ns
                             + early_delay * sdc.derate(false, DERATE_CELL, false, edge_pol),
                         late_slew,
                         early_slew,
@@ -1714,19 +1776,9 @@ fn run_sta_detail(
         }
         res
     };
-    // The ideal clock seeds both transitions at the clock latency, so a falling launch edge
-    // sits half a period later — the same convention the latch open below uses. A propagated
-    // clock carries the real fall arrival and needs no offset.
-    let launch_offset = |edge: usize| {
-        if sdc.propagated_clock || edge == RISE {
-            0.0
-        } else {
-            0.5 * sdc.period_ns
-        }
-    };
     // Clock-edge parity (mod 2) of the edge that launches `edge` at clock pin `clk`:
-    // the propagated clock's tracked parity, or `edge` itself under the ideal clock
-    // (which cannot see inverting paths). Recorded on the launched arrivals so endpoint
+    // the propagated clock's tracked parity, or the ideal clock's parity walk
+    // (which sees inverting paths). Recorded on the launched arrivals so endpoint
     // checks can tell whether the capture edge is the first edge after the launch.
     let launch_parity = |clk: PinId, edge: usize| -> u8 {
         clock_parity
@@ -1740,13 +1792,7 @@ fn run_sta_detail(
             .launches
             .iter()
             .map(|l| {
-                eval_launch(
-                    l.q,
-                    state[l.clk.0 as usize],
-                    l.lib_arc,
-                    l.edge,
-                    launch_offset(l.edge),
-                )
+                eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge)
             })
             .collect()
     } else {
@@ -1754,13 +1800,7 @@ fn run_sta_detail(
             .launches
             .par_iter()
             .map(|l| {
-                eval_launch(
-                    l.q,
-                    state[l.clk.0 as usize],
-                    l.lib_arc,
-                    l.edge,
-                    launch_offset(l.edge),
-                )
+                eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge)
             })
             .collect()
     };
@@ -1773,29 +1813,14 @@ fn run_sta_detail(
         }
     }
     // A latch opens on the clock transition named by `open_pol` (FALL for `dlxtn`,
-    // RISE for `dlxtp`). The ideal clock seeds both transitions identically, so a
-    // falling open is the rise plus half a period; a propagated clock carries the
-    // real arrival at the enable pin. `open_pol` is passed in both modes so
-    // `-fall` derates reach the arc.
-    let half_period = 0.5 * sdc.period_ns;
-    let open_offset = |pol: usize| {
-        if sdc.propagated_clock || pol == RISE {
-            0.0
-        } else {
-            half_period
-        }
-    };
+    // RISE for `dlxtp`). The enable pin's seeded state already carries the edge's
+    // phase (real under a propagated clock, parity-seeded under the ideal clock).
+    // `open_pol` is passed in both modes so `-fall` derates reach the arc.
     let latch_updates: Vec<_> = graph
         .latch_opens
         .iter()
         .map(|open| {
-            eval_launch(
-                open.q,
-                state[open.enable.0 as usize],
-                open.lib_arc,
-                open.open_pol,
-                open_offset(open.open_pol),
-            )
+            eval_launch(open.q, state[open.enable.0 as usize], open.lib_arc, open.open_pol)
         })
         .collect();
     for (open, pair) in graph.latch_opens.iter().zip(latch_updates) {
@@ -1884,8 +1909,8 @@ fn run_sta_detail(
                             if !en.reached(info.open_pol) || !en.reached(close_pol) {
                                 continue;
                             }
-                            let open = en.arrival_min[info.open_pol] + open_offset(info.open_pol);
-                            let mut close = en.arrival_min[close_pol] + open_offset(close_pol);
+                            let open = en.arrival_min[info.open_pol];
+                            let mut close = en.arrival_min[close_pol];
                             if close <= open {
                                 close += sdc.period_ns;
                             }
@@ -2089,11 +2114,10 @@ fn collect_endpoints(
     skipped.sdc_ignored_commands = sdc.ignored_commands.clone();
     skipped.sdc_commands = sdc.commands;
     let mut entries = Vec::new();
-    let half_period = 0.5 * sdc.period_ns;
-    // Clock-edge index parity of a pin's first arrival of `pol` (0 = even edge). Only a
-    // propagated clock carries it; the ideal clock falls back to the source-port
-    // convention (rise 0, fall 1). The launch side carries its own parity on each
-    // arrival extreme, so inverting launch paths are handled per endpoint.
+    // Clock-edge index parity of a pin's first arrival of `pol` (0 = even edge). Both
+    // clock modes carry it: propagated clocks track it through the network, the ideal
+    // clock derives it from the parity-only walk. The launch side carries its own
+    // parity on each arrival extreme, so inverting launch paths are handled per endpoint.
     // Common-path pessimism removal (CRPR): when launch and capture clocks share a net,
     // the shared prefix is counted late on the launch side and early on the capture side.
     // OpenSTA credits the early/late spread at the last shared point — the net driver —
@@ -2127,14 +2151,8 @@ fn collect_endpoints(
         };
         let (s, clk_state) = (state[data.0 as usize], state[clk.0 as usize]);
         // The check fires on `check.edge`: RISE for `*Rising` cells, FALL for inverting-clock
-        // cells (`dfrtn`). The ideal clock seeds both transitions at the latency, so a
-        // falling capture edge sits half a period later — the same offset the launch uses.
+        // cells (`dfrtn`). The clock pin's seeded arrival already carries the edge's phase.
         let edge = check.edge;
-        let edge_offset = if sdc.propagated_clock || edge == RISE {
-            0.0
-        } else {
-            half_period
-        };
         // A propagated clock can leave a clock pin unreached; the ideal seed always reaches.
         // A latch check also needs the opening edge (the opposite polarity of the
         // setup check edge): the borrow branch reads its arrival.
@@ -2209,27 +2227,23 @@ fn collect_endpoints(
                     continue;
                 }
                 let capture_extra = if c0 <= g { sdc.period_ns } else { 0.0 };
-                let closing_max = edge_offset + capture_extra + clk_state.arrival_min[edge]
+                let closing_max = capture_extra + clk_state.arrival_min[edge]
                     - late_time
                     - sdc.setup_uncertainty_ns
                     + credit;
                 // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
                 // is reported at the opening edge and the slack is what remains before the closing edge.
-                // A propagated clock carries the real fall arrival at the enable (uncertainty applies,
-                // as OpenSTA's `report_checks` shows); the ideal clock approximates it as half a
-                // period after the rise. The opening fall is the latest fall arrival before the
-                // closing rise; falls recur every period, so align by whole periods — the first
-                // fall alone sits one period early when the closing edge was shifted (inverting
-                // clock, parity-1 launch).
+                // The opening edge is the latest opening-polarity arrival before the
+                // closing edge; edges recur every period, so align by whole periods —
+                // the first arrival alone sits one period early when the closing edge
+                // was shifted (inverting clock, parity-1 launch). Both clock modes read
+                // the same seeded/propagated arrivals here.
                 // The latch's opening edge is the opposite polarity of the setup check
                 // edge (`dlxtn`: setup at rise, opens on fall; `dlxtp`: setup at fall,
-                // opens on rise). Under the ideal clock an opening fall sits half a
-                // period after the seeded rise; a propagated clock reads the real
-                // arrival, aligned by whole periods to the closing edge — the latest
-                // opening edge strictly before it.
+                // opens on rise).
                 let opening_max = if !check.latch {
                     0.0 // only read on the latch branch below
-                } else if sdc.propagated_clock {
+                } else {
                     let closing = clk_state.arrival_min[edge] + capture_extra;
                     let open_pol = 1 - edge;
                     let periods = ((closing - clk_state.arrival_min[open_pol]) / sdc.period_ns)
@@ -2239,9 +2253,6 @@ fn collect_endpoints(
                         + periods * sdc.period_ns
                         - sdc.setup_uncertainty_ns
                         + credit_for(open_pol)
-                } else {
-                    half_period * (1 - edge) as f32 + clk_state.arrival_min[RISE]
-                        - sdc.setup_uncertainty_ns
                 };
                 let arr_max = s.arrival_max[pol];
                 let (req, slack) = if !check.latch {
@@ -2270,7 +2281,7 @@ fn collect_endpoints(
                 eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[edge])
                     * sdc.derate(false, DERATE_CHECK, false, check_transition(early));
             let req_min =
-                edge_offset + clk_state.arrival_max[edge] + early_time + sdc.hold_uncertainty_ns
+                clk_state.arrival_max[edge] + early_time + sdc.hold_uncertainty_ns
                     - credit;
             // Hold pairs the capture edge with the next launch edge of the same polarity:
             // the arrival shifts one period when the launch edge parity precedes the
@@ -2336,53 +2347,25 @@ fn collect_endpoints(
             }
             // Tying launch parities can shift the setup capture edge and the hold
             // arrival by a period; evaluate each parity bit and keep the worst.
+            // Both clock modes read the clock pin's seeded/propagated arrivals:
+            // under the ideal clock the parity walk has already placed each
+            // transition on its clock-edge parity, so `pe` is the real parity.
             let par_bits = |mask: u8| if mask == 0 { 1 } else { mask & 0b11 };
-            let (req_max, req_min, arr_min) = if sdc.propagated_clock {
-                let req_max = (0..2usize)
-                    .filter(|g| par_bits(s.par_max[pol]) & (1 << g) != 0)
-                    .map(|g| {
-                        c.arrival_min[setup_edge]
-                            + if pe <= g { sdc.period_ns } else { 0.0 }
-                            - sdc.setup_uncertainty_ns
-                    })
-                    .fold(f32::INFINITY, f32::min);
-                let arr_min = (0..2usize)
-                    .filter(|g| par_bits(s.par_min[pol]) & (1 << g) != 0)
-                    .map(|g| {
-                        s.arrival_min[pol] + if g < pe { sdc.period_ns } else { 0.0 }
-                    })
-                    .fold(f32::INFINITY, f32::min);
-                (
-                    req_max,
-                    c.arrival_max[hold_edge] + sdc.hold_uncertainty_ns,
-                    arr_min,
-                )
-            } else {
-                let lat = sdc.design_clock_latency_ns();
-                // The ideal clock does not track clock-network inversions, so there is no
-                // parity to shift the hold arrival by; that correction exists only in the
-                // propagated branch above. The hold edge is the one preceding the setup
-                // edge: half a period after the rise for a rising check, the rise itself
-                // for a falling one.
-                let (setup_base, hold_base) = match g.kind {
-                    GateKind::Rising => (sdc.period_ns, half_period),
-                    GateKind::Falling => (half_period, 0.0),
-                };
-                // The same parity rule as the propagated branch, evaluated on the ideal
-                // clock's degenerate parity: a falling check edge has parity 1, so the
-                // min arrival moves one period later exactly as OpenSTA reports.
-                let arr_min = (0..2usize)
-                    .filter(|g| par_bits(s.par_min[pol]) & (1 << g) != 0)
-                    .map(|g| {
-                        s.arrival_min[pol] + if g < pe { sdc.period_ns } else { 0.0 }
-                    })
-                    .fold(f32::INFINITY, f32::min);
-                (
-                    setup_base + lat - sdc.setup_uncertainty_ns,
-                    hold_base + lat + sdc.hold_uncertainty_ns,
-                    arr_min,
-                )
-            };
+            let req_max = (0..2usize)
+                .filter(|g| par_bits(s.par_max[pol]) & (1 << g) != 0)
+                .map(|g| {
+                    c.arrival_min[setup_edge]
+                        + if pe <= g { sdc.period_ns } else { 0.0 }
+                        - sdc.setup_uncertainty_ns
+                })
+                .fold(f32::INFINITY, f32::min);
+            let arr_min = (0..2usize)
+                .filter(|g| par_bits(s.par_min[pol]) & (1 << g) != 0)
+                .map(|g| {
+                    s.arrival_min[pol] + if g < pe { sdc.period_ns } else { 0.0 }
+                })
+                .fold(f32::INFINITY, f32::min);
+            let req_min = c.arrival_max[hold_edge] + sdc.hold_uncertainty_ns;
             let slack_max = req_max - s.arrival_max[pol];
             let slack_min = arr_min - req_min;
             cands.max[pol] = Some(Worst {
@@ -5068,11 +5051,10 @@ mod tests {
         assert_eq!(s.par_min[RISE], 0b11);
     }
 
-    /// The ideal clock cannot see that `nand2`/`nor2` invert the gated clock, so the
-    /// `dfrtn` capture edges on `c_nand`/`c_nor` land half a period off (same limitation
-    /// as `clkinv` in the timing_derate fixture). Enable-pin checks themselves match.
+    /// OpenSTA's ideal clock still tracks edge inversion through cell-driven clock
+    /// nets: `nand2`/`nor2` swap the `dfrtn` capture edges on `c_nand`/`c_nor`, and
+    /// `ideal_clock_parity` reproduces that phase without propagating delays.
     #[test]
-    #[ignore = "ideal clock does not track edge inversion through cell-driven clock nets (u_ff0/u_ff2 D and RESET_B off by half a period)"]
     fn test_sta_edge_clock_gate_ideal() {
         compare_sta_edge(
             "clock_gate",

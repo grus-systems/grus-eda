@@ -1693,3 +1693,38 @@ tolerates, so `AES_PLACEMENT`/`IBEX_PLACEMENT` sharing the SPEF tolerances is
 justified rather than goalpost-moving. jpeg's larger 0.633 ps endpoint diff is
 informational only — its placement test stays ignored for the OpenSTA #582
 extrapolation case, unrelated to parasitics.
+
+### 2026-11-17 — Ideal clock tracks edge inversion through cell-driven clock nets
+
+- **Finding**: OpenSTA's *ideal* clock is not phase-blind. The `sta_edge/clock_gate`
+  golden shows `dfrtn` capture edges on `c_nand`/`c_nor` (nand2/nor2 outputs)
+  shifted a half period versus the non-inverting `c_or`/`c_and`/`c_icg` branches —
+  the ideal clock follows clock-network inversions for edge *phase* while still
+  ignoring cell delays. The previous implementation seeded both transitions at
+  the clock latency and could not see this (the reason
+  `test_sta_edge_clock_gate_ideal` was `#[ignore]`d).
+- **Implementation** (`crates/grus-core/src/sta/analysis.rs`):
+  - `ideal_clock_parity` walks the same levelized timing graph as
+    `propagate_clock` with no timing — each reached transition keeps the
+    clock-edge index parity (mod 2) of the source edge that produces it through
+    net wires and Liberty `timing_sense` polarities. `u8::MAX` = unreached;
+    non-unate ambiguity resolves to the first candidate in levelized order
+    (propagate_clock's incumbent-on-tie analog).
+  - Consumer clock pins (register `CLK`, check clock pins, latch enables, and
+    now clock-gate clock pins) are seeded at
+    `design_clock_latency + parity * period/2` per transition instead of both at
+    the latency; the seeded `par_max`/`par_min` masks record the producing edge
+    parity, so `edge_parity`/`launch_parity` report real parities under ideal.
+  - The phase is now inside the seeded arrivals, so the ideal-mode
+    `edge_offset`/`launch_offset`/`open_offset` corrections are gone; the latch
+    `opening_max` alignment and the clock-gate setup/hold formulas use the same
+    code path as propagated mode (`credit_for` still returns 0 under ideal).
+  - Unreached pins keep the old source-port convention (transition `pol` on
+    edge parity `pol`), so designs without inverting clock paths are
+    bit-identical — verified by the full suite.
+- **Verification**: `test_sta_edge_clock_gate_ideal` now passes at `Tol::STRICT`
+  and is un-ignored (all 13 endpoints, max/min, WNS/TNS/violations). Full
+  `cargo test --release --workspace`: 210 + 3 passed, 0 failed, 2 ignored
+  (jpeg OpenSTA #582 only). `cell_driven_clock_nets` still counts every
+  cell-driven clock net under ideal — the parity walk propagates edge phase,
+  not delays/slews.
