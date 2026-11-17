@@ -1610,3 +1610,58 @@ one, so the restriction is a documented gap, not silently approximated.
   out-of-scope cases (`picorv32`/`aes`/`ibex`/`jpeg` placement RC, `jpeg` placed SPEF)
   and `clock_gate` ideal (ideal clock does not track cell-driven clock-net inversion);
   each carries its measured reason in the attribute and in this file.
+
+### 2026-11-18 — R9.1 — OpenROAD Prim-Dijkstra placement tree (`congestion/pdr.rs`)
+
+- **What changed**: the placement-RC tree builder is now a port of OpenROAD's
+  `pdr::primDijkstra` (stt module, `alpha = 0.3`; BSD-3-Clause source read at the
+  pinned revision, own Rust implementation): nearest-neighbor bounding-box
+  selection over `(y, x)`-sorted points, alpha-weighted Prim-Dijkstra spanning
+  tree, Steiner-point insertion, degree-4 node splitting, and `checkTree`
+  (crossing bounding boxes; `deg > 100` skips). `estimate_placement_parasitics`
+  ships `build_pd_points`; the RSMT builders remain for E1 and the A/B tests.
+- **Tree equivalence vs OpenROAD's own SPEF** (`*.routed.spef` is
+  `estimate_parasitics -placement -spef_file` output for all five designs):
+  - Per-net total wire length: identical on every net (worst |diff| < 0.005 um,
+    SPEF print precision).
+  - Per-net edge-length multiset: **0 mismatches on all 78,749 nets**
+    (gcd 268, picorv32 6,743, aes 9,038, ibex 12,127, jpeg 46,567) after
+    filtering the SPEF's 1e-6 kohm pin-connect links.
+  - `checkTree`: **0 failures on all 78,749 nets**, so OpenROAD's FLUTE fallback
+    never triggers on these designs — the PD tree is the whole story here.
+  - Node-cap multiset: identical except 9 nets (8 ibex, 1 jpeg) where coincident
+    points are merged by coordinate in `build_net_tree` (`ours_nodes =
+    ref_nodes - 1`); total wire capacitance is preserved and a merge of
+    zero-edge-adjacent nodes is electrically exact, so this stays diagnostic.
+- **Timing vs the `placement_rc` golden** (`cargo test --release`, ignored tests
+  run explicitly):
+  - `picorv32`: **PASS** — un-ignored. (Was 56 failing fields under the RSMT
+    tree.)
+  - `gcd`: PASS (unchanged).
+  - `aes`: 913 -> **17 fields** (16 `max_slack_ns` off 0.009-0.016 ns, one
+    `max_slew_ns` off 5.24%; max arrival/required within 0.44%).
+  - `ibex`: 13,164 -> **3 fields** (all `max_slack_ns`, off 0.011-0.036 ns).
+  - `jpeg`: residual is now **identical to `placed_spef`'s** (WNS ours -78.084
+    vs ref -61.199 ns, TNS -134,605 vs -123,078 ns) — with edge-identical trees
+    the entire remaining error is the documented OpenSTA #582 out-of-table
+    NLDM extrapolation, not the tree or the estimator.
+- **Root cause of the aes/ibex residual**: not topology. Our wire delay/slew at
+  each sink is `Elmore` (+ `WIRE_SLEW_FACTOR * Elmore`, hypot-combined); OpenSTA
+  propagates slew/delay through its DMP calculator on the pi-reduced network.
+  The gap is the same one `GCD_PLACEMENT`'s slew tolerance already covers, wider
+  on these designs' high-fanout nets. Closing it means replacing the Elmore wire
+  model with a DMP-based per-sink evaluation — a separate task; the trees
+  themselves are now proven correct.
+- Tests: `test_pd_length_vs_placement_spef`, `test_pd_edge_multiset_vs_placement_spef`
+  (now asserts 0 edge mismatches), `test_pd_checktree_failures` (diagnostic).
+
+Review follow-up (luna6, same day): `checkTree` was re-verified against OpenROAD
+@ `dcf36133` `src/stt/src/SteinerTreeBuilder.cpp` — `rectAreaZero` is
+point-degenerate only, `odb::Rect::intersects` is inclusive, all branch pairs
+are compared, and `tree.deg > 100` skips; the port matches on all points.
+`checkTree` now runs in production builds too: `estimate_placement_parasitics`
+counts failures into `NetParasitics::pd_check_failed_nets` (pub, documented;
+`grus-eda sta` warns on stderr when nonzero) instead of silently keeping a PD
+tree where OpenROAD would fall back to FLUTE. The diagnostic tests now assert:
+per-net length equality, 0 edge-multiset mismatches, the measured coincident-
+merge cap counts (ibex 8, jpeg 1, else 0), and 0 `checkTree` failures.

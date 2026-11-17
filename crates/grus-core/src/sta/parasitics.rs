@@ -1,4 +1,4 @@
-use crate::congestion::rsmt::{Pt, build_precise_rsmt_points};
+use crate::congestion::rsmt::Pt;
 use super::dmp::PiModel;
 use crate::design_db::DesignDb;
 use crate::readers::spef::{Spef, SpefNet, unescape_spef_name};
@@ -91,6 +91,11 @@ impl NetRcTree {
 #[derive(Clone, Debug)]
 pub struct NetParasitics {
     nets: Vec<Option<NetRcTree>>,
+    /// Nets whose placement PD tree failed OpenROAD's `checkTree`: OpenROAD would
+    /// build those with FLUTE, we still use the PD tree, so our estimate diverges
+    /// from `estimate_parasitics -placement` on them. Always 0 for SPEF parasitics
+    /// and for the A/B tree builders; 0 on all five public designs.
+    pub pd_check_failed_nets: usize,
 }
 
 impl NetParasitics {
@@ -100,34 +105,50 @@ impl NetParasitics {
 }
 
 pub fn estimate_placement_parasitics(design: &DesignDb, tech: &TechDb, rc: WireRc) -> NetParasitics {
-    estimate_placement_parasitics_with_tree(design, tech, rc, build_precise_rsmt_points)
+    let failed = std::sync::atomic::AtomicUsize::new(0);
+    let mut parasitics = estimate_placement_parasitics_with_tree(design, tech, rc, |pts| {
+        let tree = crate::congestion::pdr::build_pd_tree_for_points(pts);
+        if !tree.check_passed {
+            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tree.segments
+    });
+    parasitics.pd_check_failed_nets = failed.load(std::sync::atomic::Ordering::Relaxed);
+    parasitics
 }
 
 /// The tree builder is a parameter so the measurement can compare the greedy and exact trees against
-/// routed truth; the shipped estimate is always `build_precise_rsmt_points`.
-pub(crate) fn estimate_placement_parasitics_with_tree(
+/// routed truth; the shipped estimate is the PD builder used by `estimate_placement_parasitics`.
+pub(crate) fn estimate_placement_parasitics_with_tree<F>(
     design: &DesignDb,
     tech: &TechDb,
     rc: WireRc,
-    segments: TreeBuilder,
-) -> NetParasitics {
+    segments: F,
+) -> NetParasitics
+where
+    F: Fn(&[Pt]) -> Vec<(Pt, Pt)> + Sync,
+{
     let n_nets = design.num_nets();
     let nets = if n_nets < 512 {
         (0..n_nets)
-            .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), segments))
+            .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), &segments))
             .collect()
     } else {
         (0..n_nets)
             .into_par_iter()
-            .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), segments))
+            .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), &segments))
             .collect()
     };
-    NetParasitics { nets }
+    NetParasitics { nets, pd_check_failed_nets: 0 }
 }
 
-pub(crate) type TreeBuilder = fn(&[Pt]) -> Vec<(Pt, Pt)>;
-
-fn build_net_tree(design: &DesignDb, tech: &TechDb, rc: WireRc, net: NetId, segments: TreeBuilder) -> Option<NetRcTree> {
+fn build_net_tree<F: Fn(&[Pt]) -> Vec<(Pt, Pt)>>(
+    design: &DesignDb,
+    tech: &TechDb,
+    rc: WireRc,
+    net: NetId,
+    segments: &F,
+) -> Option<NetRcTree> {
     design.net_driver(net)?;
     let pins: &[PinId] = design.net_pins(net);
     if pins.len() < 2 {
@@ -227,7 +248,7 @@ pub fn spef_parasitics(design: &DesignDb, spef: &Spef) -> Result<NetParasitics> 
     } else {
         (0..n_nets).into_par_iter().map(build_one).collect::<Result<Vec<_>>>()?
     };
-    Ok(NetParasitics { nets })
+    Ok(NetParasitics { nets, pd_check_failed_nets: 0 })
 }
 
 fn spef_pin_node_name(design: &DesignDb, pin: PinId) -> String {
@@ -395,6 +416,222 @@ mod tests {
             assert_eq!(nets, matching, "{design_name}: {degree}-point nets must match OpenROAD exactly");
         }
         assert!(lengths.longer.is_empty(), "{design_name}: tree longer than OpenROAD's: {:?}", lengths.longer);
+    }
+
+    /// Edge-length multiset of our PD tree vs OpenROAD's placement-estimate
+    /// SPEF resistors (wire resistors only; the 1e-3 kohm pin/via and
+    /// zero-length links are filtered on both sides).
+    #[test]
+    fn test_pd_edge_multiset_vs_placement_spef() {
+        for design_name in ["gcd", "picorv32", "aes", "ibex", "jpeg"] {
+            let lib_dir = sky130_hd();
+            let dir = design_dir(design_name);
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF");
+            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let spef = load_spef(&dir.join(format!("{design_name}.routed.spef"))).expect("SPEF");
+            let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
+            let dbu = tech.dbu_per_micron as f64;
+            let (mut nets, mut mismatched, mut cap_mismatches) = (0usize, 0usize, 0usize);
+            let (mut examples, mut cap_examples) = (Vec::new(), Vec::new());
+            for n in 0..design.num_nets() {
+                let net = NetId(n as u32);
+                let pins = design.net_pins(net);
+                if design.net_driver(net).is_none() || pins.len() < 2 {
+                    continue;
+                }
+                let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
+                let Some(spef_net) = spef.nets.get(&name) else { continue };
+                nets += 1;
+                let pts: Vec<Pt> = pins.iter().map(|&p| design.pin_pos_dbu(p, &tech)).collect();
+                let mut ours: Vec<f64> = crate::congestion::pdr::build_pd_points(&pts)
+                    .iter()
+                    .map(|&(a, b)| (a.0.abs_diff(b.0) + a.1.abs_diff(b.1)) as f64 / dbu)
+                    .filter(|&l| l > 0.0)
+                    .collect();
+                ours.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                // Pin/via and zero-length links are exactly 1e-6 kohm in the
+                // SPEF; the shortest real wire (1 DBU) is ~2.6e-6 kohm, so an
+                // exact-match filter cannot drop wire.
+                let mut reference: Vec<f64> = spef_net
+                    .resistors
+                    .iter()
+                    .map(|(_, _, r)| *r as f64)
+                    .filter(|&r| (r - 1e-6).abs() > 1e-9)
+                    .map(|r| r / rc.r_kohm_per_um as f64)
+                    .collect();
+                reference.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let same = ours.len() == reference.len()
+                    && ours
+                        .iter()
+                        .zip(&reference)
+                        .all(|(&a, &b)| (a - b).abs() <= (1e-3 * b).max(0.01));
+                if !same {
+                    mismatched += 1;
+                    if examples.len() < 5 {
+                        examples.push(format!(
+                            "{name} deg{} ours_edges={} ref_edges={}",
+                            pins.len(),
+                            ours.len(),
+                            reference.len()
+                        ));
+                    }
+                }
+
+                // Node-cap multiset: each tree node's wire capacitance is
+                // c0/2 * sum of incident edge lengths on both sides. A few
+                // nets differ by one node where coincident points are merged
+                // by coordinate (`intern` keys on Pt); total wire capacitance
+                // is unaffected since it depends only on total length, and a
+                // merge of zero-edge-adjacent nodes is electrically exact.
+                // Diagnostic only: timing parity is asserted by the
+                // placement-RC OpenSTA tests, not here.
+                if let Some(tree) = build_net_tree(&design, &tech, rc, net, &crate::congestion::pdr::build_pd_points) {
+                    let mut ours_caps: Vec<f64> = tree.wire_cap_pf.iter().map(|&c| c as f64).collect();
+                    ours_caps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let mut ref_caps: Vec<f64> = spef_net
+                        .caps
+                        .iter()
+                        .map(|(_, c)| *c as f64)
+                        .collect();
+                    ref_caps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let caps_same = ours_caps.len() == ref_caps.len()
+                        && ours_caps
+                            .iter()
+                            .zip(&ref_caps)
+                            .all(|(&a, &b)| (a - b).abs() <= (1e-3 * b).max(1e-6));
+                    if !caps_same {
+                        cap_mismatches += 1;
+                        if cap_examples.len() < 5 {
+                            cap_examples.push(format!(
+                                "{name} deg{} ours_nodes={} ref_nodes={}",
+                                pins.len(),
+                                ours_caps.len(),
+                                ref_caps.len()
+                            ));
+                        }
+                    }
+                }
+            }
+            println!("{design_name}: {nets} nets, {mismatched} edge-multiset mismatches, {cap_mismatches} cap-multiset mismatches");
+            for e in examples {
+                println!("  {e}");
+            }
+            for e in cap_examples {
+                println!("  cap {e}");
+            }
+            // Node-cap multiset may differ by one node on nets with coincident
+            // points (merged by coordinate in `intern`); the counts below are
+            // the measured 2026-11-18 values and may only shrink.
+            let expected_cap_mismatches = match design_name {
+                "ibex" => 8,
+                "jpeg" => 1,
+                _ => 0,
+            };
+            assert_eq!(
+                cap_mismatches, expected_cap_mismatches,
+                "{design_name}: coincident-merge node count changed; re-measure before updating"
+            );
+            assert_eq!(
+                mismatched, 0,
+                "{design_name}: PD tree edge multiset must match OpenROAD's placement SPEF"
+            );
+        }
+    }
+
+    /// Per-net PD tree length vs OpenROAD's placement-estimate SPEF
+    /// (`*.routed.spef` is the `-placement -spef_file` output for these designs).
+    #[test]
+    fn test_pd_length_vs_placement_spef() {
+        for design_name in ["gcd", "picorv32", "aes", "ibex", "jpeg"] {
+            let lib_dir = sky130_hd();
+            let dir = design_dir(design_name);
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF");
+            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let spef = load_spef(&dir.join(format!("{design_name}.routed.spef"))).expect("SPEF");
+            let c0 = WireRc::from_layer(&tech, "met2").expect("met2 RC").c_pf_per_um as f64;
+            let dbu = tech.dbu_per_micron as f64;
+            let (mut nets, mut match_n, mut worst) = (0usize, 0usize, 0.0f64);
+            let mut worst_net = String::new();
+            for n in 0..design.num_nets() {
+                let net = NetId(n as u32);
+                let pins = design.net_pins(net);
+                if design.net_driver(net).is_none() || pins.len() < 2 {
+                    continue;
+                }
+                let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
+                let Some(spef_net) = spef.nets.get(&name) else { continue };
+                let pts: Vec<Pt> = pins.iter().map(|&p| design.pin_pos_dbu(p, &tech)).collect();
+                let ours: f64 = crate::congestion::pdr::build_pd_points(&pts)
+                    .iter()
+                    .map(|&(a, b)| (a.0.abs_diff(b.0) + a.1.abs_diff(b.1)) as f64)
+                    .sum::<f64>()
+                    / dbu;
+                let reference = spef_net.caps.iter().map(|(_, c)| *c as f64).sum::<f64>() / c0;
+                nets += 1;
+                let diff = (ours - reference).abs();
+                let tol = (1e-4 * reference).max(1.0 / dbu);
+                if diff <= tol {
+                    match_n += 1;
+                }
+                if diff > worst {
+                    worst = diff;
+                    worst_net = format!("{name} deg{} ours {ours:.2} ref {reference:.2}", pins.len());
+                }
+            }
+            println!("{design_name}: {nets} nets, {match_n} length-match, worst |diff| {worst:.3} um ({worst_net})");
+            assert_eq!(match_n, nets, "{design_name}: every PD tree length must match OpenROAD's SPEF");
+        }
+    }
+
+    /// Counts nets whose PD tree fails OpenROAD's `checkTree` (crossing
+    /// bounding boxes), which is where the reference falls back to FLUTE.
+    #[test]
+    fn test_pd_checktree_failures() {
+        for design_name in ["gcd", "picorv32", "aes", "ibex", "jpeg"] {
+            let lib_dir = sky130_hd();
+            let dir = design_dir(design_name);
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF");
+            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let (mut nets, mut failed) = (0usize, 0usize);
+            for n in 0..design.num_nets() {
+                let net = NetId(n as u32);
+                if design.net_driver(net).is_none() || design.net_pins(net).len() < 2 {
+                    continue;
+                }
+                nets += 1;
+                let pts: Vec<Pt> = design
+                    .net_pins(net)
+                    .iter()
+                    .map(|&p| design.pin_pos_dbu(p, &tech))
+                    .collect();
+                if !crate::congestion::pdr::build_pd_tree_for_points(&pts).check_passed {
+                    failed += 1;
+                }
+            }
+            println!("{design_name}: {nets} nets, {failed} PD trees failed checkTree (FLUTE fallback in OpenROAD)");
+            assert_eq!(failed, 0, "{design_name}: PD tree failed checkTree — OpenROAD would use FLUTE here");
+        }
     }
 
     #[test]

@@ -2533,7 +2533,9 @@ mod tests {
             slew_rel: 0.03,
             ..Tol::STRICT
         };
-        /// Our Steiner trees are not FLUTE's, so the RC differs from OpenROAD's on nets of 4+ pins.
+        /// Placement trees are OpenROAD's Prim-Dijkstra output (edge-identical to its SPEF on all
+        /// five designs), so the residual tolerance covers our Elmore-based wire delay/slew vs
+        /// OpenSTA's DMP calculator, not tree topology.
         const GCD_PLACEMENT: Tol = Tol {
             arr_rel: 0.02,
             slew_rel: 0.05,
@@ -2593,7 +2595,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failing: 56 fields (max arrival 7.25% off, WNS -1.887 vs -1.715 ns) at picorv32 placement-RC scale; see docs/results.md"]
     fn test_picorv32_placement_rc_matches_opensta() {
         compare_design_with_opensta(
             "picorv32",
@@ -2646,8 +2647,12 @@ mod tests {
         compare_design_with_opensta("aes", "zero_wire", Rc::None, Tol::STRICT);
     }
 
+    /// Ignored: 17 fields remain (16 `max_slack_ns` off by 0.009-0.016 ns, one `max_slew_ns` off
+    /// 5.24%); max arrival/required are within 0.44%. The PD trees are edge-identical to
+    /// OpenROAD's placement SPEF, so the residual is our Elmore-based wire delay/slew vs OpenSTA's
+    /// DMP calculator — the same gap `GCD_PLACEMENT` tolerates, just wider here. See docs/results.md.
     #[test]
-    #[ignore = "aes placement-RC fails 913 fields (max arrival 83.9% off, WNS -4.407 vs -4.524 ns; TNS passes); measured table in docs/results.md"]
+    #[ignore]
     fn test_aes_placement_rc_matches_opensta() {
         compare_design_with_opensta("aes", "placement_rc", Rc::Placement, Tol::AES_PLACEMENT);
     }
@@ -2662,9 +2667,10 @@ mod tests {
         compare_design_with_opensta("jpeg", "zero_wire", Rc::None, Tol::STRICT);
     }
 
-    /// Ignored: placement RC overestimates wire delay badly at jpeg scale (14,328 failing fields;
-    /// WNS ours -397.1 vs ref -61.2 ns, TNS -489,748 vs -123,078 ns). See docs/results.md;
-    /// thresholds are not fitted.
+    /// Ignored: the PD trees are edge-identical to OpenROAD's placement SPEF (verified on all
+    /// 46,567 nets), so the residual is identical to `placed_spef`'s — the OpenSTA #582
+    /// out-of-table NLDM extrapolation on extreme slew/load (WNS ours -78.084 vs ref -61.199 ns,
+    /// TNS -134,605 vs -123,078 ns). See docs/results.md.
     #[test]
     #[ignore]
     fn test_jpeg_placement_rc_matches_opensta() {
@@ -2692,9 +2698,9 @@ mod tests {
         compare_design_with_opensta("ibex", "zero_wire", Rc::None, Tol::STRICT);
     }
 
-    /// Ignored: placement RC fails broadly at ibex scale (13,164 failing fields, down from 14,127;
-    /// TNS ours -24,230 vs ref -21,282 ns; WNS passes). See docs/results.md;
-    /// thresholds are not fitted.
+    /// Ignored: 3 `max_slack_ns` fields remain off by 0.011-0.036 ns; every other field passes.
+    /// The PD trees are edge-identical to OpenROAD's placement SPEF, so the residual is our
+    /// Elmore-based wire delay/slew vs OpenSTA's DMP calculator. See docs/results.md.
     #[test]
     #[ignore]
     fn test_ibex_placement_rc_matches_opensta() {
@@ -4363,7 +4369,7 @@ mod tests {
                 &routed_truth,
             ),
             score(
-                "(b) ours, placement RC, exact tree (build_precise_rsmt_points; shipped)",
+                "(b) ours, placement RC, exact tree (build_precise_rsmt_points)",
                 &sta(&exact),
                 &routed_truth,
             ),
@@ -4455,7 +4461,7 @@ mod tests {
 
         let vs_truth = vec![
             score(
-                "(a) ours, placement RC, exact tree (build_precise_rsmt_points; shipped)",
+                "(a) ours, placement RC, exact tree (build_precise_rsmt_points)",
                 &sta(&exact),
                 &routed_truth,
             ),

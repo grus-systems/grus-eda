@@ -157,11 +157,15 @@ The items below close these gaps, in the order proposed at the end.
 
 ### R9. Known accuracy gaps (carried over)
 
-- The `placement RC` tests on `picorv32`, `aes`, `ibex` and `jpeg` are `#[ignore]`d and
-  fail against OpenROAD's own `estimate_parasitics -placement` result. (Placement versus
-  routed was closed as an inherent estimator gap in E3.4; this item is about matching
-  OpenROAD's estimate.) Done when each test passes within a stated tolerance, or a
-  decision recorded in `results.md` drops the test.
+- The `placement RC` tests on `aes`, `ibex` and `jpeg` are `#[ignore]`d.
+  (Placement versus routed was closed as an inherent estimator gap in E3.4.)
+  `picorv32` was un-ignored in `v0.1.69` after the tree builder became a port of
+  OpenROAD's `pdr::primDijkstra` — edge-identical to its placement SPEF on all
+  78,749 nets; the remaining `aes` (17 fields) / `ibex` (3) deltas are the
+  Elmore-vs-DMP wire delay/slew model, and `jpeg`'s is the `OpenSTA #582`
+  out-of-table residual identical to `placed_spef`. Done when each test passes
+  within a stated tolerance, or a decision recorded in `results.md` drops the
+  test — the next lever is a DMP-based per-sink wire delay/slew, not the tree.
 - The E1 hot-set overlap on `picorv32` is `0.4698`, below the `0.50` criterion. Done when
   it reaches `0.50` and the test is un-ignored, or a recorded decision relaxes the
   criterion.

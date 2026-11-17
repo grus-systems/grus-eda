@@ -446,6 +446,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 _ => None,
             };
+            if let Some(p) = &parasitics
+                && p.pd_check_failed_nets > 0
+            {
+                eprintln!(
+                    "warning: {} nets failed the placement tree check; OpenROAD would use FLUTE there, we keep the PD tree",
+                    p.pd_check_failed_nets
+                );
+            }
             let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
             println!(
                 "STA ({}): endpoints={}, setup wns={:.6} tns={:.6} viol={}, hold wns={:.6} tns={:.6} viol={}, elapsed={:.2}ms",
