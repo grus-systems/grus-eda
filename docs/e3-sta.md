@@ -468,10 +468,11 @@ reference tool), write the rule in `docs/` before the code, record every compari
 - `set_clock_uncertainty` now accepts `[-setup|-hold] <ns> [get_clocks <name>]` and is applied to
   register checks, clock-gate enables **and output ports** (Phase 3, `sta_edge/clock_uncertainty`; the
   plain single-value form sets both setup and hold). Verified against OpenSTA on the fixture.
-- Latches outside the `dlxtn` shape (`setup_rising` on D) are still skipped with a warning — verified
-  divergence (`sta_edge/non_dlxtn_latch`, `#[ignore]`d): `dlxtp_1` uses `setup_falling`/`hold_falling`,
-  so the cell's arcs are ignored and 1 of 3 endpoints is reached. Extending the latch model is a
-  separate design decision.
+- Latches of every `sky130_fd_sc_hd` shape are modeled. The non-`dlxtn` positive latch `dlxtp_1`
+  (`setup_falling`/`hold_falling` on `GATE`) is handled through `open_pol` exactly like `dlxtn` —
+  verified strict on `sta_edge/non_dlxtn_latch` (all 3 endpoints reached) — and `sta_edge/latch_borrow`
+  exercises all 8 latch cells (`dlxtn`/`dlxtp`/`dlrb*`/`dlrt*`/`dlxb*`) with `D -> Q` time borrowing,
+  strict PASS ideal and propagated (31 endpoints each).
 
 ## 6. Reproducing the Test Inputs
 
