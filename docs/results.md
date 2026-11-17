@@ -1850,15 +1850,21 @@ generalised to `compare_design_files` so a test can name its own SDC and golden.
   all sampled pins (`_11496_` 1.303 vs 1.30, `_10754_` 1.789 vs 1.79, `_11498_`
   0.631 vs 0.63, `_10876_` 4.196 vs 4.20, `_10849_` 1.265 vs 1.26 ns). Required
   times match to a median ~0.3 ps over all endpoints.
-- **Three outliers, root-caused as clock-independent**: `_11496_`/`_10754_`
+- **Three outliers on clock-independent paths**: `_11496_`/`_10754_`
   `max_arr_ns`/`max_req_ns` (~0.10-0.12 ns) and `_11498_` `max_slew_ns` (12.6%).
-  Backward path tracing shows all three worst paths are `resetn`-launched
-  (input port, clock-independent data path) through cells seeing 1.8-3.5 ns
-  slews, and `_11496_`'s required time reads its setup constraint at 2.36 ns clock
-  slew — the E3.5 cell-stage gap / OpenSTA #582 regime, not a clock defect. In
-  ideal mode the same data-path gap existed but the endpoint comparison happened
-  to pair our `resetn` path against OpenSTA's flip-flop path (~31 ps, passing);
-  propagated mode re-selects the worst path on both sides to `resetn`, exposing
-  the true ~0.12 ns same-path residual. `PICORV32_PROPAGATED` therefore widens
-  only `arr_rel` (0.01 -> 0.03) and `slew_rel` (0.10 -> 0.15) over
-  `PICORV32_SPEF`; slack, TNS and WNS keep their tighter bounds.
+  OpenSTA `report_checks` shows all three worst paths are `resetn`-launched
+  (input port) in **both** ideal and propagated modes — same path, not a
+  re-selection. Our data-path arrival to these endpoints is clock-independent
+  and identical between modes (shifts exactly +0.2 ns, the `-source` latency).
+  OpenSTA's own arrival on the same `resetn` path shifts only +113 ps
+  ideal -> propagated, not the +200 ps a pure launch-reference shift predicts —
+  i.e. OpenSTA's propagated-clock I/O-launch edge/reference handling moves these
+  arrivals non-uniformly, a semantic we do not replicate. On top of that sits
+  the known E3.5 cell-stage gap: the paths traverse cells seeing 1.8-3.5 ns
+  slews and `_11496_`'s required time reads its setup constraint at 2.36 ns
+  clock slew (OpenSTA #582 regime). Neither effect is a clock-arrival defect —
+  the propagated clock's own per-pin arrival is verified above. `PICORV32_PROPAGATED`
+  widens only `arr_rel` (0.01 -> 0.03) and `slew_rel` (0.10 -> 0.15) over
+  `PICORV32_SPEF`; slack, TNS and WNS keep their tighter bounds, and clock-pin
+  arrival is independently covered by the strict `sta_edge` propagated fixtures
+  and the clean `gcd` pass.

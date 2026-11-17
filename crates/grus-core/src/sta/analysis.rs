@@ -2785,14 +2785,14 @@ mod tests {
             ..Tol::STRICT
         };
         /// picorv32 propagated clock shares `PICORV32_SPEF` and widens only arrival and
-        /// slew. The propagated clock itself is verified: per-pin clock-network delay
-        /// matches OpenSTA to ~5 ps and 14,381/14,384 endpoint fields pass. The three
-        /// outliers — `_11496_`/`_10754_` arrival+required (~0.10-0.12 ns) and `_11498_`
-        /// slew (12.6%) — are `resetn`-launched data paths through 1.8-3.5 ns-slew cells
-        /// plus a setup constraint read at 2.4 ns clock slew, i.e. the clock-independent
-        /// E3.5 cell-stage gap (OpenSTA #582 regime). Propagated mode re-selects the worst
-        /// path against the ideal-clock golden, exposing a gap the ideal comparison had
-        /// masked by comparing different launch endpoints. See docs/results.md.
+        /// slew. The three outliers — `_11496_`/`_10754_` arrival+required (~0.10-0.12 ns)
+        /// and `_11498_` slew (12.6%) — sit on `resetn`-launched data paths (OpenSTA
+        /// `report_checks`: same startpoint in ideal and propagated modes) through
+        /// 1.8-3.5 ns-slew cells, i.e. the clock-independent E3.5 cell-stage gap
+        /// (OpenSTA #582 regime) compounded by OpenSTA's non-uniform I/O-launch shift
+        /// under propagated clocks — not a clock-arrival defect. Propagated-clock
+        /// arrival itself is covered strictly by the `sta_edge` fixtures and the clean
+        /// `gcd` pass; this test is end-to-end skew/sanity coverage. See docs/results.md.
         const PICORV32_PROPAGATED: Tol = Tol {
             arr_rel: 0.03,
             slew_rel: 0.15,
