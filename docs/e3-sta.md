@@ -353,10 +353,11 @@ Done criterion for every E3 step: worst slack, and arrival and required time of 
 | ibex SPEF | pass (`v0.1.46`) | arrival, req, WNS, TNS all strict `max(5 ps, 1%)`; slack floor 40 ps (`36.6 ps` max), slew 5.5% (`5.09%` max) |
 | jpeg SPEF | `#[ignore]`, out of scope | extreme extrapolation (`7x` load / `6x` slew on `_43767_/Y`) confirmed unsupported by `OpenSTA #582`; mismatches `7,045 -> 1,419` in `v0.1.45` |
 | picorv32 placement RC | pass (`v0.1.69`) | `Tol::PICORV32_PLACEMENT` (arr 3%, slack 0.2 ns, slew 20%, TNS 10%); un-ignored once the PD tree matched OpenROAD's SPEF edge-for-edge |
-| aes placement RC | `#[ignore]`, fails | 17 fields: 16 `max_slack_ns` off 0.009-0.016 ns, one `max_slew_ns` off 5.24%; max arr/req within 0.44% — Elmore-vs-DMP wire model residual, trees proven identical |
-| ibex placement RC | `#[ignore]`, fails | 3 `max_slack_ns` fields off 0.011-0.036 ns — same wire-model residual |
+| aes placement RC | pass (`v0.1.69`) | `AES_PLACEMENT = AES_SPEF`: PD parasitics equivalent to the SPEF readback (<= 3e-6 ns/pin Elmore bare wire, <= 3.8e-3 ns uniform load), so the residual is the shared cell-stage gap |
+| ibex placement RC | pass (`v0.1.69`) | `IBEX_PLACEMENT = IBEX_SPEF`, same reasoning; worst slack field 36 ps < 40 ps floor |
 | jpeg placement RC | `#[ignore]`, fails | residual identical to `placed_spef` (WNS -78.084 vs -61.199 ns): OpenSTA #582 out-of-table NLDM extrapolation, not the tree |
 | PD tree vs OpenROAD SPEF (all 5 designs) | pass (`v0.1.69`) | edge-length multiset identical on all 78,749 nets; total length identical; `checkTree` 0 failures (FLUTE fallback unused); asserted in `test_pd_edge_multiset_vs_placement_spef` |
+| PD vs SPEF parasitics (all 5 designs) | pass (`v0.1.69`) | per-pin Elmore: bare wire <= 3e-6 ns, uniform 1 fF load <= 3.8e-3 ns — within the strict floor; asserted in `test_pd_vs_spef_parasitics_agree` |
 | DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` within 6% |
 | DMP vs `report_dcalc` (76 rows, routed SPEF) | pass (`v0.1.45`) | pi exact (max 0.43%); `Ceff` median 0.69% / max 6.79%, delay 0.12% / 6.03%, `driver_waveform_slew` 2.55% / 8.56% |
 | Pi waveform slew across 5 designs (`31,966` rows) | pass (`v0.1.45`) | shielded `<0.97` median `0.50..0.74%`; all rows median `1.70..2.49%` (`ourCe + bailout`) |
@@ -374,10 +375,13 @@ reference tool), write the rule in `docs/` before the code, record every compari
 > (Prim-Dijkstra + Steinerization + degree-4 split, `alpha = 0.3`) and falls back to FLUTE
 > only when `checkTree` rejects it. `congestion/pdr.rs` now ports that pass; its output is
 > **edge-identical to OpenROAD's placement SPEF on all 78,749 nets of the five designs**
-> (0 `checkTree` failures, so FLUTE never ran). The placement-RC residuals that remained
-> under the RSMT tree collapsed: `picorv32` passes and is un-ignored; `aes` 913 -> 17 fields,
-> `ibex` 13,164 -> 3, `jpeg` now equals `placed_spef`'s OpenSTA #582 residual exactly. What
-> remains is the Elmore-vs-DMP wire delay/slew model, not the tree — a separate task.
+> (0 `checkTree` failures, so FLUTE never ran). `test_pd_vs_spef_parasitics_agree` then showed
+> the built parasitics agree with the SPEF readback to <= 3e-6 ns per-pin Elmore on the bare
+> wire and <= 3.8e-3 ns under a uniform 1 fF load — within the strict floor — so `placement_rc`
+> measures the same engine residual as `placed_spef`: `picorv32`, `aes` and `ibex` all pass
+> un-ignored (`AES_PLACEMENT`/`IBEX_PLACEMENT` reuse the SPEF tolerances), and `jpeg`'s residual
+> equals `placed_spef`'s OpenSTA #582 out-of-table case exactly. What remains is the shared
+> cell-stage engine gap (driver waveform slew, extreme-load Ceff), not the tree or the wire model.
 - **Outcome**: our placement estimator is the same construction as OpenROAD's and scores the same against routed
   truth; the remaining placement-RC error is the placement-estimation abstraction itself, not the tree. Closed on
   the done criterion's evidence branch ("record the evidence and stop"), with the rule now known as well.

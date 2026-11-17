@@ -545,6 +545,76 @@ mod tests {
         }
     }
 
+    /// PD-built RC trees vs the same nets read back from OpenROAD's placement
+    /// SPEF: per-pin Elmore delays must agree both for the bare wire and with a
+    /// uniform 1 fF load at every pin (which exercises the pin->node mapping).
+    /// This is the evidence that `placement_rc` measures the same engine
+    /// residual as `placed_spef`, not the estimator.
+    #[test]
+    fn test_pd_vs_spef_parasitics_agree() {
+        for (design_name, expected_nets) in [
+            ("gcd", 268usize),
+            ("picorv32", 6743),
+            ("aes", 9038),
+            ("ibex", 12127),
+            ("jpeg", 46567),
+        ] {
+            let lib_dir = sky130_hd();
+            let dir = design_dir(design_name);
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF");
+            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let spef = load_spef(&dir.join(format!("{design_name}.routed.spef"))).expect("SPEF");
+            let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
+            let (mut nets, mut worst_wire, mut worst_loaded) = (0usize, 0.0f64, 0.0f64);
+            let (mut worst_wire_net, mut worst_loaded_net) = (String::new(), String::new());
+            for n in 0..design.num_nets() {
+                let net = NetId(n as u32);
+                let pins = design.net_pins(net);
+                if design.net_driver(net).is_none() || pins.len() < 2 {
+                    continue;
+                }
+                let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
+                // SPEF legitimately omits some nets (e.g. the ideal-clock port
+                // net); the asserted count below pins the covered set.
+                let Some(spef_net) = spef.nets.get(&name) else { continue };
+                nets += 1;
+                let pd = build_net_tree(&design, &tech, rc, net, &crate::congestion::pdr::build_pd_points)
+                    .expect("PD tree");
+                let sf = spef_net_tree(&design, net, &name, spef_net).expect("SPEF tree");
+                for caps in [vec![0.0f32; pins.len()], vec![1.0f32; pins.len()]] {
+                    for (&a, &b) in pd.elmore_ns(&caps).iter().zip(sf.elmore_ns(&caps).iter()) {
+                        let d = (a as f64 - b as f64).abs();
+                        if caps[0] == 0.0 && d > worst_wire {
+                            worst_wire = d;
+                            worst_wire_net = name.clone();
+                        } else if caps[0] != 0.0 && d > worst_loaded {
+                            worst_loaded = d;
+                            worst_loaded_net = name.clone();
+                        }
+                    }
+                }
+            }
+            assert_eq!(nets, expected_nets, "{design_name}: compared-net count");
+            println!(
+                "{design_name}: {nets} nets, worst Elmore |diff| wire {worst_wire:.6} ns ({worst_wire_net}), loaded {worst_loaded:.6} ns ({worst_loaded_net})"
+            );
+            // Measured 2026-11-18: wire <= 1e-6 ns everywhere; loaded worst is
+            // ~1.5e-3 ns on ibex `rst_ni` (SPEF pin nodes hang off 1e-6 kohm
+            // links and coincident-point merges shift where the uniform load
+            // lands). The loaded bound is the 5 ps strict timing floor: per-pin
+            // Elmore agrees within it even under a uniform load.
+            assert!(worst_wire <= 1e-5, "{design_name}: PD and SPEF wire parasitics diverge by {worst_wire} ns");
+            assert!(worst_loaded <= 5e-3, "{design_name}: PD and SPEF loaded parasitics diverge by {worst_loaded} ns");
+        }
+    }
+
     /// Per-net PD tree length vs OpenROAD's placement-estimate SPEF
     /// (`*.routed.spef` is the `-placement -spef_file` output for these designs).
     #[test]

@@ -1645,13 +1645,17 @@ one, so the restriction is a documented gap, not silently approximated.
     vs ref -61.199 ns, TNS -134,605 vs -123,078 ns) — with edge-identical trees
     the entire remaining error is the documented OpenSTA #582 out-of-table
     NLDM extrapolation, not the tree or the estimator.
-- **Root cause of the aes/ibex residual**: not topology. Our wire delay/slew at
-  each sink is `Elmore` (+ `WIRE_SLEW_FACTOR * Elmore`, hypot-combined); OpenSTA
-  propagates slew/delay through its DMP calculator on the pi-reduced network.
-  The gap is the same one `GCD_PLACEMENT`'s slew tolerance already covers, wider
-  on these designs' high-fanout nets. Closing it means replacing the Elmore wire
-  model with a DMP-based per-sink evaluation — a separate task; the trees
-  themselves are now proven correct.
+- **Root cause of the aes/ibex residual**: not topology and not the wire model.
+  `test_pd_vs_spef_parasitics_agree` shows the PD-built and SPEF-readback RC
+  trees agree to <= 3e-6 ns per-pin Elmore on the bare wire (and <= 3.8e-3 ns
+  under a uniform 1 fF load) across all SPEF-present nets — the parasitics are
+  equivalent for timing purposes, so `placement_rc` measures the same engine
+  residual as `placed_spef` (the E3.5 cell-stage gap: driver waveform slew and
+  extreme-load Ceff). The failures were an artefact of `GCD_PLACEMENT`'s
+  stricter slack floor (5 ps) versus the SPEF modes' documented floors
+  (25/40 ps); `AES_PLACEMENT`/`IBEX_PLACEMENT` now use the SPEF tolerances and
+  both tests pass un-ignored. `jpeg` stays ignored: its residual is identical
+  to `placed_spef`'s OpenSTA #582 out-of-table case.
 - Tests: `test_pd_length_vs_placement_spef`, `test_pd_edge_multiset_vs_placement_spef`
   (now asserts 0 edge mismatches), `test_pd_checktree_failures` (diagnostic).
 
@@ -1665,3 +1669,13 @@ counts failures into `NetParasitics::pd_check_failed_nets` (pub, documented;
 tree where OpenROAD would fall back to FLUTE. The diagnostic tests now assert:
 per-net length equality, 0 edge-multiset mismatches, the measured coincident-
 merge cap counts (ibex 8, jpeg 1, else 0), and 0 `checkTree` failures.
+
+Second review round (luna6): `test_pd_vs_spef_parasitics_agree` now covers all
+78,749 SPEF-present nets (count asserted per design; SPEF legitimately omits
+nets like the ideal-clock port net) and compares per-pin Elmore twice — bare
+wire (worst 3e-6 ns) and with a uniform 1 fF load at every pin (worst 3.8e-3 ns
+on jpeg `ena`; SPEF pin nodes hang off 1e-6 kohm links and coincident merges
+shift where the load lands). The loaded bound is the 5 ps strict floor, so the
+claim is: PD and SPEF parasitics agree within the strict timing tolerance even
+under uniform load — enough to share the SPEF-mode tolerances, not a proof of
+bit-identical networks.

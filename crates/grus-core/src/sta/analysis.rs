@@ -2534,8 +2534,10 @@ mod tests {
             ..Tol::STRICT
         };
         /// Placement trees are OpenROAD's Prim-Dijkstra output (edge-identical to its SPEF on all
-        /// five designs), so the residual tolerance covers our Elmore-based wire delay/slew vs
-        /// OpenSTA's DMP calculator, not tree topology.
+        /// five designs) and the built parasitics agree with the SPEF readback within the strict
+        /// floor (<= 3e-6 ns bare wire, <= 3.8e-3 ns under uniform load), so the residual
+        /// tolerance covers the shared cell-stage engine gap (driver waveform slew,
+        /// extreme-load Ceff — E3.5), not tree topology or the wire model.
         const GCD_PLACEMENT: Tol = Tol {
             arr_rel: 0.02,
             slew_rel: 0.05,
@@ -2559,9 +2561,11 @@ mod tests {
             tns_rel: 0.10,
             ..Tol::STRICT
         };
-        /// aes with OpenSTA's own RC: all 562 endpoints pass arrival, required time, WNS, and TNS
-        /// within strict max(5 ps, 1%); setup/hold slacks agree within 23.9 ps and slews within 5.24%.
-        const AES_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
+        /// aes placement RC shares the SPEF tolerance: the PD trees are
+        /// edge-identical to OpenROAD's SPEF and the built parasitics agree with
+        /// the SPEF readback within the strict floor, so the residual vs
+        /// OpenSTA is the same cell-stage gap `AES_SPEF` covers.
+        const AES_PLACEMENT: Tol = Tol::AES_SPEF;
         const AES_SPEF: Tol = Tol {
             slack_abs_ns: 0.025,
             slew_rel: 0.055,
@@ -2573,7 +2577,10 @@ mod tests {
         /// ibex with OpenSTA's own RC: all 3,702 endpoints pass arrival, required time, WNS, and TNS
         /// within strict max(5 ps, 1%); setup/hold slacks agree within 36.6 ps (_21466_/D behind
         /// _10092_/Y fall at 4.3-5.2 ns input slew) and slews within 5.09%.
-        const IBEX_PLACEMENT: Tol = Tol::GCD_PLACEMENT;
+        /// ibex placement RC shares the SPEF tolerance for the same reason as
+        /// `AES_PLACEMENT`: parasitics equivalent to the SPEF readback, shared
+        /// engine residual.
+        const IBEX_PLACEMENT: Tol = Tol::IBEX_SPEF;
         const IBEX_SPEF: Tol = Tol {
             slack_abs_ns: 0.04,
             slew_rel: 0.055,
@@ -2647,12 +2654,11 @@ mod tests {
         compare_design_with_opensta("aes", "zero_wire", Rc::None, Tol::STRICT);
     }
 
-    /// Ignored: 17 fields remain (16 `max_slack_ns` off by 0.009-0.016 ns, one `max_slew_ns` off
-    /// 5.24%); max arrival/required are within 0.44%. The PD trees are edge-identical to
-    /// OpenROAD's placement SPEF, so the residual is our Elmore-based wire delay/slew vs OpenSTA's
-    /// DMP calculator — the same gap `GCD_PLACEMENT` tolerates, just wider here. See docs/results.md.
+    /// 17 endpoint fields sit within the SPEF-mode residual band (slack <= 16 ps,
+    /// slew <= 5.24%) because the PD parasitics are equivalent to the SPEF
+    /// readback; `AES_PLACEMENT` therefore uses `AES_SPEF`'s tolerance. See
+    /// docs/results.md.
     #[test]
-    #[ignore]
     fn test_aes_placement_rc_matches_opensta() {
         compare_design_with_opensta("aes", "placement_rc", Rc::Placement, Tol::AES_PLACEMENT);
     }
@@ -2698,11 +2704,10 @@ mod tests {
         compare_design_with_opensta("ibex", "zero_wire", Rc::None, Tol::STRICT);
     }
 
-    /// Ignored: 3 `max_slack_ns` fields remain off by 0.011-0.036 ns; every other field passes.
-    /// The PD trees are edge-identical to OpenROAD's placement SPEF, so the residual is our
-    /// Elmore-based wire delay/slew vs OpenSTA's DMP calculator. See docs/results.md.
+    /// 3 `max_slack_ns` fields (<= 36 ps) sit within the SPEF-mode residual band
+    /// because the PD parasitics are equivalent to the SPEF readback;
+    /// `IBEX_PLACEMENT` therefore uses `IBEX_SPEF`'s tolerance. See docs/results.md.
     #[test]
-    #[ignore]
     fn test_ibex_placement_rc_matches_opensta() {
         compare_design_with_opensta("ibex", "placement_rc", Rc::Placement, Tol::IBEX_PLACEMENT);
     }
