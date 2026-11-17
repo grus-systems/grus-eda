@@ -7,6 +7,8 @@ enum PortSel {
     AllInputs { no_clocks: bool },
     AllOutputs,
     Ports(Vec<String>),
+    /// `remove_from_collection` on a predicate selection: the base minus `excluded` names.
+    Except { base: Box<PortSel>, excluded: Vec<String> },
 }
 
 impl PortSel {
@@ -16,6 +18,29 @@ impl PortSel {
             PortSel::AllInputs { no_clocks } => is_input && !(*no_clocks && clock_port == Some(port)),
             PortSel::AllOutputs => !is_input,
             PortSel::Ports(names) => names.iter().any(|n| n == port),
+            PortSel::Except { base, excluded } => {
+                base.matches(port, is_input, clock_port) && !excluded.iter().any(|n| n == port)
+            }
+        }
+    }
+
+    /// The selection minus the named ports. An explicit list filters in place; a predicate
+    /// base (`all_inputs`, `all_outputs`, or an existing `Except`) gains the names as
+    /// exclusions, which `matches` applies on top.
+    fn without(self, removed: &[String]) -> PortSel {
+        if removed.is_empty() {
+            return self;
+        }
+        match self {
+            PortSel::Ports(mut names) => {
+                names.retain(|n| !removed.contains(n));
+                PortSel::Ports(names)
+            }
+            PortSel::Except { base, mut excluded } => {
+                excluded.extend(removed.iter().cloned());
+                PortSel::Except { base, excluded }
+            }
+            other => PortSel::Except { base: Box::new(other), excluded: removed.to_vec() },
         }
     }
 }
@@ -454,6 +479,7 @@ impl Interp {
                 _ => bail!("all_outputs takes no arguments"),
             },
             "all_clocks" => Ok(Value::Clocks(self.all_clock_names())),
+            "remove_from_collection" => self.remove_from_collection(args),
             "create_clock" => {
                 self.create_clock(args)?;
                 Ok(empty())
@@ -900,6 +926,44 @@ impl Interp {
             names.push(port.clone());
         }
         names
+    }
+
+    /// `remove_from_collection <collection> <object>...`: the collection minus the named
+    /// objects, keeping the collection's type. Ports subtract through `PortSel::without`
+    /// (an explicit list filters, a predicate base records exclusions); clocks and plain
+    /// name lists subtract by name. The objects to remove must be enumerable — a predicate
+    /// selection like `all_inputs` used as an object cannot be named, so it is an error
+    /// rather than a silent no-op.
+    fn remove_from_collection(&mut self, args: &[Value]) -> Result<Value> {
+        let [collection, objects @ ..] = args else {
+            bail!("remove_from_collection takes a collection and objects");
+        };
+        if objects.is_empty() {
+            bail!("remove_from_collection takes objects to remove");
+        }
+        let mut removed: Vec<String> = Vec::new();
+        for arg in objects {
+            match arg {
+                Value::Ports(PortSel::Ports(names)) => removed.extend(names.iter().cloned()),
+                Value::Ports(_) => bail!("remove_from_collection cannot subtract a predicate selection"),
+                Value::Clocks(names) => removed.extend(names.iter().cloned()),
+                Value::Str(text) => removed.extend(text.split_whitespace().map(str::to_string)),
+            }
+        }
+        removed.sort_unstable();
+        removed.dedup();
+        match collection {
+            Value::Ports(sel) => Ok(Value::Ports(sel.clone().without(&removed))),
+            Value::Clocks(names) => Ok(Value::Clocks(
+                names.iter().filter(|n| !removed.contains(*n)).cloned().collect(),
+            )),
+            Value::Str(text) => Ok(Value::Str(
+                text.split_whitespace()
+                    .filter(|n| !removed.iter().any(|r| r.as_str() == *n))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )),
+        }
     }
 
     fn delay_rule(&mut self, args: &[Value]) -> Result<DelayRule> {
@@ -1561,6 +1625,35 @@ mod tests {
             "set_units ns\n",
         ] {
             assert!(parse_sdc(&format!("{GCD}{bad}")).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn remove_from_collection_subtracts_selections() {
+        // The result feeds the same port selectors as the commands it replaces: a predicate
+        // base keeps matching through `PortSel::Except`, an explicit list filters by name.
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_input_delay 2.0 -clock core_clk [remove_from_collection [all_inputs -no_clocks] [get_ports {{req_val}}]]\n\
+             set_output_delay 3.0 -clock core_clk [remove_from_collection [get_ports {{resp_val resp_msg[0]}}] [get_ports {{resp_msg[0]}}]]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.input_delay_ns("reset"), (2.0, 2.0));
+        assert_eq!(sdc.input_delay_ns("req_msg[0]"), (2.0, 2.0));
+        assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0), "req_val was removed");
+        assert_eq!(sdc.output_delay_ns("resp_val"), (3.0, 3.0));
+        assert_eq!(sdc.output_delay_ns("resp_msg[0]"), (1.0, 1.0), "resp_msg[0] was removed");
+    }
+
+    #[test]
+    fn remove_from_collection_rejects_what_it_cannot_name() {
+        for bad in [
+            // A predicate selection cannot be enumerated into names to subtract.
+            "set_input_delay 1.0 [remove_from_collection [all_inputs] [all_outputs]]",
+            "set_input_delay 1.0 [remove_from_collection [get_ports {a}]]",
+            "set_input_delay 1.0 [remove_from_collection]",
+        ] {
+            assert!(parse_sdc(&format!("{GCD}{bad}\n")).is_err(), "accepted: {bad}");
         }
     }
 
