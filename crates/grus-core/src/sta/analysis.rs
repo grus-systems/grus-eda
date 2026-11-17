@@ -611,14 +611,15 @@ fn gate_kind(lib: &LibDb, cell: &LibCell, out: &LibPin) -> Option<GateKind> {
     let mut neg: Option<bool> = None;
     let mut names = HashSet::new();
     for op in ops {
-        let (name, n) = match op {
-            FuncExpr::Lit(nm, p) => (*nm, *p),
-            FuncExpr::Not(b) => match &**b {
-                FuncExpr::Lit(nm, p) => (*nm, !*p),
-                _ => return None,
-            },
-            _ => return None,
-        };
+        // Peel redundant negations (`!!A`) so only the net polarity matters.
+        let mut node = op;
+        let mut n = false;
+        while let FuncExpr::Not(inner) = node {
+            n = !n;
+            node = inner;
+        }
+        let &FuncExpr::Lit(name, p) = node else { return None };
+        let n = n != p;
         match neg {
             None => neg = Some(n),
             Some(prev) if prev == n => {}

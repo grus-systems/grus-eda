@@ -784,10 +784,22 @@ fn parse_pin_body(
             }
             // `state_function` is a different attribute and must not match here.
             Token::Ident("function") => {
-                if let Some(Token::Colon) = lexer.next_token()
-                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-                        function = Some(db.strings.intern(s));
+                if let Some(Token::Colon) = lexer.next_token() {
+                    match lexer.next_token() {
+                        Some(Token::Ident(s) | Token::Str(s)) => function = Some(db.strings.intern(s)),
+                        // An unquoted expression is not valid Liberty; drain to ';'
+                        // so its tokens cannot alias pin-body keywords. The pin then
+                        // counts as function-less and keeps the legacy gate guess.
+                        Some(_) => {
+                            while let Some(t) = lexer.next_token() {
+                                if matches!(t, Token::Semi) {
+                                    break;
+                                }
+                            }
+                        }
+                        None => {}
                     }
+                }
             }
             Token::Ident("timing") => {
                 // Consume optional (args)
