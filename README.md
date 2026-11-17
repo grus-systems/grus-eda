@@ -8,13 +8,15 @@ its numbers agree with that tool's.
 > Private for now. It holds no design from other Grus repositories and must not:
 > every test design here is public (see `AGENTS.md`).
 
-> **Research prototype — read the skip summary.** `sta` uses an ideal clock (no
-> propagated clock tree), models only the `dlxtn` latch shape without the
-> `D -> Q` path or time borrowing, covers a subset of SDC, and skips asynchronous
-> `Clear`/`Preset` propagation. Every run prints what it left out as counts and
-> shares of the design's arcs and endpoints; `--strict` exits non-zero when
-> anything was skipped and `--json <path>` writes the same summary
-> machine-readably.
+> **Research prototype — read the skip summary.** `sta` covers a subset of
+> SDC (stock LibreLane `write_sdc` output parses unchanged) and models clocks
+> both ideally and via `set_propagated_clock`, including latch `D -> Q` and
+> time borrowing for `sky130_fd_sc_hd` shapes. Asynchronous `Clear`/`Preset`
+> and `min_pulse_width` arcs are counted as skips, and cells driven far
+> outside their Liberty timing tables can diverge from OpenSTA. Every run
+> prints what it left out as counts and shares of the design's arcs and
+> endpoints; `--strict` exits non-zero when anything was skipped and `--json
+> <path>` writes the same summary machine-readably.
 
 ## Why
 
