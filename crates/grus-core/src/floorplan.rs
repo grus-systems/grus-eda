@@ -20,7 +20,7 @@ impl Default for FloorplanSpec {
             die_area: None,
             utilization: 0.60,
             margin_dbu: 10_000,
-            site_name: "unithd".to_string(),
+            site_name: String::new(),
         }
     }
 }
@@ -91,6 +91,21 @@ pub fn generate_floorplan(db: &mut DesignDb, tech_db: &TechDb, spec: &FloorplanS
     if spec.margin_dbu < 0 {
         bail!("floorplan margin must be >= 0 DBU, got {}", spec.margin_dbu);
     }
+    // Row geometry always comes from the single site recorded in TechDb, so
+    // accepting an arbitrary name would emit a ROW for a site the tech LEF
+    // never defined. An empty spec falls back to the loaded site.
+    let site_name = if spec.site_name.is_empty() {
+        &tech_db.site_name
+    } else {
+        &spec.site_name
+    };
+    if !site_name.eq_ignore_ascii_case(&tech_db.site_name) {
+        bail!(
+            "floorplan: site '{}' is not the selected site in the tech LEF (selected: '{}')",
+            site_name,
+            tech_db.site_name
+        );
+    }
     let site_w = tech_db.site_width_dbu;
     let site_h = tech_db.site_height_dbu;
     if site_w <= 0 || site_h <= 0 {
@@ -148,7 +163,7 @@ pub fn generate_floorplan(db: &mut DesignDb, tech_db: &TechDb, spec: &FloorplanS
             "floorplan: core area {}x{} DBU cannot hold one {} site ({}x{} DBU); enlarge --die-area or shrink --margin",
             core_xh - core_xl,
             core_yh - core_yl,
-            spec.site_name,
+            site_name,
             site_w,
             site_h
         );
@@ -156,7 +171,7 @@ pub fn generate_floorplan(db: &mut DesignDb, tech_db: &TechDb, spec: &FloorplanS
 
     db.die_area = die;
     db.rows.clear();
-    let site_sym = db.strings.intern(&spec.site_name);
+    let site_sym = db.strings.intern(site_name);
     let core_xl32 = i32_coord(core_xl, "core left")?;
     let num_x = i32_coord((core_xh - core_xl) / site_w as i64, "row site count")?;
     let mut y = core_yl;
@@ -401,6 +416,10 @@ mod tests {
             },
             FloorplanSpec {
                 die_area: Some(RectDbu::new(0, 0, 1_000, 1_000)),
+                ..Default::default()
+            },
+            FloorplanSpec {
+                site_name: "nonexistent_site".to_string(),
                 ..Default::default()
             },
         ] {
