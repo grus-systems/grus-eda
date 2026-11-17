@@ -470,6 +470,10 @@ impl Interp {
                 self.set_clock_transition(args)?;
                 Ok(empty())
             }
+            "set_units" => {
+                self.set_units(args)?;
+                Ok(empty())
+            }
             "set_timing_derate" => {
                 self.set_timing_derate(args)?;
                 Ok(empty())
@@ -719,15 +723,44 @@ impl Interp {
         Ok(())
     }
 
+    /// `set_units [-time ns] [-capacitance pF] [-resistance ...] ...`. Every number the model
+    /// reads is already in ns and pF, so a declaration in those units is a no-op. `-time` or
+    /// `-capacitance` in any other unit would silently rescale every value, so it is an error
+    /// rather than a skipped option; the remaining unit keys name quantities the timing model
+    /// never reads and are accepted without effect.
+    fn set_units(&mut self, args: &[Value]) -> Result<()> {
+        const IGNORED: [&str; 5] = ["-resistance", "-voltage", "-current", "-power", "-distance"];
+        let mut i = 0;
+        while i < args.len() {
+            let Value::Str(flag) = &args[i] else {
+                bail!("set_units takes -flag unit pairs");
+            };
+            let Some(Value::Str(unit)) = args.get(i + 1) else {
+                bail!("{flag} needs a unit");
+            };
+            match flag.as_str() {
+                "-time" if unit != "ns" => bail!("set_units -time {unit}: the model reads ns"),
+                "-capacitance" if unit != "pF" => bail!("set_units -capacitance {unit}: the model reads pF"),
+                "-time" | "-capacitance" => {}
+                f if IGNORED.contains(&f) => {}
+                other => bail!("unsupported option `{other}`"),
+            }
+            i += 2;
+        }
+        Ok(())
+    }
+
     /// `set_timing_derate -early|-late [-rise|-fall] [-clock|-data]
-    /// [-net_delay|-cell_delay|-cell_check] <derate> [objects]`. Exactly one of `-early`/`-late`
-    /// is required and the derate value is positional. Each command overwrites only the
+    /// [-net_delay|-cell_delay|-cell_check] <derate> [objects]`. At least one of `-early`/`-late`
+    /// is required — both may appear on one command, which applies the derate to both corners —
+    /// and the derate value is positional. Each command overwrites only the
     /// categories its flags select; a bare corner flag covers cell and net delays on both
     /// clock and data paths and both transitions but not cell checks (measured on OpenSTA).
     /// Cell checks respond to `-data` only, never `-clock`. A second positional word would
     /// be the object scope, which the model cannot honour, so it is rejected.
     fn set_timing_derate(&mut self, args: &[Value]) -> Result<()> {
-        let mut late = None;
+        let mut early = false;
+        let mut late = false;
         let mut rise = false;
         let mut fall = false;
         let mut clock = false;
@@ -740,11 +773,17 @@ impl Interp {
                 bail!("set_timing_derate takes flag/value words");
             };
             match word.as_str() {
-                "-early" | "-late" => {
-                    if late.is_some() {
-                        bail!("set_timing_derate takes exactly one of -early/-late");
+                "-early" => {
+                    if early {
+                        bail!("duplicate -early");
                     }
-                    late = Some(word == "-late");
+                    early = true;
+                }
+                "-late" => {
+                    if late {
+                        bail!("duplicate -late");
+                    }
+                    late = true;
                 }
                 "-rise" => rise = true,
                 "-fall" => fall = true,
@@ -771,32 +810,40 @@ impl Interp {
                 }
             }
         }
-        let (Some(late), Some(value)) = (late, derate) else {
-            bail!("set_timing_derate needs -early or -late and a derate value");
+        let Some(value) = derate else {
+            bail!("set_timing_derate needs a derate value");
         };
+        if !early && !late {
+            bail!("set_timing_derate needs -early or -late");
+        }
         let mut selected = kinds;
         if !any_kind {
             selected[DERATE_CELL] = true;
             selected[DERATE_NET] = true;
         }
-        let corner = if late { &mut self.sdc.derate_late } else { &mut self.sdc.derate_early };
-        for (kind, &sel) in selected.iter().enumerate() {
-            if !sel {
+        for late_corner in [false, true] {
+            if (late_corner && !late) || (!late_corner && !early) {
                 continue;
             }
-            for (clock_path, row) in corner.factors[kind].iter_mut().enumerate() {
-                let is_clock = clock_path == 0;
-                if kind == DERATE_CHECK && is_clock {
+            let corner = if late_corner { &mut self.sdc.derate_late } else { &mut self.sdc.derate_early };
+            for (kind, &sel) in selected.iter().enumerate() {
+                if !sel {
                     continue;
                 }
-                if clock != data && is_clock != clock {
-                    continue;
-                }
-                for (transition, cell) in row.iter_mut().enumerate() {
-                    if rise != fall && (transition == 0) != rise {
+                for (clock_path, row) in corner.factors[kind].iter_mut().enumerate() {
+                    let is_clock = clock_path == 0;
+                    if kind == DERATE_CHECK && is_clock {
                         continue;
                     }
-                    *cell = value;
+                    if clock != data && is_clock != clock {
+                        continue;
+                    }
+                    for (transition, cell) in row.iter_mut().enumerate() {
+                        if rise != fall && (transition == 0) != rise {
+                            continue;
+                        }
+                        *cell = value;
+                    }
                 }
             }
         }
@@ -1137,6 +1184,10 @@ mod tests {
     const AES: &str = include_str!("../../../../tests/designs/aes/aes.sdc");
     const JPEG: &str = include_str!("../../../../tests/designs/jpeg/jpeg.sdc");
     const PICORV32: &str = include_str!("../../../../tests/designs/picorv32/picorv32.sdc");
+    // `write_sdc` output for gcd.propagated.sdc, emitted by OpenSTA inside the pinned
+    // LibreLane container (tests/designs/_dump_sdc.sh pattern). It uses only the supported
+    // subset: per-port `-add_delay` rules, `-pin_load`, `set_propagated_clock`, derate-free.
+    const GCD_WRITE_SDC: &str = include_str!("../../../../tests/designs/gcd/gcd.write_sdc");
 
     #[test]
     fn parses_the_gcd_constraints() {
@@ -1451,6 +1502,65 @@ mod tests {
             "set_timing_derate 0.9\n",
         ] {
             assert!(parse_sdc(&format!("create_clock -name clk -period 2.0 [get_ports clk]\n{bad}")).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn timing_derate_combined_early_late() {
+        // `-early -late` on one command applies the same derate to both corners.
+        let sdc = parse_sdc(
+            "create_clock -name clk -period 2.0 [get_ports clk]\n\
+             set_timing_derate -early -late -cell_delay 0.9\n\
+             set_timing_derate -early -late -net_delay -data -rise 1.1\n",
+        )
+        .unwrap();
+        for corner in [&sdc.derate_early, &sdc.derate_late] {
+            for row in corner.factors[DERATE_CELL] {
+                assert_eq!(row, [0.9, 0.9]);
+            }
+            assert_eq!(corner.factors[DERATE_NET][0], [1.0, 1.0]);
+            assert_eq!(corner.factors[DERATE_NET][1], [1.1, 1.0]);
+        }
+        for bad in [
+            "set_timing_derate -early -early 0.9\n",
+            "set_timing_derate -late -late 0.9\n",
+            "set_timing_derate -early -late\n",
+        ] {
+            assert!(parse_sdc(&format!("create_clock -name clk -period 2.0 [get_ports clk]\n{bad}")).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn parses_stock_write_sdc_unchanged() {
+        // The N2 criterion: a `write_sdc` file emitted by a stock LibreLane/OpenSTA run on a
+        // public design parses without error and without dropping any command.
+        let sdc = parse_sdc(GCD_WRITE_SDC).unwrap();
+        assert_eq!(sdc.period_ns, 5.0);
+        assert!(sdc.propagated_clock);
+        assert_eq!(sdc.clock_name.as_deref(), Some("core_clk"));
+        assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0));
+        assert_eq!(sdc.output_delay_ns("resp_val"), (1.0, 1.0));
+        assert_eq!(sdc.output_load_pf("resp_msg[0]"), 0.05);
+        assert!(sdc.ignored_commands.is_empty(), "{:?}", sdc.ignored_commands);
+    }
+
+    #[test]
+    fn set_units_declares_the_model_units() {
+        // ns and pF are what every parsed value already means, so they are a no-op; the
+        // unit keys the model never reads are accepted too.
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_units -time ns -capacitance pF -resistance kOhm -voltage V\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0));
+        for bad in [
+            "set_units -time ps\n",
+            "set_units -capacitance fF\n",
+            "set_units -time\n",
+            "set_units -bogus ns\n",
+            "set_units ns\n",
+        ] {
+            assert!(parse_sdc(&format!("{GCD}{bad}")).is_err(), "accepted: {bad}");
         }
     }
 
