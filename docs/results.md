@@ -1592,3 +1592,21 @@ combinational cycle and levelisation rejects it with an error — no
 phase-iterative fixed point is invented. OpenSTA resolves such loops with
 iterative relaxation; none of the public fixtures or sky130hd designs exercised
 one, so the restriction is a documented gap, not silently approximated.
+
+### 2026-11-18 — R10 — CI wiring for the sta_edge goldens
+
+- `.github/workflows/ci.yml` `generate` job gained a step that runs all eleven
+  `tests/designs/sta_edge/*/generate_ref.sh` scripts (each re-executes itself inside
+  `ghcr.io/librelane/librelane:3.0.16`) and then asserts `git diff --exit-code` and an
+  empty `git status --porcelain` on `tests/designs/sta_edge/`. This is the fixture
+  analogue of the "golden must come from the committed script, run as written" rule:
+  a hand-edited or drifted `*.reference.json` fails the generate job.
+- Decision recorded: no artifact upload for sta_edge — DEFs/SDCs are hand-written and
+  committed, goldens are committed (< 1 MB each), so only the large routed
+  picorv32/aes/jpeg/ibex inputs keep the `reference-inputs` artifact.
+- Local verification of the exact CI step (2026-11-17): all 11 scripts rerun, every
+  golden reproduced byte-identically, `git status` clean.
+- `#[ignore]` audit: the remaining ignored tests are the four placement-RC/SPEF
+  out-of-scope cases (`picorv32`/`aes`/`ibex`/`jpeg` placement RC, `jpeg` placed SPEF)
+  and `clock_gate` ideal (ideal clock does not track cell-driven clock-net inversion);
+  each carries its measured reason in the attribute and in this file.

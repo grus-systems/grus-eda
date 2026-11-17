@@ -59,6 +59,20 @@ jobs:
         if: ${{ hashFiles('tests/designs/ibex/ibex.util65.def') == '' }}
         run: tests/designs/ibex/generate_ref.sh
 
+      # The sta_edge goldens are committed, so there is nothing to upload: what CI
+      # must prove instead is that each committed *.reference.json reproduces
+      # byte-for-byte from its committed generate_ref.sh inside the pinned image.
+      # A drifted or hand-edited golden fails here before the test job runs.
+      - name: Regenerate sta_edge goldens and verify they reproduce
+        run: |
+          set -e
+          for script in tests/designs/sta_edge/*/generate_ref.sh; do
+            echo "=== $script"
+            bash "$script"
+          done
+          git diff --exit-code -- tests/designs/sta_edge/
+          test -z "$(git status --porcelain -- tests/designs/sta_edge/)"
+
       - name: Collect per-pin OpenSTA dumps
         run: |
           [ -f tests/designs/aes/pins_placed.txt ] || tests/designs/collect_pins.sh aes aes.placed.def aes.routed.spef pins_placed.txt
