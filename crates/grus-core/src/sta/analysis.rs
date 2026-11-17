@@ -1174,7 +1174,11 @@ impl LevelizedGraph {
 /// Kahn topological levels over net edges (driver -> sink) and combinational arcs,
 /// plus reverse indices so every level is data-parallel with zero write contention.
 /// Register `CLK -> Q` arcs are not edges: they start new paths.
-fn topological_levels(cx: &Context, graph: &TimingGraph) -> Result<LevelizedGraph> {
+fn topological_levels(
+    cx: &Context,
+    graph: &TimingGraph,
+    include_seq: bool,
+) -> Result<LevelizedGraph> {
     let design = cx.design;
     let n = design.num_pins();
     let mut indegree = vec![0u32; n];
@@ -1185,6 +1189,34 @@ fn topological_levels(cx: &Context, graph: &TimingGraph) -> Result<LevelizedGrap
             let edge = graph.edges[e as usize];
             indegree[edge.dst.0 as usize] += 1;
             edges_to_offsets[edge.dst.0 as usize + 1] += 1;
+        }
+    }
+    // `include_seq` adds register clock-to-Q and latch enable-to-Q arcs as ordering
+    // edges. Slew needs them: a clock gate's enable can sit on a clock net deeper
+    // than the register output it drives, so without the edge the output pin would
+    // be levelized before its own clock/enable source. The data pass keeps them out
+    // (`false`) because it evaluates those arcs as separate pre-passes instead.
+    let mut seq_adj: Vec<Vec<PinId>> = if include_seq {
+        vec![Vec::new(); n]
+    } else {
+        Vec::new()
+    };
+    if include_seq {
+        // Only arcs whose output pin actually drives a net become ordering edges:
+        // `propagate_slew` evaluates a sequential arc under the same `pin_nets`
+        // guard, so an unconnected Q gains no slew dependency and must not add a
+        // cycle constraint either.
+        for l in &graph.launches {
+            if design.pin_nets[l.q.0 as usize].is_some() {
+                indegree[l.q.0 as usize] += 1;
+                seq_adj[l.clk.0 as usize].push(l.q);
+            }
+        }
+        for o in &graph.latch_opens {
+            if design.pin_nets[o.q.0 as usize].is_some() {
+                indegree[o.q.0 as usize] += 1;
+                seq_adj[o.enable.0 as usize].push(o.q);
+            }
         }
     }
     for i in 1..=n {
@@ -1254,6 +1286,11 @@ fn topological_levels(cx: &Context, graph: &TimingGraph) -> Result<LevelizedGrap
         }
         for &e in graph.outgoing(PinId(p as u32)) {
             release(graph.edges[e as usize].dst, &mut order);
+        }
+        if include_seq {
+            for &dst in &seq_adj[p] {
+                release(dst, &mut order);
+            }
         }
     }
     if order.len() != n {
@@ -1367,14 +1404,17 @@ fn slew_reached(state: &PinTimingState, pol: usize) -> bool {
 /// Only the slew fields of the returned states are meaningful.
 fn propagate_slew(
     cx: &Context,
-    levelized: &LevelizedGraph,
     graph: &TimingGraph,
     wire_delays_per_net: &[Option<[Vec<f32>; 2]>],
     state: &[PinTimingState],
-) -> Vec<PinTimingState> {
+) -> Result<Vec<PinTimingState>> {
     let design = cx.design;
     let sdc = cx.sdc;
     let n = design.num_pins();
+    // Sequential arcs are ordering edges here (unlike the data pass, which handles
+    // them as pre-passes): a register output's slew depends on its clock pin's slew,
+    // which can sit deeper in the clock tree than the output's own level.
+    let levelized = topological_levels(cx, graph, true)?;
     let mut slew = vec![PinTimingState::UNREACHED; n];
 
     // Register clock-to-Q and latch enable-to-Q arcs are not in the combinational
@@ -1507,7 +1547,7 @@ fn propagate_slew(
             }
         }
     }
-    slew
+    Ok(slew)
 }
 
 /// Arrival of the propagated clock at every pin the clock source reaches through
@@ -1811,7 +1851,7 @@ fn run_sta_detail(
 
     let mut skipped = SkipReport::default();
     let graph = build_graph(&cx, &mut skipped);
-    let levelized = topological_levels(&cx, &graph)?;
+    let levelized = topological_levels(&cx, &graph, false)?;
     let mut state = vec![PinTimingState::UNREACHED; design.num_pins()];
 
     // Primary inputs: ideal drivers. The clock port is not a data startpoint.
@@ -1850,7 +1890,7 @@ fn run_sta_detail(
         // pin (and downstream clock pins) see. `propagate_clock` uses those slews for
         // delay lookups; the returned states carry arrival, and their slew fields are
         // overwritten with the unified values below.
-        let unified_slew = propagate_slew(&cx, &levelized, &graph, &wire_delays_per_net, &state);
+        let unified_slew = propagate_slew(&cx, &graph, &wire_delays_per_net, &state)?;
         let (mut clk_state, clk_parity) =
             propagate_clock(&cx, &levelized, &wire_delays_per_net, &unified_slew);
         for (c, u) in clk_state.iter_mut().zip(unified_slew.iter()) {
@@ -6336,9 +6376,9 @@ mod tests {
         };
         let mut skipped = SkipReport::default();
         let graph = build_graph(&cx, &mut skipped);
-        let levelized = topological_levels(&cx, &graph).expect("levelized");
+        let levelized = topological_levels(&cx, &graph, false).expect("levelized");
         let wire = vec![None; design.num_nets()];
-        let unified = propagate_slew(&cx, &levelized, &graph, &wire, &state);
+        let unified = propagate_slew(&cx, &graph, &wire, &state).expect("slew");
         let find_pin = |name: &str| {
             (0..design.num_pins())
                 .map(|i| PinId(i as u32))
@@ -6390,5 +6430,26 @@ mod tests {
             state[gate_n.0 as usize].slew_max[FALL],
             unified[x.0 as usize].slew_max[FALL]
         );
+
+        // Sequential arcs are ordering edges in the slew pass: a register output
+        // must levelize after the clock pin that launches it, or its slew would be
+        // read before the clock network produced it.
+        let seq_levelized = topological_levels(&cx, &graph, true).expect("seq levelized");
+        // u_ff6/Q drives the y output net, so its clk -> Q arc is a slew dependency.
+        let ff_clk = find_pin("u_ff6/CLK");
+        let ff_q = find_pin("u_ff6/Q");
+        assert!(
+            pin_level(&seq_levelized, ff_q) > pin_level(&seq_levelized, ff_clk),
+            "register Q must levelize after its clock pin"
+        );
+    }
+
+    fn pin_level(levelized: &LevelizedGraph, pin: PinId) -> usize {
+        for l in 0..levelized.level_offsets.len() - 1 {
+            if levelized.level(l).contains(&pin) {
+                return l;
+            }
+        }
+        panic!("pin {pin:?} not levelized")
     }
 }
