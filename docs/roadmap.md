@@ -162,9 +162,9 @@ The items below close these gaps, in the order proposed at the end.
   `picorv32` was un-ignored in `v0.1.69` after the tree builder became a port of
   OpenROAD's `pdr::primDijkstra` — edge-identical to its placement SPEF on all
   78,749 nets; `aes` and `ibex` followed once `test_pd_vs_spef_parasitics_agree`
-  proved the built parasitics agree with the SPEF readback within the strict
-  floor (<= 3e-6 ns bare wire, <= 3.8e-3 ns under uniform load; they now
-  share the SPEF tolerances). Only `jpeg` stays ignored: its residual is the
+  and `test_placement_vs_spef_sta_agree` proved the built parasitics produce
+  STA results matching the SPEF readback to <= 0.013 ps per endpoint field
+  (they now share the SPEF tolerances). Only `jpeg` stays ignored: its residual is the
   `OpenSTA #582` out-of-table case identical to `placed_spef`. Done when each
   test passes within a stated tolerance, or a decision recorded in `results.md`
   drops the test — `jpeg` is recorded out of scope below.

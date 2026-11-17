@@ -2562,9 +2562,10 @@ mod tests {
             ..Tol::STRICT
         };
         /// aes placement RC shares the SPEF tolerance: the PD trees are
-        /// edge-identical to OpenROAD's SPEF and the built parasitics agree with
-        /// the SPEF readback within the strict floor, so the residual vs
-        /// OpenSTA is the same cell-stage gap `AES_SPEF` covers.
+        /// edge-identical to OpenROAD's SPEF and our STA on them agrees with
+        /// the SPEF readback to <= 0.003 ps per endpoint field
+        /// (`test_placement_vs_spef_sta_agree`), so the residual vs OpenSTA is
+        /// the same cell-stage gap `AES_SPEF` covers.
         const AES_PLACEMENT: Tol = Tol::AES_SPEF;
         const AES_SPEF: Tol = Tol {
             slack_abs_ns: 0.025,
@@ -2578,8 +2579,8 @@ mod tests {
         /// within strict max(5 ps, 1%); setup/hold slacks agree within 36.6 ps (_21466_/D behind
         /// _10092_/Y fall at 4.3-5.2 ns input slew) and slews within 5.09%.
         /// ibex placement RC shares the SPEF tolerance for the same reason as
-        /// `AES_PLACEMENT`: parasitics equivalent to the SPEF readback, shared
-        /// engine residual.
+        /// `AES_PLACEMENT`: STA on the PD parasitics agrees with the SPEF
+        /// readback to <= 0.013 ps per endpoint field, shared engine residual.
         const IBEX_PLACEMENT: Tol = Tol::IBEX_SPEF;
         const IBEX_SPEF: Tol = Tol {
             slack_abs_ns: 0.04,
@@ -2655,9 +2656,9 @@ mod tests {
     }
 
     /// 17 endpoint fields sit within the SPEF-mode residual band (slack <= 16 ps,
-    /// slew <= 5.24%) because the PD parasitics are equivalent to the SPEF
-    /// readback; `AES_PLACEMENT` therefore uses `AES_SPEF`'s tolerance. See
-    /// docs/results.md.
+    /// slew <= 5.24%) and our STA on the PD parasitics matches the SPEF
+    /// readback to <= 0.003 ps per endpoint field; `AES_PLACEMENT` therefore
+    /// uses `AES_SPEF`'s tolerance. See docs/results.md.
     #[test]
     fn test_aes_placement_rc_matches_opensta() {
         compare_design_with_opensta("aes", "placement_rc", Rc::Placement, Tol::AES_PLACEMENT);
@@ -2705,8 +2706,9 @@ mod tests {
     }
 
     /// 3 `max_slack_ns` fields (<= 36 ps) sit within the SPEF-mode residual band
-    /// because the PD parasitics are equivalent to the SPEF readback;
-    /// `IBEX_PLACEMENT` therefore uses `IBEX_SPEF`'s tolerance. See docs/results.md.
+    /// and our STA on the PD parasitics matches the SPEF readback to
+    /// <= 0.013 ps per endpoint field; `IBEX_PLACEMENT` therefore uses
+    /// `IBEX_SPEF`'s tolerance. See docs/results.md.
     #[test]
     fn test_ibex_placement_rc_matches_opensta() {
         compare_design_with_opensta("ibex", "placement_rc", Rc::Placement, Tol::IBEX_PLACEMENT);
@@ -2715,6 +2717,91 @@ mod tests {
     #[test]
     fn test_ibex_placed_spef_matches_opensta() {
         compare_design_with_opensta("ibex", "placed_spef", Rc::Spef, Tol::IBEX_SPEF);
+    }
+
+    /// Placement RC vs the placement-estimate SPEF read back through our own
+    /// STA engine on the same DEF/SDC: every endpoint field, WNS/TNS and the
+    /// violation counts must agree. This is the direct evidence that
+    /// `placement_rc` and `placed_spef` measure the same residual against
+    /// OpenSTA, which licenses `AES_PLACEMENT`/`IBEX_PLACEMENT` sharing the
+    /// SPEF tolerances (per-net Elmore alone cannot show path accumulation).
+    #[test]
+    fn test_placement_vs_spef_sta_agree() {
+        for design_name in ["aes", "ibex", "jpeg"] {
+            let lib_dir = sky130_hd();
+            let dir = design_dir(design_name);
+            let lib =
+                load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF");
+            let design = parse_def(
+                &dir.join(format!("{design_name}.placed.def")),
+                &tech,
+                Some(&lib),
+            )
+            .expect("DEF");
+            let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
+            let rc = crate::sta::WireRc::from_layer(&tech, "met2").expect("met2 RC");
+            let parasitics_p = crate::sta::estimate_placement_parasitics(&design, &tech, rc);
+            let spef = crate::readers::load_spef(&dir.join(format!("{design_name}.routed.spef")))
+                .expect("SPEF");
+            let parasitics_s = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
+            let (rp, _, _) =
+                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_p)).expect("placement STA");
+            let (rs, _, _) =
+                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_s)).expect("SPEF STA");
+            assert_eq!(
+                rp.endpoints.len(),
+                rs.endpoints.len(),
+                "{design_name}: endpoint count"
+            );
+            let fields = |e: &EndpointReport| {
+                [
+                    e.max_arr_ns,
+                    e.max_req_ns,
+                    e.max_slack_ns,
+                    e.max_slew_ns,
+                    e.min_arr_ns,
+                    e.min_req_ns,
+                    e.min_slack_ns,
+                    e.min_slew_ns,
+                ]
+            };
+            let mut worst = [0.0f64; 8];
+            for (ep, es) in rp.endpoints.iter().zip(rs.endpoints.iter()) {
+                assert_eq!(ep.pin, es.pin, "{design_name}: endpoint order");
+                for (w, (a, b)) in worst.iter_mut().zip(fields(ep).into_iter().zip(fields(es))) {
+                    *w = (*w).max((a as f64 - b as f64).abs());
+                }
+            }
+            let wns_d = (rp.wns_max_ns as f64 - rs.wns_max_ns as f64).abs();
+            let tns_d = (rp.tns_max_ns as f64 - rs.tns_max_ns as f64).abs();
+            println!(
+                "{design_name}: placement-vs-SPEF worst endpoint |diff| {:?} ps, \
+                 wns {wns_d} ns, tns {tns_d} ns",
+                worst.map(|w| (w * 1e6).round() / 1e3)
+            );
+            assert_eq!(rp.setup_violations, rs.setup_violations, "{design_name}: setup violations");
+            assert_eq!(rp.hold_violations, rs.hold_violations, "{design_name}: hold violations");
+            // Measured 2026-11-18; see docs/results.md. Endpoint fields stay
+            // under 10 ps (the SPEF slack floors are 25/40 ps); TNS is a sum
+            // over violating endpoints so per-pin diffs accumulate — bound it
+            // relatively at the same 1% the golden comparisons use.
+            assert!(
+                worst.iter().all(|&w| w <= 0.010),
+                "{design_name}: placement vs SPEF endpoint fields diverge: {worst:?} ns"
+            );
+            assert!(wns_d <= 0.010, "{design_name}: WNS diverges by {wns_d} ns");
+            assert!(
+                tns_d <= 0.01 * (rs.tns_max_ns as f64).abs().max(1.0),
+                "{design_name}: TNS diverges by {tns_d} ns"
+            );
+        }
     }
 
     #[test]

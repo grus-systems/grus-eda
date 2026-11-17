@@ -1677,5 +1677,14 @@ wire (worst 3e-6 ns) and with a uniform 1 fF load at every pin (worst 3.8e-3 ns
 on jpeg `ena`; SPEF pin nodes hang off 1e-6 kohm links and coincident merges
 shift where the load lands). The loaded bound is the 5 ps strict floor, so the
 claim is: PD and SPEF parasitics agree within the strict timing tolerance even
-under uniform load — enough to share the SPEF-mode tolerances, not a proof of
-bit-identical networks.
+under uniform load — not a proof of bit-identical networks.
+
+Third review round (luna6) added the decisive check, `test_placement_vs_spef_sta_agree`:
+our own STA engine run on `estimate_placement_parasitics` vs the SPEF readback
+of the same nets, same DEF/SDC. Worst per-endpoint field difference — aes
+0.003 ps, ibex 0.013 ps, jpeg 0.633 ps; WNS within 0.61 ps; TNS within 1%
+relative (ibex 17.6 ps summed over violating endpoints, jpeg 0.25 ns). With
+placement and SPEF parasitics producing effectively identical STA results, the
+placement-vs-OpenSTA residual is the same engine gap `placed_spef` already
+tolerates, so `AES_PLACEMENT`/`IBEX_PLACEMENT` sharing the SPEF tolerances is
+justified rather than goalpost-moving.

@@ -294,6 +294,9 @@ fn spef_net_tree(design: &DesignDb, net: NetId, net_name: &str, spef_net: &SpefN
         pin_point.push(i);
     }
 
+    // `net_pins` stores the driver pin first (the DEF parser enforces it and
+    // `net_driver` returns `pins[0]`), so `pin_point[0]` is the driver node —
+    // the same root `build_net_tree` uses.
     let root = pin_point[0];
     let mut node_of = vec![u32::MAX; adjacency.len()];
     let mut order = vec![root];
@@ -589,7 +592,10 @@ mod tests {
                     .expect("PD tree");
                 let sf = spef_net_tree(&design, net, &name, spef_net).expect("SPEF tree");
                 for caps in [vec![0.0f32; pins.len()], vec![1.0f32; pins.len()]] {
-                    for (&a, &b) in pd.elmore_ns(&caps).iter().zip(sf.elmore_ns(&caps).iter()) {
+                    let (pd_d, sf_d) = (pd.elmore_ns(&caps), sf.elmore_ns(&caps));
+                    assert_eq!(pd_d.len(), pins.len(), "{design_name}/{name}: PD Elmore pin count");
+                    assert_eq!(sf_d.len(), pins.len(), "{design_name}/{name}: SPEF Elmore pin count");
+                    for (&a, &b) in pd_d.iter().zip(sf_d.iter()) {
                         let d = (a as f64 - b as f64).abs();
                         if caps[0] == 0.0 && d > worst_wire {
                             worst_wire = d;
@@ -605,11 +611,12 @@ mod tests {
             println!(
                 "{design_name}: {nets} nets, worst Elmore |diff| wire {worst_wire:.6} ns ({worst_wire_net}), loaded {worst_loaded:.6} ns ({worst_loaded_net})"
             );
-            // Measured 2026-11-18: wire <= 1e-6 ns everywhere; loaded worst is
-            // ~1.5e-3 ns on ibex `rst_ni` (SPEF pin nodes hang off 1e-6 kohm
-            // links and coincident-point merges shift where the uniform load
-            // lands). The loaded bound is the 5 ps strict timing floor: per-pin
-            // Elmore agrees within it even under a uniform load.
+            // Measured 2026-11-18 (printed per design above): bare-wire worst
+            // 3e-6 ns (jpeg `ena`), loaded worst 3.8e-3 ns (jpeg `ena`; SPEF pin
+            // nodes hang off 1e-6 kohm links and coincident-point merges shift
+            // where the uniform load lands). Bounds: wire 1e-5 (~3x headroom),
+            // loaded 5e-3 = the strict timing floor — per-pin Elmore agrees
+            // within it even under a uniform load.
             assert!(worst_wire <= 1e-5, "{design_name}: PD and SPEF wire parasitics diverge by {worst_wire} ns");
             assert!(worst_loaded <= 5e-3, "{design_name}: PD and SPEF loaded parasitics diverge by {worst_loaded} ns");
         }
