@@ -358,7 +358,7 @@ Done criterion for every E3 step: worst slack, and arrival and required time of 
 | jpeg placement RC | `#[ignore]`, fails | residual identical to `placed_spef` (WNS -78.084 vs -61.199 ns): OpenSTA #582 out-of-table NLDM extrapolation, not the tree |
 | PD tree vs OpenROAD SPEF (all 5 designs) | pass (`v0.1.69`) | edge-length multiset identical on all 78,749 nets; total length identical; `checkTree` 0 failures (FLUTE fallback unused); asserted in `test_pd_edge_multiset_vs_placement_spef` |
 | PD vs SPEF parasitics (all 5 designs) | pass (`v0.1.69`) | per-pin Elmore: bare wire <= 3e-6 ns, uniform 1 fF load <= 3.8e-3 ns — within the strict floor; asserted in `test_pd_vs_spef_parasitics_agree` |
-| placement RC vs SPEF RC through our STA (aes/ibex/jpeg) | pass (`v0.1.70`) | worst endpoint field diff 0.003/0.013/0.633 ps (aes/ibex/jpeg); max/min WNS <= 0.61 ps, TNS <= 1% relative — licenses the shared SPEF tolerances; asserted in `test_placement_vs_spef_sta_agree` |
+| placement RC vs SPEF RC through our STA (aes/ibex/jpeg) | pass (`v0.1.70`) | worst endpoint field diff 0.003/0.013/0.633 ps (aes/ibex/jpeg); max/min WNS <= 0.61 ps, TNS <= max(10 ps, 1% of reference) — licenses the shared SPEF tolerances; asserted in `test_placement_vs_spef_sta_agree` |
 | DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` within 6% |
 | DMP vs `report_dcalc` (76 rows, routed SPEF) | pass (`v0.1.45`) | pi exact (max 0.43%); `Ceff` median 0.69% / max 6.79%, delay 0.12% / 6.03%, `driver_waveform_slew` 2.55% / 8.56% |
 | Pi waveform slew across 5 designs (`31,966` rows) | pass (`v0.1.45`) | shielded `<0.97` median `0.50..0.74%`; all rows median `1.70..2.49%` (`ourCe + bailout`) |

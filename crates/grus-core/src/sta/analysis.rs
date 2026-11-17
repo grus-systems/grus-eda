@@ -2803,7 +2803,8 @@ mod tests {
             // Measured 2026-11-18; see docs/results.md. Endpoint fields stay
             // under 10 ps (the SPEF slack floors are 25/40 ps); TNS is a sum
             // over violating endpoints so per-pin diffs accumulate — bound it
-            // relatively at the same 1% the golden comparisons use.
+            // at max(10 ps, 1% of |reference TNS|), the golden tns_rel
+            // convention with a floor for near-zero TNS.
             assert!(
                 worst.iter().all(|&w| w <= 0.010),
                 "{design_name}: placement vs SPEF endpoint fields diverge: {worst:?} ns"

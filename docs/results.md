@@ -1684,8 +1684,9 @@ our own STA engine run on `estimate_placement_parasitics` vs the SPEF readback
 of the same nets (`*.routed.spef` is OpenROAD's `estimate_parasitics
 -placement` output for these designs), same DEF/SDC. Worst per-endpoint field
 difference — aes 0.003 ps, ibex 0.013 ps, jpeg 0.633 ps; max/min WNS within
-0.61 ps (min side ~0 everywhere); max TNS within 1% relative (ibex 17.6 ps
-summed over violating endpoints, jpeg 0.25 ns; min TNS identical). With
+0.61 ps (min side ~0 everywhere); max TNS within max(10 ps, 1% of reference)
+(ibex 17.6 ps summed over violating endpoints, jpeg 0.25 ns; min TNS
+identical). With
 placement and SPEF parasitics producing effectively identical STA results, the
 placement-vs-OpenSTA residual is the same engine gap `placed_spef` already
 tolerates, so `AES_PLACEMENT`/`IBEX_PLACEMENT` sharing the SPEF tolerances is
