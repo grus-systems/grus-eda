@@ -1,8 +1,9 @@
 use crate::congestion::rsmt::Pt;
 use super::dmp::PiModel;
 use crate::design_db::DesignDb;
+use crate::lib_db::LibDb;
 use crate::readers::spef::{Spef, SpefNet, unescape_spef_name};
-use crate::interner::{NetId, PinId};
+use crate::interner::{NetId, PinDir, PinId};
 use crate::tech_db::TechDb;
 use anyhow::{Result, bail};
 use rayon::prelude::*;
@@ -331,13 +332,141 @@ fn spef_net_tree(design: &DesignDb, net: NetId, net_name: &str, spef_net: &SpefN
     Ok(NetRcTree { parent, edge_r_kohm: edge_r, wire_cap_pf: wire_cap, pin_node, total_wire_cap_pf: total })
 }
 
+/// Escapes the characters OpenSTA's SPEF parser treats specially: `$` (an
+/// unescaped `$` truncates the net name) and `/` (the `*DIVIDER`). Bus brackets
+/// stay raw — `name[N]` is valid SPEF bus-bit syntax that resolves to the
+/// literal DEF net name, matching what OpenROAD's `write_spef` emits for plain
+/// `identifier[N]` nets. `parse_spef`'s `unescape_spef_name` strips every
+/// backslash, so `\$`/`\/` round-trip through our own reader as well.
+fn escape_spef_name(name: &str) -> String {
+    name.replace('$', "\\$").replace('/', "\\/")
+}
+
+/// OpenROAD writes pin/via and zero-length links as 1e-6 kohm stubs; pins that
+/// share one RC-tree node are split onto such a stub so every pin keeps its own
+/// SPEF node name. The stub is electrically transparent at STA precision.
+const SPEF_STUB_RES_KOHM: f32 = 1e-6;
+
+fn spef_pin_dir(dir: PinDir) -> &'static str {
+    match dir {
+        PinDir::Input => "I",
+        PinDir::Output => "O",
+        PinDir::Inout | PinDir::Internal => "IO",
+    }
+}
+
+/// Serializes the placement RC trees to IEEE 1481 SPEF — literal names (no
+/// NAME_MAP), `*CAP` per tree node, `*RES` per tree edge, `*CONN` listing every
+/// pin, `*R_UNIT 1 KOHM` so resistances round-trip bit-exact through
+/// `parse_spef` (an OHM unit would cost ~1e-7 ns of Elmore per edge through the
+/// f32 rescale). Capacitance stays wire-only (`PIN_CAP NONE`): `NetRcTree` keeps
+/// sink pin caps out of `wire_cap_pf`, so re-reading through `spef_parasitics`
+/// reproduces the same trees.
+pub fn write_spef(design: &DesignDb, lib: &LibDb, parasitics: &NetParasitics) -> Result<String> {
+    let mut out = String::new();
+    // Header mirrors what OpenROAD's `write_spef` emits: OpenSTA's SPEF parser
+    // requires the full keyword block (`*DIVIDER`, `*BUS_DELIMITER`, `*L_UNIT`,
+    // ...) and rejects a bare `*DELIMITER` header.
+    out.push_str("*SPEF \"ieee 1481-1999\"\n");
+    out.push_str(&format!("*DESIGN \"{}\"\n", design.design_name));
+    out.push_str("*DATE \"00:00:00 Thu 01 01, 1970\"\n");
+    out.push_str(concat!("*VENDOR \"grus-eda\"\n*PROGRAM \"grus-eda\"\n*VERSION \"", env!("CARGO_PKG_VERSION"), "\"\n"));
+    out.push_str("*DESIGN_FLOW \"NAME_SCOPE LOCAL\" \"PIN_CAP NONE\"\n");
+    out.push_str("*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER []\n");
+    out.push_str("*T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 KOHM\n*L_UNIT 1 HENRY\n\n");
+    out.push_str("*PORTS\n");
+    for &pin in &design.io_pins {
+        let p = pin.0 as usize;
+        let name = escape_spef_name(&unescape_spef_name(design.strings.resolve(design.pin_names[p])));
+        out.push_str(&format!("{name} {}\n", spef_pin_dir(design.pin_dirs[p])));
+    }
+    out.push('\n');
+    for n in 0..design.num_nets() {
+        let net = NetId(n as u32);
+        let Some(tree) = parasitics.net(net) else { continue };
+        let net_name = escape_spef_name(&unescape_spef_name(design.strings.resolve(design.net_names[n])));
+        let pins = design.net_pins(net);
+
+        // Tree node -> SPEF node name. A node carrying several pins keeps the
+        // first pin's name; the rest become stub nodes below.
+        let nnodes = tree.parent.len();
+        let mut node_pins: Vec<Vec<usize>> = vec![Vec::new(); nnodes];
+        for (i, &node) in tree.pin_node.iter().enumerate() {
+            node_pins[node as usize].push(i);
+        }
+        let mut node_names: Vec<String> = Vec::with_capacity(nnodes);
+        // (stub name, primary node index) pairs for pins sharing a tree node.
+        let mut stubs: Vec<(String, usize)> = Vec::new();
+        for (v, pins_at_node) in node_pins.iter().enumerate() {
+            if let Some(&primary) = pins_at_node.first() {
+                node_names.push(escape_spef_name(&spef_pin_node_name(design, pins[primary])));
+                for &extra in &pins_at_node[1..] {
+                    stubs.push((escape_spef_name(&spef_pin_node_name(design, pins[extra])), v));
+                }
+            } else {
+                node_names.push(format!("{net_name}:{v}"));
+            }
+        }
+
+        out.push_str(&format!("*D_NET {net_name} {}\n", tree.total_wire_cap_pf));
+        out.push_str("*CONN\n");
+        for &pin in pins {
+            let p = pin.0 as usize;
+            let pin_name = escape_spef_name(&unescape_spef_name(design.strings.resolve(design.pin_names[p])));
+            let dir = spef_pin_dir(design.pin_dirs[p]);
+            match design.pin_cells[p] {
+                Some(cell) => {
+                    let cell_name = escape_spef_name(&unescape_spef_name(design.strings.resolve(design.cell_names[cell.0 as usize])));
+                    let cell_type = design
+                        .cell_lib_ids[cell.0 as usize]
+                        .map(|lcid| escape_spef_name(&unescape_spef_name(lib.strings.resolve(lib.cells[lcid.0 as usize].name))))
+                        .unwrap_or_else(|| cell_name.clone());
+                    out.push_str(&format!("*I {cell_name}:{pin_name} {dir} *D {cell_type}\n"));
+                }
+                None => out.push_str(&format!("*P {pin_name} {dir}\n")),
+            }
+        }
+        out.push_str("*CAP\n");
+        let mut serial = 0u32;
+        for (v, name) in node_names.iter().enumerate() {
+            serial += 1;
+            out.push_str(&format!("{serial} {name} {}\n", tree.wire_cap_pf[v]));
+        }
+        for (name, _) in &stubs {
+            serial += 1;
+            out.push_str(&format!("{serial} {name} 0\n"));
+        }
+        out.push_str("*RES\n");
+        serial = 0;
+        for v in 1..nnodes {
+            serial += 1;
+            out.push_str(&format!(
+                "{serial} {} {} {}\n",
+                node_names[tree.parent[v] as usize],
+                node_names[v],
+                tree.edge_r_kohm[v]
+            ));
+        }
+        for (name, primary) in &stubs {
+            serial += 1;
+            out.push_str(&format!(
+                "{serial} {name} {} {}\n",
+                node_names[*primary],
+                SPEF_STUB_RES_KOHM
+            ));
+        }
+        out.push_str("*END\n\n");
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{design_dir, sky130_hd};
     use crate::congestion::rsmt::{EXACT_MAX_DEGREE, build_precise_rsmt_points};
     use crate::interner::StringInterner;
-    use crate::readers::{load_liberty, load_spef, load_tech_db, parse_def};
+    use crate::readers::{load_liberty, load_spef, load_tech_db, parse_def, parse_spef};
     use std::collections::BTreeMap;
 
     struct Lengths {
@@ -719,5 +848,106 @@ mod tests {
     #[test]
     fn test_steiner_length_vs_openroad_spef_picorv32() {
         check_known_properties("picorv32");
+    }
+
+    /// N4: `write_spef` output must re-read through `parse_spef`/`spef_parasitics`
+    /// into electrically identical trees — per-pin Elmore delays agree for the bare
+    /// wire and under a uniform 1 fF load (which exercises the pin->node mapping).
+    #[test]
+    fn test_write_spef_round_trip_parasitics() {
+        for design_name in ["gcd", "aes"] {
+            let lib_dir = sky130_hd();
+            let dir = design_dir(design_name);
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF");
+            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
+            let parasitics = estimate_placement_parasitics(&design, &tech, rc);
+            let text = write_spef(&design, &lib, &parasitics).expect("write_spef");
+            let spef = parse_spef(&text).expect("parse_spef");
+            let reparsed = spef_parasitics(&design, &spef).expect("spef_parasitics");
+
+            let (mut nets, mut worst) = (0usize, 0.0f64);
+            for n in 0..design.num_nets() {
+                let net = NetId(n as u32);
+                let (a, b) = (parasitics.net(net), reparsed.net(net));
+                assert_eq!(
+                    a.is_some(),
+                    b.is_some(),
+                    "{design_name} net {}: tree presence differs after SPEF round-trip",
+                    design.strings.resolve(design.net_names[n])
+                );
+                let (Some(a), Some(b)) = (a, b) else { continue };
+                nets += 1;
+                let pins = design.net_pins(net);
+                for caps in [vec![0.0f32; pins.len()], vec![1.0f32; pins.len()]] {
+                    let (da, db) = (a.elmore_ns(&caps), b.elmore_ns(&caps));
+                    assert_eq!(da.len(), db.len(), "{design_name} net {n}: pin count");
+                    for (&x, &y) in da.iter().zip(&db) {
+                        worst = worst.max((x as f64 - y as f64).abs());
+                    }
+                }
+            }
+            println!("{design_name}: {nets} nets round-tripped, worst Elmore diff {worst:.3e} ns");
+            assert!(worst < 1e-9, "{design_name}: SPEF round-trip changed Elmore delays by {worst} ns");
+        }
+    }
+
+    /// N4 end to end: an emitted SPEF re-read through `--spef` must reproduce the
+    /// placement-RC STA report — same endpoints, same per-endpoint numbers.
+    #[test]
+    fn test_write_spef_round_trip_sta() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("gcd");
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(&dir.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = crate::sta::load_sdc(&dir.join("gcd.sdc")).expect("SDC");
+        let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
+        let placement = estimate_placement_parasitics(&design, &tech, rc);
+        let text = write_spef(&design, &lib, &placement).expect("write_spef");
+        let spef = parse_spef(&text).expect("parse_spef");
+        let reparsed = spef_parasitics(&design, &spef).expect("spef_parasitics");
+
+        let a = crate::sta::run_sta(&design, &lib, &sdc, Some(&placement)).expect("placement STA");
+        let b = crate::sta::run_sta(&design, &lib, &sdc, Some(&reparsed)).expect("SPEF STA");
+        assert_eq!(a.endpoints.len(), b.endpoints.len());
+        assert_eq!(a.wns_max_ns, b.wns_max_ns);
+        assert_eq!(a.tns_max_ns, b.tns_max_ns);
+        assert_eq!(a.wns_min_ns, b.wns_min_ns);
+        assert_eq!(a.tns_min_ns, b.tns_min_ns);
+        assert_eq!(a.setup_violations, b.setup_violations);
+        assert_eq!(a.hold_violations, b.hold_violations);
+        for (ea, eb) in a.endpoints.iter().zip(&b.endpoints) {
+            assert_eq!(ea.pin, eb.pin);
+            for (x, y) in [
+                (ea.max_arr_ns, eb.max_arr_ns),
+                (ea.max_req_ns, eb.max_req_ns),
+                (ea.max_slack_ns, eb.max_slack_ns),
+                (ea.max_slew_ns, eb.max_slew_ns),
+                (ea.min_arr_ns, eb.min_arr_ns),
+                (ea.min_req_ns, eb.min_req_ns),
+                (ea.min_slack_ns, eb.min_slack_ns),
+                (ea.min_slew_ns, eb.min_slew_ns),
+            ] {
+                assert!(
+                    (x - y).abs() < 1e-6,
+                    "{}: {x} vs {y} after SPEF round-trip",
+                    ea.pin
+                );
+            }
+        }
     }
 }

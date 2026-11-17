@@ -153,6 +153,9 @@ struct StaArgs {
     #[arg(long, help = "Path to extracted SPEF (.spef) file")]
     spef: Option<PathBuf>,
 
+    #[arg(long, help = "Write the parasitics used by this run (placement RC or the loaded SPEF) as SPEF to this path")]
+    spef_out: Option<PathBuf>,
+
     #[arg(long, help = "Write the full STA report (endpoints and skip summary) as JSON to this path")]
     json: Option<PathBuf>,
 
@@ -453,6 +456,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     "warning: {} nets failed the placement tree check; OpenROAD would use FLUTE there, we keep the PD tree",
                     p.pd_check_failed_nets
                 );
+            }
+            if let Some(path) = &args.spef_out {
+                let Some(p) = &parasitics else {
+                    anyhow::bail!("--spef-out needs parasitics: pass --parasitics placement or --spef");
+                };
+                let spef_text = grus_core::sta::write_spef(&design, &lib_db, p)?;
+                std::fs::write(path, spef_text)?;
+                println!("Wrote SPEF to {:?}", path);
             }
             let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
             println!(

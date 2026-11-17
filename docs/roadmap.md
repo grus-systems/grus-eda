@@ -277,13 +277,25 @@ Remaining:
   edges, `non_seq_*` vs the clock) is future work — until then the counts
   stay visible in every summary and the JSON report.
 
-### N4. SPEF write-out
+### N4. SPEF write-out — DONE (v0.1.75)
 
-- The placement-RC tree (`pdr::primDijkstra` port) already builds the
-  same parasitics OpenROAD estimates; serializing it to SPEF lets
-  downstream tools and cross-checks run on identical parasitics.
-- Done when: an emitted SPEF re-reads through `readers/spef.rs` and
-  reproduces the placement-RC STA result within tolerance.
+- `sta --spef-out <path>` serializes the parasitics used by the run
+  (placement RC, or the loaded `--spef` for SPEF-to-SPEF transcoding)
+  as IEEE 1481 SPEF: literal names, `*PORTS`, `*D_NET`/`*CONN`/`*CAP`/
+  `*RES`, `*R_UNIT 1 KOHM` for bit-exact resistance round-trip,
+  wire-only caps (`PIN_CAP NONE`).
+- Compatibility details measured against OpenSTA 3.0.16 / OpenROAD
+  3.0.16 `write_spef` output: the header must carry the full keyword
+  block (`*DIVIDER`, `*BUS_DELIMITER`, `*L_UNIT`, ...); `$` and `/` in
+  names need backslash escapes while `[`/`]` stay raw (bus-bit syntax
+  resolves to the literal DEF net name — escaping them makes OpenSTA
+  report "net not found" for every `name[N]` net).
+- Verified: emitted gcd/ibex SPEFs parse in OpenROAD with zero
+  warnings; OpenSTA slack on our SPEF agrees with our placement-RC STA
+  within ~0.1% (gcd WNS 1.664237 vs 1.665178 ns; ibex WNS -14.417081 vs
+  -14.411448 ns — OpenSTA's own delay engine on identical parasitics).
+  `test_write_spef_round_trip_{parasitics,sta}` lock the internal
+  round-trip (per-pin Elmore < 1e-9 ns; endpoint report identical).
 
 ### N5. Netlist ingest + floorplan generation
 
