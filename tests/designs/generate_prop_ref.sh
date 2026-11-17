@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Reference generation for propagated-clock STA checks on the real designs: OpenSTA endpoint
 # values on <design>.placed.def + <design>.propagated.sdc (set_propagated_clock) +
-# <design>.rcx.spef (routed extraction). Only committed inputs are read; no LibreLane flow
-# is re-run. Usage: generate_prop_ref.sh <design>   (designs with a routed-extraction SPEF:
-# gcd, picorv32).
+# <design>.rcx.spef (routed extraction). No LibreLane flow is re-run; only the design's own
+# DEF/SPEF/SDC and the public Sky130 PDK are read. For picorv32 the placed DEF and rcx SPEF
+# are git-ignored — run tests/designs/picorv32/generate_ref.sh first to produce them (gcd's
+# are committed). Usage: generate_prop_ref.sh <design>   (designs with a routed-extraction
+# SPEF: gcd, picorv32).
 # Runs inside ghcr.io/librelane/librelane:3.0.16.
 set -euo pipefail
 

@@ -1833,8 +1833,9 @@ the `sta_edge` fixtures. `tests/designs/<design>/<design>.propagated.sdc` adds
 `set_clock_latency 1.0` + `-source 0.2`, `set_clock_transition 0.1`,
 `set_clock_uncertainty 0.1`, `set_propagated_clock`, and the I/O delay/transition/
 load constraints to each design's committed `.sdc`; `generate_prop_ref.sh` emits
-`<design>.propagated.reference.json` from OpenSTA 3.0.16 on the committed
-`.placed.def` + `.rcx.spef` (no flow re-run). `compare_design_with_opensta` was
+`<design>.propagated.reference.json` from OpenSTA 3.0.16 on `.placed.def` +
+`.rcx.spef` (no flow re-run; gcd's DEF/SPEF are committed, picorv32's are
+git-ignored and come from `picorv32/generate_ref.sh`). `compare_design_with_opensta` was
 generalised to `compare_design_files` so a test can name its own SDC and golden.
 
 - **gcd** (`test_gcd_propagated_clock_matches_opensta`, `GCD_SPEF`): clean pass.
