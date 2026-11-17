@@ -1768,3 +1768,30 @@ extrapolation case, unrelated to parasitics.
   extrapolation divergence, already covered by `AES_SPEF`/`IBEX_SPEF`
   tolerances. No parameter change is justified; matching would require
   curve-fitting OpenSTA's acknowledged-unsupported behaviour.
+
+### 2026-11-17 — `driver_waveform_slew` residual: unshielded rows carry a ~1.2 ps offset, extremes share the Ceff wall
+
+- **Question**: can the remaining endpoint slew error (~5%, `slew_rel` 5.5%
+  nearly maxed on aes) be reduced via `driver_waveform_slew` independently of
+  the Ceff gap?
+- **Method**: dumped `driver_waveform_slew` vs OpenSTA's `Driver waveform
+  slew` on all unshielded `report_dcalc` rows (`Ceff/total >= 0.97`, 30,340
+  rows across five designs) and tested alternative waveform evaluations
+  (rd_w variants, ramp-duration sources, forced pi-vs-lumped).
+- **Findings**:
+  - 98.7% of unshielded rows take our lumped bailout and return the table
+    slew; OpenSTA's value is ~`table - 1.2 ps` (median; ~2% on fast slews,
+    negligible on slow). The offset is ~constant in ps — not slew-, tin-, or
+    shielding-dependent — with a ±3 ps spread.
+  - No tested variant reproduces it: reusing the Ceff-solve ramp duration,
+    fitting dt to delay instead of slew, forcing the two-pole pi waveform on
+    bailout rows, and rd_w scaling all leave the ~2% median error unchanged.
+    It is consistent with an OpenSTA-internal waveform-shape / slew-definition
+    detail (GPL), not a tunable parameter.
+  - Shielded rows are already good (`driver_waveform_slew` median 0.5-0.7%);
+    the endpoint slew failures sit on the same extreme-input-slew stages as
+    the Ceff residual — the out-of-table regime of OpenSTA #582.
+- **Conclusion**: like Ceff, the waveform-slew residual is honest
+  extrapolation divergence plus an unmodelled ~ps-level OpenSTA waveform
+  detail. No parameter change is justified; `slew_rel` 5.5% continues to
+  cover it. Diagnostic-only; no production change.
