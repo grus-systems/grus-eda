@@ -1,0 +1,50 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN clock_gate ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 64000 20000 ) ;
+ROW ROW_0 unithd 0 0 N DO 139 BY 1 STEP 460 2720 ;
+ROW ROW_1 unithd 0 2720 N DO 139 BY 1 STEP 460 2720 ;
+ROW ROW_2 unithd 0 5440 N DO 139 BY 1 STEP 460 2720 ;
+ROW ROW_3 unithd 0 8160 N DO 139 BY 1 STEP 460 2720 ;
+TRACKS X 170 DO 100 STEP 340 LAYER met1 ;
+TRACKS Y 140 DO 100 STEP 340 LAYER met2 ;
+COMPONENTS 13 ;
+- u_clkbuf sky130_fd_sc_hd__clkbuf_2 + PLACED ( 9200 0 ) N ;
+- u_nand sky130_fd_sc_hd__nand2_1 + PLACED ( 18400 0 ) N ;
+- u_or sky130_fd_sc_hd__or2_1 + PLACED ( 23000 0 ) N ;
+- u_nor sky130_fd_sc_hd__nor2_1 + PLACED ( 27600 0 ) N ;
+- u_and sky130_fd_sc_hd__and2_1 + PLACED ( 32200 0 ) N ;
+- u_icg sky130_fd_sc_hd__dlclkp_1 + PLACED ( 36800 0 ) N ;
+- u_ff0 sky130_fd_sc_hd__dfrtn_1 + PLACED ( 41400 0 ) N ;
+- u_ff1 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 46000 0 ) N ;
+- u_ff2 sky130_fd_sc_hd__dfrtn_1 + PLACED ( 50600 0 ) N ;
+- u_rst sky130_fd_sc_hd__clkbuf_2 + PLACED ( 4600 2720 ) N ;
+- u_ff3 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 55200 0 ) N ;
+- u_ff4 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 59800 0 ) N ;
+- u_databuf sky130_fd_sc_hd__buf_2 + PLACED ( 4600 0 ) N ;
+END COMPONENTS
+PINS 5 ;
+- clk + NET clk + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 0 ) N ;
+- d_in + NET din + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 2720 ) N ;
+- en + NET en + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 5440 ) N ;
+- rst_n + NET rst + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 8160 ) N ;
+- y + NET y + DIRECTION OUTPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 63000 0 ) N ;
+END PINS
+NETS 13 ;
+- clk ( PIN clk ) ( u_clkbuf A ) + USE SIGNAL ;
+- rst ( PIN rst_n ) ( u_rst A ) + USE SIGNAL ;
+- rst_b ( u_rst X ) ( u_ff0 RESET_B ) ( u_ff2 RESET_B ) + USE SIGNAL ;
+- c1 ( u_clkbuf X ) ( u_nand A ) ( u_or A ) ( u_nor A ) ( u_and A ) ( u_icg CLK ) + USE SIGNAL ;
+- en ( PIN en ) ( u_nand B ) ( u_or B ) ( u_nor B ) ( u_and B ) ( u_icg GATE ) + USE SIGNAL ;
+- c_nand ( u_nand Y ) ( u_ff0 CLK_N ) + USE SIGNAL ;
+- c_or ( u_or X ) ( u_ff1 CLK ) + USE SIGNAL ;
+- c_nor ( u_nor Y ) ( u_ff2 CLK_N ) + USE SIGNAL ;
+- c_and ( u_and X ) ( u_ff3 CLK ) + USE SIGNAL ;
+- c_icg ( u_icg GCLK ) ( u_ff4 CLK ) + USE SIGNAL ;
+- din ( PIN d_in ) ( u_databuf A ) + USE SIGNAL ;
+- d1 ( u_databuf X ) ( u_ff0 D ) ( u_ff1 D ) ( u_ff2 D ) ( u_ff3 D ) ( u_ff4 D ) + USE SIGNAL ;
+- y ( u_ff4 Q ) ( PIN y ) + USE SIGNAL ;
+END NETS
+END DESIGN

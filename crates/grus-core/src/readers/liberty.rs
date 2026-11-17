@@ -15,7 +15,7 @@ use xxhash_rust::xxh3::xxh3_64;
 const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
 // Bump when the serialized LibDb layout changes (e.g. new TimingType variants shift
 // discriminant values and old caches would deserialize `Other` arcs as real types).
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -559,6 +559,7 @@ fn parse_cell_body(
                                 is_clock: false,
                                 max_cap: None,
                                 max_transition: None,
+                                function: None,
                             });
                         }
                     }
@@ -592,6 +593,7 @@ fn parse_cell_body(
                                 is_clock: false,
                                 max_cap: None,
                                 max_transition: None,
+                                function: None,
                             });
                         }
                     }
@@ -724,6 +726,7 @@ fn parse_pin_body(
     let mut is_clock = false;
     let mut max_cap = None;
     let mut max_transition = None;
+    let mut function = None;
 
     // Temporary list of timing arcs defined inside this pin
     let mut pin_arcs = Vec::new();
@@ -779,6 +782,13 @@ fn parse_pin_body(
                         max_transition = Some(number_value(s, "max_transition")? * db.time_unit_ns);
                     }
             }
+            // `state_function` is a different attribute and must not match here.
+            Token::Ident("function") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
+                        function = Some(db.strings.intern(s));
+                    }
+            }
             Token::Ident("timing") => {
                 // Consume optional (args)
                 while let Some(tok_t) = lexer.next_token() {
@@ -818,6 +828,7 @@ fn parse_pin_body(
         is_clock,
         max_cap,
         max_transition,
+        function,
     };
     // A pin sharing its name with an `ff`/`latch` state variable reuses the placeholder
     // slot pushed earlier; writing in place keeps one entry per name.
@@ -1657,6 +1668,26 @@ library (t) {
         let cr = db.cell_arcs(&db.cells[0])[0].cell_rise.as_ref().expect("cell_rise must exist");
         assert_eq!(cr.index_1, vec![0.01]);
         assert_eq!(cr.index_2, vec![1.0]);
+    }
+
+    #[test]
+    fn test_output_pin_function_is_interned() {
+        let text = r#"
+library (t) {
+  cell (c) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) {
+      direction : output;
+      function : "(A&B)";
+    }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        let pins = db.cell_pins(&db.cells[0]);
+        assert_eq!(pins[2].function.map(|s| db.strings.resolve(s)), Some("(A&B)"));
+        assert_eq!(pins[0].function, None);
     }
 
     #[test]

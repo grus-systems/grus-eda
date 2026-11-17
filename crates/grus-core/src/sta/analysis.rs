@@ -4,7 +4,7 @@ use super::parasitics::NetParasitics;
 use super::sdc::{DERATE_CELL, DERATE_CHECK, DERATE_NET, Sdc};
 use crate::design_db::DesignDb;
 use crate::interner::{CellId, LibPinId, NetId, PinDir, PinId};
-use crate::lib_db::{LibCell, LibDb, NldmTable, TimingSense, TimingType};
+use crate::lib_db::{LibCell, LibDb, LibPin, NldmTable, TimingSense, TimingType};
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -457,10 +457,10 @@ struct TimingGraph {
     edges_from_offsets: Vec<u32>,
     launches: Vec<LaunchArc>,
     latch_opens: Vec<LatchOpen>,
-    /// `(enable pin, clock input pin)` of AND-type clock gates, checked against the clock
-    /// (see `gating_enables`). The clock input is kept so a propagated clock can replace the
-    /// ideal latency in the enable's required times.
-    gating_enables: Vec<(PinId, PinId)>,
+    /// `(enable, clock input, kind)` of clock gates on clock nets (see `gating_enables`).
+    /// The clock input is kept so a propagated clock can replace the ideal latency in the
+    /// enable's required times.
+    gating_enables: Vec<GatingEnable>,
     /// Per net: reached by a register clock pin or by a gated clock output. Such nets keep the ideal
     /// clock latency, so data arriving at a clock gate does not propagate onto them.
     clock_net: Vec<bool>,
@@ -485,13 +485,178 @@ fn latch_enable(cx: &Context, cell: CellId, lib_cell: &LibCell) -> Option<PinId>
         .and_then(|arc| cx.cell_pin_for_lib_pin(cell, arc.related_pin))
 }
 
-/// `(enable, clock input)` pairs of AND-type clock gates: a combinational output on a clock
-/// net with a positive-unate arc from a clock input. Every other input with a positive-unate
-/// arc to that output is an enable. Covers `and2` only; OR/NAND-type gates (negative sense or
-/// other clock polarity) are not matched. An AND gate has one clock input; if a cell ever has
-/// more, the first in pin order is paired with every enable.
-fn gating_enables(cx: &Context, graph: &TimingGraph) -> Vec<(PinId, PinId)> {
+/// Which clock edge a clock-gate enable check is referenced to. OpenSTA 3.0.16 reports
+/// AND/NAND gates as "rising clock gating-check end-points" (setup vs the clock rise at
+/// the gate input, hold vs the preceding fall) and OR/NOR as "falling" ones with both
+/// edges swapped; the distinction is only visible in the Liberty `function` expression,
+/// not in the timing arcs (and2/or2 arcs are identical).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GateKind {
+    Rising,
+    Falling,
+}
+
+/// One clock-gate enable check: `enable` must be stable while `clk_pin` carries the clock.
+#[derive(Clone, Copy, Debug)]
+struct GatingEnable {
+    enable: PinId,
+    clk_pin: PinId,
+    kind: GateKind,
+}
+
+/// Boolean expression of a Liberty `function` attribute, kept only as deep as clock-gate
+/// classification needs.
+enum FuncExpr<'a> {
+    Lit(&'a str, bool),
+    And(Vec<FuncExpr<'a>>),
+    Or(Vec<FuncExpr<'a>>),
+    Not(Box<FuncExpr<'a>>),
+}
+
+struct FuncParser<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FuncParser<'a> {
+    fn peek(&mut self) -> Option<u8> {
+        while self.pos < self.b.len() && self.b[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+        self.b.get(self.pos).copied()
+    }
+
+    fn eat(&mut self, c: u8) -> bool {
+        if self.peek() == Some(c) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn ident(&mut self) -> Option<&'a str> {
+        while self.pos < self.b.len() && self.b[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+        let start = self.pos;
+        while self.pos < self.b.len() {
+            let c = self.b[self.pos];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'[' || c == b']' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if self.pos > start {
+            std::str::from_utf8(&self.b[start..self.pos]).ok()
+        } else {
+            None
+        }
+    }
+
+    fn parse_expr(&mut self) -> Option<FuncExpr<'a>> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Option<FuncExpr<'a>> {
+        let mut v = vec![self.parse_and()?];
+        while self.eat(b'|') {
+            v.push(self.parse_and()?);
+        }
+        Some(if v.len() == 1 { v.pop().unwrap() } else { FuncExpr::Or(v) })
+    }
+
+    fn parse_and(&mut self) -> Option<FuncExpr<'a>> {
+        let mut v = vec![self.parse_unary()?];
+        while self.eat(b'&') {
+            v.push(self.parse_unary()?);
+        }
+        Some(if v.len() == 1 { v.pop().unwrap() } else { FuncExpr::And(v) })
+    }
+
+    fn parse_unary(&mut self) -> Option<FuncExpr<'a>> {
+        if self.eat(b'!') {
+            Some(FuncExpr::Not(Box::new(self.parse_unary()?)))
+        } else if self.eat(b'(') {
+            let e = self.parse_or()?;
+            if self.eat(b')') { Some(e) } else { None }
+        } else {
+            self.ident().map(|n| FuncExpr::Lit(n, false))
+        }
+    }
+}
+
+/// Classify a clock-gate output from its Liberty `function`: a single AND or OR of
+/// literals covering every input pin, all literals of the same polarity. AND-of-positive
+/// and OR-of-negative (NAND) are Rising endpoints; OR-of-positive and AND-of-negative
+/// (NOR) are Falling. Whole-expression negation preserves the class, so leading `!`s are
+/// peeled. Anything else (muxes, partial functions, mixed polarity) returns `None`.
+fn gate_kind(lib: &LibDb, cell: &LibCell, out: &LibPin) -> Option<GateKind> {
+    let src = lib.strings.resolve(out.function?);
+    let mut p = FuncParser { b: src.as_bytes(), pos: 0 };
+    let ast = p.parse_expr()?;
+    if p.peek().is_some() {
+        return None;
+    }
+    let mut node = &ast;
+    while let FuncExpr::Not(inner) = node {
+        node = inner;
+    }
+    let (is_and, ops) = match node {
+        FuncExpr::And(v) => (true, v),
+        FuncExpr::Or(v) => (false, v),
+        _ => return None,
+    };
+    let mut neg: Option<bool> = None;
+    let mut names = HashSet::new();
+    for op in ops {
+        let (name, n) = match op {
+            FuncExpr::Lit(nm, p) => (*nm, *p),
+            FuncExpr::Not(b) => match &**b {
+                FuncExpr::Lit(nm, p) => (*nm, !*p),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        match neg {
+            None => neg = Some(n),
+            Some(prev) if prev == n => {}
+            _ => return None,
+        }
+        if !names.insert(name) {
+            return None;
+        }
+    }
+    let inputs: HashSet<&str> = lib
+        .cell_pins(cell)
+        .iter()
+        .filter(|p| p.dir == PinDir::Input)
+        .map(|p| lib.strings.resolve(p.name))
+        .collect();
+    if names.len() != inputs.len() || !names.iter().all(|n| inputs.contains(n)) {
+        return None;
+    }
+    let all_negated = neg.unwrap_or(false);
+    Some(if is_and != all_negated { GateKind::Rising } else { GateKind::Falling })
+}
+
+/// `(enable, clock input, kind)` of clock gates: a combinational output on a clock
+/// net whose Liberty `function` is a plain AND/OR/NAND/NOR of its inputs. The input on
+/// the clock net is the clock input; every other input with an arc to that output is an
+/// enable. Outputs without a `function` attribute fall back to the legacy positive-unate
+/// AND assumption (Rising), which cannot distinguish OR/NAND-type cells.
+fn gating_enables(cx: &Context, graph: &TimingGraph) -> Vec<GatingEnable> {
     let design = cx.design;
+    let has_arc = |lib_cell: &LibCell, from: PinId, to: PinId| {
+        let (Some(f), Some(t)) = (design.pin_lib_pins[from.0 as usize], design.pin_lib_pins[to.0 as usize]) else {
+            return false;
+        };
+        (lib_cell.arc_offset..lib_cell.arc_offset + lib_cell.arc_count as u32).any(|i| {
+            let arc = &cx.lib.arcs[i as usize];
+            arc.related_pin == f && arc.target_pin == t
+        })
+    };
     let positive_arc = |lib_cell: &LibCell, from: PinId, to: PinId| {
         let (Some(f), Some(t)) = (design.pin_lib_pins[from.0 as usize], design.pin_lib_pins[to.0 as usize]) else {
             return false;
@@ -515,13 +680,39 @@ fn gating_enables(cx: &Context, graph: &TimingGraph) -> Vec<(PinId, PinId)> {
                 continue;
             }
             let inputs = || pins.iter().copied().filter(|&p| !design.pin_is_driver[p.0 as usize]);
-            let Some(clk_in) = inputs().find(|&p| on_clock(p) && positive_arc(lib_cell, p, out)) else {
-                continue;
+            // `None` = no `function` attribute (legacy AND guess); `Some(None)` = a
+            // declared function that does not classify (mux, partial function).
+            let kind = design.pin_lib_pins[out.0 as usize].and_then(|i| {
+                let lp = &cx.lib.pins[i.0 as usize];
+                lp.function.map(|_| gate_kind(cx.lib, lib_cell, lp))
+            });
+            // `use_positive` keeps the legacy positive-unate requirement for cells
+            // without a `function` attribute.
+            let (clk_in, kind, use_positive) = match kind {
+                // A declared function that does not classify (mux, partial function)
+                // means the cell is not a plain clock gate: no enable checks at all.
+                Some(None) => continue,
+                Some(Some(k)) => {
+                    let Some(clk) = inputs().find(|&p| on_clock(p) && has_arc(lib_cell, p, out)) else {
+                        continue;
+                    };
+                    (clk, k, false)
+                }
+                // No `function` attribute: keep the legacy positive-unate AND guess.
+                None => {
+                    let Some(clk) = inputs().find(|&p| on_clock(p) && positive_arc(lib_cell, p, out)) else {
+                        continue;
+                    };
+                    (clk, GateKind::Rising, true)
+                }
             };
             enables.extend(
                 inputs()
-                    .filter(|&p| !on_clock(p) && positive_arc(lib_cell, p, out))
-                    .map(|enable| (enable, clk_in)),
+                    .filter(|&p| {
+                        !on_clock(p)
+                            && if use_positive { positive_arc(lib_cell, p, out) } else { has_arc(lib_cell, p, out) }
+                    })
+                    .map(|enable| GatingEnable { enable, clk_pin: clk_in, kind }),
             );
         }
     }
@@ -1137,7 +1328,7 @@ fn run_sta_detail(
             .map(|l| l.clk)
             .chain(graph.checks.iter().filter_map(|(_, c)| c.clk))
             .chain(graph.latch_opens.iter().map(|o| o.enable))
-            .chain(graph.gating_enables.iter().map(|&(_, clk)| clk));
+            .chain(graph.gating_enables.iter().map(|g| g.clk_pin));
         for pin in consumers {
             let s = clk_state[pin.0 as usize];
             if s.reached(RISE) || s.reached(FALL) {
@@ -1620,23 +1811,26 @@ fn collect_endpoints(
         record_endpoint(&mut entries, &mut skipped, || cx.pin_name(data), cands);
     }
 
-    // AND-type clock gate: the enable must settle before the rising edge and hold past the
-    // falling edge of the same cycle — the fall immediately preceding the selected rise,
-    // which is always the pin's first fall arrival. The ideal clock uses the summed clock
-    // latency directly (the gate's clock pin is not seeded); a propagated clock uses the
-    // arrival at the gate's clock input pin. Both checks pair against the selected RISE
-    // edge's clock-edge parity `c0`, the same rule the register checks apply: the setup
-    // capture edge is the first rise strictly after the launch edge (a period later
-    // unless `c0` exceeds the launch parity recorded on the arrival), and the hold
-    // arrival shifts one period under the mirror condition.
-    for &(enable, clk_pin) in &graph.gating_enables {
+    // Clock gate: the enable must settle before the propagating clock edge and hold past
+    // the opposite edge of the same cycle. AND/NAND gates ("rising" check end-point) pair
+    // setup against the clock rise and hold against the preceding fall; OR/NOR ("falling")
+    // swap both. `pe` is the clock-edge parity of the setup edge, playing the role `c0`
+    // played for the rising case: the setup capture edge is the first setup-polarity edge
+    // strictly after the launch edge (a period later unless `pe` exceeds the launch
+    // parity), and the min arrival shifts one period under the mirror condition.
+    for g in &graph.gating_enables {
+        let (enable, clk_pin) = (g.enable, g.clk_pin);
+        let (setup_edge, hold_edge) = match g.kind {
+            GateKind::Rising => (RISE, FALL),
+            GateKind::Falling => (FALL, RISE),
+        };
+        let pe = edge_parity(clk_pin, setup_edge);
         let s = state[enable.0 as usize];
         let c = state[clk_pin.0 as usize];
         if sdc.propagated_clock && (!c.reached(RISE) || !c.reached(FALL)) {
             skipped.unreached_endpoints += 1;
             continue;
         }
-        let c0 = edge_parity(clk_pin, RISE);
         let mut cands = EndpointPolarities { max: [None; 2], min: [None; 2] };
         for pol in [RISE, FALL] {
             if !s.reached(pol) {
@@ -1645,22 +1839,32 @@ fn collect_endpoints(
             let (req_max, req_min, arr_min) = if sdc.propagated_clock {
                 let g_max = if s.par_max[pol] <= 1 { s.par_max[pol] as usize } else { 0 };
                 let g_min = if s.par_min[pol] <= 1 { s.par_min[pol] as usize } else { 0 };
-                let rise_cap =
-                    c.arrival_min[RISE] + if c0 <= g_max { sdc.period_ns } else { 0.0 };
+                let cap =
+                    c.arrival_min[setup_edge] + if pe <= g_max { sdc.period_ns } else { 0.0 };
                 (
-                    rise_cap - sdc.setup_uncertainty_ns,
-                    c.arrival_max[FALL] + sdc.hold_uncertainty_ns,
-                    s.arrival_min[pol] + if c0 > g_min { sdc.period_ns } else { 0.0 },
+                    cap - sdc.setup_uncertainty_ns,
+                    c.arrival_max[hold_edge] + sdc.hold_uncertainty_ns,
+                    s.arrival_min[pol] + if g_min < pe { sdc.period_ns } else { 0.0 },
                 )
             } else {
                 let lat = sdc.design_clock_latency_ns();
                 // The ideal clock does not track clock-network inversions, so there is no
                 // parity to shift the hold arrival by; that correction exists only in the
-                // propagated branch above.
+                // propagated branch above. The hold edge is the one preceding the setup
+                // edge: half a period after the rise for a rising check, the rise itself
+                // for a falling one.
+                let (setup_base, hold_base) = match g.kind {
+                    GateKind::Rising => (sdc.period_ns, half_period),
+                    GateKind::Falling => (half_period, 0.0),
+                };
+                // The same parity rule as the propagated branch, evaluated on the ideal
+                // clock's degenerate parity: a falling check edge has parity 1, so the
+                // min arrival moves one period later exactly as OpenSTA reports.
+                let g_min = if s.par_min[pol] <= 1 { s.par_min[pol] as usize } else { 0 };
                 (
-                    sdc.period_ns + lat - sdc.setup_uncertainty_ns,
-                    half_period + lat + sdc.hold_uncertainty_ns,
-                    s.arrival_min[pol],
+                    setup_base + lat - sdc.setup_uncertainty_ns,
+                    hold_base + lat + sdc.hold_uncertainty_ns,
+                    s.arrival_min[pol] + if g_min < pe { sdc.period_ns } else { 0.0 },
                 )
             };
             let slack_max = req_max - s.arrival_max[pol];
@@ -3345,6 +3549,73 @@ mod tests {
     #[test]
     fn test_sta_edge_hold_violation_propagated() {
         compare_sta_edge("hold_violation", "hold_violation/hold.def", "propagated.sdc", None, "propagated", Tol::STRICT);
+    }
+
+    /// Combinational clock gates (`and2`/`or2`/`nand2`/`nor2`) plus the `dlclkp` integrated
+    /// clock-gating cell. The Liberty `function` expression decides the check endpoint:
+    /// AND/NAND are "rising" (setup vs clock rise, hold vs preceding fall), OR/NOR
+    /// "falling" (both swapped, min arrival one period later) — measured on OpenSTA
+    /// 3.0.16. `dlclkp` has no `function`, so it is not an enable-check gate; its GATE pin
+    /// is checked by the cell's own setup/hold arcs and CLK propagates to GCLK through
+    /// the ordinary combinational arc.
+    /// `gate_kind` reads the output pin's Liberty `function`: AND/NAND are Rising check
+    /// end-points, OR/NOR Falling; muxes and partial functions must not classify.
+    #[test]
+    fn test_gate_kind_classifies_liberty_functions() {
+        fn kind_of(expr: &str) -> Option<GateKind> {
+            let mut lib = LibDb::new();
+            let cell_name = lib.strings.intern("g");
+            for (n, dir) in [("A", PinDir::Input), ("B", PinDir::Input), ("Y", PinDir::Output)] {
+                lib.pins.push(LibPin {
+                    name: lib.strings.intern(n),
+                    dir,
+                    cap_rise: 0.0,
+                    cap_fall: 0.0,
+                    cap_nom: 0.0,
+                    is_clock: false,
+                    max_cap: None,
+                    max_transition: None,
+                    function: if dir == PinDir::Output { Some(lib.strings.intern(expr)) } else { None },
+                });
+            }
+            lib.cells.push(LibCell {
+                name: cell_name,
+                area: 0.0,
+                is_sequential: false,
+                is_latch: false,
+                pin_offset: 0,
+                pin_count: 3,
+                arc_offset: 0,
+                arc_count: 0,
+            });
+            let cell = &lib.cells[0];
+            gate_kind(&lib, cell, &lib.pins[2])
+        }
+        assert_eq!(kind_of("(A&B)"), Some(GateKind::Rising));
+        assert_eq!(kind_of("(!A) | (!B)"), Some(GateKind::Rising));
+        assert_eq!(kind_of("!(A&B)"), Some(GateKind::Rising));
+        assert_eq!(kind_of("(A) | (B)"), Some(GateKind::Falling));
+        assert_eq!(kind_of("(!A&!B)"), Some(GateKind::Falling));
+        assert_eq!(kind_of("!(A|B)"), Some(GateKind::Falling));
+        // Clock muxes and non-unate functions must not be treated as clock gates.
+        assert_eq!(kind_of("(A&S) | (B&!S)"), None);
+        assert_eq!(kind_of("(A&B&C)"), None);
+        assert_eq!(kind_of("(A)"), None);
+        assert_eq!(kind_of("(A&!B)"), None);
+    }
+
+    /// The ideal clock cannot see that `nand2`/`nor2` invert the gated clock, so the
+    /// `dfrtn` capture edges on `c_nand`/`c_nor` land half a period off (same limitation
+    /// as `clkinv` in the timing_derate fixture). Enable-pin checks themselves match.
+    #[test]
+    #[ignore = "ideal clock does not track edge inversion through cell-driven clock nets (u_ff0/u_ff2 D and RESET_B off by half a period)"]
+    fn test_sta_edge_clock_gate_ideal() {
+        compare_sta_edge("clock_gate", "clock_gate/clock_gate.def", "ideal.sdc", None, "ideal", Tol::STRICT);
+    }
+
+    #[test]
+    fn test_sta_edge_clock_gate_propagated() {
+        compare_sta_edge("clock_gate", "clock_gate/clock_gate.def", "propagated.sdc", None, "propagated", Tol::STRICT);
     }
 
     /// `set_timing_derate` early/late plus the `-cell_check`, `-clock`/`-data` and

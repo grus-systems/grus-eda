@@ -74,6 +74,10 @@ pub struct LibPin {
     pub is_clock: bool,
     pub max_cap: Option<f32>,
     pub max_transition: Option<f32>,
+    /// Boolean expression of an output pin (`function : "(A&B)"`), interned. `None` when
+    /// the Liberty file does not declare one; clock-gate classification needs it because
+    /// timing arcs alone cannot tell AND from OR.
+    pub function: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

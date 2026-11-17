@@ -1434,3 +1434,50 @@ Another `changes` verdict (no S1); dispositions:
   multi-stage-tree CRPR and `gating_enables` CRPR (pessimistic, safe);
   `clock_net` data sinks (unsupported shape); ff/latch parser duplication
   and `test_cache_roundtrip` cache isolation (test hygiene).
+
+## 2026-11-17 — Roadmap R4: combinational and integrated clock gates (v0.1.66)
+
+`sta_edge/clock_gate` exercises `and2`/`or2`/`nand2`/`nor2` plus the `dlclkp`
+integrated clock-gating cell, with `dfrtn` flip-flops on the inverting-gate
+outputs so the propagated clock sees both edge polarities.
+
+### Measured OpenSTA 3.0.16 semantics
+
+- The Liberty `function` attribute on the output pin is what distinguishes the
+  gate kinds — `and2`/`or2` carry identical positive-unate timing arcs. AND/NAND
+  report "rising clock gating-check end-points" (setup vs the clock rise at the
+  gate input, hold vs the preceding fall); OR/NOR report "falling" ones with
+  both edges swapped and the min arrival one period later. `nand2`/`nor2` are
+  classified by their negated-literal functions (`(!A)|(!B)`, `(!A&!B)`).
+- `dlclkp` declares `clock_gate_clock_pin`/`clock_gate_enable_pin`/
+  `clock_gate_out_pin` attributes, has `setup_rising`/`hold_rising` arcs on GATE
+  related to CLK, and no `function` on GCLK. Its GATE check is an ordinary
+  register check and CLK->GCLK propagates through the combinational arc — no
+  special-casing was needed.
+- Under the ideal clock, OpenSTA still sees the nand/nor inversion (the
+  `dfrtn` capture lands on the effectively-rising edge), so our ideal model —
+  which does not track edge inversion through cell-driven clock nets — is off
+  by half a period on those two FFs' D and RESET_B endpoints. Same documented
+  limitation as `clkinv` in the timing_derate fixture.
+
+### Implementation
+
+- `LibPin.function` stores the interned `function` expression (cache version
+  bumped); `gate_kind` parses it into a single-level AND/OR of literals and
+  classifies Rising/Falling, rejecting muxes and partial functions instead of
+  misclassifying them as AND.
+- `gating_enables` now carries `(enable, clk_pin, kind)`; negative-unate arcs
+  qualify for NAND/NOR, and the required-time formula is unified on
+  `pe = edge_parity(clk_pin, setup_edge)` — identical to the previous AND-only
+  rule for Rising and the swapped-edge rule for Falling.
+- Cells without a `function` attribute keep the legacy positive-unate AND
+  guess.
+
+### Results
+
+- `sta_edge/clock_gate` propagated: all 13 endpoints match OpenSTA strictly
+  (arrivals, required times, slacks, slews, WNS/TNS, violation counts),
+  including the four gate-enable checks and the `dlclkp` GATE check.
+- Ideal: enable-pin endpoints match; the two `dfrtn` FFs on inverting gate
+  outputs are off by half a period — `#[ignore]`d with the reason recorded.
+- Six `min_pulse_width` arcs remain counted `unsupported_arcs[Other]` skips.
