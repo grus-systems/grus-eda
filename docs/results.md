@@ -931,3 +931,976 @@ Fixtures are hand-written minimal DEF/SDC(/SPEF) under `tests/designs/sta_edge/`
 - **Case B `clock_uncertainty` — PASS after a real fix**: SDC `set_clock_uncertainty -setup 0.2 [get_clocks core_clk]`. OpenSTA golden showed setup uncertainty **does** apply to the output-port required time (`y` req_max 3.8 = 5.0 - 1.0 - 0.2); ours did not (`collect_endpoints` output branch had no uncertainty term) — the divergence the ticket predicted. Fixed: `Sdc` now carries `setup_uncertainty_ns`/`hold_uncertainty_ns` (plain `set_clock_uncertainty <ns>` sets both, preserving prior semantics), the parser accepts `[-setup|-hold] <ns> [get_clocks <name>]` with clock-name validation, and output-port `req_max`/`req_min` gained the same `∓/±` uncertainty terms as register checks and clock-gate enables. All 8 endpoint fields + WNS/TNS pass strict.
 - **Case C `non_dlxtn_latch` — verified divergence, `#[ignore]`d**: `sky130_fd_sc_hd__dlxtp_1` is a positive latch whose Liberty checks are `setup_falling`/`hold_falling` on GATE; `latch_enable` only models the `dlxtn` `setup_rising` shape, so the cell's arcs are ignored with the documented warning. Result: ours reaches **1 of 3** endpoints (`y` only; `u_ff/D` and `u_lt/D` unreached, `unreached_endpoints=1`) vs OpenSTA's 3. Extending the latch model is a separate design decision — recorded, not bolted on.
 - **Verification**: `cargo test --release -p grus-core sta::` — 59 passed / 0 failed / 6 ignored; `cargo clippy --all-targets -- -D warnings` clean.
+
+### 2026-11-16 — Roadmap R0: skip summary with shares, `--strict`, `--json` (`v0.1.58`)
+
+- `SkipReport` (`crates/grus-core/src/sta/analysis.rs`) now counts everything a run leaves
+  out, per kind and as a share: `unmodelled_latch_cells` (latch shapes outside `dlxtn`,
+  previously only an `eprintln` per cell), `latch_arcs_dropped` by `TimingType` (the `D -> Q`
+  `Combinational` path and every other unmodelled latch arc, previously silent), the existing
+  `unsupported_arcs`/`unresolved_arcs`/`incomplete_checks`/`unreached_endpoints`/
+  `cell_driven_clock_nets`/`unmapped_cells`, plus denominators `total_arcs` (arcs of all
+  Liberty-mapped instances; unmapped cells have no Liberty arcs to count) and
+  `total_endpoints` (checks + clock-gate enables + output ports). `arcs_skipped()` and
+  `endpoints_skipped()` give the totals; `is_clean()` drives `--strict`.
+- SDC: `-lib_cell` and `-pin` were accepted and silently dropped by `positionals`; they are
+  now counted in `Sdc::ignored_options`/`Sdc::commands` and reported as
+  `sdc_ignored_options`/`sdc_commands` in the same summary. Unsupported commands still fail
+  the parse (lenient mode is roadmap R1).
+- CLI (`grus-eda sta`): prints the skip summary after the STA line, `--json <path>` writes the
+  full `StaReport` (endpoints + skip summary) as JSON, `--strict` exits 1 when `is_clean()`
+  is false.
+- Observed, `tests/designs/sta_edge/non_dlxtn_latch` (one `dlxtp_1`, zero wire):
+  `skipped: 6/10 arcs (60.00%), 1/2 endpoints (50.00%)` —
+  `unsupported_arcs[Other=1]`, `latch_arcs_dropped[Combinational=1, HoldFalling=1, Other=1,
+  RisingEdge=1, SetupFalling=1]` (all 5 `dlxtp_1` arcs), `unmodelled_latch_cells=1`,
+  `unreached_endpoints=1`; `--strict` exits 1. The latch counts reproduce an independent
+  recount from the Liberty arcs and the DEF (`test_skip_report_counts_latch_arcs`).
+- Observed, `tests/designs/ibex` zero wire: `skipped: 5267/49427 arcs (10.66%),
+  7/3709 endpoints (0.19%)` — `unsupported_arcs[Clear=1655, Other=3601, Preset=9]`
+  (asynchronous arcs, roadmap R6), `latch_arcs_dropped[Combinational=1, Other=1]` (the `dlxtn`
+  `D -> Q` path and one unmodelled arc), `unmapped_cells=4263` (well taps),
+  `unreached_endpoints=7`, `cell_driven_clock_nets=1`.
+- Verification: `cargo test --release -p grus-core -- sta::` — 61 passed / 0 failed /
+  6 ignored; new tests `test_skip_report_counts_latch_arcs` (edge_latch + ibex) and
+  `counts_ignored_lib_cell_and_pin_options`. Timing results unchanged (counting only).
+- **Hydrogen review (`subcon review`, 2026-11-16, verdict reject -> fixed)**: S1 —
+  `positionals` shared one `VALUE_FLAGS` list across commands, so `-clock`/`-name`/`-period`
+  on a command that does not read them (e.g. `set_load ... -clock core_clk`) was silently
+  dropped; flags are now per-command (`DELAY_VALUE_FLAGS`/`PORT_VALUE_FLAGS`/
+  `CLOCK_VALUE_FLAGS`) and anything else errors. S2 — a value flag with no value (or whose
+  "value" is another flag) was skipped via `i += 2`; `positionals` now requires a
+  non-flag string value. S2 — `expected_latch_skips` no longer calls `latch_enable`, and the
+  test asserts literal per-design counts plus `arcs_skipped() <= total_arcs`. S2 —
+  `--strict` returns `Err` from `run()` instead of `std::process::exit`, and
+  `cli_sta_json_and_strict` covers `--json`/`--strict` on gcd. S3 (empty-endpoint WNS
+  serializes as JSON `null`) left as-is: pre-existing degenerate case, out of R0 scope.
+  Verification after fixes: `cargo test --release -p grus-core -- sta::` 62 passed /
+  0 failed / 6 ignored; `cargo test --release -p grus-eda` 3 passed;
+  `cargo clippy --all-targets -- -D warnings` clean.
+
+### 2026-11-16 — R1 — Stock LibreLane SDC (`write_sdc` output) parses unchanged and matches OpenSTA
+
+- **Inputs**: `gcd` from a stock LibreLane 3.0.16 run (`~/ll_gcd/runs/RUN_2026-11-16_11-43-52/`,
+  public OpenROAD-flow-scripts design). The emitted `final/sdc/gcd.sdc` contains
+  `create_clock`, `set_clock_transition`, `set_clock_uncertainty`, `set_input_delay` /
+  `set_output_delay` with `-clock [get_clocks {...}]` and `-add_delay`, `set_load -pin_load`,
+  `set_driving_cell -lib_cell/-pin/-input_transition_*`, `set_timing_derate -early/-late`, and
+  `set_max_transition`/`set_max_capacitance`/`set_max_fanout`.
+- **Reference**: `openroad` + `sta` in `ghcr.io/librelane/librelane:3.0.16`
+  (`~/ll_gcd/probe/run_sta.tcl`, `PROBE_SDC`/`PROBE_SPEF`/`PROBE_OUT`).
+- **Modelled in R1**: `-min`/`-max`/`-add_delay` delay corners, `-pin_load`,
+  `set_clock_transition` (clock-pin slew), `set_timing_derate` (early/late on propagated cell
+  and wire delays, and on the driving-cell delay), `set_driving_cell` (input-port slew and
+  delay from the driver cell's Liberty arcs, worst over combinational arcs into the named
+  pin), `-clock` as bare name or `[get_clocks {...}]`, and
+  `set_propagated_clock`/`unset_propagated_clock` accepted and counted until R2.
+- **`-add_delay` semantics** (measured against OpenSTA `report_checks`, not assumed): it does
+  not sum. Each corner keeps the extreme of every `-add_delay` value seen since the last plain
+  rule — `1.0 -add_delay` then `0.4 -add_delay` yields min 0.4 / max 1.0, order-independent,
+  and a later plain rule resets the fold. `-min`/`-max` touch one corner only; OpenSTA rejects
+  `-min V -max V` in a single command, so one command per sense is the accepted form.
+- **Parse-only, counted**: `set_max_transition`/`set_max_capacitance`/`set_max_fanout` go to
+  `sdc_ignored_commands`; they are shown in the skip summary but do not fail `--strict`
+  (`SkipReport::is_clean` exempts exactly these three — they cannot change a compared number).
+- **Still rejected** (no `--lenient` flag; the stop policy is kept for now): a second
+  `create_clock`, `create_generated_clock`, `set_case_analysis`, `set_false_path`,
+  `set_multicycle_path`, clock wildcards and `get_pins` selectors — all out of the single-clock
+  ideal-clock model and left for the roadmap items that need them.
+- **Comparisons** (all 53 endpoints, per-pin arrival/required/slack/slew, min and max):
+
+  | Run | Worst abs diff | Tolerance | Result |
+  |---|---|---|---|
+  | zero wire, stock SDC | 0.33 ps (`_411_/D`; after review fixes) | STRICT max(5 ps, 1%) | PASS |
+  | SPEF (`nom.spef`) | 3.5 ps slack/arr, 6.1 ps slew (`resp_msg[3]`, 1.7%) | `GCD_SPEF` slew 3% | PASS |
+  | `no_derate`, `no_clktrans`, `no_drvcell`, `no_load`, `no_unc`, `no_clkdrv`, `clk_ideal` | <= 0.33 ps | STRICT | PASS |
+  | `drv16` (driving cell `inv_16`) | 11.0 ps slack | STRICT (rel 1% of ~3 ns) | PASS |
+  | `minmax` (`-min`/`-max` as separate commands, OpenSTA's accepted form) | 8.6 ps slack | STRICT | PASS, 0 field failures |
+  | `addelay2` (synthetic: two `-add_delay` rules on `req_val`) | 7.8 ps hold slack (`_411_/D` min side) | STRICT max(5 ps, 1% of 0.55 ns = 5.5 ps) | **1 field over tol** — see notes |
+
+- **Notes**: OpenSTA rejects `set_input_delay -min V -max V` in one command ("requires two
+  positional arguments"); the accepted form is one command per sense, which is what `minmax.sdc`
+  uses. The driving-cell delay uses the source-transition delay table at zero load (for an
+  inverting driver the output rise is `cell_fall`), derated like a cell arc; residuals are
+  ~0.7 ps on `inv_2` and ~10 ps on `inv_16` — inside tolerance, recorded as an approximation.
+  The `addelay2` hold-side residual is a synthetic double-`-add_delay` case that `write_sdc`
+  never emits (one rule per port); the max corner folds exactly like OpenSTA.
+- **Review fixes (Hydrogen, `subcon review`)**: `-add_delay` was summing — now folds per corner
+  as OpenSTA does (S1); `port_drive` now requires finite delay *and* slew per polarity and
+  filters to combinational arcs (S2); the driving-cell delay is derated early/late (S1);
+  `resolve_clock` falls back to the source port name when `create_clock` omits `-name` (S2);
+  `set_propagated_clock`/`unset_propagated_clock`/`set_max_*` reject flag-shaped or stray
+  arguments (S3); `NONDEFAULTRULES` skip and the `is_clean` design-rule exemption gained unit
+  tests (S2). The reviewer's `dst_pol`-for-delay suggestion was tested and rejected: it gave
+  +11 ps on `inv_2` and +18 ps on `inv_16` versus OpenSTA; `src_pol` at zero load measures
+  closest.
+- **Side fix**: the DEF reader now skips `NONDEFAULTRULES` (routing-only, not in the timing
+  database); the stock LibreLane `gcd.def` previously failed to parse.
+- **Runtime**: debug binary, zero-wire `gcd` STA end-to-end 0.14 s wall (includes Liberty/DEF/SDC
+  parse; not a cold-cache measurement).
+- **Verification**: `cargo test --workspace` 180 passed / 0 failed / 7 ignored;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean. SDC tests cover the emitted
+  `write_sdc` syntax, `-min`/`-max`/`-add_delay` (incl. the OpenSTA fold), `-pin_load`, derate,
+  clock transition, driving cells, clock-name fallback, argument rejection on ignored commands,
+  and `NONDEFAULTRULES`; an analysis test pins the `is_clean` design-rule exemption.
+
+### 2026-11-16 — R2 — Propagated clock through buffers, an inverter, an AND gate and a latch (`v0.1.60`)
+
+- **Fixture**: `tests/designs/sta_edge/propagated_clock/` — hand-written public DEF using only
+  `sky130_fd_sc_hd` cells: `clk` port fans out to `u_ff0`/`u_ff5` clock pins directly and to
+  `u_clkbuf` (`clkbuf_2`), whose output `c1` feeds `u_ff1`/`u_ff6`, `u_clkinv` (`clkinv_2`,
+  inverting branch to `u_ff2` and to a second AND gate `u_and2`) and `u_clkbuf2` (`clkbuf_4`,
+  to `u_ff4`); `u_and` (`and2_1`, enable `en` on `B`) gates the clock to `u_ff3` and the
+  `dlxtn_1` latch `u_lt/GATE_N`, and `u_and2` gates the inverted branch to `u_ff7`; `u_lt/Q`
+  launches `u_ff5`/`u_ff6`; `u_ff6/Q` drives output `y`. SDC: `set_propagated_clock`,
+  `set_clock_latency 1.0` (ideal, ignored) + `set_clock_latency -source 0.2`,
+  `set_clock_transition 0.1`, `set_clock_uncertainty 0.1`, I/O delays 0.5 ns. No stock
+  benchmark DEF has a buffered clock tree (gcd's `clk` net reaches every `CLK` pin directly —
+  0 `clkbuf`/`clk_gate` cells), so the fixture is synthetic, same pattern as the other
+  `sta_edge` cases. Golden `propagated_clock.reference.json` is emitted by OpenSTA inside
+  `ghcr.io/librelane/librelane:3.0.16` via the committed `generate_ref.sh`.
+- **Model**: `propagate_clock` walks the levelized combinational graph along clock nets only
+  (clock-net marking keeps clock arrival out of data paths) and computes per-transition
+  arrival and slew at every reached pin with the same NLDM/derate/net-load machinery as data
+  arcs. It also tracks, per pin and transition, the parity (mod 2) of the clock-edge index
+  that produced the earliest arrival — inverting cells flip it. Consumer pins (register `CLK`,
+  latch enables, clock-gate clock inputs) receive the propagated state; ideal mode is
+  unchanged when `set_propagated_clock` is absent.
+- **Edge semantics** (verified against OpenSTA `report_checks`, not assumed):
+  - Setup capture = the capture pin's first rise when it sits on clock edge 1 (odd parity,
+    e.g. `u_ff2/CLK` behind `clkinv`), otherwise that rise plus one period.
+  - Hold pairs the capture edge with the next rising launch edge: odd-parity capture shifts
+    the reported min arrival by one period (`u_ff2/D` min_arr 5.854 ns = launch on clock edge
+    2, matching OpenSTA exactly).
+  - Latch borrow required time = the propagated **fall** arrival at `GATE_N` **minus** setup
+    clock uncertainty (OpenSTA `report_checks -path_delay max -to u_lt/D`: fall edge 2.50 +
+    network 0.38 - unc 0.10 = 2.78).
+  - AND-gate enable: setup vs the next rise, hold vs the fall, with the same parity shift.
+  - `set_clock_latency` without `-source` is ignored under propagation; `-source` latency is
+    the reference for I/O delays (OpenSTA reports "clock network delay (propagated) 0.20"
+    at the input port). The propagated slew seeds from the clock port's `set_input_transition`,
+    not `set_clock_transition` — corrected in R3 (see below); with `0.15 [all_inputs]` the
+    direct clock pins see 0.15 and `u_clkbuf/X` 0.07/0.05, matching OpenSTA `report_slews`.
+- **Comparison** (all 12 endpoints, zero wire): worst abs diff 22.8 ps at R2 commit time,
+  re-measured **0.34 ps** after the R3 slew fix (every field within `Tol::STRICT`).
+  WNS max 1.7897 vs 1.7897 ns, WNS min -2.1000 vs -2.1000 ns. The original residual was a
+  uniform ~10-23 ps early bias on clock-referenced fields — later identified as the wrong
+  propagated-clock source slew (see the R3 entry), not per-cell NLDM differences.
+- **Known approximations** (documented, not silent): the launch side of the hold/setup edge
+  pairing assumes clock-edge parity 0 — an endpoint launched through an inverting clock path
+  pairs a different edge and is not corrected; `unset_propagated_clock` after `set` is
+  honoured; propagating the virtual I/O clock is rejected; clock nets the propagation cannot
+  reach (behind latches/unmapped cells) still count in `cell_driven_clock_nets`. The fixture
+  run still skips 9/39 arcs (`Other=7`, latch `Combinational=1`/`Other=1`) so `--strict`
+  fails on it — the skip accounting is honest, the comparison test does not use strict.
+- **Review fixes (Hydrogen, `subcon review`)**: ideal-clock latency now sums `-source` and
+  network latency — measured against OpenSTA (`set_clock_latency 1.0` + `-source 0.2` reports
+  1.20 ns ideal delay), previously `-source` was silently dropped outside propagated mode
+  and overwrote virtual-clock latency (S2); `graph.clock_net` now follows combinational arcs
+  forward from the clock port so intermediate nets of deeper trees are marked — AND gates
+  whose output reaches no clock pin directly are found and data cannot leak onto clock nets
+  (S2); latch checks under propagation require the fall edge and `eval_launch` returns early
+  on unreached clock pins instead of feeding infinite slew to the delay calculator (S2); the
+  hold-side constraint uses the capture clock's early slew (S3). The AND-gate hold edge was
+  corrected twice: first the fall-edge period shift was removed (the hold fall is always the
+  pin's first fall), then the fixture gained `u_and2` behind `clkinv` which showed OpenSTA
+  shifts the enable's min arrival by one period on odd-parity clock inputs — the same rule
+  as register checks (S1, verified: `u_and2/B` min_arr 5.7 ns). Wire-delay application is
+  shared between the data pass and `propagate_clock` via `sink_state_with_wire` (S3).
+- **Verification**: `cargo test --workspace` 182 passed / 0 failed / 7 ignored (all pre-existing
+  ignores); `cargo clippy --workspace --all-targets -- -D warnings` clean. `test_sta_edge_propagated_clock`
+  compares all 12 endpoints and WNS/TNS against the OpenSTA golden; SDC tests cover
+  `set_propagated_clock`/`unset_propagated_clock` flag rejection, virtual-clock rejection,
+  and the `-source` vs plain latency split. Ideal-clock mode is regression-covered by every
+  existing `sta_edge` and design test (parity paths are no-ops without the flag).
+
+## 2026-11-17 — R3: hold with propagated clocks (v0.1.61)
+
+- **Violation counts**: `StaReport` gains `setup_violations`/`hold_violations` (endpoints whose
+  worst slack is negative), printed by `sta` next to WNS/TNS and serialised in `--json`.
+  `compare_sta_edge` asserts them exactly when the golden carries the keys; the OpenSTA side
+  counts distinct endpoint pins with `slack < 0` over `find_timing_paths -endpoint_path_count 1`.
+- **Fixture** `sta_edge/hold_violation/`: `clk -> u_clkb (clkbuf_2) -> c1 -> u_ff0/u_ff1/u_ff2
+  CLK`; `d_in` drives `u_ff0/D` and `u_ff2/D` directly (zero data delay) and `u_ff0/Q ->
+  u_ff1/D`; `u_ff1/Q -> y`. `ideal.sdc` and `propagated.sdc` share the constraints
+  (`-min 0.0` input delay, 0.1 ns hold uncertainty) so both modes have real hold violations:
+  OpenSTA reports 2/4 endpoints violated, WNS min -0.0646 ns ideal / -0.1432 ns propagated.
+  Golden `hold_violation.reference.json` holds both modes, emitted by the committed
+  `generate_ref.sh` (two `openroad` runs inside the pinned LibreLane image).
+- **Root-cause fix (the R2 residual)**: the propagated clock's source slew is the clock
+  port's `set_input_transition`, not `set_clock_transition` and not zero. Evidence:
+  `report_slews` shows 0.15 at directly connected clock pins under
+  `set_input_transition 0.15 [all_inputs]` (propagated_clock) and 0.00 under
+  `set_input_transition [get_ports d_in]` only (hold_violation); `set_clock_transition`
+  values 0.1 and 1.0 leave arrival and slew unchanged, so it never reaches the propagated
+  network. Seeding `tr = input_transition_ns(clk_port)` made `propagated_clock` match
+  OpenSTA to **0.34 ps worst** (was 22.8 ps) and `hold_violation` to **0.0 ps** in both
+  modes — the earlier "per-cell NLDM residual" was this slew error all along.
+- **Min path**: the early/late split was already plumbed in R2 (`arrival_min`, `slew_min`,
+  `derate_early` on data and clock alike); this fixture is the first with real propagated
+  hold violations and it matches OpenSTA on violation count, WNS/TNS and every per-endpoint
+  min field exactly (zero wire, `Tol::STRICT`).
+- **Verification**: `cargo test --workspace` 184 passed / 0 failed / 7 ignored;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean. New tests
+  `test_sta_edge_hold_violation_{ideal,propagated}`; `test_sta_edge_propagated_clock` now
+  runs at `Tol::STRICT`.
+- **Review fixes (Hydrogen, `subcon review --target`, verdict reject)**: ideal-clock latch
+  borrow `opening_max` now subtracts `set_clock_uncertainty -setup` like the propagated
+  branch (S1); the data pass no longer lets a reached net driver overwrite the clock state
+  seeded on clock-net pins (`!graph.clock_net` guard on the sink transfer, S1); `clock_net`
+  marks are pruned to nets that can still reach a clock-edge consumer, so clock-fed
+  branches that only drive data logic (clock dividers, clock-as-data) are no longer
+  blocked or flagged as clock gates (S1); `latch_opens` only accepts `falling_edge` arcs
+  out of the enable pin (S2). Deferred with rationale: `port_drive` still collapses
+  driving-cell arcs to max delay/slew for both corners (pre-existing R1 approximation,
+  needs a fixture to measure); a `set_driving_cell` rule covering the clock port under
+  propagation is not modelled (no OpenSTA measurement yet); multi-driver nets remain
+  rejected upstream; empty-endpoint WNS serialises as JSON null (carried over).
+
+## 2026-11-17 — R7: timing derate and CRPR (v0.1.62)
+
+- **OpenSTA syntax measured** (pinned `ghcr.io/librelane/librelane:3.0.16`, `openroad` Tcl
+  probes on `sta_edge` DEFs): `set_timing_derate -early|-late [-rise|-fall] [-clock|-data]
+  [-net_delay|-cell_delay|-cell_check] <derate> [objects]`. `-early`/`-late` are mutually
+  exclusive per command and the value is positional — `write_sdc` emits them as separate
+  commands, which the parser now requires too (`-early X -late Y` in one command is
+  rejected, matching OpenSTA's error). Repeated commands are last-wins per selected
+  category, order-independent. A bare corner flag covers cell+net delays on clock+data
+  paths and both transitions but **not** `-cell_check`; `-cell_check` is data-side only
+  (`-clock` never reaches check arcs, measured). `-rise`/`-fall` select the transition
+  **entering** the arc (source polarity), verified against `report_checks`: on the
+  inverting `clkinv` path a rise arrival launches fall-sourced arcs. `[objects]` scoping
+  is rejected (the model cannot honour it; R0-style loud failure).
+- **Corner application**: `-early` derates the early/min quantities and the setup
+  required time through the early capture-clock side; `-late` the max quantities and
+  hold required time — matching OpenSTA endpoint fields within ~1 ps on asymmetric
+  probes (`early 0.1 / late 5.0` included).
+- **CRPR**: with different early/late derates on a shared propagated clock, OpenSTA
+  removes the common-path pessimism — measured as a 21.6 ps residual on the only
+  register-to-register endpoint of the fixture before the fix. Implemented for the
+  case the fixture exercises: launch and capture clock pins on the **same net**. The
+  launch side is resolved by tracing the check pin's drivers back to flip-flop `Q`
+  pins (`crpr_sink_net`/`crpr_driver_net`, memoized); ports, latches, undriven pins and
+  mixed sources yield no credit (conservative). The credit is the `arrival_max -
+  arrival_min` spread at the clock net's driver pin — the last shared point — added to
+  the setup required time and subtracted from the hold required time. Divergent clock
+  trees (different nets sharing a prefix) get no credit; that needs path-parent
+  tracking and is recorded as a limitation.
+- **Fixture** `sta_edge/timing_derate/`: `hold.def` topology (`clk -> u_clkb -> c1 ->
+  3 FFs`, one register-to-register path `u_ff0 -> u_ff1`) — `propagated_clock.def` was
+  rejected for the ideal run because its inverting clock path hits the documented
+  ideal-mode launch-parity approximation (a full-period min-arrival shift, unrelated to
+  derate). `ideal.sdc`/`propagated.sdc` carry `write_sdc`-style `-early/-late` pairs plus
+  selector coverage (`-cell_check`, `-clock`/`-data`, `-cell_delay -rise/-fall`). Golden
+  `timing_derate.reference.json` emitted by the committed `generate_ref.sh`.
+- **Verification**: `test_sta_edge_timing_derate_{ideal,propagated}` pass — all
+  endpoints, WNS/TNS and violation counts within tolerance (propagated needed the CRPR
+  credit to match `u_ff1/D` required times exactly). `cargo test --workspace` 183
+  passed / 0 failed / 7 ignored; `cargo clippy --all-targets -- -D warnings` clean. New
+  `timing_derate_selectors_and_last_wins` SDC test covers mutual exclusion, positional
+  value, per-category last-wins, `-cell_check` data-only and object-scope rejection.
+- **Not covered**: `-net_delay` has no observable effect on zero-wire fixtures (wire
+  delay is zero); SPEF-backed derate runs are untested. `-cell_check` was verified on
+  register checks only.
+- **Review fixes (Hydrogen, `subcon review --target`, verdict reject)**: ideal-clock
+  `dlxtn` latch launches now pass FALL (not RISE) as the edge polarity so `-fall`
+  derates reach the arc — the ideal clock seeds both transitions identically, so only
+  the derate index changes (S1). `port_drive` derates each driving-cell arc by its
+  **source** transition before the cross-source maximum and returns separate
+  early/late delays, fixing `-rise`/`-fall` derates on inverting `set_driving_cell`
+  drivers such as the `inv_2` stock `write_sdc` emits (S2). Stale comments claiming
+  the fixture uses the `propagated_clock` DEF corrected to the `hold.def` topology
+  (S3). The fixture SDCs gained `-cell_check -rise`/`-fall`; OpenSTA accepts every
+  selector combination probed (`-cell_check -clock` verified to have no effect,
+  `-cell_check -rise` ≡ plain, `-cell_check -fall` distinct) and the regenerated
+  golden still matches.
+- **Deferred with rationale**: same-net CRPR credits the full `arrival_max -
+  arrival_min` spread at the clock net driver, which can over-credit if
+  reconvergent clock logic upstream produces different early/late paths — proper
+  per-path common-point tracking is not implemented and the direction is optimistic,
+  recorded here as a known approximation (S2). `gating_enables` checks do not get
+  CRPR credit yet (needs an FF-driven enable fixture; belongs with the R4 clock-gating
+  work) (S2). `-net_delay` is unverifiable on zero-wire fixtures — SPEF-backed derate
+  runs are untested; latch and inverting driving-cell derate paths are modelled but
+  not covered by the fixture golden (S2).
+
+## 2026-11-17 — Roadmap R6: asynchronous arcs (`dfrtp`/`dfrtn`, ideal + propagated)
+
+- **Scope measured on OpenSTA 3.0.16 (LibreLane container)**: `clear`/`preset` arcs
+  (`RESET_B -> Q`, `SET_B -> Q`) are **not propagated** into ordinary timing paths.
+  On `sta_edge/async_reset` (`dfrtp_1`), `find_timing_paths -from rst_n -through
+  u_ff0/Q` returns no path and `report_arrival u_ff0/Q` shows only clock-derived
+  arrival; OpenSTA checks recovery/removal (and min pulse width internally) on the
+  async pin only. grus-eda therefore keeps `Clear`/`Preset` arcs in the R0 skip
+  count instead of propagating them — propagating would diverge from the reference
+  tool. The roadmap's "downstream endpoints reached through a Clear/Preset arc"
+  clause is vacuous for this OpenSTA version: no such endpoints exist.
+- **Falling variants implemented**: `recovery_falling`/`removal_falling` added to
+  `TimingType` + Liberty parser; `SetupFalling`/`HoldFalling`/`FallingEdge` arcs
+  (previously all unsupported) now build checks/launches. `RegisterCheck.edge` and
+  `LaunchArc.edge` carry the check/launch clock polarity; `collect_endpoints` uses
+  the matching clock transition for arrival, slew, parity and CRPR spread. Under
+  the ideal clock (both transitions seeded at the latency) a falling edge sits half
+  a period later and has parity 1 — matching the propagated-clock convention
+  (`parity = [0, 1]` at the source port).
+- **Stale-cache bug found and fixed**: `TimingType` gained variants mid-enum, which
+  shifted discriminant values; the `.libcache` binary cache (`CACHE_VERSION = 1`)
+  then deserialized old `Other` arcs as `RemovalFalling`, producing bogus
+  self-pin removal checks (`CLK -> CLK`) on every FF. `CACHE_VERSION` bumped to 2;
+  caches deleted. This class of bug is why enum layout changes must bump the
+  cache version.
+- **Fixtures**: `sta_edge/async_reset/` (`dfrtp_1`, rising recovery/removal) and
+  `sta_edge/async_fall/` (`dfrtn_1` inverting clock — falling setup/hold on D,
+  `falling_edge` launch into a rising capture at `u_ff1/D`, falling
+  recovery/removal on `RESET_B`). Both run ideal and propagated; goldens emitted
+  by the committed `generate_ref.sh` in `ghcr.io/librelane/librelane:3.0.16`.
+- **Verification**: `test_sta_edge_async_{reset,fall}_{ideal,propagated}` — all
+  endpoints match OpenSTA within `Tol::STRICT` (async check pins included;
+  `u_ff0/RESET_B` max slack 3.586 vs 3.556 ns on the reset fixture is inside the
+  strict slew/arrival bands). `cargo test --workspace` 188 passed / 0 failed /
+  7 ignored; clippy clean.
+- **Not covered**: `dfbbn`/`dlrtp`/`dlrbp`/scan `sdf*` cells (set+reset or latch
+  shapes — latch side is R5); `non_seq_*` arcs remain `Other`; Clear/Preset
+  propagation deferred unless a future OpenSTA version models it (would need
+  re-measurement, not assumption).
+
+### R6 review fixes (same day, `v0.1.64`)
+
+An external read-only review rejected the first R6 commit; every S1/S2 finding was
+reproduced or fixed:
+
+- **Launch-edge parity is now tracked through the data graph** (was S1). Each
+  arrival extreme on `PinTimingState` carries `par_max`/`par_min`: the clock-edge
+  index parity (mod 2) of the launch edge that produced it — 0 for primary inputs
+  and rising launches, the propagated clock's tracked parity for clock-launched
+  arcs, half-period/FALL convention under the ideal clock. Parity propagates
+  unchanged through combinational arcs and net wire delay. `collect_endpoints`
+  compares it against the capture pin's first-edge parity (`c0`): the setup
+  capture edge is the first edge of the check polarity strictly after the launch
+  edge, so the required time gains a period unless `c0 > launch_parity`; hold
+  shifts the min arrival by a period under the mirror condition. Before this fix
+  a `dfrtn_1 -> dfrtn_1` path (same-edge-1 launch and capture) reported
+  `u_ff1/D` max required 2.5178 ns vs OpenSTA's 6.5178 ns — a full period early,
+  with a false setup violation (design WNS -0.521 ns vs OpenSTA's +0.956 ns).
+  New fixture
+  `sta_edge/async_fall_chain/` covers exactly this pair plus a mixed-polarity
+  `dfrtn -> dfxtp` endpoint on the same clock net; both modes match OpenSTA
+  strictly on all fields.
+- **`topological_levels` released net sinks on any `pin_is_driver` pin** (was
+  S1). The indegree is charged against `design.net_driver(net)`, so release now
+  requires `net_driver(net) == pin` and skips the driver pin itself — an INOUT or
+  second driver can no longer double-release sinks and underflow indegrees.
+- **CRPR credited the capture edge's spread regardless of the launch
+  transition** (was S2). The launch trace now packs `net * 2 + launch_edge` and
+  credit is granted only when the launch edge polarity equals the check edge —
+  a falling launch no longer collects the rising transition's early/late spread.
+  Mixed launch edges on converging paths resolve to no credit (conservative).
+- **Ideal clock did not seed latch enables** (was S3). `latch_opens` enables are
+  now seeded like other clock consumers, so `-fall` derates and arrivals reach
+  the latch open consistently with the propagated mode.
+- **Deferred (documented, not fixed)**: `port_drive` collapses early/min and
+  late/max driver behaviour into one slew (R1-era approximation, needs a
+  fixture); RC shielding differences vs a real DMP driver response (same
+  fixture dependency).
+
+### R6 second review round (same day)
+
+A follow-up read-only review of the parity fix plus the surrounding files
+returned reject again; dispositions:
+
+- **Fixed — clock-gate enables ignored launch parity** (S1): the
+  `gating_enables` endpoint now applies the same `c0` vs `par_max`/`par_min`
+  rule as register checks, per data polarity. Required times are computed per
+  polarity inside the loop. Existing fixtures are unchanged (their enables
+  launch at parity 0).
+- **Fixed — latch `opening_max` could sit one period early** (S1): under a
+  propagated clock the opening fall is now aligned to the closing edge's cycle
+  by whole periods (`floor((closing - first_fall) / period)`), instead of
+  always using the first fall arrival. The non-inverting case resolves to the
+  same value as before; the inverting-clock + parity-1-launch corner moves one
+  period later. No dedicated fixture yet — recorded as a residual.
+- **Fixed — `port_drive` early delay used `.max`** (S1): raw driving-cell
+  delays are now tracked as per-(output, source) min and max; `early` takes the
+  minimum derated value so `arrival_min` is not inflated on non-unate or
+  multi-input driving cells. Single-input `inv`/`buf` drivers are unaffected
+  (one arc per transition pair).
+- **Fixed — Liberty parser robustness** (S1/S2/S3 batch): NLDM tables pad a
+  missing axis symmetrically and validate `values.len() == index_1 * index_2`
+  (previously `index_2`-only or undersized tables could panic `eval_2d`);
+  arcs with missing/unresolvable `related_pin` are dropped instead of
+  fabricating self-loop arcs; unknown attribute statements inside
+  cell/pin/timing bodies are skipped whole so values cannot alias keywords
+  (`cell_footprint : latch;` no longer sets `is_latch`); unterminated bodies
+  now error instead of returning partial parses; `capacitive_load_unit`
+  accepts `pf`/`ff`/`nf`/`uf` explicitly and rejects the rest; `u16` id/count
+  casts are checked; `LibDb` defaults `time_unit_ns`/`cap_unit_pf` to 1.0;
+  `ff`/`latch` state-variable pins sharing a `pin()` name reuse the slot
+  instead of duplicating; redundant map rebuilds after parse removed.
+  `CACHE_VERSION` bumped to 3 for the parser changes.
+- **Deferred — documented limitations**: `gating_enables` cannot distinguish
+  AND from OR/NAND clock gates (identical positive-unate signature; needs cell
+  function info Liberty does not provide); multiple `timing()` arcs targeting
+  the same check pin still overwrite each other (`when`-conditional arcs are
+  skipped entirely, so this needs same-condition duplicates — scan `sdf*`
+  cells, unused by current fixtures).
+
+### R6 third review round (same day)
+
+A further read-only review of the parser hardening and parity changes returned
+reject again; dispositions:
+
+- **Fixed — empty-paren NLDM table headers truncated the library** (S1):
+  `cell_rise () { ... }` made `parse_nldm_table` consume `{` as the missing
+  `)`, return `Ok(None)`, and let the table's `}` close the enclosing `timing`
+  body early — silently dropping the rest of the file. All `( name ... )`
+  headers (`library`, `cell`, `lu_table_template`, NLDM tables) now read to
+  the closing paren via `read_paren_header`, and nameless `cell`/`template`
+  bodies are skipped whole instead of desynchronising the library loop.
+- **Fixed — template `index_*` scaled before `variable_*` was known** (S2):
+  `lu_table_template` bodies may declare `index_1`/`index_2` before
+  `variable_1`/`variable_2`; the capacitance axis was then scaled by
+  `time_unit` instead of `capacitive_load_unit`. Indices are now stored raw
+  and scaled once the body closes. Covered by
+  `test_template_index_scaled_after_variables`.
+- **Fixed — empty or headless Liberty input returned `Ok`** (S2): inputs with
+  no `library (name) { ... }` body now bail. Covered by
+  `test_liberty_without_library_body_is_an_error`.
+- **Fixed — latch `opening_max` omitted FALL-edge CRPR credit** (S2): the
+  credit computation is now a `credit_for(trans)` closure; the propagated
+  opening fall gets the same shared-path spread credit when the launch edge
+  polarity is FALL. No dedicated fixture covers propagated-clock latch +
+  asymmetric derate yet — recorded as a residual below.
+- **Fixed — dead `c0 == 1` hold shift in ideal `gating_enables`** (S3): the
+  ideal clock has no parity, so the branch was unreachable; removed and the
+  comment now states clock-network inversions are propagated-clock only.
+- **Fixed — `parse_nldm_table` lacked close/skip guards** (S3): the body loop
+  now tracks `closed` and bails on EOF, and unknown attributes are skipped
+  whole (stopping at `;`, a nested group, or the table's `}` — NLDM entries
+  carry no semicolons, so `skip_statement_or_group` alone would have run past
+  the closing brace).
+- **Fixed — `expected_latch_skips` drifted from `build_graph`** (S3): the
+  independent recount now matches on `SetupFalling`/`HoldFalling` checks and
+  requires `FallingEdge` for open arcs.
+- **Deferred — `port_drive` ignores `pi_models` on RC nets** (S2): with
+  parasitics, a `set_driving_cell` port's slew is still evaluated at the
+  lumped `net_load` instead of the DMP pi-model response. Same fixture
+  dependency as the existing `port_drive` early/late deferral (needs a
+  `set_driving_cell` + SPEF design); recorded, not fixed.
+
+### R6 fourth review round (same day, verdict: changes)
+
+A follow-up review returned `changes` (no S1); dispositions:
+
+- **Fixed — `skip_statement_or_group` ran past `}`** (S2): it now returns
+  whether it consumed the enclosing group's closing brace, and the library,
+  cell, pin, timing, and template body loops treat that as their own close.
+  An unknown attribute without a trailing `;` before `}` no longer
+  desynchronises the parse.
+- **Fixed — `pin (A, B)` multi-name headers** (S2): the header is drained to
+  `)`; only single-name declarations are modelled, anything else has its
+  group skipped instead of leaking `,`/`B` into the body parser.
+- **Fixed — `parse_template_body` keyword aliasing** (S2): unknown
+  attributes are skipped whole with the same `}`-aware rule.
+- **Fixed — `port_drive` reported max slew for both extremes** (S2): slew
+  min/max are now tracked independently per output transition. The
+  `pi_models` part of the same finding stays deferred (above).
+- **Fixed — unterminated `/* */` comment emitted a token** (S3): the lexer
+  now consumes to EOF.
+- **Fixed — `opening_max` computed for non-latch checks** (S3): guarded by
+  `check.latch`.
+- **Deferred — documented limitations**: multiple conditional check arcs on
+  one pin still overwrite each other (needs `when`-conditional modelling);
+  `gating_enables` can still misclassify non-AND positive-unate cells such as
+  clock muxes (Liberty carries no cell function); CRPR credits only when
+  launch and capture share the exact clock net — multi-stage clock trees stay
+  pessimistic, which is the safe direction; `gating_enables` endpoints get no
+  CRPR credit (same safe direction); data sinks on retained `clock_net` nets
+  stay unreached (clock-as-data is not a supported shape); `wns_*` is
+  `INFINITY` on an empty endpoint set.
+
+### R6 fifth review round (same day, verdict: changes)
+
+Another `changes` verdict (no S1); dispositions:
+
+- **Fixed — `pin (A, B)` now errors** (S2): multi-name pin declarations are
+  not valid Liberty; they bail instead of being silently skipped.
+- **Fixed — `capacitive_load_unit` drains to `)`** (S3): extra arguments can
+  no longer leak into library-body keyword matching.
+- **Fixed — `parse_time_unit` is case-insensitive** (S3).
+- **Deferred — acknowledged, not fixed**: `port_drive` still lacks dedicated
+  `set_driving_cell` test coverage and ignores `pi_models` (fixture
+  dependency, recorded above); `RegisterCheck` single-arc-per-kind and
+  missing late/early independence (same `when`-conditional limitation);
+  multi-stage-tree CRPR and `gating_enables` CRPR (pessimistic, safe);
+  `clock_net` data sinks (unsupported shape); ff/latch parser duplication
+  and `test_cache_roundtrip` cache isolation (test hygiene).
+
+## 2026-11-17 — Roadmap R4: combinational and integrated clock gates (v0.1.66)
+
+`sta_edge/clock_gate` exercises `and2`/`or2`/`nand2`/`nor2` plus the `dlclkp`
+integrated clock-gating cell, with `dfrtn` flip-flops on the inverting-gate
+outputs so the propagated clock sees both edge polarities.
+
+### Measured OpenSTA 3.0.16 semantics
+
+- The Liberty `function` attribute on the output pin is what distinguishes the
+  gate kinds — `and2`/`or2` carry identical positive-unate timing arcs. AND/NAND
+  report "rising clock gating-check end-points" (setup vs the clock rise at the
+  gate input, hold vs the preceding fall); OR/NOR report "falling" ones with
+  both edges swapped and the min arrival one period later. `nand2`/`nor2` are
+  classified by their negated-literal functions (`(!A)|(!B)`, `(!A&!B)`).
+- `dlclkp` declares `clock_gate_clock_pin`/`clock_gate_enable_pin`/
+  `clock_gate_out_pin` attributes, has `setup_rising`/`hold_rising` arcs on GATE
+  related to CLK, and no `function` on GCLK. Its GATE check is an ordinary
+  register check and CLK->GCLK propagates through the combinational arc — no
+  special-casing was needed.
+- Under the ideal clock, OpenSTA still sees the nand/nor inversion (the
+  `dfrtn` capture lands on the effectively-rising edge), so our ideal model —
+  which does not track edge inversion through cell-driven clock nets — is off
+  by half a period on those two FFs' D and RESET_B endpoints. Same documented
+  limitation as `clkinv` in the timing_derate fixture.
+
+### Implementation
+
+- `LibPin.function` stores the interned `function` expression (cache version
+  bumped); `gate_kind` parses it into a single-level AND/OR of literals and
+  classifies Rising/Falling, rejecting muxes and partial functions instead of
+  misclassifying them as AND.
+- `gating_enables` now carries `(enable, clk_pin, kind)`; negative-unate arcs
+  qualify for NAND/NOR, and the required-time formula is unified on
+  `pe = edge_parity(clk_pin, setup_edge)` — identical to the previous AND-only
+  rule for Rising and the swapped-edge rule for Falling.
+- Cells without a `function` attribute keep the legacy positive-unate AND
+  guess.
+
+### Results
+
+- `sta_edge/clock_gate` propagated: all 13 endpoints match OpenSTA strictly
+  (arrivals, required times, slacks, slews, WNS/TNS, violation counts),
+  including the four gate-enable checks and the `dlclkp` GATE check.
+- Ideal: enable-pin endpoints match; the two `dfrtn` FFs on inverting gate
+  outputs are off by half a period — `#[ignore]`d with the reason recorded.
+- Six `min_pulse_width` arcs remain counted `unsupported_arcs[Other]` skips.
+
+### 2026-11-17 — R8 — sky130 library and corner coverage
+
+- **Scope decision**: one Liberty library per `sta` run. Multi-corner analysis
+  (separate setup/hold libraries, `-min`/`-max` parasitics) is **out of scope**:
+  the CLI takes a single `--lib`/`--spef`, and no SDC construct in the verified
+  corpus selects a corner. Each PVT point is verified as an independent run.
+- **Method**: `sta_edge/propagated_clock` (`propagated.def` + `edge.sdc`,
+  propagated clock through a buffered/inverting tree, an AND gate and a
+  `dlxtn` latch) run through OpenSTA inside `ghcr.io/librelane/librelane:3.0.16`
+  and through `grus-eda sta` on every `sky130_fd_sc_hd` timing corner present in
+  `~/.ciel/sky130A/libs.ref` (16 `.lib` files, excluding the two `_ccsnoise`
+  variants which carry identical timing content). Comparison: all endpoint
+  fields (arrival, required, slack, slew, both edges) at `max(5 ps, 1%)`.
+- **Result**: 15 of 16 corners match on all 12 endpoints with zero mismatches,
+  including the slowest (`ss_n40C_1v28`) and fastest (`ff_100C_1v95`) corners.
+  `ss_n40C_1v35` has one residual: `u_ff5/D` and `u_ff6/D` `max_arr_ns` are
+  6.0 ps low (5.3719 vs 5.3779 ns), which propagates to `max_slack_ns`
+  (-0.5380 vs -0.5440, -0.0619 vs -0.0679). `report_checks` shows the whole
+  difference is the launch-side clock arrival at `u_lt/GATE_N` (the `c_and`
+  net driven through the `u_and` clock gate); required times, slews and all
+  min-edge fields match to ~1e-6. This is a corner-specific NLDM residual on
+  the gated-clock path, 0.18% of the 3.34 ns arrival — recorded, not fixed.
+- **Other library families** (`grus-eda check-e0 --lib`, parse-level only):
+  `sky130_fd_sc_hvl__tt_025C_3v30.lib` loads (57 cells, 318 arcs);
+  `sky130_fd_sc_hd__ff_n40C_1v95_ccsnoise.lib` loads with identical counts to
+  its timing twin (428 cells, noise tables skipped); a `sky130_ef_io` pad
+  wrapper loads (1 cell). `sky130_fd_pr` and `sky130_ml_xx_hd` ship no
+  `.lib`; `sky130_sram_macros` `.lib` files are memory wrappers, untested.
+  STA agreement is verified only for `sky130_fd_sc_hd`; hvl/io/sram are
+  parse-accepted but not STA-verified (no matching fixtures).
+- **PDK layouts**: `sky130A` and `sky130B` `libs.ref` contents are identical
+  for the tested library (byte-compared `tt_025C_1v80`).
+
+### 2026-11-17 — R9 — recorded decisions on the carried-over gaps
+
+- **R9.1 placement RC vs OpenROAD's estimate (`picorv32`/`aes`/`ibex`/`jpeg`)**:
+  decision — the four tests stay `#[ignore]`d. Matching OpenROAD's
+  `estimate_parasitics -placement` requires a FLUTE-equivalent rectilinear
+  Steiner tree builder (OpenROAD's `stt`, BSD-3; readable but not copyable)
+  plus its exact per-branch pi-model construction; our exact RSMT solver is
+  *shorter* than FLUTE on most multi-pin nets, so the residual is structural,
+  not a tuning gap (E3.4). The value of exact agreement is also limited: E3.4
+  measured OpenROAD's own estimate ~150 ps median off routed truth on gcd,
+  an order of magnitude above the strict criterion. `gcd` placement RC remains
+  the passing coverage; the ignored tests keep their measured field counts.
+- **R9.2 picorv32 E1 hot-set overlap**: investigated, then the criterion was
+  relaxed `0.50 -> 0.45` (roadmap's recorded-decision branch). Measurements on
+  the current estimator: aes `0.7296/0.6613`, ibex `0.6452/0.5636`, jpeg
+  `0.5000/0.5238`, picorv32 `0.6304/0.4698` (H/V). picorv32 V was the only
+  failure at 0.50. Attempts before deciding: Pass-2 route cost switched from
+  pure `overflow_cost` to the Pass-3 `edge_cost` logistic — regressed every
+  design (ibex H `0.6452 -> 0.3978`, jpeg H `0.5000 -> 0.3333`), reverted;
+  Pass-3 rip-up margins extended `2,3,4 -> 2,3,4,6,8` — no measurable change,
+  reverted. Diagnostics showed the disagreement is demand *placement*, not
+  capacity accounting alone: our V demand on reference-hot edges runs 0.43-0.86
+  of the reference ratio while totals differ ~2.3x (OpenROAD's dump appears to
+  count usage per layer). Closing the residual needs FastRoute-grade
+  negotiated-congestion fidelity — the same open F2 follow-up class as the
+  (now passing) jpeg/ibex maps. `test_picorv32_congestion_map` is un-ignored;
+  README and `docs/e1-congestion.md` record the 0.45 floor. The relaxation is
+  acknowledged as fitted to the four measured designs; it still rejects
+  empty or misplaced hot sets.
+
+### 2026-11-18 — R5 — latch `D -> Q` propagation and time borrowing
+
+Model derived from OpenSTA probes (`report_checks`/`find_timing_paths` on a
+hand-written `dlxtn`/`dlxtp` fixture inside `ghcr.io/librelane/librelane:3.0.16`,
+period 5.0 ns, uncertainty 0.1 ns, arrival sweeps at the latch `D`):
+
+- **Endpoint required time** for a latch `D` inside the transparent window is
+  `min(arrival, closing_required)` where `closing_required` is the normal
+  setup required time of that transition — the closing edge minus uncertainty
+  and the transition's own setup arc value. Arrivals before the opening edge
+  keep normal required time; arrivals inside the window get `req = arr`
+  (zero slack); arrivals past the close edge violate with `req` clamped at the
+  cap. OpenSTA reports the transition with the worst slack, so the per-
+  transition `min` matches `u_lp/D` (rise `-0.92` reported over fall `-0.80`).
+- **Startpoint launch** through `D -> Q` is `min(arrival(tr), close_edge -
+  uncertainty - setup(tr))` — the same per-transition cap. Arrival before the
+  opening edge instead launches through the enable's clock-to-Q arc at the open
+  edge (the pre-R5 behaviour, kept).
+- **Transparent arcs propagate the same transition** at both ends: OpenSTA's
+  `report_checks` shows `v` at `D` -> `v` at `Q`/`Q_N` even where the Liberty
+  arc is `negative_unate` (`dlxb*`/`dlrb*` `D -> Q_N`), so the borrow edge
+  clamps and delays each polarity against the same-polarity arrival.
+- **Polarity**: `latch_enable` reads the check arc type — `setup_rising`
+  (`dlxtn`/`GATE_N`, opens on FALL) vs `setup_falling` (`dlxtp`/`GATE`, opens
+  on RISE) — instead of assuming FALL; `LatchOpen`/`LatchInfo` carry
+  `open_pol`, and the open-edge offset convention (half period for FALL under
+  the ideal clock) applies symmetrically.
+
+Fixture `tests/designs/sta_edge/latch_borrow/` instantiates every
+`sky130_fd_sc_hd` latch shape (`dlxtn/dlxtp`, `dlxbn/dlxbp`, `dlrtn/dlrtp`,
+`dlrbn/dlrbp`, `lpflow_inputisolatch`) fed by `buf_2` delays chosen so `D`
+arrivals land before, inside and after the borrow windows; latch `Q`/`Q_N`
+drive `dfxtp` `D` pins and `RESET_B` pins carry recovery/removal checks. Both
+`ideal` (port clock) and `propagated` (`set_propagated_clock` through `u_clkb`)
+modes match OpenSTA **strictly on all 31 endpoints** (11 latch `D`, 4 latch
+`RESET_B`, 15 FF `D`, output `y`), max and min, arr/req/slack/slew/WNS/TNS/
+violation counts. `generate_ref.sh` reproduces the golden inside the pinned
+container. The older `non_dlxtn_latch` fixture (`dlxtp`) now passes strict and
+is un-ignored; `test_skip_report_counts_latch_arcs` recounts drops: only
+`min_pulse_width` arcs remain per latch cell.
+
+Recorded restriction: a latch `D -> Q` cycle (latch feeding another latch's `D`
+through combinational logic only, or a latch `D` looped back) is a
+combinational cycle and levelisation rejects it with an error — no
+phase-iterative fixed point is invented. OpenSTA resolves such loops with
+iterative relaxation; none of the public fixtures or sky130hd designs exercised
+one, so the restriction is a documented gap, not silently approximated.
+
+### 2026-11-18 — R10 — CI wiring for the sta_edge goldens
+
+- `.github/workflows/ci.yml` `generate` job gained a step that runs all eleven
+  `tests/designs/sta_edge/*/generate_ref.sh` scripts (each re-executes itself inside
+  `ghcr.io/librelane/librelane:3.0.16`) and then asserts `git diff --exit-code` and an
+  empty `git status --porcelain` on `tests/designs/sta_edge/`. This is the fixture
+  analogue of the "golden must come from the committed script, run as written" rule:
+  a hand-edited or drifted `*.reference.json` fails the generate job.
+- Decision recorded: no artifact upload for sta_edge — DEFs/SDCs are hand-written and
+  committed, goldens are committed (< 1 MB each), so only the large routed
+  picorv32/aes/jpeg/ibex inputs keep the `reference-inputs` artifact.
+- Local verification of the exact CI step (2026-11-17): all 11 scripts rerun, every
+  golden reproduced byte-identically, `git status` clean.
+- `#[ignore]` audit: the remaining ignored tests are the four placement-RC/SPEF
+  out-of-scope cases (`picorv32`/`aes`/`ibex`/`jpeg` placement RC, `jpeg` placed SPEF)
+  and `clock_gate` ideal (ideal clock does not track cell-driven clock-net inversion);
+  each carries its measured reason in the attribute and in this file.
+
+### 2026-11-18 — R9.1 — OpenROAD Prim-Dijkstra placement tree (`congestion/pdr.rs`)
+
+- **What changed**: the placement-RC tree builder is now a port of OpenROAD's
+  `pdr::primDijkstra` (stt module, `alpha = 0.3`; BSD-3-Clause source read at the
+  pinned revision, own Rust implementation): nearest-neighbor bounding-box
+  selection over `(y, x)`-sorted points, alpha-weighted Prim-Dijkstra spanning
+  tree, Steiner-point insertion, degree-4 node splitting, and `checkTree`
+  (crossing bounding boxes; `deg > 100` skips). `estimate_placement_parasitics`
+  ships `build_pd_points`; the RSMT builders remain for E1 and the A/B tests.
+- **Tree equivalence vs OpenROAD's own SPEF** (`*.routed.spef` is
+  `estimate_parasitics -placement -spef_file` output for all five designs):
+  - Per-net total wire length: identical on every net (worst |diff| < 0.005 um,
+    SPEF print precision).
+  - Per-net edge-length multiset: **0 mismatches on all 78,749 nets**
+    (gcd 268, picorv32 6,743, aes 9,038, ibex 12,127, jpeg 46,567) after
+    filtering the SPEF's 1e-6 kohm pin-connect links.
+  - `checkTree`: **0 failures on all 78,749 nets**, so OpenROAD's FLUTE fallback
+    never triggers on these designs — the PD tree is the whole story here.
+  - Node-cap multiset: identical except 9 nets (8 ibex, 1 jpeg) where coincident
+    points are merged by coordinate in `build_net_tree` (`ours_nodes =
+    ref_nodes - 1`); total wire capacitance is preserved and a merge of
+    zero-edge-adjacent nodes is electrically exact, so this stays diagnostic.
+- **Timing vs the `placement_rc` golden** (`cargo test --release`, ignored tests
+  run explicitly):
+  - `picorv32`: **PASS** — un-ignored. (Was 56 failing fields under the RSMT
+    tree.)
+  - `gcd`: PASS (unchanged).
+  - `aes`: 913 -> **17 fields** (16 `max_slack_ns` off 0.009-0.016 ns, one
+    `max_slew_ns` off 5.24%; max arrival/required within 0.44%).
+  - `ibex`: 13,164 -> **3 fields** (all `max_slack_ns`, off 0.011-0.036 ns).
+  - `jpeg`: residual is now **identical to `placed_spef`'s** (WNS ours -78.084
+    vs ref -61.199 ns, TNS -134,605 vs -123,078 ns) — with edge-identical trees
+    the entire remaining error is the documented OpenSTA #582 out-of-table
+    NLDM extrapolation, not the tree or the estimator.
+- **Root cause of the aes/ibex residual**: not topology and not the wire model.
+  `test_pd_vs_spef_parasitics_agree` shows the PD-built and SPEF-readback RC
+  trees agree to <= 3e-6 ns per-pin Elmore on the bare wire (and <= 3.8e-3 ns
+  under a uniform 1 fF load) across all SPEF-present nets — the parasitics are
+  equivalent for timing purposes, so `placement_rc` measures the same engine
+  residual as `placed_spef` (the E3.5 cell-stage gap: driver waveform slew and
+  extreme-load Ceff). The failures were an artefact of `GCD_PLACEMENT`'s
+  stricter slack floor (5 ps) versus the SPEF modes' documented floors
+  (25/40 ps); `AES_PLACEMENT`/`IBEX_PLACEMENT` now use the SPEF tolerances and
+  both tests pass un-ignored. `jpeg` stays ignored: its residual is identical
+  to `placed_spef`'s OpenSTA #582 out-of-table case.
+- Tests: `test_pd_length_vs_placement_spef`, `test_pd_edge_multiset_vs_placement_spef`
+  (now asserts 0 edge mismatches), `test_pd_checktree_failures` (diagnostic).
+
+Review follow-up (luna6, same day): `checkTree` was re-verified against OpenROAD
+@ `dcf36133` `src/stt/src/SteinerTreeBuilder.cpp` — `rectAreaZero` is
+point-degenerate only, `odb::Rect::intersects` is inclusive, all branch pairs
+are compared, and `tree.deg > 100` skips; the port matches on all points.
+`checkTree` now runs in production builds too: `estimate_placement_parasitics`
+counts failures into `NetParasitics::pd_check_failed_nets` (pub, documented;
+`grus-eda sta` warns on stderr when nonzero) instead of silently keeping a PD
+tree where OpenROAD would fall back to FLUTE. The diagnostic tests now assert:
+per-net length equality, 0 edge-multiset mismatches, the measured coincident-
+merge cap counts (ibex 8, jpeg 1, else 0), and 0 `checkTree` failures.
+
+Second review round (luna6): `test_pd_vs_spef_parasitics_agree` now covers all
+78,749 SPEF-present nets (count asserted per design; SPEF legitimately omits
+nets like the ideal-clock port net) and compares per-pin Elmore twice — bare
+wire (worst 3e-6 ns) and with a uniform 1 fF load at every pin (worst 3.8e-3 ns
+on jpeg `ena`; SPEF pin nodes hang off 1e-6 kohm links and coincident merges
+shift where the load lands). The loaded bound is the 5 ps strict floor, so the
+claim is: PD and SPEF parasitics agree within the strict timing tolerance even
+under uniform load — not a proof of bit-identical networks.
+
+Third review round (luna6) added the decisive check, `test_placement_vs_spef_sta_agree`:
+our own STA engine run on `estimate_placement_parasitics` vs the SPEF readback
+of the same nets (`*.routed.spef` is OpenROAD's `estimate_parasitics
+-placement` output for these designs), same DEF/SDC. Worst per-endpoint field
+difference — aes 0.003 ps, ibex 0.013 ps, jpeg 0.633 ps; max/min WNS within
+0.61 ps (min side ~0 everywhere); max TNS within max(10 ps, 1% of reference)
+(ibex 17.6 ps summed over violating endpoints, jpeg 0.25 ns; min TNS
+identical). With
+placement and SPEF parasitics producing effectively identical STA results, the
+placement-vs-OpenSTA residual is the same engine gap `placed_spef` already
+tolerates, so `AES_PLACEMENT`/`IBEX_PLACEMENT` sharing the SPEF tolerances is
+justified rather than goalpost-moving. jpeg's larger 0.633 ps endpoint diff is
+informational only — its placement test stays ignored for the OpenSTA #582
+extrapolation case, unrelated to parasitics.
+
+### 2026-11-17 — Ideal clock tracks edge inversion through cell-driven clock nets
+
+- **Finding**: OpenSTA's *ideal* clock is not phase-blind. The `sta_edge/clock_gate`
+  golden shows `dfrtn` capture edges on `c_nand`/`c_nor` (nand2/nor2 outputs)
+  shifted a half period versus the non-inverting `c_or`/`c_and`/`c_icg` branches —
+  the ideal clock follows clock-network inversions for edge *phase* while still
+  ignoring cell delays. The previous implementation seeded both transitions at
+  the clock latency and could not see this (the reason
+  `test_sta_edge_clock_gate_ideal` was `#[ignore]`d).
+- **Implementation** (`crates/grus-core/src/sta/analysis.rs`):
+  - `ideal_clock_parity` walks the same levelized timing graph as
+    `propagate_clock` with no timing — each reached transition keeps the
+    clock-edge index parity (mod 2) of the source edge that produces it through
+    net wires and Liberty `timing_sense` polarities. `u8::MAX` = unreached;
+    non-unate ambiguity resolves to the first candidate in levelized order
+    (propagate_clock's incumbent-on-tie analog).
+  - Consumer clock pins (register `CLK`, check clock pins, latch enables, and
+    now clock-gate clock pins) are seeded at
+    `design_clock_latency + parity * period/2` per transition instead of both at
+    the latency; the seeded `par_max`/`par_min` masks record the producing edge
+    parity, so `edge_parity`/`launch_parity` report real parities under ideal.
+  - The phase is now inside the seeded arrivals, so the ideal-mode
+    `edge_offset`/`launch_offset`/`open_offset` corrections are gone; the latch
+    `opening_max` alignment and the clock-gate setup/hold formulas use the same
+    code path as propagated mode (`credit_for` still returns 0 under ideal).
+  - Unreached pins keep the old source-port convention (transition `pol` on
+    edge parity `pol`), so designs without inverting clock paths are
+    bit-identical — verified by the full suite.
+- **Verification**: `test_sta_edge_clock_gate_ideal` now passes at `Tol::STRICT`
+  and is un-ignored (all 13 endpoints, max/min, WNS/TNS/violations). Full
+  `cargo test --release --workspace`: 210 + 3 passed, 0 failed, 2 ignored
+  (jpeg OpenSTA #582 only). `cell_driven_clock_nets` still counts every
+  cell-driven clock net under ideal — the parity walk propagates edge phase,
+  not delays/slews.
+
+### 2026-11-17 — DMP residual root-cause: extreme-slew Ceff is a model-formulation gap, not a parameter
+
+- **Question**: the aes/ibex `placed_spef`/`placement_rc` residual (17 and 3
+  endpoint fields, slack ~16-37 ps, slew ~5%) concentrates on a handful of
+  driver stages at input slew 4-5.2 ns — beyond the Liberty table range. Is
+  the gap a tunable parameter (`RD_SCALE`, ramp fit, charge quadrature) or a
+  model-formulation difference?
+- **Method**: dumped `report_dcalc` rows for all five designs (23,722 rows)
+  and, for each, bisected the *constant* `rd` that makes our `solve_dmp`
+  reproduce OpenSTA's `Ceff` (`rd_root`), alongside `delay_slope`/`slew_slope`
+  at the reported `Ceff`. Diagnostic-only; no production change.
+- **Findings**:
+  - The pi model is exact: OpenSTA's `C1`/`Rpi`/`C2` match ours to <0.5% on
+    every row, so the RC reduction is not the cause.
+  - `rd = 3.0 * d(delay)/dC` is confirmed, not fitted noise: on the 64
+    well-conditioned shielded rows (`Ceff/total < 0.9`) `rd_root/dsl` has
+    median 2.94 (rise 2.96 / fall 2.94). Our delay table is linear in `C`,
+    so the slope is step-size independent.
+  - The residual is **fall-transition-specific and slew-driven**: at ref
+    `Ceff` our residual `pi_charge - 0.5*Ceff` is ~0 for rise rows but
+    +0.6..0.9% for fall rows, so our `Ceff` lands 1.5-2.6% high and delay
+    ~1.8% high (the ~16-37 ps slack, ~5% slew endpoint errors).
+  - The ramp duration is not the lever: sweeping `dt` 0..2 ns at fixed `rd`
+    moves the charge residual by <0.001 — `fit_ramp`'s degenerate `dt -> 0`
+    on fall arcs is not the cause.
+  - **Decisive**: on the clean `repro_extreme_ceff` 7-point slew sweep,
+    `rd_root` hits the search bounds — no `rd` reproduces OpenSTA's `Ceff`
+    for `fall` at input slew >= 1.5 ns (`<lo_bnd`) or `rise` at slew 6 ns.
+    OpenSTA's `Ceff` drops to 54-74% of total (fall) and is non-monotonic on
+    rise (2.10 -> 1.09 -> snaps to total at 9.14 ns). Our pi+ramp model's
+    minimum `Ceff` stays above OpenSTA's — the charge-equivalence
+    formulation itself cannot represent that regime.
+- **Conclusion**: the aes/ibex residual is the same phenomenon as OpenSTA
+  #582 — out-of-table NLDM extrapolation where OpenSTA's own `Ceff` is
+  non-monotonic and hits internal bailouts. `RD_SCALE = 3.0` is correct
+  wherever the model is conditioned; the remaining error is honest
+  extrapolation divergence, already covered by `AES_SPEF`/`IBEX_SPEF`
+  tolerances. No parameter change is justified; matching would require
+  curve-fitting OpenSTA's acknowledged-unsupported behaviour.
+
+### 2026-11-17 — `driver_waveform_slew` residual: unshielded rows carry a ~1.2 ps offset, extremes share the Ceff wall
+
+- **Question**: can the remaining endpoint slew error (~5%, `slew_rel` 5.5%
+  nearly maxed on aes) be reduced via `driver_waveform_slew` independently of
+  the Ceff gap?
+- **Method**: dumped `driver_waveform_slew` vs OpenSTA's `Driver waveform
+  slew` on all unshielded `report_dcalc` rows (`Ceff/total >= 0.97`, 30,340
+  rows across five designs) and tested alternative waveform evaluations
+  (rd_w variants, ramp-duration sources, forced pi-vs-lumped).
+- **Findings**:
+  - 98.7% of unshielded rows take our lumped bailout and return the table
+    slew; OpenSTA's value is ~`table - 1.2 ps` (median; ~2% on fast slews,
+    negligible on slow). The offset is ~constant in ps — not slew-, tin-, or
+    shielding-dependent — with a ±3 ps spread.
+  - No tested variant reproduces it: reusing the Ceff-solve ramp duration,
+    fitting dt to delay instead of slew, forcing the two-pole pi waveform on
+    bailout rows, and rd_w scaling all leave the ~2% median error unchanged.
+    It is consistent with an OpenSTA-internal waveform-shape / slew-definition
+    detail (GPL), not a tunable parameter.
+  - Shielded rows are already good (`driver_waveform_slew` median 0.5-0.7%);
+    the endpoint slew failures sit on the same extreme-input-slew stages as
+    the Ceff residual — the out-of-table regime of OpenSTA #582.
+- **Conclusion**: like Ceff, the waveform-slew residual is honest
+  extrapolation divergence plus an unmodelled ~ps-level OpenSTA waveform
+  detail. No parameter change is justified; `slew_rel` 5.5% continues to
+  cover it. Diagnostic-only; no production change.
+
+### 2026-11-18 — Propagated-clock slew merge: `ss_n40C_1v35` residual resolved
+
+- **Root cause** (supersedes the "corner-specific NLDM residual" note in the
+  R8 entry above): the ~6 ps `u_ff5/D`/`u_ff6/D` `max_arr_ns` gap was not an
+  NLDM interpolation difference. OpenSTA `report_dcalc` on the pinned image
+  showed the latch enable pin `u_lt/GATE_N` sees input slew `0.114658 ns`,
+  while our propagated clock carried only the `u_and` *clock-input* (`A -> X`)
+  arc's output slew `0.105098 ns`. The gate's *enable-input* (`B -> X`) arc
+  produces the larger falling slew, and OpenSTA merges every incoming arc's
+  slew at each vertex — clock and data arcs alike. Our `propagate_clock`
+  propagated only clock-reached arcs, so the enable arc never contributed.
+- **Fix**: new `propagate_slew` pass computes unified `slew_max`/`slew_min`
+  for every pin in one levelized traversal (arrival-independent, so slew needs
+  no arrival). It merges combinational arcs, register clock-to-Q arcs and
+  latch enable-to-Q arcs uniformly, including latch `D -> Q` borrow edges and
+  sequential-arc sources indexed by output pin. `propagate_clock` now uses the
+  unified slews for its delay lookups and its returned states take the unified
+  slew fields. Computed only under `set_propagated_clock`; ideal-clock runs are
+  unaffected.
+- **Verification**: `u_lt/GATE_N` slew is now `0.114658 ns` and `u_lt/Q` /
+  `u_ff5/D` `max_arr_ns` `5.3778677 ns`, matching OpenSTA `5.377868 ns` to
+  ~1e-7 — the residual is gone on `ss_n40C_1v35` (and the same merge applies
+  to every corner). New regression test
+  `test_propagated_clock_gate_merges_enable_arc_slew` asserts the merged slew
+  equals the max over `u_and`'s input arcs (enable arc dominates) and that the
+  latch enable sees the driver pin's slew; verified it fails without the fix.
+  `cargo test --workspace --release`: 211 + 3 pass, 0 fail; the two `jpeg`
+  ignores are unchanged (OpenSTA #582). All propagated-clock `sta_edge`
+  fixtures still match strictly.
+
+### 2026-11-18 — Real-design propagated-clock validation (gcd, picorv32)
+
+First `set_propagated_clock` check on the full ORFS/picorv32 designs rather than
+the `sta_edge` fixtures. `tests/designs/<design>/<design>.propagated.sdc` adds
+`set_clock_latency 1.0` + `-source 0.2`, `set_clock_transition 0.1`,
+`set_clock_uncertainty 0.1`, `set_propagated_clock`, and the I/O delay/transition/
+load constraints to each design's committed `.sdc`; `generate_prop_ref.sh` emits
+`<design>.propagated.reference.json` from OpenSTA 3.0.16 on `.placed.def` +
+`.rcx.spef` (no flow re-run; gcd's DEF/SPEF are committed, picorv32's are
+git-ignored and come from `picorv32/generate_ref.sh`). The golden carries the
+endpoint aggregates plus a `clock_pins` array of per-clock-pin arrival/slew.
+`compare_design_with_opensta` was generalised to `compare_design_files` so a
+test can name its own SDC and golden.
+
+- **gcd** (`test_gcd_propagated_clock_matches_opensta`, `GCD_SPEF`): clean pass.
+  53 endpoints; max relative diffs arr 0.38%, req 0.009%, slack 0.43%, slew 2.8%,
+  min-side slew 3.8%. Propagated WNS 1.4118 ns / TNS 0 vs ideal 1.5731 ns — the
+  routed RC now sets a per-pin launch/capture edge.
+- **picorv32** (`test_picorv32_propagated_clock_matches_opensta`,
+  `PICORV32_PROPAGATED`): 1,798 endpoints, hold side now violates (WNS -2.476 ns,
+  TNS -1053.67 ns vs ideal's clean min side) because clock skew is real on the
+  unbuffered net. 14,381/14,384 endpoint fields pass; WNS/TNS match.
+- **Clock-pin arrival/slew is asserted per pin**: the golden's `clock_pins`
+  array holds OpenSTA `get_property` `arrival_{max,min}_{rise,fall}` and
+  `slew_{max,min}_{rise,fall}` for every `is_clock` pin of `all_registers`
+  sequential cells (gcd 35, picorv32 1,597 — the only clock consumers in these
+  designs; neither has clock-gate cells). `compare_design_files` requires a
+  non-empty `clock_pins` array whenever the SDC is propagated (a missing or
+  empty one is a hard error, so the check cannot be silently disabled), and
+  cross-checks that every clock consumer our timing graph models appears in
+  the golden — our modeled set equals the golden's exactly (35 / 1,597). It
+  then checks all eight fields per pin against our per-pin state at a 1 ps
+  absolute bound (~100x the f32 noise floor), independent of the endpoint
+  tolerance. Measured max abs diff: gcd 1e-6 ns, picorv32 8e-6 ns —
+  the propagated clock network itself is exact, so the endpoint residuals
+  below are purely data-path. (Earlier spot checks via `report_checks` had
+  shown ~5 ps agreement at sampled pins; the golden now makes it exhaustive.)
+- **Three outliers on clock-independent paths**: `_11496_`/`_10754_`
+  `max_arr_ns`/`max_req_ns` (~0.10-0.12 ns) and `_11498_` `max_slew_ns` (12.6%).
+  OpenSTA `report_checks` shows all three worst paths are `resetn`-launched
+  (input port) in **both** ideal and propagated modes — same path, not a
+  re-selection. Our data-path arrival to these endpoints is clock-independent
+  and identical between modes (shifts exactly +0.2 ns, the `-source` latency).
+  OpenSTA's own arrival on the same `resetn` path shifts only +113 ps
+  ideal -> propagated, not the +200 ps a pure launch-reference shift predicts —
+  i.e. OpenSTA's propagated-clock I/O-launch edge/reference handling moves these
+  arrivals non-uniformly, a semantic we do not replicate. On top of that sits
+  the known E3.5 cell-stage gap: the paths traverse cells seeing 1.8-3.5 ns
+  slews and `_11496_`'s required time reads its setup constraint at 2.36 ns
+  clock slew (OpenSTA #582 regime). Neither effect is a clock-arrival defect —
+  the per-pin `clock_pins` assertion above covers the clock network directly.
+  `PICORV32_PROPAGATED` widens only `arr_rel` (0.01 -> 0.03) and `slew_rel`
+  (0.10 -> 0.15) over `PICORV32_SPEF`; slack, TNS and WNS keep their tighter
+  bounds.
+
+### 2026-11-17 — Ideal clock tracks inversion on the propagated_clock topology (empirical check)
+
+Ran `grus-eda sta` on `tests/designs/sta_edge/propagated_clock/propagated.def`
+with an ideal-clock SDC (`edge.sdc` minus `set_propagated_clock`, zero-wire) and
+compared all 12 endpoints against a fresh OpenSTA `find_timing_paths`
+reference on the same DEF/SDC/lib/lef in ideal mode (no committed golden —
+this fixture's golden is propagated-mode only).
+
+- **All 12 endpoints match within 1e-6 ns** (worst abs diff; the reference
+  was printed at `%.6f` ns so this is print-rounding level). Setup WNS
+  `1.6175045`, hold WNS `-2.1` / 1 violation — identical to OpenSTA.
+- The topology exercises the `v0.1.71` parity walk across an inverting buffer
+  (`clkinv` -> `c2` -> `u_ff2`/`u_ff7`), AND-type clock gates on **both** a
+  non-inverting path (`u_and` -> `c_and` -> `u_ff3`/`u_lt`) and an inverting
+  path (`u_and2` -> `c_and2` -> `u_ff7`), and a transparent latch (`u_lt`).
+- Inverting endpoints reproduce the expected half-period capture-edge shift
+  (`u_ff2`/`u_ff7` max req `3.5026` vs non-inverting `6.0026`) and the
+  full-period min-arrival shift (`6.8603` vs `1.8603`). The two gate-enable
+  checks get correctly distinct required times (`u_and/B` `6.1` vs
+  `u_and2/B` `3.6`), so enable-edge selection also follows the parity.
+
+This complements the committed `sta_edge/clock_gate` ideal golden (strict
+PASS), which covers inversion but not the clock-gate + latch combination.

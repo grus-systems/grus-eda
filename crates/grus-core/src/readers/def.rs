@@ -658,8 +658,10 @@ pub fn parse_def_bytes(
                     add_special_net(&mut db, tech_db, words, line)
                 })?;
             }
-            // Vias are not in the database: they come from the tech LEF's via definitions.
+            // Vias and non-default rules are not in the database: they come from the tech
+            // LEF and only constrain routing, which the STA model does not read.
             DefToken::Word("VIAS") => skip_section(&mut lexer, "VIAS")?,
+            DefToken::Word("NONDEFAULTRULES") => skip_section(&mut lexer, "NONDEFAULTRULES")?,
             DefToken::Word("NETS") => {
                 let declared = section_count(&mut lexer, "NETS")?;
                 let mut net_pins_list: Vec<Vec<PinId>> = Vec::new();
@@ -1367,6 +1369,17 @@ END DESIGN
     fn test_net_to_unknown_macro_pin_is_an_error() {
         let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 Q )"));
         assert!(msg.contains("u1/Q"), "{msg}");
+    }
+
+    /// `NONDEFAULTRULES` only constrains detailed routing, which the timing database does not
+    /// read; the stock LibreLane DEF emits it and must parse.
+    #[test]
+    fn test_nondedefaultrules_is_skipped() {
+        let def = MINI_DEF.replace(
+            "COMPONENTS 1 ;",
+            "NONDEFAULTRULES\n  - abc\nEND NONDEFAULTRULES\nCOMPONENTS 1 ;",
+        );
+        parse_def_bytes(def.as_bytes(), &mini_tech(), None).expect("DEF with NONDEFAULTRULES must parse");
     }
 
     /// Every truncation of the mini DEF must return `Ok` or `Err` without panicking, and only the

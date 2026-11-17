@@ -26,6 +26,8 @@ pub enum TimingType {
     Clear,
     RemovalRising,
     RecoveryRising,
+    RemovalFalling,
+    RecoveryFalling,
     Other,
 }
 
@@ -72,6 +74,10 @@ pub struct LibPin {
     pub is_clock: bool,
     pub max_cap: Option<f32>,
     pub max_transition: Option<f32>,
+    /// Boolean expression of an output pin (`function : "(A&B)"`), interned. `None` when
+    /// the Liberty file does not declare one; clock-gate classification needs it because
+    /// timing arcs alone cannot tell AND from OR.
+    pub function: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,7 +92,7 @@ pub struct LibCell {
     pub arc_count: u16,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LibDb {
     pub library_name: String,
     pub time_unit_ns: f32, // multiplier to convert file time -> ns
@@ -97,6 +103,23 @@ pub struct LibDb {
     pub arcs: Vec<LibTimingArc>,
     #[serde(skip)]
     pub cell_by_name: HashMap<SymbolId, LibCellId>,
+}
+
+impl Default for LibDb {
+    fn default() -> Self {
+        Self {
+            library_name: String::new(),
+            // Unity multipliers: a table value is already in the file's own unit
+            // until `time_unit`/`capacitive_load_unit` rescales it.
+            time_unit_ns: 1.0,
+            cap_unit_pf: 1.0,
+            strings: crate::interner::StringInterner::new(),
+            cells: Vec::new(),
+            pins: Vec::new(),
+            arcs: Vec::new(),
+            cell_by_name: HashMap::new(),
+        }
+    }
 }
 
 impl LibDb {

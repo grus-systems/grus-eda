@@ -8,3 +8,4 @@ license.workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true }
 grus-core = { path = "../grus-core" }
+serde_json = { workspace = true }

@@ -218,6 +218,22 @@ generic text above disagree, this section wins.
    `arrival = 0.0` (rise edge at t=0) and **`slew = 0.0`** for both max and min, even though
    `set_input_transition 0.15 [all_inputs]` matches `clk`. Only `RisingEdge` arcs are used
    for `dfxtp`; `min_pulse_width` and other non-delay arcs are ignored.
+   `set_propagated_clock` switches to the propagated mode (`v0.1.60`, roadmap R2): a separate
+   pass walks clock nets through combinational arcs and computes arrival/slew per transition
+   at every consumer clock pin, tracking the clock-edge index parity so inverting paths pick
+   the right capture/hold edge; plain `set_clock_latency` is then ignored and `-source`
+   latency seeds the port. Validated on `tests/designs/sta_edge/propagated_clock/` and on
+   the real designs `gcd`/`picorv32` (`<design>.propagated.sdc` +
+   `generate_prop_ref.sh` goldens; per-clock-pin arrival/slew asserted against OpenSTA
+   `get_property` at 1 ps — max diff 8e-6 ns — with the golden's `clock_pins` required
+   non-empty and cross-checked against our modeled clock consumers); details in
+   `docs/results.md`.
+   The ideal clock still tracks edge *phase* through cell-driven clock nets (`v0.1.71`):
+   a parity-only walk over the same graph places each consumer transition on its
+   clock-edge parity (`latency + parity * period/2`), so `nand`/`nor`/`inv` stages on the
+   clock network shift capture/hold/launch edges exactly as OpenSTA's ideal mode does —
+   validated on `sta_edge/clock_gate` (strict, all 13 endpoints). Delays and slews are
+   still not propagated; `cell_driven_clock_nets` keeps counting those nets.
 4. **Clock-to-Q.** `RisingEdge` arcs are `non_unate`: evaluate `CLK(RISE) → Q(RISE)` with
    `cell_rise`/`rise_transition` and `CLK(RISE) → Q(FALL)` with `cell_fall`/`fall_transition`,
    both at `in_slew = 0.0` and `out_cap = load(net(Q), pol)`. Check: `_384_/Q` rise
@@ -346,9 +362,13 @@ Done criterion for every E3 step: worst slack, and arrival and required time of 
 | aes SPEF | pass (`v0.1.46`) | arrival, req, WNS, TNS all strict `max(5 ps, 1%)`; slack floor 25 ps (`23.9 ps` max), slew 5.5% (`5.24%` max) |
 | ibex SPEF | pass (`v0.1.46`) | arrival, req, WNS, TNS all strict `max(5 ps, 1%)`; slack floor 40 ps (`36.6 ps` max), slew 5.5% (`5.09%` max) |
 | jpeg SPEF | `#[ignore]`, out of scope | extreme extrapolation (`7x` load / `6x` slew on `_43767_/Y`) confirmed unsupported by `OpenSTA #582`; mismatches `7,045 -> 1,419` in `v0.1.45` |
-| picorv32 placement RC | `#[ignore]`, fails | 56 fields (`max_arr_ns` 7.25% off, down from 103 in `v0.1.44`; E3.4 closed 2026-11-15: placement estimator vs routed truth) |
-| aes / ibex / jpeg placement RC | `#[ignore]`, fails | placement estimator vs routed truth (`913` / `13,164` / `14,328` fields, E3.4) |
-| Steiner length vs OpenROAD SPEF (gcd, picorv32) | pass | 2- and 3-point nets match exactly; the optimal tree is never longer than OpenROAD's (asserted) |
+| picorv32 placement RC | pass (`v0.1.69`) | `Tol::PICORV32_PLACEMENT` (arr 3%, slack 0.2 ns, slew 20%, TNS 10%); un-ignored once the PD tree matched OpenROAD's SPEF edge-for-edge |
+| aes placement RC | pass (`v0.1.69`) | `AES_PLACEMENT = AES_SPEF`: PD parasitics equivalent to the SPEF readback (<= 3e-6 ns/pin Elmore bare wire, <= 3.8e-3 ns uniform load), so the residual is the shared cell-stage gap |
+| ibex placement RC | pass (`v0.1.69`) | `IBEX_PLACEMENT = IBEX_SPEF`, same reasoning; worst slack field 36 ps < 40 ps floor |
+| jpeg placement RC | `#[ignore]`, fails | residual identical to `placed_spef` (WNS -78.084 vs -61.199 ns): OpenSTA #582 out-of-table NLDM extrapolation, not the tree |
+| PD tree vs OpenROAD SPEF (all 5 designs) | pass (`v0.1.69`) | edge-length multiset identical on all 78,749 nets; total length identical; `checkTree` 0 failures (FLUTE fallback unused); asserted in `test_pd_edge_multiset_vs_placement_spef` |
+| PD vs SPEF parasitics (all 5 designs) | pass (`v0.1.69`) | per-pin Elmore: bare wire <= 3e-6 ns, uniform 1 fF load <= 3.8e-3 ns — within the strict floor; asserted in `test_pd_vs_spef_parasitics_agree` |
+| placement RC vs SPEF RC through our STA (aes/ibex/jpeg) | pass (`v0.1.70`) | worst endpoint field diff 0.003/0.013/0.633 ps (aes/ibex/jpeg); max/min WNS <= 0.61 ps, TNS <= max(10 ps, 1% of reference) — licenses the shared SPEF tolerances; asserted in `test_placement_vs_spef_sta_agree` |
 | DMP vs `report_dcalc` (6 arcs) | pass | `Ceff` within 6% |
 | DMP vs `report_dcalc` (76 rows, routed SPEF) | pass (`v0.1.45`) | pi exact (max 0.43%); `Ceff` median 0.69% / max 6.79%, delay 0.12% / 6.03%, `driver_waveform_slew` 2.55% / 8.56% |
 | Pi waveform slew across 5 designs (`31,966` rows) | pass (`v0.1.45`) | shielded `<0.97` median `0.50..0.74%`; all rows median `1.70..2.49%` (`ourCe + bailout`) |
@@ -360,6 +380,19 @@ reference tool), write the rule in `docs/` before the code, record every compari
 `docs/results.md`, and prove each new test can fail by breaking the code on purpose.
 
 ### E3.4: Which Steiner tree OpenROAD builds — CLOSED 2026-11-15 (step 6, ticket 15)
+
+> **Update 2026-11-18 (`v0.1.69`)**: the "FLUTE tree" conclusion below was wrong for the
+> pinned LibreLane image. The image's OpenROAD builds the tree with `pdr::primDijkstra`
+> (Prim-Dijkstra + Steinerization + degree-4 split, `alpha = 0.3`) and falls back to FLUTE
+> only when `checkTree` rejects it. `congestion/pdr.rs` now ports that pass; its output is
+> **edge-identical to OpenROAD's placement SPEF on all 78,749 nets of the five designs**
+> (0 `checkTree` failures, so FLUTE never ran). `test_pd_vs_spef_parasitics_agree` then showed
+> the built parasitics agree with the SPEF readback to <= 3e-6 ns per-pin Elmore on the bare
+> wire and <= 3.8e-3 ns under a uniform 1 fF load — within the strict floor — so `placement_rc`
+> measures the same engine residual as `placed_spef`: `picorv32`, `aes` and `ibex` all pass
+> un-ignored (`AES_PLACEMENT`/`IBEX_PLACEMENT` reuse the SPEF tolerances), and `jpeg`'s residual
+> equals `placed_spef`'s OpenSTA #582 out-of-table case exactly. What remains is the shared
+> cell-stage engine gap (driver waveform slew, extreme-load Ceff), not the tree or the wire model.
 - **Outcome**: our placement estimator is the same construction as OpenROAD's and scores the same against routed
   truth; the remaining placement-RC error is the placement-estimation abstraction itself, not the tree. Closed on
   the done criterion's evidence branch ("record the evidence and stop"), with the rule now known as well.

@@ -1,0 +1,35 @@
+{
+  "design": "sta_edge_async_fall",
+  "ideal": {
+  "wns_max_ns": 1.089548,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": 0.635445,
+  "tns_min_ns": 0.000000,
+  "setup_violations": 0,
+  "hold_violations": 0,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 1.400000, "max_req_ns": 2.489548, "max_slack_ns": 1.089548, "max_slew_ns": 0.100000, "min_arr_ns": 5.400000, "min_req_ns": 2.894076, "min_slack_ns": 2.505924, "min_slew_ns": 0.100000},
+      {"pin": "u_ff0/RESET_B", "max_arr_ns": 1.313740, "max_req_ns": 2.990378, "max_slack_ns": 1.676638, "max_slew_ns": 0.033528, "min_arr_ns": 5.313740, "min_req_ns": 3.253456, "min_slack_ns": 2.060284, "min_slew_ns": 0.033528},
+      {"pin": "u_ff1/D", "max_arr_ns": 3.095685, "max_req_ns": 4.605462, "max_slack_ns": 1.509777, "max_slew_ns": 0.037925, "min_arr_ns": 3.037871, "min_req_ns": 0.763154, "min_slack_ns": 2.274717, "min_slew_ns": 0.034701},
+      {"pin": "u_ff2/D", "max_arr_ns": 1.400000, "max_req_ns": 4.528237, "max_slack_ns": 3.128237, "max_slew_ns": 0.100000, "min_arr_ns": 1.400000, "min_req_ns": 0.764555, "min_slack_ns": 0.635445, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 1.323993, "max_req_ns": 4.350000, "max_slack_ns": 3.026007, "max_slew_ns": 0.469099, "min_arr_ns": 1.176338, "min_req_ns": 0.500000, "min_slack_ns": 0.676337, "min_slew_ns": 0.229591}
+  ]
+}
+,
+  "propagated": {
+  "wns_max_ns": 1.200728,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": 0.521106,
+  "tns_min_ns": 0.000000,
+  "setup_violations": 0,
+  "hold_violations": 0,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 2.000728, "max_slack_ns": 1.200728, "max_slew_ns": 0.100000, "min_arr_ns": 4.800000, "min_req_ns": 2.397445, "min_slack_ns": 2.402555, "min_slew_ns": 0.100000},
+      {"pin": "u_ff0/RESET_B", "max_arr_ns": 0.713740, "max_req_ns": 2.489807, "max_slack_ns": 1.776067, "max_slew_ns": 0.033528, "min_arr_ns": 4.713740, "min_req_ns": 2.756487, "min_slack_ns": 1.957253, "min_slew_ns": 0.033528},
+      {"pin": "u_ff1/D", "max_arr_ns": 2.596183, "max_req_ns": 4.119321, "max_slack_ns": 1.523138, "max_slew_ns": 0.037892, "min_arr_ns": 2.538178, "min_req_ns": 0.272304, "min_slack_ns": 2.265874, "min_slew_ns": 0.034702},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 4.036861, "max_slack_ns": 3.236861, "max_slew_ns": 0.100000, "min_arr_ns": 0.800000, "min_req_ns": 0.278894, "min_slack_ns": 0.521106, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.824742, "max_req_ns": 3.750000, "max_slack_ns": 2.925258, "max_slew_ns": 0.469463, "min_arr_ns": 0.677377, "min_req_ns": -0.100000, "min_slack_ns": 0.777377, "min_slew_ns": 0.230089}
+  ]
+}
+
+}

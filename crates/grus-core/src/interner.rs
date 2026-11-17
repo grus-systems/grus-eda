@@ -172,6 +172,7 @@ mod tests {
             is_clock: false,
             max_cap: None,
             max_transition: Some(1.5),
+            function: None,
         });
         lib.pins.push(LibPin {
             name: p_out,
@@ -182,6 +183,7 @@ mod tests {
             is_clock: false,
             max_cap: Some(0.2),
             max_transition: Some(1.5),
+            function: None,
         });
 
         let table = NldmTable {

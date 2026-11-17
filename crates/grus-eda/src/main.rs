@@ -152,6 +152,12 @@ struct StaArgs {
 
     #[arg(long, help = "Path to extracted SPEF (.spef) file")]
     spef: Option<PathBuf>,
+
+    #[arg(long, help = "Write the full STA report (endpoints and skip summary) as JSON to this path")]
+    json: Option<PathBuf>,
+
+    #[arg(long, help = "Exit non-zero when any cell, arc, endpoint or SDC option was skipped")]
+    strict: bool,
 }
 
 fn check_top_name(expected: Option<&str>, kind: &str, actual: &str) -> anyhow::Result<()> {
@@ -440,23 +446,75 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 _ => None,
             };
+            if let Some(p) = &parasitics
+                && p.pd_check_failed_nets > 0
+            {
+                eprintln!(
+                    "warning: {} nets failed the placement tree check; OpenROAD would use FLUTE there, we keep the PD tree",
+                    p.pd_check_failed_nets
+                );
+            }
             let report = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
-            let skipped = report.skipped.nonzero();
-            let skipped_note = if skipped.is_empty() { String::new() } else { format!(", skipped: {}", skipped.join(" ")) };
             println!(
-                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6}, hold wns={:.6} tns={:.6}, elapsed={:.2}ms{}",
+                "STA ({}): endpoints={}, setup wns={:.6} tns={:.6} viol={}, hold wns={:.6} tns={:.6} viol={}, elapsed={:.2}ms",
                 mode,
                 report.endpoints.len(),
                 report.wns_max_ns,
                 report.tns_max_ns,
+                report.setup_violations,
                 report.wns_min_ns,
                 report.tns_min_ns,
+                report.hold_violations,
                 t0.elapsed().as_secs_f64() * 1000.0,
-                skipped_note
             );
+            print_skip_summary(&report);
+            if let Some(path) = &args.json {
+                let json = serde_json::to_string_pretty(&report)?;
+                std::fs::write(path, json)?;
+                println!("Wrote STA report JSON to {:?}", path);
+            }
+            if args.strict && !report.skipped.is_clean() {
+                anyhow::bail!("strict: the run skipped inputs; see the summary above");
+            }
         }
     }
     Ok(())
+}
+
+/// Per-kind counts of everything the STA run left out, as a share of the design's arcs and
+/// endpoints plus the ignored SDC options. Printed at the end of every `sta` run.
+fn print_skip_summary(report: &grus_core::sta::StaReport) {
+    let s = &report.skipped;
+    if s.is_clean() {
+        println!("skipped: none");
+        return;
+    }
+    let share = |n: usize, total: usize| {
+        if total == 0 { "n/a".to_string() } else { format!("{:.2}%", 100.0 * n as f64 / total as f64) }
+    };
+    println!(
+        "skipped: {}/{} arcs ({}), {}/{} endpoints ({})",
+        s.arcs_skipped(),
+        s.total_arcs,
+        share(s.arcs_skipped(), s.total_arcs),
+        s.endpoints_skipped(),
+        s.total_endpoints,
+        share(s.endpoints_skipped(), s.total_endpoints),
+    );
+    if s.sdc_commands > 0 {
+        let ignored: usize = s.sdc_ignored_options.values().sum();
+        if ignored > 0 {
+            println!(
+                "  sdc: {} ignored option(s) of {} commands ({:.2}%)",
+                ignored,
+                s.sdc_commands,
+                100.0 * ignored as f64 / s.sdc_commands as f64
+            );
+        }
+    }
+    for category in s.nonzero() {
+        println!("  {category}");
+    }
 }
 
 fn print_heatmap(grid_w: usize, grid_h: usize, ratios: &[f32]) {
@@ -608,5 +666,41 @@ mod tests {
         assert!(err_sta.is_err(), "contradictory --parasitics placement --spef must fail");
 
         let _ = std::fs::remove_file(&out_def);
+    }
+
+    #[test]
+    fn cli_sta_json_and_strict() {
+        let hd = sky130_hd();
+        let lib = require(hd.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
+        let tlef = require(hd.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef = require(hd.join("lef/sky130_fd_sc_hd.lef"));
+        let gcd = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/designs/gcd");
+        let def = gcd.join("gcd.placed.def");
+        let sdc = gcd.join("gcd.sdc");
+        let sta_argv = |extra: &[&str]| {
+            let mut argv = vec![
+                "grus-eda", "sta",
+                "--lib", lib.to_str().unwrap(),
+                "--tlef", tlef.to_str().unwrap(),
+                "--lef", lef.to_str().unwrap(),
+                "--def", def.to_str().unwrap(),
+                "--sdc", sdc.to_str().unwrap(),
+            ];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv).unwrap()
+        };
+
+        // gcd.placed.def has 93 unmapped welltap cells, so --strict must fail.
+        let json_path = std::env::temp_dir().join("grus_cli_test_sta.json");
+        run(sta_argv(&["--json", json_path.to_str().unwrap()])).expect("sta must succeed");
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).expect("report JSON")).expect("JSON parses");
+        assert_eq!(report["skipped"]["unmapped_cells"].as_u64().unwrap(), 93);
+        assert!(report["skipped"]["total_arcs"].as_u64().unwrap() > 0);
+
+        let err = run(sta_argv(&["--strict"]));
+        assert!(err.is_err(), "--strict must fail when cells were skipped");
+
+        let _ = std::fs::remove_file(&json_path);
     }
 }

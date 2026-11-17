@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
 const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
-const CACHE_VERSION: u32 = 1;
+// Bump when the serialized LibDb layout changes (e.g. new TimingType variants shift
+// discriminant values and old caches would deserialize `Other` arcs as real types).
+const CACHE_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -69,6 +71,10 @@ impl<'a> Lexer<'a> {
                 }
                 if self.pos + 1 < self.src.len() {
                     self.pos += 2;
+                } else {
+                    // Unterminated comment: consume to EOF so its last byte is
+                    // not emitted as an identifier token.
+                    self.pos = self.src.len();
                 }
             } else {
                 break;
@@ -217,6 +223,8 @@ fn parse_timing_type(s: &str) -> TimingType {
         "clear" => TimingType::Clear,
         "recovery_rising" => TimingType::RecoveryRising,
         "removal_rising" => TimingType::RemovalRising,
+        "recovery_falling" => TimingType::RecoveryFalling,
+        "removal_falling" => TimingType::RemovalFalling,
         _ => TimingType::Other,
     }
 }
@@ -241,7 +249,7 @@ fn number_value(s: &str, attribute: &str) -> Result<f32> {
 
 /// `time_unit` such as `1ns` or `100ps`, converted to ns. A bare number is taken as ns.
 fn parse_time_unit(s: &str) -> Result<f32> {
-    let clean = s.trim_matches('"').trim();
+    let clean = s.trim_matches('"').trim().to_ascii_lowercase();
     let (num_str, scale) = if let Some(num_str) = clean.strip_suffix("ps") {
         (num_str, 0.001)
     } else if let Some(num_str) = clean.strip_suffix("ns") {
@@ -249,7 +257,7 @@ fn parse_time_unit(s: &str) -> Result<f32> {
     } else if let Some(num_str) = clean.strip_suffix("us") {
         (num_str, 1000.0)
     } else {
-        (clean, 1.0)
+        (clean.as_str(), 1.0)
     };
     Ok(number_value(num_str, "time_unit")? * scale)
 }
@@ -275,24 +283,24 @@ pub fn parse_liberty_bytes(bytes: &[u8]) -> Result<LibDb> {
     let mut templates: HashMap<String, TemplateDef> = HashMap::new();
 
     // Top-level must start with library ( <name> ) { ... }
+    let mut saw_library = false;
     while let Some(tok) = lexer.next_token() {
-        if let Token::Ident("library") = tok
-            && let Some(Token::LParen) = lexer.next_token()
-                && let Some(name_tok) = lexer.next_token() {
-                    let lib_name = match name_tok {
-                        Token::Ident(s) | Token::Str(s) => s.to_string(),
-                        _ => "unnamed".to_string(),
-                    };
-                    db.library_name = lib_name;
-                    let _ = lexer.next_token(); // RParen
-                    if let Some(Token::LBrace) = lexer.next_token() {
-                        parse_library_body(&mut lexer, &mut db, &mut templates)?;
-                    }
-                }
+        if !matches!(tok, Token::Ident("library")) || !matches!(lexer.next_token(), Some(Token::LParen)) {
+            continue;
+        }
+        db.library_name = read_paren_header(&mut lexer).unwrap_or_else(|| "unnamed".to_string());
+        if let Some(Token::LBrace) = lexer.next_token() {
+            parse_library_body(&mut lexer, &mut db, &mut templates)?;
+            saw_library = true;
+        }
+    }
+    if !saw_library {
+        bail!("Liberty input has no `library (name) {{ ... }}` body");
     }
 
     db.strings.rebuild_map();
     db.rebuild_cell_by_name();
+    u16::try_from(db.cells.len()).context("Liberty cell count exceeds u16")?;
 
     Ok(db)
 }
@@ -302,9 +310,13 @@ fn parse_library_body(
     db: &mut LibDb,
     templates: &mut HashMap<String, TemplateDef>,
 ) -> Result<()> {
+    let mut closed = false;
     while let Some(tok) = lexer.next_token() {
         match tok {
-            Token::RBrace => break,
+            Token::RBrace => {
+                closed = true;
+                break;
+            }
             Token::Ident("time_unit") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Str(s) | Token::Ident(s)) = lexer.next_token() {
@@ -324,62 +336,107 @@ fn parse_library_body(
                             && let Token::Ident(s) | Token::Str(s) = tok_unit {
                                 unit_str = s.trim_matches('"');
                             }
-                    if unit_str.eq_ignore_ascii_case("ff") {
-                        db.cap_unit_pf = val * 0.001;
-                    } else {
-                        db.cap_unit_pf = val;
+                    db.cap_unit_pf = match unit_str.to_ascii_lowercase().as_str() {
+                        "pf" => val,
+                        "ff" => val * 0.001,
+                        "nf" => val * 1_000.0,
+                        "uf" => val * 1_000_000.0,
+                        _ => bail!("unsupported capacitive_load_unit {unit_str:?}"),
+                    };
+                    // Drain any remaining arguments through `)` so they cannot
+                    // leak into the library body's keyword matching.
+                    while let Some(t) = lexer.next_token() {
+                        if matches!(t, Token::RParen) {
+                            break;
+                        }
                     }
                 }
             }
             Token::Ident("lu_table_template") => {
-                if let Some(Token::LParen) = lexer.next_token()
-                    && let Some(Token::Ident(tpl_name) | Token::Str(tpl_name)) = lexer.next_token() {
-                        let tname = tpl_name.to_string();
-                        let _ = lexer.next_token(); // RParen
-                        if let Some(Token::LBrace) = lexer.next_token() {
-                            let tpl = parse_template_body(lexer, db)?;
-                            templates.insert(tname, tpl);
+                if matches!(lexer.next_token(), Some(Token::LParen)) {
+                    let tname = read_paren_header(lexer);
+                    if let Some(Token::LBrace) = lexer.next_token() {
+                        match tname {
+                            Some(tname) => {
+                                let tpl = parse_template_body(lexer, db)?;
+                                templates.insert(tname, tpl);
+                            }
+                            None => lexer.skip_balanced_braces(),
                         }
                     }
+                }
             }
             Token::Ident("cell") => {
-                if let Some(Token::LParen) = lexer.next_token()
-                    && let Some(Token::Ident(cell_name) | Token::Str(cell_name)) = lexer.next_token() {
-                        let cname_id = db.strings.intern(cell_name);
-                        let _ = lexer.next_token(); // RParen
-                        if let Some(Token::LBrace) = lexer.next_token() {
-                            parse_cell_body(lexer, db, cname_id, templates)?;
+                if matches!(lexer.next_token(), Some(Token::LParen)) {
+                    let cname = read_paren_header(lexer);
+                    if let Some(Token::LBrace) = lexer.next_token() {
+                        match cname {
+                            Some(cname) => {
+                                let cname_id = db.strings.intern(&cname);
+                                parse_cell_body(lexer, db, cname_id, templates)?;
+                            }
+                            None => lexer.skip_balanced_braces(),
                         }
                     }
+                }
             }
-            Token::Ident(_) => {
-                // Check if this is a group with { ... } or attribute with ;
-                skip_statement_or_group(lexer);
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn skip_statement_or_group(lexer: &mut Lexer) {
-    while let Some(tok) = lexer.next_token() {
-        match tok {
-            Token::Semi => break,
-            Token::LBrace => {
-                lexer.skip_balanced_braces();
+            // Check if this is a group with { ... } or attribute with ;
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
                 break;
             }
             _ => {}
         }
     }
+    if !closed {
+        bail!("unterminated Liberty library body (missing closing brace)");
+    }
+    Ok(())
+}
+
+/// Reads a `( name ... )` header up to the closing paren and returns the first
+/// identifier — the declared name — if one appears. Extra arguments are consumed
+/// so the following `{` stays aligned even for `()` or multi-argument headers.
+fn read_paren_header(lexer: &mut Lexer) -> Option<String> {
+    let mut name = None;
+    while let Some(tok) = lexer.next_token() {
+        match tok {
+            Token::RParen => break,
+            Token::Ident(s) | Token::Str(s) if name.is_none() => name = Some(s.to_string()),
+            _ => {}
+        }
+    }
+    name
+}
+
+/// Skips an unknown attribute's value tokens up to `;` or a `{...}` group.
+/// Returns `true` when the skip ran into the enclosing group's closing `}` —
+/// the caller must treat its own block as closed. Without this an
+/// unterminated attribute would consume the `}` and desynchronize the parse.
+fn skip_statement_or_group(lexer: &mut Lexer) -> bool {
+    while let Some(tok) = lexer.next_token() {
+        match tok {
+            Token::Semi => return false,
+            Token::LBrace => {
+                lexer.skip_balanced_braces();
+                return false;
+            }
+            Token::RBrace => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
     let mut tpl = TemplateDef::default();
+    let mut closed = false;
     while let Some(tok) = lexer.next_token() {
         match tok {
-            Token::RBrace => break,
+            Token::RBrace => {
+                closed = true;
+                break;
+            }
             Token::Ident("variable_1") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Str(s) | Token::Ident(s)) = lexer.next_token() {
@@ -392,16 +449,14 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
                         tpl.var2 = parse_axis_var(s);
                     }
             }
+            // Index values are stored raw: `index_*` may precede `variable_*`, so the
+            // unit scale is applied once the body closes and both are known.
             Token::Ident("index_1") => {
                 if let Some(Token::LParen) = lexer.next_token() {
-                    let scale = match tpl.var1 {
-                        TableAxisVar::TotalOutputNetCapacitance => db.cap_unit_pf,
-                        _ => db.time_unit_ns,
-                    };
                     while let Some(tok_arg) = lexer.next_token() {
                         match tok_arg {
                             Token::RParen => break,
-                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut tpl.index_1)?,
+                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, 1.0, &mut tpl.index_1)?,
                             _ => {}
                         }
                     }
@@ -409,14 +464,10 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
             }
             Token::Ident("index_2") => {
                 if let Some(Token::LParen) = lexer.next_token() {
-                    let scale = match tpl.var2 {
-                        TableAxisVar::TotalOutputNetCapacitance => db.cap_unit_pf,
-                        _ => db.time_unit_ns,
-                    };
                     while let Some(tok_arg) = lexer.next_token() {
                         match tok_arg {
                             Token::RParen => break,
-                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, scale, &mut tpl.index_2)?,
+                            Token::Str(s) | Token::Ident(s) => parse_float_list(s, 1.0, &mut tpl.index_2)?,
                             _ => {}
                         }
                     }
@@ -425,8 +476,27 @@ fn parse_template_body(lexer: &mut Lexer, db: &LibDb) -> Result<TemplateDef> {
             Token::LBrace => {
                 lexer.skip_balanced_braces();
             }
+            // Unknown attributes are skipped whole so a value cannot alias a template
+            // keyword (`custom : index_1;`) and corrupt the axis indices.
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
+            }
             _ => {}
         }
+    }
+    if !closed {
+        bail!("unterminated Liberty template body (missing closing brace)");
+    }
+    let axis_unit = |v: TableAxisVar| match v {
+        TableAxisVar::TotalOutputNetCapacitance => db.cap_unit_pf,
+        _ => db.time_unit_ns,
+    };
+    for v in &mut tpl.index_1 {
+        *v *= axis_unit(tpl.var1);
+    }
+    for v in &mut tpl.index_2 {
+        *v *= axis_unit(tpl.var2);
     }
     Ok(tpl)
 }
@@ -446,10 +516,14 @@ fn parse_cell_body(
     // Track cell-local pins mapping SymbolId to global LibPinId
     let mut local_pin_names: HashMap<SymbolId, LibPinId> = HashMap::new();
     let mut pending_arcs = Vec::new();
+    let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
         match tok {
-            Token::RBrace => break,
+            Token::RBrace => {
+                closed = true;
+                break;
+            }
             Token::Ident("area") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
@@ -474,7 +548,7 @@ fn parse_cell_body(
                     for var in vars {
                         let sym = db.strings.intern(&var);
                         if let std::collections::hash_map::Entry::Vacant(e) = local_pin_names.entry(sym) {
-                            let global_id = LibPinId(db.pins.len() as u16);
+                            let global_id = LibPinId(u16::try_from(db.pins.len()).context("Liberty pin count exceeds u16")?);
                             e.insert(global_id);
                             db.pins.push(LibPin {
                                 name: sym,
@@ -485,6 +559,7 @@ fn parse_cell_body(
                                 is_clock: false,
                                 max_cap: None,
                                 max_transition: None,
+                                function: None,
                             });
                         }
                     }
@@ -507,7 +582,7 @@ fn parse_cell_body(
                     for var in vars {
                         let sym = db.strings.intern(&var);
                         if let std::collections::hash_map::Entry::Vacant(e) = local_pin_names.entry(sym) {
-                            let global_id = LibPinId(db.pins.len() as u16);
+                            let global_id = LibPinId(u16::try_from(db.pins.len()).context("Liberty pin count exceeds u16")?);
                             e.insert(global_id);
                             db.pins.push(LibPin {
                                 name: sym,
@@ -518,19 +593,38 @@ fn parse_cell_body(
                                 is_clock: false,
                                 max_cap: None,
                                 max_transition: None,
+                                function: None,
                             });
                         }
                     }
                 }
             }
             Token::Ident("pin") => {
-                if let Some(Token::LParen) = lexer.next_token()
-                    && let Some(Token::Ident(pin_name) | Token::Str(pin_name)) = lexer.next_token() {
-                        let pin_sym = db.strings.intern(pin_name);
-                        let _ = lexer.next_token(); // RParen
-                        if let Some(Token::LBrace) = lexer.next_token() {
-                            let global_id = LibPinId(db.pins.len() as u16);
-                            local_pin_names.insert(pin_sym, global_id);
+                if matches!(lexer.next_token(), Some(Token::LParen)) {
+                    // Drain the header: `pin (A, B)` is not valid Liberty (the `pin`
+                    // statement takes one name), so reject it loudly instead of
+                    // leaking `,`/`B` into the body parser.
+                    let mut names = Vec::new();
+                    while let Some(t) = lexer.next_token() {
+                        match t {
+                            Token::RParen => break,
+                            Token::Ident(s) | Token::Str(s) => names.push(s.to_string()),
+                            _ => {}
+                        }
+                    }
+                    if let Some(Token::LBrace) = lexer.next_token() {
+                        if names.len() == 1 {
+                            let pin_sym = db.strings.intern(&names[0]);
+                            // An `ff`/`latch` state variable may already occupy this name;
+                            // reuse its slot so the pin is declared once, in place.
+                            let global_id = match local_pin_names.get(&pin_sym) {
+                                Some(&id) => id,
+                                None => {
+                                    let id = LibPinId(u16::try_from(db.pins.len()).context("Liberty pin count exceeds u16")?);
+                                    local_pin_names.insert(pin_sym, id);
+                                    id
+                                }
+                            };
                             parse_pin_body(
                                 lexer,
                                 db,
@@ -539,26 +633,39 @@ fn parse_cell_body(
                                 templates,
                                 &mut pending_arcs,
                             )?;
+                        } else {
+                            bail!("unsupported pin declaration with {} names", names.len());
                         }
                     }
-            }
-            Token::Ident("test_cell")
-            | Token::Ident("pg_pin")
-            | Token::Ident("leakage_power")
-            | Token::Ident("internal_power")
-            | Token::Ident("dynamic_current") => {
-                skip_statement_or_group(lexer);
+                }
             }
             Token::LBrace => {
                 lexer.skip_balanced_braces();
             }
+            // `test_cell`, `pg_pin`, `leakage_power`, `internal_power`,
+            // `dynamic_current` and any other unknown attribute are skipped whole so
+            // their values cannot alias keywords (`cell_footprint : latch;` would
+            // otherwise set `is_latch`). One arm only: a guard that fails must not
+            // fall through to a second skip.
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
+            }
             _ => {}
         }
     }
+    if !closed {
+        bail!("unterminated Liberty cell body (missing closing brace)");
+    }
 
-    // Deferred resolution of related_pin SymbolIds to global LibPinId
+    // Deferred resolution of related_pin SymbolIds to global LibPinId. An arc whose
+    // `related_pin` is missing or names a pin the cell does not declare (e.g. a skipped
+    // `pg_pin`) is dropped: substituting the target pin would fabricate a self-loop arc
+    // that levelization reports as a combinational loop.
     for (target_pin_id, rel_sym, sense, ttype, rise, fall, r_trans, f_trans, r_const, f_const) in pending_arcs {
-        let rel_pin_id = local_pin_names.get(&rel_sym).copied().unwrap_or(target_pin_id);
+        let Some(&rel_pin_id) = local_pin_names.get(&rel_sym) else {
+            continue;
+        };
         db.arcs.push(LibTimingArc {
             related_pin: rel_pin_id,
             target_pin: target_pin_id,
@@ -573,8 +680,8 @@ fn parse_cell_body(
         });
     }
 
-    let pin_count = (db.pins.len() as u32 - pin_offset) as u16;
-    let arc_count = (db.arcs.len() as u32 - arc_offset) as u16;
+    let pin_count = u16::try_from(db.pins.len() - pin_offset as usize).context("cell pin count exceeds u16")?;
+    let arc_count = u16::try_from(db.arcs.len() - arc_offset as usize).context("cell arc count exceeds u16")?;
 
     db.cells.push(LibCell {
         name: cell_name,
@@ -619,13 +726,18 @@ fn parse_pin_body(
     let mut is_clock = false;
     let mut max_cap = None;
     let mut max_transition = None;
+    let mut function = None;
 
     // Temporary list of timing arcs defined inside this pin
     let mut pin_arcs = Vec::new();
+    let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
         match tok {
-            Token::RBrace => break,
+            Token::RBrace => {
+                closed = true;
+                break;
+            }
             Token::Ident("direction") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
@@ -670,6 +782,25 @@ fn parse_pin_body(
                         max_transition = Some(number_value(s, "max_transition")? * db.time_unit_ns);
                     }
             }
+            // `state_function` is a different attribute and must not match here.
+            Token::Ident("function") => {
+                if let Some(Token::Colon) = lexer.next_token() {
+                    match lexer.next_token() {
+                        Some(Token::Ident(s) | Token::Str(s)) => function = Some(db.strings.intern(s)),
+                        // An unquoted expression is not valid Liberty; drain to ';'
+                        // so its tokens cannot alias pin-body keywords. The pin then
+                        // counts as function-less and keeps the legacy gate guess.
+                        Some(_) => {
+                            while let Some(t) = lexer.next_token() {
+                                if matches!(t, Token::Semi) {
+                                    break;
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
             Token::Ident("timing") => {
                 // Consume optional (args)
                 while let Some(tok_t) = lexer.next_token() {
@@ -684,6 +815,11 @@ fn parse_pin_body(
             Token::LBrace => {
                 lexer.skip_balanced_braces();
             }
+            // Skip unknown pin attributes whole so their values cannot alias keywords.
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
+            }
             _ => {}
         }
     }
@@ -695,7 +831,7 @@ fn parse_pin_body(
         cap_fall = cap;
     }
 
-    db.pins.push(LibPin {
+    let pin = LibPin {
         name: pin_name,
         dir,
         cap_rise,
@@ -704,7 +840,16 @@ fn parse_pin_body(
         is_clock,
         max_cap,
         max_transition,
-    });
+        function,
+    };
+    // A pin sharing its name with an `ff`/`latch` state variable reuses the placeholder
+    // slot pushed earlier; writing in place keeps one entry per name.
+    let idx = target_pin_id.0 as usize;
+    if idx < db.pins.len() {
+        db.pins[idx] = pin;
+    } else {
+        db.pins.push(pin);
+    }
 
     for (rel_sym, sense, ttype, rise, fall, r_trans, f_trans, r_const, f_const) in pin_arcs {
         pending_arcs.push((
@@ -719,6 +864,10 @@ fn parse_pin_body(
             r_const,
             f_const,
         ));
+    }
+
+    if !closed {
+        bail!("unterminated Liberty pin body (missing closing brace)");
     }
 
     Ok(())
@@ -752,10 +901,14 @@ fn parse_timing_body(
     let mut fall_trans = None;
     let mut rise_const = None;
     let mut fall_const = None;
+    let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
         match tok {
-            Token::RBrace => break,
+            Token::RBrace => {
+                closed = true;
+                break;
+            }
             Token::Ident("related_pin") => {
                 if let Some(Token::Colon) = lexer.next_token()
                     && let Some(Token::Str(s) | Token::Ident(s)) = lexer.next_token() {
@@ -795,6 +948,12 @@ fn parse_timing_body(
             Token::LBrace => {
                 lexer.skip_balanced_braces();
             }
+            // Unknown timing attributes (including `when` conditionals, whose arcs this
+            // parser does not model) are skipped with their values.
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
+            }
             _ => {}
         }
     }
@@ -830,6 +989,10 @@ fn parse_timing_body(
         }
     }
 
+    if !closed {
+        bail!("unterminated Liberty timing body (missing closing brace)");
+    }
+
     Ok(())
 }
 
@@ -839,11 +1002,8 @@ fn parse_nldm_table(
     templates: &HashMap<String, TemplateDef>,
 ) -> Result<Option<NldmTable>> {
     let mut tpl_name = String::new();
-    if let Some(Token::LParen) = lexer.next_token() {
-        if let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
-            tpl_name = s.to_string();
-        }
-        let _ = lexer.next_token(); // RParen
+    if matches!(lexer.next_token(), Some(Token::LParen)) {
+        tpl_name = read_paren_header(lexer).unwrap_or_default();
     }
 
     if let Some(Token::LBrace) = lexer.next_token() {
@@ -854,10 +1014,14 @@ fn parse_nldm_table(
         let mut index_1 = Vec::new();
         let mut index_2 = Vec::new();
         let mut values = Vec::new();
+        let mut closed = false;
 
         while let Some(tok) = lexer.next_token() {
             match tok {
-                Token::RBrace => break,
+                Token::RBrace => {
+                    closed = true;
+                    break;
+                }
                 Token::Ident("index_1") => {
                     if let Some(Token::LParen) = lexer.next_token() {
                         let scale = match var1 {
@@ -904,8 +1068,35 @@ fn parse_nldm_table(
                 Token::LBrace => {
                     lexer.skip_balanced_braces();
                 }
+                // Unknown attributes are skipped whole so a value cannot alias a table
+                // keyword (e.g. `foo : cell_rise;`) and open a phantom table. NLDM entries
+                // carry no `;`, so the table's closing brace also terminates the skip.
+                Token::Ident(_) => {
+                    let mut hit_close = false;
+                    while let Some(t) = lexer.next_token() {
+                        match t {
+                            Token::Semi => break,
+                            Token::LBrace => {
+                                lexer.skip_balanced_braces();
+                                break;
+                            }
+                            Token::RBrace => {
+                                hit_close = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if hit_close {
+                        closed = true;
+                        break;
+                    }
+                }
                 _ => {}
             }
+        }
+        if !closed {
+            bail!("unterminated Liberty NLDM table body (missing closing brace)");
         }
 
         // Fallback to template indices if not specified on instance
@@ -929,13 +1120,20 @@ fn parse_nldm_table(
             }));
         }
 
-        // 1D table
-        if index_2.is_empty() && !index_1.is_empty() {
+        // Pad a missing axis symmetrically so `eval_2d` always sees at least one index
+        // per dimension; an `index_2`-only table would otherwise underflow `m - 1`.
+        if index_1.is_empty() {
+            index_1 = vec![0.0];
+        }
+        if index_2.is_empty() {
             index_2 = vec![0.0];
         }
 
-        if index_1.is_empty() && index_2.is_empty() && values.is_empty() {
+        if values.is_empty() {
             return Ok(None);
+        }
+        if values.len() != index_1.len() * index_2.len() {
+            bail!("NLDM table has {} values for a {}x{} index grid", values.len(), index_1.len(), index_2.len());
         }
 
         Ok(Some(NldmTable {
@@ -1044,8 +1242,9 @@ fn load_liberty_in(path: &Path, dir: &Path) -> Result<LibDb> {
         return Ok(db);
     }
 
-    // Cache miss: parse directly from mmap
-    let mut db = parse_liberty_bytes(&mmap)?;
+    // Cache miss: parse directly from mmap; `parse_liberty_bytes` already rebuilt the
+    // lookup maps.
+    let db = parse_liberty_bytes(&mmap)?;
 
     // Serialize and write to cache
     let cache_obj = CacheFile {
@@ -1060,8 +1259,6 @@ fn load_liberty_in(path: &Path, dir: &Path) -> Result<LibDb> {
         let _ = write_cache_file(&cache_path, &encoded);
     }
 
-    db.strings.rebuild_map();
-    db.rebuild_cell_by_name();
     Ok(db)
 }
 
@@ -1420,5 +1617,95 @@ library(test_fwd) {
     fn test_unknown_pin_direction_is_an_error() {
         let msg = sample_lib_error("direction : input;", "direction : sideways;");
         assert!(msg.contains("sideways"), "{msg}");
+    }
+
+    #[test]
+    fn test_empty_paren_nldm_table_does_not_truncate() {
+        // `cell_rise ()` carries no template name; the parser must still find the
+        // table body instead of consuming `{` as the missing `)` and dropping the
+        // rest of the file.
+        let text = r#"
+library (t) {
+  cell (c) {
+    pin (A) { direction : input; }
+    pin (Y) {
+      direction : output;
+      timing () {
+        related_pin : "A";
+        timing_type : combinational;
+        cell_rise () {
+          values ("0.02");
+        }
+      }
+    }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        assert_eq!(db.cells.len(), 1);
+        let cr = db.cell_arcs(&db.cells[0])[0].cell_rise.as_ref().expect("cell_rise must exist");
+        assert_eq!(cr.values, vec![0.02]);
+    }
+
+    #[test]
+    fn test_template_index_scaled_after_variables() {
+        // `index_*` may precede `variable_*`; the capacitance axis must still use
+        // `capacitive_load_unit`, not `time_unit`.
+        let text = r#"
+library (t) {
+  time_unit : "1ns";
+  capacitive_load_unit (1, nf);
+  lu_table_template (tpl) {
+    index_1 ("0.01");
+    index_2 ("0.001");
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+  }
+  cell (c) {
+    pin (A) { direction : input; }
+    pin (Y) {
+      direction : output;
+      timing () {
+        related_pin : "A";
+        timing_type : combinational;
+        cell_rise (tpl) {
+          values ("0.02");
+        }
+      }
+    }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        let cr = db.cell_arcs(&db.cells[0])[0].cell_rise.as_ref().expect("cell_rise must exist");
+        assert_eq!(cr.index_1, vec![0.01]);
+        assert_eq!(cr.index_2, vec![1.0]);
+    }
+
+    #[test]
+    fn test_output_pin_function_is_interned() {
+        let text = r#"
+library (t) {
+  cell (c) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) {
+      direction : output;
+      function : "(A&B)";
+    }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        let pins = db.cell_pins(&db.cells[0]);
+        assert_eq!(pins[2].function.map(|s| db.strings.resolve(s)), Some("(A&B)"));
+        assert_eq!(pins[0].function, None);
+    }
+
+    #[test]
+    fn test_liberty_without_library_body_is_an_error() {
+        assert!(parse_liberty_bytes(b"").is_err());
+        assert!(parse_liberty_bytes(b"library (foo);").is_err());
+        assert!(parse_liberty_bytes(b"not a liberty file").is_err());
     }
 }
