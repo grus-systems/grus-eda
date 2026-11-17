@@ -224,18 +224,35 @@ candidates, not commitments — order and scope are open.
   output ports and one `ibex` check pin tied to constant `conb_1` cells.
   `cargo test` covers both the `check` and `output_port` kinds.
 
-### N2. SDC subset coverage vs. stock flows
+### N2. SDC subset coverage vs. stock flows — partially done
 
-- The parser hard-fails on constructs real flows emit: `set_units`,
-  collection operations such as `remove_from_collection`, `all_registers`,
-  and combined `-early`/`-late` on one `set_timing_derate` line. Stock
-  `write_sdc` output for the simple committed fixtures does not exercise
-  these, so the gap only shows on richer SDCs.
-- Either support them or count them in the skip summary behind a
-  `--lenient` path — never a silent pass.
-- Done when: a `write_sdc` file emitted by a stock LibreLane run on a
-  public design parses unchanged (the original R1 criterion, extended to
-  the constructs above).
+Done (`8f5eccc`, `44131bd`):
+
+- `set_units`: `-time ns` / `-capacitance pF` and the unit keys the model
+  never reads are accepted; a `-time`/`-capacitance` in another unit is an
+  error rather than a silent rescale.
+- `set_timing_derate`: `-early` and `-late` may share one command and apply
+  to both corners.
+- `remove_from_collection`: ports subtract through `PortSel::Except`
+  (predicate bases record exclusions), clocks and name lists by name.
+- Criterion met: `tests/designs/gcd/gcd.write_sdc` — unchanged `write_sdc`
+  output from OpenSTA on `gcd.propagated.sdc` — parses with zero ignored
+  commands (`parses_stock_write_sdc_unchanged`). Stock `write_sdc` resolves
+  collections to per-object `[get_ports {...}]` rules and expands derate per
+  corner, so it never emits the constructs below; those come from
+  hand/flow-written constraint SDCs.
+
+Remaining:
+
+- Object-producing selections (`all_registers`, `get_cells`, `get_pins`,
+  `get_nets`, `all_fanouts`, …) and the path exceptions that consume them
+  (`set_false_path`, `set_multicycle_path`, `set_max/min_delay`). These
+  select cells/pins/nets the port-based delay model cannot honour, and
+  `parse_sdc` runs without the design, so names cannot be resolved at parse
+  time. Options: a symbolic object selection plus counted-skip of the
+  consuming constraint (the request's lenient path — but ignoring a real
+  timing exception changes slack, so it needs an explicit decision), or
+  deferring until a stage needs register-selection constraints.
 
 ### N3. Check arcs: `min_pulse_width` and friends
 
