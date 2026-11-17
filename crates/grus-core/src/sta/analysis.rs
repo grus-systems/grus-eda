@@ -222,9 +222,16 @@ pub struct SkipReport {
     pub unmodelled_latch_cells: usize,
     /// Arcs that have no model on non-latch cells, by `TimingType` name.
     pub unsupported_arcs: BTreeMap<String, usize>,
-    /// Arcs that have no model on latch cells, by `TimingType` name: `min_pulse_width`
-    /// arcs and anything that is neither a check, the opening edge arc nor a `D -> Q`
-    /// transparent arc.
+    /// Recognised Liberty check-arc types the endpoint model defers: `min_pulse_width`,
+    /// `non_seq_*`, `three_state_*`, `preserve` and async `clear`/`preset`. They constrain a
+    /// pin rather than propagate data, so they add endpoints outside the modelled set
+    /// instead of altering arrivals. Counted here and shown in the summary; like the
+    /// design rules they are exempt from `--strict` (see `is_clean`), because dropping a
+    /// check arc cannot change the arrival or slack of an endpoint the model does report.
+    pub recognized_check_arcs: BTreeMap<String, usize>,
+    /// Arcs that have no model on latch cells, by `TimingType` name: anything that is
+    /// neither a modelled check, the opening edge arc, a `D -> Q` transparent arc nor a
+    /// deferred check arc (those count in `recognized_check_arcs` on every cell kind).
     pub latch_arcs_dropped: BTreeMap<String, usize>,
     /// Arcs whose related or target pin does not resolve on the instance.
     pub unresolved_arcs: usize,
@@ -262,6 +269,7 @@ impl SkipReport {
         let mut out = Vec::new();
         for (name, map) in [
             ("unsupported_arcs", &self.unsupported_arcs),
+            ("recognized_check_arcs", &self.recognized_check_arcs),
             ("latch_arcs_dropped", &self.latch_arcs_dropped),
             ("sdc_ignored_options", &self.sdc_ignored_options),
             ("sdc_ignored_commands", &self.sdc_ignored_commands),
@@ -287,10 +295,13 @@ impl SkipReport {
         out
     }
 
-    /// Arcs dropped for any reason: unresolved pins, unmodelled timing, latch arcs.
+    /// Arcs that never entered the timing graph: unresolved pins, unmodelled or
+    /// deferred-from-endpoint timing, and latch arcs. Deferred check arcs count here
+    /// even though `is_clean` exempts them, so the skipped share stays honest.
     pub fn arcs_skipped(&self) -> usize {
         self.unresolved_arcs
             + self.unsupported_arcs.values().sum::<usize>()
+            + self.recognized_check_arcs.values().sum::<usize>()
             + self.latch_arcs_dropped.values().sum::<usize>()
     }
 
@@ -299,9 +310,12 @@ impl SkipReport {
         self.incomplete_checks + self.unreached_endpoints
     }
 
-    /// True when the run left nothing out. SDC design-rule commands (`set_max_*`) are the one
-    /// exception: they never feed the timing model, so ignoring them cannot make a compared
-    /// number wrong. They stay visible in the summary; `--strict` only fails on skips that can.
+    /// True when the run left nothing out. Two kinds of skip are exempt because they cannot
+    /// change a compared number: SDC design-rule commands (`set_max_*`), which never feed the
+    /// timing model, and `recognized_check_arcs`, recognised Liberty check arcs deferred from
+    /// the endpoint model — they add checks outside the reported endpoint set rather than
+    /// altering an arrival or slack the report does produce. Both stay visible in the
+    /// summary; `--strict` only fails on skips that can make a reported number wrong.
     pub fn is_clean(&self) -> bool {
         const DESIGN_RULES: [&str; 3] = [
             "set_max_transition",
@@ -1009,6 +1023,19 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
                     check.clk = Some(src);
                     check.edge = check_transition(arc);
                     check.removal_arc = Some(lib_arc);
+                }
+                // Recognised check arcs (`min_pulse_width`, `non_seq_*`, `three_state_*`,
+                // `preserve`, `clear`, `preset`) constrain a pin rather than propagate data.
+                // They are deferred to `recognized_check_arcs`, distinct from the unknown
+                // `unsupported_arcs` catch-all, so the summary separates "known check we do
+                // not endpoint-model" from "arc type we do not recognise". The arm sits
+                // before the latch arm so a latch's pulse-width check counts here too
+                // instead of inflating `latch_arcs_dropped`, which `--strict` rejects.
+                t if t.is_deferred_check() => {
+                    *skipped
+                        .recognized_check_arcs
+                        .entry(format!("{t:?}"))
+                        .or_default() += 1
                 }
                 _ if let Some((enable, open_pol, latch_idx)) = latch => {
                     // The enable pin's clock-to-Q arc of the opening polarity models
@@ -2287,6 +2314,12 @@ fn run_sta_detail(
         skipped,
     )?;
     for category in report.skipped.nonzero() {
+        // Deferred check arcs are a documented, counted deferral shown in the report —
+        // not an unrecognised gap, and `min_pulse_width` alone would warn on every
+        // flop design. They stay in `nonzero()`/the summary and JSON.
+        if category.starts_with("recognized_check_arcs") {
+            continue;
+        }
         eprintln!("warning: STA skipped {category}; the report does not model these");
     }
     Ok((report, state, polarities))
@@ -2866,7 +2899,7 @@ mod tests {
     use crate::test_support::{design_dir, sky130_hd};
 
     #[test]
-    fn skip_report_is_clean_exempts_only_design_rules() {
+    fn skip_report_is_clean_exempts_only_design_rules_and_deferred_checks() {
         let mut skipped = SkipReport::default();
         assert!(skipped.is_clean());
         for cmd in [
@@ -2888,6 +2921,21 @@ mod tests {
             "an unmodelled clock must fail --strict"
         );
         skipped.sdc_ignored_commands.clear();
+        skipped
+            .recognized_check_arcs
+            .insert("MinPulseWidth".to_string(), 2);
+        assert!(
+            skipped.is_clean(),
+            "a deferred check arc adds an endpoint outside the report, it does not alter one"
+        );
+        skipped.latch_arcs_dropped.insert("Other".to_string(), 1);
+        assert!(
+            !skipped.is_clean(),
+            "an unmodelled latch arc can hide a data path and must fail --strict"
+        );
+        skipped.latch_arcs_dropped.clear();
+        skipped.unsupported_arcs.insert("Other".to_string(), 1);
+        assert!(!skipped.is_clean());
         skipped.unresolved_driving_cells = 1;
         assert!(!skipped.is_clean());
     }
@@ -3392,7 +3440,7 @@ mod tests {
                         | TimingType::CombinationalRise
                         | TimingType::CombinationalFall
                 ) && design.pin_is_driver[dst.0 as usize];
-                if !is_check && !is_open && !is_borrow {
+                if !is_check && !is_open && !is_borrow && !arc.timing_type.is_deferred_check() {
                     *arcs.entry(format!("{:?}", arc.timing_type)).or_default() += 1;
                 }
             }
@@ -3403,9 +3451,10 @@ mod tests {
     /// R0: the skip summary counts latch cells and arcs per kind, with totals that an
     /// independent recount from the Liberty and the netlist reproduces. The literal maps are
     /// the ground truth read off `sky130_fd_sc_hd__tt_025C_1v80.lib`: `dlxtp_1` has five arcs
-    /// (`setup_falling`, `hold_falling`, `min_pulse_width`->Other, `combinational`,
-    /// `rising_edge`) and drops only `min_pulse_width`; `dlxtn_1` drops only its
-    /// `min_pulse_width` arc.
+    /// (`setup_falling`, `hold_falling`, `min_pulse_width`, `combinational`,
+    /// `rising_edge`) and drops none — its `min_pulse_width` is a deferred check arc and
+    /// counts in `recognized_check_arcs` like every other cell's. `dlxtn_1` drops nothing
+    /// for the same reason.
     #[test]
     fn test_skip_report_counts_latch_arcs() {
         for (design_name, def_file, sdc_file, want) in [
@@ -3413,13 +3462,25 @@ mod tests {
                 "sta_edge",
                 "non_dlxtn_latch/edge_latch.def",
                 "non_dlxtn_latch/edge_latch.sdc",
-                (0, BTreeMap::from([("Other".to_string(), 1)])),
+                (
+                    0,
+                    BTreeMap::new(),
+                    BTreeMap::from([("MinPulseWidth".to_string(), 2)]),
+                ),
             ),
             (
                 "ibex",
                 "ibex.placed.def",
                 "ibex.sdc",
-                (0, BTreeMap::from([("Other".to_string(), 1)])),
+                (
+                    0,
+                    BTreeMap::new(),
+                    BTreeMap::from([
+                        ("Clear".to_string(), 1655),
+                        ("MinPulseWidth".to_string(), 3602),
+                        ("Preset".to_string(), 9),
+                    ]),
+                ),
             ),
         ] {
             let lib_dir = sky130_hd();
@@ -3437,13 +3498,17 @@ mod tests {
             let sdc = load_sdc(&dir.join(sdc_file)).expect("SDC");
             let report = run_sta(&design, &lib, &sdc, None).expect("STA");
 
-            let (want_cells, want_arcs) = want;
+            let (want_cells, want_arcs, want_checks) = want;
             assert_eq!(
                 report.skipped.unmodelled_latch_cells, want_cells,
                 "{design_name}"
             );
             assert_eq!(
                 report.skipped.latch_arcs_dropped, want_arcs,
+                "{design_name}"
+            );
+            assert_eq!(
+                report.skipped.recognized_check_arcs, want_checks,
                 "{design_name}"
             );
 

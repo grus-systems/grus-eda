@@ -486,7 +486,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 fn print_skip_summary(report: &grus_core::sta::StaReport) {
     let s = &report.skipped;
     if s.is_clean() {
-        println!("skipped: none");
+        // `is_clean` exempts deferred check arcs and SDC design rules; they still
+        // count in `nonzero()`, so a clean run lists them instead of hiding them.
+        let deferred = s.nonzero();
+        if deferred.is_empty() {
+            println!("skipped: none");
+        } else {
+            println!("skipped: none affecting reported timing");
+            for category in deferred {
+                println!("  {category}");
+            }
+        }
         return;
     }
     let share = |n: usize, total: usize| {

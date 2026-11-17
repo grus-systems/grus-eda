@@ -225,6 +225,14 @@ fn parse_timing_type(s: &str) -> TimingType {
         "removal_rising" => TimingType::RemovalRising,
         "recovery_falling" => TimingType::RecoveryFalling,
         "removal_falling" => TimingType::RemovalFalling,
+        "min_pulse_width" => TimingType::MinPulseWidth,
+        "non_seq_setup_rising" => TimingType::NonSeqSetupRising,
+        "non_seq_setup_falling" => TimingType::NonSeqSetupFalling,
+        "non_seq_hold_rising" => TimingType::NonSeqHoldRising,
+        "non_seq_hold_falling" => TimingType::NonSeqHoldFalling,
+        "three_state_enable" => TimingType::ThreeStateEnable,
+        "three_state_disable" => TimingType::ThreeStateDisable,
+        "preserve" => TimingType::Preserve,
         _ => TimingType::Other,
     }
 }

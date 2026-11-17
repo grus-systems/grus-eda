@@ -254,17 +254,28 @@ Remaining:
   timing exception changes slack, so it needs an explicit decision), or
   deferring until a stage needs register-selection constraints.
 
-### N3. Check arcs: `min_pulse_width` and friends
+### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 
-- Flop-heavy designs leave a non-trivial share of arcs in
-  `unsupported_arcs[Other]` — `ibex` zero-wire reports `Other=3601`
-  (~7% of arcs) plus `Clear=1655`/`Preset=9`, so `--strict` can never
+- Flop-heavy designs left a non-trivial share of arcs in
+  `unsupported_arcs[Other]` — `ibex` zero-wire reported `Other=3601`
+  (~7% of arcs) plus `Clear=1655`/`Preset=9`, so `--strict` could never
   pass. These are check arcs (pulse width, `non_seq_*`), not
-  data-propagation arcs; modelling them clears the summary without
-  changing path delays.
-- Done when: each such arc is either modelled as a check or counted in a
-  dedicated "recognized check, not endpoint-modeled" category, and the
-  `--strict` semantics for what remains are documented.
+  data-propagation arcs.
+- `TimingType` now names every `sky130_fd_sc_hd` check arc
+  (`min_pulse_width`, `non_seq_setup/hold_*`, `three_state_*`, `preserve`)
+  and `SkipReport::recognized_check_arcs` counts them per type on every
+  cell kind, latches included (a latch's pulse-width check no longer lands
+  in `latch_arcs_dropped`). They are exempt from `--strict` via `is_clean`
+  because they add endpoints outside the reported set rather than altering
+  an arrival or slack; `unsupported_arcs` and `latch_arcs_dropped` still
+  fail strict, and the CLI summary lists deferred arcs even on a clean run
+  ("skipped: none affecting reported timing").
+- `ibex` now reports `recognized_check_arcs[Clear=1655, MinPulseWidth=3602,
+  Preset=9]` with `unsupported_arcs`/`latch_arcs_dropped` empty;
+  `sta_edge/non_dlxtn_latch --strict` passes.
+- Deferred: actually evaluating these checks (pulse width between clock
+  edges, `non_seq_*` vs the clock) is future work — until then the counts
+  stay visible in every summary and the JSON report.
 
 ### N4. SPEF write-out
 

@@ -28,7 +28,44 @@ pub enum TimingType {
     RecoveryRising,
     RemovalFalling,
     RecoveryFalling,
+    /// Minimum clock-pulse width at the related pin (`min_pulse_width`): an
+    /// intra-cell check, never a data-propagation arc.
+    MinPulseWidth,
+    /// Setup/hold checks on non-sequential pins (`non_seq_*`): like the D-pin
+    /// checks but without a `CLK -> Q` launch, deferred from the endpoint model.
+    NonSeqSetupRising,
+    NonSeqSetupFalling,
+    NonSeqHoldRising,
+    NonSeqHoldFalling,
+    /// Tristate/bus-hold timing (`three_state_enable`/`three_state_disable`).
+    ThreeStateEnable,
+    ThreeStateDisable,
+    /// Value-preservation checks (`preserve`).
+    Preserve,
+    /// Any `timing_type` string outside the recognised set.
     Other,
+}
+
+impl TimingType {
+    /// Liberty `timing_type` names that are recognised check arcs: they constrain a
+    /// pin (pulse width, non-sequential setup/hold, tristate, preserve, async
+    /// clear/preset) rather than propagate data, so the endpoint model defers them
+    /// into `SkipReport::recognized_check_arcs` instead of dropping them as unknown.
+    pub fn is_deferred_check(self) -> bool {
+        matches!(
+            self,
+            Self::MinPulseWidth
+                | Self::NonSeqSetupRising
+                | Self::NonSeqSetupFalling
+                | Self::NonSeqHoldRising
+                | Self::NonSeqHoldFalling
+                | Self::ThreeStateEnable
+                | Self::ThreeStateDisable
+                | Self::Preserve
+                | Self::Clear
+                | Self::Preset
+        )
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
