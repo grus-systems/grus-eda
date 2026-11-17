@@ -197,3 +197,79 @@ The items below close these gaps, in the order proposed at the end.
 
 R10 runs alongside every step. For a design with an integrated clock-gating cell, R4b
 comes before R2.
+
+## Candidate next work items
+
+The R0–R10 items above closed the gaps found on plain flip-flop and
+moderately-featured public designs. Exercising the tool further on
+realistic gate-level netlists surfaced the following generic EDA gaps.
+Each was re-verified on the public designs and `sta_edge` fixtures before
+being listed; none depends on any private design or number. They are
+candidates, not commitments — order and scope are open.
+
+### N1. Unreached-endpoint diagnostics
+
+- `SkipReport` only counts `unreached_endpoints`; it does not say which
+  pins were unreached or why (no clock, no path, dropped arc).
+- Done when: the report names each unreached endpoint and the reason it
+  produced no check, verified on a public design that has unreached
+  endpoints (`ibex` zero-wire reports 7).
+
+### N2. SDC subset coverage vs. stock flows
+
+- The parser hard-fails on constructs real flows emit: `set_units`,
+  collection operations such as `remove_from_collection`, `all_registers`,
+  and combined `-early`/`-late` on one `set_timing_derate` line. Stock
+  `write_sdc` output for the simple committed fixtures does not exercise
+  these, so the gap only shows on richer SDCs.
+- Either support them or count them in the skip summary behind a
+  `--lenient` path — never a silent pass.
+- Done when: a `write_sdc` file emitted by a stock LibreLane run on a
+  public design parses unchanged (the original R1 criterion, extended to
+  the constructs above).
+
+### N3. Check arcs: `min_pulse_width` and friends
+
+- Flop-heavy designs leave a non-trivial share of arcs in
+  `unsupported_arcs[Other]` — `ibex` zero-wire reports `Other=3601`
+  (~7% of arcs) plus `Clear=1655`/`Preset=9`, so `--strict` can never
+  pass. These are check arcs (pulse width, `non_seq_*`), not
+  data-propagation arcs; modelling them clears the summary without
+  changing path delays.
+- Done when: each such arc is either modelled as a check or counted in a
+  dedicated "recognized check, not endpoint-modeled" category, and the
+  `--strict` semantics for what remains are documented.
+
+### N4. SPEF write-out
+
+- The placement-RC tree (`pdr::primDijkstra` port) already builds the
+  same parasitics OpenROAD estimates; serializing it to SPEF lets
+  downstream tools and cross-checks run on identical parasitics.
+- Done when: an emitted SPEF re-reads through `readers/spef.rs` and
+  reproduces the placement-RC STA result within tolerance.
+
+### N5. Netlist ingest + floorplan generation
+
+- `place`/`sta` only accept DEF produced elsewhere. Add a `floorplan`
+  stage (or flags on `place`): read a gate-level netlist (Yosys JSON or
+  Verilog) plus a floorplan spec (die area / target utilization,
+  site/row generation, edge pin assignment) and emit a floorplan DEF,
+  making `synth -> estimate` self-contained.
+- Gotcha: Yosys JSON lists the same wire bit under multiple `netnames`
+  aliases; the converter must dedupe by bit id or it silently connects a
+  pin to several nets (shows up as a bogus combinational loop at
+  levelization). Reproducible with any yosys-synthesized public design.
+- Done when: a public synthesised netlist produces a legal floorplan DEF
+  whose downstream `place`/`sta` runs match the DEF-fed path.
+
+### N6. Multi-corner analysis (optional, previously out of scope)
+
+- Separate min/max libraries for setup and hold; single-corner-per-run
+  already works. Convenience plus correct worst-case across corners.
+- Recorded out of scope in R9; revisit only if a public design needs it.
+
+### N7. Power reporting (new stage, scope-gated)
+
+- VCD/SAIF-driven power estimation checked against OpenROAD
+  `report_power` within a stated tolerance. Largest item; only if power
+  estimation is in scope for the project.
