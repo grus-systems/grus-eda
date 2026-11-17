@@ -162,6 +162,54 @@ pub struct EndpointReport {
     pub min_slew_ns: f32,
 }
 
+/// What kind of timing endpoint an [`SkippedEndpoint`] was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointKind {
+    /// Register data or asynchronous set/reset check.
+    Check,
+    /// Clock-gate enable check.
+    ClockGate,
+    /// Top-level output port.
+    OutputPort,
+}
+
+/// Why an endpoint candidate produced no check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The check lacks a clock pin or a late/early arc pair.
+    IncompleteCheck,
+    /// The check's or clock gate's clock pin never received a clock edge
+    /// (propagated clock only). `related` names the clock pin.
+    NoClock,
+    /// The endpoint pin itself never received a data arrival. `related` names the
+    /// net driver to inspect next, or is `None` when the net has no driver.
+    NoPath,
+    /// The endpoint's net driver is a cell that produces no timed arrival: either it
+    /// has no Liberty mapping at all, or its Liberty cell declares no timing arcs
+    /// (constants such as `conb`, taps, fillers). `related` names the driver. This is
+    /// the benign `NoPath` subcase behind most real-design unreached endpoints.
+    UntimedDriver,
+    /// The endpoint pin was reached but none of its arrived transitions had a
+    /// usable NLDM constraint table, so no setup/hold bound could be evaluated.
+    NoConstraintTable,
+}
+
+/// One endpoint candidate that produced no check, with the pin and the reason.
+/// `skipped_endpoints` holds one entry per `incomplete_checks` +
+/// `unreached_endpoints` count.
+#[derive(Clone, Debug, Serialize)]
+pub struct SkippedEndpoint {
+    /// Endpoint pin name (`inst/pin` for cell pins, port name for top-level pins).
+    pub pin: String,
+    pub kind: EndpointKind,
+    pub reason: SkipReason,
+    /// Context pin or description: the unreached clock pin for `NoClock`, the net
+    /// driver for `NoPath`/`UntimedDriver`, the missing piece for `IncompleteCheck`.
+    pub related: Option<String>,
+}
+
 /// Inputs and checks the analysis left out, counted per category, with the totals they are a
 /// share of. A non-zero count means the report is missing timing that the design has.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -184,6 +232,9 @@ pub struct SkipReport {
     pub incomplete_checks: usize,
     /// Checks and outputs that no polarity of a path reached.
     pub unreached_endpoints: usize,
+    /// Per-endpoint detail for every `incomplete_checks` + `unreached_endpoints`
+    /// skip: which pin produced no check and why.
+    pub skipped_endpoints: Vec<SkippedEndpoint>,
     /// Clock nets driven by a cell output (buffered or gated clock). Counted only for nets
     /// the active clock model does not propagate: all of them under the ideal clock, and the
     /// unreached ones under `set_propagated_clock`.
@@ -2263,18 +2314,65 @@ fn pick_worst_polarity(pair: &[Option<Worst>; 2]) -> Option<Worst> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_endpoint(
+    cx: &Context,
+    levelized: &LevelizedGraph,
+    state: &[PinTimingState],
     entries: &mut Vec<(EndpointReport, EndpointPolarities)>,
     skipped: &mut SkipReport,
-    pin: impl FnOnce() -> String,
+    kind: EndpointKind,
+    pin: PinId,
     cands: EndpointPolarities,
 ) {
     match (
         pick_worst_polarity(&cands.max),
         pick_worst_polarity(&cands.min),
     ) {
-        (Some(max), Some(min)) => entries.push((endpoint_report(pin(), &max, &min), cands)),
-        _ => skipped.unreached_endpoints += 1,
+        (Some(max), Some(min)) => {
+            entries.push((endpoint_report(cx.pin_name(pin), &max, &min), cands))
+        }
+        _ => {
+            skipped.unreached_endpoints += 1;
+            let s = state[pin.0 as usize];
+            // A reached check pin with no candidate means every arrived transition
+            // lacked a usable NLDM constraint table; gates and ports have no such
+            // table lookup, so their only failure is an unreached pin.
+            let (reason, related) = if kind == EndpointKind::Check
+                && (s.reached(RISE) || s.reached(FALL))
+            {
+                (SkipReason::NoConstraintTable, None)
+            } else {
+                match levelized.pin_driver[pin.0 as usize] {
+                    Some((_, _, drv)) => {
+                        // A driver cell with no Liberty mapping or no timing arcs at all
+                        // (constant `conb`, tap, filler) can never deliver a timed arrival;
+                        // name it so the skip reads as the expected untimed case.
+                        let untimed = cx.design.pin_cells[drv.0 as usize].is_some_and(|c| {
+                            match cx.design.cell_lib_ids[c.0 as usize] {
+                                Some(lcid) => cx.lib.cells[lcid.0 as usize].arc_count == 0,
+                                None => true,
+                            }
+                        });
+                        (
+                            if untimed {
+                                SkipReason::UntimedDriver
+                            } else {
+                                SkipReason::NoPath
+                            },
+                            Some(cx.pin_name(drv)),
+                        )
+                    }
+                    None => (SkipReason::NoPath, None),
+                }
+            };
+            skipped.skipped_endpoints.push(SkippedEndpoint {
+                pin: cx.pin_name(pin),
+                kind,
+                reason,
+                related,
+            });
+        }
     }
 }
 
@@ -2394,6 +2492,22 @@ fn collect_endpoints(
             (check.clk, check.late_arc(), check.early_arc())
         else {
             skipped.incomplete_checks += 1;
+            let mut missing = Vec::new();
+            if check.clk.is_none() {
+                missing.push("clock pin");
+            }
+            if check.late_arc().is_none() {
+                missing.push("late arc");
+            }
+            if check.early_arc().is_none() {
+                missing.push("early arc");
+            }
+            skipped.skipped_endpoints.push(SkippedEndpoint {
+                pin: cx.pin_name(data),
+                kind: EndpointKind::Check,
+                reason: SkipReason::IncompleteCheck,
+                related: Some(missing.join(", ")),
+            });
             continue;
         };
         let (s, clk_state) = (state[data.0 as usize], state[clk.0 as usize]);
@@ -2407,6 +2521,12 @@ fn collect_endpoints(
             || (check.latch && sdc.propagated_clock && !clk_state.reached(1 - edge))
         {
             skipped.unreached_endpoints += 1;
+            skipped.skipped_endpoints.push(SkippedEndpoint {
+                pin: cx.pin_name(data),
+                kind: EndpointKind::Check,
+                reason: SkipReason::NoClock,
+                related: Some(cx.pin_name(clk)),
+            });
             continue;
         }
         // The setup capture edge is the first edge of `edge` polarity strictly after the
@@ -2561,7 +2681,16 @@ fn collect_endpoints(
                 slew: s.slew_min[pol],
             });
         }
-        record_endpoint(&mut entries, &mut skipped, || cx.pin_name(data), cands);
+        record_endpoint(
+            cx,
+            levelized,
+            state,
+            &mut entries,
+            &mut skipped,
+            EndpointKind::Check,
+            data,
+            cands,
+        );
     }
 
     // Clock gate: the enable must settle before the propagating clock edge and hold past
@@ -2582,6 +2711,12 @@ fn collect_endpoints(
         let c = state[clk_pin.0 as usize];
         if sdc.propagated_clock && (!c.reached(RISE) || !c.reached(FALL)) {
             skipped.unreached_endpoints += 1;
+            skipped.skipped_endpoints.push(SkippedEndpoint {
+                pin: cx.pin_name(enable),
+                kind: EndpointKind::ClockGate,
+                reason: SkipReason::NoClock,
+                related: Some(cx.pin_name(clk_pin)),
+            });
             continue;
         }
         let mut cands = EndpointPolarities {
@@ -2628,7 +2763,16 @@ fn collect_endpoints(
                 slew: s.slew_min[pol],
             });
         }
-        record_endpoint(&mut entries, &mut skipped, || cx.pin_name(enable), cands);
+        record_endpoint(
+            cx,
+            levelized,
+            state,
+            &mut entries,
+            &mut skipped,
+            EndpointKind::ClockGate,
+            enable,
+            cands,
+        );
     }
 
     for &pin in &design.io_pins {
@@ -2667,7 +2811,16 @@ fn collect_endpoints(
                 slew: s.slew_min[pol],
             });
         }
-        record_endpoint(&mut entries, &mut skipped, || cx.pin_name(pin), cands);
+        record_endpoint(
+            cx,
+            levelized,
+            state,
+            &mut entries,
+            &mut skipped,
+            EndpointKind::OutputPort,
+            pin,
+            cands,
+        );
     }
 
     entries.sort_by(|a, b| a.0.pin.cmp(&b.0.pin));
@@ -3132,6 +3285,49 @@ mod tests {
             .skipped
             .nonzero()
             .contains(&"unmapped_cells=94".to_string()));
+    }
+
+    /// N1: every endpoint candidate that produces no check is named with its pin,
+    /// kind and reason. ibex's unreached endpoints are all driven by constant
+    /// `conb_1` cells (no Liberty timing arcs), so they report `untimed_driver` and
+    /// name the driving pin — covering both the `check` and `output_port` kinds.
+    #[test]
+    fn test_unreached_endpoint_diagnostics() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("ibex");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF");
+        let design = parse_def(&dir.join("ibex.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join("ibex.sdc")).expect("SDC");
+        let report = run_sta(&design, &lib, &sdc, None).expect("STA");
+
+        let skipped = &report.skipped;
+        assert_eq!(
+            skipped.skipped_endpoints.len(),
+            skipped.unreached_endpoints + skipped.incomplete_checks
+        );
+        assert!(!skipped.skipped_endpoints.is_empty());
+        for e in &skipped.skipped_endpoints {
+            assert_eq!(e.reason, SkipReason::UntimedDriver, "{}", e.pin);
+            assert!(e.related.is_some(), "{}", e.pin);
+        }
+        let kind_of = |pin: &str| {
+            skipped
+                .skipped_endpoints
+                .iter()
+                .find(|e| e.pin == pin)
+                .unwrap_or_else(|| panic!("{pin} not reported"))
+                .kind
+        };
+        assert_eq!(kind_of("_21812_/D"), EndpointKind::Check);
+        assert_eq!(kind_of("alert_major_o"), EndpointKind::OutputPort);
     }
 
     /// Recount of the latch arcs `build_graph` drops, tallied straight from the Liberty

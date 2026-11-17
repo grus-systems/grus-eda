@@ -207,13 +207,22 @@ Each was re-verified on the public designs and `sta_edge` fixtures before
 being listed; none depends on any private design or number. They are
 candidates, not commitments — order and scope are open.
 
-### N1. Unreached-endpoint diagnostics
+### N1. Unreached-endpoint diagnostics — done
 
-- `SkipReport` only counts `unreached_endpoints`; it does not say which
-  pins were unreached or why (no clock, no path, dropped arc).
-- Done when: the report names each unreached endpoint and the reason it
-  produced no check, verified on a public design that has unreached
-  endpoints (`ibex` zero-wire reports 7).
+- `SkipReport` now carries `skipped_endpoints`: one `SkippedEndpoint`
+  (`pin`, `kind`, `reason`, `related`) per `incomplete_checks` +
+  `unreached_endpoints` skip, serialized in the `--json` report and printed
+  by the `sta` skip summary.
+- Reasons: `incomplete_check` (missing clock pin or late/early arc, `related`
+  names the missing piece), `no_clock` (`related` = the unreached clock pin,
+  propagated clock only), `no_path`, `untimed_driver` (the net driver is a
+  cell with no Liberty mapping or no timing arcs — constants such as `conb`,
+  taps, fillers; `related` = the driver pin), and `no_constraint_table`
+  (pin reached but no arrived transition had a usable NLDM constraint table).
+- Verified on public designs: every unreached endpoint across `ibex` (7),
+  `jpeg` (1) and `picorv32` propagated (106) is an `untimed_driver` case —
+  output ports and one `ibex` check pin tied to constant `conb_1` cells.
+  `cargo test` covers both the `check` and `output_port` kinds.
 
 ### N2. SDC subset coverage vs. stock flows
 

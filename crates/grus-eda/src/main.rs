@@ -515,6 +515,14 @@ fn print_skip_summary(report: &grus_core::sta::StaReport) {
     for category in s.nonzero() {
         println!("  {category}");
     }
+    for e in &s.skipped_endpoints {
+        let related = e
+            .related
+            .as_deref()
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        println!("    endpoint {} {:?}: {:?}{}", e.pin, e.kind, e.reason, related);
+    }
 }
 
 fn print_heatmap(grid_w: usize, grid_h: usize, ratios: &[f32]) {
