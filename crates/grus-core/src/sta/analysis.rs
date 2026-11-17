@@ -2720,8 +2720,8 @@ mod tests {
     }
 
     /// Placement RC vs the placement-estimate SPEF read back through our own
-    /// STA engine on the same DEF/SDC: every endpoint field, WNS/TNS and the
-    /// violation counts must agree. This is the direct evidence that
+    /// STA engine on the same DEF/SDC: every endpoint field, max/min WNS/TNS
+    /// and the violation counts must agree. This is the direct evidence that
     /// `placement_rc` and `placed_spef` measure the same residual against
     /// OpenSTA, which licenses `AES_PLACEMENT`/`IBEX_PLACEMENT` sharing the
     /// SPEF tolerances (per-net Elmore alone cannot show path accumulation).
@@ -2748,6 +2748,9 @@ mod tests {
             let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
             let rc = crate::sta::WireRc::from_layer(&tech, "met2").expect("met2 RC");
             let parasitics_p = crate::sta::estimate_placement_parasitics(&design, &tech, rc);
+            // `*.routed.spef` is OpenROAD's `estimate_parasitics -placement`
+            // output for these designs — a placement estimate, not a routed
+            // extraction (tests/designs/README.md).
             let spef = crate::readers::load_spef(&dir.join(format!("{design_name}.routed.spef")))
                 .expect("SPEF");
             let parasitics_s = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
@@ -2779,11 +2782,20 @@ mod tests {
                     *w = (*w).max((a as f64 - b as f64).abs());
                 }
             }
-            let wns_d = (rp.wns_max_ns as f64 - rs.wns_max_ns as f64).abs();
-            let tns_d = (rp.tns_max_ns as f64 - rs.tns_max_ns as f64).abs();
+            let wns_d = [
+                (rp.wns_max_ns as f64 - rs.wns_max_ns as f64).abs(),
+                (rp.wns_min_ns as f64 - rs.wns_min_ns as f64).abs(),
+            ];
+            let tns_d = [
+                (rp.tns_max_ns as f64 - rs.tns_max_ns as f64).abs(),
+                (rp.tns_min_ns as f64 - rs.tns_min_ns as f64).abs(),
+            ];
+            let [wns_max_d, wns_min_d] = wns_d;
+            let [tns_max_d, tns_min_d] = tns_d;
             println!(
                 "{design_name}: placement-vs-SPEF worst endpoint |diff| {:?} ps, \
-                 wns {wns_d} ns, tns {tns_d} ns",
+                 wns_max {wns_max_d:.6} ns, wns_min {wns_min_d:.6} ns, \
+                 tns_max {tns_max_d:.6} ns, tns_min {tns_min_d:.6} ns",
                 worst.map(|w| (w * 1e6).round() / 1e3)
             );
             assert_eq!(rp.setup_violations, rs.setup_violations, "{design_name}: setup violations");
@@ -2796,11 +2808,16 @@ mod tests {
                 worst.iter().all(|&w| w <= 0.010),
                 "{design_name}: placement vs SPEF endpoint fields diverge: {worst:?} ns"
             );
-            assert!(wns_d <= 0.010, "{design_name}: WNS diverges by {wns_d} ns");
-            assert!(
-                tns_d <= 0.01 * (rs.tns_max_ns as f64).abs().max(1.0),
-                "{design_name}: TNS diverges by {tns_d} ns"
-            );
+            for (side, ((wd, td), tns_ref)) in ["max", "min"]
+                .into_iter()
+                .zip(wns_d.into_iter().zip(tns_d).zip([rs.tns_max_ns, rs.tns_min_ns]))
+            {
+                assert!(wd <= 0.010, "{design_name}: {side} WNS diverges by {wd} ns");
+                assert!(
+                    td <= 0.01 * (tns_ref as f64).abs().max(1.0),
+                    "{design_name}: {side} TNS diverges by {td} ns"
+                );
+            }
         }
     }
 
