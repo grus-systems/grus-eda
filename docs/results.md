@@ -2191,14 +2191,23 @@ same capture-anchored required time. `pm2_min2`/`pmd_multi` confirm the
 min side and per-class anchoring are unchanged in form.
 
 **Comparison after the fix**: all 68 evaluated scenarios match STRICT
-tolerances; the 4 OpenSTA-rejection records unchanged. 31 of 72
-scenarios moved vs the previous golden (every propagated-clock row whose
-report touches `u_ff2`'s launch or the swapped mux inputs, plus
-min-side `u_ff2` rows); 41 are byte-identical — `base`, the `fp_*`,
-`mc_*`, `mhu_*` and ideal `md_*` sets where the winner's value is
-source-agnostic (`m2_both` keeps 1.277188: the same number now sourced
-from `u_ff0` instead of `u_ff2`), and the `md_early`/`md_datapath` error
-records. `sel`'s port-launched candidate did not steal the arrival
+tolerances; the 4 OpenSTA-rejection records (`mc_both`,
+`mc_setup2_hold1`, `md_early`, `md_datapath`) unchanged. 31 of 72
+scenarios moved vs the previous golden: all 4 propagated-clock runs
+(`base_prop`, `pmd_basic`, `pmd_min`, `pmd_multi`), all `pm2_*`,
+`m2_max0`/`m2_max2`/`m2_min2`, `mhu_min1`/`mhu_max1`, 6 `mc_*`
+(`mc_setup2`, `mc_setup2_pos`, `mc_bare2`, `mc_holdneg`, `mc_overlap`,
+`mc_pin_clk`) and 13 `md_*` (`md_basic`, `md_tight`, `md_min`,
+`md_min1`, `md_overlap`, `md_overlap_rev`, `md_both`, `md_mc`,
+`md_mc_rev`, `md_min_mc`, `md_min_mc_rev`, `md_min_mcp_h1`,
+`md_min_mcp_s2`) — every scenario whose report contains a `u_ff0`- or
+`u_ff2`-sourced row. 41 are byte-identical: `base`, all 20 `fp_*`,
+`mhu_base`, the source-agnostic `mc_*` (`mc_hold0`, `mc_hold1`,
+`mc_to_y`, `mc_allregs`, `mc_pin`, `mc_s2_h1_split`,
+`mc_setup2_nofrom`) and `md_*` (`md_nofrom`, `md_loose`, `md_port`,
+`md_min0`, `md_minport`, `md_fp`, `md_through`) winners, the 4 error
+records, and `m2_both` — which keeps 1.277188, the same winning value
+now sourced from `u_ff0` instead of `u_ff2`. `sel`'s port-launched candidate did not steal the arrival
 report (u_ff2's 0.786764 > sel's reach). Fail-proof: composing the
 reported arrival from `arrival_min` instead of the covered candidate's
 arrival turns `pm2_both` red, and the retired pairing's red run above is

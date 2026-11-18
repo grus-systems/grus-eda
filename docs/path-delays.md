@@ -313,7 +313,10 @@ Resolved by review + additional probing (2026-11-18):
 - ~~command-order precedence~~ — order-independent delay-over-MCP,
   file-order last-wins within a constraint type (new golden scenarios).
 
-Resolved by the v1 implementation (2026-11-18):
+Resolved by the v1 implementation (2026-11-18; superseded — the
+`delay_launch`/`delay_max` machinery named below was retired with the
+delay domain on 2026-11-19, see section 2; the signature-class split
+stays):
 
 - ~~`delay_launch` seed pairing~~ — the late clock-pin arrival
   (`clk_state.arrival_max[edge]`) for sequential launches; verified against

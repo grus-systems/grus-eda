@@ -259,13 +259,17 @@ Done since (`0711785`, `32abb45`, exception application):
 Done since (path-delay checks, `docs/path-delays.md`):
 
 - `set_max_delay`/`set_min_delay` with the same `-from`/`-to` selector set:
-  `PinTimingState` carries a per-transition delay domain (`arrival` minus
-  launch-clock arrival, propagated on the same arcs) that replaces the
-  clock check on the covered side — measured precedence false_path >
-  delay > multicycle, file-order last-wins within a kind. Unsupported
-  qualifiers and out-of-model endpoints (output ports, clock gates,
-  latch-D, async checks) are counted, never silently applied
-  (`unsupported_path_delay_endpoints`).
+  delay coverage joins the exception signature so covered sources land in
+  their own eval class; at a delay-covered endpoint the clock check's
+  candidate is kept (its ordinary arrival and slew) with only the
+  required time replaced by the capture-anchored delay requirement —
+  measured precedence false_path > delay > multicycle, file-order
+  last-wins within a kind. An earlier per-pin delay domain
+  (`delay_max`/`delay_launch_max`) was retired on 2026-11-19 when the
+  diverging-winner fixture falsified its pairing (`docs/path-delays.md`
+  section 5). Unsupported qualifiers and out-of-model endpoints (output
+  ports, clock gates, latch-D, async checks) are counted, never silently
+  applied (`unsupported_path_delay_endpoints`).
 
 Remaining:
 
