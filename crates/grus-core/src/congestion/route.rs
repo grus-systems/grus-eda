@@ -751,8 +751,9 @@ mod tests {
         }
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
@@ -809,8 +810,9 @@ mod tests {
         let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path).expect("Reference JSON");
@@ -1154,8 +1156,9 @@ mod tests {
         let dump = parse_usage_dump(&require(design_dir("aes").join("aes.gcell_usage.txt")));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let design_db =
             parse_def(&def_path, &tech_db, None).expect("Failed to parse aes.util65.def");
 
@@ -1208,8 +1211,9 @@ mod tests {
         let dump = parse_usage_dump(&require(design_dir("jpeg").join("jpeg.gcell_usage.txt")));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let design_db =
             parse_def(&def_path, &tech_db, None).expect("Failed to parse jpeg.util65.def");
 
@@ -1262,8 +1266,9 @@ mod tests {
         let dump = parse_usage_dump(&require(design_dir("ibex").join("ibex.gcell_usage.txt")));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let design_db =
             parse_def(&def_path, &tech_db, None).expect("Failed to parse ibex.util65.def");
 
@@ -1320,8 +1325,9 @@ mod tests {
         ));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let design_db =
             parse_def(&def_path, &tech_db, None).expect("Failed to parse picorv32.util65.def");
 

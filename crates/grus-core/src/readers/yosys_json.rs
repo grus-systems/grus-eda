@@ -343,8 +343,9 @@ mod tests {
         }
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_yosys_json(&json_path, &tech_db, None).expect("Failed to parse Yosys JSON");
 
@@ -399,8 +400,9 @@ mod tests {
         let json_path = require(design_dir("aes").join("aes.synth.json"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_yosys_json(&json_path, &tech_db, None).expect("Failed to parse Yosys JSON");
 
@@ -455,8 +457,9 @@ mod tests {
         let json_path = require(design_dir("jpeg").join("jpeg.synth.json"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_yosys_json(&json_path, &tech_db, None).expect("Failed to parse Yosys JSON");
 
@@ -511,8 +514,9 @@ mod tests {
         let json_path = require(design_dir("ibex").join("ibex.synth.json"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_yosys_json(&json_path, &tech_db, None).expect("Failed to parse Yosys JSON");
 

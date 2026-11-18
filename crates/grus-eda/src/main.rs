@@ -1,5 +1,32 @@
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Loads the tech DB and reports skipped top-level LEF statements on stderr.
+fn load_lef_tech_db(
+    tlef: &Path,
+    lef: &Path,
+    interner: &mut grus_core::interner::StringInterner,
+) -> anyhow::Result<grus_core::tech_db::TechDb> {
+    let (tech_db, report) = grus_core::readers::load_tech_db(tlef, lef, interner)?;
+    print_lef_skip_summary(&report);
+    Ok(tech_db)
+}
+
+fn print_lef_skip_summary(report: &grus_core::readers::LefSkipReport) {
+    if report.skipped.is_empty() {
+        return;
+    }
+    let total = report.total();
+    // Count descending, keyword ascending for determinism.
+    let mut parts: Vec<_> = report.skipped.iter().collect();
+    parts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let detail = parts
+        .iter()
+        .map(|(k, v)| format!("{k} x{v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("lef: skipped {total} statements ({detail})");
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -331,7 +358,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("Loading LEF from {:?} and {:?}", tlef_path, lef_path);
                 let t_lef = std::time::Instant::now();
                 let mut interner = grus_core::interner::StringInterner::new();
-                let tech_db = grus_core::readers::load_tech_db(tlef_path, lef_path, &mut interner)?;
+                let tech_db = load_lef_tech_db(tlef_path, lef_path, &mut interner)?;
                 let elapsed_lef_ms = t_lef.elapsed().as_secs_f64() * 1000.0;
                 println!(
                     "Loaded LEF: dbu/um={}, site={} ({}x{} dbu), routing_layers={}, macros={}, macro_pins={}, elapsed={:.2}ms",
@@ -404,7 +431,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
             let mut interner = grus_core::interner::StringInterner::new();
             let t_load = std::time::Instant::now();
-            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
             let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
 
@@ -457,7 +484,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 anyhow::bail!("floorplan needs exactly one of --json or --verilog");
             }
             let mut interner = grus_core::interner::StringInterner::new();
-            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let lib_db = match &args.lib {
                 Some(path) => Some(grus_core::readers::load_liberty(path)?),
                 None => None,
@@ -527,7 +554,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
             let mut interner = grus_core::interner::StringInterner::new();
             let t_load = std::time::Instant::now();
-            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let mut design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
             let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
             let movable_count = design_db
@@ -642,7 +669,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None => None,
             };
             let mut interner = grus_core::interner::StringInterner::new();
-            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let design = grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?;
             let design_hold = match &lib_hold_db {
                 Some(lib) => Some(grus_core::readers::parse_def(
@@ -739,7 +766,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             };
             let lib_db = grus_core::readers::load_liberty(&args.lib)?;
             let mut interner = grus_core::interner::StringInterner::new();
-            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let design = grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?;
             let sdc = grus_core::sta::load_sdc(&args.sdc)?;
             let parasitics = match (mode, &args.spef) {

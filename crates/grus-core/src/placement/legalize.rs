@@ -1560,8 +1560,9 @@ mod tests {
         }
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let mut design_db =
             parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
@@ -1976,8 +1977,9 @@ mod tests {
         let floorplan_def_path = require(design_dir("aes").join("aes.floorplan.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let mut design_db =
             parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
@@ -2038,8 +2040,9 @@ mod tests {
         let floorplan_def_path = require(design_dir("jpeg").join("jpeg.floorplan.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let mut design_db =
             parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
@@ -2100,8 +2103,9 @@ mod tests {
         let floorplan_def_path = require(design_dir("ibex").join("ibex.floorplan.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let mut design_db =
             parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
@@ -2162,8 +2166,9 @@ mod tests {
         let floorplan_def_path = require(design_dir("picorv32").join("picorv32.floorplan.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
         let mut design_db =
             parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 

@@ -544,7 +544,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(
             &dir.join(format!("{design_name}.placed.def")),
             &tech,
@@ -651,7 +652,8 @@ mod tests {
                 &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
                 &mut interner,
             )
-            .expect("LEF");
+            .expect("LEF")
+            .0;
             let design = parse_def(
                 &dir.join(format!("{design_name}.placed.def")),
                 &tech,
@@ -800,7 +802,8 @@ mod tests {
                 &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
                 &mut interner,
             )
-            .expect("LEF");
+            .expect("LEF")
+            .0;
             let design = parse_def(
                 &dir.join(format!("{design_name}.placed.def")),
                 &tech,
@@ -893,7 +896,8 @@ mod tests {
                 &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
                 &mut interner,
             )
-            .expect("LEF");
+            .expect("LEF")
+            .0;
             let design = parse_def(
                 &dir.join(format!("{design_name}.placed.def")),
                 &tech,
@@ -961,7 +965,8 @@ mod tests {
                 &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
                 &mut interner,
             )
-            .expect("LEF");
+            .expect("LEF")
+            .0;
             let design = parse_def(
                 &dir.join(format!("{design_name}.placed.def")),
                 &tech,
@@ -1020,7 +1025,8 @@ mod tests {
                 &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
                 &mut interner,
             )
-            .expect("LEF");
+            .expect("LEF")
+            .0;
             let design = parse_def(
                 &dir.join(format!("{design_name}.placed.def")),
                 &tech,
@@ -1076,7 +1082,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&dir.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = crate::sta::load_sdc(&dir.join("gcd.sdc")).expect("SDC");
         let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");

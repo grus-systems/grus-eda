@@ -1,8 +1,34 @@
 use crate::interner::{LayerId, MacroId, PinDir, StringInterner};
 use crate::tech_db::{LayerDir, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer, TechDb};
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
+
+/// Top-level LEF statements the reader skipped, counted by uppercased keyword.
+/// `skipped` is empty when nothing was skipped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LefSkipReport {
+    pub skipped: BTreeMap<String, usize>,
+}
+
+impl LefSkipReport {
+    /// Adds `other`'s counts into `self` (used to merge .tlef + .lef reports).
+    pub fn merge(&mut self, other: &LefSkipReport) {
+        for (k, v) in &other.skipped {
+            *self.skipped.entry(k.clone()).or_default() += v;
+        }
+    }
+
+    /// Sum of all per-keyword counts.
+    pub fn total(&self) -> usize {
+        self.skipped.values().sum()
+    }
+}
+
+fn count_skip(report: &mut LefSkipReport, keyword: &str) {
+    *report.skipped.entry(keyword.to_uppercase()).or_default() += 1;
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum Token<'a> {
@@ -192,12 +218,13 @@ fn skip_block(lexer: &mut LefLexer, block_name: &str) -> Result<()> {
     bail!("LEF: {block_name} block is not terminated by END {block_name} (truncated file?)")
 }
 
-/// Parses a Technology LEF (.tlef) or Macro LEF (.lef) file bytes into `TechDb`.
+/// Parses a Technology LEF (.tlef) or Macro LEF (.lef) file bytes into `TechDb`,
+/// reporting the top-level statements it skipped.
 pub fn parse_lef_bytes(
     bytes: &[u8],
     tech_db: &mut TechDb,
     interner: &mut StringInterner,
-) -> Result<()> {
+) -> Result<LefSkipReport> {
     if tech_db.dbu_per_micron == 0 {
         tech_db.dbu_per_micron = 1000;
     }
@@ -208,6 +235,7 @@ pub fn parse_lef_bytes(
     // Top-level statements we do not model (VERSION, BUSBITCHARS, DIVIDERCHAR, MANUFACTURINGGRID,
     // NAMESCASESENSITIVE, ...) fall through to the `skip_to_semi` at the end of the chain. The
     // top-level keyword set is open-ended in LEF, so unknown ones are skipped, not rejected.
+    let mut report = LefSkipReport::default();
     while let Some(tok) = lexer.next_token() {
         let word = match tok {
             Token::Word(w) => w,
@@ -224,25 +252,29 @@ pub fn parse_lef_bytes(
             parse_macro(&mut lexer, tech_db, interner)?;
         } else if word.eq_ignore_ascii_case("PROPERTYDEFINITIONS") {
             skip_block(&mut lexer, "PROPERTYDEFINITIONS")?;
+            count_skip(&mut report, word);
         } else if word.eq_ignore_ascii_case("VIA")
             || word.eq_ignore_ascii_case("VIARULE")
             || word.eq_ignore_ascii_case("NONDEFAULTRULE")
         {
+            count_skip(&mut report, word);
             let name = required_word(&mut lexer, word)?.to_string();
             skip_block(&mut lexer, &name)?;
         } else if word.eq_ignore_ascii_case("SPACING") {
             skip_block(&mut lexer, "SPACING")?;
+            count_skip(&mut report, word);
         } else if word.eq_ignore_ascii_case("END") {
             let _ = lexer.next_word();
             if let Some(Token::Semi) = lexer.peek_token() {
                 let _ = lexer.next_token();
             }
-        } else if tok != Token::Semi {
+        } else {
+            count_skip(&mut report, word);
             lexer.skip_to_semi();
         }
     }
 
-    Ok(())
+    Ok(report)
 }
 
 fn parse_units(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
@@ -763,30 +795,36 @@ fn parse_obs(
     Ok(())
 }
 
-/// Parses a single LEF file into an existing `TechDb`.
-pub fn parse_lef(path: &Path, tech_db: &mut TechDb, interner: &mut StringInterner) -> Result<()> {
+/// Parses a single LEF file into an existing `TechDb`, reporting the top-level
+/// statements it skipped.
+pub fn parse_lef(
+    path: &Path,
+    tech_db: &mut TechDb,
+    interner: &mut StringInterner,
+) -> Result<LefSkipReport> {
     let file =
         File::open(path).with_context(|| format!("Failed to open LEF file at {:?}", path))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    parse_lef_bytes(&mmap, tech_db, interner)
+    let report = parse_lef_bytes(&mmap, tech_db, interner)
         .with_context(|| format!("Failed to parse LEF file at {:?}", path))?;
     tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
-    Ok(())
+    Ok(report)
 }
 
-/// Convenience function to parse both Technology LEF (.tlef) and Macro LEF (.lef) into a new `TechDb`.
+/// Convenience function to parse both Technology LEF (.tlef) and Macro LEF (.lef) into a
+/// new `TechDb`, with the merged skip report of both files.
 pub fn load_tech_db(
     tlef_path: &Path,
     lef_path: &Path,
     interner: &mut StringInterner,
-) -> Result<TechDb> {
+) -> Result<(TechDb, LefSkipReport)> {
     let mut tech_db = TechDb::new();
-    parse_lef(tlef_path, &mut tech_db, interner)?;
-    parse_lef(lef_path, &mut tech_db, interner)?;
+    let mut report = parse_lef(tlef_path, &mut tech_db, interner)?;
+    report.merge(&parse_lef(lef_path, &mut tech_db, interner)?);
     tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
-    Ok(tech_db)
+    Ok((tech_db, report))
 }
 
 #[cfg(test)]
@@ -950,7 +988,8 @@ END inv_sample
         let mut interner = StringInterner::new();
         let t0 = std::time::Instant::now();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load sky130 TechDb");
+            .expect("Failed to load sky130 TechDb")
+            .0;
         let elapsed = t0.elapsed();
 
         println!("sky130 LEF load elapsed: {:?}", elapsed);
@@ -1090,7 +1129,7 @@ END inv_sample
         let mut db = TechDb::new();
         match parse_lef_bytes(text.as_bytes(), &mut db, &mut interner) {
             Err(e) => format!("{e:#}"),
-            Ok(()) => panic!("malformed LEF was accepted:\n{text}"),
+            Ok(_) => panic!("malformed LEF was accepted:\n{text}"),
         }
     }
 
@@ -1193,5 +1232,90 @@ END inv_sample
             let mut db = TechDb::new();
             let _ = parse_lef_bytes(&SAMPLE_LEF.as_bytes()[..n], &mut db, &mut interner);
         }
+    }
+
+    const SKIP_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+
+FOO 42 ;
+VERSION 5.7 ;
+
+VIA via_a
+END via_a
+
+via via_b
+END via_b
+
+VIARULE rule1
+END rule1
+
+NONDEFAULTRULE ndr1
+END ndr1
+
+PROPERTYDEFINITIONS
+END PROPERTYDEFINITIONS
+
+SPACING
+END SPACING
+
+MACRO m1
+  CLASS CORE ;
+  SIZE 1.0 BY 1.0 ;
+END m1
+END
+"#;
+
+    #[test]
+    fn test_skip_report_counts_skips() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        let report = parse_lef_bytes(SKIP_LEF.as_bytes(), &mut db, &mut interner).unwrap();
+
+        assert_eq!(db.macros.len(), 1);
+        assert_eq!(report.skipped["FOO"], 1);
+        assert_eq!(report.skipped["VERSION"], 1);
+        // Lowercase `via` still counts under the uppercased keyword.
+        assert_eq!(report.skipped["VIA"], 2);
+        assert_eq!(report.skipped["VIARULE"], 1);
+        assert_eq!(report.skipped["NONDEFAULTRULE"], 1);
+        assert_eq!(report.skipped["PROPERTYDEFINITIONS"], 1);
+        assert_eq!(report.skipped["SPACING"], 1);
+        assert_eq!(report.total(), 8);
+    }
+
+    const KNOWN_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+
+LAYER li1
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.17 ;
+END li1
+
+MACRO m1
+  CLASS CORE ;
+  SIZE 1.0 BY 1.0 ;
+END m1
+END
+"#;
+
+    #[test]
+    fn test_skip_report_empty_when_nothing_skipped() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        let report = parse_lef_bytes(KNOWN_LEF.as_bytes(), &mut db, &mut interner).unwrap();
+
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.total(), 0);
     }
 }
