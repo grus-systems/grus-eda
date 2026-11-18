@@ -1290,16 +1290,22 @@ impl Interp {
                 Value::Str(s)
                     if kind == ExceptionKind::Multicycle && (s == "-setup" || s == "-hold") =>
                 {
-                    let Some(Value::Str(v)) = args.get(i + 1) else {
-                        bail!("{name} {s} needs a value");
-                    };
-                    let n = multicycle_count(v)?;
-                    if s == "-setup" {
-                        setup_n = Some(setup_count(n, name, s)?);
-                    } else {
-                        hold_n = Some(hold_count(n, name, s)?);
+                    // The count may already have been given positionally
+                    // (`set_multicycle_path 2 -setup` is accepted SDC), so a
+                    // non-numeric next token makes the flag a no-op marker;
+                    // any real count error still surfaces at the end check.
+                    match args.get(i + 1) {
+                        Some(Value::Str(v)) if v.parse::<i64>().is_ok() => {
+                            let n = multicycle_count(v)?;
+                            if s == "-setup" {
+                                setup_n = Some(setup_count(n, name, s)?);
+                            } else {
+                                hold_n = Some(hold_count(n, name, s)?);
+                            }
+                            i += 2;
+                        }
+                        _ => i += 1,
                     }
-                    i += 2;
                 }
                 Value::Str(s)
                     if kind == ExceptionKind::FalsePath

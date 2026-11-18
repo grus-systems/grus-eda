@@ -197,7 +197,8 @@ regression test covers it.
 
 - `Sdc.exceptions: Vec<TimingException>` in file order:
   `{ kind: FalsePath | Multicycle, from: Option<Sel>, to: Option<Sel>,
-  setup_n: Option<u32>, hold_n: Option<u32> }`.
+  setup_n: Option<u32>, hold_n: Option<i32> }` — `hold_n` is signed because
+  measured OpenSTA semantics accept `-hold -1`.
 - New symbolic selectors resolved after design load: `get_cells`,
   `all_registers` (new `Value` variant with `PortSel`-style `Except`
   composition for `remove_from_collection`); `get_ports`, `all_inputs`,
@@ -231,7 +232,8 @@ regression test covers it.
 - `-through`, `-start`, `-end`, `-rise`, `-fall`, `-edge`, `-lib_cell`,
   `-pin`, `-points`, clock-object selectors
 - `set_min_delay` / `set_max_delay` (different check type; separate milestone)
-- multicycle on latch/clock-gate/output endpoints (counted diagnostic)
+- multicycle on latch-D/clock-gate-enable endpoints (counted diagnostic);
+  output-port endpoints **are** covered (measured)
 
 ## Cost
 
@@ -263,6 +265,36 @@ Public, reproducible, per AGENTS.md rules:
    exceptions (filter=None path); `merge_corner_reports` endpoint sets must
    match across `--lib-hold` corners (false_path drops are corner-independent
    — verify `hold_design` shares pin identity).
+
+## Implementation status (2026-11-18)
+
+Implemented per this design, in three commits:
+
+- `0711785` — SDC data model + parser: `TimingException`, `ObjSel`
+  (`Ports`/`Cells`/`Names`), `PortSel`/`CellSel` with `Except` composition,
+  positional/`-setup`/`-hold` counts (redundant flags after a positional
+  count are no-ops), `-both` → `ignored_commands`, unsupported
+  qualifiers/selectors → whole command `ignored_commands`.
+- `32abb45` — `run_sta_detail` split into `prepare_sta` (once) /
+  `eval_sta` (per signature class, `allowed: Option<&HashSet<u32>>`) /
+  `assemble_sta_report`; excluded sources merge slew-only via
+  `merge(NEG_INFINITY, INFINITY, slew…)`; `EndpointEntries` carries `PinId`.
+- exception application — `run_sta_partitioned`: selector resolution
+  (`resolve_from`/`resolve_to`, empty sides and unknown names counted in
+  `unresolved_exception_selectors`), signature-class partitioning, per-class
+  `eval_sta`, composition (false-path drop, per-field multicycle merge in
+  file order, measured req shifts on FF checks + output ports, latch-D /
+  clock-gate enables → `unsupported_multicycle_endpoints`), skip pass on
+  the composed endpoint set.
+
+Verification: `test_sta_exceptions_match_opensta` deserializes
+`exceptions.reference.json` and compares all 17 OpenSTA-parseable scenarios
+endpoint-by-endpoint (8 fields + WNS/TNS + violation counts);
+`test_sta_exception_diagnostics` covers false-path removal counts,
+unresolved selectors, and `-both` accounting. `mc_setup2_hold1` (valid SDC
+OpenSTA rejects) and `mc_both` are exercised for diagnostics only.
+`sta_pin_slews`/power see the union state — slews are identical across
+classes by construction.
 
 ## Files (expected)
 

@@ -1,7 +1,7 @@
 use super::dmp::{PiModel, driver_waveform_slew, solve_dmp};
 use super::nldm::{eval_nldm_constraint, eval_nldm_delay_or_slew};
 use super::parasitics::NetParasitics;
-use super::sdc::{DERATE_CELL, DERATE_CHECK, DERATE_NET, Sdc};
+use super::sdc::{CellSel, DERATE_CELL, DERATE_CHECK, DERATE_NET, ExceptionKind, ObjSel, Sdc};
 use crate::design_db::DesignDb;
 use crate::interner::{CellId, LibPinId, NetId, PinDir, PinId};
 use crate::lib_db::{LibCell, LibDb, LibPin, NldmTable, TimingSense, TimingType};
@@ -147,6 +147,20 @@ impl PinTimingState {
         self.slew_max[pol] = self.slew_max[pol].max(slew_max);
         self.slew_min[pol] = self.slew_min[pol].min(slew_min);
     }
+
+    /// Element-wise worst-of merge across exception-signature runs: the union
+    /// of per-class arrivals is the unfiltered arrival, and slews are identical
+    /// across runs because every source merges them unfiltered.
+    fn merge_all(&mut self, o: &Self) {
+        for pol in [RISE, FALL] {
+            self.arrival_max[pol] = self.arrival_max[pol].max(o.arrival_max[pol]);
+            self.arrival_min[pol] = self.arrival_min[pol].min(o.arrival_min[pol]);
+            self.slew_max[pol] = self.slew_max[pol].max(o.slew_max[pol]);
+            self.slew_min[pol] = self.slew_min[pol].min(o.slew_min[pol]);
+            self.par_max[pol] |= o.par_max[pol];
+            self.par_min[pol] |= o.par_min[pol];
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -261,6 +275,17 @@ pub struct SkipReport {
     pub sdc_ignored_commands: BTreeMap<String, usize>,
     /// Top-level SDC commands evaluated while parsing, the denominator for `sdc_ignored_options`.
     pub sdc_commands: usize,
+    /// Endpoint candidates removed entirely by `set_false_path` (every
+    /// signature class covering them was dropped). Exempt from `is_clean`
+    /// like design rules: the exception is applied, not skipped.
+    pub false_path_endpoints: usize,
+    /// Endpoint candidates an applicable `set_multicycle_path` could not
+    /// shift because their kind has no rigid required-time model (latch-D
+    /// checks and clock-gate enables). They keep their unshifted slack.
+    pub unsupported_multicycle_endpoints: usize,
+    /// `-from`/`-to` selector sides that resolved to no launch source or no
+    /// endpoint, plus bare selector names matching nothing.
+    pub unresolved_exception_selectors: usize,
 }
 
 impl SkipReport {
@@ -287,6 +312,14 @@ impl SkipReport {
             ("unreached_endpoints", self.unreached_endpoints),
             ("cell_driven_clock_nets", self.cell_driven_clock_nets),
             ("unresolved_driving_cells", self.unresolved_driving_cells),
+            (
+                "unsupported_multicycle_endpoints",
+                self.unsupported_multicycle_endpoints,
+            ),
+            (
+                "unresolved_exception_selectors",
+                self.unresolved_exception_selectors,
+            ),
         ] {
             if count > 0 {
                 out.push(format!("{name}={count}"));
@@ -329,6 +362,8 @@ impl SkipReport {
             && self.unreached_endpoints == 0
             && self.cell_driven_clock_nets == 0
             && self.unresolved_driving_cells == 0
+            && self.unsupported_multicycle_endpoints == 0
+            && self.unresolved_exception_selectors == 0
             && self.unsupported_arcs.is_empty()
             && self.latch_arcs_dropped.is_empty()
             && self.sdc_ignored_options.is_empty()
@@ -1940,25 +1975,14 @@ fn run_sta_detail(
     parasitics: Option<&NetParasitics>,
     emit_warnings: bool,
 ) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
-    // Exceptions are parsed but the partitioned evaluation is not wired up
-    // yet; reporting unconstrained timing for an exception-bearing SDC would
-    // be silently wrong, so refuse until the exceptions are applied.
-    if !sdc.exceptions.is_empty() {
-        anyhow::bail!("SDC timing exceptions are parsed but not yet applied");
-    }
     let prepared = prepare_sta(design, lib, sdc, parasitics)?;
+    if !sdc.exceptions.is_empty() {
+        return run_sta_partitioned(&prepared, emit_warnings);
+    }
     let outcome = eval_sta(&prepared, None, prepared.skipped.clone())?;
     let (report, polarities) = assemble_sta_report(outcome.entries, outcome.skipped);
     if emit_warnings {
-        for category in report.skipped.nonzero() {
-            // Deferred check arcs are a documented, counted deferral shown in the report —
-            // not an unrecognised gap, and `min_pulse_width` alone would warn on every
-            // flop design. They stay in `nonzero()`/the summary and JSON.
-            if category.starts_with("recognized_check_arcs") {
-                continue;
-            }
-            eprintln!("warning: STA skipped {category}; the report does not model these");
-        }
+        emit_sta_warnings(&report);
     }
     Ok((report, outcome.state, polarities))
 }
@@ -2570,6 +2594,627 @@ fn assemble_sta_report(
     )
 }
 
+/// Endpoint classification for exception application. `Check { latch }`
+/// distinguishes latch-D checks — their required time is piecewise under
+/// time borrowing, so a multicycle path cannot shift it rigidly.
+#[derive(Clone, Copy, PartialEq)]
+enum ExceptionEndpointKind {
+    Check { latch: bool },
+    ClockGate,
+    OutputPort,
+}
+
+/// Name/index context for resolving symbolic exception selectors against the
+/// prepared design: launch sources, endpoint candidates, and the sequential
+/// cells `all_registers` means.
+struct ExceptionCtx<'p, 'd> {
+    prepared: &'p StaPrepared<'d>,
+    cell_by_name: HashMap<String, CellId>,
+    seq_cells: HashSet<CellId>,
+    launch_keys: HashSet<u32>,
+    keys_by_cell: HashMap<CellId, Vec<u32>>,
+    endpoint_pins: HashSet<u32>,
+    eps_by_cell: HashMap<CellId, Vec<u32>>,
+    output_ports: Vec<u32>,
+    ep_kinds: HashMap<u32, ExceptionEndpointKind>,
+    unresolved: usize,
+}
+
+impl ExceptionCtx<'_, '_> {
+    fn design(&self) -> &DesignDb {
+        self.prepared.cx.design
+    }
+
+    fn sdc(&self) -> &Sdc {
+        self.prepared.cx.sdc
+    }
+
+    /// `CellSel` -> the instance cells it names. Unresolvable instance names
+    /// are counted, not fatal: the selector still applies to what it found.
+    fn cell_sel_ids(&mut self, sel: &CellSel) -> HashSet<CellId> {
+        match sel {
+            CellSel::Cells(names) => {
+                let mut ids = HashSet::new();
+                for n in names {
+                    match self.cell_by_name.get(n) {
+                        Some(&c) => {
+                            ids.insert(c);
+                        }
+                        None => self.unresolved += 1,
+                    }
+                }
+                ids
+            }
+            CellSel::AllRegisters => self.seq_cells.clone(),
+            CellSel::Except { base, excluded } => {
+                let mut ids = self.cell_sel_ids(base);
+                for n in excluded {
+                    if let Some(&c) = self.cell_by_name.get(n) {
+                        ids.remove(&c);
+                    }
+                }
+                ids
+            }
+        }
+    }
+
+    /// `ObjSel` -> the launch-source pins it covers. Ports match only seeded
+    /// data inputs (the clock port is never a launch source); cells match
+    /// launch pins owned by the resolved instances.
+    fn resolve_from(&mut self, sel: &ObjSel) -> HashSet<u32> {
+        let prepared = self.prepared;
+        match sel {
+            ObjSel::Ports(ps) => {
+                let clock = self.sdc().clock_port.as_deref();
+                prepared
+                    .port_seeds
+                    .iter()
+                    .filter(|s| ps.matches(prepared.cx.port_name(s.pin), true, clock))
+                    .map(|s| s.pin.0)
+                    .collect()
+            }
+            ObjSel::Cells(cs) => {
+                let ids = self.cell_sel_ids(cs);
+                self.launch_keys
+                    .iter()
+                    .copied()
+                    .filter(|&k| {
+                        self.design().pin_cells[k as usize].is_some_and(|c| ids.contains(&c))
+                    })
+                    .collect()
+            }
+            ObjSel::Names(names) => {
+                let mut out = HashSet::new();
+                for n in names {
+                    let mut hit = false;
+                    for s in &prepared.port_seeds {
+                        if prepared.cx.port_name(s.pin) == n {
+                            out.insert(s.pin.0);
+                            hit = true;
+                        }
+                    }
+                    if let Some(&c) = self.cell_by_name.get(n)
+                        && let Some(ks) = self.keys_by_cell.get(&c)
+                    {
+                        out.extend(ks.iter().copied());
+                        hit = true;
+                    }
+                    if !hit {
+                        self.unresolved += 1;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// `ObjSel` -> the endpoint pins it covers. Ports match output ports
+    /// only; cells match endpoint pins owned by the resolved instances
+    /// (register checks and clock-gate enables alike).
+    fn resolve_to(&mut self, sel: &ObjSel) -> HashSet<u32> {
+        let prepared = self.prepared;
+        match sel {
+            ObjSel::Ports(ps) => {
+                let clock = self.sdc().clock_port.as_deref();
+                self.output_ports
+                    .iter()
+                    .copied()
+                    .filter(|&p| ps.matches(prepared.cx.port_name(PinId(p)), false, clock))
+                    .collect()
+            }
+            ObjSel::Cells(cs) => {
+                let ids = self.cell_sel_ids(cs);
+                self.endpoint_pins
+                    .iter()
+                    .copied()
+                    .filter(|&p| {
+                        self.design().pin_cells[p as usize].is_some_and(|c| ids.contains(&c))
+                    })
+                    .collect()
+            }
+            ObjSel::Names(names) => {
+                let mut out = HashSet::new();
+                for n in names {
+                    let mut hit = false;
+                    for &p in &self.output_ports {
+                        if prepared.cx.port_name(PinId(p)) == n {
+                            out.insert(p);
+                            hit = true;
+                        }
+                    }
+                    if let Some(&c) = self.cell_by_name.get(n)
+                        && let Some(eps) = self.eps_by_cell.get(&c)
+                    {
+                        out.extend(eps.iter().copied());
+                        hit = true;
+                    }
+                    if !hit {
+                        self.unresolved += 1;
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+/// A timing exception with its selectors resolved to concrete pin sets.
+/// `from`/`to` are `None` when the flag was absent (every launch source /
+/// every endpoint); `Some(empty)` means the selector resolved to nothing and
+/// was diagnosed — it covers no source or endpoint.
+struct ResolvedException {
+    kind: ExceptionKind,
+    from: Option<HashSet<u32>>,
+    to: Option<HashSet<u32>>,
+    setup_n: Option<u32>,
+    hold_n: Option<i32>,
+}
+
+/// The reason a reached endpoint still produced no report, shared by
+/// `record_endpoint` and the partitioned skip pass.
+fn endpoint_skip_reason(
+    cx: &Context,
+    levelized: &LevelizedGraph,
+    state: &[PinTimingState],
+    kind: EndpointKind,
+    pin: PinId,
+) -> (SkipReason, Option<String>) {
+    let s = state[pin.0 as usize];
+    // A reached check pin with no candidate means every arrived transition
+    // lacked a usable NLDM constraint table; gates and ports have no such
+    // table lookup, so their only failure is an unreached pin.
+    if kind == EndpointKind::Check && (s.reached(RISE) || s.reached(FALL)) {
+        return (SkipReason::NoConstraintTable, None);
+    }
+    match levelized.pin_driver[pin.0 as usize] {
+        Some((_, _, drv)) => {
+            // A driver cell with no Liberty mapping or no timing arcs at all
+            // (constant `conb`, tap, filler) can never deliver a timed arrival;
+            // name it so the skip reads as the expected untimed case.
+            let untimed = cx.design.pin_cells[drv.0 as usize].is_some_and(|c| {
+                match cx.design.cell_lib_ids[c.0 as usize] {
+                    Some(lcid) => cx.lib.cells[lcid.0 as usize].arc_count == 0,
+                    None => true,
+                }
+            });
+            (
+                if untimed {
+                    SkipReason::UntimedDriver
+                } else {
+                    SkipReason::NoPath
+                },
+                Some(cx.pin_name(drv)),
+            )
+        }
+        None => (SkipReason::NoPath, None),
+    }
+}
+
+fn emit_sta_warnings(report: &StaReport) {
+    for category in report.skipped.nonzero() {
+        // Deferred check arcs are a documented, counted deferral shown in the report —
+        // not an unrecognised gap, and `min_pulse_width` alone would warn on every
+        // flop design. They stay in `nonzero()`/the summary and JSON.
+        if category.starts_with("recognized_check_arcs") {
+            continue;
+        }
+        eprintln!("warning: STA skipped {category}; the report does not model these");
+    }
+}
+
+/// STA with timing exceptions applied: resolve selectors, partition launch
+/// sources by exception signature, evaluate each class once, then compose
+/// per-endpoint candidates — false paths drop covered classes, multicycle
+/// paths shift required times by the measured OpenSTA formulas.
+fn run_sta_partitioned(
+    prepared: &StaPrepared,
+    emit_warnings: bool,
+) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
+    let cx = &prepared.cx;
+    let (design, sdc) = (cx.design, cx.sdc);
+    let graph = &prepared.graph;
+
+    let mut cell_by_name = HashMap::new();
+    for c in 0..design.num_cells() {
+        cell_by_name.insert(
+            design.strings.resolve(design.cell_names[c]).to_string(),
+            CellId(c as u32),
+        );
+    }
+    // Sequential cells own a register check or a launch arc; `all_registers`
+    // covers exactly these — never input-port launch sources.
+    let mut seq_cells = HashSet::new();
+    for &(d, _) in &graph.checks {
+        if let Some(c) = design.pin_cells[d as usize] {
+            seq_cells.insert(c);
+        }
+    }
+    for s in prepared.launch_seeds.iter().chain(&prepared.latch_seeds) {
+        if let Some(c) = design.pin_cells[s.q.0 as usize] {
+            seq_cells.insert(c);
+        }
+    }
+
+    let mut launch_keys = HashSet::new();
+    let mut keys_by_cell: HashMap<CellId, Vec<u32>> = HashMap::new();
+    for s in &prepared.port_seeds {
+        launch_keys.insert(s.pin.0);
+    }
+    for s in prepared.launch_seeds.iter().chain(&prepared.latch_seeds) {
+        launch_keys.insert(s.q.0);
+        if let Some(c) = design.pin_cells[s.q.0 as usize] {
+            keys_by_cell.entry(c).or_default().push(s.q.0);
+        }
+    }
+
+    let mut endpoint_pins = HashSet::new();
+    let mut eps_by_cell: HashMap<CellId, Vec<u32>> = HashMap::new();
+    let mut ep_kinds = HashMap::new();
+    for &(d, check) in &graph.checks {
+        endpoint_pins.insert(d);
+        ep_kinds.insert(d, ExceptionEndpointKind::Check { latch: check.latch });
+        if let Some(c) = design.pin_cells[d as usize] {
+            eps_by_cell.entry(c).or_default().push(d);
+        }
+    }
+    for g in &graph.gating_enables {
+        let e = g.enable.0;
+        endpoint_pins.insert(e);
+        ep_kinds
+            .entry(e)
+            .or_insert(ExceptionEndpointKind::ClockGate);
+        if let Some(c) = design.pin_cells[e as usize] {
+            eps_by_cell.entry(c).or_default().push(e);
+        }
+    }
+    let mut output_ports = Vec::new();
+    for &p in &design.io_pins {
+        if design.pin_dirs[p.0 as usize] == PinDir::Output {
+            endpoint_pins.insert(p.0);
+            output_ports.push(p.0);
+            ep_kinds
+                .entry(p.0)
+                .or_insert(ExceptionEndpointKind::OutputPort);
+        }
+    }
+
+    let mut ctx = ExceptionCtx {
+        prepared,
+        cell_by_name,
+        seq_cells,
+        launch_keys,
+        keys_by_cell,
+        endpoint_pins,
+        eps_by_cell,
+        output_ports,
+        ep_kinds,
+        unresolved: 0,
+    };
+
+    let mut resolved = Vec::with_capacity(sdc.exceptions.len());
+    for ex in &sdc.exceptions {
+        let from = ex.from.as_ref().map(|sel| ctx.resolve_from(sel));
+        if from.as_ref().is_some_and(|f| f.is_empty()) {
+            ctx.unresolved += 1;
+        }
+        let to = ex.to.as_ref().map(|sel| ctx.resolve_to(sel));
+        if to.as_ref().is_some_and(|t| t.is_empty()) {
+            ctx.unresolved += 1;
+        }
+        resolved.push(ResolvedException {
+            kind: ex.kind,
+            from,
+            to,
+            setup_n: ex.setup_n,
+            hold_n: ex.hold_n,
+        });
+    }
+
+    // A launch source's signature is the file-ordered exception indices whose
+    // `from` covers it (absent `from` = universal). Sources sharing a
+    // signature see identical applicable exceptions at every endpoint, so one
+    // eval run per signature class is sufficient.
+    let mut class_map: HashMap<Vec<u32>, HashSet<u32>> = HashMap::new();
+    for &k in &ctx.launch_keys {
+        let mut sig = Vec::new();
+        for (i, ex) in resolved.iter().enumerate() {
+            if ex.from.as_ref().is_none_or(|s| s.contains(&k)) {
+                sig.push(i as u32);
+            }
+        }
+        class_map.entry(sig).or_default().insert(k);
+    }
+    let mut classes: Vec<(Vec<u32>, HashSet<u32>)> = class_map.into_iter().collect();
+    classes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut class_maps = Vec::with_capacity(classes.len());
+    let mut class_states = Vec::with_capacity(classes.len());
+    for (_, keys) in &classes {
+        let outcome = eval_sta(prepared, Some(keys), SkipReport::default())?;
+        class_maps.push(
+            outcome
+                .entries
+                .iter()
+                .map(|(pin, _, pols)| (pin.0, *pols))
+                .collect::<HashMap<u32, EndpointPolarities>>(),
+        );
+        class_states.push(outcome.state);
+    }
+
+    // Compose per endpoint: a class's candidates survive unless a false path
+    // covers them; a surviving multicycle shifts required times. The worst
+    // slack across surviving (class, polarity) candidates wins, keeping the
+    // winning triple together.
+    let mut composed: HashMap<u32, EndpointPolarities> = HashMap::new();
+    let mut fp_endpoints: HashSet<u32> = HashSet::new();
+    let mut unsupported_mc: HashSet<u32> = HashSet::new();
+    for (&ep, &kind) in &ctx.ep_kinds {
+        let mut best_max: [Option<Worst>; 2] = [None; 2];
+        let mut best_min: [Option<Worst>; 2] = [None; 2];
+        let mut had = false;
+        let mut survived = false;
+        for (ci, (sigma, _)) in classes.iter().enumerate() {
+            let Some(pols) = class_maps[ci].get(&ep) else {
+                continue;
+            };
+            had = true;
+            let mut drop = false;
+            // Applicable multicycles merge per field in file order: a later
+            // command overrides only the counts it specifies (measured:
+            // `-setup 2` then `-hold 1` keeps setup 2 and takes hold 1).
+            let mut mc_setup: Option<u32> = None;
+            let mut mc_hold: Option<i32> = None;
+            for &exi in sigma {
+                let ex = &resolved[exi as usize];
+                if !ex.to.as_ref().is_none_or(|s| s.contains(&ep)) {
+                    continue;
+                }
+                match ex.kind {
+                    ExceptionKind::FalsePath => {
+                        drop = true;
+                        break;
+                    }
+                    ExceptionKind::Multicycle => {
+                        if ex.setup_n.is_some() {
+                            mc_setup = ex.setup_n;
+                        }
+                        if ex.hold_n.is_some() {
+                            mc_hold = ex.hold_n;
+                        }
+                    }
+                }
+            }
+            if drop {
+                continue;
+            }
+            survived = true;
+            let mut pols = *pols;
+            if mc_setup.is_some() || mc_hold.is_some() {
+                // Measured OpenSTA semantics: setup shifts max required by
+                // (N-1) periods and min required by ((N-1) - H) periods.
+                // Latch-D and clock-gate endpoints have no rigid required
+                // time, so they are diagnosed instead of shifted.
+                if matches!(
+                    kind,
+                    ExceptionEndpointKind::Check { latch: false }
+                        | ExceptionEndpointKind::OutputPort
+                ) {
+                    let ns = mc_setup.unwrap_or(1) as f32;
+                    let nh = mc_hold.unwrap_or(0) as f32;
+                    let period = sdc.period_ns;
+                    let d_max = (ns - 1.0) * period;
+                    let d_min = ((ns - 1.0) - nh) * period;
+                    for w in pols.max.iter_mut().flatten() {
+                        w.req += d_max;
+                        w.slack = w.req - w.arr;
+                    }
+                    for w in pols.min.iter_mut().flatten() {
+                        w.req += d_min;
+                        w.slack = w.arr - w.req;
+                    }
+                } else {
+                    unsupported_mc.insert(ep);
+                }
+            }
+            for pol in [RISE, FALL] {
+                for (cand, best) in [
+                    (pols.max[pol], &mut best_max[pol]),
+                    (pols.min[pol], &mut best_min[pol]),
+                ] {
+                    if let Some(w) = cand
+                        && best.is_none_or(|b| w.slack < b.slack)
+                    {
+                        *best = Some(w);
+                    }
+                }
+            }
+        }
+        if !had {
+            continue;
+        }
+        if !survived {
+            fp_endpoints.insert(ep);
+            continue;
+        }
+        composed.insert(
+            ep,
+            EndpointPolarities {
+                max: best_max,
+                min: best_min,
+            },
+        );
+    }
+
+    let mut entries = EndpointEntries::new();
+    let mut reported = HashSet::new();
+    for (&ep, &pols) in &composed {
+        if let (Some(max), Some(min)) = (
+            pick_worst_polarity(&pols.max),
+            pick_worst_polarity(&pols.min),
+        ) {
+            entries.push((
+                PinId(ep),
+                endpoint_report(cx.pin_name(PinId(ep)), &max, &min),
+                pols,
+            ));
+            reported.insert(ep);
+        }
+    }
+
+    // Skip pass on the composed endpoint set: per-run skips were discarded;
+    // reached-ness comes from the union of all class states.
+    let mut merged = vec![PinTimingState::UNREACHED; design.num_pins()];
+    for st in &class_states {
+        for (i, s) in st.iter().enumerate() {
+            merged[i].merge_all(s);
+        }
+    }
+    let mut skipped = prepared.skipped.clone();
+    skipped.total_endpoints = ctx.endpoint_pins.len();
+    skipped.sdc_ignored_options = sdc.ignored_options.clone();
+    skipped.sdc_ignored_commands = sdc.ignored_commands.clone();
+    skipped.sdc_commands = sdc.commands;
+    skipped.false_path_endpoints = fp_endpoints.len();
+    skipped.unsupported_multicycle_endpoints = unsupported_mc.len();
+    skipped.unresolved_exception_selectors = ctx.unresolved;
+
+    let skip_endpoint = |skipped: &mut SkipReport,
+                         kind: EndpointKind,
+                         pin: PinId,
+                         reason: SkipReason,
+                         related: Option<String>| {
+        skipped.unreached_endpoints += 1;
+        skipped.skipped_endpoints.push(SkippedEndpoint {
+            pin: cx.pin_name(pin),
+            kind,
+            reason,
+            related,
+        });
+    };
+    for &(d, check) in &graph.checks {
+        if reported.contains(&d) || fp_endpoints.contains(&d) {
+            continue;
+        }
+        let (Some(clk), Some(_), Some(_)) = (check.clk, check.late_arc(), check.early_arc()) else {
+            skipped.incomplete_checks += 1;
+            let mut missing = Vec::new();
+            if check.clk.is_none() {
+                missing.push("clock pin");
+            }
+            if check.late_arc().is_none() {
+                missing.push("late arc");
+            }
+            if check.early_arc().is_none() {
+                missing.push("early arc");
+            }
+            skipped.skipped_endpoints.push(SkippedEndpoint {
+                pin: cx.pin_name(PinId(d)),
+                kind: EndpointKind::Check,
+                reason: SkipReason::IncompleteCheck,
+                related: Some(missing.join(", ")),
+            });
+            continue;
+        };
+        let clk_s = merged[clk.0 as usize];
+        if !clk_s.reached(check.edge)
+            || (check.latch && sdc.propagated_clock && !clk_s.reached(1 - check.edge))
+        {
+            skip_endpoint(
+                &mut skipped,
+                EndpointKind::Check,
+                PinId(d),
+                SkipReason::NoClock,
+                Some(cx.pin_name(clk)),
+            );
+            continue;
+        }
+        let (reason, related) = endpoint_skip_reason(
+            cx,
+            &prepared.levelized,
+            &merged,
+            EndpointKind::Check,
+            PinId(d),
+        );
+        skip_endpoint(&mut skipped, EndpointKind::Check, PinId(d), reason, related);
+    }
+    for g in &graph.gating_enables {
+        let e = g.enable.0;
+        if reported.contains(&e) || fp_endpoints.contains(&e) {
+            continue;
+        }
+        let c = merged[g.clk_pin.0 as usize];
+        if sdc.propagated_clock && (!c.reached(RISE) || !c.reached(FALL)) {
+            skip_endpoint(
+                &mut skipped,
+                EndpointKind::ClockGate,
+                g.enable,
+                SkipReason::NoClock,
+                Some(cx.pin_name(g.clk_pin)),
+            );
+            continue;
+        }
+        let (reason, related) = endpoint_skip_reason(
+            cx,
+            &prepared.levelized,
+            &merged,
+            EndpointKind::ClockGate,
+            g.enable,
+        );
+        skip_endpoint(
+            &mut skipped,
+            EndpointKind::ClockGate,
+            g.enable,
+            reason,
+            related,
+        );
+    }
+    for &p in &ctx.output_ports {
+        if reported.contains(&p) || fp_endpoints.contains(&p) {
+            continue;
+        }
+        let (reason, related) = endpoint_skip_reason(
+            cx,
+            &prepared.levelized,
+            &merged,
+            EndpointKind::OutputPort,
+            PinId(p),
+        );
+        skip_endpoint(
+            &mut skipped,
+            EndpointKind::OutputPort,
+            PinId(p),
+            reason,
+            related,
+        );
+    }
+
+    let (report, polarities) = assemble_sta_report(entries, skipped);
+    if emit_warnings {
+        emit_sta_warnings(&report);
+    }
+    Ok((report, merged, polarities))
+}
+
 #[derive(Clone, Copy)]
 struct Worst {
     arr: f32,
@@ -2612,37 +3257,7 @@ fn record_endpoint(
         }
         _ => {
             skipped.unreached_endpoints += 1;
-            let s = state[pin.0 as usize];
-            // A reached check pin with no candidate means every arrived transition
-            // lacked a usable NLDM constraint table; gates and ports have no such
-            // table lookup, so their only failure is an unreached pin.
-            let (reason, related) =
-                if kind == EndpointKind::Check && (s.reached(RISE) || s.reached(FALL)) {
-                    (SkipReason::NoConstraintTable, None)
-                } else {
-                    match levelized.pin_driver[pin.0 as usize] {
-                        Some((_, _, drv)) => {
-                            // A driver cell with no Liberty mapping or no timing arcs at all
-                            // (constant `conb`, tap, filler) can never deliver a timed arrival;
-                            // name it so the skip reads as the expected untimed case.
-                            let untimed = cx.design.pin_cells[drv.0 as usize].is_some_and(|c| {
-                                match cx.design.cell_lib_ids[c.0 as usize] {
-                                    Some(lcid) => cx.lib.cells[lcid.0 as usize].arc_count == 0,
-                                    None => true,
-                                }
-                            });
-                            (
-                                if untimed {
-                                    SkipReason::UntimedDriver
-                                } else {
-                                    SkipReason::NoPath
-                                },
-                                Some(cx.pin_name(drv)),
-                            )
-                        }
-                        None => (SkipReason::NoPath, None),
-                    }
-                };
+            let (reason, related) = endpoint_skip_reason(cx, levelized, state, kind, pin);
             skipped.skipped_endpoints.push(SkippedEndpoint {
                 pin: cx.pin_name(pin),
                 kind,
@@ -3209,6 +3824,13 @@ fn merge_skip_reports(a: SkipReport, b: SkipReport) -> SkipReport {
         sdc_ignored_options: merge_map(a.sdc_ignored_options, b.sdc_ignored_options),
         sdc_ignored_commands: merge_map(a.sdc_ignored_commands, b.sdc_ignored_commands),
         sdc_commands: a.sdc_commands.max(b.sdc_commands),
+        false_path_endpoints: a.false_path_endpoints.max(b.false_path_endpoints),
+        unsupported_multicycle_endpoints: a
+            .unsupported_multicycle_endpoints
+            .max(b.unsupported_multicycle_endpoints),
+        unresolved_exception_selectors: a
+            .unresolved_exception_selectors
+            .max(b.unresolved_exception_selectors),
     }
 }
 
@@ -3258,6 +3880,12 @@ mod tests {
         skipped.latch_arcs_dropped.clear();
         skipped.unsupported_arcs.insert("Other".to_string(), 1);
         assert!(!skipped.is_clean());
+        skipped.unsupported_arcs.clear();
+        skipped.false_path_endpoints = 3;
+        assert!(
+            skipped.is_clean(),
+            "an applied false path is a declared exception, not a modelling gap"
+        );
         skipped.unresolved_driving_cells = 1;
         assert!(!skipped.is_clean());
     }
@@ -7349,5 +7977,168 @@ mod tests {
         assert_eq!(merged.unsupported_arcs["Clear"], 5);
         assert_eq!(merged.unsupported_arcs["Preset"], 1);
         assert_eq!(merged.skipped_endpoints.len(), 1);
+    }
+
+    /// `tests/designs/sta_exceptions`: a three-flop DEF plus 19 SDC scenarios.
+    /// `exceptions.reference.json` was emitted by the committed
+    /// `generate_ref.sh` running OpenSTA inside the pinned LibreLane image.
+    /// The two `error` scenarios are SDC forms OpenSTA's own parser rejects
+    /// (`-setup X -hold Y` on one command, `-both`); our parser accepts them
+    /// as valid SDC, so they are checked for diagnostics instead of numbers.
+    #[test]
+    fn test_sta_exceptions_match_opensta() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("sta_exceptions");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design = parse_def(&dir.join("exceptions.def"), &tech, Some(&lib)).expect("DEF");
+        let reference: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("exceptions.reference.json")).expect("golden file"),
+        )
+        .expect("golden JSON");
+        let scenarios = reference["scenarios"].as_object().expect("scenarios");
+
+        const FIELDS: [&str; 8] = [
+            "max_arr_ns",
+            "max_req_ns",
+            "max_slack_ns",
+            "max_slew_ns",
+            "min_arr_ns",
+            "min_req_ns",
+            "min_slack_ns",
+            "min_slew_ns",
+        ];
+        let mut compared = 0;
+        for (name, golden) in scenarios {
+            if golden.get("error").is_some() {
+                continue;
+            }
+            let sdc = load_sdc(&dir.join(format!("{name}.sdc"))).expect("SDC");
+            let (report, _, _) =
+                run_sta_detail(&design, &lib, &sdc, None, true).expect("partitioned STA");
+            compared += 1;
+            let ref_endpoints = golden["endpoints"].as_array().expect("endpoints");
+            assert_eq!(
+                report.endpoints.len(),
+                ref_endpoints.len(),
+                "{name}: endpoint count"
+            );
+            for r in ref_endpoints {
+                let pin = r["pin"].as_str().unwrap();
+                let ep = report
+                    .endpoints
+                    .iter()
+                    .find(|e| e.pin == pin)
+                    .unwrap_or_else(|| panic!("{name}: missing endpoint {pin}"));
+                let ours = [
+                    ep.max_arr_ns,
+                    ep.max_req_ns,
+                    ep.max_slack_ns,
+                    ep.max_slew_ns,
+                    ep.min_arr_ns,
+                    ep.min_req_ns,
+                    ep.min_slack_ns,
+                    ep.min_slew_ns,
+                ];
+                for (i, field) in FIELDS.iter().enumerate() {
+                    let expected = r[*field].as_f64().unwrap();
+                    let (ok, rel) = within_tolerance(ours[i], expected, 0.01, 0.005);
+                    assert!(
+                        ok,
+                        "{name} {pin}.{field}: ours={} ref={expected} (rel {rel:.2e})",
+                        ours[i]
+                    );
+                }
+            }
+            for (ours, key) in [
+                (report.wns_max_ns, "wns_max_ns"),
+                (report.tns_max_ns, "tns_max_ns"),
+                (report.wns_min_ns, "wns_min_ns"),
+                (report.tns_min_ns, "tns_min_ns"),
+            ] {
+                let expected = golden[key].as_f64().unwrap();
+                let (ok, _) = within_tolerance(ours, expected, 0.01, 0.005);
+                assert!(ok, "{name} {key}: ours={ours} ref={expected}");
+            }
+            assert_eq!(
+                report.setup_violations as u64,
+                golden["setup_violations"].as_u64().unwrap(),
+                "{name}: setup violations"
+            );
+            assert_eq!(
+                report.hold_violations as u64,
+                golden["hold_violations"].as_u64().unwrap(),
+                "{name}: hold violations"
+            );
+        }
+        assert_eq!(compared, 17, "every non-error scenario must be compared");
+    }
+
+    /// Exception diagnostics the golden cannot express: false-path endpoint
+    /// removal is counted (and exempt from `is_clean`), unresolvable selector
+    /// names/sides are counted, and `-both` lands in `ignored_commands`.
+    #[test]
+    fn test_sta_exception_diagnostics() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("sta_exceptions");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design = parse_def(&dir.join("exceptions.def"), &tech, Some(&lib)).expect("DEF");
+
+        let run = |sdc_name: &str| {
+            let sdc = load_sdc(&dir.join(format!("{sdc_name}.sdc"))).expect("SDC");
+            run_sta_detail(&design, &lib, &sdc, None, false).expect("STA")
+        };
+
+        // u_ff0 -> u_ff1 false path removes exactly that endpoint.
+        let (report, _, _) = run("fp_uf0_uf1");
+        assert_eq!(report.skipped.false_path_endpoints, 1);
+        assert!(!report.endpoints.iter().any(|e| e.pin == "u_ff1/D"));
+
+        // `-from [all_inputs]`-style port false paths remove both port-launched
+        // endpoints; the register-launched one survives.
+        let (report, _, _) = run("fp_from_din");
+        assert_eq!(report.skipped.false_path_endpoints, 2);
+        assert!(report.endpoints.iter().any(|e| e.pin == "u_ff1/D"));
+
+        // Unknown instance names count once per name and once per emptied
+        // selector side; the resolvable multicycle still applies.
+        let (report, _, _) = run("exc_diag");
+        assert_eq!(report.skipped.unresolved_exception_selectors, 4);
+        assert_eq!(report.skipped.false_path_endpoints, 0);
+        let ff1 = report
+            .endpoints
+            .iter()
+            .find(|e| e.pin == "u_ff1/D")
+            .expect("u_ff1/D");
+        // `-setup 2` shifts the max required time by one 2 ns period.
+        assert!((ff1.max_req_ns - 4.562147).abs() < 0.005);
+
+        // `-both` is valid SDC OpenSTA rejects; it is counted ignored, not applied.
+        let (report, _, _) = run("mc_both");
+        assert_eq!(
+            report
+                .skipped
+                .sdc_ignored_commands
+                .get("set_multicycle_path"),
+            Some(&1)
+        );
+        assert!(!report.skipped.is_clean());
     }
 }

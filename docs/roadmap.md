@@ -242,17 +242,28 @@ Done (`8f5eccc`, `44131bd`):
   corner, so it never emits the constructs below; those come from
   hand/flow-written constraint SDCs.
 
+Done since (`0711785`, `32abb45`, exception application):
+
+- `set_false_path` / `set_multicycle_path` with `get_cells`,
+  `all_registers`, `get_ports`, `all_inputs`, `all_outputs` and bare-name
+  selectors, resolved after design load. STA runs once per exception
+  signature class (prepare/eval split; slew stays unfiltered) and
+  endpoint reports are composed — false paths drop covered launch classes,
+  multicycles shift required times by the OpenSTA-measured formulas
+  (`docs/timing-exceptions.md`, `tests/designs/sta_exceptions/`).
+  Unsupported qualifiers (`-through`, `-rise`, clock selectors, …) and
+  `-both` are counted in `ignored_commands`; latch-D/clock-gate multicycle
+  endpoints are counted in `unsupported_multicycle_endpoints`.
+  `set_max_delay`/`set_min_delay` remain rejected.
+
 Remaining:
 
-- Object-producing selections (`all_registers`, `get_cells`, `get_pins`,
-  `get_nets`, `all_fanouts`, …) and the path exceptions that consume them
-  (`set_false_path`, `set_multicycle_path`, `set_max/min_delay`). These
-  select cells/pins/nets the port-based delay model cannot honour, and
-  `parse_sdc` runs without the design, so names cannot be resolved at parse
-  time. Options: a symbolic object selection plus counted-skip of the
-  consuming constraint (the request's lenient path — but ignoring a real
-  timing exception changes slack, so it needs an explicit decision), or
-  deferring until a stage needs register-selection constraints.
+- Other object-producing selections (`get_pins`, `get_nets`, `all_fanouts`,
+  …) and `set_max/min_delay`. These select pins/nets/checks the
+  port-based delay model cannot honour, and `parse_sdc` runs without the
+  design, so names cannot be resolved at parse time. Options: symbolic
+  selections plus counted-skip of the consuming constraint, or deferring
+  until a stage needs them.
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 

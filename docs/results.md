@@ -1978,3 +1978,47 @@ skipped and counted (`conditional_power_blocks`); cells without a Liberty
 counterpart (filler/tap, 93 on gcd) contribute nothing; undriven/active nets
 and missing slews are reported in `diagnostics`, not silently approximated.
 SAIF input is not yet implemented (VCD only).
+
+### 2026-11-18 — N2 — `set_false_path` / `set_multicycle_path` (partitioned re-analysis)
+
+Implements the B2 design in `docs/timing-exceptions.md` (reviewed by
+Hydrogen + SWE-2 Flash; measured OpenSTA semantics in
+`tests/designs/sta_exceptions/`). `run_sta_detail` splits into
+`prepare_sta` (graph, slews, clock — once) and `eval_sta` (per exception
+signature class); excluded launch sources merge slew-only so downstream
+delay tables are untouched. `run_sta_partitioned` resolves `get_cells` /
+`all_registers` / `get_ports` / `all_inputs` / `all_outputs` / bare names
+after design load, drops false-pathed classes per endpoint, and shifts
+required times by the measured formulas (`setup: max_req += (N-1)·T`,
+`hold: min_req += ((N-1)-H)·T`, per-field last-command-wins).
+
+**Reference**: `exceptions.reference.json` — OpenSTA `report_timing` inside
+the pinned LibreLane image via committed `generate_ref.sh`, 19 scenarios on
+a 3-FF fixture (period 2.0 ns).
+
+**Comparison** (`cargo test -p grus-core test_sta_exception`, endpoint-level:
+8 fields + WNS/TNS + setup/hold violation counts per endpoint):
+
+- 17/17 OpenSTA-parseable scenarios match within STRICT-class tolerances
+  (rel 1%, abs 5 ps) — including false-path endpoint removal
+  (`fp_uf0_uf1`, `fp_allregs`, `fp_from_din`, `fp_to_y`, `fp_mc_same`) and
+  every multicycle variant (`mc_setup2`, `mc_hold0/1/-1`, `mc_overlap`,
+  `mc_to_y`, `mc_allregs`, `mc_bare2`, `mc_setup2_pos`, `mc_setup2_nofrom`,
+  `mc_s2_h1_split`).
+- `mc_setup2_hold1` (combined `-setup 2 -hold 1`): valid SDC our parser
+  accepts with split-command-identical results; OpenSTA rejects the syntax
+  (`path_multiplier`), so no numeric reference exists — verified
+  self-consistently against `mc_s2_h1_split`.
+- `mc_both`: `-both` is counted in `sdc_ignored_commands` (OpenSTA
+  `STA-0563`; semantics unverifiable), never applied.
+
+**Diagnostics**: `false_path_endpoints` counts removed endpoints (exempt
+from `is_clean` — a declared exception, not a modelling gap);
+`unresolved_exception_selectors` counts unknown names and selectors
+resolving empty; `unsupported_multicycle_endpoints` counts latch-D /
+clock-gate-enable endpoints a multicycle could not rigidly shift.
+Unsupported qualifiers (`-through`, `-rise`, clock selectors, …) still
+route the whole command to `ignored_commands`.
+
+**Regression**: 247 lib tests + 3 integration tests pass; ordinary SDCs
+take the unpartitioned path unchanged (`sdc.exceptions.is_empty()`).
