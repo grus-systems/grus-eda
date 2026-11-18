@@ -1070,8 +1070,9 @@ mod tests {
         }
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
@@ -1137,7 +1138,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e))
+            .0;
         let db = parse_def(&gcd_dir.join("gcd.orient.def"), &tech_db, None)
             .expect("Failed to parse gcd.orient.def");
 
@@ -1185,8 +1187,9 @@ mod tests {
         let def_path = require(design_dir("aes").join("aes.placed.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
@@ -1250,7 +1253,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e))
+            .0;
         let db = parse_def(&require(aes_dir.join("aes.orient.def")), &tech_db, None)
             .expect("Failed to parse aes.orient.def");
 
@@ -1299,8 +1303,9 @@ mod tests {
         let def_path = require(design_dir("jpeg").join("jpeg.placed.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
@@ -1364,7 +1369,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e))
+            .0;
         let db = parse_def(&require(jpeg_dir.join("jpeg.orient.def")), &tech_db, None)
             .expect("Failed to parse jpeg.orient.def");
 
@@ -1413,8 +1419,9 @@ mod tests {
         let def_path = require(design_dir("ibex").join("ibex.placed.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
@@ -1478,7 +1485,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e))
+            .0;
         let db = parse_def(&require(ibex_dir.join("ibex.orient.def")), &tech_db, None)
             .expect("Failed to parse ibex.orient.def");
 

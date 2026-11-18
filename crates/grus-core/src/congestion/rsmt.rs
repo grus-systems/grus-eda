@@ -885,8 +885,9 @@ mod tests {
         }
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 

@@ -3384,7 +3384,8 @@ mod tests {
                 &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
                 &mut interner,
             )
-            .expect("LEF");
+            .expect("LEF")
+            .0;
             let design = parse_def(
                 &dir.join(format!("{design_name}.placed.def")),
                 &tech,
@@ -3489,7 +3490,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let mut design = parse_def(&dir.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&dir.join("gcd.sdc")).expect("SDC");
 
@@ -3529,7 +3531,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&dir.join("ibex.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&dir.join("ibex.sdc")).expect("SDC");
         let report = run_sta(&design, &lib, &sdc, None).expect("STA");
@@ -3671,7 +3674,8 @@ mod tests {
                 &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
                 &mut interner,
             )
-            .expect("LEF");
+            .expect("LEF")
+            .0;
             let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
             let sdc = load_sdc(&dir.join(sdc_file)).expect("SDC");
             let report = run_sta(&design, &lib, &sdc, None).expect("STA");
@@ -3744,7 +3748,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&dir.join("picorv32.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&dir.join("picorv32.sdc")).expect("SDC");
         let spef = crate::readers::load_spef(&dir.join("picorv32.routed.spef")).expect("SPEF");
@@ -4004,7 +4009,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&dir.join("picorv32.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&dir.join("picorv32.sdc")).expect("SDC");
         let spef = crate::readers::load_spef(&dir.join("picorv32.rcx.spef")).expect("SPEF");
@@ -4156,7 +4162,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
         let spef = crate::readers::load_spef(&dir.join(spef_file)).expect("SPEF");
@@ -4494,7 +4501,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
         let spef = crate::readers::load_spef(&dir.join(spef_file)).expect("SPEF");
@@ -4695,7 +4703,8 @@ mod tests {
                 &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
                 &mut interner,
             )
-            .expect("LEF");
+            .expect("LEF")
+            .0;
             let design = parse_def(&dir.join(def_file), &tech, Some(&lib)).expect("DEF");
             let sdc = load_sdc(&dir.join(format!("{design_name}.sdc"))).expect("SDC");
             let spef = crate::readers::load_spef(&dir.join(spef_file)).expect("SPEF");
@@ -5166,7 +5175,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&gcd.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&gcd.join("gcd.sdc")).expect("SDC");
         let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
@@ -5266,7 +5276,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&dir.join("picorv32.placed.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&dir.join("picorv32.sdc")).expect("SDC");
         let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
@@ -5383,7 +5394,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(
             &gcd.join(format!("{design_name}.placed.def")),
             &tech,
@@ -5654,7 +5666,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(&design_dir("sta_edge").join(def), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&case_dir.join(sdc)).expect("SDC");
         let parasitics = spef.map(|s| {
@@ -6984,7 +6997,8 @@ mod tests {
             &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
             &mut interner,
         )
-        .expect("LEF");
+        .expect("LEF")
+        .0;
         let design = parse_def(
             &design_dir("sta_edge").join("propagated_clock/propagated.def"),
             &tech,

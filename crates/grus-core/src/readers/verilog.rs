@@ -729,8 +729,9 @@ mod tests {
         }
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_verilog(&v_path, &tech_db, None).expect("Failed to parse Verilog netlist");
 
@@ -785,8 +786,9 @@ mod tests {
         let v_path = require(design_dir("aes").join("aes.synth.v"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_verilog(&v_path, &tech_db, None).expect("Failed to parse Verilog netlist");
 
@@ -841,8 +843,9 @@ mod tests {
         let v_path = require(design_dir("jpeg").join("jpeg.synth.v"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_verilog(&v_path, &tech_db, None).expect("Failed to parse Verilog netlist");
 
@@ -897,8 +900,9 @@ mod tests {
         let v_path = require(design_dir("ibex").join("ibex.synth.v"));
 
         let mut interner = StringInterner::new();
-        let tech_db =
-            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
 
         let db = parse_verilog(&v_path, &tech_db, None).expect("Failed to parse Verilog netlist");
 

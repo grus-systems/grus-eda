@@ -279,6 +279,7 @@ mod tests {
             &mut interner,
         )
         .expect("LEF")
+        .0
     }
 
     fn gcd_netlist_db(tech: &TechDb) -> DesignDb {
