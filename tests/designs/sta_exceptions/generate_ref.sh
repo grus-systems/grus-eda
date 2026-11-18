@@ -130,7 +130,7 @@ exit
 EOF
 }
 
-SCENARIOS="base mc_setup2 mc_hold1 mc_setup2_hold1 mc_setup2_pos mc_bare2 mc_s2_h1_split mc_holdneg mc_both mc_overlap mc_setup2_nofrom mc_hold0 mc_to_y mc_allregs fp_uf0_uf1 fp_mc_same fp_allregs fp_to_y fp_from_din fp_pin_from fp_pin_to fp_pin_inst fp_pin_port fp_pin_badpin fp_pin_nondrive fp_bare_pin mc_pin fp_pin_clk fp_pin_clk2 fp_pin_allpins fp_pin_badinst fp_pin_clkport mc_pin_clk fp_bare_clk fp_bare_clk2 fp_bare_to md_basic md_nofrom md_loose md_tight md_port md_min md_min0 md_min1 md_minport md_overlap md_both md_mc md_fp md_through mhu_base mhu_min1 mhu_max1 base_prop pmd_basic pmd_min pmd_multi md_early md_datapath"
+SCENARIOS="base mc_setup2 mc_hold1 mc_setup2_hold1 mc_setup2_pos mc_bare2 mc_s2_h1_split mc_holdneg mc_both mc_overlap mc_setup2_nofrom mc_hold0 mc_to_y mc_allregs fp_uf0_uf1 fp_mc_same fp_allregs fp_to_y fp_from_din fp_pin_from fp_pin_to fp_pin_inst fp_pin_port fp_pin_badpin fp_pin_nondrive fp_bare_pin mc_pin fp_pin_clk fp_pin_clk2 fp_pin_allpins fp_pin_badinst fp_pin_clkport mc_pin_clk fp_bare_clk fp_bare_clk2 fp_bare_to md_basic md_nofrom md_loose md_tight md_port md_min md_min0 md_min1 md_minport md_overlap md_overlap_rev md_both md_mc md_mc_rev md_fp md_through md_min_mc md_min_mc_rev md_min_mcp_h1 md_min_mcp_s2 mhu_base mhu_min1 mhu_max1 base_prop pmd_basic pmd_min pmd_multi md_early md_datapath"
 
 for name in $SCENARIOS; do
     run_sta "$name.sdc" "ref_$name.json"
