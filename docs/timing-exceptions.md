@@ -140,25 +140,46 @@ computed once on the composed endpoint set (an endpoint is unreached only
 if no surviving group produced a candidate). Run-invariant diagnostics
 (`unresolved_driving_cells`, etc.) are taken from one run.
 
-### Multicycle semantics — measure, don't guess
+### Multicycle semantics — measured on OpenSTA
 
-The `(N-1)*T` formula and `-setup`/`-hold` independence in earlier drafts
-were wrong guesses (independent review). Before coding, measure on the
-pinned OpenSTA (LibreLane container, committed Tcl + golden file):
+Probe: `tests/designs/sta_exceptions/` (3-FF design, 19 SDC scenarios,
+`generate_ref.sh` inside the pinned LibreLane image →
+`exceptions.reference.json`). Period `T = 2.0 ns`. Required-time shifts
+measured per endpoint (`u_ff1/D`, the only MCP target):
 
-- `-setup N` alone: setup shift and the *default* hold-edge interaction
-- `-hold M` alone: baseline and sign (positional `N` vs `-setup N` syntax)
-- `-setup` + `-hold` on one command; `-both`
-- precedence: FP vs MC; overlapping MCs (specificity vs file order)
-- multicycle on latch-D endpoints (composability limit below)
+- **setup**: `max_req += (N_setup - 1) * T` when the exception matches.
+- **hold**: `min_req += ((N_setup - 1) - H_hold) * T`, defaults
+  `N_setup = 1`, `H_hold = 0`. All seven measured points fit:
+  `-setup 2` alone → hold `+1T`; `-hold 1` alone → hold `-1T`;
+  `-hold 0` → `0`; `-hold -1` → `+1T`; `-setup 2` + `-hold 1` (two
+  commands) → `0`; `-setup 3` overwriting `-setup 2` → `+2T`.
+- Bare positional `set_multicycle_path 2` and `-setup 2` are identical;
+  a bare `N` means setup. `-hold`/`-setup` values may be `0` or negative
+  (hold only; semantics above).
+- **Precedence**: a later exception on the same path replaces an earlier
+  one (`-setup 2` then `-setup 3` → `N_setup = 3`). `set_false_path`
+  beats `set_multicycle_path` on the same path (endpoint disappears).
+- **Endpoint coverage**: MCP applies to FF-D checks *and* output-port
+  checks (`-to [get_ports y]` shifted `y` req by `+1T` on both sides).
+  `-from` omitted = all launch sources.
+- **OpenSTA parser limits (measured, not assumed)**: `-setup X -hold Y`
+  on one command fails (`can't read "path_multiplier"`); `-both N`
+  fails (`STA-0563`). Both are valid SDC — our parser accepts the
+  combined form (semantics identical to the split form above) and maps
+  `-both N` to `N_setup = N`, `H_hold = N`; OpenSTA validation of those
+  two forms is therefore impossible and is documented as such.
+- `set_false_path -from [all_registers]` does **not** cover primary-input
+  launches (`fp_allregs` left the `d_in`→D hold violations intact);
+  `-from [get_ports d_in]` removed exactly those endpoints. Confirms the
+  signature-class design: `all_registers` is not a universal source set.
 
 ### Multicycle endpoint-kind limit (v1)
 
 Latch endpoints evaluate slack piecewise (borrowing clamp in
 `collect_endpoints`), so `slack + shift` composition is invalid there, and
-clock-gate/output endpoints have their own required-time structure.
-`set_multicycle_path` whose `-to` resolves to any non-FF-check endpoint
-(latch D, clock-gate enable, output port) is **partially applied**: FF-check
+clock-gate enable endpoints have their own required-time structure.
+`set_multicycle_path` whose `-to` resolves to a latch-D or clock-gate
+enable endpoint is **partially applied**: FF-check and output-port
 endpoints get the exception, the rest are counted in a new diagnostic —
 same partial-with-count precedent as `-lib_cell`/`-pin` drops. `false_path`
 has no such limit (it only removes groups).
@@ -193,10 +214,13 @@ regression test covers it.
   (e.g. `[get_pins ...]`, hierarchical forms) must route the command to
   `ignored_commands`, not abort `parse_sdc` — an opaque `Value` variant or
   caught evaluation, with parse tests.
-- `set_multicycle_path` accepts `N` as `-setup/-hold` value and bare
-  positional form; `N` must be a positive integer (reject 0/negative).
-  `-both N` sets both. `-setup`/`-hold` flags on `set_false_path` are
-  accepted as no-ops (the path is removed regardless).
+- `set_multicycle_path` accepts `N` as `-setup`/`-hold` value, bare
+  positional form (setup), and `-setup X -hold Y` combined (valid SDC;
+  OpenSTA rejects it — see measured semantics). `-both N` maps to
+  `N_setup = N`, `H_hold = N`. `-setup N` requires `N >= 1`; `-hold H`
+  accepts any integer (`0` = default, negative tightens — measured).
+  `-setup`/`-hold` flags on `set_false_path` are accepted as no-ops
+  (the path is removed regardless).
 - Empty selector resolution (typo'd cell, input port as `-to`) → diagnostic
   count, matching OpenSTA's warn-not-silent behavior.
 
@@ -228,8 +252,8 @@ Public, reproducible, per AGENTS.md rules:
    diagnostic, unsupported-qualifier diagnostics.
 2. Reference: OpenSTA in the LibreLane container — `report_timing`
    WNS/TNS + per-endpoint slack via committed Tcl → golden file. The
-   multicycle-semantics probe script lands first and its output is committed
-   before implementation.
+   multicycle-semantics probe (`tests/designs/sta_exceptions/`, 19
+   scenarios) is committed with its golden before implementation.
 3. Unit tests: selector resolution, signature partitioning, slew-only
    merging for excluded sources, composition rules, ignored-command
    accounting, can-fail checks.
@@ -260,8 +284,9 @@ Public, reproducible, per AGENTS.md rules:
 - Review record: subcon reviews `20261118-100552-7401` (agy,
   gemini-4-hydrogen-high) and `20261118-101221-da89` (devin, swe-2-flash),
   both "reject as written; core approach sound" — findings incorporated above
-- OpenSTA exception semantics: to be measured on the pinned LibreLane image,
-  not assumed
+- OpenSTA exception semantics: measured — `tests/designs/sta_exceptions/`
+  (`generate_ref.sh` → `exceptions.reference.json`), formulas in
+  "Multicycle semantics — measured on OpenSTA" above
 
 <!--
 Reviewers: design review, not code review. The snapshot has the full repo at
