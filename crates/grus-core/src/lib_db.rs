@@ -115,6 +115,20 @@ pub struct LibPin {
     /// the Liberty file does not declare one; clock-gate classification needs it because
     /// timing arcs alone cannot tell AND from OR.
     pub function: Option<SymbolId>,
+    /// `internal_power` blocks: energy tables evaluated on pin transitions.
+    pub internal_power: Vec<LibPinInternalPower>,
+}
+
+/// One `internal_power` block inside a pin. `related_pin` names the cell-local pin
+/// whose transition triggers the power (`None` = the pin's own transition, the
+/// input-pin self-power form). `rise`/`fall` select the trigger edge.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibPinInternalPower {
+    pub related_pin: Option<SymbolId>,
+    /// Raw `when` state expression (only ebu*/einv* cells use it); `None` = unconditional.
+    pub when: Option<SymbolId>,
+    pub rise: Option<NldmTable>,
+    pub fall: Option<NldmTable>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,6 +141,9 @@ pub struct LibCell {
     pub pin_count: u16,
     pub arc_offset: u32,
     pub arc_count: u16,
+    /// `cell_leakage_power` in watts: the Liberty-provided average over all
+    /// `leakage_power` `when` states. `None` when the cell declares neither.
+    pub leakage_power_w: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -134,6 +151,12 @@ pub struct LibDb {
     pub library_name: String,
     pub time_unit_ns: f32, // multiplier to convert file time -> ns
     pub cap_unit_pf: f32,  // multiplier to convert file cap -> pF
+    /// Multiplier to convert file leakage power values -> W.
+    pub leakage_power_unit_w: f32,
+    /// `default_cell_leakage_power` converted to W; used when a cell declares none.
+    pub default_cell_leakage_power_w: f32,
+    /// `nom_voltage` in volts; 0 when undeclared (power estimation reports it).
+    pub nominal_voltage_v: f32,
     pub strings: crate::interner::StringInterner,
     pub cells: Vec<LibCell>,
     pub pins: Vec<LibPin>,
@@ -150,6 +173,9 @@ impl Default for LibDb {
             // until `time_unit`/`capacitive_load_unit` rescales it.
             time_unit_ns: 1.0,
             cap_unit_pf: 1.0,
+            leakage_power_unit_w: 1e-9, // 1 nW; Liberty overrides via leakage_power_unit
+            default_cell_leakage_power_w: 0.0,
+            nominal_voltage_v: 0.0,
             strings: crate::interner::StringInterner::new(),
             cells: Vec::new(),
             pins: Vec::new(),

@@ -173,6 +173,7 @@ mod tests {
             max_cap: None,
             max_transition: Some(1.5),
             function: None,
+            internal_power: Vec::new(),
         });
         lib.pins.push(LibPin {
             name: p_out,
@@ -184,6 +185,7 @@ mod tests {
             max_cap: Some(0.2),
             max_transition: Some(1.5),
             function: None,
+            internal_power: Vec::new(),
         });
 
         let table = NldmTable {
@@ -216,6 +218,7 @@ mod tests {
             pin_count: 2,
             arc_offset: 0,
             arc_count: 1,
+            leakage_power_w: None,
         });
 
         lib.rebuild_cell_by_name();

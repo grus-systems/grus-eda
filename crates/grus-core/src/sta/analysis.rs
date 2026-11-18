@@ -5816,6 +5816,7 @@ mod tests {
                     } else {
                         None
                     },
+                    internal_power: Vec::new(),
                 });
             }
             lib.cells.push(LibCell {
@@ -5827,6 +5828,7 @@ mod tests {
                 pin_count: 3,
                 arc_offset: 0,
                 arc_count: 0,
+                leakage_power_w: None,
             });
             let cell = &lib.cells[0];
             gate_kind(&lib, cell, &lib.pins[2])

@@ -1,6 +1,7 @@
 use crate::interner::{LibPinId, PinDir, SymbolId};
 use crate::lib_db::{
-    LibCell, LibDb, LibPin, LibTimingArc, NldmTable, TableAxisVar, TimingSense, TimingType,
+    LibCell, LibDb, LibPin, LibPinInternalPower, LibTimingArc, NldmTable, TableAxisVar,
+    TimingSense, TimingType,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use xxhash_rust::xxh3::xxh3_64;
 const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
 // Bump when the serialized LibDb layout changes (e.g. new TimingType variants shift
 // discriminant values and old caches would deserialize `Other` arcs as real types).
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -189,7 +190,7 @@ struct TemplateDef {
 fn parse_axis_var(s: &str) -> TableAxisVar {
     let clean = s.trim_matches('"').trim();
     match clean {
-        "input_net_transition" => TableAxisVar::InputNetTransition,
+        "input_net_transition" | "input_transition_time" => TableAxisVar::InputNetTransition,
         "total_output_net_capacitance" => TableAxisVar::TotalOutputNetCapacitance,
         "constrained_pin_transition" => TableAxisVar::ConstrainedPinTransition,
         "related_pin_transition" => TableAxisVar::RelatedPinTransition,
@@ -270,6 +271,42 @@ fn parse_time_unit(s: &str) -> Result<f32> {
     Ok(number_value(num_str, "time_unit")? * scale)
 }
 
+/// `leakage_power_unit` such as `1nW` or `1uW`, converted to watts. Liberty expresses
+/// every power value (leakage and internal_power tables) in this unit.
+fn parse_power_unit_w(s: &str) -> Result<f32> {
+    let clean = s.trim_matches('"').trim();
+    let split = clean
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(clean.len());
+    let (num, unit) = clean.split_at(split);
+    let scale = match unit.to_ascii_lowercase().as_str() {
+        "w" => 1.0,
+        "mw" => 1e-3,
+        "uw" => 1e-6,
+        "nw" => 1e-9,
+        "pw" => 1e-12,
+        "fw" => 1e-15,
+        _ => bail!("unsupported leakage_power_unit {unit:?}"),
+    };
+    Ok(number_value(num, "leakage_power_unit")? * scale)
+}
+
+/// `voltage_unit` such as `1V` or `1mV`, converted to volts.
+fn parse_voltage_unit_v(s: &str) -> Result<f32> {
+    let clean = s.trim_matches('"').trim();
+    let split = clean
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(clean.len());
+    let (num, unit) = clean.split_at(split);
+    let scale = match unit.to_ascii_lowercase().as_str() {
+        "v" => 1.0,
+        "mv" => 1e-3,
+        "uv" => 1e-6,
+        _ => bail!("unsupported voltage_unit {unit:?}"),
+    };
+    Ok(number_value(num, "voltage_unit")? * scale)
+}
+
 fn parse_float_list(s: &str, scale: f32, out: &mut Vec<f32>) -> Result<()> {
     for part in s.split(',') {
         // A backslash line continuation inside a quoted list is layout, not part of a value.
@@ -318,6 +355,11 @@ fn parse_library_body(
     db: &mut LibDb,
     templates: &mut HashMap<String, TemplateDef>,
 ) -> Result<()> {
+    // Unit-scaled attributes are resolved after the loop so their order relative to
+    // `leakage_power_unit`/`voltage_unit` does not matter.
+    let mut default_cell_leakage_raw: Option<f32> = None;
+    let mut nom_voltage_raw: Option<f32> = None;
+    let mut voltage_unit_v = 1.0f32;
     let mut closed = false;
     while let Some(tok) = lexer.next_token() {
         match tok {
@@ -360,7 +402,32 @@ fn parse_library_body(
                     }
                 }
             }
-            Token::Ident("lu_table_template") => {
+            Token::Ident("leakage_power_unit") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Str(s) | Token::Ident(s)) = lexer.next_token() {
+                        db.leakage_power_unit_w = parse_power_unit_w(s)?;
+                    }
+            }
+            Token::Ident("voltage_unit") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Str(s) | Token::Ident(s)) = lexer.next_token() {
+                        voltage_unit_v = parse_voltage_unit_v(s)?;
+                    }
+            }
+            Token::Ident("default_cell_leakage_power") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
+                        default_cell_leakage_raw =
+                            Some(number_value(s, "default_cell_leakage_power")?);
+                    }
+            }
+            Token::Ident("nom_voltage") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
+                        nom_voltage_raw = Some(number_value(s, "nom_voltage")?);
+                    }
+            }
+            Token::Ident("lu_table_template") | Token::Ident("power_lut_template") => {
                 if matches!(lexer.next_token(), Some(Token::LParen)) {
                     let tname = read_paren_header(lexer);
                     if let Some(Token::LBrace) = lexer.next_token() {
@@ -398,6 +465,12 @@ fn parse_library_body(
     }
     if !closed {
         bail!("unterminated Liberty library body (missing closing brace)");
+    }
+    if let Some(v) = default_cell_leakage_raw {
+        db.default_cell_leakage_power_w = v * db.leakage_power_unit_w;
+    }
+    if let Some(v) = nom_voltage_raw {
+        db.nominal_voltage_v = v * voltage_unit_v;
     }
     Ok(())
 }
@@ -520,6 +593,7 @@ fn parse_cell_body(
     let mut area = 0.0f32;
     let mut is_sequential = false;
     let mut is_latch = false;
+    let mut cell_leakage_raw: Option<f32> = None;
 
     // Track cell-local pins mapping SymbolId to global LibPinId
     let mut local_pin_names: HashMap<SymbolId, LibPinId> = HashMap::new();
@@ -568,6 +642,7 @@ fn parse_cell_body(
                                 max_cap: None,
                                 max_transition: None,
                                 function: None,
+                                internal_power: Vec::new(),
                             });
                         }
                     }
@@ -602,10 +677,17 @@ fn parse_cell_body(
                                 max_cap: None,
                                 max_transition: None,
                                 function: None,
+                                internal_power: Vec::new(),
                             });
                         }
                     }
                 }
+            }
+            Token::Ident("cell_leakage_power") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
+                        cell_leakage_raw = Some(number_value(s, "cell_leakage_power")?);
+                    }
             }
             Token::Ident("pin") => {
                 if matches!(lexer.next_token(), Some(Token::LParen)) {
@@ -650,7 +732,7 @@ fn parse_cell_body(
             Token::LBrace => {
                 lexer.skip_balanced_braces();
             }
-            // `test_cell`, `pg_pin`, `leakage_power`, `internal_power`,
+            // `test_cell`, `pg_pin`, `leakage_power` (summarized by `cell_leakage_power`),
             // `dynamic_current` and any other unknown attribute are skipped whole so
             // their values cannot alias keywords (`cell_footprint : latch;` would
             // otherwise set `is_latch`). One arm only: a guard that fails must not
@@ -700,6 +782,7 @@ fn parse_cell_body(
         pin_count,
         arc_offset,
         arc_count,
+        leakage_power_w: cell_leakage_raw.map(|v| v * db.leakage_power_unit_w),
     });
 
     Ok(())
@@ -738,6 +821,7 @@ fn parse_pin_body(
 
     // Temporary list of timing arcs defined inside this pin
     let mut pin_arcs = Vec::new();
+    let mut pin_internal_power = Vec::new();
     let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
@@ -809,6 +893,9 @@ fn parse_pin_body(
                     }
                 }
             }
+            Token::Ident("internal_power") => {
+                pin_internal_power.push(parse_internal_power_block(lexer, db, templates)?);
+            }
             Token::Ident("timing") => {
                 // Consume optional (args)
                 while let Some(tok_t) = lexer.next_token() {
@@ -849,6 +936,7 @@ fn parse_pin_body(
         max_cap,
         max_transition,
         function,
+        internal_power: pin_internal_power,
     };
     // A pin sharing its name with an `ff`/`latch` state variable reuses the placeholder
     // slot pushed earlier; writing in place keeps one entry per name.
@@ -879,6 +967,74 @@ fn parse_pin_body(
     }
 
     Ok(())
+}
+
+/// Parses one `internal_power () { ... }` block inside a pin body. Attribute order is
+/// not fixed (`related_pin` may sit between `fall_power` and `rise_power`), so the
+/// whole block is scanned and both edges collected independently.
+fn parse_internal_power_block(
+    lexer: &mut Lexer,
+    db: &mut LibDb,
+    templates: &HashMap<String, TemplateDef>,
+) -> Result<LibPinInternalPower> {
+    let mut entry = LibPinInternalPower {
+        related_pin: None,
+        when: None,
+        rise: None,
+        fall: None,
+    };
+    // Consume the optional `()`/`(args)` header up to the body brace.
+    let mut saw_brace = false;
+    while let Some(tok) = lexer.next_token() {
+        if matches!(tok, Token::LBrace) {
+            saw_brace = true;
+            break;
+        }
+    }
+    if !saw_brace {
+        bail!("internal_power is missing its body brace");
+    }
+    let mut closed = false;
+    while let Some(tok) = lexer.next_token() {
+        match tok {
+            Token::RBrace => {
+                closed = true;
+                break;
+            }
+            Token::Ident("related_pin") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
+                        entry.related_pin = Some(db.strings.intern(s));
+                    }
+            }
+            Token::Ident("when") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token() {
+                        entry.when = Some(db.strings.intern(s));
+                    }
+            }
+            Token::Ident("fall_power") => {
+                entry.fall = parse_power_table(lexer, db, templates)?;
+            }
+            Token::Ident("rise_power") => {
+                entry.rise = parse_power_table(lexer, db, templates)?;
+            }
+            Token::LBrace => {
+                lexer.skip_balanced_braces();
+            }
+            // Unknown attributes are skipped whole; hitting the block's own `}`
+            // without a `;`/`{` means the attribute ran to the end — treat as closed.
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !closed {
+        bail!("unterminated Liberty internal_power block (missing closing brace)");
+    }
+    Ok(entry)
 }
 
 #[allow(clippy::type_complexity)]
@@ -1009,6 +1165,24 @@ fn parse_nldm_table(
     db: &LibDb,
     templates: &HashMap<String, TemplateDef>,
 ) -> Result<Option<NldmTable>> {
+    parse_lut_table(lexer, db, templates, db.time_unit_ns)
+}
+
+/// `internal_power` tables carry power values in `leakage_power_unit`, not time units.
+fn parse_power_table(
+    lexer: &mut Lexer,
+    db: &LibDb,
+    templates: &HashMap<String, TemplateDef>,
+) -> Result<Option<NldmTable>> {
+    parse_lut_table(lexer, db, templates, db.leakage_power_unit_w)
+}
+
+fn parse_lut_table(
+    lexer: &mut Lexer,
+    db: &LibDb,
+    templates: &HashMap<String, TemplateDef>,
+    value_scale: f32,
+) -> Result<Option<NldmTable>> {
     let mut tpl_name = String::new();
     if matches!(lexer.next_token(), Some(Token::LParen)) {
         tpl_name = read_paren_header(lexer).unwrap_or_default();
@@ -1066,7 +1240,7 @@ fn parse_nldm_table(
                             match arg {
                                 Token::RParen => break,
                                 Token::Str(s) | Token::Ident(s) => {
-                                    parse_float_list(s, db.time_unit_ns, &mut values)?;
+                                    parse_float_list(s, value_scale, &mut values)?;
                                 }
                                 _ => {}
                             }
@@ -1491,6 +1665,47 @@ library (test_lib) {
         let d_arc = dlx_arcs.iter().find(|a| db.pins[a.target_pin.0 as usize].name == d_sym)
             .expect("timing arc for D not found");
         assert_eq!(db.pins[d_arc.related_pin.0 as usize].name, gate_sym);
+
+        // Power data: library units and per-cell/per-pin power tables.
+        assert!((db.leakage_power_unit_w - 1e-9).abs() < 1e-15);
+        assert!((db.nominal_voltage_v - 1.8).abs() < 1e-6);
+        let inv_leak = inv_cell.leakage_power_w.expect("inv_1 leakage_power_w");
+        assert!((inv_leak - 5.326_682e-12).abs() < 1e-20);
+        // inv_1 output Y carries one internal_power block keyed by related pin A
+        // (2-D: related-pin slew x output load).
+        let y_pin = &inv_pins[1];
+        assert_eq!(y_pin.internal_power.len(), 1);
+        let ip = &y_pin.internal_power[0];
+        assert_eq!(
+            ip.related_pin.map(|s| db.strings.resolve(s)),
+            Some("A")
+        );
+        assert!(ip.when.is_none());
+        let rise = ip.rise.as_ref().expect("inv_1 Y rise_power table");
+        assert_eq!(rise.var1, TableAxisVar::InputNetTransition);
+        assert_eq!(rise.var2, TableAxisVar::TotalOutputNetCapacitance);
+        assert_eq!(rise.index_1.len(), 7);
+        assert_eq!(rise.index_2.len(), 7);
+        assert_eq!(rise.values.len(), 49);
+        // dfxtp_1: 3 internal_power blocks across CLK/D/Q; Q's reference CLK by name.
+        assert_eq!(dfx_cell.pin_count, 5);
+        let dfx_ip_count: usize = db
+            .cell_pins(dfx_cell)
+            .iter()
+            .map(|p| p.internal_power.len())
+            .sum();
+        assert_eq!(dfx_ip_count, 3);
+        let q_pin = db
+            .cell_pins(dfx_cell)
+            .iter()
+            .find(|p| db.strings.resolve(p.name) == "Q")
+            .expect("dfxtp_1 Q pin");
+        let q_ip = &q_pin.internal_power;
+        assert!(q_ip.iter().any(|e| {
+            e.related_pin
+                .map(|s| db.strings.resolve(s) == "CLK")
+                .unwrap_or(false)
+        }));
     }
 
     #[test]
