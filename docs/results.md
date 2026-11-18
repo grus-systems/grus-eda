@@ -2084,3 +2084,66 @@ endpoints, which keep their clock-check values. The 17-qualifier
 **Regression**: full `cargo test -p grus-core` passes (255 lib tests);
 ordinary SDCs take the unpartitioned path unchanged when
 `sdc.path_delays.is_empty()`.
+
+### 2026-11-19 — N3 — two-source delay-merge fixture (`m2_*`/`pm2_*`)
+
+Extends the `sta_exceptions` fixture so `u_ff1/D` is reachable from two
+sequential launch sources with skewed launch clocks: `u_ff0/Q -> u_mux/A0`
+and `u_ff2/Q -> u_mux/A1` (`sky130_fd_sc_hd__mux2_1` at `u_mux`), a
+constrained `sel` port driving `u_mux/S` (`-min 0.1` / `-max 0.3` input
+delays — live but losing: its hold slack stays positive so the min-side
+delay probes still win, its setup slack loses to every `set_max_delay`
+check), and a second `clkbuf` `u_clkb2` so `u_ff2/CLK` rides `c2` while
+`u_ff0`/`u_ff1` stay on `c1`.
+
+- **Reference command**: `bash tests/designs/sta_exceptions/generate_ref.sh`
+  (re-invokes itself inside `ghcr.io/librelane/librelane:3.0.16`; all 72
+  scenarios regenerated, every value emitted by that run — no hand-edited
+  numbers).
+- **Our command**: `cargo test -p grus-core test_sta_exceptions_match_opensta`
+  (STRICT: rel 1%, abs 5 ps; per-endpoint 8 fields + WNS/TNS + violation
+  counts).
+
+**Real divergence found and fixed.** With the split clock nets the new
+`pm2_both` scenario (single `-from {u_ff0 u_ff2}` command → merged delay
+domain) exposed that the max-side delay-check required time was anchored
+to the *launch* source's clock arrival: ours 1.0048 vs OpenSTA 1.013333 on
+`u_ff1/D`, an 8.5 ps miss equal to the `c1`/`c2` clock skew. OpenSTA
+anchors `req` at the endpoint register's own clock pin (early capture
+arrival, like the setup clock check, minus the period the clock check
+adds) — invisible while every FF shared one clock net. Fixed in
+`run_sta_partitioned`: `req = capture_arrival_min[check.edge] - unc -
+t_setup + N`, `arr = delay_launch + delay_max`, `slack = req - arr`. The
+two-command propagated scenario `pmd_multi` exercises the same anchoring
+per class. The clock check's CRPR credit is not applied to delay checks
+(the delay domain tracks the winner's launch time, not its clock net);
+unexercised here — zero late/early spread on this fixture's clock nets.
+
+**Comparison after the fix**: all 68 evaluated scenarios match STRICT
+tolerances including the new `m2_max0`/`m2_max2`/`m2_both`/`m2_min2`/
+`pm2_prop`/`pm2_min2`/`pm2_both`; the 4 OpenSTA-rejection records are
+unchanged. Regenerated values legitimately shifted: `u_ff1/D` arrivals
+gain the mux delay and the `sel`/`u_ff2` candidates everywhere; `fp_uf0_uf1`
+now reports `u_ff1/D` (survives via `u_ff2`/`sel`); `exc_diag`'s report
+winner is the unshifted `u_ff2`/`sel` clock check (req 2.550057) — the
+`-setup 2` shift still applies to the `u_ff0` class candidate but loses
+the min-slack pick (diagnostics test updated accordingly). One fixture
+intent did not hold: `sel`'s `-max 0.3` was meant to keep `base`'s
+`u_ff1/D` max report on an FF path, but the port launch (arr 1.313326)
+beats both FF arrivals (`u_ff2` 1.277188) and wins that report —
+harmless, since every delay probe still wins its own scenario, but the
+`base` `u_ff1/D` max row now measures a port-launched path.
+
+**Winner-pairing outcome**: the delay winner (`u_ff2`, ~10 ps larger path
+delay via `A1`) is also the arrival winner — its ~8.5 ps earlier launch on
+`c2` does not overcome the delay gap — so the delay-winner vs
+arrival-winner split did not materialize on golden data. Fail-proof check:
+pairing `delay_max` with the max launch instead of the winner's launch
+turns `pm2_both u_ff1/D.max_arr_ns` red (0.72798 vs 0.719321); restored.
+A fixture separating the two winners (larger `c1` load) is listed as
+follow-up in `docs/path-delays.md` section 5.
+
+**Regression**: `cargo test -p grus-core` passes including the updated
+`test_sta_exception_diagnostics` (partial false-path coverage asserted on
+`fp_uf0_uf1`, full removal on `fp_to_y`, winner required time on
+`exc_diag`).
