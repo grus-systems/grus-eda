@@ -84,8 +84,8 @@ pub fn parse_yosys_json_bytes(
     tech_db: &TechDb,
     lib_db: Option<&LibDb>,
 ) -> Result<DesignDb> {
-    let root: YosysRoot = serde_json::from_slice(bytes)
-        .context("Failed to parse Yosys JSON netlist")?;
+    let root: YosysRoot =
+        serde_json::from_slice(bytes).context("Failed to parse Yosys JSON netlist")?;
 
     // Find top module (non-blackbox with cells)
     let (mod_name, top_module) = root
@@ -136,7 +136,10 @@ pub fn parse_yosys_json_bytes(
         }
     }
 
-    let get_or_create_net = |bit: YosysBit, net_bits: &mut Vec<YosysBit>, bit_to_net: &mut HashMap<YosysBit, NetId>| -> Option<NetId> {
+    let get_or_create_net = |bit: YosysBit,
+                             net_bits: &mut Vec<YosysBit>,
+                             bit_to_net: &mut HashMap<YosysBit, NetId>|
+     -> Option<NetId> {
         if matches!(bit, YosysBit::Other) {
             return None;
         }
@@ -206,7 +209,8 @@ pub fn parse_yosys_json_bytes(
         let mac = &tech_db.macros[macro_id.0 as usize];
 
         let lib_cell_id = lib_db.and_then(|lib| {
-            lib.strings.get(&cell_data.cell_type)
+            lib.strings
+                .get(&cell_data.cell_type)
                 .and_then(|s| lib.cell_by_name.get(&s).copied())
         });
 
@@ -238,9 +242,10 @@ pub fn parse_yosys_json_bytes(
                 if let Some(lcid) = lib_cell_id {
                     let lcell = &lib.cells[lcid.0 as usize];
                     let lpins = lib.cell_pins(lcell);
-                    lpins.iter().position(|lp| {
-                        lib.strings.resolve(lp.name) == pin_name
-                    }).map(|idx| LibPinId((lcell.pin_offset as usize + idx) as u16))
+                    lpins
+                        .iter()
+                        .position(|lp| lib.strings.resolve(lp.name) == pin_name)
+                        .map(|idx| LibPinId((lcell.pin_offset as usize + idx) as u16))
                 } else {
                     None
                 }
@@ -249,7 +254,8 @@ pub fn parse_yosys_json_bytes(
             db.pin_names.push(mpin.name);
             db.pin_dirs.push(mpin.dir);
             db.pin_cells.push(Some(cell_id));
-            db.pin_macro_pins.push(Some(MacroPinId(mac.pin_offset + pin_idx as u32)));
+            db.pin_macro_pins
+                .push(Some(MacroPinId(mac.pin_offset + pin_idx as u32)));
             db.pin_lib_pins.push(lib_pin_id);
             db.pin_nets.push(net_id);
             db.pin_offset_x_dbu.push(mpin.offset_x_dbu);
@@ -275,12 +281,15 @@ pub fn parse_yosys_json_bytes(
     db.net_pin_offsets.reserve(num_nets + 1);
 
     for (nid_idx, &bit) in net_bits.iter().enumerate() {
-        let name = bit_canonical_name.get(&bit).cloned().unwrap_or_else(|| match bit {
-            YosysBit::Int(i) => format!("_net_{}", i),
-            YosysBit::Const0 => "__const_0".to_string(),
-            YosysBit::Const1 => "__const_1".to_string(),
-            YosysBit::Other => format!("_net_other_{}", nid_idx),
-        });
+        let name = bit_canonical_name
+            .get(&bit)
+            .cloned()
+            .unwrap_or_else(|| match bit {
+                YosysBit::Int(i) => format!("_net_{}", i),
+                YosysBit::Const0 => "__const_0".to_string(),
+                YosysBit::Const1 => "__const_1".to_string(),
+                YosysBit::Other => format!("_net_other_{}", nid_idx),
+            });
         db.net_names.push(db.strings.intern(&name));
     }
 
@@ -302,11 +311,7 @@ pub fn parse_yosys_json_bytes(
     Ok(db)
 }
 
-pub fn parse_yosys_json(
-    path: &Path,
-    tech_db: &TechDb,
-    lib_db: Option<&LibDb>,
-) -> Result<DesignDb> {
+pub fn parse_yosys_json(path: &Path, tech_db: &TechDb, lib_db: Option<&LibDb>) -> Result<DesignDb> {
     let mut file = File::open(path)
         .with_context(|| format!("Failed to open Yosys JSON file at {:?}", path))?;
     let mut contents = Vec::new();
@@ -317,9 +322,9 @@ pub fn parse_yosys_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, require, sky130_hd};
-    use crate::readers::lef::load_tech_db;
     use crate::interner::StringInterner;
+    use crate::readers::lef::load_tech_db;
+    use crate::test_support::{design_dir, require, sky130_hd};
 
     #[test]
     fn test_gcd_yosys_json() {
@@ -338,11 +343,10 @@ mod tests {
         }
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
 
-        let db = parse_yosys_json(&json_path, &tech_db, None)
-            .expect("Failed to parse Yosys JSON");
+        let db = parse_yosys_json(&json_path, &tech_db, None).expect("Failed to parse Yosys JSON");
 
         let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
@@ -351,10 +355,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["verilog_logic_instances"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["verilog_signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["verilog_bterms"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["verilog_inst_pins"].as_u64().unwrap() as usize
+        );
 
         // Verify driver invariant on all nets with at least one driver
         let mut driven_nets = 0;
@@ -363,10 +379,17 @@ mod tests {
             if let Some(drv) = db.net_driver(nid) {
                 driven_nets += 1;
                 let first_pin = db.net_pins(nid)[0];
-                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+                assert_eq!(
+                    first_pin, drv,
+                    "Driver pin must be first at net_pin_offsets"
+                );
             }
         }
-        assert!(driven_nets >= 260, "Expected most nets to be driven, got {}", driven_nets);
+        assert!(
+            driven_nets >= 260,
+            "Expected most nets to be driven, got {}",
+            driven_nets
+        );
     }
 
     #[test]
@@ -376,21 +399,33 @@ mod tests {
         let json_path = require(design_dir("aes").join("aes.synth.json"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
 
-        let db = parse_yosys_json(&json_path, &tech_db, None)
-            .expect("Failed to parse Yosys JSON");
+        let db = parse_yosys_json(&json_path, &tech_db, None).expect("Failed to parse Yosys JSON");
 
         let ref_path = require(design_dir("aes").join("aes.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["verilog_logic_instances"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["verilog_signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["verilog_bterms"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["verilog_inst_pins"].as_u64().unwrap() as usize
+        );
 
         // Driver invariant on every driven net. The count is printed, not asserted: no aes
         // golden value exists for it.
@@ -400,10 +435,17 @@ mod tests {
             if let Some(drv) = db.net_driver(nid) {
                 driven_nets += 1;
                 let first_pin = db.net_pins(nid)[0];
-                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+                assert_eq!(
+                    first_pin, drv,
+                    "Driver pin must be first at net_pin_offsets"
+                );
             }
         }
-        println!("aes yosys: {} of {} nets have a driver", driven_nets, db.num_nets());
+        println!(
+            "aes yosys: {} of {} nets have a driver",
+            driven_nets,
+            db.num_nets()
+        );
     }
 
     #[test]
@@ -413,21 +455,33 @@ mod tests {
         let json_path = require(design_dir("jpeg").join("jpeg.synth.json"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
 
-        let db = parse_yosys_json(&json_path, &tech_db, None)
-            .expect("Failed to parse Yosys JSON");
+        let db = parse_yosys_json(&json_path, &tech_db, None).expect("Failed to parse Yosys JSON");
 
         let ref_path = require(design_dir("jpeg").join("jpeg.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["verilog_logic_instances"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["verilog_signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["verilog_bterms"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["verilog_inst_pins"].as_u64().unwrap() as usize
+        );
 
         // Driver invariant on every driven net. The count is printed, not asserted: no jpeg
         // golden value exists for it.
@@ -437,10 +491,17 @@ mod tests {
             if let Some(drv) = db.net_driver(nid) {
                 driven_nets += 1;
                 let first_pin = db.net_pins(nid)[0];
-                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+                assert_eq!(
+                    first_pin, drv,
+                    "Driver pin must be first at net_pin_offsets"
+                );
             }
         }
-        println!("jpeg yosys: {} of {} nets have a driver", driven_nets, db.num_nets());
+        println!(
+            "jpeg yosys: {} of {} nets have a driver",
+            driven_nets,
+            db.num_nets()
+        );
     }
 
     #[test]
@@ -450,21 +511,33 @@ mod tests {
         let json_path = require(design_dir("ibex").join("ibex.synth.json"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
 
-        let db = parse_yosys_json(&json_path, &tech_db, None)
-            .expect("Failed to parse Yosys JSON");
+        let db = parse_yosys_json(&json_path, &tech_db, None).expect("Failed to parse Yosys JSON");
 
         let ref_path = require(design_dir("ibex").join("ibex.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read ibex.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read ibex.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["verilog_logic_instances"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["verilog_signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["verilog_bterms"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["verilog_inst_pins"].as_u64().unwrap() as usize
+        );
 
         // Driver invariant on every driven net. The count is printed, not asserted: no ibex
         // golden value exists for it.
@@ -474,9 +547,16 @@ mod tests {
             if let Some(drv) = db.net_driver(nid) {
                 driven_nets += 1;
                 let first_pin = db.net_pins(nid)[0];
-                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+                assert_eq!(
+                    first_pin, drv,
+                    "Driver pin must be first at net_pin_offsets"
+                );
             }
         }
-        println!("ibex yosys: {} of {} nets have a driver", driven_nets, db.num_nets());
+        println!(
+            "ibex yosys: {} of {} nets have a driver",
+            driven_nets,
+            db.num_nets()
+        );
     }
 }

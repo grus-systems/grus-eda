@@ -1,7 +1,7 @@
 use crate::design_db::DesignDb;
 use crate::placement::density::DensitySolver;
 use crate::placement::wirelength::{
-    compute_hpwl_um, compute_wa_wirelength_and_grad, WaWirelengthPrecomp,
+    WaWirelengthPrecomp, compute_hpwl_um, compute_wa_wirelength_and_grad,
 };
 use crate::tech_db::TechDb;
 
@@ -346,8 +346,7 @@ pub fn run_nesterov_placement(
     let mut pin_cnt = vec![0.0f32; num_cells];
     let mut cell_area = vec![0.0f32; num_cells];
     for c in 0..num_cells {
-        pin_cnt[c] =
-            (design_db.cell_pin_offsets[c + 1] - design_db.cell_pin_offsets[c]) as f32;
+        pin_cnt[c] = (design_db.cell_pin_offsets[c + 1] - design_db.cell_pin_offsets[c]) as f32;
         cell_area[c] = density_solver.cell_w_um[c] * density_solver.cell_h_um[c];
     }
 
@@ -486,11 +485,11 @@ pub fn run_nesterov_placement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
     use crate::design_db::PlacementStatus;
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
+    use crate::test_support::{design_dir, sky130_hd};
 
     #[test]
     fn test_gcd_nesterov_global_placement() {
@@ -499,25 +498,37 @@ mod tests {
         let floorplan_def_path = design_dir("gcd").join("gcd.floorplan.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !floorplan_def_path.exists() {
-            panic!("Required test files missing: tlef={:?}, lef={:?}, def={:?}",
-                   tlef_path, lef_path, floorplan_def_path);
+            panic!(
+                "Required test files missing: tlef={:?}, lef={:?}, def={:?}",
+                tlef_path, lef_path, floorplan_def_path
+            );
         }
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let design_db = parse_def(&floorplan_def_path, &tech_db, None)
-            .expect("Failed to parse floorplan DEF");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let design_db =
+            parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
         let config = NesterovConfig::default();
         let t0 = std::time::Instant::now();
         let res = run_nesterov_placement(&design_db, &tech_db, &config);
         let elapsed = t0.elapsed();
 
-        let status = if res.converged { "converged" } else { "did not converge" };
+        let status = if res.converged {
+            "converged"
+        } else {
+            "did not converge"
+        };
         println!(
             "Nesterov placement {} in {} iters, time: {:?}, init_ovf: {:.4}, final_ovf: {:.4}, init_hpwl: {:.2} um, final_hpwl: {:.2} um",
-            status, res.iterations, elapsed, res.initial_overflow, res.final_overflow, res.initial_hpwl_um, res.final_hpwl_um
+            status,
+            res.iterations,
+            elapsed,
+            res.initial_overflow,
+            res.final_overflow,
+            res.initial_hpwl_um,
+            res.final_hpwl_um
         );
 
         // 1. CG initial placement yields ~0.40 initial overflow on gcd; GP drives it <= 0.10
@@ -542,10 +553,24 @@ mod tests {
 
         // 3. Core bounds check
         let dbu_per_um = design_db.dbu_per_micron as f32;
-        let core_xl = design_db.rows.iter().map(|r| r.orig_x_dbu).min().unwrap() as f32 / dbu_per_um;
-        let core_xh = design_db.rows.iter().map(|r| r.orig_x_dbu + r.num_x * r.step_x_dbu).max().unwrap() as f32 / dbu_per_um;
-        let core_yl = design_db.rows.iter().map(|r| r.orig_y_dbu).min().unwrap() as f32 / dbu_per_um;
-        let core_yh = design_db.rows.iter().map(|r| r.orig_y_dbu + tech_db.site_height_dbu).max().unwrap() as f32 / dbu_per_um;
+        let core_xl =
+            design_db.rows.iter().map(|r| r.orig_x_dbu).min().unwrap() as f32 / dbu_per_um;
+        let core_xh = design_db
+            .rows
+            .iter()
+            .map(|r| r.orig_x_dbu + r.num_x * r.step_x_dbu)
+            .max()
+            .unwrap() as f32
+            / dbu_per_um;
+        let core_yl =
+            design_db.rows.iter().map(|r| r.orig_y_dbu).min().unwrap() as f32 / dbu_per_um;
+        let core_yh = design_db
+            .rows
+            .iter()
+            .map(|r| r.orig_y_dbu + tech_db.site_height_dbu)
+            .max()
+            .unwrap() as f32
+            / dbu_per_um;
 
         let num_cells = design_db.num_cells();
         let wl_precomp = WaWirelengthPrecomp::new(&design_db, &tech_db);
@@ -564,12 +589,20 @@ mod tests {
                 assert!(
                     x >= core_xl - 1e-4 && x + w <= core_xh + 1e-4,
                     "Movable cell {} X out of bounds: x={}, w={}, core=[{}, {}]",
-                    c, x, w, core_xl, core_xh
+                    c,
+                    x,
+                    w,
+                    core_xl,
+                    core_xh
                 );
                 assert!(
                     y >= core_yl - 1e-4 && y + h <= core_yh + 1e-4,
                     "Movable cell {} Y out of bounds: y={}, h={}, core=[{}, {}]",
-                    c, y, h, core_yl, core_yh
+                    c,
+                    y,
+                    h,
+                    core_yl,
+                    core_yh
                 );
             } else if design_db.cell_status[c] == PlacementStatus::Fixed {
                 // Fixed cells must remain exactly at their initial coordinates
@@ -578,12 +611,16 @@ mod tests {
                 assert!(
                     (x - orig_x).abs() < 1e-5,
                     "Fixed cell {} X changed from {} to {}",
-                    c, orig_x, x
+                    c,
+                    orig_x,
+                    x
                 );
                 assert!(
                     (y - orig_y).abs() < 1e-5,
                     "Fixed cell {} Y changed from {} to {}",
-                    c, orig_y, y
+                    c,
+                    orig_y,
+                    y
                 );
             }
         }
@@ -688,7 +725,10 @@ mod tests {
         };
         let res = run_nesterov_placement(&design_db, &tech_db, &config);
 
-        assert!(!res.converged, "run that hit max_iters must not report convergence");
+        assert!(
+            !res.converged,
+            "run that hit max_iters must not report convergence"
+        );
         assert_eq!(res.iterations, 3, "3 gradient steps were executed");
         assert_eq!(res.cell_x_um.len(), design_db.num_cells());
         assert!(res.final_overflow.is_finite() && res.final_overflow >= 0.0);

@@ -1,9 +1,9 @@
-use crate::congestion::rsmt::Pt;
 use super::dmp::PiModel;
+use crate::congestion::rsmt::Pt;
 use crate::design_db::DesignDb;
+use crate::interner::{NetId, PinDir, PinId};
 use crate::lib_db::LibDb;
 use crate::readers::spef::{Spef, SpefNet, unescape_spef_name};
-use crate::interner::{NetId, PinDir, PinId};
 use crate::tech_db::TechDb;
 use anyhow::{Result, bail};
 use rayon::prelude::*;
@@ -83,7 +83,10 @@ impl NetRcTree {
         for v in 1..n {
             tau[v] = tau[self.parent[v] as usize] + self.edge_r_kohm[v] * downstream[v];
         }
-        self.pin_node.iter().map(|&node| tau[node as usize]).collect()
+        self.pin_node
+            .iter()
+            .map(|&node| tau[node as usize])
+            .collect()
     }
 }
 
@@ -105,7 +108,11 @@ impl NetParasitics {
     }
 }
 
-pub fn estimate_placement_parasitics(design: &DesignDb, tech: &TechDb, rc: WireRc) -> NetParasitics {
+pub fn estimate_placement_parasitics(
+    design: &DesignDb,
+    tech: &TechDb,
+    rc: WireRc,
+) -> NetParasitics {
     let failed = std::sync::atomic::AtomicUsize::new(0);
     let mut parasitics = estimate_placement_parasitics_with_tree(design, tech, rc, |pts| {
         let tree = crate::congestion::pdr::build_pd_tree_for_points(pts);
@@ -140,7 +147,10 @@ where
             .map(|n| build_net_tree(design, tech, rc, NetId(n as u32), &segments))
             .collect()
     };
-    NetParasitics { nets, pd_check_failed_nets: 0 }
+    NetParasitics {
+        nets,
+        pd_check_failed_nets: 0,
+    }
 }
 
 fn build_net_tree<F: Fn(&[Pt]) -> Vec<(Pt, Pt)>>(
@@ -156,10 +166,7 @@ fn build_net_tree<F: Fn(&[Pt]) -> Vec<(Pt, Pt)>>(
         return None;
     }
     let dbu_per_um = tech.dbu_per_micron as f32;
-    let pin_pts: Vec<Pt> = pins
-        .iter()
-        .map(|&p| design.pin_pos_dbu(p, tech))
-        .collect();
+    let pin_pts: Vec<Pt> = pins.iter().map(|&p| design.pin_pos_dbu(p, tech)).collect();
 
     let mut points: Vec<Pt> = Vec::with_capacity(pin_pts.len() * 2);
     let mut index: Option<HashMap<Pt, usize>> = None;
@@ -214,7 +221,9 @@ fn build_net_tree<F: Fn(&[Pt]) -> Vec<(Pt, Pt)>>(
             if node_of[v] != u32::MAX {
                 continue;
             }
-            let length_um = (points[u].0.abs_diff(points[v].0) + points[u].1.abs_diff(points[v].1)) as f32 / dbu_per_um;
+            let length_um = (points[u].0.abs_diff(points[v].0) + points[u].1.abs_diff(points[v].1))
+                as f32
+                / dbu_per_um;
             let cap = rc.c_pf_per_um * length_um;
             node_of[v] = order.len() as u32;
             order.push(v);
@@ -227,7 +236,13 @@ fn build_net_tree<F: Fn(&[Pt]) -> Vec<(Pt, Pt)>>(
         }
     }
     let pin_node = pin_point.iter().map(|&p| node_of[p]).collect();
-    Some(NetRcTree { parent, edge_r_kohm: edge_r, wire_cap_pf: wire_cap, pin_node, total_wire_cap_pf: total_cap })
+    Some(NetRcTree {
+        parent,
+        edge_r_kohm: edge_r,
+        wire_cap_pf: wire_cap,
+        pin_node,
+        total_wire_cap_pf: total_cap,
+    })
 }
 
 /// Builds the RC trees from an extracted SPEF. SPEF capacitance is wire-only (`PIN_CAP NONE`), so
@@ -247,9 +262,15 @@ pub fn spef_parasitics(design: &DesignDb, spef: &Spef) -> Result<NetParasitics> 
     let nets: Vec<Option<NetRcTree>> = if n_nets < 512 {
         (0..n_nets).map(build_one).collect::<Result<Vec<_>>>()?
     } else {
-        (0..n_nets).into_par_iter().map(build_one).collect::<Result<Vec<_>>>()?
+        (0..n_nets)
+            .into_par_iter()
+            .map(build_one)
+            .collect::<Result<Vec<_>>>()?
     };
-    Ok(NetParasitics { nets, pd_check_failed_nets: 0 })
+    Ok(NetParasitics {
+        nets,
+        pd_check_failed_nets: 0,
+    })
 }
 
 fn spef_pin_node_name(design: &DesignDb, pin: PinId) -> String {
@@ -264,15 +285,23 @@ fn spef_pin_node_name(design: &DesignDb, pin: PinId) -> String {
     }
 }
 
-fn spef_net_tree(design: &DesignDb, net: NetId, net_name: &str, spef_net: &SpefNet) -> Result<NetRcTree> {
+fn spef_net_tree(
+    design: &DesignDb,
+    net: NetId,
+    net_name: &str,
+    spef_net: &SpefNet,
+) -> Result<NetRcTree> {
     let pins = design.net_pins(net);
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut intern = |name: &str| -> usize {
         let next = index.len();
         *index.entry(name.to_string()).or_insert(next)
     };
-    let resistor_ends: Vec<(usize, usize, f32)> =
-        spef_net.resistors.iter().map(|(a, b, r)| (intern(a), intern(b), *r)).collect();
+    let resistor_ends: Vec<(usize, usize, f32)> = spef_net
+        .resistors
+        .iter()
+        .map(|(a, b, r)| (intern(a), intern(b), *r))
+        .collect();
     let cap_nodes: Vec<(usize, f32)> = spef_net.caps.iter().map(|(n, c)| (intern(n), *c)).collect();
     let node_count = index.len();
     let mut adjacency: Vec<Vec<(usize, f32)>> = vec![Vec::new(); node_count];
@@ -286,7 +315,10 @@ fn spef_net_tree(design: &DesignDb, net: NetId, net_name: &str, spef_net: &SpefN
     for &(i, cap) in &cap_nodes {
         node_cap[i] += cap;
     }
-    let pin_names: Vec<String> = pins.iter().map(|&p| spef_pin_node_name(design, p)).collect();
+    let pin_names: Vec<String> = pins
+        .iter()
+        .map(|&p| spef_pin_node_name(design, p))
+        .collect();
     let mut pin_point = Vec::with_capacity(pins.len());
     for name in &pin_names {
         let Some(&i) = index.get(name) else {
@@ -329,7 +361,13 @@ fn spef_net_tree(design: &DesignDb, net: NetId, net_name: &str, spef_net: &SpefN
         pin_node.push(node_of[p]);
     }
     let total = wire_cap.iter().sum();
-    Ok(NetRcTree { parent, edge_r_kohm: edge_r, wire_cap_pf: wire_cap, pin_node, total_wire_cap_pf: total })
+    Ok(NetRcTree {
+        parent,
+        edge_r_kohm: edge_r,
+        wire_cap_pf: wire_cap,
+        pin_node,
+        total_wire_cap_pf: total,
+    })
 }
 
 /// Escapes the characters OpenSTA's SPEF parser treats specially: `$` (an
@@ -370,21 +408,31 @@ pub fn write_spef(design: &DesignDb, lib: &LibDb, parasitics: &NetParasitics) ->
     out.push_str("*SPEF \"ieee 1481-1999\"\n");
     out.push_str(&format!("*DESIGN \"{}\"\n", design.design_name));
     out.push_str("*DATE \"00:00:00 Thu 01 01, 1970\"\n");
-    out.push_str(concat!("*VENDOR \"grus-eda\"\n*PROGRAM \"grus-eda\"\n*VERSION \"", env!("CARGO_PKG_VERSION"), "\"\n"));
+    out.push_str(concat!(
+        "*VENDOR \"grus-eda\"\n*PROGRAM \"grus-eda\"\n*VERSION \"",
+        env!("CARGO_PKG_VERSION"),
+        "\"\n"
+    ));
     out.push_str("*DESIGN_FLOW \"NAME_SCOPE LOCAL\" \"PIN_CAP NONE\"\n");
     out.push_str("*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER []\n");
     out.push_str("*T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 KOHM\n*L_UNIT 1 HENRY\n\n");
     out.push_str("*PORTS\n");
     for &pin in &design.io_pins {
         let p = pin.0 as usize;
-        let name = escape_spef_name(&unescape_spef_name(design.strings.resolve(design.pin_names[p])));
+        let name = escape_spef_name(&unescape_spef_name(
+            design.strings.resolve(design.pin_names[p]),
+        ));
         out.push_str(&format!("{name} {}\n", spef_pin_dir(design.pin_dirs[p])));
     }
     out.push('\n');
     for n in 0..design.num_nets() {
         let net = NetId(n as u32);
-        let Some(tree) = parasitics.net(net) else { continue };
-        let net_name = escape_spef_name(&unescape_spef_name(design.strings.resolve(design.net_names[n])));
+        let Some(tree) = parasitics.net(net) else {
+            continue;
+        };
+        let net_name = escape_spef_name(&unescape_spef_name(
+            design.strings.resolve(design.net_names[n]),
+        ));
         let pins = design.net_pins(net);
 
         // Tree node -> SPEF node name. A node carrying several pins keeps the
@@ -401,7 +449,10 @@ pub fn write_spef(design: &DesignDb, lib: &LibDb, parasitics: &NetParasitics) ->
             if let Some(&primary) = pins_at_node.first() {
                 node_names.push(escape_spef_name(&spef_pin_node_name(design, pins[primary])));
                 for &extra in &pins_at_node[1..] {
-                    stubs.push((escape_spef_name(&spef_pin_node_name(design, pins[extra])), v));
+                    stubs.push((
+                        escape_spef_name(&spef_pin_node_name(design, pins[extra])),
+                        v,
+                    ));
                 }
             } else {
                 node_names.push(format!("{net_name}:{v}"));
@@ -412,14 +463,21 @@ pub fn write_spef(design: &DesignDb, lib: &LibDb, parasitics: &NetParasitics) ->
         out.push_str("*CONN\n");
         for &pin in pins {
             let p = pin.0 as usize;
-            let pin_name = escape_spef_name(&unescape_spef_name(design.strings.resolve(design.pin_names[p])));
+            let pin_name = escape_spef_name(&unescape_spef_name(
+                design.strings.resolve(design.pin_names[p]),
+            ));
             let dir = spef_pin_dir(design.pin_dirs[p]);
             match design.pin_cells[p] {
                 Some(cell) => {
-                    let cell_name = escape_spef_name(&unescape_spef_name(design.strings.resolve(design.cell_names[cell.0 as usize])));
-                    let cell_type = design
-                        .cell_lib_ids[cell.0 as usize]
-                        .map(|lcid| escape_spef_name(&unescape_spef_name(lib.strings.resolve(lib.cells[lcid.0 as usize].name))))
+                    let cell_name = escape_spef_name(&unescape_spef_name(
+                        design.strings.resolve(design.cell_names[cell.0 as usize]),
+                    ));
+                    let cell_type = design.cell_lib_ids[cell.0 as usize]
+                        .map(|lcid| {
+                            escape_spef_name(&unescape_spef_name(
+                                lib.strings.resolve(lib.cells[lcid.0 as usize].name),
+                            ))
+                        })
                         .unwrap_or_else(|| cell_name.clone());
                     out.push_str(&format!("*I {cell_name}:{pin_name} {dir} *D {cell_type}\n"));
                 }
@@ -442,17 +500,14 @@ pub fn write_spef(design: &DesignDb, lib: &LibDb, parasitics: &NetParasitics) ->
             serial += 1;
             out.push_str(&format!(
                 "{serial} {} {} {}\n",
-                node_names[tree.parent[v] as usize],
-                node_names[v],
-                tree.edge_r_kohm[v]
+                node_names[tree.parent[v] as usize], node_names[v], tree.edge_r_kohm[v]
             ));
         }
         for (name, primary) in &stubs {
             serial += 1;
             out.push_str(&format!(
                 "{serial} {name} {} {}\n",
-                node_names[*primary],
-                SPEF_STUB_RES_KOHM
+                node_names[*primary], SPEF_STUB_RES_KOHM
             ));
         }
         out.push_str("*END\n\n");
@@ -463,10 +518,10 @@ pub fn write_spef(design: &DesignDb, lib: &LibDb, parasitics: &NetParasitics) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
     use crate::congestion::rsmt::{EXACT_MAX_DEGREE, build_precise_rsmt_points};
     use crate::interner::StringInterner;
     use crate::readers::{load_liberty, load_spef, load_tech_db, parse_def, parse_spef};
+    use crate::test_support::{design_dir, sky130_hd};
     use std::collections::BTreeMap;
 
     struct Lengths {
@@ -481,7 +536,8 @@ mod tests {
     fn compare_lengths(design_name: &str) -> Lengths {
         let lib_dir = sky130_hd();
         let dir = design_dir(design_name);
-        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
         let mut interner = StringInterner::new();
         let tech = load_tech_db(
             &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
@@ -489,9 +545,16 @@ mod tests {
             &mut interner,
         )
         .expect("LEF");
-        let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+        let design = parse_def(
+            &dir.join(format!("{design_name}.placed.def")),
+            &tech,
+            Some(&lib),
+        )
+        .expect("DEF");
         let spef = load_spef(&dir.join(format!("{design_name}.routed.spef"))).expect("SPEF");
-        let c0 = WireRc::from_layer(&tech, "met2").expect("met2 RC").c_pf_per_um as f64;
+        let c0 = WireRc::from_layer(&tech, "met2")
+            .expect("met2 RC")
+            .c_pf_per_um as f64;
         let dbu = tech.dbu_per_micron as f64;
 
         let mut table: BTreeMap<usize, (usize, usize, f64)> = BTreeMap::new();
@@ -503,7 +566,9 @@ mod tests {
                 continue;
             }
             let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
-            let Some(spef_net) = spef.nets.get(&name) else { continue };
+            let Some(spef_net) = spef.nets.get(&name) else {
+                continue;
+            };
             let pts: Vec<Pt> = pins.iter().map(|&p| design.pin_pos_dbu(p, &tech)).collect();
             let ours: f64 = build_precise_rsmt_points(&pts)
                 .iter()
@@ -521,13 +586,23 @@ mod tests {
                 entry.2 = entry.2.max(ours - reference);
                 if pins.len() <= EXACT_MAX_DEGREE {
                     if ours > reference {
-                        longer.push(format!("{name} (degree {}): ours {ours:.4} um, SPEF {reference:.4} um", pins.len()));
+                        longer.push(format!(
+                            "{name} (degree {}): ours {ours:.4} um, SPEF {reference:.4} um",
+                            pins.len()
+                        ));
                     }
-                    mismatches.push(format!("{name} (degree {}): ours {ours:.4} um, SPEF {reference:.4} um", pins.len()));
+                    mismatches.push(format!(
+                        "{name} (degree {}): ours {ours:.4} um, SPEF {reference:.4} um",
+                        pins.len()
+                    ));
                 }
             }
         }
-        Lengths { table, mismatches, longer }
+        Lengths {
+            table,
+            mismatches,
+            longer,
+        }
     }
 
     fn print_table(design_name: &str, table: &BTreeMap<usize, (usize, usize, f64)>) {
@@ -542,12 +617,22 @@ mod tests {
     fn check_known_properties(design_name: &str) {
         let lengths = compare_lengths(design_name);
         print_table(design_name, &lengths.table);
-        println!("{} nets of up to {EXACT_MAX_DEGREE} points differ from OpenROAD's length", lengths.mismatches.len());
+        println!(
+            "{} nets of up to {EXACT_MAX_DEGREE} points differ from OpenROAD's length",
+            lengths.mismatches.len()
+        );
         for degree in [2, 3] {
             let (nets, matching, _) = lengths.table[&degree];
-            assert_eq!(nets, matching, "{design_name}: {degree}-point nets must match OpenROAD exactly");
+            assert_eq!(
+                nets, matching,
+                "{design_name}: {degree}-point nets must match OpenROAD exactly"
+            );
         }
-        assert!(lengths.longer.is_empty(), "{design_name}: tree longer than OpenROAD's: {:?}", lengths.longer);
+        assert!(
+            lengths.longer.is_empty(),
+            "{design_name}: tree longer than OpenROAD's: {:?}",
+            lengths.longer
+        );
     }
 
     /// Edge-length multiset of our PD tree vs OpenROAD's placement-estimate
@@ -558,7 +643,8 @@ mod tests {
         for design_name in ["gcd", "picorv32", "aes", "ibex", "jpeg"] {
             let lib_dir = sky130_hd();
             let dir = design_dir(design_name);
-            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"))
+                .expect("Liberty");
             let mut interner = StringInterner::new();
             let tech = load_tech_db(
                 &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
@@ -566,7 +652,12 @@ mod tests {
                 &mut interner,
             )
             .expect("LEF");
-            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let design = parse_def(
+                &dir.join(format!("{design_name}.placed.def")),
+                &tech,
+                Some(&lib),
+            )
+            .expect("DEF");
             let spef = load_spef(&dir.join(format!("{design_name}.routed.spef"))).expect("SPEF");
             let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
             let dbu = tech.dbu_per_micron as f64;
@@ -579,7 +670,9 @@ mod tests {
                     continue;
                 }
                 let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
-                let Some(spef_net) = spef.nets.get(&name) else { continue };
+                let Some(spef_net) = spef.nets.get(&name) else {
+                    continue;
+                };
                 nets += 1;
                 let pts: Vec<Pt> = pins.iter().map(|&p| design.pin_pos_dbu(p, &tech)).collect();
                 let mut ours: Vec<f64> = crate::congestion::pdr::build_pd_points(&pts)
@@ -624,14 +717,18 @@ mod tests {
                 // merge of zero-edge-adjacent nodes is electrically exact.
                 // Diagnostic only: timing parity is asserted by the
                 // placement-RC OpenSTA tests, not here.
-                if let Some(tree) = build_net_tree(&design, &tech, rc, net, &crate::congestion::pdr::build_pd_points) {
-                    let mut ours_caps: Vec<f64> = tree.wire_cap_pf.iter().map(|&c| c as f64).collect();
+                if let Some(tree) = build_net_tree(
+                    &design,
+                    &tech,
+                    rc,
+                    net,
+                    &crate::congestion::pdr::build_pd_points,
+                ) {
+                    let mut ours_caps: Vec<f64> =
+                        tree.wire_cap_pf.iter().map(|&c| c as f64).collect();
                     ours_caps.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let mut ref_caps: Vec<f64> = spef_net
-                        .caps
-                        .iter()
-                        .map(|(_, c)| *c as f64)
-                        .collect();
+                    let mut ref_caps: Vec<f64> =
+                        spef_net.caps.iter().map(|(_, c)| *c as f64).collect();
                     ref_caps.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     let caps_same = ours_caps.len() == ref_caps.len()
                         && ours_caps
@@ -651,7 +748,9 @@ mod tests {
                     }
                 }
             }
-            println!("{design_name}: {nets} nets, {mismatched} edge-multiset mismatches, {cap_mismatches} cap-multiset mismatches");
+            println!(
+                "{design_name}: {nets} nets, {mismatched} edge-multiset mismatches, {cap_mismatches} cap-multiset mismatches"
+            );
             for e in examples {
                 println!("  {e}");
             }
@@ -693,7 +792,8 @@ mod tests {
         ] {
             let lib_dir = sky130_hd();
             let dir = design_dir(design_name);
-            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"))
+                .expect("Liberty");
             let mut interner = StringInterner::new();
             let tech = load_tech_db(
                 &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
@@ -701,7 +801,12 @@ mod tests {
                 &mut interner,
             )
             .expect("LEF");
-            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let design = parse_def(
+                &dir.join(format!("{design_name}.placed.def")),
+                &tech,
+                Some(&lib),
+            )
+            .expect("DEF");
             let spef = load_spef(&dir.join(format!("{design_name}.routed.spef"))).expect("SPEF");
             let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
             let (mut nets, mut worst_wire, mut worst_loaded) = (0usize, 0.0f64, 0.0f64);
@@ -715,15 +820,31 @@ mod tests {
                 let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
                 // SPEF legitimately omits some nets (e.g. the ideal-clock port
                 // net); the asserted count below pins the covered set.
-                let Some(spef_net) = spef.nets.get(&name) else { continue };
+                let Some(spef_net) = spef.nets.get(&name) else {
+                    continue;
+                };
                 nets += 1;
-                let pd = build_net_tree(&design, &tech, rc, net, &crate::congestion::pdr::build_pd_points)
-                    .expect("PD tree");
+                let pd = build_net_tree(
+                    &design,
+                    &tech,
+                    rc,
+                    net,
+                    &crate::congestion::pdr::build_pd_points,
+                )
+                .expect("PD tree");
                 let sf = spef_net_tree(&design, net, &name, spef_net).expect("SPEF tree");
                 for caps in [vec![0.0f32; pins.len()], vec![1.0f32; pins.len()]] {
                     let (pd_d, sf_d) = (pd.elmore_ns(&caps), sf.elmore_ns(&caps));
-                    assert_eq!(pd_d.len(), pins.len(), "{design_name}/{name}: PD Elmore pin count");
-                    assert_eq!(sf_d.len(), pins.len(), "{design_name}/{name}: SPEF Elmore pin count");
+                    assert_eq!(
+                        pd_d.len(),
+                        pins.len(),
+                        "{design_name}/{name}: PD Elmore pin count"
+                    );
+                    assert_eq!(
+                        sf_d.len(),
+                        pins.len(),
+                        "{design_name}/{name}: SPEF Elmore pin count"
+                    );
                     for (&a, &b) in pd_d.iter().zip(sf_d.iter()) {
                         let d = (a as f64 - b as f64).abs();
                         if caps[0] == 0.0 && d > worst_wire {
@@ -746,8 +867,14 @@ mod tests {
             // where the uniform load lands). Bounds: wire 1e-5 (~3x headroom),
             // loaded 5e-3 = the strict timing floor — per-pin Elmore agrees
             // within it even under a uniform load.
-            assert!(worst_wire <= 1e-5, "{design_name}: PD and SPEF wire parasitics diverge by {worst_wire} ns");
-            assert!(worst_loaded <= 5e-3, "{design_name}: PD and SPEF loaded parasitics diverge by {worst_loaded} ns");
+            assert!(
+                worst_wire <= 1e-5,
+                "{design_name}: PD and SPEF wire parasitics diverge by {worst_wire} ns"
+            );
+            assert!(
+                worst_loaded <= 5e-3,
+                "{design_name}: PD and SPEF loaded parasitics diverge by {worst_loaded} ns"
+            );
         }
     }
 
@@ -758,7 +885,8 @@ mod tests {
         for design_name in ["gcd", "picorv32", "aes", "ibex", "jpeg"] {
             let lib_dir = sky130_hd();
             let dir = design_dir(design_name);
-            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"))
+                .expect("Liberty");
             let mut interner = StringInterner::new();
             let tech = load_tech_db(
                 &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
@@ -766,9 +894,16 @@ mod tests {
                 &mut interner,
             )
             .expect("LEF");
-            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let design = parse_def(
+                &dir.join(format!("{design_name}.placed.def")),
+                &tech,
+                Some(&lib),
+            )
+            .expect("DEF");
             let spef = load_spef(&dir.join(format!("{design_name}.routed.spef"))).expect("SPEF");
-            let c0 = WireRc::from_layer(&tech, "met2").expect("met2 RC").c_pf_per_um as f64;
+            let c0 = WireRc::from_layer(&tech, "met2")
+                .expect("met2 RC")
+                .c_pf_per_um as f64;
             let dbu = tech.dbu_per_micron as f64;
             let (mut nets, mut match_n, mut worst) = (0usize, 0usize, 0.0f64);
             let mut worst_net = String::new();
@@ -779,7 +914,9 @@ mod tests {
                     continue;
                 }
                 let name = unescape_spef_name(design.strings.resolve(design.net_names[n]));
-                let Some(spef_net) = spef.nets.get(&name) else { continue };
+                let Some(spef_net) = spef.nets.get(&name) else {
+                    continue;
+                };
                 let pts: Vec<Pt> = pins.iter().map(|&p| design.pin_pos_dbu(p, &tech)).collect();
                 let ours: f64 = crate::congestion::pdr::build_pd_points(&pts)
                     .iter()
@@ -795,11 +932,17 @@ mod tests {
                 }
                 if diff > worst {
                     worst = diff;
-                    worst_net = format!("{name} deg{} ours {ours:.2} ref {reference:.2}", pins.len());
+                    worst_net =
+                        format!("{name} deg{} ours {ours:.2} ref {reference:.2}", pins.len());
                 }
             }
-            println!("{design_name}: {nets} nets, {match_n} length-match, worst |diff| {worst:.3} um ({worst_net})");
-            assert_eq!(match_n, nets, "{design_name}: every PD tree length must match OpenROAD's SPEF");
+            println!(
+                "{design_name}: {nets} nets, {match_n} length-match, worst |diff| {worst:.3} um ({worst_net})"
+            );
+            assert_eq!(
+                match_n, nets,
+                "{design_name}: every PD tree length must match OpenROAD's SPEF"
+            );
         }
     }
 
@@ -810,7 +953,8 @@ mod tests {
         for design_name in ["gcd", "picorv32", "aes", "ibex", "jpeg"] {
             let lib_dir = sky130_hd();
             let dir = design_dir(design_name);
-            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"))
+                .expect("Liberty");
             let mut interner = StringInterner::new();
             let tech = load_tech_db(
                 &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
@@ -818,7 +962,12 @@ mod tests {
                 &mut interner,
             )
             .expect("LEF");
-            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let design = parse_def(
+                &dir.join(format!("{design_name}.placed.def")),
+                &tech,
+                Some(&lib),
+            )
+            .expect("DEF");
             let (mut nets, mut failed) = (0usize, 0usize);
             for n in 0..design.num_nets() {
                 let net = NetId(n as u32);
@@ -835,8 +984,13 @@ mod tests {
                     failed += 1;
                 }
             }
-            println!("{design_name}: {nets} nets, {failed} PD trees failed checkTree (FLUTE fallback in OpenROAD)");
-            assert_eq!(failed, 0, "{design_name}: PD tree failed checkTree — OpenROAD would use FLUTE here");
+            println!(
+                "{design_name}: {nets} nets, {failed} PD trees failed checkTree (FLUTE fallback in OpenROAD)"
+            );
+            assert_eq!(
+                failed, 0,
+                "{design_name}: PD tree failed checkTree — OpenROAD would use FLUTE here"
+            );
         }
     }
 
@@ -858,7 +1012,8 @@ mod tests {
         for design_name in ["gcd", "aes"] {
             let lib_dir = sky130_hd();
             let dir = design_dir(design_name);
-            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"))
+                .expect("Liberty");
             let mut interner = StringInterner::new();
             let tech = load_tech_db(
                 &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
@@ -866,7 +1021,12 @@ mod tests {
                 &mut interner,
             )
             .expect("LEF");
-            let design = parse_def(&dir.join(format!("{design_name}.placed.def")), &tech, Some(&lib)).expect("DEF");
+            let design = parse_def(
+                &dir.join(format!("{design_name}.placed.def")),
+                &tech,
+                Some(&lib),
+            )
+            .expect("DEF");
             let rc = WireRc::from_layer(&tech, "met2").expect("met2 RC");
             let parasitics = estimate_placement_parasitics(&design, &tech, rc);
             let text = write_spef(&design, &lib, &parasitics).expect("write_spef");
@@ -895,7 +1055,10 @@ mod tests {
                 }
             }
             println!("{design_name}: {nets} nets round-tripped, worst Elmore diff {worst:.3e} ns");
-            assert!(worst < 1e-9, "{design_name}: SPEF round-trip changed Elmore delays by {worst} ns");
+            assert!(
+                worst < 1e-9,
+                "{design_name}: SPEF round-trip changed Elmore delays by {worst} ns"
+            );
         }
     }
 
@@ -905,7 +1068,8 @@ mod tests {
     fn test_write_spef_round_trip_sta() {
         let lib_dir = sky130_hd();
         let dir = design_dir("gcd");
-        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
         let mut interner = StringInterner::new();
         let tech = load_tech_db(
             &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),

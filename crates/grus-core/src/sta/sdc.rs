@@ -4,18 +4,25 @@ use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq)]
 enum PortSel {
-    AllInputs { no_clocks: bool },
+    AllInputs {
+        no_clocks: bool,
+    },
     AllOutputs,
     Ports(Vec<String>),
     /// `remove_from_collection` on a predicate selection: the base minus `excluded` names.
-    Except { base: Box<PortSel>, excluded: Vec<String> },
+    Except {
+        base: Box<PortSel>,
+        excluded: Vec<String>,
+    },
 }
 
 impl PortSel {
     /// `clock_port` is needed because `-no_clocks` excludes the clock source, which the selector cannot see.
     fn matches(&self, port: &str, is_input: bool, clock_port: Option<&str>) -> bool {
         match self {
-            PortSel::AllInputs { no_clocks } => is_input && !(*no_clocks && clock_port == Some(port)),
+            PortSel::AllInputs { no_clocks } => {
+                is_input && !(*no_clocks && clock_port == Some(port))
+            }
             PortSel::AllOutputs => !is_input,
             PortSel::Ports(names) => names.iter().any(|n| n == port),
             PortSel::Except { base, excluded } => {
@@ -40,7 +47,10 @@ impl PortSel {
                 excluded.extend(removed.iter().cloned());
                 PortSel::Except { base, excluded }
             }
-            other => PortSel::Except { base: Box::new(other), excluded: removed.to_vec() },
+            other => PortSel::Except {
+                base: Box::new(other),
+                excluded: removed.to_vec(),
+            },
         }
     }
 }
@@ -99,7 +109,9 @@ pub struct DerateCorner {
 
 impl Default for DerateCorner {
     fn default() -> Self {
-        Self { factors: [[[1.0; 2]; 2]; 3] }
+        Self {
+            factors: [[[1.0; 2]; 2]; 3],
+        }
     }
 }
 
@@ -154,14 +166,26 @@ pub struct Sdc {
 /// `1.0 -add_delay` then `0.4 -add_delay` gives `(0.4, 1.0)`, and a later plain rule resets
 /// the fold). `-min`/`-max` rules touch one corner only. `None` when no rule matches, so
 /// callers keep their "no constraint" defaults.
-fn delay_at(rules: &[DelayRule], port: &str, is_input: bool, clock_port: Option<&str>) -> Option<(f32, f32, ClockRef)> {
+fn delay_at(
+    rules: &[DelayRule],
+    port: &str,
+    is_input: bool,
+    clock_port: Option<&str>,
+) -> Option<(f32, f32, ClockRef)> {
     let (mut min_v, mut max_v, mut min_set, mut max_set, mut clock, mut matched) =
         (0.0, 0.0, false, false, ClockRef::Design, false);
-    for r in rules.iter().filter(|r| r.sel.matches(port, is_input, clock_port)) {
+    for r in rules
+        .iter()
+        .filter(|r| r.sel.matches(port, is_input, clock_port))
+    {
         matched = true;
         clock = r.clock;
         let apply = |cur: &mut f32, set: &mut bool, widen: fn(f32, f32) -> f32| {
-            *cur = if r.add && *set { widen(*cur, r.value_ns) } else { r.value_ns };
+            *cur = if r.add && *set {
+                widen(*cur, r.value_ns)
+            } else {
+                r.value_ns
+            };
             *set = true;
         };
         match r.sense {
@@ -176,8 +200,17 @@ fn delay_at(rules: &[DelayRule], port: &str, is_input: bool, clock_port: Option<
     matched.then_some((min_v, max_v, clock))
 }
 
-fn last_value(rules: &[(PortSel, f32)], port: &str, is_input: bool, clock_port: Option<&str>) -> Option<f32> {
-    rules.iter().rev().find(|(sel, _)| sel.matches(port, is_input, clock_port)).map(|&(_, v)| v)
+fn last_value(
+    rules: &[(PortSel, f32)],
+    port: &str,
+    is_input: bool,
+    clock_port: Option<&str>,
+) -> Option<f32> {
+    rules
+        .iter()
+        .rev()
+        .find(|(sel, _)| sel.matches(port, is_input, clock_port))
+        .map(|&(_, v)| v)
 }
 
 impl Sdc {
@@ -203,32 +236,46 @@ impl Sdc {
     /// `kind` is a `DERATE_*` constant, `clock_path` marks delays on the clock network,
     /// and `transition` is RISE/FALL.
     pub fn derate(&self, late: bool, kind: usize, clock_path: bool, transition: usize) -> f32 {
-        let corner = if late { &self.derate_late } else { &self.derate_early };
+        let corner = if late {
+            &self.derate_late
+        } else {
+            &self.derate_early
+        };
         corner.factors[kind][usize::from(!clock_path)][transition]
     }
 
     /// `(min, max)` input delay in ns; both equal the plain value when no `-min`/`-max` was given.
     pub fn input_delay_ns(&self, port: &str) -> (f32, f32) {
-        delay_at(&self.input_delays, port, true, self.clock_port.as_deref()).map_or((0.0, 0.0), |(min_v, max_v, _)| (min_v, max_v))
+        delay_at(&self.input_delays, port, true, self.clock_port.as_deref())
+            .map_or((0.0, 0.0), |(min_v, max_v, _)| (min_v, max_v))
     }
 
     /// Latency of the clock that the port's input delay is referenced to.
     pub fn input_clock_latency_ns(&self, port: &str) -> f32 {
-        delay_at(&self.input_delays, port, true, self.clock_port.as_deref()).map_or(0.0, |(_, _, clock)| self.latency_ns(clock))
+        delay_at(&self.input_delays, port, true, self.clock_port.as_deref())
+            .map_or(0.0, |(_, _, clock)| self.latency_ns(clock))
     }
 
     /// `(min, max)` output delay in ns.
     pub fn output_delay_ns(&self, port: &str) -> (f32, f32) {
-        delay_at(&self.output_delays, port, false, self.clock_port.as_deref()).map_or((0.0, 0.0), |(min_v, max_v, _)| (min_v, max_v))
+        delay_at(&self.output_delays, port, false, self.clock_port.as_deref())
+            .map_or((0.0, 0.0), |(min_v, max_v, _)| (min_v, max_v))
     }
 
     /// Latency of the clock that the port's output delay is referenced to.
     pub fn output_clock_latency_ns(&self, port: &str) -> f32 {
-        delay_at(&self.output_delays, port, false, self.clock_port.as_deref()).map_or(0.0, |(_, _, clock)| self.latency_ns(clock))
+        delay_at(&self.output_delays, port, false, self.clock_port.as_deref())
+            .map_or(0.0, |(_, _, clock)| self.latency_ns(clock))
     }
 
     pub fn input_transition_ns(&self, port: &str) -> f32 {
-        last_value(&self.input_transitions, port, true, self.clock_port.as_deref()).unwrap_or(0.0)
+        last_value(
+            &self.input_transitions,
+            port,
+            true,
+            self.clock_port.as_deref(),
+        )
+        .unwrap_or(0.0)
     }
 
     pub fn output_load_pf(&self, port: &str) -> f32 {
@@ -246,7 +293,8 @@ impl Sdc {
 }
 
 pub fn load_sdc(path: &Path) -> Result<Sdc> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("Failed to read SDC {:?}", path))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read SDC {:?}", path))?;
     parse_sdc(&text)
 }
 
@@ -281,7 +329,13 @@ struct Interp {
 
 impl Interp {
     fn new(text: &str) -> Self {
-        Interp { src: text.chars().collect(), pos: 0, vars: HashMap::new(), sdc: Sdc::default(), virtual_clocks: Vec::new() }
+        Interp {
+            src: text.chars().collect(),
+            pos: 0,
+            vars: HashMap::new(),
+            sdc: Sdc::default(),
+            virtual_clocks: Vec::new(),
+        }
     }
 
     fn peek(&self) -> Option<char> {
@@ -459,7 +513,8 @@ impl Interp {
             _ => return self.error("a command name must be a plain word"),
         };
         let line = self.line();
-        self.command(name, args).with_context(|| format!("SDC line {line}: `{name}`"))
+        self.command(name, args)
+            .with_context(|| format!("SDC line {line}: `{name}`"))
     }
 
     fn command(&mut self, name: &str, args: &[Value]) -> Result<Value> {
@@ -471,7 +526,9 @@ impl Interp {
             "get_clocks" => Ok(Value::Clocks(plain_names(args)?)),
             "all_inputs" => match args {
                 [] => Ok(Value::Ports(PortSel::AllInputs { no_clocks: false })),
-                [Value::Str(flag)] if flag == "-no_clocks" => Ok(Value::Ports(PortSel::AllInputs { no_clocks: true })),
+                [Value::Str(flag)] if flag == "-no_clocks" => {
+                    Ok(Value::Ports(PortSel::AllInputs { no_clocks: true }))
+                }
                 _ => bail!("all_inputs takes at most -no_clocks"),
             },
             "all_outputs" => match args {
@@ -519,12 +576,24 @@ impl Interp {
                 Ok(empty())
             }
             "set_input_transition" => {
-                let rule = value_and_ports(args, &PORT_VALUE_FLAGS, &IGNORED_VALUE_FLAGS, &[], &mut self.sdc.ignored_options)?;
+                let rule = value_and_ports(
+                    args,
+                    &PORT_VALUE_FLAGS,
+                    &IGNORED_VALUE_FLAGS,
+                    &[],
+                    &mut self.sdc.ignored_options,
+                )?;
                 self.sdc.input_transitions.push(rule);
                 Ok(empty())
             }
             "set_load" => {
-                let rule = value_and_ports(args, &PORT_VALUE_FLAGS, &IGNORED_VALUE_FLAGS, &["-pin_load"], &mut self.sdc.ignored_options)?;
+                let rule = value_and_ports(
+                    args,
+                    &PORT_VALUE_FLAGS,
+                    &IGNORED_VALUE_FLAGS,
+                    &["-pin_load"],
+                    &mut self.sdc.ignored_options,
+                )?;
                 self.sdc.loads.push(rule);
                 Ok(empty())
             }
@@ -533,7 +602,11 @@ impl Interp {
             // `ignored_commands` so the skip summary still shows them.
             "set_max_transition" | "set_max_capacitance" | "set_max_fanout" => {
                 self.design_rule(args)?;
-                *self.sdc.ignored_commands.entry(name.to_string()).or_default() += 1;
+                *self
+                    .sdc
+                    .ignored_commands
+                    .entry(name.to_string())
+                    .or_default() += 1;
                 Ok(empty())
             }
             "set_propagated_clock" | "unset_propagated_clock" => {
@@ -557,7 +630,15 @@ impl Interp {
     fn create_clock(&mut self, args: &[Value]) -> Result<()> {
         let name = flag_value(args, "-name")?.map(str::to_string);
         let period_ns = parse_f32(flag_value(args, "-period")?.context("missing -period")?)?;
-        match positionals(args, &CLOCK_VALUE_FLAGS, &[], &[], &mut self.sdc.ignored_options)?.as_slice() {
+        match positionals(
+            args,
+            &CLOCK_VALUE_FLAGS,
+            &[],
+            &[],
+            &mut self.sdc.ignored_options,
+        )?
+        .as_slice()
+        {
             [] => {
                 let Some(name) = name else {
                     bail!("a virtual clock needs -name");
@@ -591,7 +672,11 @@ impl Interp {
         for arg in args {
             match arg {
                 Value::Str(s) if s.as_str() == "-setup" || s.as_str() == "-hold" => {
-                    let slot = if s.as_str() == "-setup" { &mut setup } else { &mut hold };
+                    let slot = if s.as_str() == "-setup" {
+                        &mut setup
+                    } else {
+                        &mut hold
+                    };
                     if *slot {
                         bail!("duplicate {s}");
                     }
@@ -662,7 +747,10 @@ impl Interp {
             _ => bail!("set_clock_latency takes a value and optional clock names"),
         };
         let latency = parse_f32(value)?;
-        let clock = clock.map(|n| self.resolve_clock(n)).transpose()?.unwrap_or(ClockRef::Design);
+        let clock = clock
+            .map(|n| self.resolve_clock(n))
+            .transpose()?
+            .unwrap_or(ClockRef::Design);
         match clock {
             ClockRef::Design => {
                 if source {
@@ -691,7 +779,9 @@ impl Interp {
         let mut names = Vec::new();
         for arg in args {
             match arg {
-                Value::Str(s) if s.starts_with('-') => bail!("{command} takes clock objects, not `{s}`"),
+                Value::Str(s) if s.starts_with('-') => {
+                    bail!("{command} takes clock objects, not `{s}`")
+                }
                 Value::Str(s) => names.extend(s.split_whitespace().map(str::to_string)),
                 Value::Clocks(ns) => names.extend(ns.iter().cloned()),
                 Value::Ports(PortSel::Ports(ns)) => names.extend(ns.iter().cloned()),
@@ -742,7 +832,11 @@ impl Interp {
             match self.resolve_clock(&name)? {
                 ClockRef::Design => self.sdc.clock_transition_ns = transition,
                 ClockRef::Virtual => {
-                    *self.sdc.ignored_options.entry("set_clock_transition (virtual clock)".to_string()).or_default() += 1;
+                    *self
+                        .sdc
+                        .ignored_options
+                        .entry("set_clock_transition (virtual clock)".to_string())
+                        .or_default() += 1;
                 }
             }
         }
@@ -766,7 +860,9 @@ impl Interp {
             };
             match flag.as_str() {
                 "-time" if unit != "ns" => bail!("set_units -time {unit}: the model reads ns"),
-                "-capacitance" if unit != "pF" => bail!("set_units -capacitance {unit}: the model reads pF"),
+                "-capacitance" if unit != "pF" => {
+                    bail!("set_units -capacitance {unit}: the model reads pF")
+                }
                 "-time" | "-capacitance" => {}
                 f if IGNORED.contains(&f) => {}
                 other => bail!("unsupported option `{other}`"),
@@ -851,7 +947,11 @@ impl Interp {
             if (late_corner && !late) || (!late_corner && !early) {
                 continue;
             }
-            let corner = if late_corner { &mut self.sdc.derate_late } else { &mut self.sdc.derate_early };
+            let corner = if late_corner {
+                &mut self.sdc.derate_late
+            } else {
+                &mut self.sdc.derate_early
+            };
             for (kind, &sel) in selected.iter().enumerate() {
                 if !sel {
                     continue;
@@ -880,19 +980,31 @@ impl Interp {
     /// [-input_transition_fall f] <sel>`. Unlike the delay commands, `-lib_cell`/`-pin` are the
     /// driver's identity here, not restrictions to drop.
     fn set_driving_cell(&mut self, args: &[Value]) -> Result<()> {
-        const FLAGS: [&str; 4] = ["-lib_cell", "-pin", "-input_transition_rise", "-input_transition_fall"];
+        const FLAGS: [&str; 4] = [
+            "-lib_cell",
+            "-pin",
+            "-input_transition_rise",
+            "-input_transition_fall",
+        ];
         let pos = positionals(args, &FLAGS, &[], &[], &mut self.sdc.ignored_options)?;
         let [Value::Ports(sel)] = pos.as_slice() else {
             bail!("set_driving_cell takes a port selector");
         };
         let in_trans = |flag: &str| -> Result<f32> {
-            flag_value(args, flag)?.map(parse_f32).transpose().map(|v| v.unwrap_or(0.0))
+            flag_value(args, flag)?
+                .map(parse_f32)
+                .transpose()
+                .map(|v| v.unwrap_or(0.0))
         };
         self.sdc.driving_cells.push((
             sel.clone(),
             DrivingCell {
-                cell: flag_value(args, "-lib_cell")?.context("set_driving_cell needs -lib_cell")?.to_string(),
-                pin: flag_value(args, "-pin")?.context("set_driving_cell needs -pin")?.to_string(),
+                cell: flag_value(args, "-lib_cell")?
+                    .context("set_driving_cell needs -lib_cell")?
+                    .to_string(),
+                pin: flag_value(args, "-pin")?
+                    .context("set_driving_cell needs -pin")?
+                    .to_string(),
                 in_trans_rise: in_trans("-input_transition_rise")?,
                 in_trans_fall: in_trans("-input_transition_fall")?,
             },
@@ -945,7 +1057,9 @@ impl Interp {
         for arg in objects {
             match arg {
                 Value::Ports(PortSel::Ports(names)) => removed.extend(names.iter().cloned()),
-                Value::Ports(_) => bail!("remove_from_collection cannot subtract a predicate selection"),
+                Value::Ports(_) => {
+                    bail!("remove_from_collection cannot subtract a predicate selection")
+                }
                 Value::Clocks(names) => removed.extend(names.iter().cloned()),
                 Value::Str(text) => removed.extend(text.split_whitespace().map(str::to_string)),
             }
@@ -955,7 +1069,11 @@ impl Interp {
         match collection {
             Value::Ports(sel) => Ok(Value::Ports(sel.clone().without(&removed))),
             Value::Clocks(names) => Ok(Value::Clocks(
-                names.iter().filter(|n| !removed.contains(*n)).cloned().collect(),
+                names
+                    .iter()
+                    .filter(|n| !removed.contains(*n))
+                    .cloned()
+                    .collect(),
             )),
             Value::Str(text) => Ok(Value::Str(
                 text.split_whitespace()
@@ -974,7 +1092,13 @@ impl Interp {
             (false, false) => DelaySense::Both,
         };
         let add = has_flag(args, "-add_delay");
-        let (sel, value_ns) = value_and_ports(args, &DELAY_VALUE_FLAGS, &IGNORED_VALUE_FLAGS, &DELAY_BOOL_FLAGS, &mut self.sdc.ignored_options)?;
+        let (sel, value_ns) = value_and_ports(
+            args,
+            &DELAY_VALUE_FLAGS,
+            &IGNORED_VALUE_FLAGS,
+            &DELAY_BOOL_FLAGS,
+            &mut self.sdc.ignored_options,
+        )?;
         let clock = match flag_arg(args, "-clock")? {
             None => ClockRef::Design,
             Some(Value::Str(name)) => self.resolve_clock(name)?,
@@ -984,13 +1108,23 @@ impl Interp {
             },
             Some(_) => bail!("-clock needs a clock name"),
         };
-        Ok(DelayRule { sel, value_ns, clock, sense, add })
+        Ok(DelayRule {
+            sel,
+            value_ns,
+            clock,
+            sense,
+            add,
+        })
     }
 
     fn resolve_clock(&self, name: &str) -> Result<ClockRef> {
         // `create_clock` without `-name` leaves the port name as the clock's handle, the same
         // fallback `all_clock_names` uses.
-        let design_name = self.sdc.clock_name.as_deref().or(self.sdc.clock_port.as_deref());
+        let design_name = self
+            .sdc
+            .clock_name
+            .as_deref()
+            .or(self.sdc.clock_port.as_deref());
         if design_name == Some(name) {
             return Ok(ClockRef::Design);
         }
@@ -1007,7 +1141,10 @@ impl Interp {
         // The analysis uses one period for the design and the virtual I/O clock.
         for (name, period_ns) in &self.virtual_clocks {
             if *period_ns != self.sdc.period_ns {
-                bail!("virtual clock `{name}` has period {period_ns}, not the design period {}", self.sdc.period_ns);
+                bail!(
+                    "virtual clock `{name}` has period {period_ns}, not the design period {}",
+                    self.sdc.period_ns
+                );
             }
         }
         Ok(self.sdc)
@@ -1046,7 +1183,8 @@ fn plain_names(args: &[Value]) -> Result<Vec<String>> {
 }
 
 fn parse_f32(text: &str) -> Result<f32> {
-    text.parse().with_context(|| format!("`{text}` is not a number"))
+    text.parse()
+        .with_context(|| format!("`{text}` is not a number"))
 }
 
 /// Value flags the parser drops without applying them; each occurrence is counted in
@@ -1074,7 +1212,10 @@ fn flag_value<'a>(args: &'a [Value], flag: &str) -> Result<Option<&'a str>> {
 
 /// The argument after `flag`, keeping its type: `-clock [get_clocks ...]` yields `Value::Clocks`.
 fn flag_arg<'a>(args: &'a [Value], flag: &str) -> Result<Option<&'a Value>> {
-    let Some(i) = args.iter().position(|a| matches!(a, Value::Str(s) if s == flag)) else {
+    let Some(i) = args
+        .iter()
+        .position(|a| matches!(a, Value::Str(s) if s == flag))
+    else {
         return Ok(None);
     };
     match args.get(i + 1) {
@@ -1091,8 +1232,9 @@ fn has_flag(args: &[Value], flag: &str) -> bool {
 
 /// `-1.5` or `-.5`: a dash followed by a decimal number. `-inf` is not one.
 fn is_negative_number(text: &str) -> bool {
-    text.strip_prefix('-')
-        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit() || c == '.') && rest.parse::<f32>().is_ok())
+    text.strip_prefix('-').is_some_and(|rest| {
+        rest.starts_with(|c: char| c.is_ascii_digit() || c == '.') && rest.parse::<f32>().is_ok()
+    })
 }
 
 /// The arguments that are neither a value flag, a boolean flag, nor the value of one. Any
@@ -1130,7 +1272,9 @@ fn positionals<'a>(
             Value::Str(s) if bool_flags.contains(&s.as_str()) => {
                 i += 1;
             }
-            Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => bail!("unsupported option `{s}`"),
+            Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => {
+                bail!("unsupported option `{s}`")
+            }
             value => {
                 out.push(value);
                 i += 1;
@@ -1147,7 +1291,9 @@ fn value_and_ports(
     bool_flags: &[&str],
     ignored: &mut BTreeMap<String, usize>,
 ) -> Result<(PortSel, f32)> {
-    let [Value::Str(value), Value::Ports(sel)] = positionals(args, value_flags, ignored_flags, bool_flags, ignored)?.as_slice() else {
+    let [Value::Str(value), Value::Ports(sel)] =
+        positionals(args, value_flags, ignored_flags, bool_flags, ignored)?.as_slice()
+    else {
         bail!("expected a numeric value and a port selector");
     };
     Ok((sel.clone(), parse_f32(value)?))
@@ -1156,7 +1302,10 @@ fn value_and_ports(
 /// Four-operator arithmetic with parentheses over decimal numbers. Values are f64; the caller
 /// narrows them. Tcl's integer division is refused rather than emulated.
 fn eval_arith(text: &str) -> Option<f64> {
-    let mut arith = Arith { src: text.as_bytes(), pos: 0 };
+    let mut arith = Arith {
+        src: text.as_bytes(),
+        pos: 0,
+    };
     let (value, _) = arith.expr()?;
     arith.skip_ws();
     (arith.pos == text.len() && value.is_finite()).then_some(value)
@@ -1285,7 +1434,11 @@ mod tests {
         assert_eq!(sdc.clock_latency_ns, 1.095);
         assert_eq!(sdc.io_clock_latency_ns, 1.095);
         assert_eq!(sdc.input_delay_ns("instr_rdata_i"), (1.6, 1.6));
-        assert_eq!(sdc.input_delay_ns("clk_i"), (0.0, 0.0), "-no_clocks must exclude the clock port");
+        assert_eq!(
+            sdc.input_delay_ns("clk_i"),
+            (0.0, 0.0),
+            "-no_clocks must exclude the clock port"
+        );
         assert_eq!(sdc.input_clock_latency_ns("instr_rdata_i"), 1.095);
         assert_eq!(sdc.output_delay_ns("instr_req_o"), (1.6, 1.6));
         assert_eq!(sdc.output_clock_latency_ns("instr_req_o"), 1.095);
@@ -1395,7 +1548,10 @@ mod tests {
             "set_input_delay -min -max 1.0 -clock core_clk [all_inputs]",
             "set_load -add_delay 0.1 [all_outputs]",
         ] {
-            assert!(parse_sdc(&format!("{GCD}{snippet}\n")).is_err(), "accepted: {snippet}");
+            assert!(
+                parse_sdc(&format!("{GCD}{snippet}\n")).is_err(),
+                "accepted: {snippet}"
+            );
         }
     }
 
@@ -1444,7 +1600,10 @@ mod tests {
             "set_max_transition 0.75 -bogus [current_design]",
             "set_max_fanout 10.0 0.5 [current_design]",
         ] {
-            assert!(parse_sdc(&format!("{GCD}{snippet}\n")).is_err(), "accepted: {snippet}");
+            assert!(
+                parse_sdc(&format!("{GCD}{snippet}\n")).is_err(),
+                "accepted: {snippet}"
+            );
         }
         // The emitted forms still parse; the propagated clock is modelled, `set_max_*` is counted.
         let sdc = parse_sdc(&format!(
@@ -1565,7 +1724,13 @@ mod tests {
             "set_timing_derate -early 0.9 [get_cells]\n",
             "set_timing_derate 0.9\n",
         ] {
-            assert!(parse_sdc(&format!("create_clock -name clk -period 2.0 [get_ports clk]\n{bad}")).is_err(), "accepted: {bad}");
+            assert!(
+                parse_sdc(&format!(
+                    "create_clock -name clk -period 2.0 [get_ports clk]\n{bad}"
+                ))
+                .is_err(),
+                "accepted: {bad}"
+            );
         }
     }
 
@@ -1590,7 +1755,13 @@ mod tests {
             "set_timing_derate -late -late 0.9\n",
             "set_timing_derate -early -late\n",
         ] {
-            assert!(parse_sdc(&format!("create_clock -name clk -period 2.0 [get_ports clk]\n{bad}")).is_err(), "accepted: {bad}");
+            assert!(
+                parse_sdc(&format!(
+                    "create_clock -name clk -period 2.0 [get_ports clk]\n{bad}"
+                ))
+                .is_err(),
+                "accepted: {bad}"
+            );
         }
     }
 
@@ -1605,7 +1776,11 @@ mod tests {
         assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0));
         assert_eq!(sdc.output_delay_ns("resp_val"), (1.0, 1.0));
         assert_eq!(sdc.output_load_pf("resp_msg[0]"), 0.05);
-        assert!(sdc.ignored_commands.is_empty(), "{:?}", sdc.ignored_commands);
+        assert!(
+            sdc.ignored_commands.is_empty(),
+            "{:?}",
+            sdc.ignored_commands
+        );
     }
 
     #[test]
@@ -1624,7 +1799,10 @@ mod tests {
             "set_units -bogus ns\n",
             "set_units ns\n",
         ] {
-            assert!(parse_sdc(&format!("{GCD}{bad}")).is_err(), "accepted: {bad}");
+            assert!(
+                parse_sdc(&format!("{GCD}{bad}")).is_err(),
+                "accepted: {bad}"
+            );
         }
     }
 
@@ -1640,9 +1818,17 @@ mod tests {
         .unwrap();
         assert_eq!(sdc.input_delay_ns("reset"), (2.0, 2.0));
         assert_eq!(sdc.input_delay_ns("req_msg[0]"), (2.0, 2.0));
-        assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0), "req_val was removed");
+        assert_eq!(
+            sdc.input_delay_ns("req_val"),
+            (1.0, 1.0),
+            "req_val was removed"
+        );
         assert_eq!(sdc.output_delay_ns("resp_val"), (3.0, 3.0));
-        assert_eq!(sdc.output_delay_ns("resp_msg[0]"), (1.0, 1.0), "resp_msg[0] was removed");
+        assert_eq!(
+            sdc.output_delay_ns("resp_msg[0]"),
+            (1.0, 1.0),
+            "resp_msg[0] was removed"
+        );
     }
 
     #[test]
@@ -1653,7 +1839,10 @@ mod tests {
             "set_input_delay 1.0 [remove_from_collection [get_ports {a}]]",
             "set_input_delay 1.0 [remove_from_collection]",
         ] {
-            assert!(parse_sdc(&format!("{GCD}{bad}\n")).is_err(), "accepted: {bad}");
+            assert!(
+                parse_sdc(&format!("{GCD}{bad}\n")).is_err(),
+                "accepted: {bad}"
+            );
         }
     }
 
@@ -1677,7 +1866,10 @@ mod tests {
 
     #[test]
     fn keeps_negative_values_and_the_known_flags() {
-        let sdc = parse_sdc(&format!("{GCD}set_input_delay -0.5 -clock core_clk [all_inputs -no_clocks]\n")).unwrap();
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_input_delay -0.5 -clock core_clk [all_inputs -no_clocks]\n"
+        ))
+        .unwrap();
         assert_eq!(sdc.input_delay_ns("req_val"), (-0.5, -0.5));
         let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty 0.1\n")).unwrap();
         assert_eq!(sdc.setup_uncertainty_ns, 0.1);
@@ -1686,13 +1878,22 @@ mod tests {
 
     #[test]
     fn clock_uncertainty_setup_hold_and_clock_list() {
-        let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty -setup 0.2 [get_clocks core_clk]\n")).unwrap();
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_clock_uncertainty -setup 0.2 [get_clocks core_clk]\n"
+        ))
+        .unwrap();
         assert_eq!(sdc.setup_uncertainty_ns, 0.2);
         assert_eq!(sdc.hold_uncertainty_ns, 0.0);
-        let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty -hold 0.1 [get_clocks core_clk]\n")).unwrap();
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_clock_uncertainty -hold 0.1 [get_clocks core_clk]\n"
+        ))
+        .unwrap();
         assert_eq!(sdc.setup_uncertainty_ns, 0.0);
         assert_eq!(sdc.hold_uncertainty_ns, 0.1);
-        let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty 0.3 [get_clocks core_clk]\n")).unwrap();
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_clock_uncertainty 0.3 [get_clocks core_clk]\n"
+        ))
+        .unwrap();
         assert_eq!(sdc.setup_uncertainty_ns, 0.3);
         assert_eq!(sdc.hold_uncertainty_ns, 0.3);
     }

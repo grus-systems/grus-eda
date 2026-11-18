@@ -92,7 +92,12 @@ struct Heap<T> {
 
 impl<T: Clone> Heap<T> {
     fn new(key: fn(&T) -> usize, less: fn(&T, &T) -> bool) -> Self {
-        Self { data: Vec::new(), pos: Vec::new(), key, less }
+        Self {
+            data: Vec::new(),
+            pos: Vec::new(),
+            key,
+            less,
+        }
     }
 
     fn ensure_pos(&mut self, node: usize) {
@@ -268,7 +273,12 @@ fn nearest_neighbors(pts: &[Pt]) -> Vec<Vec<usize>> {
 fn build_spanning_tree(g: &mut PdGraph, driver: usize, nn: &[Vec<usize>]) {
     let n = g.pts.len();
     let mut heap = Heap::new(search_edge_key, search_edge_less);
-    heap.push(SearchEdge { weight: 0.0, path_length: 0, parent: -1, node: driver });
+    heap.push(SearchEdge {
+        weight: 0.0,
+        path_length: 0,
+        parent: -1,
+        node: driver,
+    });
     let mut visited = vec![false; n];
     let mut visited_count = 0;
 
@@ -367,7 +377,13 @@ fn best_steiner_for_node(g: &PdGraph, node: usize) -> CandidateSteiner {
             }
             let gain = (sx - pt_node.0).abs() + (sy - pt_node.1).abs();
             if gain > best.gain {
-                best = CandidateSteiner { gain, node, edge1: e1, edge2: e2, pt: (sx, sy) };
+                best = CandidateSteiner {
+                    gain,
+                    node,
+                    edge1: e1,
+                    edge2: e2,
+                    pt: (sx, sy),
+                };
             }
         }
     }
@@ -438,8 +454,7 @@ fn steinerize(g: &mut PdGraph) {
 /// chains linked by zero-length edges, breadth-first in node-id-descending
 /// seed order.
 fn split_degree4_nodes(g: &mut PdGraph) {
-    let mut to_process: std::collections::VecDeque<usize> =
-        (0..g.pts.len()).rev().collect();
+    let mut to_process: std::collections::VecDeque<usize> = (0..g.pts.len()).rev().collect();
     while let Some(node) = to_process.pop_front() {
         if g.adj[node].len() <= 3 {
             continue;
@@ -500,9 +515,8 @@ fn check_tree(g: &PdGraph, parent: &[usize], deg: usize) -> bool {
     let intersects = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| {
         a.2 >= b.0 && a.0 <= b.2 && a.3 >= b.1 && a.1 <= b.3
     };
-    let is_corner = |r: (i32, i32, i32, i32), x: i32, y: i32| {
-        (x == r.0 || x == r.2) && (y == r.1 || y == r.3)
-    };
+    let is_corner =
+        |r: (i32, i32, i32, i32), x: i32, y: i32| (x == r.0 || x == r.2) && (y == r.1 || y == r.3);
     let share_corner = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| {
         [(b.0, b.1), (b.0, b.3), (b.2, b.1), (b.2, b.3)]
             .iter()
@@ -547,7 +561,10 @@ pub(crate) fn build_pd_tree(sorted_pts: &[Pt], driver: usize) -> PdTree {
             segments.push((g.pts[i], g.pts[p]));
         }
     }
-    PdTree { segments, check_passed }
+    PdTree {
+        segments,
+        check_passed,
+    }
 }
 
 /// Segments-only entry point: `pts[0]` is the driver pin location, remaining
@@ -563,7 +580,10 @@ pub fn build_pd_points(pts: &[Pt]) -> Vec<(Pt, Pt)> {
 /// and any choice yields an isomorphic tree).
 pub(crate) fn build_pd_tree_for_points(pts: &[Pt]) -> PdTree {
     if pts.len() < 2 {
-        return PdTree { segments: Vec::new(), check_passed: true };
+        return PdTree {
+            segments: Vec::new(),
+            check_passed: true,
+        };
     }
     let mut order: Vec<usize> = (0..pts.len()).collect();
     order.sort_by_key(|&i| (pts[i].0, pts[i].1));

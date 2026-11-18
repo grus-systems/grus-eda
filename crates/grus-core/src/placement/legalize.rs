@@ -1,8 +1,8 @@
-use anyhow::{bail, Context, Result};
-use rayon::prelude::*;
 use crate::design_db::{DesignDb, Orient, PlacementStatus};
 use crate::interner::{CellId, NetId, PinId};
 use crate::tech_db::{MacroClass, TechDb};
+use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct LegalizeResult {
@@ -312,7 +312,10 @@ struct Extremum {
 }
 
 // Placeholder for the unused slots of nets with fewer than two pins; never read.
-const UNUSED_EXTREMUM: Extremum = Extremum { val: 0, pin: PinId(0) };
+const UNUSED_EXTREMUM: Extremum = Extremum {
+    val: 0,
+    pin: PinId(0),
+};
 
 // Two smallest (`lo`) and two largest (`hi`) pin coordinates per axis (0 = x, 1 = y), best
 // first, each with its pin. The slots hold real pins only when `pin_count >= 2`.
@@ -484,7 +487,14 @@ fn evaluate_trial_swap(
     let mut hpwl_after = 0i64;
     for &n in incident {
         moved_pins_on_net(db, n, c1, c2, &mut eval.moved);
-        hpwl_after += net_hpwl_after_swap(db, tech_db, n, &net_ext[n], &eval.moved, &mut eval.fallbacks);
+        hpwl_after += net_hpwl_after_swap(
+            db,
+            tech_db,
+            n,
+            &net_ext[n],
+            &eval.moved,
+            &mut eval.fallbacks,
+        );
     }
     (hpwl_before, hpwl_after)
 }
@@ -623,7 +633,9 @@ fn band_of(band_ys: &[i32], y: i32) -> usize {
 }
 
 fn band_remove(band: &mut Vec<BandEntry>, entry: BandEntry) {
-    let pos = band.binary_search(&entry).expect("pass 1 index lost a cell");
+    let pos = band
+        .binary_search(&entry)
+        .expect("pass 1 index lost a cell");
     band.remove(pos);
 }
 
@@ -1324,7 +1336,13 @@ pub fn legalize_placement(
                     let med_idx = other_xs_buf.len() / 2;
                     other_xs_buf.select_nth_unstable(med_idx);
                     let med = other_xs_buf[med_idx];
-                    let snapped = snap_to_site(med - wc / 2, sr.orig_x_dbu, sr.step_x_dbu, left_limit, right_limit);
+                    let snapped = snap_to_site(
+                        med - wc / 2,
+                        sr.orig_x_dbu,
+                        sr.step_x_dbu,
+                        left_limit,
+                        right_limit,
+                    );
                     candidates_buf.push(snapped);
                 }
 
@@ -1450,13 +1468,21 @@ pub fn verify_legality(design_db: &DesignDb, tech_db: &TechDb) -> Result<()> {
             let row = &design_db.rows[row_order[pos]];
 
             if orient != row.orient {
-                bail!("Cell {} orient {:?} does not match row orient {:?}", c, orient, row.orient);
+                bail!(
+                    "Cell {} orient {:?} does not match row orient {:?}",
+                    c,
+                    orient,
+                    row.orient
+                );
             }
 
             if (cx - row.orig_x_dbu) % row.step_x_dbu != 0 {
                 bail!(
                     "Cell {} x={} is not snapped to row site grid (orig_x={}, step={})",
-                    c, cx, row.orig_x_dbu, row.step_x_dbu
+                    c,
+                    cx,
+                    row.orig_x_dbu,
+                    row.step_x_dbu
                 );
             }
 
@@ -1464,7 +1490,11 @@ pub fn verify_legality(design_db: &DesignDb, tech_db: &TechDb) -> Result<()> {
             if cx < row.orig_x_dbu || cx + cw > row_xh {
                 bail!(
                     "Cell {} [{}, {}] exceeds row horizontal bounds [{}, {}]",
-                    c, cx, cx + cw, row.orig_x_dbu, row_xh
+                    c,
+                    cx,
+                    cx + cw,
+                    row.orig_x_dbu,
+                    row_xh
                 );
             }
         }
@@ -1490,7 +1520,14 @@ pub fn verify_legality(design_db: &DesignDb, tech_db: &TechDb) -> Result<()> {
             if x1_h > x2_l {
                 bail!(
                     "Overlap on row y={}: cell {} [{}, {}] overlaps cell {} [{}, {}] by {} DBU",
-                    row_yl, c1, x1_l, x1_h, c2, x2_l, cells[i + 1].1, x1_h - x2_l
+                    row_yl,
+                    c1,
+                    x1_l,
+                    x1_h,
+                    c2,
+                    x2_l,
+                    cells[i + 1].1,
+                    x1_h - x2_l
                 );
             }
         }
@@ -1502,12 +1539,12 @@ pub fn verify_legality(design_db: &DesignDb, tech_db: &TechDb) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, require, sky130_hd};
     use crate::interner::{CellId, MacroId, NetId, PinDir, PinId, StringInterner, SymbolId};
-    use crate::placement::nesterov::{run_nesterov_placement, NesterovConfig};
-    use crate::tech_db::MacroDef;
+    use crate::placement::nesterov::{NesterovConfig, run_nesterov_placement};
     use crate::readers::def::{parse_def, write_def};
     use crate::readers::lef::load_tech_db;
+    use crate::tech_db::MacroDef;
+    use crate::test_support::{design_dir, require, sky130_hd};
 
     #[test]
     fn test_gcd_place_and_legalize() {
@@ -1516,15 +1553,17 @@ mod tests {
         let floorplan_def_path = design_dir("gcd").join("gcd.floorplan.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !floorplan_def_path.exists() {
-            panic!("Required test files missing: tlef={:?}, lef={:?}, def={:?}",
-                   tlef_path, lef_path, floorplan_def_path);
+            panic!(
+                "Required test files missing: tlef={:?}, lef={:?}, def={:?}",
+                tlef_path, lef_path, floorplan_def_path
+            );
         }
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let mut design_db = parse_def(&floorplan_def_path, &tech_db, None)
-            .expect("Failed to parse floorplan DEF");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let mut design_db =
+            parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
         // 1. Run global placement
         let config = NesterovConfig::default();
@@ -1532,13 +1571,23 @@ mod tests {
 
         // 2. Run greedy Abacus legalization + local refinement
         let t0 = std::time::Instant::now();
-        let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
-            .expect("Legalization must succeed");
+        let leg_res = legalize_placement(
+            &mut design_db,
+            &tech_db,
+            &gp_res.cell_x_um,
+            &gp_res.cell_y_um,
+        )
+        .expect("Legalization must succeed");
         let elapsed = t0.elapsed();
 
         println!(
             "Legalization completed in {:?}: pre_legal_hpwl={} dbu, post_abacus_hpwl={} dbu, final_hpwl={} dbu, avg_disp={:.3} um, max_disp={:.3} um",
-            elapsed, leg_res.pre_legal_hpwl_dbu, leg_res.post_abacus_hpwl_dbu, leg_res.final_hpwl_dbu, leg_res.avg_displacement_um, leg_res.max_displacement_um
+            elapsed,
+            leg_res.pre_legal_hpwl_dbu,
+            leg_res.post_abacus_hpwl_dbu,
+            leg_res.final_hpwl_dbu,
+            leg_res.avg_displacement_um,
+            leg_res.max_displacement_um
         );
 
         // 3. Verify legality self-check passes
@@ -1553,12 +1602,16 @@ mod tests {
         let rel_diff = (leg_res.final_hpwl_dbu - ref_hpwl_dbu).abs() as f64 / ref_hpwl_dbu as f64;
         println!(
             "HPWL comparison: reference={} dbu, ours={} dbu, diff={:.2}%",
-            ref_hpwl_dbu, leg_res.final_hpwl_dbu, rel_diff * 100.0
+            ref_hpwl_dbu,
+            leg_res.final_hpwl_dbu,
+            rel_diff * 100.0
         );
         assert!(
             rel_diff <= 0.05,
             "Legalized HPWL {} must be within 5% of OpenROAD {}, got {:.2}%",
-            leg_res.final_hpwl_dbu, ref_hpwl_dbu, rel_diff * 100.0
+            leg_res.final_hpwl_dbu,
+            ref_hpwl_dbu,
+            rel_diff * 100.0
         );
 
         // 5. Test DEF write and re-parse roundtrip
@@ -1567,8 +1620,8 @@ mod tests {
         write_def(&design_db, &tech_db, &floorplan_def_path, &out_def_path)
             .expect("Failed to write legalized DEF");
 
-        let reloaded_db = parse_def(&out_def_path, &tech_db, None)
-            .expect("Failed to re-parse written DEF");
+        let reloaded_db =
+            parse_def(&out_def_path, &tech_db, None).expect("Failed to re-parse written DEF");
 
         verify_legality(&reloaded_db, &tech_db).expect("Reloaded DEF must pass verify_legality");
         let reloaded_hpwl = reloaded_db.compute_hpwl_dbu(&tech_db);
@@ -1701,13 +1754,21 @@ mod tests {
         let mut cell_pin_ids = Vec::new();
         let mut cell_pin_offsets = vec![0u32];
         for c in 0..n {
-            cell_pin_ids.extend((0..p).filter(|&i| pins[i].0 == Some(c)).map(|i| PinId(i as u32)));
+            cell_pin_ids.extend(
+                (0..p)
+                    .filter(|&i| pins[i].0 == Some(c))
+                    .map(|i| PinId(i as u32)),
+            );
             cell_pin_offsets.push(cell_pin_ids.len() as u32);
         }
         let mut net_pin_ids = Vec::new();
         let mut net_pin_offsets = vec![0u32];
         for net in 0..num_nets {
-            net_pin_ids.extend((0..p).filter(|&i| pins[i].1 == Some(net)).map(|i| PinId(i as u32)));
+            net_pin_ids.extend(
+                (0..p)
+                    .filter(|&i| pins[i].1 == Some(net))
+                    .map(|i| PinId(i as u32)),
+            );
             net_pin_offsets.push(net_pin_ids.len() as u32);
         }
 
@@ -1725,11 +1786,17 @@ mod tests {
         db.pin_cells = pins.iter().map(|q| q.0.map(|c| CellId(c as u32))).collect();
         db.pin_macro_pins = vec![None; p];
         db.pin_lib_pins = vec![None; p];
-        db.pin_nets = pins.iter().map(|q| q.1.map(|net| NetId(net as u32))).collect();
+        db.pin_nets = pins
+            .iter()
+            .map(|q| q.1.map(|net| NetId(net as u32)))
+            .collect();
         db.pin_offset_x_dbu = pins.iter().map(|q| q.2).collect();
         db.pin_offset_y_dbu = pins.iter().map(|q| q.3).collect();
         db.pin_is_driver = vec![false; p];
-        db.io_pins = (0..p).filter(|&i| pins[i].0.is_none()).map(|i| PinId(i as u32)).collect();
+        db.io_pins = (0..p)
+            .filter(|&i| pins[i].0.is_none())
+            .map(|i| PinId(i as u32))
+            .collect();
         db.net_names = vec![SymbolId(0); num_nets];
         db.net_pin_offsets = net_pin_offsets;
         db.net_pin_ids = net_pin_ids;
@@ -1812,7 +1879,11 @@ mod tests {
             }
         }
         for (net, ext) in net_ext.iter().enumerate() {
-            assert_eq!(cached_hpwl(ext), net_hpwl_dbu(db, tech_db, net), "final cache, net {net}");
+            assert_eq!(
+                cached_hpwl(ext),
+                net_hpwl_dbu(db, tech_db, net),
+                "final cache, net {net}"
+            );
         }
         eval.fallbacks
     }
@@ -1826,7 +1897,10 @@ mod tests {
             let mut db = random_pass1_db(&mut rng);
             total_fallbacks += differential_sweep(&mut db, &tech_db);
         }
-        assert!(total_fallbacks > 0, "random designs must exercise the full-scan fallback");
+        assert!(
+            total_fallbacks > 0,
+            "random designs must exercise the full-scan fallback"
+        );
     }
 
     #[test]
@@ -1846,7 +1920,9 @@ mod tests {
             (Some(1), Some(1), 0, 0),
         ];
         let mut db = build_pass1_db(&cells, &pins, 2);
-        let net_ext: Vec<NetExtrema> = (0..2).map(|n| build_net_extrema(&db, &tech_db, n)).collect();
+        let net_ext: Vec<NetExtrema> = (0..2)
+            .map(|n| build_net_extrema(&db, &tech_db, n))
+            .collect();
         let mut eval = Pass1Eval::default();
 
         let incident = incident_nets(&db, 0, 1);
@@ -1874,7 +1950,10 @@ mod tests {
             &mut ro_eval,
         );
         assert_eq!((ro_before, ro_after, ro_eval.fallbacks), (1100, 1000, 1));
-        assert_eq!(db.cell_x_dbu[0], 0, "read-only evaluator must leave db unmutated");
+        assert_eq!(
+            db.cell_x_dbu[0], 0,
+            "read-only evaluator must leave db unmutated"
+        );
 
         let (cached_before, cached_after) =
             evaluate_trial_swap(&mut db, &tech_db, &net_ext, &incident, 0, 1, &mut eval);
@@ -1883,7 +1962,10 @@ mod tests {
         assert_eq!(eval.fallbacks, 1, "only net 0 needs a full rescan");
 
         // The trial is still applied, so the full scan sees the same positions as the cache.
-        let full_after: i64 = incident.iter().map(|&n| net_hpwl_dbu(&db, &tech_db, n)).sum();
+        let full_after: i64 = incident
+            .iter()
+            .map(|&n| net_hpwl_dbu(&db, &tech_db, n))
+            .sum();
         assert_eq!(full_after, 1000);
     }
 
@@ -1894,38 +1976,53 @@ mod tests {
         let floorplan_def_path = require(design_dir("aes").join("aes.floorplan.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let mut design_db = parse_def(&floorplan_def_path, &tech_db, None)
-            .expect("Failed to parse floorplan DEF");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let mut design_db =
+            parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
         let gp_res = run_nesterov_placement(&design_db, &tech_db, &NesterovConfig::default());
         println!(
             "aes GP: converged={}, iterations={}, final_overflow={:.4}, final_hpwl_um={:.1}",
             gp_res.converged, gp_res.iterations, gp_res.final_overflow, gp_res.final_hpwl_um
         );
-        assert!(gp_res.converged && gp_res.iterations < 300, "aes GP must converge in < 300 iterations");
+        assert!(
+            gp_res.converged && gp_res.iterations < 300,
+            "aes GP must converge in < 300 iterations"
+        );
 
-        let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
-            .expect("Legalization must succeed");
+        let leg_res = legalize_placement(
+            &mut design_db,
+            &tech_db,
+            &gp_res.cell_x_um,
+            &gp_res.cell_y_um,
+        )
+        .expect("Legalization must succeed");
         verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
 
         let ref_path = require(design_dir("aes").join("aes.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
-            .expect("Parse aes.reference.json");
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
+                .expect("Parse aes.reference.json");
         let ref_hpwl_dbu = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
         let gap = (leg_res.final_hpwl_dbu - ref_hpwl_dbu) as f64 / ref_hpwl_dbu as f64;
         println!(
             "aes HPWL: reference={} dbu, ours={} dbu, gap={:+.2}%",
-            ref_hpwl_dbu, leg_res.final_hpwl_dbu, gap * 100.0
+            ref_hpwl_dbu,
+            leg_res.final_hpwl_dbu,
+            gap * 100.0
         );
-        assert!(gap.abs() <= 0.05, "aes legalized HPWL gap {:.2}% exceeds 5%", gap * 100.0);
+        assert!(
+            gap.abs() <= 0.05,
+            "aes legalized HPWL gap {:.2}% exceeds 5%",
+            gap * 100.0
+        );
 
         let out_def_path = std::env::temp_dir().join("grus_aes_legalized_test.def");
         write_def(&design_db, &tech_db, &floorplan_def_path, &out_def_path)
             .expect("Failed to write legalized DEF");
-        let reloaded_db = parse_def(&out_def_path, &tech_db, None)
-            .expect("Failed to re-parse written DEF");
+        let reloaded_db =
+            parse_def(&out_def_path, &tech_db, None).expect("Failed to re-parse written DEF");
         verify_legality(&reloaded_db, &tech_db).expect("Reloaded DEF must pass verify_legality");
         assert_eq!(
             reloaded_db.compute_hpwl_dbu(&tech_db),
@@ -1941,38 +2038,53 @@ mod tests {
         let floorplan_def_path = require(design_dir("jpeg").join("jpeg.floorplan.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let mut design_db = parse_def(&floorplan_def_path, &tech_db, None)
-            .expect("Failed to parse floorplan DEF");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let mut design_db =
+            parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
         let gp_res = run_nesterov_placement(&design_db, &tech_db, &NesterovConfig::default());
         println!(
             "jpeg GP at target density 0.60: converged={}, iterations={}, final_overflow={:.4}, final_hpwl_um={:.1}",
             gp_res.converged, gp_res.iterations, gp_res.final_overflow, gp_res.final_hpwl_um
         );
-        assert!(gp_res.converged && gp_res.iterations < 300, "jpeg GP must converge in < 300 iterations");
+        assert!(
+            gp_res.converged && gp_res.iterations < 300,
+            "jpeg GP must converge in < 300 iterations"
+        );
 
-        let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
-            .expect("Legalization must succeed");
+        let leg_res = legalize_placement(
+            &mut design_db,
+            &tech_db,
+            &gp_res.cell_x_um,
+            &gp_res.cell_y_um,
+        )
+        .expect("Legalization must succeed");
         verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
 
         let ref_path = require(design_dir("jpeg").join("jpeg.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
-            .expect("Parse jpeg.reference.json");
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
+                .expect("Parse jpeg.reference.json");
         let ref_hpwl_dbu = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
         let gap = (leg_res.final_hpwl_dbu - ref_hpwl_dbu) as f64 / ref_hpwl_dbu as f64;
         println!(
             "jpeg HPWL: reference={} dbu, ours={} dbu, gap={:+.2}%",
-            ref_hpwl_dbu, leg_res.final_hpwl_dbu, gap * 100.0
+            ref_hpwl_dbu,
+            leg_res.final_hpwl_dbu,
+            gap * 100.0
         );
-        assert!(gap.abs() <= 0.05, "jpeg legalized HPWL gap {:.2}% exceeds 5%", gap * 100.0);
+        assert!(
+            gap.abs() <= 0.05,
+            "jpeg legalized HPWL gap {:.2}% exceeds 5%",
+            gap * 100.0
+        );
 
         let out_def_path = std::env::temp_dir().join("grus_jpeg_legalized_test.def");
         write_def(&design_db, &tech_db, &floorplan_def_path, &out_def_path)
             .expect("Failed to write legalized DEF");
-        let reloaded_db = parse_def(&out_def_path, &tech_db, None)
-            .expect("Failed to re-parse written DEF");
+        let reloaded_db =
+            parse_def(&out_def_path, &tech_db, None).expect("Failed to re-parse written DEF");
         verify_legality(&reloaded_db, &tech_db).expect("Reloaded DEF must pass verify_legality");
         assert_eq!(
             reloaded_db.compute_hpwl_dbu(&tech_db),
@@ -1988,38 +2100,53 @@ mod tests {
         let floorplan_def_path = require(design_dir("ibex").join("ibex.floorplan.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let mut design_db = parse_def(&floorplan_def_path, &tech_db, None)
-            .expect("Failed to parse floorplan DEF");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let mut design_db =
+            parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
         let gp_res = run_nesterov_placement(&design_db, &tech_db, &NesterovConfig::default());
         println!(
             "ibex GP at target density 0.60: converged={}, iterations={}, final_overflow={:.4}, final_hpwl_um={:.1}",
             gp_res.converged, gp_res.iterations, gp_res.final_overflow, gp_res.final_hpwl_um
         );
-        assert!(gp_res.converged && gp_res.iterations < 300, "ibex GP must converge in < 300 iterations");
+        assert!(
+            gp_res.converged && gp_res.iterations < 300,
+            "ibex GP must converge in < 300 iterations"
+        );
 
-        let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
-            .expect("Legalization must succeed");
+        let leg_res = legalize_placement(
+            &mut design_db,
+            &tech_db,
+            &gp_res.cell_x_um,
+            &gp_res.cell_y_um,
+        )
+        .expect("Legalization must succeed");
         verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
 
         let ref_path = require(design_dir("ibex").join("ibex.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read ibex.reference.json"))
-            .expect("Parse ibex.reference.json");
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read ibex.reference.json"))
+                .expect("Parse ibex.reference.json");
         let ref_hpwl_dbu = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
         let gap = (leg_res.final_hpwl_dbu - ref_hpwl_dbu) as f64 / ref_hpwl_dbu as f64;
         println!(
             "ibex HPWL: reference={} dbu, ours={} dbu, gap={:+.2}%",
-            ref_hpwl_dbu, leg_res.final_hpwl_dbu, gap * 100.0
+            ref_hpwl_dbu,
+            leg_res.final_hpwl_dbu,
+            gap * 100.0
         );
-        assert!(gap.abs() <= 0.05, "ibex legalized HPWL gap {:.2}% exceeds 5%", gap * 100.0);
+        assert!(
+            gap.abs() <= 0.05,
+            "ibex legalized HPWL gap {:.2}% exceeds 5%",
+            gap * 100.0
+        );
 
         let out_def_path = std::env::temp_dir().join("grus_ibex_legalized_test.def");
         write_def(&design_db, &tech_db, &floorplan_def_path, &out_def_path)
             .expect("Failed to write legalized DEF");
-        let reloaded_db = parse_def(&out_def_path, &tech_db, None)
-            .expect("Failed to re-parse written DEF");
+        let reloaded_db =
+            parse_def(&out_def_path, &tech_db, None).expect("Failed to re-parse written DEF");
         verify_legality(&reloaded_db, &tech_db).expect("Reloaded DEF must pass verify_legality");
         assert_eq!(
             reloaded_db.compute_hpwl_dbu(&tech_db),
@@ -2035,32 +2162,48 @@ mod tests {
         let floorplan_def_path = require(design_dir("picorv32").join("picorv32.floorplan.def"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let mut design_db = parse_def(&floorplan_def_path, &tech_db, None)
-            .expect("Failed to parse floorplan DEF");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
+        let mut design_db =
+            parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
         let gp_res = run_nesterov_placement(&design_db, &tech_db, &NesterovConfig::default());
         println!(
             "picorv32 GP: converged={}, iterations={}, final_overflow={:.4}, final_hpwl_um={:.1}",
             gp_res.converged, gp_res.iterations, gp_res.final_overflow, gp_res.final_hpwl_um
         );
-        assert!(gp_res.converged && gp_res.iterations < 300, "picorv32 GP must converge in < 300 iterations");
+        assert!(
+            gp_res.converged && gp_res.iterations < 300,
+            "picorv32 GP must converge in < 300 iterations"
+        );
 
-        let leg_res = legalize_placement(&mut design_db, &tech_db, &gp_res.cell_x_um, &gp_res.cell_y_um)
-            .expect("Legalization must succeed");
+        let leg_res = legalize_placement(
+            &mut design_db,
+            &tech_db,
+            &gp_res.cell_x_um,
+            &gp_res.cell_y_um,
+        )
+        .expect("Legalization must succeed");
         verify_legality(&design_db, &tech_db).expect("verify_legality must pass");
 
         let ref_path = require(design_dir("picorv32").join("picorv32.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read picorv32.reference.json"))
-            .expect("Parse picorv32.reference.json");
+        let ref_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&ref_path).expect("read picorv32.reference.json"),
+        )
+        .expect("Parse picorv32.reference.json");
         let ref_hpwl_dbu = ref_json["placed_hpwl_dbu"].as_i64().unwrap();
         let gap = (leg_res.final_hpwl_dbu - ref_hpwl_dbu) as f64 / ref_hpwl_dbu as f64;
         println!(
             "picorv32 HPWL: reference={} dbu, ours={} dbu, gap={:+.2}%",
-            ref_hpwl_dbu, leg_res.final_hpwl_dbu, gap * 100.0
+            ref_hpwl_dbu,
+            leg_res.final_hpwl_dbu,
+            gap * 100.0
         );
-        assert!(gap.abs() <= 0.05, "picorv32 legalized HPWL gap {:.2}% exceeds 5%", gap * 100.0);
+        assert!(
+            gap.abs() <= 0.05,
+            "picorv32 legalized HPWL gap {:.2}% exceeds 5%",
+            gap * 100.0
+        );
     }
 
     #[test]
@@ -2081,7 +2224,9 @@ mod tests {
         // Pseudo-random deterministic stream of cell widths (multiples of site) and x_gp targets
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         for c in 0..80usize {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let w_i = (((rng >> 16) % 5) as i32 + 1) * 460;
             if w_i > sr.free_width {
                 continue;
@@ -2099,7 +2244,11 @@ mod tests {
             sr.free_width -= w_i;
             let c_last = sr.clusters.last().unwrap();
             let actual_x = c_last.x_dbu + c_last.width_dbu - w_i;
-            assert_eq!(trial_x, actual_x, "Mismatch at cell {} (x_gp={}, w={})", c, x_gp, w_i);
+            assert_eq!(
+                trial_x, actual_x,
+                "Mismatch at cell {} (x_gp={}, w={})",
+                c, x_gp, w_i
+            );
         }
     }
 }

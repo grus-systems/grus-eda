@@ -232,8 +232,8 @@ mod tests {
         let config = bincode::config::standard();
         let encoded =
             bincode::serde::encode_to_vec(&lib, config).expect("LibDb bincode encode failed");
-        let (mut decoded, _): (LibDb, usize) =
-            bincode::serde::decode_from_slice(&encoded, config).expect("LibDb bincode decode failed");
+        let (mut decoded, _): (LibDb, usize) = bincode::serde::decode_from_slice(&encoded, config)
+            .expect("LibDb bincode decode failed");
 
         decoded.strings.rebuild_map();
         decoded.rebuild_cell_by_name();

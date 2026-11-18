@@ -7,7 +7,7 @@
 //! x is not a defined logic edge. Scope paths are ignored: DEF net names are flat
 //! leaf names, and directly-connected ports share their driver's transitions.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -145,7 +145,13 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
         if let Some((v, id)) = parse_scalar_change(line) {
             apply_change(v, id, &headers.decls, &mut headers.last_state, &mut signals);
         } else if let Some((bits, id)) = parse_vector_change(line) {
-            apply_vector_change(bits, id, &headers.decls, &mut headers.last_state, &mut signals);
+            apply_vector_change(
+                bits,
+                id,
+                &headers.decls,
+                &mut headers.last_state,
+                &mut signals,
+            );
         }
         // Anything else (r<real>, malformed) is ignored.
     }
@@ -241,9 +247,7 @@ fn parse_var_decl(item: &str, headers: &mut VcdHeaders) -> Result<()> {
                     depth: headers.scope_depth,
                 },
             );
-            headers
-                .last_state
-                .insert(id_key, vec![2u8; nbits]);
+            headers.last_state.insert(id_key, vec![2u8; nbits]);
         }
     }
     Ok(())

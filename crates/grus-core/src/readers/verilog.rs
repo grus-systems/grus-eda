@@ -2,7 +2,7 @@ use crate::design_db::{DesignDb, Orient, PlacementStatus};
 use crate::interner::{CellId, LibPinId, MacroPinId, NetId, PinDir, PinId};
 use crate::lib_db::LibDb;
 use crate::tech_db::TechDb;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -75,11 +75,18 @@ impl<'a> VerilogLexer<'a> {
     /// reading it as a net or as zero would be silently wrong.
     fn based_constant(&mut self, start: usize, one_bit: bool) -> VerilogToken {
         let input = self.input;
-        if self.pos < input.len() && matches!(input[self.pos], b'b' | b'B' | b'd' | b'D' | b'h' | b'H' | b'o' | b'O') {
+        if self.pos < input.len()
+            && matches!(
+                input[self.pos],
+                b'b' | b'B' | b'd' | b'D' | b'h' | b'H' | b'o' | b'O'
+            )
+        {
             self.pos += 1;
         }
         let value_start = self.pos;
-        while self.pos < input.len() && (input[self.pos].is_ascii_alphanumeric() || input[self.pos] == b'_') {
+        while self.pos < input.len()
+            && (input[self.pos].is_ascii_alphanumeric() || input[self.pos] == b'_')
+        {
             self.pos += 1;
         }
         let value = &input[value_start..self.pos];
@@ -186,7 +193,9 @@ impl<'a> VerilogLexer<'a> {
                 }
                 if start == self.pos {
                     self.pos += 1;
-                    VerilogToken::Ident(String::from_utf8_lossy(&self.input[start..self.pos]).to_string())
+                    VerilogToken::Ident(
+                        String::from_utf8_lossy(&self.input[start..self.pos]).to_string(),
+                    )
                 } else {
                     let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("");
                     VerilogToken::Ident(s.to_string())
@@ -241,14 +250,15 @@ pub fn parse_verilog_bytes(
     let mut module_name = String::new();
     while tok != VerilogToken::Eof {
         if let VerilogToken::Ident(ref s) = tok
-            && s == "module" {
+            && s == "module"
+        {
+            tok = lexer.next_token();
+            if let VerilogToken::Ident(ref mname) = tok {
+                module_name = mname.clone();
                 tok = lexer.next_token();
-                if let VerilogToken::Ident(ref mname) = tok {
-                    module_name = mname.clone();
-                    tok = lexer.next_token();
-                }
-                break;
             }
+            break;
+        }
         tok = lexer.next_token();
     }
 
@@ -283,66 +293,70 @@ pub fn parse_verilog_bytes(
     let mut alias_pairs: Vec<(String, String)> = Vec::new();
 
     // Helper to parse bus range `[msb:lsb]`
-    let parse_range = |tok: &mut VerilogToken, lexer: &mut VerilogLexer| -> Result<Option<(i64, i64)>> {
-        if *tok == VerilogToken::LBracket {
-            *tok = lexer.next_token();
-            let msb = if let VerilogToken::Int(n) = *tok {
-                n
+    let parse_range =
+        |tok: &mut VerilogToken, lexer: &mut VerilogLexer| -> Result<Option<(i64, i64)>> {
+            if *tok == VerilogToken::LBracket {
+                *tok = lexer.next_token();
+                let msb = if let VerilogToken::Int(n) = *tok {
+                    n
+                } else {
+                    bail!("Expected int for MSB in range");
+                };
+                *tok = lexer.next_token();
+                if *tok != VerilogToken::Colon {
+                    bail!("Expected ':' in range");
+                }
+                *tok = lexer.next_token();
+                let lsb = if let VerilogToken::Int(n) = *tok {
+                    n
+                } else {
+                    bail!("Expected int for LSB in range");
+                };
+                *tok = lexer.next_token();
+                if *tok != VerilogToken::RBracket {
+                    bail!("Expected ']' in range");
+                }
+                *tok = lexer.next_token();
+                Ok(Some((msb, lsb)))
             } else {
-                bail!("Expected int for MSB in range");
-            };
-            *tok = lexer.next_token();
-            if *tok != VerilogToken::Colon {
-                bail!("Expected ':' in range");
+                Ok(None)
             }
-            *tok = lexer.next_token();
-            let lsb = if let VerilogToken::Int(n) = *tok {
-                n
-            } else {
-                bail!("Expected int for LSB in range");
-            };
-            *tok = lexer.next_token();
-            if *tok != VerilogToken::RBracket {
-                bail!("Expected ']' in range");
-            }
-            *tok = lexer.next_token();
-            Ok(Some((msb, lsb)))
-        } else {
-            Ok(None)
-        }
-    };
+        };
 
     // Helper to parse net identifier/expression inside connection or assign
-    let parse_net_ref = |tok: &mut VerilogToken, lexer: &mut VerilogLexer| -> Result<Option<String>> {
-        match tok {
-            VerilogToken::Const(false) => {
-                *tok = lexer.next_token();
-                Ok(Some("__const_0".to_string()))
-            }
-            VerilogToken::Const(true) => {
-                *tok = lexer.next_token();
-                Ok(Some("__const_1".to_string()))
-            }
-            VerilogToken::Unsupported(text) => bail!("unsupported Verilog constant or literal `{text}`"),
-            VerilogToken::Ident(name) => {
-                let base = name.clone();
-                *tok = lexer.next_token();
-                if *tok == VerilogToken::LBracket {
+    let parse_net_ref =
+        |tok: &mut VerilogToken, lexer: &mut VerilogLexer| -> Result<Option<String>> {
+            match tok {
+                VerilogToken::Const(false) => {
                     *tok = lexer.next_token();
-                    if let VerilogToken::Int(idx) = *tok {
-                        *tok = lexer.next_token();
-                        if *tok == VerilogToken::RBracket {
-                            *tok = lexer.next_token();
-                            return Ok(Some(format!("{}[{}]", base, idx)));
-                        }
-                    }
-                    bail!("Malformed bus bit index on {}", base);
+                    Ok(Some("__const_0".to_string()))
                 }
-                Ok(Some(base))
+                VerilogToken::Const(true) => {
+                    *tok = lexer.next_token();
+                    Ok(Some("__const_1".to_string()))
+                }
+                VerilogToken::Unsupported(text) => {
+                    bail!("unsupported Verilog constant or literal `{text}`")
+                }
+                VerilogToken::Ident(name) => {
+                    let base = name.clone();
+                    *tok = lexer.next_token();
+                    if *tok == VerilogToken::LBracket {
+                        *tok = lexer.next_token();
+                        if let VerilogToken::Int(idx) = *tok {
+                            *tok = lexer.next_token();
+                            if *tok == VerilogToken::RBracket {
+                                *tok = lexer.next_token();
+                                return Ok(Some(format!("{}[{}]", base, idx)));
+                            }
+                        }
+                        bail!("Malformed bus bit index on {}", base);
+                    }
+                    Ok(Some(base))
+                }
+                _ => Ok(None),
             }
-            _ => Ok(None),
-        }
-    };
+        };
 
     // Parse module body
     while tok != VerilogToken::Eof {
@@ -485,16 +499,17 @@ pub fn parse_verilog_bytes(
     let mut all_net_names: Vec<String> = Vec::new();
     let mut name_to_id: HashMap<String, usize> = HashMap::new();
 
-    let get_or_create_name_id = |name: &str, names: &mut Vec<String>, map: &mut HashMap<String, usize>| -> usize {
-        if let Some(&id) = map.get(name) {
-            id
-        } else {
-            let id = names.len();
-            map.insert(name.to_string(), id);
-            names.push(name.to_string());
-            id
-        }
-    };
+    let get_or_create_name_id =
+        |name: &str, names: &mut Vec<String>, map: &mut HashMap<String, usize>| -> usize {
+            if let Some(&id) = map.get(name) {
+                id
+            } else {
+                let id = names.len();
+                map.insert(name.to_string(), id);
+                names.push(name.to_string());
+                id
+            }
+        };
 
     // Primary I/O ports
     for (port_name, _) in &port_decls {
@@ -545,7 +560,11 @@ pub fn parse_verilog_bytes(
         }
     }
 
-    let resolve_net = |name: &str, ds: &mut DisjointSet, map: &HashMap<String, usize>, root_to_net: &HashMap<usize, NetId>| -> Option<NetId> {
+    let resolve_net = |name: &str,
+                       ds: &mut DisjointSet,
+                       map: &HashMap<String, usize>,
+                       root_to_net: &HashMap<usize, NetId>|
+     -> Option<NetId> {
         let id = map.get(name)?;
         let root = ds.find(*id);
         root_to_net.get(&root).copied()
@@ -615,9 +634,8 @@ pub fn parse_verilog_bytes(
             let pin_name = tech_db.strings.resolve(mpin.name);
             let net_ref_opt = conn_map.get(pin_name).and_then(|n| n.as_ref());
 
-            let net_id = net_ref_opt.and_then(|nname| {
-                resolve_net(nname, &mut ds, &name_to_id, &root_to_net)
-            });
+            let net_id = net_ref_opt
+                .and_then(|nname| resolve_net(nname, &mut ds, &name_to_id, &root_to_net));
 
             let pin_id = PinId(db.pin_names.len() as u32);
             let is_driver = matches!(mpin.dir, PinDir::Output);
@@ -638,7 +656,8 @@ pub fn parse_verilog_bytes(
             db.pin_names.push(mpin.name);
             db.pin_dirs.push(mpin.dir);
             db.pin_cells.push(Some(cell_id));
-            db.pin_macro_pins.push(Some(MacroPinId(mac.pin_offset + pin_idx as u32)));
+            db.pin_macro_pins
+                .push(Some(MacroPinId(mac.pin_offset + pin_idx as u32)));
             db.pin_lib_pins.push(lib_pin_id);
             db.pin_nets.push(net_id);
             db.pin_offset_x_dbu.push(mpin.offset_x_dbu);
@@ -678,13 +697,9 @@ pub fn parse_verilog_bytes(
     Ok(db)
 }
 
-pub fn parse_verilog(
-    path: &Path,
-    tech_db: &TechDb,
-    lib_db: Option<&LibDb>,
-) -> Result<DesignDb> {
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open Verilog file at {:?}", path))?;
+pub fn parse_verilog(path: &Path, tech_db: &TechDb, lib_db: Option<&LibDb>) -> Result<DesignDb> {
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open Verilog file at {:?}", path))?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
     parse_verilog_bytes(&contents, tech_db, lib_db)
@@ -693,9 +708,9 @@ pub fn parse_verilog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, require, sky130_hd};
     use crate::interner::StringInterner;
     use crate::readers::lef::load_tech_db;
+    use crate::test_support::{design_dir, require, sky130_hd};
 
     #[test]
     fn test_gcd_verilog() {
@@ -714,11 +729,10 @@ mod tests {
         }
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
 
-        let db = parse_verilog(&v_path, &tech_db, None)
-            .expect("Failed to parse Verilog netlist");
+        let db = parse_verilog(&v_path, &tech_db, None).expect("Failed to parse Verilog netlist");
 
         let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
@@ -727,10 +741,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["verilog_logic_instances"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["verilog_signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["verilog_bterms"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["verilog_inst_pins"].as_u64().unwrap() as usize
+        );
 
         // Verify driver invariant on all nets with at least one driver
         let mut driven_nets = 0;
@@ -739,10 +765,17 @@ mod tests {
             if let Some(drv) = db.net_driver(nid) {
                 driven_nets += 1;
                 let first_pin = db.net_pins(nid)[0];
-                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+                assert_eq!(
+                    first_pin, drv,
+                    "Driver pin must be first at net_pin_offsets"
+                );
             }
         }
-        assert!(driven_nets >= 260, "Expected most nets to be driven, got {}", driven_nets);
+        assert!(
+            driven_nets >= 260,
+            "Expected most nets to be driven, got {}",
+            driven_nets
+        );
     }
 
     #[test]
@@ -752,21 +785,33 @@ mod tests {
         let v_path = require(design_dir("aes").join("aes.synth.v"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
 
-        let db = parse_verilog(&v_path, &tech_db, None)
-            .expect("Failed to parse Verilog netlist");
+        let db = parse_verilog(&v_path, &tech_db, None).expect("Failed to parse Verilog netlist");
 
         let ref_path = require(design_dir("aes").join("aes.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["verilog_logic_instances"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["verilog_signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["verilog_bterms"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["verilog_inst_pins"].as_u64().unwrap() as usize
+        );
 
         // Driver invariant on every driven net. The count is printed, not asserted: no aes
         // golden value exists for it.
@@ -776,10 +821,17 @@ mod tests {
             if let Some(drv) = db.net_driver(nid) {
                 driven_nets += 1;
                 let first_pin = db.net_pins(nid)[0];
-                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+                assert_eq!(
+                    first_pin, drv,
+                    "Driver pin must be first at net_pin_offsets"
+                );
             }
         }
-        println!("aes verilog: {} of {} nets have a driver", driven_nets, db.num_nets());
+        println!(
+            "aes verilog: {} of {} nets have a driver",
+            driven_nets,
+            db.num_nets()
+        );
     }
 
     #[test]
@@ -789,21 +841,33 @@ mod tests {
         let v_path = require(design_dir("jpeg").join("jpeg.synth.v"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
 
-        let db = parse_verilog(&v_path, &tech_db, None)
-            .expect("Failed to parse Verilog netlist");
+        let db = parse_verilog(&v_path, &tech_db, None).expect("Failed to parse Verilog netlist");
 
         let ref_path = require(design_dir("jpeg").join("jpeg.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["verilog_logic_instances"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["verilog_signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["verilog_bterms"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["verilog_inst_pins"].as_u64().unwrap() as usize
+        );
 
         // Driver invariant on every driven net. The count is printed, not asserted: no jpeg
         // golden value exists for it.
@@ -813,10 +877,17 @@ mod tests {
             if let Some(drv) = db.net_driver(nid) {
                 driven_nets += 1;
                 let first_pin = db.net_pins(nid)[0];
-                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+                assert_eq!(
+                    first_pin, drv,
+                    "Driver pin must be first at net_pin_offsets"
+                );
             }
         }
-        println!("jpeg verilog: {} of {} nets have a driver", driven_nets, db.num_nets());
+        println!(
+            "jpeg verilog: {} of {} nets have a driver",
+            driven_nets,
+            db.num_nets()
+        );
     }
 
     #[test]
@@ -826,21 +897,33 @@ mod tests {
         let v_path = require(design_dir("ibex").join("ibex.synth.v"));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+        let tech_db =
+            load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
 
-        let db = parse_verilog(&v_path, &tech_db, None)
-            .expect("Failed to parse Verilog netlist");
+        let db = parse_verilog(&v_path, &tech_db, None).expect("Failed to parse Verilog netlist");
 
         let ref_path = require(design_dir("ibex").join("ibex.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read ibex.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read ibex.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["verilog_logic_instances"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["verilog_signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["verilog_bterms"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["verilog_inst_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["verilog_logic_instances"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["verilog_signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["verilog_bterms"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["verilog_inst_pins"].as_u64().unwrap() as usize
+        );
 
         // Driver invariant on every driven net. The count is printed, not asserted: no ibex
         // golden value exists for it.
@@ -850,10 +933,17 @@ mod tests {
             if let Some(drv) = db.net_driver(nid) {
                 driven_nets += 1;
                 let first_pin = db.net_pins(nid)[0];
-                assert_eq!(first_pin, drv, "Driver pin must be first at net_pin_offsets");
+                assert_eq!(
+                    first_pin, drv,
+                    "Driver pin must be first at net_pin_offsets"
+                );
             }
         }
-        println!("ibex verilog: {} of {} nets have a driver", driven_nets, db.num_nets());
+        println!(
+            "ibex verilog: {} of {} nets have a driver",
+            driven_nets,
+            db.num_nets()
+        );
     }
 
     const INV_LEF: &str = r#"
@@ -886,7 +976,8 @@ END INV
 END LIBRARY
 "#;
 
-    const TOP_V: &str = "module top (a, y);\n  input a;\n  output y;\n  INV u1 (.A(a), .Y(y));\nendmodule\n";
+    const TOP_V: &str =
+        "module top (a, y);\n  input a;\n  output y;\n  INV u1 (.A(a), .Y(y));\nendmodule\n";
 
     fn inv_tech() -> TechDb {
         let mut interner = StringInterner::new();
@@ -908,14 +999,18 @@ END LIBRARY
     #[test]
     fn test_one_bit_constant_connection_is_read() {
         let text = TOP_V.replace(".A(a)", ".A(1'h0)");
-        let db = parse_verilog_bytes(text.as_bytes(), &inv_tech(), None).expect("1'h0 is a valid constant");
+        let db = parse_verilog_bytes(text.as_bytes(), &inv_tech(), None)
+            .expect("1'h0 is a valid constant");
         assert_eq!(db.num_cells(), 1);
     }
 
     #[test]
     fn test_wide_constant_connection_is_an_error() {
         let msg = verilog_error(&TOP_V.replace(".A(a)", ".A(4'hF)"));
-        assert!(msg.contains("unsupported Verilog constant or literal `4'hF`"), "{msg}");
+        assert!(
+            msg.contains("unsupported Verilog constant or literal `4'hF`"),
+            "{msg}"
+        );
     }
 
     #[test]
