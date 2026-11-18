@@ -119,6 +119,26 @@ pub enum ExceptionKind {
     Multicycle,
 }
 
+/// Which side of the check a `set_max_delay`/`set_min_delay` constraint applies to:
+/// `Max` replaces the setup (late) clock check, `Min` the hold (early) one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathDelayKind {
+    Max,
+    Min,
+}
+
+/// One `set_max_delay`/`set_min_delay` command, in file order. `from`/`to` are
+/// `None` when the flag was absent (every launch source / every endpoint).
+/// `value_ns` is the signed positional delay; overlapping rules of the same
+/// kind fold last-wins in file order (measured on OpenSTA, `md_overlap*`).
+#[derive(Clone, Debug)]
+pub struct PathDelay {
+    pub kind: PathDelayKind,
+    pub from: Option<ObjSel>,
+    pub to: Option<ObjSel>,
+    pub value_ns: f32,
+}
+
 /// One `set_false_path`/`set_multicycle_path` command, in file order.
 /// `from`/`to` are `None` when the flag was absent (every launch source /
 /// every endpoint). Multicycle counts follow the measured OpenSTA
@@ -232,6 +252,9 @@ pub struct Sdc {
     /// Commands with unsupported qualifiers or unresolvable selectors are not
     /// stored here; they are counted in `ignored_commands` instead.
     pub exceptions: Vec<TimingException>,
+    /// Path-delay constraints (`set_max_delay`, `set_min_delay`) in file
+    /// order, same symbolic-selector treatment as `exceptions`.
+    pub path_delays: Vec<PathDelay>,
     /// Options the parser accepts but does not apply, counted by flag or by descriptive key.
     /// `-lib_cell` and `-pin` restrict a delay to one cell or pin; the model has no per-arc
     /// endpoint matching, so the restriction is dropped and the delay applies to every
@@ -649,6 +672,14 @@ impl Interp {
             }
             "set_multicycle_path" => {
                 self.timing_exception(name, args, ExceptionKind::Multicycle)?;
+                Ok(empty())
+            }
+            "set_max_delay" => {
+                self.path_delay(name, args, PathDelayKind::Max)?;
+                Ok(empty())
+            }
+            "set_min_delay" => {
+                self.path_delay(name, args, PathDelayKind::Min)?;
                 Ok(empty())
             }
             "create_clock" => {
@@ -1384,6 +1415,85 @@ impl Interp {
         Ok(())
     }
 
+    /// `set_max_delay`/`set_min_delay`: a path-delay constraint with a signed
+    /// positional value and symbolic `-from`/`-to` selectors, resolved against
+    /// the design at STA time like timing exceptions. Qualifiers the model
+    /// cannot honour (`-rise`/`-fall`/`-through`/`-early`/`-clock`/...) drop
+    /// the whole command into `ignored_commands` — a half-applied delay
+    /// constraint would silently change reported timing. Measured OpenSTA
+    /// acceptance is recorded in `docs/path-delays.md`.
+    fn path_delay(&mut self, name: &str, args: &[Value], kind: PathDelayKind) -> Result<()> {
+        if args.iter().any(
+            |a| matches!(a, Value::Str(s) if PATH_DELAY_UNSUPPORTED_FLAGS.contains(&s.as_str())),
+        ) {
+            *self
+                .sdc
+                .ignored_commands
+                .entry(name.to_string())
+                .or_default() += 1;
+            return Ok(());
+        }
+        let mut from = None;
+        let mut to = None;
+        let mut value_ns = None;
+        let mut i = 0;
+        while i < args.len() {
+            match &args[i] {
+                Value::Str(s) if s == "-from" || s == "-to" => {
+                    let flag = s.clone();
+                    let slot = if s == "-from" { &mut from } else { &mut to };
+                    if slot.is_some() {
+                        bail!("{name} takes each of -from/-to once");
+                    }
+                    let sel = match args.get(i + 1) {
+                        None => bail!("{name} {flag} needs a value"),
+                        Some(Value::Str(v)) if v.starts_with('-') && !is_negative_number(v) => {
+                            bail!("{name} {flag} needs a value, found `{v}`")
+                        }
+                        Some(
+                            v
+                            @ (Value::Ports(_) | Value::Cells(_) | Value::Pins(_) | Value::Str(_)),
+                        ) => obj_sel(v),
+                        Some(_) => None,
+                    };
+                    match sel {
+                        Some(sel) => *slot = Some(sel),
+                        None => {
+                            *self
+                                .sdc
+                                .ignored_commands
+                                .entry(name.to_string())
+                                .or_default() += 1;
+                            return Ok(());
+                        }
+                    }
+                    i += 2;
+                }
+                Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => {
+                    bail!("unsupported option `{s}`")
+                }
+                Value::Str(s) => {
+                    if value_ns.is_some() {
+                        bail!("{name} takes one delay value, found `{s}`");
+                    }
+                    value_ns = Some(parse_f32(s)?);
+                    i += 1;
+                }
+                _ => bail!("{name} takes a delay value and -from/-to selectors"),
+            }
+        }
+        let Some(value_ns) = value_ns else {
+            bail!("{name} needs a delay value");
+        };
+        self.sdc.path_delays.push(PathDelay {
+            kind,
+            from,
+            to,
+            value_ns,
+        });
+        Ok(())
+    }
+
     fn delay_rule(&mut self, args: &[Value]) -> Result<DelayRule> {
         let sense = match (has_flag(args, "-min"), has_flag(args, "-max")) {
             (true, true) => bail!("a delay takes at most one of -min/-max"),
@@ -1499,6 +1609,33 @@ const EXCEPTION_UNSUPPORTED_FLAGS: [&str; 9] = [
     "-points",
     "-lib_cell",
     "-pin",
+];
+
+/// Qualifiers that make a path-delay command unsupported: the whole
+/// command is counted in `ignored_commands` rather than half-applied.
+/// Superset of the exception list — delay commands additionally take the
+/// `-rise_from`/`-fall_from`/`-rise_to`/`-fall_to` edge qualifiers and the
+/// delay-specific `-early`/`-late`/`-datapath_only`/`-clock` options OpenSTA
+/// either rejects (`STA-0563`) or scopes per edge (unmeasured; `md_through`
+/// shows `-through` resolves but cannot be honoured).
+const PATH_DELAY_UNSUPPORTED_FLAGS: [&str; 17] = [
+    "-through",
+    "-start",
+    "-end",
+    "-rise",
+    "-fall",
+    "-rise_from",
+    "-fall_from",
+    "-rise_to",
+    "-fall_to",
+    "-edge",
+    "-points",
+    "-lib_cell",
+    "-pin",
+    "-early",
+    "-late",
+    "-datapath_only",
+    "-clock",
 ];
 
 /// Command names that produce object selections. Ones the model does not
@@ -1777,8 +1914,105 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_commands() {
-        assert!(parse_sdc("set_max_delay 1.0 -from a -to b\n").is_err());
         assert!(parse_sdc("frobnicate the_things\n").is_err());
+    }
+
+    #[test]
+    fn parses_path_delay_commands() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_max_delay 1.0 -from [get_cells u1] -to [get_cells u2]\n\
+             set_min_delay -0.5 -from [all_registers]\n\
+             set_max_delay 2.5 -to [get_ports y]\n\
+             set_min_delay 0.1\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.path_delays.len(), 4);
+        let pd = &sdc.path_delays;
+        assert_eq!(pd[0].kind, PathDelayKind::Max);
+        assert_eq!(pd[0].value_ns, 1.0);
+        assert!(matches!(
+            pd[0].from,
+            Some(ObjSel::Cells(CellSel::Cells(ref n))) if *n == ["u1"]
+        ));
+        assert!(matches!(
+            pd[0].to,
+            Some(ObjSel::Cells(CellSel::Cells(ref n))) if *n == ["u2"]
+        ));
+        assert_eq!(pd[1].kind, PathDelayKind::Min);
+        assert_eq!(pd[1].value_ns, -0.5);
+        assert!(matches!(
+            pd[1].from,
+            Some(ObjSel::Cells(CellSel::AllRegisters))
+        ));
+        assert!(pd[1].to.is_none());
+        assert!(pd[2].from.is_none());
+        assert!(matches!(
+            pd[2].to,
+            Some(ObjSel::Ports(PortSel::Ports(ref n))) if *n == ["y"]
+        ));
+        assert!(pd[3].from.is_none() && pd[3].to.is_none());
+    }
+
+    #[test]
+    fn path_delay_unsupported_qualifiers_are_ignored_not_fatal() {
+        for snippet in [
+            "set_max_delay 1.0 -through [get_cells u1] -from a -to b",
+            "set_min_delay 0.5 -rise -from a",
+            "set_max_delay 1.0 -rise_from [get_cells u1] -to b",
+            "set_min_delay 0.5 -fall_to [get_ports y]",
+            "set_max_delay 1.0 -edge 1 -from a",
+            "set_min_delay 0.5 -points u1 -to b",
+            "set_max_delay 1.0 -lib_cell BUF -from a",
+            "set_min_delay 0.5 -pin u1/D -to b",
+            "set_max_delay 1.0 -early -from a",
+            "set_min_delay 0.5 -late -from a",
+            "set_max_delay 1.0 -datapath_only -from a",
+            "set_min_delay 0.5 -clock core_clk -from a",
+            "set_max_delay 1.0 -start -from a",
+            "set_min_delay 0.5 -end -to b",
+        ] {
+            let sdc = parse_sdc(&format!("{GCD}{snippet}\n")).unwrap();
+            assert!(sdc.path_delays.is_empty(), "stored: {snippet}");
+            let counted = sdc
+                .ignored_commands
+                .get("set_max_delay")
+                .copied()
+                .unwrap_or(0)
+                + sdc
+                    .ignored_commands
+                    .get("set_min_delay")
+                    .copied()
+                    .unwrap_or(0);
+            assert_eq!(counted, 1, "not counted: {snippet}");
+        }
+    }
+
+    #[test]
+    fn path_delay_needs_a_value() {
+        assert!(parse_sdc(&format!("{GCD}set_max_delay -from a -to b\n")).is_err());
+        assert!(parse_sdc(&format!("{GCD}set_min_delay\n")).is_err());
+        assert!(parse_sdc(&format!("{GCD}set_max_delay 1.0 2.0\n")).is_err());
+        assert!(parse_sdc(&format!("{GCD}set_min_delay 0.5 -from\n")).is_err());
+        assert!(parse_sdc(&format!("{GCD}set_max_delay 1.0 -from a -from b\n")).is_err());
+        assert!(parse_sdc(&format!("{GCD}set_min_delay 0.5 -bogus x\n")).is_err());
+    }
+
+    #[test]
+    fn path_delay_unresolvable_selectors_are_ignored_not_fatal() {
+        for snippet in [
+            "set_max_delay 1.0 -from [get_clocks core_clk] -to [get_cells u1]",
+            "set_min_delay 0.5 -to [all_clocks]",
+            "set_max_delay 1.0 -from [select_cells u1]",
+        ] {
+            let sdc = parse_sdc(&format!("{GCD}{snippet}\n")).unwrap();
+            assert!(sdc.path_delays.is_empty(), "stored: {snippet}");
+            assert!(
+                sdc.ignored_commands.contains_key("set_max_delay")
+                    || sdc.ignored_commands.contains_key("set_min_delay"),
+                "not counted: {snippet}"
+            );
+        }
     }
 
     #[test]

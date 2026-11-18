@@ -1,9 +1,13 @@
 # Path delay constraints (`set_max_delay` / `set_min_delay`)
 
-Status: design probe complete, implementation pending. This document records the
-OpenSTA semantics measured on the `sta_exceptions` fixture (see
-`tests/designs/sta_exceptions/generate_ref.sh`) and the proposed implementation
-shape. Nothing here is implemented yet.
+Status: **implemented v1** (2026-11-18) — parser, delay-domain state and
+composition live in `crates/grus-core/src/sta/{sdc,analysis}.rs`; every
+committed `md_*`/`pmd_*`/`mhu_*` scenario matches OpenSTA
+(`test_sta_exceptions_match_opensta`). This document records the OpenSTA
+semantics measured on the `sta_exceptions` fixture (see
+`tests/designs/sta_exceptions/generate_ref.sh`) and the implementation shape.
+Sections 3's "v1 diagnoses" and "explicitly out of scope" lists still apply;
+the follow-ups in section 5 are open.
 
 ## 1. What OpenSTA does (measured)
 
@@ -294,21 +298,27 @@ Resolved by review + additional probing (2026-11-18):
 - ~~command-order precedence~~ — order-independent delay-over-MCP,
   file-order last-wins within a constraint type (new golden scenarios).
 
+Resolved by the v1 implementation (2026-11-18):
+
+- ~~`delay_launch` seed pairing~~ — the late clock-pin arrival
+  (`clk_state.arrival_max[edge]`) for sequential launches; verified against
+  `pmd_*`/`md_*` goldens.
+- ~~Port launch reference~~ — `input_clock_latency_ns`, the same I/O clock
+  anchor the port's own input delay uses (`md_port`/`md_minport` match). The
+  propagated-clock port anchor (source latency vs propagated clock-port
+  arrival) is unverified — no golden exercises it.
+- ~~`delay_max` tie-breaking~~ — keep-first implemented, matching the
+  arrival merge order; OpenSTA tie-break remains unmeasured.
+- ~~Signature-class split~~ — implemented as chosen: delay coverage joins
+  the exception signature.
+
 Still open:
 
-1. `delay_launch` seed pairing: clock-pin `arrival_max` vs `arrival_min` per
-   edge/transition — implement with the late arrival for max-side seeds,
-   verify against `pmd_*`/`md_*` goldens.
-2. Port launch reference: exact anchor for `io_clock_ref` (clk port arrival vs
-   ideal edge + source latency; `ClockRef::Virtual` fallback). Candidate
-   measured: 0.528237 for `d_in`.
-3. Tie-breaking when two paths share `delay_max`: keep-first vs min-launch —
-   unmeasured; pick keep-first (matches arrival merge) and document.
-4. Skewed two-clock fixture for `set_min_delay` launch-vs-capture anchoring
+1. Skewed two-clock fixture for `set_min_delay` launch-vs-capture anchoring
    (single-clock-net fixture cannot fully discriminate); async-reset
    endpoint probe; latch-borrow delay fixture — all need DEF/SDC additions.
-5. Output-port delay semantics (formulas measured ad hoc in section 1;
+2. Output-port delay semantics (formulas measured ad hoc in section 1;
    dedicated scenarios + multi-source probing before implementing).
-6. Whether delay coverage should split signature classes (chosen: yes) vs.
-   computing delay state for all sources and masking at composition (rejected:
-   per-source coverage info is lost in aggregates).
+3. A two-driver fixture so the delay-winner vs arrival-winner divergence is
+   exercised by golden data (section 4's honest-coverage note).
+4. Propagated-clock input-port launch anchor (see above).

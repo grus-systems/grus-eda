@@ -255,18 +255,26 @@ Done since (`0711785`, `32abb45`, exception application):
   Unsupported qualifiers (`-through`, `-rise`, clock selectors, …) and
   `-both` are counted in `ignored_commands`; latch-D/clock-gate multicycle
   endpoints are counted in `unsupported_multicycle_endpoints`.
-  `set_max_delay`/`set_min_delay` remain rejected pending the path-delay
-  design (`docs/path-delays.md` — OpenSTA semantics measured on
-  `tests/designs/sta_exceptions/`, implementation not started).
+
+Done since (path-delay checks, `docs/path-delays.md`):
+
+- `set_max_delay`/`set_min_delay` with the same `-from`/`-to` selector set:
+  `PinTimingState` carries a per-transition delay domain (`arrival` minus
+  launch-clock arrival, propagated on the same arcs) that replaces the
+  clock check on the covered side — measured precedence false_path >
+  delay > multicycle, file-order last-wins within a kind. Unsupported
+  qualifiers and out-of-model endpoints (output ports, clock gates,
+  latch-D, async checks) are counted, never silently applied
+  (`unsupported_path_delay_endpoints`).
 
 Remaining:
 
 - `get_pins`/`get_nets`/`all_fanouts` selections in *other* commands
-  (`set_load`, `set_fanout_load`), and `set_max/min_delay` implementation
-  per `docs/path-delays.md` (delay-domain arrival state + composition).
-  These select pins/nets the port-based delay model cannot honour yet;
-  options are symbolic selections plus counted-skip, or deferring until
-  a stage needs them.
+  (`set_load`, `set_fanout_load`), and the path-delay follow-ups in
+  `docs/path-delays.md` section 5 (output-port delay checks, two-driver
+  and latch fixtures). These select pins/nets the port-based delay model
+  cannot honour yet; options are symbolic selections plus counted-skip,
+  or deferring until a stage needs them.
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 

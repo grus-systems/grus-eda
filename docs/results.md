@@ -2031,3 +2031,56 @@ route the whole command to `ignored_commands`.
 
 **Regression**: 247 lib tests + 3 integration tests pass; ordinary SDCs
 take the unpartitioned path unchanged (`sdc.exceptions.is_empty()`).
+
+### 2026-11-18 — N2 — `set_max_delay` / `set_min_delay` (delay checks)
+
+Implements `docs/path-delays.md` (v2, reviewed): `PinTimingState` gains a
+per-transition delay domain — `delay_max` (`arrival` minus launch-clock
+arrival, propagated over the same late arc and wire delays, seeded at the
+launch arc's `t_cq`) plus `delay_launch_max` (the winning path's raw launch
+arrival: the late clock-pin arrival for sequential launches, the I/O clock
+reference `input_clock_latency_ns` for input-port launches). Delay coverage
+joins the exception signature, so each signature class's eval run keeps the
+covered sources' delay state separate; `run_sta_partitioned` composes per
+endpoint with measured precedence false_path > delay > multicycle, per side
+independently. Latch `D -> Q` borrow arcs clamp the reconstructed absolute
+arrival (`launch + delay`) and re-derive the delay — no latch fixture covers
+this yet (path-delays.md section 5).
+
+**Reference**: `exceptions.reference.json` — OpenSTA `report_timing` inside
+the pinned LibreLane image via the committed `generate_ref.sh`; 28
+`md_*`/`mhu_*`/`pmd_*` scenarios on the 3-FF fixture.
+
+**Comparison** (`cargo test -p grus-core test_sta_exceptions_match_opensta`,
+endpoint-level: 8 fields + WNS/TNS + violation counts per endpoint):
+
+- All 61 OpenSTA-parseable scenarios match within STRICT-class tolerances
+  (rel 1%, abs 5 ps), including every delay variant: replace semantics at
+  `N = 0.3/0.5/1.0/2.0/5.0` (`md_tight`…`md_loose`), file-order last-wins
+  (`md_overlap`/`md_overlap_rev`, both directions), order-independent delay
+  over multicycle (`md_mc`, `md_mc_rev`), min-side pre-MCP required
+  (`md_min_mcp_h1`, `md_min_mcp_s2`), port-source launches (`md_port`,
+  `md_minport`), pin selectors (`md_pin`), universal `-from` (`md_nofrom`),
+  propagated clock (`pmd_basic`, `pmd_min`, `pmd_multi`) and hold-uncertainty
+  0.5 (`mhu_*`).
+- `md_early`/`md_datapath` are OpenSTA rejection records (our parser counts
+  them in `ignored_commands`); `md_through` exercises the qualifier-diagnostic
+  path — `-through` is unsupported, the whole command is counted ignored.
+- Fail-proof check: flipping the delay formulas (`req - N` on the max side,
+  `req - N` on the min side) turns the test red on `md_basic`; restored.
+
+**Honest coverage note** (carried from the design doc): every fixture
+endpoint has a single launch source, so the delay-winner vs arrival-winner
+divergence that `delay_launch_max` exists for is covered by construction and
+by `test_delay_merge_tracks_the_delay_winner_launch`, not by golden data —
+a two-driver fixture is listed as follow-up.
+
+**Diagnostics**: `unsupported_path_delay_endpoints` counts delay rules
+covering output ports, clock-gate enables, latch-D and async recovery/removal
+endpoints, which keep their clock-check values. The 17-qualifier
+`PATH_DELAY_UNSUPPORTED_FLAGS` list routes the whole command to
+`ignored_commands` (never half-applied).
+
+**Regression**: full `cargo test -p grus-core` passes (255 lib tests);
+ordinary SDCs take the unpartitioned path unchanged when
+`sdc.path_delays.is_empty()`.
