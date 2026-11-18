@@ -213,6 +213,4 @@ the full repository at HEAD; read the referenced code to verify the claims
 above (especially the "Launch sources", "Filtering mechanics", "Composition
 rules" and "CRPR safety" sections). Answer the seven open questions and flag
 any correctness hole in the multi-run approach. Do not modify files.
--->
-</content>
-</invoke><|end_message|><|message_model|><|content_thinking|>Now commit the doc, write the review brief, and launch both reviews.<|end_message|><|message_model|>exec<|content_invoke_tool_json|>{
+--><|end_message|><|message_model|><|content_thinking|>Now commit the doc, write the review brief, and launch both reviews.<|end_message|><|message_model|>exec<|content_invoke_tool_json|>{
