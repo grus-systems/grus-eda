@@ -2127,7 +2127,12 @@ gain the mux delay and the `sel`/`u_ff2` candidates everywhere; `fp_uf0_uf1`
 now reports `u_ff1/D` (survives via `u_ff2`/`sel`); `exc_diag`'s report
 winner is the unshifted `u_ff2`/`sel` clock check (req 2.550057) — the
 `-setup 2` shift still applies to the `u_ff0` class candidate but loses
-the min-slack pick (diagnostics test updated accordingly).
+the min-slack pick (diagnostics test updated accordingly). One fixture
+intent did not hold: `sel`'s `-max 0.3` was meant to keep `base`'s
+`u_ff1/D` max report on an FF path, but the port launch (arr 1.313326)
+beats both FF arrivals (`u_ff2` 1.277188) and wins that report —
+harmless, since every delay probe still wins its own scenario, but the
+`base` `u_ff1/D` max row now measures a port-launched path.
 
 **Winner-pairing outcome**: the delay winner (`u_ff2`, ~10 ps larger path
 delay via `A1`) is also the arrival winner — its ~8.5 ps earlier launch on

@@ -8394,9 +8394,12 @@ mod tests {
     /// split clock buffers) plus 72 SDC scenarios.
     /// `exceptions.reference.json` was emitted by the committed
     /// `generate_ref.sh` running OpenSTA inside the pinned LibreLane image.
-    /// The two `error` scenarios are SDC forms OpenSTA's own parser rejects
-    /// (`-setup X -hold Y` on one command, `-both`); our parser accepts them
-    /// as valid SDC, so they are checked for diagnostics instead of numbers.
+    /// Four scenarios carry `error` records: a combined `-setup X -hold Y`
+    /// on one command trips OpenSTA's Tcl wrapper (`mc_setup2_hold1`), and
+    /// the `-both` (`mc_both`), `-early` (`md_early`) and `-datapath_only`
+    /// (`md_datapath`) qualifiers are rejected `STA-0563`; our parser
+    /// accepts all of them, so they are checked for diagnostics instead of
+    /// numbers.
     #[test]
     fn test_sta_exceptions_match_opensta() {
         let lib_dir = sky130_hd();

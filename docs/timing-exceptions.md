@@ -159,7 +159,10 @@ shifts measured per endpoint (`u_ff1/D`, the only MCP target):
   (hold only; semantics above).
 - **Precedence**: a later exception on the same path replaces an earlier
   one (`-setup 2` then `-setup 3` → `N_setup = 3`). `set_false_path`
-  beats `set_multicycle_path` on the same path (endpoint disappears).
+  beats `set_multicycle_path` on the same path — the covered source's
+  candidate disappears; the endpoint itself drops only when every launch
+  source is covered (`u_ff1/D` survives `fp_uf0_uf1` via `u_ff2`/`sel`,
+  `fp_to_y` removes `y`).
 - **Endpoint coverage**: MCP applies to FF-D checks *and* output-port
   checks (`-to [get_ports y]` shifted `y` req by `+1T` on both sides).
   `-from` omitted = all launch sources.
