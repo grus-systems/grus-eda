@@ -72,14 +72,27 @@ struct SignalDecl {
     /// (left, right) index bounds for vectors; `None` for scalars.
     range: Option<(i64, i64)>,
     nbits: usize,
+    /// `$scope` nesting depth at declaration; Icarus reuses identifier codes in
+    /// sibling scopes, so the shallowest declaration names the shared stream.
+    depth: usize,
+}
+
+/// Header-parse state shared by `$var`/`$scope`/`$upscope` items.
+struct VcdHeaders {
+    decls: HashMap<String, SignalDecl>,
+    /// Per-identifier last definite state, one slot per bit.
+    last_state: HashMap<String, Vec<u8>>,
+    scope_depth: usize,
 }
 
 /// Parses VCD text into per-signal edge counts.
 pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
     let timescale_s = parse_timescale(text)?;
-    let mut decls: HashMap<String, SignalDecl> = HashMap::new();
-    // Per-identifier last definite state, one slot per bit.
-    let mut last_state: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut headers = VcdHeaders {
+        decls: HashMap::new(),
+        last_state: HashMap::new(),
+        scope_depth: 0,
+    };
     let mut signals: HashMap<String, SignalActivity> = HashMap::new();
     let mut first_ts: Option<u64> = None;
     let mut last_ts: u64 = 0;
@@ -98,7 +111,7 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
             pending.push_str(line);
             if line.contains("$end") {
                 let item = std::mem::take(&mut pending);
-                handle_header_item(&item, &mut decls, &mut last_state)?;
+                handle_header_item(&item, &mut headers)?;
             }
             continue;
         }
@@ -109,7 +122,7 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
             }
             if line.starts_with('$') {
                 if line.contains("$end") {
-                    handle_header_item(line, &mut decls, &mut last_state)?;
+                    handle_header_item(line, &mut headers)?;
                 } else {
                     pending.push_str(line);
                 }
@@ -130,9 +143,9 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
             continue; // $dumpvars/$dumpoff/$dumpon/$end/$finish
         }
         if let Some((v, id)) = parse_scalar_change(line) {
-            apply_change(v, id, &decls, &mut last_state, &mut signals);
+            apply_change(v, id, &headers.decls, &mut headers.last_state, &mut signals);
         } else if let Some((bits, id)) = parse_vector_change(line) {
-            apply_vector_change(bits, id, &decls, &mut last_state, &mut signals);
+            apply_vector_change(bits, id, &headers.decls, &mut headers.last_state, &mut signals);
         }
         // Anything else (r<real>, malformed) is ignored.
     }
@@ -149,25 +162,23 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
 }
 
 /// Handles one complete header item (`$end` already included in `item`).
-fn handle_header_item(
-    item: &str,
-    decls: &mut HashMap<String, SignalDecl>,
-    last_state: &mut HashMap<String, Vec<u8>>,
-) -> Result<()> {
+fn handle_header_item(item: &str, headers: &mut VcdHeaders) -> Result<()> {
     let item = item.trim();
-    if item.starts_with("$var") {
-        parse_var_decl(item, decls, last_state)
+    if item.starts_with("$scope") {
+        headers.scope_depth += 1;
+        Ok(())
+    } else if item.starts_with("$upscope") {
+        headers.scope_depth = headers.scope_depth.saturating_sub(1);
+        Ok(())
+    } else if item.starts_with("$var") {
+        parse_var_decl(item, headers)
     } else {
-        Ok(()) // $scope/$upscope/$comment/$date/$version/$timescale: not needed per-signal
+        Ok(()) // $comment/$date/$version/$timescale: not needed per-signal
     }
 }
 
 /// `$var <type> <size> <id> <name> [<msb> <lsb>] $end`
-fn parse_var_decl(
-    item: &str,
-    decls: &mut HashMap<String, SignalDecl>,
-    last_state: &mut HashMap<String, Vec<u8>>,
-) -> Result<()> {
+fn parse_var_decl(item: &str, headers: &mut VcdHeaders) -> Result<()> {
     let body = item
         .trim_start_matches("$var")
         .trim_end_matches("$end")
@@ -214,8 +225,27 @@ fn parse_var_decl(
         Some((a, b)) => (a - b).unsigned_abs() as usize + 1,
         None => 1,
     };
-    decls.insert(id.to_string(), SignalDecl { name, range, nbits });
-    last_state.insert(id.to_string(), vec![2u8; nbits]);
+    let id_key = id.to_string();
+    // Icarus reuses identifier codes across sibling scopes; value changes cannot
+    // distinguish them, so one stream feeds whichever declaration we keep. The
+    // shallowest scope is the design-level net name (`clk`, not a cell's `CLK`).
+    match headers.decls.get(&id_key) {
+        Some(existing) if existing.depth <= headers.scope_depth => {}
+        _ => {
+            headers.decls.insert(
+                id_key.clone(),
+                SignalDecl {
+                    name,
+                    range,
+                    nbits,
+                    depth: headers.scope_depth,
+                },
+            );
+            headers
+                .last_state
+                .insert(id_key, vec![2u8; nbits]);
+        }
+    }
     Ok(())
 }
 
@@ -483,6 +513,29 @@ $finish
             .expect("escaped name");
         assert_eq!(s.rise, 1);
         assert!(!act.signals.contains_key("dpath.a_lt_b$in"));
+    }
+
+    #[test]
+    fn test_scope_reused_identifier() {
+        // Icarus reuses identifier codes in sibling scopes: `!` names the top-level
+        // `clk` and every cell's `CLK` pin. Value changes cannot tell them apart;
+        // the shallowest declaration supplies the name.
+        let vcd = "$timescale 1ns $end\n\
+                   $scope module dut $end\n\
+                   $var wire 1 ! clk $end\n\
+                   $upscope $end\n\
+                   $scope module _1_ $end\n\
+                   $var wire 1 ! CLK $end\n\
+                   $upscope $end\n\
+                   $scope module _2_ $end\n\
+                   $var wire 1 ! CLK $end\n\
+                   $upscope $end\n\
+                   $enddefinitions $end\n\
+                   #0\n0!\n#5\n1!\n#10\n0!\n";
+        let act = parse_vcd(vcd).expect("parse");
+        let s = act.signals.get("clk").expect("clk");
+        assert_eq!((s.rise, s.fall), (1, 1));
+        assert!(!act.signals.contains_key("CLK"));
     }
 
     #[test]
