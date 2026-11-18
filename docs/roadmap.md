@@ -245,8 +245,9 @@ Done (`8f5eccc`, `44131bd`):
 Done since (`0711785`, `32abb45`, exception application):
 
 - `set_false_path` / `set_multicycle_path` with `get_cells`,
-  `all_registers`, `get_ports`, `all_inputs`, `all_outputs` and bare-name
-  selectors, resolved after design load. STA runs once per exception
+  `all_registers`, `get_ports`, `all_inputs`, `all_outputs`, `get_pins`
+  and bare-name/`instance/pin` selectors, resolved after design load.
+  STA runs once per exception
   signature class (prepare/eval split; slew stays unfiltered) and
   endpoint reports are composed — false paths drop covered launch classes,
   multicycles shift required times by the OpenSTA-measured formulas
@@ -258,12 +259,13 @@ Done since (`0711785`, `32abb45`, exception application):
 
 Remaining:
 
-- Other object-producing selections (`get_pins`, `get_nets`, `all_fanouts`,
-  …) and `set_max/min_delay`. These select pins/nets/checks the
-  port-based delay model cannot honour, and `parse_sdc` runs without the
-  design, so names cannot be resolved at parse time. Options: symbolic
-  selections plus counted-skip of the consuming constraint, or deferring
-  until a stage needs them.
+- `get_pins`/`get_nets`/`all_fanouts` selections in *other* commands
+  (`set_load`, `set_fanout_load`, `set_max/min_delay`), and
+  `set_max/min_delay` themselves — path-delay checks need per-source
+  launch times, a larger design than the exception partitioning. These
+  select pins/nets the port-based delay model cannot honour yet; options
+  are symbolic selections plus counted-skip, or deferring until a stage
+  needs them.
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 

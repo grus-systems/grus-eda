@@ -2012,6 +2012,15 @@ a 3-FF fixture (period 2.0 ns).
 - `mc_both`: `-both` is counted in `sdc_ignored_commands` (OpenSTA
   `STA-0563`; semantics unverifiable), never applied.
 
+**Pin selectors (follow-up, same fixture)**: `get_pins` and bare
+`instance/pin` specs in `-from`/`-to` — 17 more scenarios regenerated via
+the committed `generate_ref.sh`. Measured OpenSTA semantics: the launch
+object is the sequential cell's **clock pin** (`-from [get_pins u_ff0/CLK]`
+cuts the path; `u_ff0/Q`, `u_ff0/D` cover nothing), the capture object is
+the endpoint pin (`-to [get_pins u_ff1/D]` matches). `get_pins` on a bare
+instance or a port name resolves empty. All 34 OpenSTA-parseable
+scenarios now match endpoint-by-endpoint.
+
 **Diagnostics**: `false_path_endpoints` counts removed endpoints (exempt
 from `is_clean` — a declared exception, not a modelling gap);
 `unresolved_exception_selectors` counts unknown names and selectors

@@ -172,6 +172,15 @@ measured per endpoint (`u_ff1/D`, the only MCP target):
   launches (`fp_allregs` left the `d_in`→D hold violations intact);
   `-from [get_ports d_in]` removed exactly those endpoints. Confirms the
   signature-class design: `all_registers` is not a universal source set.
+- **Pin selectors** (`get_pins`, bare `inst/pin`; 14 more scenarios):
+  OpenSTA's launch objects are the sequential cells' **clock pins** —
+  `-from [get_pins u_ff0/CLK]` removes the path, `-from [get_pins
+  u_ff0/Q]` and `-from [get_pins u_ff0/D]` cover nothing. On the capture
+  side `-to [get_pins u_ff1/D]` matches the D endpoint. `get_pins u_ff0`
+  (bare instance), `get_pins d_in`/`get_pins clk` (port names) and
+  `get_pins u_ff0/NOPE`/`u_nope/CLK` all resolve empty → dead exception,
+  baseline timing. Bare `u_ff0/CLK`/`u_ff1/D` behave identically to the
+  `get_pins` forms.
 
 ### Multicycle endpoint-kind limit (v1)
 
@@ -202,8 +211,11 @@ regression test covers it.
 - New symbolic selectors resolved after design load: `get_cells`,
   `all_registers` (new `Value` variant with `PortSel`-style `Except`
   composition for `remove_from_collection`); `get_ports`, `all_inputs`,
-  `all_outputs` reuse `PortSel`; bare names (`-from a`) resolve against both
-  ports and cells at design time.
+  `all_outputs` reuse `PortSel`; `get_pins` and bare `instance/pin` names
+  become `ObjSel::Pins`, resolved to cell pins via an `inst/pin` ->
+  `PinId` map — `-from` keeps only pins that launch (clock/enable pins,
+  mapped to their launch keys), `-to` keeps endpoint pins; bare names
+  (`-from a`) resolve against both namespaces once the design is loaded.
 - Clock-object selectors (`get_clocks`, `all_clocks`) in `-from`/`-to`:
   **v1 → whole command to `ignored_commands`** — launch keys carry no clock
   attribution today and multi-clock SDC is already unsupported.
@@ -288,8 +300,9 @@ Implemented per this design, in three commits:
   the composed endpoint set.
 
 Verification: `test_sta_exceptions_match_opensta` deserializes
-`exceptions.reference.json` and compares all 17 OpenSTA-parseable scenarios
-endpoint-by-endpoint (8 fields + WNS/TNS + violation counts);
+`exceptions.reference.json` and compares every OpenSTA-parseable scenario
+endpoint-by-endpoint (8 fields + WNS/TNS + violation counts) — 34
+scenarios including the pin-selector set;
 `test_sta_exception_diagnostics` covers false-path removal counts,
 unresolved selectors, and `-both` accounting. `mc_setup2_hold1` (valid SDC
 OpenSTA rejects) and `mc_both` are exercised for diagnostics only.

@@ -96,12 +96,17 @@ impl CellSel {
 }
 
 /// A `-from`/`-to` object selection of a timing exception, kept symbolic:
-/// ports, cells, or bare names resolved against both namespaces once the
-/// design is loaded.
+/// ports, cells, pins, or bare names resolved against both namespaces once
+/// the design is loaded.
 #[derive(Clone, Debug)]
 pub enum ObjSel {
     Ports(PortSel),
     Cells(CellSel),
+    /// `get_pins` or bare `instance/pin` specs. Measured OpenSTA semantics:
+    /// only sequential cells' clock pins (and latch enables) are launch
+    /// objects, and only endpoint pins are capture objects — a `Q`/`D` pin
+    /// spec resolves but covers nothing.
+    Pins(Vec<String>),
     /// Bare words (`-from u_ff0`): matched against port and cell names at
     /// resolution time. An empty list came from an empty selector and must
     /// be diagnosed at resolution, not treated as absent.
@@ -391,7 +396,9 @@ enum Value {
     Ports(PortSel),
     Clocks(Vec<String>),
     Cells(CellSel),
-    /// A selection the model cannot represent (`get_pins`, `select_*`, a
+    /// `get_pins`: `instance/pin` specs, symbolic until the design is known.
+    Pins(Vec<String>),
+    /// A selection the model cannot represent (`select_*`, a
     /// malformed selector). Selector combinators propagate it; exception
     /// commands count it as ignored instead of failing the whole SDC.
     Opaque,
@@ -615,6 +622,10 @@ impl Interp {
                 Err(_) => Value::Opaque,
             }),
             "get_cells" | "get_instance" | "get_inst" => Ok(self.cells_sel(args)),
+            "get_pins" => Ok(match plain_names(args) {
+                Ok(names) => Value::Pins(names),
+                Err(_) => Value::Opaque,
+            }),
             "all_registers" => Ok(match args {
                 [] => Value::Cells(CellSel::AllRegisters),
                 _ => Value::Opaque,
@@ -1176,6 +1187,21 @@ impl Interp {
         {
             return Ok(Value::Opaque);
         }
+        // Pin specs only subtract from other pin specs: mixing namespaces
+        // (`remove_from_collection [get_pins ...] [get_cells ...]`) cannot be
+        // honoured name-wise, so it degrades to opaque like any other
+        // unrepresentable selection.
+        let pins_in_objects = objects.iter().any(|a| matches!(a, Value::Pins(_)));
+        if pins_in_objects && !matches!(collection, Value::Pins(_)) {
+            return Ok(Value::Opaque);
+        }
+        if matches!(collection, Value::Pins(_))
+            && objects
+                .iter()
+                .any(|a| matches!(a, Value::Cells(_) | Value::Ports(_) | Value::Clocks(_)))
+        {
+            return Ok(Value::Opaque);
+        }
         let mut removed: Vec<String> = Vec::new();
         for arg in objects {
             match arg {
@@ -1188,6 +1214,7 @@ impl Interp {
                     bail!("remove_from_collection cannot subtract a predicate selection")
                 }
                 Value::Clocks(names) => removed.extend(names.iter().cloned()),
+                Value::Pins(names) => removed.extend(names.iter().cloned()),
                 Value::Str(text) => removed.extend(text.split_whitespace().map(str::to_string)),
                 Value::Opaque => unreachable!(),
             }
@@ -1197,6 +1224,13 @@ impl Interp {
         match collection {
             Value::Ports(sel) => Ok(Value::Ports(sel.clone().without(&removed))),
             Value::Cells(sel) => Ok(Value::Cells(sel.clone().without(&removed))),
+            Value::Pins(specs) => Ok(Value::Pins(
+                specs
+                    .iter()
+                    .filter(|s| !removed.contains(*s))
+                    .cloned()
+                    .collect(),
+            )),
             Value::Clocks(names) => Ok(Value::Clocks(
                 names
                     .iter()
@@ -1256,7 +1290,10 @@ impl Interp {
                         Some(Value::Str(v)) if v.starts_with('-') && !is_negative_number(v) => {
                             bail!("{name} {flag} needs a value, found `{v}`")
                         }
-                        Some(v @ (Value::Ports(_) | Value::Cells(_) | Value::Str(_))) => obj_sel(v),
+                        Some(
+                            v
+                            @ (Value::Ports(_) | Value::Cells(_) | Value::Pins(_) | Value::Str(_)),
+                        ) => obj_sel(v),
                         // Clock objects and opaque selections cannot be
                         // honoured by the exception model: the whole command
                         // is counted ignored.
@@ -1477,6 +1514,7 @@ fn obj_sel(v: &Value) -> Option<ObjSel> {
     match v {
         Value::Ports(sel) => Some(ObjSel::Ports(sel.clone())),
         Value::Cells(sel) => Some(ObjSel::Cells(sel.clone())),
+        Value::Pins(specs) => Some(ObjSel::Pins(specs.clone())),
         Value::Str(text) => Some(ObjSel::Names(
             text.split_whitespace().map(str::to_string).collect(),
         )),
@@ -1849,8 +1887,8 @@ mod tests {
             "set_false_path -from [get_clocks core_clk] -to [get_cells u1]",
             "set_multicycle_path -setup 2 -to [all_clocks]",
             // Nested selectors the model cannot represent stay opaque.
-            "set_false_path -from [get_pins u1/A] -to b",
             "set_multicycle_path -setup 2 -from [select_cells u1]",
+            // Pin specs cannot subtract from a port collection.
             "set_false_path -from [remove_from_collection [all_inputs] [get_pins u1/A]]",
         ] {
             let sdc = parse_sdc(&format!("{GCD}{snippet}\n")).unwrap();
@@ -1873,6 +1911,34 @@ mod tests {
         assert_eq!(sdc.exceptions[0].kind, ExceptionKind::FalsePath);
         assert_eq!(sdc.exceptions[0].setup_n, None);
         assert!(sdc.exceptions[0].hold_n.is_none());
+    }
+
+    #[test]
+    fn parses_pin_selectors_in_exceptions() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_false_path -from [get_pins {{u1/CLK u2/CLK}}] -to [get_pins u3/D]\n\
+             set_multicycle_path -setup 2 -from u_ff0/CLK -to u_ff1/D\n\
+             set_false_path -from [remove_from_collection [get_pins {{u1/CLK u2/CLK}}] [get_pins u1/CLK]] -to b\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.exceptions.len(), 3);
+        assert!(matches!(
+            sdc.exceptions[0].from,
+            Some(ObjSel::Pins(ref s)) if s.as_slice() == ["u1/CLK", "u2/CLK"]
+        ));
+        assert!(matches!(
+            sdc.exceptions[0].to,
+            Some(ObjSel::Pins(ref s)) if *s == ["u3/D"]
+        ));
+        // Bare `instance/pin` names are pin specs too.
+        assert!(matches!(
+            sdc.exceptions[1].from,
+            Some(ObjSel::Names(ref s)) if s.iter().any(|n| n == "u_ff0/CLK")
+        ));
+        assert!(matches!(
+            sdc.exceptions[2].from,
+            Some(ObjSel::Pins(ref s)) if *s == ["u2/CLK"]
+        ));
     }
 
     #[test]

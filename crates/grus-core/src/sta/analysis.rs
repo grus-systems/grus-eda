@@ -2617,6 +2617,14 @@ struct ExceptionCtx<'p, 'd> {
     eps_by_cell: HashMap<CellId, Vec<u32>>,
     output_ports: Vec<u32>,
     ep_kinds: HashMap<u32, ExceptionEndpointKind>,
+    /// `instance/pin` -> PinId for every cell pin (`get_pins` and bare pin
+    /// specs resolve through this; port pins are not in it, matching
+    /// OpenSTA where `get_pins <port>` returns nothing usable).
+    pin_by_path: HashMap<String, u32>,
+    /// Sequential clock/enable pin -> the launch keys it launches. Measured
+    /// OpenSTA semantics: `-from [get_pins inst/CLK]` selects the launches,
+    /// while `inst/Q` and `inst/D` cover nothing.
+    clk_launch: HashMap<u32, Vec<u32>>,
     unresolved: usize,
 }
 
@@ -2658,6 +2666,34 @@ impl ExceptionCtx<'_, '_> {
         }
     }
 
+    /// Launch keys covered by one `instance/pin` spec. Measured OpenSTA
+    /// semantics: only a sequential cell's clock/enable pin is a launch
+    /// object — `inst/Q` and `inst/D` resolve but cover nothing. Unknown
+    /// specs count as unresolved.
+    fn pin_launches(&mut self, spec: &str, out: &mut HashSet<u32>) {
+        match self.pin_by_path.get(spec) {
+            Some(&pid) => {
+                if let Some(qs) = self.clk_launch.get(&pid) {
+                    out.extend(qs.iter().copied());
+                }
+            }
+            None => self.unresolved += 1,
+        }
+    }
+
+    /// Endpoint pins covered by one `instance/pin` spec: the pin must exist
+    /// and be an endpoint (check data pin, clock-gate enable). Unknown specs
+    /// count as unresolved.
+    fn pin_endpoints(&mut self, spec: &str, out: &mut HashSet<u32>) {
+        match self.pin_by_path.get(spec) {
+            Some(&pid) if self.endpoint_pins.contains(&pid) => {
+                out.insert(pid);
+            }
+            Some(_) => {}
+            None => self.unresolved += 1,
+        }
+    }
+
     /// `ObjSel` -> the launch-source pins it covers. Ports match only seeded
     /// data inputs (the clock port is never a launch source); cells match
     /// launch pins owned by the resolved instances.
@@ -2683,9 +2719,22 @@ impl ExceptionCtx<'_, '_> {
                     })
                     .collect()
             }
+            ObjSel::Pins(specs) => {
+                let mut out = HashSet::new();
+                for spec in specs {
+                    self.pin_launches(spec, &mut out);
+                }
+                out
+            }
             ObjSel::Names(names) => {
                 let mut out = HashSet::new();
                 for n in names {
+                    // Bare `instance/pin` names are pin specs, the same
+                    // objects `get_pins` returns.
+                    if n.contains('/') {
+                        self.pin_launches(n, &mut out);
+                        continue;
+                    }
                     let mut hit = false;
                     for s in &prepared.port_seeds {
                         if prepared.cx.port_name(s.pin) == n {
@@ -2732,9 +2781,20 @@ impl ExceptionCtx<'_, '_> {
                     })
                     .collect()
             }
+            ObjSel::Pins(specs) => {
+                let mut out = HashSet::new();
+                for spec in specs {
+                    self.pin_endpoints(spec, &mut out);
+                }
+                out
+            }
             ObjSel::Names(names) => {
                 let mut out = HashSet::new();
                 for n in names {
+                    if n.contains('/') {
+                        self.pin_endpoints(n, &mut out);
+                        continue;
+                    }
                     let mut hit = false;
                     for &p in &self.output_ports {
                         if prepared.cx.port_name(PinId(p)) == n {
@@ -2898,6 +2958,23 @@ fn run_sta_partitioned(
         }
     }
 
+    let mut pin_by_path = HashMap::new();
+    for c in 0..design.num_cells() {
+        let cell = CellId(c as u32);
+        let inst = design.strings.resolve(design.cell_names[c]).to_string();
+        for &p in design.cell_pins(cell) {
+            let pname = design.strings.resolve(design.pin_names[p.0 as usize]);
+            pin_by_path.insert(format!("{inst}/{pname}"), p.0);
+        }
+    }
+    let mut clk_launch: HashMap<u32, Vec<u32>> = HashMap::new();
+    for l in &graph.launches {
+        clk_launch.entry(l.clk.0).or_default().push(l.q.0);
+    }
+    for o in &graph.latch_opens {
+        clk_launch.entry(o.enable.0).or_default().push(o.q.0);
+    }
+
     let mut ctx = ExceptionCtx {
         prepared,
         cell_by_name,
@@ -2908,6 +2985,8 @@ fn run_sta_partitioned(
         eps_by_cell,
         output_ports,
         ep_kinds,
+        pin_by_path,
+        clk_launch,
         unresolved: 0,
     };
 
@@ -8079,7 +8158,14 @@ mod tests {
                 "{name}: hold violations"
             );
         }
-        assert_eq!(compared, 17, "every non-error scenario must be compared");
+        let expected = scenarios
+            .values()
+            .filter(|g| g.get("error").is_none())
+            .count();
+        assert_eq!(
+            compared, expected,
+            "every non-error scenario must be compared"
+        );
     }
 
     /// Exception diagnostics the golden cannot express: false-path endpoint
