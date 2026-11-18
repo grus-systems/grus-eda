@@ -164,10 +164,10 @@ measured per endpoint (`u_ff1/D`, the only MCP target):
   `-from` omitted = all launch sources.
 - **OpenSTA parser limits (measured, not assumed)**: `-setup X -hold Y`
   on one command fails (`can't read "path_multiplier"`); `-both N`
-  fails (`STA-0563`). Both are valid SDC — our parser accepts the
-  combined form (semantics identical to the split form above) and maps
-  `-both N` to `N_setup = N`, `H_hold = N`; OpenSTA validation of those
-  two forms is therefore impossible and is documented as such.
+  fails (`STA-0563`). The combined `-setup`/`-hold` form is valid SDC
+  with semantics identical to the split form, so our parser accepts it.
+  `-both` is counted in `ignored_commands` instead: valid SDC, but its
+  hold-side semantics cannot be verified against OpenSTA.
 - `set_false_path -from [all_registers]` does **not** cover primary-input
   launches (`fp_allregs` left the `d_in`→D hold violations intact);
   `-from [get_ports d_in]` removed exactly those endpoints. Confirms the
@@ -216,11 +216,13 @@ regression test covers it.
   caught evaluation, with parse tests.
 - `set_multicycle_path` accepts `N` as `-setup`/`-hold` value, bare
   positional form (setup), and `-setup X -hold Y` combined (valid SDC;
-  OpenSTA rejects it — see measured semantics). `-both N` maps to
-  `N_setup = N`, `H_hold = N`. `-setup N` requires `N >= 1`; `-hold H`
-  accepts any integer (`0` = default, negative tightens — measured).
-  `-setup`/`-hold` flags on `set_false_path` are accepted as no-ops
-  (the path is removed regardless).
+  OpenSTA rejects it — see measured semantics). `-setup N` requires
+  `N >= 1`; `-hold H` accepts any integer (`0` = default, negative
+  tightens — measured). `-both N` is counted in `ignored_commands`: it is
+  valid SDC but OpenSTA rejects it (`STA-0563`), so its hold-side
+  semantics cannot be verified — it is reported, not guessed.
+  `-setup`/`-hold`/`-both` flags on `set_false_path` are accepted as
+  no-ops (the path is removed regardless).
 - Empty selector resolution (typo'd cell, input port as `-to`) → diagnostic
   count, matching OpenSTA's warn-not-silent behavior.
 

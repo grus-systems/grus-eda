@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq)]
-enum PortSel {
+pub enum PortSel {
     AllInputs {
         no_clocks: bool,
     },
@@ -18,7 +18,7 @@ enum PortSel {
 
 impl PortSel {
     /// `clock_port` is needed because `-no_clocks` excludes the clock source, which the selector cannot see.
-    fn matches(&self, port: &str, is_input: bool, clock_port: Option<&str>) -> bool {
+    pub fn matches(&self, port: &str, is_input: bool, clock_port: Option<&str>) -> bool {
         match self {
             PortSel::AllInputs { no_clocks } => {
                 is_input && !(*no_clocks && clock_port == Some(port))
@@ -53,6 +53,83 @@ impl PortSel {
             },
         }
     }
+}
+
+/// Cell-space object selection for timing exceptions (`get_cells`,
+/// `all_registers`), symbolic until the design is known: instance names
+/// resolve against the DEF after parsing.
+#[derive(Clone, Debug)]
+pub enum CellSel {
+    /// Explicit instance names (`get_cells`, `get_instance`, `get_inst`).
+    Cells(Vec<String>),
+    /// `all_registers`: every sequential cell instance.
+    AllRegisters,
+    /// `remove_from_collection` on a predicate selection: the base minus
+    /// `excluded` instance names.
+    Except {
+        base: Box<CellSel>,
+        excluded: Vec<String>,
+    },
+}
+
+impl CellSel {
+    /// The selection minus the named instances. Mirrors `PortSel::without`.
+    fn without(self, removed: &[String]) -> CellSel {
+        if removed.is_empty() {
+            return self;
+        }
+        match self {
+            CellSel::Cells(mut names) => {
+                names.retain(|n| !removed.contains(n));
+                CellSel::Cells(names)
+            }
+            CellSel::Except {
+                base,
+                mut excluded,
+            } => {
+                excluded.extend(removed.iter().cloned());
+                CellSel::Except { base, excluded }
+            }
+            other => CellSel::Except {
+                base: Box::new(other),
+                excluded: removed.to_vec(),
+            },
+        }
+    }
+}
+
+/// A `-from`/`-to` object selection of a timing exception, kept symbolic:
+/// ports, cells, or bare names resolved against both namespaces once the
+/// design is loaded.
+#[derive(Clone, Debug)]
+pub enum ObjSel {
+    Ports(PortSel),
+    Cells(CellSel),
+    /// Bare words (`-from u_ff0`): matched against port and cell names at
+    /// resolution time. An empty list came from an empty selector and must
+    /// be diagnosed at resolution, not treated as absent.
+    Names(Vec<String>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExceptionKind {
+    FalsePath,
+    Multicycle,
+}
+
+/// One `set_false_path`/`set_multicycle_path` command, in file order.
+/// `from`/`to` are `None` when the flag was absent (every launch source /
+/// every endpoint). Multicycle counts follow the measured OpenSTA
+/// convention: `setup_n` defaults to 1 and `hold_n` to 0 when absent, and
+/// `hold_n` accepts any integer (0 = default, negative tightens); `setup_n`
+/// requires >= 1.
+#[derive(Clone, Debug)]
+pub struct TimingException {
+    pub kind: ExceptionKind,
+    pub from: Option<ObjSel>,
+    pub to: Option<ObjSel>,
+    pub setup_n: Option<u32>,
+    pub hold_n: Option<i32>,
 }
 
 /// Which clock a delay is referenced to: the design clock, or the virtual I/O clock.
@@ -148,6 +225,11 @@ pub struct Sdc {
     input_transitions: Vec<(PortSel, f32)>,
     loads: Vec<(PortSel, f32)>,
     driving_cells: Vec<(PortSel, DrivingCell)>,
+    /// Timing exceptions (`set_false_path`, `set_multicycle_path`) in file
+    /// order, with symbolic selectors resolved against the design at STA time.
+    /// Commands with unsupported qualifiers or unresolvable selectors are not
+    /// stored here; they are counted in `ignored_commands` instead.
+    pub exceptions: Vec<TimingException>,
     /// Options the parser accepts but does not apply, counted by flag or by descriptive key.
     /// `-lib_cell` and `-pin` restrict a delay to one cell or pin; the model has no per-arc
     /// endpoint matching, so the restriction is dropped and the delay applies to every
@@ -311,6 +393,11 @@ enum Value {
     Str(String),
     Ports(PortSel),
     Clocks(Vec<String>),
+    Cells(CellSel),
+    /// A selection the model cannot represent (`get_pins`, `select_*`, a
+    /// malformed selector). Selector combinators propagate it; exception
+    /// commands count it as ignored instead of failing the whole SDC.
+    Opaque,
 }
 
 fn empty() -> Value {
@@ -522,21 +609,40 @@ impl Interp {
             "current_design" => Ok(empty()),
             "set" => self.set(args),
             "expr" => expr(args),
-            "get_ports" => Ok(Value::Ports(PortSel::Ports(plain_names(args)?))),
-            "get_clocks" => Ok(Value::Clocks(plain_names(args)?)),
-            "all_inputs" => match args {
-                [] => Ok(Value::Ports(PortSel::AllInputs { no_clocks: false })),
+            "get_ports" => Ok(match plain_names(args) {
+                Ok(names) => Value::Ports(PortSel::Ports(names)),
+                Err(_) => Value::Opaque,
+            }),
+            "get_clocks" => Ok(match plain_names(args) {
+                Ok(names) => Value::Clocks(names),
+                Err(_) => Value::Opaque,
+            }),
+            "get_cells" | "get_instance" | "get_inst" => Ok(self.cells_sel(args)),
+            "all_registers" => Ok(match args {
+                [] => Value::Cells(CellSel::AllRegisters),
+                _ => Value::Opaque,
+            }),
+            "all_inputs" => Ok(match args {
+                [] => Value::Ports(PortSel::AllInputs { no_clocks: false }),
                 [Value::Str(flag)] if flag == "-no_clocks" => {
-                    Ok(Value::Ports(PortSel::AllInputs { no_clocks: true }))
+                    Value::Ports(PortSel::AllInputs { no_clocks: true })
                 }
-                _ => bail!("all_inputs takes at most -no_clocks"),
-            },
-            "all_outputs" => match args {
-                [] => Ok(Value::Ports(PortSel::AllOutputs)),
-                _ => bail!("all_outputs takes no arguments"),
-            },
+                _ => Value::Opaque,
+            }),
+            "all_outputs" => Ok(match args {
+                [] => Value::Ports(PortSel::AllOutputs),
+                _ => Value::Opaque,
+            }),
             "all_clocks" => Ok(Value::Clocks(self.all_clock_names())),
             "remove_from_collection" => self.remove_from_collection(args),
+            "set_false_path" => {
+                self.timing_exception(name, args, ExceptionKind::FalsePath)?;
+                Ok(empty())
+            }
+            "set_multicycle_path" => {
+                self.timing_exception(name, args, ExceptionKind::Multicycle)?;
+                Ok(empty())
+            }
             "create_clock" => {
                 self.create_clock(args)?;
                 Ok(empty())
@@ -613,6 +719,11 @@ impl Interp {
                 self.propagated_clock(name, args)?;
                 Ok(empty())
             }
+            // Selector commands outside the modelled set evaluate to an opaque
+            // value: inside an exception argument the command degrades to
+            // `ignored_commands` instead of aborting the whole SDC; anywhere
+            // else it still fails on the type mismatch downstream.
+            _ if is_object_selector(name) => Ok(Value::Opaque),
             _ => bail!("unsupported command `{name}`"),
         }
     }
@@ -1040,18 +1151,34 @@ impl Interp {
         names
     }
 
+    /// `get_cells`/`get_instance`/`get_inst`: explicit instance names. Any
+    /// flag or non-name argument makes the selection opaque — exception
+    /// commands then count it ignored rather than failing the whole SDC.
+    fn cells_sel(&self, args: &[Value]) -> Value {
+        match plain_names(args) {
+            Ok(names) => Value::Cells(CellSel::Cells(names)),
+            Err(_) => Value::Opaque,
+        }
+    }
+
     /// `remove_from_collection <collection> <object>...`: the collection minus the named
     /// objects, keeping the collection's type. Ports subtract through `PortSel::without`
-    /// (an explicit list filters, a predicate base records exclusions); clocks and plain
-    /// name lists subtract by name. The objects to remove must be enumerable — a predicate
-    /// selection like `all_inputs` used as an object cannot be named, so it is an error
-    /// rather than a silent no-op.
+    /// (an explicit list filters, a predicate base records exclusions); cells subtract
+    /// through `CellSel::without` the same way; clocks and plain name lists subtract by
+    /// name. The objects to remove must be enumerable — a predicate selection like
+    /// `all_inputs` used as an object cannot be named, so it is an error rather than a
+    /// silent no-op. An opaque value anywhere makes the result opaque.
     fn remove_from_collection(&mut self, args: &[Value]) -> Result<Value> {
         let [collection, objects @ ..] = args else {
             bail!("remove_from_collection takes a collection and objects");
         };
         if objects.is_empty() {
             bail!("remove_from_collection takes objects to remove");
+        }
+        if matches!(collection, Value::Opaque)
+            || objects.iter().any(|a| matches!(a, Value::Opaque))
+        {
+            return Ok(Value::Opaque);
         }
         let mut removed: Vec<String> = Vec::new();
         for arg in objects {
@@ -1060,14 +1187,20 @@ impl Interp {
                 Value::Ports(_) => {
                     bail!("remove_from_collection cannot subtract a predicate selection")
                 }
+                Value::Cells(CellSel::Cells(names)) => removed.extend(names.iter().cloned()),
+                Value::Cells(_) => {
+                    bail!("remove_from_collection cannot subtract a predicate selection")
+                }
                 Value::Clocks(names) => removed.extend(names.iter().cloned()),
                 Value::Str(text) => removed.extend(text.split_whitespace().map(str::to_string)),
+                Value::Opaque => unreachable!(),
             }
         }
         removed.sort_unstable();
         removed.dedup();
         match collection {
             Value::Ports(sel) => Ok(Value::Ports(sel.clone().without(&removed))),
+            Value::Cells(sel) => Ok(Value::Cells(sel.clone().without(&removed))),
             Value::Clocks(names) => Ok(Value::Clocks(
                 names
                     .iter()
@@ -1081,7 +1214,140 @@ impl Interp {
                     .collect::<Vec<_>>()
                     .join(" "),
             )),
+            Value::Opaque => unreachable!(),
         }
+    }
+
+    /// `set_false_path`/`set_multicycle_path`: a timing exception with
+    /// symbolic `-from`/`-to` selectors, resolved against the design at STA
+    /// time. An unsupported qualifier (`-through`, `-rise`, ...) or an
+    /// unresolvable selector (clock objects, opaque selections) drops the
+    /// whole command into `ignored_commands` — a half-applied exception
+    /// would silently change reported timing. Multicycle counts follow the
+    /// measured OpenSTA convention (`docs/timing-exceptions.md`): a bare
+    /// positional `N` or `-setup N` sets the setup count (>= 1), `-hold H`
+    /// accepts any integer, and `-setup X -hold Y` on one command is valid
+    /// SDC (OpenSTA rejects it) and is accepted here. `-both` is counted
+    /// ignored: OpenSTA rejects it too, so its hold-side semantics cannot
+    /// be verified. `-setup`/`-hold`/`-both` on `set_false_path` are
+    /// accepted no-ops.
+    fn timing_exception(&mut self, name: &str, args: &[Value], kind: ExceptionKind) -> Result<()> {
+        if args.iter().any(|a| {
+            matches!(a, Value::Str(s) if EXCEPTION_UNSUPPORTED_FLAGS.contains(&s.as_str()))
+        }) {
+            *self
+                .sdc
+                .ignored_commands
+                .entry(name.to_string())
+                .or_default() += 1;
+            return Ok(());
+        }
+        let mut from = None;
+        let mut to = None;
+        let mut setup_n = None;
+        let mut hold_n = None;
+        let mut i = 0;
+        while i < args.len() {
+            match &args[i] {
+                Value::Str(s) if s == "-from" || s == "-to" => {
+                    let flag = s.clone();
+                    let slot = if s == "-from" { &mut from } else { &mut to };
+                    if slot.is_some() {
+                        bail!("{name} takes each of -from/-to once");
+                    }
+                    let sel = match args.get(i + 1) {
+                        None => bail!("{name} {flag} needs a value"),
+                        Some(Value::Str(v))
+                            if v.starts_with('-') && !is_negative_number(v) =>
+                        {
+                            bail!("{name} {flag} needs a value, found `{v}`")
+                        }
+                        Some(v @ (Value::Ports(_) | Value::Cells(_) | Value::Str(_))) => {
+                            obj_sel(v)
+                        }
+                        // Clock objects and opaque selections cannot be
+                        // honoured by the exception model: the whole command
+                        // is counted ignored.
+                        Some(_) => None,
+                    };
+                    match sel {
+                        Some(sel) => *slot = Some(sel),
+                        None => {
+                            *self
+                                .sdc
+                                .ignored_commands
+                                .entry(name.to_string())
+                                .or_default() += 1;
+                            return Ok(());
+                        }
+                    }
+                    i += 2;
+                }
+                Value::Str(s) if s == "-both" && kind == ExceptionKind::Multicycle => {
+                    // `-both N` is valid SDC but OpenSTA rejects it (STA-0563),
+                    // so its hold-side semantics cannot be verified against the
+                    // reference tool — count the command ignored rather than
+                    // guess a mapping.
+                    *self
+                        .sdc
+                        .ignored_commands
+                        .entry(name.to_string())
+                        .or_default() += 1;
+                    return Ok(());
+                }
+                Value::Str(s)
+                    if kind == ExceptionKind::Multicycle
+                        && (s == "-setup" || s == "-hold") =>
+                {
+                    let Some(Value::Str(v)) = args.get(i + 1) else {
+                        bail!("{name} {s} needs a value");
+                    };
+                    let n = multicycle_count(v)?;
+                    if s == "-setup" {
+                        setup_n = Some(setup_count(n, name, s)?);
+                    } else {
+                        hold_n = Some(hold_count(n, name, s)?);
+                    }
+                    i += 2;
+                }
+                Value::Str(s)
+                    if kind == ExceptionKind::FalsePath
+                        && (s == "-setup" || s == "-hold" || s == "-both") =>
+                {
+                    // Accepted no-ops; consume an optional following number so
+                    // `-setup 2` does not surface as a stray positional.
+                    i += 1;
+                    if matches!(args.get(i), Some(Value::Str(n)) if n.parse::<i64>().is_ok()) {
+                        i += 1;
+                    }
+                }
+                Value::Str(s) if s == "-quiet" => {
+                    i += 1;
+                }
+                Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => {
+                    bail!("unsupported option `{s}`")
+                }
+                Value::Str(s) => {
+                    if kind != ExceptionKind::Multicycle {
+                        bail!("{name} takes no positional arguments, found `{s}`");
+                    }
+                    setup_n = Some(setup_count(multicycle_count(s)?, name, "positional")?);
+                    i += 1;
+                }
+                _ => bail!("{name} takes flags and -from/-to selectors"),
+            }
+        }
+        if kind == ExceptionKind::Multicycle && setup_n.is_none() && hold_n.is_none() {
+            bail!("{name} needs a multicycle value (-setup/-hold/-both or a positional N)");
+        }
+        self.sdc.exceptions.push(TimingException {
+            kind,
+            from,
+            to,
+            setup_n,
+            hold_n,
+        });
+        Ok(())
     }
 
     fn delay_rule(&mut self, args: &[Value]) -> Result<DelayRule> {
@@ -1185,6 +1451,52 @@ fn plain_names(args: &[Value]) -> Result<Vec<String>> {
 fn parse_f32(text: &str) -> Result<f32> {
     text.parse()
         .with_context(|| format!("`{text}` is not a number"))
+}
+
+/// Qualifiers that make a timing-exception command unsupported: the whole
+/// command is counted in `ignored_commands` rather than half-applied.
+const EXCEPTION_UNSUPPORTED_FLAGS: [&str; 9] = [
+    "-through", "-start", "-end", "-rise", "-fall", "-edge", "-points", "-lib_cell", "-pin",
+];
+
+/// Command names that produce object selections. Ones the model does not
+/// implement evaluate to [`Value::Opaque`] rather than a parse error.
+fn is_object_selector(name: &str) -> bool {
+    name.starts_with("get_") || name.starts_with("select_") || name.starts_with("all_")
+}
+
+/// A `-from`/`-to` argument as an [`ObjSel`]; `None` for selections the
+/// exception model cannot honour (clock objects, opaque selections) — the
+/// caller counts the command ignored.
+fn obj_sel(v: &Value) -> Option<ObjSel> {
+    match v {
+        Value::Ports(sel) => Some(ObjSel::Ports(sel.clone())),
+        Value::Cells(sel) => Some(ObjSel::Cells(sel.clone())),
+        Value::Str(text) => Some(ObjSel::Names(
+            text.split_whitespace().map(str::to_string).collect(),
+        )),
+        Value::Clocks(_) | Value::Opaque => None,
+    }
+}
+
+/// The multicycle count as written: an integer, possibly negative for `-hold`.
+fn multicycle_count(text: &str) -> Result<i64> {
+    text.parse()
+        .with_context(|| format!("`{text}` is not an integer multicycle count"))
+}
+
+/// `-setup N`/positional `N`/`-both N`: the setup count must be >= 1.
+fn setup_count(n: i64, name: &str, flag: &str) -> Result<u32> {
+    if !(1..=i64::from(u32::MAX)).contains(&n) {
+        bail!("{name} {flag} needs a positive integer, found {n}");
+    }
+    Ok(n as u32)
+}
+
+/// `-hold H`/`-both N`: any integer is valid (0 = default, negative tightens —
+/// measured on OpenSTA).
+fn hold_count(n: i64, name: &str, flag: &str) -> Result<i32> {
+    i32::try_from(n).with_context(|| format!("{name} {flag} count {n} is out of range"))
 }
 
 /// Value flags the parser drops without applying them; each occurrence is counted in
@@ -1422,7 +1734,153 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_commands() {
-        assert!(parse_sdc("set_false_path -from a -to b\n").is_err());
+        assert!(parse_sdc("set_max_delay 1.0 -from a -to b\n").is_err());
+        assert!(parse_sdc("frobnicate the_things\n").is_err());
+    }
+
+    #[test]
+    fn parses_false_path_exceptions() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_false_path -from [get_cells u1] -to [get_cells {{u2 u3}}]\n\
+             set_false_path -from [all_registers] -to [all_outputs]\n\
+             set_false_path -from d_in\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.exceptions.len(), 3);
+        let ex = &sdc.exceptions[0];
+        assert_eq!(ex.kind, ExceptionKind::FalsePath);
+        assert!(matches!(
+            ex.from,
+            Some(ObjSel::Cells(CellSel::Cells(ref n))) if *n == ["u1"]
+        ));
+        assert!(matches!(
+            ex.to,
+            Some(ObjSel::Cells(CellSel::Cells(ref n))) if *n == ["u2", "u3"]
+        ));
+        assert!(matches!(
+            sdc.exceptions[1].from,
+            Some(ObjSel::Cells(CellSel::AllRegisters))
+        ));
+        assert!(matches!(
+            sdc.exceptions[1].to,
+            Some(ObjSel::Ports(PortSel::AllOutputs))
+        ));
+        // A bare `-from` name stays symbolic: it resolves against ports and
+        // cells at design time.
+        assert!(matches!(
+            sdc.exceptions[2].from,
+            Some(ObjSel::Names(ref n)) if *n == ["d_in"]
+        ));
+        assert!(sdc.exceptions[2].to.is_none());
+    }
+
+    #[test]
+    fn parses_multicycle_path_forms() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_multicycle_path 2 -from [get_cells u1] -to [get_cells u2]\n\
+             set_multicycle_path -setup 3 -hold 1 -from [all_registers]\n\
+             set_multicycle_path -hold -1 -to [get_ports y]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.exceptions.len(), 3);
+        let ex = &sdc.exceptions;
+        // Bare positional N is the setup count.
+        assert_eq!((ex[0].setup_n, ex[0].hold_n), (Some(2), None));
+        // `-setup X -hold Y` combined is valid SDC (OpenSTA rejects it).
+        assert_eq!((ex[1].setup_n, ex[1].hold_n), (Some(3), Some(1)));
+        // `-hold` accepts zero and negative counts.
+        assert_eq!((ex[2].setup_n, ex[2].hold_n), (None, Some(-1)));
+        assert!(ex.iter().all(|e| e.kind == ExceptionKind::Multicycle));
+    }
+
+    #[test]
+    fn multicycle_both_is_ignored_not_guessed() {
+        // `-both` is valid SDC but OpenSTA rejects it (STA-0563): its
+        // hold-side semantics cannot be verified, so the command is counted
+        // ignored rather than mapped by guesswork.
+        let sdc = parse_sdc(&format!("{GCD}set_multicycle_path -both 2\n")).unwrap();
+        assert!(sdc.exceptions.is_empty());
+        assert_eq!(sdc.ignored_commands["set_multicycle_path"], 1);
+    }
+
+    #[test]
+    fn multicycle_path_needs_a_count() {
+        assert!(parse_sdc(&format!("{GCD}set_multicycle_path -from a -to b\n")).is_err());
+        assert!(parse_sdc(&format!("{GCD}set_multicycle_path -setup 0\n")).is_err());
+        assert!(parse_sdc(&format!("{GCD}set_multicycle_path -setup\n")).is_err());
+        assert!(parse_sdc(&format!("{GCD}set_multicycle_path -from a -from b\n")).is_err());
+    }
+
+    #[test]
+    fn exception_unsupported_qualifiers_are_ignored_not_fatal() {
+        for snippet in [
+            "set_false_path -through [get_cells u1] -from a -to b",
+            "set_false_path -rise -from a -to b",
+            "set_multicycle_path -setup 2 -start [get_cells u1] -to b",
+            "set_false_path -edge 1 -from a",
+        ] {
+            let sdc = parse_sdc(&format!("{GCD}{snippet}\n")).unwrap();
+            assert!(sdc.exceptions.is_empty(), "stored: {snippet}");
+            let counted = sdc
+                .ignored_commands
+                .get("set_false_path")
+                .copied()
+                .unwrap_or(0)
+                + sdc
+                    .ignored_commands
+                    .get("set_multicycle_path")
+                    .copied()
+                    .unwrap_or(0);
+            assert_eq!(counted, 1, "not counted: {snippet}");
+        }
+    }
+
+    #[test]
+    fn exception_unresolvable_selectors_are_ignored_not_fatal() {
+        for snippet in [
+            // Clock-object selectors are unsupported in v1.
+            "set_false_path -from [get_clocks core_clk] -to [get_cells u1]",
+            "set_multicycle_path -setup 2 -to [all_clocks]",
+            // Nested selectors the model cannot represent stay opaque.
+            "set_false_path -from [get_pins u1/A] -to b",
+            "set_multicycle_path -setup 2 -from [select_cells u1]",
+            "set_false_path -from [remove_from_collection [all_inputs] [get_pins u1/A]]",
+        ] {
+            let sdc = parse_sdc(&format!("{GCD}{snippet}\n")).unwrap();
+            assert!(sdc.exceptions.is_empty(), "stored: {snippet}");
+            assert!(
+                sdc.ignored_commands.contains_key("set_false_path")
+                    || sdc.ignored_commands.contains_key("set_multicycle_path"),
+                "not counted: {snippet}"
+            );
+        }
+    }
+
+    #[test]
+    fn false_path_setup_hold_flags_are_noops() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_false_path -setup 2 -hold 1 -from [all_inputs]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.exceptions.len(), 1);
+        assert_eq!(sdc.exceptions[0].kind, ExceptionKind::FalsePath);
+        assert_eq!(sdc.exceptions[0].setup_n, None);
+        assert!(sdc.exceptions[0].hold_n.is_none());
+    }
+
+    #[test]
+    fn remove_from_collection_on_cells() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}set_false_path -from [remove_from_collection [all_registers] [get_cells u_keep]] -to [all_outputs]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.exceptions.len(), 1);
+        assert!(matches!(
+            sdc.exceptions[0].from,
+            Some(ObjSel::Cells(CellSel::Except { .. }))
+        ));
     }
 
     #[test]

@@ -1940,6 +1940,12 @@ fn run_sta_detail(
     parasitics: Option<&NetParasitics>,
     emit_warnings: bool,
 ) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
+    // Exceptions are parsed but the partitioned evaluation is not wired up
+    // yet; reporting unconstrained timing for an exception-bearing SDC would
+    // be silently wrong, so refuse until the exceptions are applied.
+    if !sdc.exceptions.is_empty() {
+        anyhow::bail!("SDC timing exceptions are parsed but not yet applied");
+    }
     let mut cx = Context {
         design,
         lib,
