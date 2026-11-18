@@ -1,216 +1,276 @@
 # Timing exceptions: `set_false_path` / `set_multicycle_path`
 
-Design note for the N2 deferred item. Today both commands are hard parse errors
-(`sdc.rs` test asserts `parse_sdc("set_false_path ...").is_err()`), which blocks any
-stock SDC that uses them.
+Design note for the N2 deferred item, revised after independent review
+(Gemini 4 Hydrogen-high and SWE-2 Flash via subcon; both verdicts: core
+approach sound, specification below incorporates their findings).
+
+Today both commands are hard parse errors (`sdc.rs` test asserts
+`parse_sdc("set_false_path ...").is_err()`), which blocks any stock SDC that
+uses them.
 
 ## The problem
 
 Our STA collapses each pin's timing to one worst arrival/required pair
-(`PinTimingState`: per-pin rise/fall max/min plus a launch-edge-parity bitmask).
-It does not retain *which* launch object produced an endpoint's worst arrival.
-SDC exceptions are defined per (launch, capture) path pair, so a `-from
-[get_cells u1]` exception cannot be applied to an aggregated endpoint: filtering
-on the collapsed value could hide a real violation or erase an unrelated path.
+(`PinTimingState`: per-pin rise/fall max/min plus a launch-edge-parity
+bitmask). It does not retain *which* launch object produced an endpoint's
+worst arrival. SDC exceptions are defined per (launch, capture) path pair,
+so a `-from [get_cells u1]` exception cannot be applied to an aggregated
+endpoint: filtering on the collapsed value could hide a real violation or
+erase an unrelated path.
 
 ## Approach: partitioned re-analysis ("multi-run")
 
-Instead of teaching `PinTimingState` about path identity (a rewrite of the
-verified R2–R9 core: propagated clocks, latch borrowing, async reset, CRPR),
-run the existing engine once per launch-source group and compose the endpoint
-results. The timing core stays byte-identical; only a launch filter is added.
+Run the existing engine once per launch-source *signature class* and compose
+the endpoint results. The timing core's algorithms stay identical; the only
+change is a launch filter plus a prepare/eval split.
 
-### Launch sources
+### Launch sources and keys
 
 Every path starts at one of three source kinds, all identifiable by `PinId`:
 
-- primary-input port seeding (`state[pin]` written directly for non-clock inputs)
+- primary-input port seeding (`state[pin]` written directly for non-clock
+  inputs)
 - `TimingGraph.launches` — FF `CLK -> Q` arcs; source key = `l.q` pin
 - `TimingGraph.latch_opens` — latch enable-to-Q arcs; source key = `o.q` pin
 
-Latch `D -> Q` borrow arcs stay unfiltered: they propagate an existing arrival
-through a transparent latch, they do not create a new path origin.
+Latch `D -> Q` borrow arcs are never filtered: they propagate an existing
+arrival through a transparent latch and create no new path origin.
 
 A `LaunchKey` is the `PinId` of the launched pin (Q pin, or the I/O pin for
-ports). `-from [get_cells u1]` resolves to every launch key whose pin belongs to
-instance `u1`; `-from [all_registers]` resolves to all FF/latch launch keys;
-`-from [all_inputs]`/`[get_ports p]` resolve to I/O pin keys.
+ports). `-from [get_cells u1]` resolves to every launch key whose pin belongs
+to instance `u1`; `[all_registers]` resolves to all FF/latch launch keys;
+`[all_inputs]`/`[get_ports p]` resolve to seeded (non-clock) input-port keys.
+Selectors resolving to zero launch keys are diagnosed, not silently ignored.
 
-### Exception universe
+### Signature-class partition (replaces per-source runs)
 
-`E_set` = union of the *explicitly resolved* `-from` launch keys across all
-exceptions. From-sets that resolve to "every launch source" (e.g.
-`all_registers` when the design has only registers, `all_clocks` on a
-single-clock design) stay symbolic predicates and do not expand `E_set` — they
-need no per-source runs.
+For each parsed exception `ex`, let `from(ex)` be its resolved launch-key set
+(or "universal" when it provably covers **every** launch source *including
+input ports* — e.g. missing `-from`; `all_registers`/`all_clocks` alone do
+NOT qualify because port launches exist).
 
-Runs needed: `1 + |E_set|`.
+Each launch key `s` gets a signature `σ(s)` = the set of exceptions whose
+`from` contains `s`. Keys with identical signatures are merged into one run:
+for every endpoint they have identical applicable-exception sets, so their
+worst arrival can be taken jointly. Runs needed = number of distinct
+signatures (the empty signature is the default group).
 
-- **default run**: every launch source except `E_set` members launches.
-- **source run `s`**: only `s` launches (all ports, FFs, latch opens except `s`
-  are suppressed at seeding/eval time).
+This collapses the common cases: `set_false_path -from [all_registers] ...`
+puts every register launch in one class and ports in the default → 2 runs,
+not ~1600. A pathological SDC naming every register differently still
+degrades to many runs — correct but slow; measured on `picorv32`/`aes`
+before shipping (see Cost).
 
-In source run `s`, the worst arrival at endpoint `E` is exactly the worst
-`s -> E` path arrival: path arrival depends only on its own launch edge and arc
-delays, never on other sources. In the default run it is the worst path from
-any non-exception source.
+### Prepare / eval split
 
-### Filtering mechanics
+`run_sta_detail` splits into:
 
-`run_sta_detail` gains a launch filter applied at exactly three points:
+- **prepare** (once): `Context`, `build_graph`, `topological_levels`,
+  `pi_models`, `wire_delays_per_net`, `propagate_slew`,
+  `propagate_clock`/`ideal_clock_parity` + clock-consumer seeding. All of
+  these are arrival-filter-independent by construction (verified: clock
+  propagation reads only clock-network state and port *slews*).
+- **eval** (per signature class): data-pass propagation + `collect_endpoints`.
 
-1. input-port seeding loop (~line 1994): skip ports not in the allowed set
-2. `launch_updates` (~line 2173): skip `LaunchArc`s whose `q` is not allowed
-3. `latch_updates` (~line 2207): skip `LatchOpen`s whose `q` is not allowed
+### The filter suppresses arrivals only — never slews
 
-Everything else is untouched: `build_graph`, levelization, clock propagation /
-ideal-clock seeding, `collect_endpoints`, CRPR. Clock-pin seeding intentionally
-keeps *all* clock pins (checks still need capture-clock arrivals regardless of
-which data sources launch).
+`PinTimingState::merge` already merges `slew_max`/`slew_min` independently
+of which arrival wins (OpenSTA Graph-Based Analysis). Exceptions must not
+change slews: gate delays and NLDM constraint lookups are slew-indexed, so
+dropping a sibling source's slew would corrupt every downstream delay —
+the review's key correctness finding.
 
-To avoid rebuilding the graph per run, split `run_sta_detail` into a prepare
-phase (graph + levelized, built once) and an eval phase taking the filter.
-`run_sta*` public entry points keep their signatures.
+Implementation: excluded sources still merge **slew only** — call
+`merge(pol, NEG_INFINITY, INFINITY, slew_max, slew_min, 0, 0)`, which updates
+just the slew fields. Concretely:
 
-### Endpoint identity
+- port seeding: always merge the `port_drive` slews; merge the arrival only
+  for allowed ports
+- `launch_updates`/`latch_updates`: evaluate every launch (its slew feeds
+  `seq_in` anyway); merge arrival fields only for allowed keys, slew always
 
-Endpoints are `graph.checks` data pins (setup/hold and recovery/removal),
-clock-gate enable pins, and output ports — all `PinId`-keyed internally.
-`-to` selectors resolve to a set of endpoint `PinId`s:
+With slews unfiltered, endpoint-pin slews — and therefore NLDM constraint
+times — are identical across runs, restoring the required-time invariance
+the first draft assumed (capture clock side was never filtered; data-side
+slew now isn't either). Launch-parity effects on required time remain
+per-arrival and are handled by keeping per-polarity candidates.
 
-- `[get_cells u2]` → every check pin of instance `u2` (D, async set/reset, latch D)
-- `[get_ports p]` / `[all_outputs]` → output `PinId`s
-- `[all_registers]` → all sequential-cell check pins
-- a missing `-to` means "all endpoints"; a missing `-from` means "all sources"
+Clock-pin seeding stays unfiltered in every run: checks need capture-clock
+arrivals regardless of which data sources launch.
 
-`run_sta_detail` already returns `Vec<EndpointPolarities>` parallel to the
-sorted `endpoints` vec; the combine layer needs the `PinId` alongside — extend
-the return (or `EndpointReport`) with the pin id rather than matching on the
-rendered `inst/pin` string.
+### Endpoint identity and `-to` resolution
 
-### Composition rules
+Endpoints are `PinId`-keyed internally: `graph.checks` data pins (setup/hold
+plus recovery/removal on async pins, latch D included), `gating_enables`
+enable pins (`EndpointKind::ClockGate`), and output `io_pins`. `run_sta_detail`
+must return polarities keyed by `PinId` (today `Vec<EndpointPolarities>` is
+parallel to the pin-name-sorted endpoints; add the id or a map).
 
-For each endpoint `E`, gather the group's worst candidates and apply every
-exception whose `-to` matches `E`:
+`-to` selector resolution:
 
-- **false_path**: drop every group fully covered by the exception's `-from`
-  set. The default group can only be dropped by a universal `-from`. If all
-  groups drop, the endpoint leaves the report (counted in a new
-  `SkipReport::false_path_endpoints`, never silently).
-- **multicycle_path** `-setup N` / `-hold N`: paths in `-from` get required
-  time shifted by `(N-1) * period` (setup: capture edge N cycles later; hold:
-  early edge correspondingly earlier — exact convention verified against
-  OpenSTA before coding). Equivalent to adding `(N-1)*T` to that group's slack.
-  `-setup` and `-hold` are independent.
-- **precedence**: false_path beats multicycle on the same (source, endpoint);
-  overlapping multicycles on one group need an OpenSTA-measured rule (validate
-  empirically, do not guess).
+- `[get_cells u]` → every endpoint pin of instance `u`: check pins **and**
+  clock-gate enable pins owned by `u`
+- `[all_registers]` → check pins of sequential cells (FF + latch), **not**
+  clock-gate enables, **not** output ports
+- `[get_ports p]`/`[all_outputs]` → output-port endpoints; an input port or
+  unknown name resolves empty → diagnostic
+- missing `-to` → all endpoints
 
-Per endpoint the worst slack is the min over surviving groups of
-`group_slack + shift(group)`, for both setup (max) and hold (min) sides.
-`EndpointReport`'s collapsed max/min triples suffice because the required time
-is identical across runs (capture side is unfiltered) and the multicycle shift
-is uniform per group.
+### Composition
 
-### CRPR safety
+For each endpoint `E`, collect each signature group's `EndpointPolarities`
+(per-polarity `Worst{arr, req, slack, slew}` for max and min sides — compose
+on these, **not** the collapsed `EndpointReport`, so the winning group's
+full triple is reported consistently). Apply every exception whose `-to`
+matches `E`:
 
-`crpr_sink_net` traces the endpoint's comb cone structurally. It returns a
-value only when *every* launch in the cone agrees on (clock net, edge); a
-per-source run's arrival must come through that same source, so the traced
-value either matches it or the trace returns `CRPR_BAD` (no credit) — identical
-to the unfiltered run. No change needed; a regression test covers it.
+- **false_path**: drop every group whose signature intersects the
+  exception's `from`. A universal `from` drops all groups → the endpoint
+  leaves the report, counted in `SkipReport::false_path_endpoints`
+  (exempt from `is_clean` like design rules, still shown by `nonzero()`).
+- **multicycle_path**: for groups inside `from`, shift the required time by
+  the measured OpenSTA convention (see below) and re-derive slack; take the
+  worst surviving (group, polarity) candidate per side.
+- **precedence**: false_path beats multicycle on the same (source,
+  endpoint). Overlapping multicycles: rule measured on OpenSTA, with a
+  stated deterministic fallback — never guessed.
+
+Per-run `SkipReport`s are **discarded**; the composed report's skips are
+computed once on the composed endpoint set (an endpoint is unreached only
+if no surviving group produced a candidate). Run-invariant diagnostics
+(`unresolved_driving_cells`, etc.) are taken from one run.
+
+### Multicycle semantics — measure, don't guess
+
+The `(N-1)*T` formula and `-setup`/`-hold` independence in earlier drafts
+were wrong guesses (independent review). Before coding, measure on the
+pinned OpenSTA (LibreLane container, committed Tcl + golden file):
+
+- `-setup N` alone: setup shift and the *default* hold-edge interaction
+- `-hold M` alone: baseline and sign (positional `N` vs `-setup N` syntax)
+- `-setup` + `-hold` on one command; `-both`
+- precedence: FP vs MC; overlapping MCs (specificity vs file order)
+- multicycle on latch-D endpoints (composability limit below)
+
+### Multicycle endpoint-kind limit (v1)
+
+Latch endpoints evaluate slack piecewise (borrowing clamp in
+`collect_endpoints`), so `slack + shift` composition is invalid there, and
+clock-gate/output endpoints have their own required-time structure.
+`set_multicycle_path` whose `-to` resolves to any non-FF-check endpoint
+(latch D, clock-gate enable, output port) is **partially applied**: FF-check
+endpoints get the exception, the rest are counted in a new diagnostic —
+same partial-with-count precedent as `-lib_cell`/`-pin` drops. `false_path`
+has no such limit (it only removes groups).
+
+### CRPR safety (verified by both reviewers)
+
+`crpr_sink_net`/`crpr_driver_net` trace the endpoint's comb cone
+structurally and return a value only when every launch in the cone agrees on
+(clock net, edge). A single-signature run's arrival must come through that
+class's sources, so the traced value either matches or the trace returns
+`CRPR_BAD` — identical conservatism to the unfiltered run. No change needed;
+regression test covers it.
 
 ## SDC parsing
 
-- New `Value::Cells`-style symbolic selectors: `get_cells`, `all_registers`
-  stay unresolved until design load (they are design-dependent, unlike
-  `get_ports`). `remove_from_collection` learns the new variant.
-- `Sdc.exceptions: Vec<TimingException>` stores `{ kind, from: Option<Sel>,
-  to: Option<Sel>, setup_n, hold_n }` in file order.
+- `Sdc.exceptions: Vec<TimingException>` in file order:
+  `{ kind: FalsePath | Multicycle, from: Option<Sel>, to: Option<Sel>,
+  setup_n: Option<u32>, hold_n: Option<u32> }`.
+- New symbolic selectors resolved after design load: `get_cells`,
+  `all_registers` (new `Value` variant with `PortSel`-style `Except`
+  composition for `remove_from_collection`); `get_ports`, `all_inputs`,
+  `all_outputs` reuse `PortSel`; bare names (`-from a`) resolve against both
+  ports and cells at design time.
+- Clock-object selectors (`get_clocks`, `all_clocks`) in `-from`/`-to`:
+  **v1 → whole command to `ignored_commands`** — launch keys carry no clock
+  attribution today and multi-clock SDC is already unsupported.
 - Unsupported qualifiers (`-through`, `-start`, `-end`, `-rise`, `-fall`,
-  `-edge`, `-lib_cell`, `-pin`, `-points`) move the whole command to
-  `ignored_commands` — loud in the skip summary and failing `--strict`, never
-  silently half-applied. Rationale: applying the exception minus the qualifier
-  would over-apply it; ignoring it entirely only risks false violations, the
-  conservative direction.
+  `-edge`, `-lib_cell`, `-pin`, `-points`) → whole command to
+  `ignored_commands`: loud in the skip summary, fails `--strict`, never
+  half-applied.
+- Selector subcommands that fail to evaluate inside exception arguments
+  (e.g. `[get_pins ...]`, hierarchical forms) must route the command to
+  `ignored_commands`, not abort `parse_sdc` — an opaque `Value` variant or
+  caught evaluation, with parse tests.
+- `set_multicycle_path` accepts `N` as `-setup/-hold` value and bare
+  positional form; `N` must be a positive integer (reject 0/negative).
+  `-both N` sets both. `-setup`/`-hold` flags on `set_false_path` are
+  accepted as no-ops (the path is removed regardless).
+- Empty selector resolution (typo'd cell, input port as `-to`) → diagnostic
+  count, matching OpenSTA's warn-not-silent behavior.
 
 ## Out of scope for v1 (diagnosed, not approximated)
 
-- `-through`, `-start`, `-end`, `-rise`, `-fall`, `-edge`, `-lib_cell`, `-pin`,
-  `-points` on either command
+- `-through`, `-start`, `-end`, `-rise`, `-fall`, `-edge`, `-lib_cell`,
+  `-pin`, `-points`, clock-object selectors
 - `set_min_delay` / `set_max_delay` (different check type; separate milestone)
-- clock-object `-from`/`-to` selectors beyond what resolves unambiguously on
-  the single-design-clock model (multi-clock SDC is already unsupported)
+- multicycle on latch/clock-gate/output endpoints (counted diagnostic)
 
 ## Cost
 
-`1 + |E_set|` STA evals. Typical exception SDCs name a handful of synchronizer
-or CDC registers → a few extra runs, each the same cost as today's `run_sta`.
-A pathological `all_registers` `-from` that does not cover every launch source
-could mean hundreds of runs; measure on `picorv32`/`aes` and document. If it
-is too slow, batch sources that share identical exception membership per
-endpoint — a later optimization, not v1.
+Prepare once + eval per signature class. Typical exception SDCs → 2–5 runs.
+Pathological per-register exceptions → up to #classes runs; each eval costs
+what `run_sta` costs today. Measure on `picorv32`/`aes`; if a design exceeds
+a documented budget, sources that cannot reach any `-to` endpoint may be
+pruned (reachability pre-pass — only if measurement demands it).
+
+`sta_pin_slews` (power estimation) always uses the unfiltered single run —
+unchanged.
 
 ## Validation
 
 Public, reproducible, per AGENTS.md rules:
 
-1. Craft exception SDCs on `gcd` and `picorv32` (committed fixtures):
-   false_path reg→reg, false_path `-to [all_registers]`, multicycle `-setup 2`,
-   multicycle `-hold`, `-from [all_inputs]`, mixed FP+MC on one endpoint.
-2. Reference: OpenSTA inside the LibreLane container — `report_timing` WNS/TNS
-   and per-endpoint slack for the same DEF/SDC, emitted by a committed Tcl
-   script into a golden file.
-3. Unit tests: selector resolution, group filtering (a source run sees only its
-   own arrivals), composition rules, ignored-command accounting, and a
-   can-fail check (remove the filter → test must go red).
-4. Regression: all existing `sta_edge` goldens and corner tests must stay
-   byte-identical when no exceptions are present (filter = None path).
-
-## Open questions for review
-
-1. Is per-source-run arrival truly independent of other sources in *this*
-   engine (latch borrow, clock gates, CRPR, derates)? Any hidden coupling?
-2. `EndpointReport`/`EndpointPolarities` composition: is collapsing to the
-   worst triple per group sufficient for multicycle `-rise`/`-fall` later, or
-   must v1 keep per-polarity candidates?
-3. Multicycle required-time shift sign/convention — is `(N-1)*T` right for
-   both `-setup` and `-hold`, and how does OpenSTA order `-setup`/`-hold`/`-both`?
-4. Precedence when several exceptions match one (source, endpoint) pair.
-5. Cost model: is `1 + |E_set|` runs acceptable, or should universal-from
-   exceptions shortcut harder?
-6. Anything in `collect_endpoints` (clock-gate enables, output ports, async
-   checks) that breaks when arrivals come from a single-source run?
-7. Should exceptions also apply to the hold corner (`--lib-hold` second run)
-   identically, or are there interactions?
+1. Exception SDC fixtures on `gcd` and `picorv32` (committed): false_path
+   reg→reg, `-to [all_registers]`, `-from [all_inputs]`, multicycle setup/hold
+   (post-measurement conventions), mixed FP+MC, latch-endpoint multicycle
+   diagnostic, unsupported-qualifier diagnostics.
+2. Reference: OpenSTA in the LibreLane container — `report_timing`
+   WNS/TNS + per-endpoint slack via committed Tcl → golden file. The
+   multicycle-semantics probe script lands first and its output is committed
+   before implementation.
+3. Unit tests: selector resolution, signature partitioning, slew-only
+   merging for excluded sources, composition rules, ignored-command
+   accounting, can-fail checks.
+4. Regression: all `sta_edge` goldens + 16 corners byte-identical with no
+   exceptions (filter=None path); `merge_corner_reports` endpoint sets must
+   match across `--lib-hold` corners (false_path drops are corner-independent
+   — verify `hold_design` shares pin identity).
 
 ## Files (expected)
 
 - `crates/grus-core/src/sta/sdc.rs` — selectors, `TimingException`, parsing
-- `crates/grus-core/src/sta/analysis.rs` — prepare/eval split, launch filter,
-  exception composition, `SkipReport` additions
+- `crates/grus-core/src/sta/analysis.rs` — prepare/eval split, arrival-only
+  filter, `EndpointPolarities` keyed by `PinId`, composition, `SkipReport`
+  additions (`false_path_endpoints`, multicycle-endpoint diagnostic)
 - possibly `crates/grus-core/src/sta/exceptions.rs` — resolution + composition
 - `crates/grus-eda/src/main.rs` — wiring (likely unchanged if `run_sta` wraps)
-- `tests/designs/**` — exception SDC fixtures + OpenSTA golden script
+- `tests/designs/**` — exception SDC fixtures + OpenSTA golden scripts
 - `docs/results.md`, `docs/roadmap.md` — measurements and status
 
 ## References
 
 - `crates/grus-core/src/sta/analysis.rs`: `TimingGraph` (~L612),
-  `build_graph` (~L940), port seeding (~L1994), launch eval (~L2173),
-  `collect_endpoints` (~L2546), `crpr_sink_net` (~L2490)
-- `crates/grus-core/src/sta/sdc.rs`: `Value`/`PortSel` (~L10-60), `Sdc` (~L121),
-  `Interp::command` (~L520)
-- OpenSTA exception semantics: SDC `set_false_path` / `set_multicycle_path`
-  (to be measured against the pinned OpenSTA in the LibreLane image, not
-  assumed)
-- Prior art inside this repo: `docs/e3-sta.md` open tasks, R0–R10 / N1–N7
-  results in `docs/results.md`
+  `build_graph` (~L940), port seeding (~L1994), `propagate_slew` (~L1479),
+  launch eval (~L2173), `collect_endpoints` (~L2546), `crpr_sink_net`
+  (~L2490), `PinTimingState::merge` (~L122)
+- `crates/grus-core/src/sta/sdc.rs`: `Value`/`PortSel` (~L10-60), `Sdc`
+  (~L121), `Interp::command` (~L520)
+- Review record: subcon reviews `20261118-100552-7401` (agy,
+  gemini-4-hydrogen-high) and `20261118-101221-da89` (devin, swe-2-flash),
+  both "reject as written; core approach sound" — findings incorporated above
+- OpenSTA exception semantics: to be measured on the pinned LibreLane image,
+  not assumed
 
 <!--
-Reviewers: this is a design review, not a code review. The snapshot contains
-the full repository at HEAD; read the referenced code to verify the claims
-above (especially the "Launch sources", "Filtering mechanics", "Composition
-rules" and "CRPR safety" sections). Answer the seven open questions and flag
-any correctness hole in the multi-run approach. Do not modify files.
---><|end_message|><|message_model|><|content_thinking|>Now commit the doc, write the review brief, and launch both reviews.<|end_message|><|message_model|>exec<|content_invoke_tool_json|>{
+Reviewers: design review, not code review. The snapshot has the full repo at
+HEAD; verify claims against the referenced code. Prior review round
+(20261118-*) found: slew coupling (fixed by arrival-only filtering +
+prepare-hoisted slew/clock passes), symbolic-from unsoundness for
+all_registers (fixed by signature classes + strict universal rule),
+multicycle semantics guessed (now measurement-gated), latch multicycle
+non-composable (now diagnosed), -to clock-gate endpoints (now included),
+SkipReport composition (now specified), nested selector hard-fail (now
+specified). Flag any remaining correctness hole.
+-->
