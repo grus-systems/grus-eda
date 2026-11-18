@@ -243,7 +243,8 @@ regression test covers it.
 
 - `-through`, `-start`, `-end`, `-rise`, `-fall`, `-edge`, `-lib_cell`,
   `-pin`, `-points`, clock-object selectors
-- `set_min_delay` / `set_max_delay` (different check type; separate milestone)
+- `set_min_delay` / `set_max_delay` — path-delay checks, designed separately
+  in `docs/path-delays.md` (OpenSTA semantics measured; not yet implemented)
 - multicycle on latch-D/clock-gate-enable endpoints (counted diagnostic);
   output-port endpoints **are** covered (measured)
 
