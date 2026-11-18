@@ -192,8 +192,20 @@ fn parse_var_decl(
     let id = fields[2];
     let rest = body[pos..].trim();
     // rest = `<name>` or `<name> [<msb>:<lsb>]` / `<name> <msb> <lsb>`.
-    // Escaped names (`\foo bar `) keep their spaces; peel a trailing range off.
-    let (name_part, range) = split_name_range(rest);
+    // An escaped identifier (`\...`) runs to the first whitespace, so brackets
+    // inside it are literal name characters (`\dpath.a_lt_b$in1[9]` is a scalar,
+    // not a range); only tokens after that whitespace can be a range.
+    let (name_part, range) = if rest.starts_with('\\') {
+        match rest.find(char::is_whitespace) {
+            Some(ws) => {
+                let (nm, tail) = rest.split_at(ws);
+                (nm, split_name_range(tail.trim()).1)
+            }
+            None => (rest, None),
+        }
+    } else {
+        split_name_range(rest)
+    };
     let name = unescape_vcd_name(name_part.trim_end());
     if name.is_empty() {
         bail!("VCD $var has empty name in `{item}`");
@@ -458,13 +470,19 @@ $finish
 
     #[test]
     fn test_escaped_name() {
+        // `\dpath.a_lt_b$in1[9]` is a scalar whose name literally contains
+        // brackets — the `[9]` must not be read as a vector range.
         let vcd = "$timescale 1ns $end\n\
-                   $var wire 1 ! \\foo bar $end\n\
+                   $var wire 1 ! \\dpath.a_lt_b$in1[9] $end\n\
                    $enddefinitions $end\n\
                    #0\n0!\n#5\n1!\n";
         let act = parse_vcd(vcd).expect("parse");
-        let s = act.signals.get("foo bar").expect("escaped name");
+        let s = act
+            .signals
+            .get("dpath.a_lt_b$in1[9]")
+            .expect("escaped name");
         assert_eq!(s.rise, 1);
+        assert!(!act.signals.contains_key("dpath.a_lt_b$in"));
     }
 
     #[test]
