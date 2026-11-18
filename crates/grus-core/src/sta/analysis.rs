@@ -104,19 +104,6 @@ struct PinTimingState {
     /// worst slack across them.
     par_max: [u8; 2],
     par_min: [u8; 2],
-    /// Pure data-path delay per transition: `arrival` minus the launching clock's
-    /// arrival at the source. It propagates through the same late arc and wire
-    /// delays as `arrival_max` but seeds at the launch arc delay alone
-    /// (`docs/path-delays.md`). A `set_max_delay` check measures slack against
-    /// this, and under a propagated clock its winner can differ from the
-    /// arrival winner, so the winning path's launch reference travels along
-    /// in `delay_launch_max`.
-    delay_max: [f32; 2],
-    /// Raw launch clock arrival paired with the `delay_max` winner: the late
-    /// clock-pin arrival for sequential launches, the I/O clock reference
-    /// latency for input-port launches. `NEG_INFINITY` while the transition
-    /// is unreached in the delay domain.
-    delay_launch_max: [f32; 2],
 }
 
 impl PinTimingState {
@@ -127,8 +114,6 @@ impl PinTimingState {
         slew_min: [f32::INFINITY; 2],
         par_max: [0; 2],
         par_min: [0; 2],
-        delay_max: [f32::NEG_INFINITY; 2],
-        delay_launch_max: [f32::NEG_INFINITY; 2],
     };
 
     fn reached(&self, pol: usize) -> bool {
@@ -145,8 +130,6 @@ impl PinTimingState {
         slew_min: f32,
         par_max: u8,
         par_min: u8,
-        delay_max: f32,
-        delay_launch: f32,
     ) {
         // Slews are merged independently of which arc wins the arrival (OpenSTA GraphDelayCalc).
         // The parity arguments are masks: a strictly better arrival replaces the mask,
@@ -163,12 +146,6 @@ impl PinTimingState {
         } else if arr_min == self.arrival_min[pol] {
             self.par_min[pol] |= par_min;
         }
-        // A tying delay candidate keeps the incumbent launch: OpenSTA's tie-break
-        // is unmeasured, and keep-first matches the arrival merge's order.
-        if delay_max > self.delay_max[pol] {
-            self.delay_max[pol] = delay_max;
-            self.delay_launch_max[pol] = delay_launch;
-        }
         self.slew_max[pol] = self.slew_max[pol].max(slew_max);
         self.slew_min[pol] = self.slew_min[pol].min(slew_min);
     }
@@ -184,10 +161,6 @@ impl PinTimingState {
             self.slew_min[pol] = self.slew_min[pol].min(o.slew_min[pol]);
             self.par_max[pol] |= o.par_max[pol];
             self.par_min[pol] |= o.par_min[pol];
-            if o.delay_max[pol] > self.delay_max[pol] {
-                self.delay_max[pol] = o.delay_max[pol];
-                self.delay_launch_max[pol] = o.delay_launch_max[pol];
-            }
         }
     }
 }
@@ -1495,15 +1468,11 @@ fn sink_state_with_wire(
             let delay = std::f32::consts::LN_2 * elmore;
             sink_state.arrival_max[pol] += delay * sdc.derate(true, DERATE_NET, clock_path, pol);
             sink_state.arrival_min[pol] += delay * sdc.derate(false, DERATE_NET, clock_path, pol);
-            // The wire delay is part of the path delay the same way; the
-            // launch reference rides along unchanged.
-            sink_state.delay_max[pol] += delay * sdc.derate(true, DERATE_NET, clock_path, pol);
             sink_state.slew_max[pol] = driver_state.slew_max[pol] + degrade;
             sink_state.slew_min[pol] = driver_state.slew_min[pol] + degrade;
         } else {
             sink_state.arrival_max[pol] += elmore * sdc.derate(true, DERATE_NET, clock_path, pol);
             sink_state.arrival_min[pol] += elmore * sdc.derate(false, DERATE_NET, clock_path, pol);
-            sink_state.delay_max[pol] += elmore * sdc.derate(true, DERATE_NET, clock_path, pol);
             sink_state.slew_max[pol] = driver_state.slew_max[pol].hypot(degrade);
             sink_state.slew_min[pol] = driver_state.slew_min[pol].hypot(degrade);
         }
@@ -1741,28 +1710,8 @@ fn propagate_clock(
     let lat = sdc.clock_source_latency_ns;
     let tr = sdc.input_transition_ns(cx.port_name(port));
     let p = port.0 as usize;
-    clk[p].merge(
-        RISE,
-        lat,
-        lat,
-        tr,
-        tr,
-        1,
-        1,
-        f32::NEG_INFINITY,
-        f32::NEG_INFINITY,
-    );
-    clk[p].merge(
-        FALL,
-        lat + half_period,
-        lat + half_period,
-        tr,
-        tr,
-        2,
-        2,
-        f32::NEG_INFINITY,
-        f32::NEG_INFINITY,
-    );
+    clk[p].merge(RISE, lat, lat, tr, tr, 1, 1);
+    clk[p].merge(FALL, lat + half_period, lat + half_period, tr, tr, 2, 2);
     parity[p] = [0, 1];
 
     for lvl in 1..levelized.level_offsets.len() - 1 {
@@ -1840,8 +1789,6 @@ fn propagate_clock(
                             early_slew,
                             1 << src_par[src_pol],
                             1 << src_par[src_pol],
-                            f32::NEG_INFINITY,
-                            f32::NEG_INFINITY,
                         );
                         changed = true;
                     }
@@ -2056,18 +2003,13 @@ fn run_sta_detail(
 /// `(arr_max, arr_min, slew_max, slew_min)`. `eval_sta` merges the arrival
 /// fields only for ports in the run's allowed set but always merges slew —
 /// downstream delay lookups depend on the physical slew at the pin.
-/// `launch` is the I/O clock reference the port's input delay anchors to;
-/// the delay domain seeds `arr_max - launch` against it.
 struct PortSeed {
     pin: PinId,
-    launch: f32,
     per_pol: [(f32, f32, f32, f32); 2],
 }
 
 /// One output transition of a launch's precomputed merge arguments:
-/// `(arr_max, arr_min, slew_max, slew_min)` plus the delay-domain seed
-/// (`delay`, the bare arc delay) and the raw launch clock arrival it is
-/// measured against (`delay_launch`).
+/// `(arr_max, arr_min, slew_max, slew_min)`.
 #[derive(Clone, Copy)]
 struct LaunchPair {
     q: PinId,
@@ -2076,8 +2018,6 @@ struct LaunchPair {
     arr_min: f32,
     slew_max: f32,
     slew_min: f32,
-    delay: f32,
-    delay_launch: f32,
 }
 
 impl LaunchPair {
@@ -2088,8 +2028,6 @@ impl LaunchPair {
         arr_min: f32::NEG_INFINITY,
         slew_max: f32::NEG_INFINITY,
         slew_min: f32::NEG_INFINITY,
-        delay: f32::NEG_INFINITY,
-        delay_launch: f32::NEG_INFINITY,
     };
 }
 
@@ -2219,15 +2157,9 @@ fn prepare_sta<'a>(
                 per_pol[pol].3,
                 1,
                 0,
-                per_pol[pol].0 - latency,
-                latency,
             );
         }
-        port_seeds.push(PortSeed {
-            pin,
-            launch: latency,
-            per_pol,
-        });
+        port_seeds.push(PortSeed { pin, per_pol });
     }
 
     let mut base_state = vec![PinTimingState::UNREACHED; design.num_pins()];
@@ -2309,8 +2241,6 @@ fn prepare_sta<'a>(
                     sdc.clock_transition_ns,
                     1 << edge_par,
                     1 << edge_par,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
                 );
             }
         }
@@ -2352,9 +2282,6 @@ fn prepare_sta<'a>(
                                     clk_state.slew_min[edge_pol],
                                 )
                             };
-                        // The delay-domain seed is the bare arc delay against the
-                        // launch edge's late clock-pin arrival (`pmd_basic` measured
-                        // the late arrival as the launch reference).
                         res[dst_pol] = LaunchPair {
                             q,
                             dst_pol,
@@ -2364,8 +2291,6 @@ fn prepare_sta<'a>(
                                 + early_delay * sdc.derate(false, DERATE_CELL, false, edge_pol),
                             slew_max: late_slew,
                             slew_min: early_slew,
-                            delay: late_delay * sdc.derate(true, DERATE_CELL, false, edge_pol),
-                            delay_launch: clk_state.arrival_max[edge_pol],
                         };
                     }
                 }
@@ -2461,17 +2386,7 @@ fn eval_sta(
         for pol in [RISE, FALL] {
             let (arr_max, arr_min, slew_max, slew_min) = seed.per_pol[pol];
             if ok {
-                state[p].merge(
-                    pol,
-                    arr_max,
-                    arr_min,
-                    slew_max,
-                    slew_min,
-                    1,
-                    0,
-                    arr_max - seed.launch,
-                    seed.launch,
-                );
+                state[p].merge(pol, arr_max, arr_min, slew_max, slew_min, 1, 0);
             } else {
                 state[p].merge(
                     pol,
@@ -2481,8 +2396,6 @@ fn eval_sta(
                     slew_min,
                     0,
                     0,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
                 );
             }
         }
@@ -2500,8 +2413,6 @@ fn eval_sta(
                         pair.slew_min,
                         1 << seed.par,
                         1 << seed.par,
-                        pair.delay,
-                        pair.delay_launch,
                     );
                 } else {
                     state[pair.q.0 as usize].merge(
@@ -2512,8 +2423,6 @@ fn eval_sta(
                         pair.slew_min,
                         0,
                         0,
-                        f32::NEG_INFINITY,
-                        f32::NEG_INFINITY,
                     );
                 }
             }
@@ -2590,7 +2499,7 @@ fn eval_sta(
                         // the window holding the arrival, minus uncertainty and the per-transition
                         // setup). Data arriving before the latch opens contributes nothing — the
                         // clock-to-Q launch covers it.
-                        let (arr_in_max, delay_in_max) = if let Some(&li) = borrow {
+                        let arr_in_max = if let Some(&li) = borrow {
                             let info = &graph.latch_info[li as usize];
                             let en = state[info.enable.0 as usize];
                             let close_pol = 1 - info.open_pol;
@@ -2627,22 +2536,9 @@ fn eval_sta(
                                         - setup,
                                 )
                             };
-                            // The delay domain cannot clamp directly — its cap
-                            // is absolute. Reconstruct the delay winner's
-                            // absolute arrival (`launch + delay`), apply the
-                            // same borrow clamp, and re-derive the delay
-                            // against that path's own launch. The arrival gate
-                            // already passed, and the delay winner's arrival
-                            // cannot exceed `arrival_max`, so it borrows too.
-                            let delay = if src.delay_max[src_pol] > f32::NEG_INFINITY {
-                                let launch = src.delay_launch_max[src_pol];
-                                cap(launch + src.delay_max[src_pol]) - launch
-                            } else {
-                                f32::NEG_INFINITY
-                            };
-                            (cap(src.arrival_max[src_pol]), delay)
+                            cap(src.arrival_max[src_pol])
                         } else {
-                            (src.arrival_max[src_pol], src.delay_max[src_pol])
+                            src.arrival_max[src_pol]
                         };
                         next.merge(
                             dst_pol,
@@ -2657,9 +2553,6 @@ fn eval_sta(
                             early_slew,
                             src.par_max[src_pol],
                             src.par_min[src_pol],
-                            delay_in_max
-                                + late_delay * sdc.derate(true, DERATE_CELL, false, src_pol),
-                            src.delay_launch_max[src_pol],
                         );
                         changed = true;
                     }
@@ -3303,46 +3196,43 @@ fn run_sta_partitioned(
             {
                 let s = class_states[ci][ep as usize];
                 for pol in [RISE, FALL] {
-                    let (Some(_), Some(late_arc), Some(clk)) =
+                    let (Some(w), Some(late_arc), Some(clk)) =
                         (pols.max[pol], check.late_arc(), check.clk)
                     else {
                         continue;
                     };
                     let late = &lib.arcs[late_arc as usize];
-                    let delay = s.delay_max[pol];
                     let Some(table) = constraint_table(late, pol) else {
                         continue;
                     };
-                    if !delay.is_finite() {
-                        continue;
-                    }
                     // req = capture - uncertainty - t_setup + N,
-                    // slack = req - (launch + delay). The required time is
-                    // anchored to the endpoint register's own clock pin (the
-                    // early capture arrival, like the setup check), not the
-                    // launch source's clock: under `set_propagated_clock`
-                    // with skewed clock trees the two differ (`pm2_both`,
-                    // measured 8.5 ps on `u_ff1/D`). They coincide only when
-                    // launch and capture see identical clock arrivals —
-                    // every `md_*`/`pmd_*` scenario before the split clock
-                    // buffers. The CRPR credit the clock check adds is not
-                    // reproduced here: the delay domain tracks the winner's
-                    // launch time, not its clock net, so the shared-net test
-                    // cannot be applied (unexercised: zero spread in this
-                    // fixture).
+                    // slack = req - arr. The reported arrival is the covered
+                    // sources' ordinary max arrival: OpenSTA's path-delay
+                    // check keeps the worst covered path as launched, so when
+                    // launch skew exceeds the pure-delay gap the winner is
+                    // the arrival winner, not the largest path delay
+                    // (`pm2_both`: `u_ff2`'s 0.786764 beats `u_ff0`'s
+                    // 0.731424 while `u_ff0` holds the larger pure delay).
+                    // The required time is anchored to the endpoint
+                    // register's own clock pin (the early capture arrival,
+                    // like the setup check), not the launch source's clock:
+                    // under `set_propagated_clock` with skewed clock trees
+                    // the two differ. The CRPR credit the clock check adds
+                    // is not reproduced here: the shared launch/capture
+                    // clock-net test needs the winning path's clock net,
+                    // which the per-class merge does not keep (unexercised:
+                    // zero spread in this fixture).
                     let t_setup = eval_nldm_constraint(
                         table,
                         s.slew_max[pol],
                         class_states[ci][clk.0 as usize].slew_max[check.edge],
                     ) * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
-                    let launch = s.delay_launch_max[pol];
                     let capture = class_states[ci][clk.0 as usize].arrival_min[check.edge];
                     let req = capture - sdc.setup_uncertainty_ns - t_setup + n;
                     pols.max[pol] = Some(Worst {
-                        arr: launch + delay,
                         req,
-                        slack: req - (launch + delay),
-                        slew: s.slew_max[pol],
+                        slack: req - w.arr,
+                        ..w
                     });
                 }
             }
@@ -7058,77 +6948,20 @@ mod tests {
     #[test]
     fn test_parity_mask_keeps_tied_arrivals() {
         let mut s = PinTimingState::UNREACHED;
-        s.merge(
-            RISE,
-            1.0,
-            0.5,
-            0.1,
-            0.1,
-            0b01,
-            0b01,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        );
+        s.merge(RISE, 1.0, 0.5, 0.1, 0.1, 0b01, 0b01);
         // Same max arrival, opposite parity: both bits survive.
-        s.merge(
-            RISE,
-            1.0,
-            0.4,
-            0.1,
-            0.1,
-            0b10,
-            0b10,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        );
+        s.merge(RISE, 1.0, 0.4, 0.1, 0.1, 0b10, 0b10);
         assert_eq!(s.par_max[RISE], 0b11);
         // The better min arrival replaces its mask entirely.
         assert_eq!(s.par_min[RISE], 0b10);
         // A strictly better max replaces the mask; an equal max unions again. The
         // equal min arrival also unions its parity bit.
-        s.merge(
-            RISE,
-            1.2,
-            0.4,
-            0.1,
-            0.1,
-            0b10,
-            0b01,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        );
+        s.merge(RISE, 1.2, 0.4, 0.1, 0.1, 0b10, 0b01);
         assert_eq!(s.par_max[RISE], 0b10);
         assert_eq!(s.par_min[RISE], 0b11);
-        s.merge(
-            RISE,
-            1.2,
-            0.45,
-            0.1,
-            0.1,
-            0b01,
-            0b10,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        );
+        s.merge(RISE, 1.2, 0.45, 0.1, 0.1, 0b01, 0b10);
         assert_eq!(s.par_max[RISE], 0b11);
         assert_eq!(s.par_min[RISE], 0b11);
-    }
-
-    /// The delay domain merges independently of the arrival winner: the max
-    /// `arrival - launch` path keeps its own launch reference, so a later but
-    /// cheaper-launched source can win the delay check it never wins on arrival.
-    #[test]
-    fn test_delay_merge_tracks_the_delay_winner_launch() {
-        let mut s = PinTimingState::UNREACHED;
-        // Source A: arr 10 launch 5 (delay 5); source B: arr 8 launch 0 (delay 8).
-        s.merge(RISE, 10.0, 9.0, 0.1, 0.1, 1, 1, 5.0, 5.0);
-        s.merge(RISE, 8.0, 7.0, 0.1, 0.1, 1, 1, 8.0, 0.0);
-        assert_eq!(s.arrival_max[RISE], 10.0, "arrival keeps the later winner");
-        assert_eq!(s.delay_max[RISE], 8.0, "delay keeps the larger path delay");
-        assert_eq!(s.delay_launch_max[RISE], 0.0, "and the winner's launch");
-        // A tying delay keeps the incumbent launch (measured order-independent).
-        s.merge(RISE, 9.0, 7.0, 0.1, 0.1, 1, 1, 8.0, 3.0);
-        assert_eq!(s.delay_launch_max[RISE], 0.0);
     }
 
     /// OpenSTA's ideal clock still tracks edge inversion through cell-driven clock
@@ -8559,7 +8392,7 @@ mod tests {
             .expect("u_ff1/D");
         // The `-setup 2` shift applies to the u_ff0->u_ff1 candidate, but the
         // report keeps the min-slack candidate across launch sources: an
-        // unshifted u_ff2/sel clock check beats the shifted 4.562147.
+        // unshifted u_ff2/sel clock check beats the shifted 4.550057.
         assert!((ff1.max_req_ns - 2.550057).abs() < 0.005);
 
         // `-both` is valid SDC OpenSTA rejects; it is counted ignored, not applied.

@@ -1,6 +1,6 @@
 # Path delay constraints (`set_max_delay` / `set_min_delay`)
 
-Status: **implemented v1** (2026-11-18) — parser, delay-domain state and
+Status: **implemented v1** (2026-11-18) — parser and signature-class
 composition live in `crates/grus-core/src/sta/{sdc,analysis}.rs`; every
 committed `md_*`/`pmd_*`/`mhu_*` scenario matches OpenSTA
 (`test_sta_exceptions_match_opensta`). This document records the OpenSTA
@@ -30,33 +30,40 @@ uses**, plus N:
 
 ```
 req_max_delay = capture_clk_arrival_early - setup_uncertainty - t_setup(endpoint, transition) + N
-arr_delay     = launch_clk_arrival_late + delay_max
+arr_delay     = the covered path's ordinary data arrival
+                (its own launch_clk_arrival_late + data delay)
 slack         = req_max_delay - arr_delay
 ```
 
-where `delay_max = arr_data - launch_clk_arrival` is the pure path delay
-(clock arrival excluded) and the capture term is the endpoint register's
-**own** clock-pin early arrival — the same `arrival_min[check.edge]` the
-setup clock check builds its closing edge on, minus the period the clock
-check adds. Verified numerically on `u_ff0 -> u_ff1/D` (ideal clock,
-`md_basic`/`m2_max0`): `0.7 - 0.05 - 0.099944 + 1.0 = 1.550056` — the two
-per-transition checks differ only through `t_setup` (the golden reports the
-rise winner; the pre-mux fixture measured 0.087853 rise / 0.043395 fall
-when `u_ff1/D` saw the bare `u_ff0 -> D` arc), sharing one launch arrival.
-An earlier draft of this document misidentified `setup_req - period` as the
-launch arrival (0.550057 on the current fixture); review corrected it —
-the raw clock-pin arrival (0.7 ideal; under propagation each clock net
-carries its own — `pm2_both` separates `c1`/`c2` by ~8.5 ps) is the launch
+Each covered (source, transition) pair produces a candidate carrying its
+own launch; the reported check keeps the worst covered candidate — i.e.
+the covered-source **arrival** winner, which under a skewed clock tree
+need not be the largest pure path delay. Measured on the diverging-winner
+fixture (`pm2_both` vs `pm2_prop`, `m2_max0` vs `m2_max2`): `u_ff0` holds
+the larger pure delay (~13.5 ps via the `A1` mux input) yet `u_ff2`'s ~69
+ps later launch wins the `pm2_both` report (0.786764 vs 0.731424). The
+capture term is the endpoint register's **own** clock-pin early arrival —
+the same `arrival_min[check.edge]` the setup clock check builds its
+closing edge on, minus the period the clock check adds. Verified
+numerically on `u_ff0 -> u_ff1/D` (ideal clock, `md_basic`/`m2_max0`):
+`0.7 - 0.05 - 0.099944 + 1.0 = 1.550056` — the two per-transition checks
+differ only through `t_setup` (the golden reports the rise winner; the
+pre-mux fixture measured 0.087853 rise / 0.043395 fall when `u_ff1/D` saw
+the bare `u_ff0 -> D` arc), sharing one launch arrival. An earlier draft
+of this document misidentified `setup_req - period` as the launch arrival
+(0.550057 on the current fixture); review corrected it — the raw
+clock-pin arrival (0.7 ideal; under propagation each clock net carries
+its own — `pm2_both` separates `c1`/`c3` by ~69 ps) is the launch
 reference and the uncertainty/setup-time terms are subtracted explicitly.
 
 The capture-vs-launch distinction is invisible while every clock pin shares
 one net arrival — the split-clock-buffer fixture (`pm2_both`) separates
-them: `u_ff1/D` reports `req = 1.013333` (anchored at `u_ff1/CLK` on `c1`,
-~8.5 ps later than the delay winner `u_ff2`'s launch on `c2`), not the
-launch-referenced `1.0048`. The CRPR credit the clock check adds is not
-applied to delay checks (unexercised: the delay domain tracks the winner's
-launch time, not its clock net, and this fixture's clock nets carry zero
-late/early spread).
+them: `u_ff1/D` reports `req = 1.013333` (anchored at `u_ff1/CLK` on `c1`),
+not the launch-referenced ~1.082 the arrival winner `u_ff2`'s launch on
+`c3` (~69 ps later, behind the extra `u_clkb3` stage) would give. The CRPR
+credit the clock check adds is not applied to delay checks (unexercised:
+the per-class merge does not keep the winning path's clock net, and this
+fixture's clock nets carry zero late/early spread).
 
 - Replace semantics proven by `md_loose` (`N = 5.0` >> setup budget): the
   covered `u_ff0` source's req became `capture - unc - t_setup + 5.0` —
@@ -87,11 +94,11 @@ with `-hold 1` or `-setup 2` on the same pair, the delay required stayed
 `0.778288 + 0.5` — MCP shifts do **not** feed into the delay check (the
 delay check replaces the MCP-adjusted clock check entirely on that side).
 
-`pm2_min2` separates the launch (`u_ff2` on `c2`) from the capture (`u_ff1`
-on `c1`) by ~8.5 ps and the formula still reproduces exactly, so the
-capture-anchored `req_hold_base + N` is verified for skewed launches on one
-clock domain; a literal two-clock-domain fixture is listed as follow-up
-work in section 5.
+`pm2_min2` separates the launch (`u_ff2` on `c3`, behind two clock-buffer
+stages) from the capture (`u_ff1` on `c1`) by ~69 ps and the formula still
+reproduces exactly, so the capture-anchored `req_hold_base + N` is
+verified for skewed launches on one clock domain; a literal
+two-clock-domain fixture is listed as follow-up work in section 5.
 
 ### Output ports (`-to [get_ports ...]`)
 
@@ -152,84 +159,41 @@ selectors (`get_cells`, `get_ports`, `all_registers`, `all_inputs`,
 | `-datapath_only` | **rejected** `STA-0563` (`md_datapath` committed) |
 | `-clock` | **rejected** `STA-0563` (ad hoc probe) |
 
-## 2. Why this needs new STA state
+## 2. Implementation shape
 
-The delay check needs, per (class, endpoint, transition):
-
-```
-slack = N + capture - max_over_covered_sources( launch(s) + delay(s) )
-      - unc - t_setup
-```
-
-where `delay(s) = arr_data(s) - launch(s)` is the **path delay excluding
-clock arrivals** and `capture` is the endpoint register's own clock-pin
-arrival — under a shared clock net `capture - launch(s)` cancels and this
-reduces to `N - delay - unc - t_setup`. The delay term propagates exactly
-like arrival (same arc delays) but seeds at the cell arc delay (`t_cq`)
-instead of `clk_arrival + t_cq`. Under a propagated clock, different
-sources have different launch times, so the max-delay winner can differ
-from the max-arrival winner — the existing aggregated `arrival_max` cannot
-answer this. Under an ideal clock all launches coincide and the two winners
-always agree, but we do not special-case that.
-
-### Proposed state addition
-
-`PinTimingState` gains two per-transition fields:
-
-- `delay_max: [f32; 2]` — max over paths of `(arrival - launch)`, propagated
-  with the same arc/net delays as `arrival_max` but seeded at arc delay only.
-- `delay_launch_max: [f32; 2]` — the **raw** launch clock arrival paired with
-  the `delay_max` winner (clock-pin arrival for FF/latch seeds; I/O clock
-  reference for port seeds). Raw, not uncertainty/setup-adjusted — those
-  terms are applied at the endpoint where `t_setup` is known.
-
-Merge semantics mirror `arrival_max`: independent winner tracking (the
-delay-max path may differ from the arrival-max path), ties keep the existing
-launch (documented; exact tie-break vs OpenSTA unmeasured — flagged for
-reviewers).
-
-Reported endpoint values for a delay-covered (endpoint, transition `pol`),
-with `t_setup` = the endpoint check arc's setup (late) time for `pol`:
+Per covered (class, endpoint, transition) the delay check is the clock
+check's candidate with a different required time:
 
 ```
-arr_reported = delay_launch + delay_max          (the delay-winner's arrival)
+arr_reported = the class's ordinary max arrival at the endpoint
+               (each covered source's launch already paired with its
+               data delay by the per-class propagation)
 req_reported = capture_arrival_min[check.edge] - unc_setup - t_setup + N
 slack        = req_reported - arr_reported
 ```
 
 with the capture arrival read at the endpoint register's own clock pin —
-it coincides with `delay_launch` only when launch and capture clocks see
-equal arrivals (measured on `pm2_both`).
+it coincides with a launch reference only when launch and capture clocks
+see equal arrivals. No per-pin delay domain is needed: the reported
+arrival is the covered-source **arrival** winner, which the
+signature-class eval run computes directly.
 
-`min` side needs **no** new state: the delay check uses the **pre-MCP** hold
-required time — `req_min_delay = req_hold_base + N` per transition, applied
-instead of the multicycle shift for covered pairs.
+An earlier v1 tracked a separate delay domain on `PinTimingState`
+(`delay_max` = max `arrival - launch` per transition, plus
+`delay_launch_max` = the delay winner's launch reference) and composed
+`arr = delay_launch_max + delay_max`. The 2026-11-19 diverging-winner
+regen falsified that pairing: OpenSTA's `pm2_both` reports `u_ff2`'s
+arrival (0.786764), not the delay winner `u_ff0`'s (0.731424) — the delay
+domain was retired (fields, seed pairing, merge terms and the
+latch-borrow delay reconstruction all removed; see `docs/results.md`).
+
+`min` side needs no special state either: the delay check uses the
+**pre-MCP** hold required time — `req_min_delay = req_hold_base + N` per
+transition, applied instead of the multicycle shift for covered pairs.
 
 Slew needs no pairing: slew is a per-pin/per-transition quantity in our model
 (and OpenSTA queries it at the endpoint vertex), identical for clock and
 delay checks.
-
-### Latch borrow interaction (review finding)
-
-`eval_sta` clamps latch-borrow arrivals against absolute clock-edge arrivals.
-Delay-domain values cannot be clamped directly, so at latch boundaries the
-code reconstructs the absolute arrival as `delay_launch + delay_max`, applies
-the same borrow clamp, and re-derives `delay_max`. The delay fields therefore
-propagate through latch arcs with borrow semantics preserved; this must be
-verified against an OpenSTA fixture containing a latch on a delay-constrained
-path (fixture follow-up — the current `sta_exceptions` DEF has no latches).
-
-### Seeds
-
-- FF `CLK -> Q` / latch enable -> Q: `delay = t_cq` (the arc's own derated
-  delay), `delay_launch = clock_state[clk_pin].arrival_*[edge]` — the raw
-  clock-pin arrival for the launching edge instance and clock transition
-  (max side uses the late arrival; exact min/max pairing verified against
-  golden during implementation).
-- Input ports: `delay = port_arrival - io_clock_ref`, `delay_launch =
-  io_clock_ref` where `io_clock_ref` is the referenced clock's arrival at the
-  clock port (0.528237-equivalent measured for `d_in`; `ClockRef::Virtual`
-  fallback TBD).
 
 ### Signature classes
 
@@ -248,9 +212,10 @@ only re-run delay state — rejected for v1 complexity.)
 Per side independently (max and min compose separately):
 
 1. false_path covering (s, e): drop candidate (existing).
-2. else max_delay covering (s, e): replace max-side candidate with the delay
-   check (`req = capture_clk_arrival_min[check.edge] - unc_setup - t_setup + N`,
-   `arr = delay_launch_max[pol] + delay_max[pol]`, `slack = req - arr`).
+2. else max_delay covering (s, e): keep the covered candidate's ordinary
+   arrival and slew, replace its required time with
+   `req = capture_clk_arrival_min[check.edge] - unc_setup - t_setup + N`,
+   `slack = req - arr`.
 3. else multicycle covering (s, e): existing req shift.
 4. min side: min_delay covering (s, e) -> `req = req_hold_base + N` (the
    pre-MCP hold required); else existing hold/multicycle handling.
@@ -275,7 +240,7 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
   and are excluded (counted in `unsupported_path_delay_endpoints`).
 - Universal (no `-from`/`-to`) rules.
 - Interaction with false_path / multicycle per section 1 precedence.
-- Propagated and ideal clocks (delay-state propagation is clock-agnostic).
+- Propagated and ideal clocks.
 
 **v1 diagnoses (ignored_commands / dedicated counters, never silent)**
 
@@ -313,25 +278,29 @@ variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 qualifier-diagnostic coverage, and the `m2_*`/`pm2_*` two-source set.
 
 Since 2026-11-19 the fixture drives `u_ff1/D` from a `mux2` with two FF
-inputs (`u_ff0`, `u_ff2`) and a constrained input port (`sel`), and splits
-`u_ff2`'s clock onto a second `clkbuf` (`c2`). `m2_both`/`pm2_both` merge
-two covered sources in one delay domain (a single `-from {u_ff0 u_ff2}`
+inputs (`u_ff0`, `u_ff2`) and a constrained input port (`sel`), assigns
+`u_ff0` the higher-capacitance mux input `A1` (the larger pure delay,
+~13.5 ps over `A0`), and delays `u_ff2`'s clock by an extra buffer stage
+(`c2 -> u_clkb3 -> c3`, ~81 ps of added launch delay — `u_ff2`'s launch
+lands ~69 ps after `u_ff0`'s on `c1`). `m2_both`/`pm2_both` merge two
+covered sources in one delay check (a single `-from {u_ff0 u_ff2}`
 command — the signature-class form that actually merges); `pm2_both` under
 `set_propagated_clock` showed the required time anchors to the **capture**
-clock pin, not the delay winner's launch (~8.5 ps skew between `c1`/`c2`).
-`pm2_min2` covers the min side under skewed launches. `pmd_multi` (two
-commands) and `md_nofrom` (universal `-from`) became multi-source delay
-scenarios for free.
+clock pin, not the launch's. `pm2_min2` covers the min side under skewed
+launches. `pmd_multi` (two commands) and `md_nofrom` (universal `-from`)
+became multi-source delay scenarios for free.
 
-Honest coverage note: the merged delay domain now runs on golden data and
-a deliberately mis-paired launch turns `pm2_both` red (fail-proof checked).
-However the delay winner and the arrival winner did **not** diverge in this
-fixture — `u_ff2`'s path delay advantage (~10 ps via `A1`) exceeds its
-earlier launch (~8.5 ps on `c2`), so `u_ff2` wins both. A golden that
-separates the two winners (e.g. a larger `c1` load) remains possible
-follow-up; the pairing is verified for the mis-paired-launch direction
-only. The delay check's CRPR credit is likewise unexercised (zero
-late/early spread on this fixture's clock nets).
+Honest coverage note: the merged delay check runs on golden data with the
+delay/arrival winners split — `pm2_both` reports the arrival winner
+`u_ff2` (0.786764) where `pm2_prop` reports `u_ff0`'s isolated delay check
+(0.731424), while the pure-delay order is `u_ff0` > `u_ff2` (`m2_max0`
+1.277188 vs `m2_max2` 1.263656 under a shared ideal launch). The 55.3 ps
+split falsified the earlier delay-winner pairing — `arr = delay_launch +
+delay_max` went red by exactly that gap — and established that OpenSTA
+reports the covered-source arrival winner (a wrong-arrival mutation was
+also checked red, per the fail-proof rule). The delay check's CRPR credit
+remains unexercised (zero late/early spread on this fixture's clock
+nets).
 
 ## 5. Open questions / follow-ups
 
@@ -361,15 +330,24 @@ Resolved by the v1 implementation (2026-11-18):
 Resolved by the two-source fixture (2026-11-19):
 
 - ~~two-driver fixture for the delay merge~~ — `m2_both`/`pm2_both` merge
-  two covered sources in one delay domain on golden data; `pmd_multi` and
-  `md_nofrom` are multi-source for free. Diverging delay/arrival winners
-  remain unexercised (section 4 note).
+  two covered sources in one delay check on golden data; `pmd_multi` and
+  `md_nofrom` are multi-source for free.
 - ~~skewed-launch `set_min_delay` anchoring~~ — `pm2_min2` covers a min
-  delay check whose launch (`u_ff2` on `c2`) is skewed from the capture
-  clock (`c1`); a literal two-clock-domain fixture stays open.
+  delay check whose launch (`u_ff2` on `c3`) is skewed ~69 ps from the
+  capture clock (`c1`); a literal two-clock-domain fixture stays open.
 - ~~max-side launch-vs-capture anchoring~~ — `pm2_both` measured the
   required time anchored to the endpoint's own clock-pin early arrival
-  (~8.5 ps skew); fixed req composition accordingly.
+  (~8.5 ps skew then, ~69 ps now); fixed req composition accordingly.
+
+Resolved by the diverging-winner regen (2026-11-19):
+
+- ~~delay-vs-arrival winner pairing~~ — `u_ff0` owns the larger pure delay
+  (~13.5 ps via `A1`) while `u_ff2`'s extra clock-buffer stage makes it
+  the arrival winner (~69 ps launch skew, 55.3 ps report split on
+  `pm2_both` vs `pm2_prop`). The golden falsified the
+  `delay_launch_max + delay_max` composition: OpenSTA reports the
+  covered-source arrival winner, so the delay domain was retired and the
+  delay check now keeps the covered candidate's ordinary arrival.
 
 Still open:
 
@@ -378,9 +356,6 @@ Still open:
    DEF/SDC additions.
 2. Output-port delay semantics (formulas measured ad hoc in section 1;
    dedicated scenarios + multi-source probing before implementing).
-3. A fixture where the delay winner and the arrival winner actually
-   diverge (skew > path-delay difference, e.g. a larger `c1` load), so the
-   `delay_launch_max` pairing is discriminated on golden data in both
-   directions; CRPR credit on delay checks needs a fixture with nonzero
-   clock-net late/early spread.
+3. CRPR credit on delay checks needs a fixture with nonzero clock-net
+   late/early spread.
 4. Propagated-clock input-port launch anchor (see above).
