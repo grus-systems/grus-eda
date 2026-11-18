@@ -31,6 +31,10 @@ enum Commands {
 
     /// E3: Static timing analysis (zero-wire, placement-based RC, or SPEF)
     Sta(StaArgs),
+
+    /// N7: Power estimation from VCD switching activity (leakage + switching + internal)
+    #[command(name = "power")]
+    Power(PowerArgs),
 }
 
 #[derive(Args, Debug)]
@@ -109,7 +113,10 @@ struct FloorplanArgs {
     #[arg(long, help = "Path to standard cell LEF (.lef) file")]
     lef: PathBuf,
 
-    #[arg(long, help = "Path to Liberty (.lib) file (optional; fills cell library ids)")]
+    #[arg(
+        long,
+        help = "Path to Liberty (.lib) file (optional; fills cell library ids)"
+    )]
     lib: Option<PathBuf>,
 
     #[arg(long, help = "Path to Yosys netlist JSON (.json) file")]
@@ -124,13 +131,23 @@ struct FloorplanArgs {
     #[arg(long, help = "Path to output floorplan DEF (.def) file")]
     out: PathBuf,
 
-    #[arg(long, help = "Explicit die area `xl,yl,xh,yh` in microns (overrides --utilization)")]
+    #[arg(
+        long,
+        help = "Explicit die area `xl,yl,xh,yh` in microns (overrides --utilization)"
+    )]
     die_area: Option<String>,
 
-    #[arg(long, help = "Target standard-cell utilization for auto die sizing (default 0.60)")]
+    #[arg(
+        long,
+        help = "Target standard-cell utilization for auto die sizing (default 0.60)"
+    )]
     utilization: Option<f64>,
 
-    #[arg(long, default_value_t = 10.0, help = "Core-to-die margin in microns (default 10.0)")]
+    #[arg(
+        long,
+        default_value_t = 10.0,
+        help = "Core-to-die margin in microns (default 10.0)"
+    )]
     margin_um: f64,
 
     #[arg(long, help = "Row site name (default: the tech LEF site)")]
@@ -172,7 +189,10 @@ struct StaArgs {
     #[arg(long, help = "Path to Liberty (.lib) file (setup corner)")]
     lib: PathBuf,
 
-    #[arg(long, help = "Path to Liberty (.lib) file for hold checks (default: same as --lib)")]
+    #[arg(
+        long,
+        help = "Path to Liberty (.lib) file for hold checks (default: same as --lib)"
+    )]
     lib_hold: Option<PathBuf>,
 
     #[arg(long, help = "Path to technology LEF (.tlef) file")]
@@ -187,23 +207,84 @@ struct StaArgs {
     #[arg(long, help = "Path to SDC (.sdc) timing constraints file")]
     sdc: PathBuf,
 
-    #[arg(long, value_enum, help = "Parasitic interconnect model (default: zero wire unless --spef is given)")]
+    #[arg(
+        long,
+        value_enum,
+        help = "Parasitic interconnect model (default: zero wire unless --spef is given)"
+    )]
     parasitics: Option<ParasiticsMode>,
 
-    #[arg(long, default_value = "met2", help = "Routing layer whose RC is used for --parasitics placement")]
+    #[arg(
+        long,
+        default_value = "met2",
+        help = "Routing layer whose RC is used for --parasitics placement"
+    )]
     wire_layer: String,
 
     #[arg(long, help = "Path to extracted SPEF (.spef) file")]
     spef: Option<PathBuf>,
 
-    #[arg(long, help = "Write the parasitics used by this run (placement RC or the loaded SPEF) as SPEF to this path")]
+    #[arg(
+        long,
+        help = "Write the parasitics used by this run (placement RC or the loaded SPEF) as SPEF to this path"
+    )]
     spef_out: Option<PathBuf>,
 
-    #[arg(long, help = "Write the full STA report (endpoints and skip summary) as JSON to this path")]
+    #[arg(
+        long,
+        help = "Write the full STA report (endpoints and skip summary) as JSON to this path"
+    )]
     json: Option<PathBuf>,
 
-    #[arg(long, help = "Exit non-zero when any cell, arc, endpoint or SDC option was skipped")]
+    #[arg(
+        long,
+        help = "Exit non-zero when any cell, arc, endpoint or SDC option was skipped"
+    )]
     strict: bool,
+}
+
+#[derive(Args, Debug)]
+struct PowerArgs {
+    #[arg(long, help = "Path to Liberty (.lib) file")]
+    lib: PathBuf,
+
+    #[arg(long, help = "Path to technology LEF (.tlef) file")]
+    tlef: PathBuf,
+
+    #[arg(long, help = "Path to standard cell LEF (.lef) file")]
+    lef: PathBuf,
+
+    #[arg(long, help = "Path to placed DEF (.def) file")]
+    def: PathBuf,
+
+    #[arg(
+        long,
+        help = "Path to SDC (.sdc) timing constraints file (seeds pin slews)"
+    )]
+    sdc: PathBuf,
+
+    #[arg(long, help = "Path to VCD (.vcd) switching-activity dump")]
+    vcd: PathBuf,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Parasitic interconnect model (default: zero wire unless --spef is given)"
+    )]
+    parasitics: Option<ParasiticsMode>,
+
+    #[arg(
+        long,
+        default_value = "met2",
+        help = "Routing layer whose RC is used for --parasitics placement"
+    )]
+    wire_layer: String,
+
+    #[arg(long, help = "Path to extracted SPEF (.spef) file")]
+    spef: Option<PathBuf>,
+
+    #[arg(long, help = "Write the power report as JSON to this path")]
+    json: Option<PathBuf>,
 }
 
 fn check_top_name(expected: Option<&str>, kind: &str, actual: &str) -> anyhow::Result<()> {
@@ -250,8 +331,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("Loading LEF from {:?} and {:?}", tlef_path, lef_path);
                 let t_lef = std::time::Instant::now();
                 let mut interner = grus_core::interner::StringInterner::new();
-                let tech_db =
-                    grus_core::readers::load_tech_db(tlef_path, lef_path, &mut interner)?;
+                let tech_db = grus_core::readers::load_tech_db(tlef_path, lef_path, &mut interner)?;
                 let elapsed_lef_ms = t_lef.elapsed().as_secs_f64() * 1000.0;
                 println!(
                     "Loaded LEF: dbu/um={}, site={} ({}x{} dbu), routing_layers={}, macros={}, macro_pins={}, elapsed={:.2}ms",
@@ -268,7 +348,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 if let Some(json_path) = &args.json {
                     println!("Loading Yosys JSON netlist from {:?}", json_path);
                     let t_json = std::time::Instant::now();
-                    let db_json = grus_core::readers::parse_yosys_json(json_path, &tech_db, Some(&lib_db))?;
+                    let db_json =
+                        grus_core::readers::parse_yosys_json(json_path, &tech_db, Some(&lib_db))?;
                     check_top_name(args.top.as_deref(), "Yosys JSON", &db_json.design_name)?;
                     let elapsed_json_ms = t_json.elapsed().as_secs_f64() * 1000.0;
                     println!(
@@ -344,7 +425,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let elapsed_route = t_route.elapsed().as_secs_f64() * 1000.0;
 
             let total_cap: f32 = grid.h_cap.iter().sum::<f32>() + grid.v_cap.iter().sum::<f32>();
-            let total_demand: f32 = grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
+            let total_demand: f32 =
+                grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
 
             println!(
                 "Congestion Estimation: design={}, grid={}x{}, tile_w={} dbu, tile_h={} dbu",
@@ -356,7 +438,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             );
             println!(
                 "Congestion Metrics: max_edge_overflow={:.1}, top_05pct_overflow={:.2}, overflow_gcells={}/{}",
-                report.max_edge_overflow, report.top_05pct_overflow, report.overflow_gcells, grid.nx * grid.ny
+                report.max_edge_overflow,
+                report.top_05pct_overflow,
+                report.overflow_gcells,
+                grid.nx * grid.ny
             );
             println!(
                 "Runtime: load={:.2}ms, estimation={:.2}ms",
@@ -481,7 +566,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 ..Default::default()
             };
             let t_gp = std::time::Instant::now();
-            let gp_res = grus_core::placement::run_nesterov_placement(&design_db, &tech_db, &config);
+            let gp_res =
+                grus_core::placement::run_nesterov_placement(&design_db, &tech_db, &config);
             let elapsed_gp = t_gp.elapsed().as_secs_f64() * 1000.0;
             if gp_res.converged {
                 println!(
@@ -544,7 +630,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 (None | Some(ParasiticsMode::None), None) => "zero wire",
                 (Some(ParasiticsMode::Placement), None) => "placement RC",
                 (None | Some(ParasiticsMode::Spef), Some(_)) => "SPEF",
-                (parasitics, spef) => anyhow::bail!("unsupported --parasitics {:?} with --spef {:?}", parasitics, spef),
+                (parasitics, spef) => anyhow::bail!(
+                    "unsupported --parasitics {:?} with --spef {:?}",
+                    parasitics,
+                    spef
+                ),
             };
             let lib_db = grus_core::readers::load_liberty(&args.lib)?;
             let lib_hold_db = match &args.lib_hold {
@@ -555,7 +645,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let design = grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?;
             let design_hold = match &lib_hold_db {
-                Some(lib) => Some(grus_core::readers::parse_def(&args.def, &tech_db, Some(lib))?),
+                Some(lib) => Some(grus_core::readers::parse_def(
+                    &args.def,
+                    &tech_db,
+                    Some(lib),
+                )?),
                 None => None,
             };
             let sdc = grus_core::sta::load_sdc(&args.sdc)?;
@@ -588,7 +682,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if let Some(path) = &args.spef_out {
                 let Some(p) = &parasitics else {
-                    anyhow::bail!("--spef-out needs parasitics: pass --parasitics placement or --spef");
+                    anyhow::bail!(
+                        "--spef-out needs parasitics: pass --parasitics placement or --spef"
+                    );
                 };
                 let spef_text = grus_core::sta::write_spef(&design, &lib_db, p)?;
                 std::fs::write(path, spef_text)?;
@@ -596,8 +692,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             let report = match (&lib_hold_db, &design_hold, &parasitics_hold) {
                 (Some(hold_lib), Some(hold_design), Some(hold_parasitics)) => {
-                    let setup = grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
-                    let hold = grus_core::sta::run_sta_quiet(hold_design, hold_lib, &sdc, Some(hold_parasitics))?;
+                    let setup =
+                        grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
+                    let hold = grus_core::sta::run_sta_quiet(
+                        hold_design,
+                        hold_lib,
+                        &sdc,
+                        Some(hold_parasitics),
+                    )?;
                     grus_core::sta::merge_corner_reports(setup, hold)?
                 }
                 _ => grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?,
@@ -624,6 +726,91 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 anyhow::bail!("strict: the run skipped inputs; see the summary above");
             }
         }
+        Commands::Power(args) => {
+            let mode = match (args.parasitics, &args.spef) {
+                (None | Some(ParasiticsMode::None), None) => "zero wire",
+                (Some(ParasiticsMode::Placement), None) => "placement RC",
+                (None | Some(ParasiticsMode::Spef), Some(_)) => "SPEF",
+                (parasitics, spef) => anyhow::bail!(
+                    "unsupported --parasitics {:?} with --spef {:?}",
+                    parasitics,
+                    spef
+                ),
+            };
+            let lib_db = grus_core::readers::load_liberty(&args.lib)?;
+            let mut interner = grus_core::interner::StringInterner::new();
+            let tech_db = grus_core::readers::load_tech_db(&args.tlef, &args.lef, &mut interner)?;
+            let design = grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?;
+            let sdc = grus_core::sta::load_sdc(&args.sdc)?;
+            let parasitics = match (mode, &args.spef) {
+                ("placement RC", _) => {
+                    let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                    Some(grus_core::sta::estimate_placement_parasitics(
+                        &design, &tech_db, rc,
+                    ))
+                }
+                (_, Some(spef_path)) => {
+                    let spef = grus_core::readers::load_spef(spef_path)?;
+                    Some(grus_core::sta::spef_parasitics(&design, &spef)?)
+                }
+                _ => None,
+            };
+            let t0 = std::time::Instant::now();
+            let pin_slews =
+                grus_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?;
+            let vcd = grus_core::readers::load_vcd(&args.vcd)?;
+            let report = grus_core::power::estimate_power(
+                &design,
+                &lib_db,
+                &sdc,
+                parasitics.as_ref(),
+                &vcd,
+                &pin_slews,
+            );
+            println!(
+                "Power ({} parasitics, VCD {:.3} s): internal={:.6e} W, switching={:.6e} W, leakage={:.6e} W, total={:.6e} W ({:.2} ms)",
+                mode,
+                report.duration_s,
+                report.internal_w,
+                report.switching_w,
+                report.leakage_w,
+                report.total_w,
+                t0.elapsed().as_secs_f64() * 1000.0,
+            );
+            for g in &report.groups {
+                println!(
+                    "  {:<14} internal={:.6e} switching={:.6e} leakage={:.6e} total={:.6e} W",
+                    g.name,
+                    g.internal_w,
+                    g.switching_w,
+                    g.leakage_w,
+                    g.internal_w + g.switching_w + g.leakage_w
+                );
+            }
+            let d = &report.diagnostics;
+            if d.cells_without_lib_cell > 0
+                || d.driven_nets_without_vcd > 0
+                || d.active_nets_without_cell_driver > 0
+                || d.internal_power_without_slew > 0
+                || d.unresolved_related_pin > 0
+                || d.conditional_power_blocks > 0
+            {
+                eprintln!(
+                    "power: {} cells without lib cell, {} driven nets without VCD activity, {} active nets without cell driver, {} internal-power lookups missing slew, {} unresolved related pins, {} conditional power blocks",
+                    d.cells_without_lib_cell,
+                    d.driven_nets_without_vcd,
+                    d.active_nets_without_cell_driver,
+                    d.internal_power_without_slew,
+                    d.unresolved_related_pin,
+                    d.conditional_power_blocks,
+                );
+            }
+            if let Some(path) = &args.json {
+                let json = serde_json::to_string_pretty(&report)?;
+                std::fs::write(path, json)?;
+                println!("Wrote power report JSON to {:?}", path);
+            }
+        }
     }
     Ok(())
 }
@@ -647,7 +834,11 @@ fn print_skip_summary(report: &grus_core::sta::StaReport) {
         return;
     }
     let share = |n: usize, total: usize| {
-        if total == 0 { "n/a".to_string() } else { format!("{:.2}%", 100.0 * n as f64 / total as f64) }
+        if total == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.2}%", 100.0 * n as f64 / total as f64)
+        }
     };
     println!(
         "skipped: {}/{} arcs ({}), {}/{} endpoints ({})",
@@ -678,7 +869,10 @@ fn print_skip_summary(report: &grus_core::sta::StaReport) {
             .as_deref()
             .map(|r| format!(" ({r})"))
             .unwrap_or_default();
-        println!("    endpoint {} {:?}: {:?}{}", e.pin, e.kind, e.reason, related);
+        println!(
+            "    endpoint {} {:?}: {:?}{}",
+            e.pin, e.kind, e.reason, related
+        );
     }
 }
 
@@ -731,13 +925,119 @@ mod tests {
 
     #[test]
     fn cli_parsers_reject_out_of_range_and_nan() {
-        assert!(Cli::try_parse_from(["grus-eda", "congestion", "--tlef", "a", "--lef", "b", "--def", "c", "--layer-adjust", "1.5"]).is_err());
-        assert!(Cli::try_parse_from(["grus-eda", "congestion", "--tlef", "a", "--lef", "b", "--def", "c", "--layer-adjust", "NaN"]).is_err());
-        assert!(Cli::try_parse_from(["grus-eda", "congestion", "--tlef", "a", "--lef", "b", "--def", "c", "--gcell-tracks", "0"]).is_err());
-        assert!(Cli::try_parse_from(["grus-eda", "place", "--tlef", "a", "--lef", "b", "--def", "c", "--out-def", "d", "--target-density", "0"]).is_err());
-        assert!(Cli::try_parse_from(["grus-eda", "place", "--tlef", "a", "--lef", "b", "--def", "c", "--out-def", "d", "--target-density", "1.1"]).is_err());
-        assert!(Cli::try_parse_from(["grus-eda", "place", "--tlef", "a", "--lef", "b", "--def", "c", "--out-def", "d", "--target-density", "NaN"]).is_err());
-        assert!(Cli::try_parse_from(["grus-eda", "place", "--tlef", "a", "--lef", "b", "--def", "c", "--out-def", "d", "--target-density", "0.60"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda",
+                "congestion",
+                "--tlef",
+                "a",
+                "--lef",
+                "b",
+                "--def",
+                "c",
+                "--layer-adjust",
+                "1.5"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda",
+                "congestion",
+                "--tlef",
+                "a",
+                "--lef",
+                "b",
+                "--def",
+                "c",
+                "--layer-adjust",
+                "NaN"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda",
+                "congestion",
+                "--tlef",
+                "a",
+                "--lef",
+                "b",
+                "--def",
+                "c",
+                "--gcell-tracks",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda",
+                "place",
+                "--tlef",
+                "a",
+                "--lef",
+                "b",
+                "--def",
+                "c",
+                "--out-def",
+                "d",
+                "--target-density",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda",
+                "place",
+                "--tlef",
+                "a",
+                "--lef",
+                "b",
+                "--def",
+                "c",
+                "--out-def",
+                "d",
+                "--target-density",
+                "1.1"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda",
+                "place",
+                "--tlef",
+                "a",
+                "--lef",
+                "b",
+                "--def",
+                "c",
+                "--out-def",
+                "d",
+                "--target-density",
+                "NaN"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda",
+                "place",
+                "--tlef",
+                "a",
+                "--lef",
+                "b",
+                "--def",
+                "c",
+                "--out-def",
+                "d",
+                "--target-density",
+                "0.60"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -751,51 +1051,90 @@ mod tests {
 
         // 1. --top mismatches and missing --tlef/--lef must fail loudly
         let err_missing_lef = run(Cli::try_parse_from([
-            "grus-eda", "check-e0", "--lib", lib.to_str().unwrap(),
-            "--def", gcd.join("gcd.placed.def").to_str().unwrap(),
-        ]).unwrap());
-        assert!(err_missing_lef.is_err(), "check-e0 with --def but no --tlef/--lef must fail");
+            "grus-eda",
+            "check-e0",
+            "--lib",
+            lib.to_str().unwrap(),
+            "--def",
+            gcd.join("gcd.placed.def").to_str().unwrap(),
+        ])
+        .unwrap());
+        assert!(
+            err_missing_lef.is_err(),
+            "check-e0 with --def but no --tlef/--lef must fail"
+        );
 
         let err_top = run(Cli::try_parse_from([
-            "grus-eda", "check-e0",
-            "--lib", lib.to_str().unwrap(),
-            "--tlef", tlef.to_str().unwrap(),
-            "--lef", lef.to_str().unwrap(),
-            "--json", gcd.join("gcd.synth.json").to_str().unwrap(),
-            "--top", "wrong_module",
-        ]).unwrap());
+            "grus-eda",
+            "check-e0",
+            "--lib",
+            lib.to_str().unwrap(),
+            "--tlef",
+            tlef.to_str().unwrap(),
+            "--lef",
+            lef.to_str().unwrap(),
+            "--json",
+            gcd.join("gcd.synth.json").to_str().unwrap(),
+            "--top",
+            "wrong_module",
+        ])
+        .unwrap());
         assert!(err_top.is_err(), "mismatched --top must fail");
 
         // 2. E0: check-e0 across Liberty, LEF, JSON, Verilog, DEF with matching --top
         run(Cli::try_parse_from([
-            "grus-eda", "check-e0",
-            "--lib", lib.to_str().unwrap(),
-            "--tlef", tlef.to_str().unwrap(),
-            "--lef", lef.to_str().unwrap(),
-            "--json", gcd.join("gcd.synth.json").to_str().unwrap(),
-            "--verilog", gcd.join("gcd.synth.v").to_str().unwrap(),
-            "--def", gcd.join("gcd.placed.def").to_str().unwrap(),
-            "--top", "gcd",
-        ]).unwrap()).expect("check-e0 must succeed");
+            "grus-eda",
+            "check-e0",
+            "--lib",
+            lib.to_str().unwrap(),
+            "--tlef",
+            tlef.to_str().unwrap(),
+            "--lef",
+            lef.to_str().unwrap(),
+            "--json",
+            gcd.join("gcd.synth.json").to_str().unwrap(),
+            "--verilog",
+            gcd.join("gcd.synth.v").to_str().unwrap(),
+            "--def",
+            gcd.join("gcd.placed.def").to_str().unwrap(),
+            "--top",
+            "gcd",
+        ])
+        .unwrap())
+        .expect("check-e0 must succeed");
 
         // 3. E2: place -> out_def
         run(Cli::try_parse_from([
-            "grus-eda", "place",
-            "--tlef", tlef.to_str().unwrap(),
-            "--lef", lef.to_str().unwrap(),
-            "--def", gcd.join("gcd.floorplan.def").to_str().unwrap(),
-            "--out-def", out_def.to_str().unwrap(),
-        ]).unwrap()).expect("place must succeed");
+            "grus-eda",
+            "place",
+            "--tlef",
+            tlef.to_str().unwrap(),
+            "--lef",
+            lef.to_str().unwrap(),
+            "--def",
+            gcd.join("gcd.floorplan.def").to_str().unwrap(),
+            "--out-def",
+            out_def.to_str().unwrap(),
+        ])
+        .unwrap())
+        .expect("place must succeed");
 
         // 4. E1: congestion on newly placed DEF with --heatmap and --layer-adjust
         run(Cli::try_parse_from([
-            "grus-eda", "congestion",
-            "--tlef", tlef.to_str().unwrap(),
-            "--lef", lef.to_str().unwrap(),
-            "--def", out_def.to_str().unwrap(),
-            "--layer-adjust", "0.2",
+            "grus-eda",
+            "congestion",
+            "--tlef",
+            tlef.to_str().unwrap(),
+            "--lef",
+            lef.to_str().unwrap(),
+            "--def",
+            out_def.to_str().unwrap(),
+            "--layer-adjust",
+            "0.2",
             "--heatmap",
-        ]).unwrap()).expect("congestion must succeed");
+        ])
+        .unwrap())
+        .expect("congestion must succeed");
 
         // 5. E3: zero-wire, placement RC on placed out_def, and routed SPEF
         let sdc_p = gcd.join("gcd.sdc");
@@ -806,12 +1145,18 @@ mod tests {
             vec!["--parasitics", "spef", "--spef", spef_p.to_str().unwrap()],
         ] {
             let mut argv = vec![
-                "grus-eda", "sta",
-                "--lib", lib.to_str().unwrap(),
-                "--tlef", tlef.to_str().unwrap(),
-                "--lef", lef.to_str().unwrap(),
-                "--def", out_def.to_str().unwrap(),
-                "--sdc", sdc_p.to_str().unwrap(),
+                "grus-eda",
+                "sta",
+                "--lib",
+                lib.to_str().unwrap(),
+                "--tlef",
+                tlef.to_str().unwrap(),
+                "--lef",
+                lef.to_str().unwrap(),
+                "--def",
+                out_def.to_str().unwrap(),
+                "--sdc",
+                sdc_p.to_str().unwrap(),
             ];
             argv.extend(extra);
             run(Cli::try_parse_from(argv).unwrap()).expect("sta must succeed");
@@ -819,16 +1164,28 @@ mod tests {
 
         // Reject contradictory --parasitics placement --spef
         let err_sta = run(Cli::try_parse_from([
-            "grus-eda", "sta",
-            "--lib", lib.to_str().unwrap(),
-            "--tlef", tlef.to_str().unwrap(),
-            "--lef", lef.to_str().unwrap(),
-            "--def", out_def.to_str().unwrap(),
-            "--sdc", sdc_p.to_str().unwrap(),
-            "--parasitics", "placement",
-            "--spef", spef_p.to_str().unwrap(),
-        ]).unwrap());
-        assert!(err_sta.is_err(), "contradictory --parasitics placement --spef must fail");
+            "grus-eda",
+            "sta",
+            "--lib",
+            lib.to_str().unwrap(),
+            "--tlef",
+            tlef.to_str().unwrap(),
+            "--lef",
+            lef.to_str().unwrap(),
+            "--def",
+            out_def.to_str().unwrap(),
+            "--sdc",
+            sdc_p.to_str().unwrap(),
+            "--parasitics",
+            "placement",
+            "--spef",
+            spef_p.to_str().unwrap(),
+        ])
+        .unwrap());
+        assert!(
+            err_sta.is_err(),
+            "contradictory --parasitics placement --spef must fail"
+        );
 
         let _ = std::fs::remove_file(&out_def);
     }
@@ -844,12 +1201,18 @@ mod tests {
         let sdc = gcd.join("gcd.sdc");
         let sta_argv = |extra: &[&str]| {
             let mut argv = vec![
-                "grus-eda", "sta",
-                "--lib", lib.to_str().unwrap(),
-                "--tlef", tlef.to_str().unwrap(),
-                "--lef", lef.to_str().unwrap(),
-                "--def", def.to_str().unwrap(),
-                "--sdc", sdc.to_str().unwrap(),
+                "grus-eda",
+                "sta",
+                "--lib",
+                lib.to_str().unwrap(),
+                "--tlef",
+                tlef.to_str().unwrap(),
+                "--lef",
+                lef.to_str().unwrap(),
+                "--def",
+                def.to_str().unwrap(),
+                "--sdc",
+                sdc.to_str().unwrap(),
             ];
             argv.extend_from_slice(extra);
             Cli::try_parse_from(argv).unwrap()
@@ -859,7 +1222,8 @@ mod tests {
         let json_path = std::env::temp_dir().join("grus_cli_test_sta.json");
         run(sta_argv(&["--json", json_path.to_str().unwrap()])).expect("sta must succeed");
         let report: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&json_path).expect("report JSON")).expect("JSON parses");
+            serde_json::from_slice(&std::fs::read(&json_path).expect("report JSON"))
+                .expect("JSON parses");
         assert_eq!(report["skipped"]["unmapped_cells"].as_u64().unwrap(), 93);
         assert!(report["skipped"]["total_arcs"].as_u64().unwrap() > 0);
 

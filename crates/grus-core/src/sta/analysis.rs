@@ -1,11 +1,11 @@
-use super::dmp::{driver_waveform_slew, solve_dmp, PiModel};
+use super::dmp::{PiModel, driver_waveform_slew, solve_dmp};
 use super::nldm::{eval_nldm_constraint, eval_nldm_delay_or_slew};
 use super::parasitics::NetParasitics;
-use super::sdc::{Sdc, DERATE_CELL, DERATE_CHECK, DERATE_NET};
+use super::sdc::{DERATE_CELL, DERATE_CHECK, DERATE_NET, Sdc};
 use crate::design_db::DesignDb;
 use crate::interner::{CellId, LibPinId, NetId, PinDir, PinId};
 use crate::lib_db::{LibCell, LibDb, LibPin, NldmTable, TimingSense, TimingType};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -762,11 +762,7 @@ impl<'a> FuncParser<'a> {
             Some(FuncExpr::Not(Box::new(self.parse_unary()?)))
         } else if self.eat(b'(') {
             let e = self.parse_or()?;
-            if self.eat(b')') {
-                Some(e)
-            } else {
-                None
-            }
+            if self.eat(b')') { Some(e) } else { None }
         } else {
             self.ident().map(|n| FuncExpr::Lit(n, false))
         }
@@ -1855,6 +1851,44 @@ fn constraint_table(arc: &crate::lib_db::LibTimingArc, pol: usize) -> Option<&Nl
     }
 }
 
+/// Worst (`slew_max`) transition slew in ns at each pin, per transition. Unreached
+/// pins keep `f32::NEG_INFINITY`; power table lookups treat them as missing.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct PinSlew {
+    pub rise_ns: f32,
+    pub fall_ns: f32,
+}
+
+impl PinSlew {
+    pub fn reached(&self, pol: usize) -> bool {
+        let s = if pol == RISE {
+            self.rise_ns
+        } else {
+            self.fall_ns
+        };
+        s.is_finite() && s > 0.0
+    }
+}
+
+/// Runs the full STA flow and returns the per-pin worst slews, for consumers that
+/// need operating-point data (e.g. `internal_power` table lookups) rather than the
+/// endpoint report. Costs the same as [`run_sta`].
+pub fn sta_pin_slews(
+    design: &DesignDb,
+    lib: &LibDb,
+    sdc: &Sdc,
+    parasitics: Option<&NetParasitics>,
+) -> Result<Vec<PinSlew>> {
+    let (_report, state, _parities) = run_sta_detail(design, lib, sdc, parasitics, false)?;
+    Ok(state
+        .iter()
+        .map(|s| PinSlew {
+            rise_ns: s.slew_max[RISE],
+            fall_ns: s.slew_max[FALL],
+        })
+        .collect())
+}
+
 /// Zero-wire STA when `parasitics` is `None`; otherwise wire capacitance and Elmore wire delay are added.
 pub fn run_sta(
     design: &DesignDb,
@@ -2140,24 +2174,28 @@ fn run_sta_detail(
         graph
             .launches
             .iter()
-            .map(|l| {
-                eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge)
-            })
+            .map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge))
             .collect()
     } else {
         graph
             .launches
             .par_iter()
-            .map(|l| {
-                eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge)
-            })
+            .map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge))
             .collect()
     };
     for (l, pair) in graph.launches.iter().zip(launch_updates) {
         let par = launch_parity(l.clk, l.edge);
         for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
             if arr_max > f32::NEG_INFINITY {
-                state[q.0 as usize].merge(dst_pol, arr_max, arr_min, slew_max, slew_min, 1 << par, 1 << par);
+                state[q.0 as usize].merge(
+                    dst_pol,
+                    arr_max,
+                    arr_min,
+                    slew_max,
+                    slew_min,
+                    1 << par,
+                    1 << par,
+                );
             }
         }
     }
@@ -2169,14 +2207,27 @@ fn run_sta_detail(
         .latch_opens
         .iter()
         .map(|open| {
-            eval_launch(open.q, state[open.enable.0 as usize], open.lib_arc, open.open_pol)
+            eval_launch(
+                open.q,
+                state[open.enable.0 as usize],
+                open.lib_arc,
+                open.open_pol,
+            )
         })
         .collect();
     for (open, pair) in graph.latch_opens.iter().zip(latch_updates) {
         let par = launch_parity(open.enable, open.open_pol);
         for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
             if arr_max > f32::NEG_INFINITY {
-                state[q.0 as usize].merge(dst_pol, arr_max, arr_min, slew_max, slew_min, 1 << par, 1 << par);
+                state[q.0 as usize].merge(
+                    dst_pol,
+                    arr_max,
+                    arr_min,
+                    slew_max,
+                    slew_min,
+                    1 << par,
+                    1 << par,
+                );
             }
         }
     }
@@ -2397,34 +2448,33 @@ fn record_endpoint(
             // A reached check pin with no candidate means every arrived transition
             // lacked a usable NLDM constraint table; gates and ports have no such
             // table lookup, so their only failure is an unreached pin.
-            let (reason, related) = if kind == EndpointKind::Check
-                && (s.reached(RISE) || s.reached(FALL))
-            {
-                (SkipReason::NoConstraintTable, None)
-            } else {
-                match levelized.pin_driver[pin.0 as usize] {
-                    Some((_, _, drv)) => {
-                        // A driver cell with no Liberty mapping or no timing arcs at all
-                        // (constant `conb`, tap, filler) can never deliver a timed arrival;
-                        // name it so the skip reads as the expected untimed case.
-                        let untimed = cx.design.pin_cells[drv.0 as usize].is_some_and(|c| {
-                            match cx.design.cell_lib_ids[c.0 as usize] {
-                                Some(lcid) => cx.lib.cells[lcid.0 as usize].arc_count == 0,
-                                None => true,
-                            }
-                        });
-                        (
-                            if untimed {
-                                SkipReason::UntimedDriver
-                            } else {
-                                SkipReason::NoPath
-                            },
-                            Some(cx.pin_name(drv)),
-                        )
+            let (reason, related) =
+                if kind == EndpointKind::Check && (s.reached(RISE) || s.reached(FALL)) {
+                    (SkipReason::NoConstraintTable, None)
+                } else {
+                    match levelized.pin_driver[pin.0 as usize] {
+                        Some((_, _, drv)) => {
+                            // A driver cell with no Liberty mapping or no timing arcs at all
+                            // (constant `conb`, tap, filler) can never deliver a timed arrival;
+                            // name it so the skip reads as the expected untimed case.
+                            let untimed = cx.design.pin_cells[drv.0 as usize].is_some_and(|c| {
+                                match cx.design.cell_lib_ids[c.0 as usize] {
+                                    Some(lcid) => cx.lib.cells[lcid.0 as usize].arc_count == 0,
+                                    None => true,
+                                }
+                            });
+                            (
+                                if untimed {
+                                    SkipReason::UntimedDriver
+                                } else {
+                                    SkipReason::NoPath
+                                },
+                                Some(cx.pin_name(drv)),
+                            )
+                        }
+                        None => (SkipReason::NoPath, None),
                     }
-                    None => (SkipReason::NoPath, None),
-                }
-            };
+                };
             skipped.skipped_endpoints.push(SkippedEndpoint {
                 pin: cx.pin_name(pin),
                 kind,
@@ -2487,11 +2537,7 @@ fn crpr_driver_net(
             }
             net = r;
         }
-        if net == -1 {
-            CRPR_BAD
-        } else {
-            net
-        }
+        if net == -1 { CRPR_BAD } else { net }
     };
     memo[p] = result;
     result
@@ -2646,7 +2692,11 @@ fn collect_endpoints(
             // each tying parity can shift the capture edge by a period, so evaluate
             // the required time per parity bit and keep the worst slack. An empty
             // mask cannot occur on a reached pin; parity 0 is the fallback anyway.
-            let max_mask = if s.par_max[pol] == 0 { 1 } else { s.par_max[pol] };
+            let max_mask = if s.par_max[pol] == 0 {
+                1
+            } else {
+                s.par_max[pol]
+            };
             let mut max_pick: Option<(f32, f32)> = None;
             for g in 0..2usize {
                 if max_mask & (1 << g) == 0 {
@@ -2675,8 +2725,7 @@ fn collect_endpoints(
                     let periods = ((closing - clk_state.arrival_min[open_pol]) / sdc.period_ns)
                         .floor()
                         .max(0.0);
-                    clk_state.arrival_min[open_pol]
-                        + periods * sdc.period_ns
+                    clk_state.arrival_min[open_pol] + periods * sdc.period_ns
                         - sdc.setup_uncertainty_ns
                         + credit_for(open_pol)
                 };
@@ -2707,14 +2756,17 @@ fn collect_endpoints(
                 eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[edge])
                     * sdc.derate(false, DERATE_CHECK, false, check_transition(early));
             let req_min =
-                clk_state.arrival_max[edge] + early_time + sdc.hold_uncertainty_ns
-                    - credit;
+                clk_state.arrival_max[edge] + early_time + sdc.hold_uncertainty_ns - credit;
             // Hold pairs the capture edge with the next launch edge of the same polarity:
             // the arrival shifts one period when the launch edge parity precedes the
             // capture pin's first edge of this polarity.
             // Same parity tie on the early side: the hold arrival shifts one period
             // per tying launch parity; keep the smallest resulting slack.
-            let min_mask = if s.par_min[pol] == 0 { 1 } else { s.par_min[pol] };
+            let min_mask = if s.par_min[pol] == 0 {
+                1
+            } else {
+                s.par_min[pol]
+            };
             let mut min_pick: Option<(f32, f32)> = None;
             for g in 0..2usize {
                 if min_mask & (1 << g) == 0 {
@@ -2795,16 +2847,13 @@ fn collect_endpoints(
             let req_max = (0..2usize)
                 .filter(|g| par_bits(s.par_max[pol]) & (1 << g) != 0)
                 .map(|g| {
-                    c.arrival_min[setup_edge]
-                        + if pe <= g { sdc.period_ns } else { 0.0 }
+                    c.arrival_min[setup_edge] + if pe <= g { sdc.period_ns } else { 0.0 }
                         - sdc.setup_uncertainty_ns
                 })
                 .fold(f32::INFINITY, f32::min);
             let arr_min = (0..2usize)
                 .filter(|g| par_bits(s.par_min[pol]) & (1 << g) != 0)
-                .map(|g| {
-                    s.arrival_min[pol] + if g < pe { sdc.period_ns } else { 0.0 }
-                })
+                .map(|g| s.arrival_min[pol] + if g < pe { sdc.period_ns } else { 0.0 })
                 .fold(f32::INFINITY, f32::min);
             let req_min = c.arrival_max[hold_edge] + sdc.hold_uncertainty_ns;
             let slack_max = req_max - s.arrival_max[pol];
@@ -3327,8 +3376,8 @@ mod tests {
         for design_name in ["aes", "ibex", "jpeg"] {
             let lib_dir = sky130_hd();
             let dir = design_dir(design_name);
-            let lib =
-                load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+            let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"))
+                .expect("Liberty");
             let mut interner = StringInterner::new();
             let tech = load_tech_db(
                 &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
@@ -3350,9 +3399,10 @@ mod tests {
             // extraction (tests/designs/README.md).
             let spef = crate::readers::load_spef(&dir.join(format!("{design_name}.routed.spef")))
                 .expect("SPEF");
-            let parasitics_s = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
-            let (rp, _, _) =
-                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_p), true).expect("placement STA");
+            let parasitics_s =
+                crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
+            let (rp, _, _) = run_sta_detail(&design, &lib, &sdc, Some(&parasitics_p), true)
+                .expect("placement STA");
             let (rs, _, _) =
                 run_sta_detail(&design, &lib, &sdc, Some(&parasitics_s), true).expect("SPEF STA");
             assert_eq!(
@@ -3395,8 +3445,14 @@ mod tests {
                  tns_max {tns_max_d:.6} ns, tns_min {tns_min_d:.6} ns",
                 worst.map(|w| (w * 1e6).round() / 1e3)
             );
-            assert_eq!(rp.setup_violations, rs.setup_violations, "{design_name}: setup violations");
-            assert_eq!(rp.hold_violations, rs.hold_violations, "{design_name}: hold violations");
+            assert_eq!(
+                rp.setup_violations, rs.setup_violations,
+                "{design_name}: setup violations"
+            );
+            assert_eq!(
+                rp.hold_violations, rs.hold_violations,
+                "{design_name}: hold violations"
+            );
             // Measured 2026-11-18; see docs/results.md. Endpoint fields stay
             // under 10 ps (the SPEF slack floors are 25/40 ps); TNS is a sum
             // over violating endpoints so per-pin diffs accumulate — bound it
@@ -3406,10 +3462,12 @@ mod tests {
                 worst.iter().all(|&w| w <= 0.010),
                 "{design_name}: placement vs SPEF endpoint fields diverge: {worst:?} ns"
             );
-            for (side, ((wd, td), tns_ref)) in ["max", "min"]
-                .into_iter()
-                .zip(wns_d.into_iter().zip(tns_d).zip([rs.tns_max_ns, rs.tns_min_ns]))
-            {
+            for (side, ((wd, td), tns_ref)) in ["max", "min"].into_iter().zip(
+                wns_d
+                    .into_iter()
+                    .zip(tns_d)
+                    .zip([rs.tns_max_ns, rs.tns_min_ns]),
+            ) {
                 assert!(wd <= 0.010, "{design_name}: {side} WNS diverges by {wd} ns");
                 assert!(
                     td <= 0.01 * (tns_ref as f64).abs().max(1.0),
@@ -3447,10 +3505,12 @@ mod tests {
         design.cell_lib_ids[target] = None;
         let report = run_sta(&design, &lib, &sdc, None).expect("STA with unmapped cell");
         assert_eq!(report.skipped.unmapped_cells, 94);
-        assert!(report
-            .skipped
-            .nonzero()
-            .contains(&"unmapped_cells=94".to_string()));
+        assert!(
+            report
+                .skipped
+                .nonzero()
+                .contains(&"unmapped_cells=94".to_string())
+        );
     }
 
     /// N1: every endpoint candidate that produces no check is named with its pin,
@@ -5094,7 +5154,7 @@ mod tests {
     fn measure_gcd_estimators_against_routed_truth() {
         use crate::congestion::rsmt::{build_precise_rsmt_points, build_rsmt_points};
         use crate::sta::parasitics::estimate_placement_parasitics_with_tree;
-        use crate::sta::{spef_parasitics, WireRc};
+        use crate::sta::{WireRc, spef_parasitics};
 
         let lib_dir = sky130_hd();
         let gcd = design_dir("gcd");
@@ -5194,7 +5254,7 @@ mod tests {
     fn measure_picorv32_estimators_against_routed_truth() {
         use crate::congestion::rsmt::build_precise_rsmt_points;
         use crate::sta::parasitics::estimate_placement_parasitics_with_tree;
-        use crate::sta::{spef_parasitics, WireRc};
+        use crate::sta::{WireRc, spef_parasitics};
 
         let lib_dir = sky130_hd();
         let dir = design_dir("picorv32");
@@ -5285,11 +5345,7 @@ mod tests {
                     + (w.req as f64 - ref_req).abs()
                     + (w.slew as f64 - ref_slew).abs()
             };
-            if dist(f) < dist(r) {
-                f
-            } else {
-                r
-            }
+            if dist(f) < dist(r) { f } else { r }
         } else {
             default
         }
@@ -6156,7 +6212,7 @@ mod tests {
     /// and `3.0`) against OpenSTA's 7-point input-slew sweep in `tests/designs/repro_extreme_ceff/sweep_reference.txt`.
     #[test]
     fn test_repro_extreme_ceff_sweep_vs_opensta() {
-        use crate::sta::dmp::{solve_dmp, solve_dmp_with, PiModel};
+        use crate::sta::dmp::{PiModel, solve_dmp, solve_dmp_with};
 
         let dir = design_dir("repro_extreme_ceff");
         let text =
@@ -6450,7 +6506,7 @@ mod tests {
     #[test]
     fn test_dmp_pi_waveform_slew_vs_opensta() {
         use crate::sta::dmp::{
-            driver_waveform_slew, fit_ramp_duration, pi_waveform_slew, solve_dmp, PiModel,
+            PiModel, driver_waveform_slew, fit_ramp_duration, pi_waveform_slew, solve_dmp,
         };
 
         let dslope = |table: &dyn Fn(f64) -> (f64, f64), c: f64| -> f64 {

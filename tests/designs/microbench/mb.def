@@ -1,0 +1,34 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN mb ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 10000 10000 ) ;
+ROW ROW_0 unithd 0 0 N DO 1 BY 1 STEP 460 0 ;
+TRACKS X 10 DO 10 STEP 1000 LAYER li1 ;
+TRACKS Y 10 DO 10 STEP 1000 LAYER li1 ;
+COMPONENTS 2 ;
+    - _d_ sky130_fd_sc_hd__dfxtp_1 + PLACED ( 2000 2000 ) N ;
+    - _i_ sky130_fd_sc_hd__inv_1 + PLACED ( 4000 2000 ) N ;
+END COMPONENTS
+PINS 3 ;
+    - clk + NET clk + DIRECTION INPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 140 140 ) N ;
+    - a + NET a + DIRECTION INPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 140 280 ) N ;
+    - y + NET y + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 9860 9860 ) N ;
+END PINS
+NETS 4 ;
+    - clk ( PIN clk ) ( _d_ CLK ) + USE SIGNAL ;
+    - a ( PIN a ) ( _d_ D ) + USE SIGNAL ;
+    - q ( _d_ Q ) ( _i_ A ) + USE SIGNAL ;
+    - y ( PIN y ) ( _i_ Y ) + USE SIGNAL ;
+END NETS
+END DESIGN

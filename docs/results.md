@@ -1904,3 +1904,77 @@ this fixture's golden is propagated-mode only).
 
 This complements the committed `sta_edge/clock_gate` ideal golden (strict
 PASS), which covers inversion but not the clock-gate + latch combination.
+
+### 2026-11-18 — N7 — VCD-driven power estimation vs OpenROAD `report_power`
+
+Adds `grus-eda power` (`--vcd` required): Liberty `internal_power` tables,
+`cell_leakage_power`, and `0.5·C·V²·rate` switching, grouped
+Sequential/Combinational/Clock like `report_power`. Activity is the exact
+per-net VCD rise/fall edge counts over the dump window — not OpenSTA's
+statistical propagation. Slews come from `sta_pin_slews` on the same
+Lib/SDC/parasitic context.
+
+**Reference**: OpenROAD `read_vcd -scope gcd_tb/dut` + `report_power`,
+`tests/designs/gcd/power/power_vcd_check.tcl` (LibreLane 3.0.16,
+sky130_fd_sc_hd tt_025C_1v80, `gcd.placed.def`, `gcd.sdc`, `gcd.vcd`).
+
+#### Micro-benchmark formula check (`tests/designs/microbench/`)
+
+A two-cell clocked design (`dfxtp_1` + `inv_1`) with a hand-written VCD of
+known activity (clk 100 cycles/2 µs, `a` two 400 ns pulses) isolates the
+formula where propagated activity ≈ exact counts. `mb.vcd` was regenerated
+with proper `$dumpvars` initials after discovering that missing initials
+left every signal undefined and dropped each net's first 0->1 edge.
+
+| quantity | grus-eda | OpenROAD | diff |
+|---|---|---|---|
+| Sequential internal | 2.089e-6 | 2.08e-6 | +0.4% |
+| Sequential switching | 7.496e-9 | 7.74e-9 | -3% |
+| Combinational internal | 5.714e-9 | 5.61e-9 | +1.8% |
+| Combinational switching | 1.628e-7 | 1.62e-7 | +0.5% |
+| leakage (all groups) | — | — | <1% |
+
+The internal-power formula is confirmed: table values are **joules per
+transition** (pJ at parse), counted by the power-owning pin's **own net**
+transitions — a DFF's `Q` `power_outputs` block is indexed by the related
+CLK pin's slew but multiplied by Q's activity, not CLK's. This was the
+decisive fix; using the related pin's count over-counted sequential internal
+power ~50x on the micro-bench.
+
+#### gcd comparison (zero-wire parasitics)
+
+| group | grus internal | OR internal | grus switch | OR switch |
+|---|---|---|---|---|
+| Sequential | 1.56e-4 | 2.98e-4 | 1.02e-5 | 1.07e-5 |
+| Combinational | 1.35e-4 | 5.88e-5 | 4.17e-5 | 8.93e-5 |
+| Clock | 0 | 0 | 0 | 0 |
+| **Total** | **2.91e-4** | **3.57e-4** | **5.20e-5** | **1.00e-4** |
+
+Leakage matches to <2% in every group (cell_leakage_power sum is exact).
+
+**Divergences, with root causes:**
+
+- **Internal power does not match on gcd** although the formula is proven on
+  the micro-bench. OpenSTA does not read per-net VCD counts directly; it
+  seeds boundary activities from the dump and **propagates activity
+  statistically** through the design (BDD-based), with sequential cells
+  getting `findSeqActivity` register-propagated values. On `mb2.vcd` (added
+  clock-edge-aligned glitches to `a`) OpenROAD's combinational internal
+  collapsed to 0 while ours stayed exact — direct evidence the two activity
+  models differ. Our per-net counts are the true simulated toggles; where
+  they diverge from OpenSTA's estimate (sequential Q activity is propagated
+  higher than actual toggles, deep combinational logic is attenuated) the
+  totals diverge correspondingly. This is a modeling difference, not a
+  formula defect — matching it would require reimplementing OpenSTA's
+  activity propagation.
+- **Switching under-counts on zero-wire** because OpenROAD estimates wire
+  parasitics from the placed DEF even without SPEF. With `--spef
+  gcd.rcx.spef` our switching total rises 5.20e-5 -> 6.93e-5 (OR 1.00e-4);
+  with `--parasitics placement` (Prim-Dijkstra) -> 6.09e-5. The residual is
+  the wire-RC model difference, secondary to the activity issue.
+
+**Honest scope**: `when`-qualified `internal_power` blocks (ebu*/einv*) are
+skipped and counted (`conditional_power_blocks`); cells without a Liberty
+counterpart (filler/tap, 93 on gcd) contribute nothing; undriven/active nets
+and missing slews are reported in `diagnostics`, not silently approximated.
+SAIF input is not yet implemented (VCD only).
