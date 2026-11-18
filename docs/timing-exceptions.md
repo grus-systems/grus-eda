@@ -142,10 +142,11 @@ if no surviving group produced a candidate). Run-invariant diagnostics
 
 ### Multicycle semantics — measured on OpenSTA
 
-Probe: `tests/designs/sta_exceptions/` (3-FF design, 19 SDC scenarios,
-`generate_ref.sh` inside the pinned LibreLane image →
-`exceptions.reference.json`). Period `T = 2.0 ns`. Required-time shifts
-measured per endpoint (`u_ff1/D`, the only MCP target):
+Probe: `tests/designs/sta_exceptions/` (3-FF design with `u_ff1/D` driven
+by a `mux2` from `u_ff0`/`u_ff2` plus a `sel` input, split `c1`/`c2` clock
+buffers, 72 SDC scenarios, `generate_ref.sh` inside the pinned LibreLane
+image → `exceptions.reference.json`). Period `T = 2.0 ns`. Required-time
+shifts measured per endpoint (`u_ff1/D`, the only MCP target):
 
 - **setup**: `max_req += (N_setup - 1) * T` when the exception matches.
 - **hold**: `min_req += ((N_setup - 1) - H_hold) * T`, defaults

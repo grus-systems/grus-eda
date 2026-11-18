@@ -3316,19 +3316,32 @@ fn run_sta_partitioned(
                     if !delay.is_finite() {
                         continue;
                     }
-                    // req = launch - uncertainty - t_setup + N,
-                    // slack = N - delay - uncertainty - t_setup
-                    // (`docs/path-delays.md`, verified on `md_*`/`pmd_*`).
+                    // req = capture - uncertainty - t_setup + N,
+                    // slack = req - (launch + delay). The required time is
+                    // anchored to the endpoint register's own clock pin (the
+                    // early capture arrival, like the setup check), not the
+                    // launch source's clock: under `set_propagated_clock`
+                    // with skewed clock trees the two differ (`pm2_both`,
+                    // measured 8.5 ps on `u_ff1/D`). They coincide only when
+                    // launch and capture see identical clock arrivals —
+                    // every `md_*`/`pmd_*` scenario before the split clock
+                    // buffers. The CRPR credit the clock check adds is not
+                    // reproduced here: the delay domain tracks the winner's
+                    // launch time, not its clock net, so the shared-net test
+                    // cannot be applied (unexercised: zero spread in this
+                    // fixture).
                     let t_setup = eval_nldm_constraint(
                         table,
                         s.slew_max[pol],
                         class_states[ci][clk.0 as usize].slew_max[check.edge],
                     ) * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
                     let launch = s.delay_launch_max[pol];
+                    let capture = class_states[ci][clk.0 as usize].arrival_min[check.edge];
+                    let req = capture - sdc.setup_uncertainty_ns - t_setup + n;
                     pols.max[pol] = Some(Worst {
                         arr: launch + delay,
-                        req: launch - sdc.setup_uncertainty_ns - t_setup + n,
-                        slack: n - delay - sdc.setup_uncertainty_ns - t_setup,
+                        req,
+                        slack: req - (launch + delay),
                         slew: s.slew_max[pol],
                     });
                 }
@@ -8377,7 +8390,8 @@ mod tests {
         assert_eq!(merged.skipped_endpoints.len(), 1);
     }
 
-    /// `tests/designs/sta_exceptions`: a three-flop DEF plus 19 SDC scenarios.
+    /// `tests/designs/sta_exceptions`: a three-flop DEF (muxed `u_ff1/D`,
+    /// split clock buffers) plus 72 SDC scenarios.
     /// `exceptions.reference.json` was emitted by the committed
     /// `generate_ref.sh` running OpenSTA inside the pinned LibreLane image.
     /// The two `error` scenarios are SDC forms OpenSTA's own parser rejects
@@ -8511,10 +8525,18 @@ mod tests {
             run_sta_detail(&design, &lib, &sdc, None, false).expect("STA")
         };
 
-        // u_ff0 -> u_ff1 false path removes exactly that endpoint.
+        // u_ff0 -> u_ff1 false path covers only the u_ff0 launch source: the
+        // mux adds u_ff2 and sel launches, so u_ff1/D stays (partial removal,
+        // counted only when every candidate drops).
         let (report, _, _) = run("fp_uf0_uf1");
+        assert_eq!(report.skipped.false_path_endpoints, 0);
+        assert!(report.endpoints.iter().any(|e| e.pin == "u_ff1/D"));
+
+        // `-to [get_ports y]` covers the only launch reaching y, so the
+        // endpoint drops entirely — full-removal coverage.
+        let (report, _, _) = run("fp_to_y");
         assert_eq!(report.skipped.false_path_endpoints, 1);
-        assert!(!report.endpoints.iter().any(|e| e.pin == "u_ff1/D"));
+        assert!(!report.endpoints.iter().any(|e| e.pin == "y"));
 
         // `-from [all_inputs]`-style port false paths remove both port-launched
         // endpoints; the register-launched one survives.
@@ -8532,8 +8554,10 @@ mod tests {
             .iter()
             .find(|e| e.pin == "u_ff1/D")
             .expect("u_ff1/D");
-        // `-setup 2` shifts the max required time by one 2 ns period.
-        assert!((ff1.max_req_ns - 4.562147).abs() < 0.005);
+        // The `-setup 2` shift applies to the u_ff0->u_ff1 candidate, but the
+        // report keeps the min-slack candidate across launch sources: an
+        // unshifted u_ff2/sel clock check beats the shifted 4.562147.
+        assert!((ff1.max_req_ns - 2.550057).abs() < 0.005);
 
         // `-both` is valid SDC OpenSTA rejects; it is counted ignored, not applied.
         let (report, _, _) = run("mc_both");
