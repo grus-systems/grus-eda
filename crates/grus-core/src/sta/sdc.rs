@@ -83,10 +83,7 @@ impl CellSel {
                 names.retain(|n| !removed.contains(n));
                 CellSel::Cells(names)
             }
-            CellSel::Except {
-                base,
-                mut excluded,
-            } => {
+            CellSel::Except { base, mut excluded } => {
                 excluded.extend(removed.iter().cloned());
                 CellSel::Except { base, excluded }
             }
@@ -1175,8 +1172,7 @@ impl Interp {
         if objects.is_empty() {
             bail!("remove_from_collection takes objects to remove");
         }
-        if matches!(collection, Value::Opaque)
-            || objects.iter().any(|a| matches!(a, Value::Opaque))
+        if matches!(collection, Value::Opaque) || objects.iter().any(|a| matches!(a, Value::Opaque))
         {
             return Ok(Value::Opaque);
         }
@@ -1232,9 +1228,9 @@ impl Interp {
     /// be verified. `-setup`/`-hold`/`-both` on `set_false_path` are
     /// accepted no-ops.
     fn timing_exception(&mut self, name: &str, args: &[Value], kind: ExceptionKind) -> Result<()> {
-        if args.iter().any(|a| {
-            matches!(a, Value::Str(s) if EXCEPTION_UNSUPPORTED_FLAGS.contains(&s.as_str()))
-        }) {
+        if args.iter().any(
+            |a| matches!(a, Value::Str(s) if EXCEPTION_UNSUPPORTED_FLAGS.contains(&s.as_str())),
+        ) {
             *self
                 .sdc
                 .ignored_commands
@@ -1257,14 +1253,10 @@ impl Interp {
                     }
                     let sel = match args.get(i + 1) {
                         None => bail!("{name} {flag} needs a value"),
-                        Some(Value::Str(v))
-                            if v.starts_with('-') && !is_negative_number(v) =>
-                        {
+                        Some(Value::Str(v)) if v.starts_with('-') && !is_negative_number(v) => {
                             bail!("{name} {flag} needs a value, found `{v}`")
                         }
-                        Some(v @ (Value::Ports(_) | Value::Cells(_) | Value::Str(_))) => {
-                            obj_sel(v)
-                        }
+                        Some(v @ (Value::Ports(_) | Value::Cells(_) | Value::Str(_))) => obj_sel(v),
                         // Clock objects and opaque selections cannot be
                         // honoured by the exception model: the whole command
                         // is counted ignored.
@@ -1296,8 +1288,7 @@ impl Interp {
                     return Ok(());
                 }
                 Value::Str(s)
-                    if kind == ExceptionKind::Multicycle
-                        && (s == "-setup" || s == "-hold") =>
+                    if kind == ExceptionKind::Multicycle && (s == "-setup" || s == "-hold") =>
                 {
                     let Some(Value::Str(v)) = args.get(i + 1) else {
                         bail!("{name} {s} needs a value");
@@ -1456,7 +1447,15 @@ fn parse_f32(text: &str) -> Result<f32> {
 /// Qualifiers that make a timing-exception command unsupported: the whole
 /// command is counted in `ignored_commands` rather than half-applied.
 const EXCEPTION_UNSUPPORTED_FLAGS: [&str; 9] = [
-    "-through", "-start", "-end", "-rise", "-fall", "-edge", "-points", "-lib_cell", "-pin",
+    "-through",
+    "-start",
+    "-end",
+    "-rise",
+    "-fall",
+    "-edge",
+    "-points",
+    "-lib_cell",
+    "-pin",
 ];
 
 /// Command names that produce object selections. Ones the model does not

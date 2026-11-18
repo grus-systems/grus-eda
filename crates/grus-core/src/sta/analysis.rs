@@ -1946,6 +1946,77 @@ fn run_sta_detail(
     if !sdc.exceptions.is_empty() {
         anyhow::bail!("SDC timing exceptions are parsed but not yet applied");
     }
+    let prepared = prepare_sta(design, lib, sdc, parasitics)?;
+    let outcome = eval_sta(&prepared, None, prepared.skipped.clone())?;
+    let (report, polarities) = assemble_sta_report(outcome.entries, outcome.skipped);
+    if emit_warnings {
+        for category in report.skipped.nonzero() {
+            // Deferred check arcs are a documented, counted deferral shown in the report —
+            // not an unrecognised gap, and `min_pulse_width` alone would warn on every
+            // flop design. They stay in `nonzero()`/the summary and JSON.
+            if category.starts_with("recognized_check_arcs") {
+                continue;
+            }
+            eprintln!("warning: STA skipped {category}; the report does not model these");
+        }
+    }
+    Ok((report, outcome.state, polarities))
+}
+
+/// One seeded input port's unfiltered merge arguments, per transition:
+/// `(arr_max, arr_min, slew_max, slew_min)`. `eval_sta` merges the arrival
+/// fields only for ports in the run's allowed set but always merges slew —
+/// downstream delay lookups depend on the physical slew at the pin.
+struct PortSeed {
+    pin: PinId,
+    per_pol: [(f32, f32, f32, f32); 2],
+}
+
+/// One launch's precomputed output pairs plus the clock-edge parity that
+/// launched them. `pairs` is indexed by output transition.
+struct LaunchSeed {
+    q: PinId,
+    par: u8,
+    pairs: [(PinId, usize, f32, f32, f32, f32); 2],
+}
+
+/// Everything `eval_sta` needs that does not depend on which launch sources a
+/// run allows: the design context, timing graph, levelization, wire delays,
+/// clock seeds, and the precomputed port/launch/latch contributions.
+struct StaPrepared<'a> {
+    cx: Context<'a>,
+    graph: TimingGraph,
+    levelized: LevelizedGraph,
+    wire_delays_per_net: Vec<Option<[Vec<f32>; 2]>>,
+    skipped: SkipReport,
+    /// Clock-consumer seeds only (propagated-clock consumers or ideal clock
+    /// pins); data arrivals are merged per eval run on top of this.
+    base_state: Vec<PinTimingState>,
+    port_seeds: Vec<PortSeed>,
+    launch_seeds: Vec<LaunchSeed>,
+    latch_seeds: Vec<LaunchSeed>,
+    clock_parity: Option<Vec<[u8; 2]>>,
+    clock_state: Option<Vec<PinTimingState>>,
+}
+
+struct EvalOutcome {
+    /// `(pin, report, polarities)` triples, unsorted; `assemble_sta_report`
+    /// sorts and reduces them.
+    entries: EndpointEntries,
+    state: Vec<PinTimingState>,
+    skipped: SkipReport,
+}
+
+/// Run-invariant preparation: context, pi models, wire delays, timing graph,
+/// levelization, clock propagation/seeding, and the per-source launch and
+/// port contributions. Clock-pin state is identical for every exception
+/// signature class, so it is seeded once into `base_state`.
+fn prepare_sta<'a>(
+    design: &'a DesignDb,
+    lib: &'a LibDb,
+    sdc: &'a Sdc,
+    parasitics: Option<&'a NetParasitics>,
+) -> Result<StaPrepared<'a>> {
     let mut cx = Context {
         design,
         lib,
@@ -1994,9 +2065,12 @@ fn run_sta_detail(
     let mut skipped = SkipReport::default();
     let graph = build_graph(&cx, &mut skipped);
     let levelized = topological_levels(&cx, &graph, false)?;
-    let mut state = vec![PinTimingState::UNREACHED; design.num_pins()];
-
     // Primary inputs: ideal drivers. The clock port is not a data startpoint.
+    // Seeds are stored unfiltered; `eval_sta` re-merges them per allowed set.
+    // `state_ports` additionally feeds `propagate_slew`, which must see every
+    // source's slew regardless of exception filtering.
+    let mut port_seeds = Vec::new();
+    let mut state_ports = vec![PinTimingState::UNREACHED; design.num_pins()];
     for &pin in &design.io_pins {
         let p = pin.0 as usize;
         let name = cx.port_name(pin);
@@ -2006,21 +2080,30 @@ fn run_sta_detail(
         let (in_min, in_max) = sdc.input_delay_ns(name);
         let latency = sdc.input_clock_latency_ns(name);
         let drive = cx.port_drive(pin, &mut skipped);
+        let mut per_pol = [(0.0f32, 0.0, 0.0, 0.0); 2];
         for pol in [RISE, FALL] {
             let (slew_max, slew_min, drv_early, drv_late) = drive[pol];
             // An input delay is referenced to the clock's rising edge: launch parity 0.
-            state[p].merge(
-                pol,
+            per_pol[pol] = (
                 latency + in_max + drv_late,
                 latency + in_min + drv_early,
                 slew_max,
                 slew_min,
+            );
+            state_ports[p].merge(
+                pol,
+                per_pol[pol].0,
+                per_pol[pol].1,
+                per_pol[pol].2,
+                per_pol[pol].3,
                 1,
                 0,
             );
         }
+        port_seeds.push(PortSeed { pin, per_pol });
     }
 
+    let mut base_state = vec![PinTimingState::UNREACHED; design.num_pins()];
     let clock_parity: Option<Vec<[u8; 2]>>;
     let mut clock_state: Option<Vec<PinTimingState>> = None;
     if sdc.propagated_clock {
@@ -2032,7 +2115,7 @@ fn run_sta_detail(
         // pin (and downstream clock pins) see. `propagate_clock` uses those slews for
         // delay lookups; the returned states carry arrival, and their slew fields are
         // overwritten with the unified values below.
-        let unified_slew = propagate_slew(&cx, &graph, &wire_delays_per_net, &state)?;
+        let unified_slew = propagate_slew(&cx, &graph, &wire_delays_per_net, &state_ports)?;
         let (mut clk_state, clk_parity) =
             propagate_clock(&cx, &levelized, &wire_delays_per_net, &unified_slew);
         for (c, u) in clk_state.iter_mut().zip(unified_slew.iter()) {
@@ -2050,7 +2133,7 @@ fn run_sta_detail(
         for pin in consumers {
             let s = clk_state[pin.0 as usize];
             if s.reached(RISE) || s.reached(FALL) {
-                state[pin.0 as usize] = s;
+                base_state[pin.0 as usize] = s;
             }
         }
         // Clock nets the propagation did not reach (e.g. behind a latch or an unmapped
@@ -2091,7 +2174,7 @@ fn run_sta_detail(
                 // `pol` sits on clock-edge parity `pol`.
                 let p = ideal_par[clk.0 as usize][pol];
                 let edge_par = if p <= 1 { p as usize } else { pol };
-                state[clk.0 as usize].merge(
+                base_state[clk.0 as usize].merge(
                     pol,
                     ideal_latency + edge_par as f32 * half_period,
                     ideal_latency + edge_par as f32 * half_period,
@@ -2176,64 +2259,123 @@ fn run_sta_detail(
             .filter(|&v| v <= 1)
             .unwrap_or(edge as u8)
     };
-    let launch_updates: Vec<_> = if graph.launches.len() < 64 {
+    // Launch and latch-open contributions are run-invariant — they read only
+    // clock-pin state, which `base_state` already carries — so the pairs are
+    // computed once here; `eval_sta` merges them filtered by allowed source.
+    let launch_seeds: Vec<LaunchSeed> = if graph.launches.len() < 64 {
         graph
             .launches
             .iter()
-            .map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge))
+            .map(|l| LaunchSeed {
+                q: l.q,
+                par: launch_parity(l.clk, l.edge),
+                pairs: eval_launch(l.q, base_state[l.clk.0 as usize], l.lib_arc, l.edge),
+            })
             .collect()
     } else {
         graph
             .launches
             .par_iter()
-            .map(|l| eval_launch(l.q, state[l.clk.0 as usize], l.lib_arc, l.edge))
+            .map(|l| LaunchSeed {
+                q: l.q,
+                par: launch_parity(l.clk, l.edge),
+                pairs: eval_launch(l.q, base_state[l.clk.0 as usize], l.lib_arc, l.edge),
+            })
             .collect()
     };
-    for (l, pair) in graph.launches.iter().zip(launch_updates) {
-        let par = launch_parity(l.clk, l.edge);
-        for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
-            if arr_max > f32::NEG_INFINITY {
-                state[q.0 as usize].merge(
-                    dst_pol,
-                    arr_max,
-                    arr_min,
-                    slew_max,
-                    slew_min,
-                    1 << par,
-                    1 << par,
-                );
-            }
-        }
-    }
     // A latch opens on the clock transition named by `open_pol` (FALL for `dlxtn`,
     // RISE for `dlxtp`). The enable pin's seeded state already carries the edge's
     // phase (real under a propagated clock, parity-seeded under the ideal clock).
     // `open_pol` is passed in both modes so `-fall` derates reach the arc.
-    let latch_updates: Vec<_> = graph
+    let latch_seeds: Vec<LaunchSeed> = graph
         .latch_opens
         .iter()
-        .map(|open| {
-            eval_launch(
+        .map(|open| LaunchSeed {
+            q: open.q,
+            par: launch_parity(open.enable, open.open_pol),
+            pairs: eval_launch(
                 open.q,
-                state[open.enable.0 as usize],
+                base_state[open.enable.0 as usize],
                 open.lib_arc,
                 open.open_pol,
-            )
+            ),
         })
         .collect();
-    for (open, pair) in graph.latch_opens.iter().zip(latch_updates) {
-        let par = launch_parity(open.enable, open.open_pol);
-        for (q, dst_pol, arr_max, arr_min, slew_max, slew_min) in pair {
-            if arr_max > f32::NEG_INFINITY {
-                state[q.0 as usize].merge(
-                    dst_pol,
-                    arr_max,
-                    arr_min,
+
+    Ok(StaPrepared {
+        cx,
+        graph,
+        levelized,
+        wire_delays_per_net,
+        skipped,
+        base_state,
+        port_seeds,
+        launch_seeds,
+        latch_seeds,
+        clock_parity,
+        clock_state,
+    })
+}
+
+/// One exception-signature eval run: seed `base_state` with the allowed
+/// sources' arrivals (every source still merges slew), propagate data through
+/// the levelized graph, and collect endpoint candidates.
+fn eval_sta(
+    prepared: &StaPrepared,
+    allowed: Option<&HashSet<u32>>,
+    skipped_seed: SkipReport,
+) -> Result<EvalOutcome> {
+    let cx = &prepared.cx;
+    let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
+    let graph = &prepared.graph;
+    let levelized = &prepared.levelized;
+    let wire_delays_per_net = &prepared.wire_delays_per_net;
+    let mut state = prepared.base_state.clone();
+    for seed in &prepared.port_seeds {
+        let p = seed.pin.0 as usize;
+        let ok = allowed.is_none_or(|a| a.contains(&seed.pin.0));
+        for pol in [RISE, FALL] {
+            let (arr_max, arr_min, slew_max, slew_min) = seed.per_pol[pol];
+            if ok {
+                state[p].merge(pol, arr_max, arr_min, slew_max, slew_min, 1, 0);
+            } else {
+                state[p].merge(
+                    pol,
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
                     slew_max,
                     slew_min,
-                    1 << par,
-                    1 << par,
+                    0,
+                    0,
                 );
+            }
+        }
+    }
+    for seed in prepared.launch_seeds.iter().chain(&prepared.latch_seeds) {
+        let ok = allowed.is_none_or(|a| a.contains(&seed.q.0));
+        for &(q, dst_pol, arr_max, arr_min, slew_max, slew_min) in seed.pairs.iter() {
+            if arr_max > f32::NEG_INFINITY {
+                if ok {
+                    state[q.0 as usize].merge(
+                        dst_pol,
+                        arr_max,
+                        arr_min,
+                        slew_max,
+                        slew_min,
+                        1 << seed.par,
+                        1 << seed.par,
+                    );
+                } else {
+                    state[q.0 as usize].merge(
+                        dst_pol,
+                        f32::NEG_INFINITY,
+                        f32::INFINITY,
+                        slew_max,
+                        slew_min,
+                        0,
+                        0,
+                    );
+                }
             }
         }
     }
@@ -2385,27 +2527,47 @@ fn run_sta_detail(
         }
     }
 
-    let (report, polarities) = collect_endpoints(
-        &cx,
-        &graph,
-        &levelized,
-        clock_state.as_deref(),
+    let (entries, skipped) = collect_endpoints(
+        cx,
+        graph,
+        levelized,
+        prepared.clock_state.as_deref(),
         &state,
-        clock_parity.as_deref(),
-        skipped,
+        prepared.clock_parity.as_deref(),
+        skipped_seed,
     )?;
-    if emit_warnings {
-        for category in report.skipped.nonzero() {
-            // Deferred check arcs are a documented, counted deferral shown in the report —
-            // not an unrecognised gap, and `min_pulse_width` alone would warn on every
-            // flop design. They stay in `nonzero()`/the summary and JSON.
-            if category.starts_with("recognized_check_arcs") {
-                continue;
-            }
-            eprintln!("warning: STA skipped {category}; the report does not model these");
-        }
-    }
-    Ok((report, state, polarities))
+    Ok(EvalOutcome {
+        entries,
+        state,
+        skipped,
+    })
+}
+
+/// Sort endpoint entries by pin name and reduce them to the report plus the
+/// per-endpoint polarities parallel to `report.endpoints`.
+fn assemble_sta_report(
+    mut entries: EndpointEntries,
+    skipped: SkipReport,
+) -> (StaReport, Vec<EndpointPolarities>) {
+    entries.sort_by(|a, b| a.1.pin.cmp(&b.1.pin));
+    let (endpoints, polarities): (Vec<_>, Vec<_>) =
+        entries.into_iter().map(|(_, r, p)| (r, p)).unzip();
+    let wns = |f: fn(&EndpointReport) -> f32| endpoints.iter().map(f).fold(f32::INFINITY, f32::min);
+    let tns =
+        |f: fn(&EndpointReport) -> f32| endpoints.iter().map(f).map(|s| s.min(0.0)).sum::<f32>();
+    (
+        StaReport {
+            wns_max_ns: wns(|e| e.max_slack_ns),
+            tns_max_ns: tns(|e| e.max_slack_ns),
+            wns_min_ns: wns(|e| e.min_slack_ns),
+            tns_min_ns: tns(|e| e.min_slack_ns),
+            setup_violations: endpoints.iter().filter(|e| e.max_slack_ns < 0.0).count() as u32,
+            hold_violations: endpoints.iter().filter(|e| e.min_slack_ns < 0.0).count() as u32,
+            endpoints,
+            skipped,
+        },
+        polarities,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2435,7 +2597,7 @@ fn record_endpoint(
     cx: &Context,
     levelized: &LevelizedGraph,
     state: &[PinTimingState],
-    entries: &mut Vec<(EndpointReport, EndpointPolarities)>,
+    entries: &mut EndpointEntries,
     skipped: &mut SkipReport,
     kind: EndpointKind,
     pin: PinId,
@@ -2446,7 +2608,7 @@ fn record_endpoint(
         pick_worst_polarity(&cands.min),
     ) {
         (Some(max), Some(min)) => {
-            entries.push((endpoint_report(cx.pin_name(pin), &max, &min), cands))
+            entries.push((pin, endpoint_report(cx.pin_name(pin), &max, &min), cands))
         }
         _ => {
             skipped.unreached_endpoints += 1;
@@ -2549,6 +2711,10 @@ fn crpr_driver_net(
     result
 }
 
+/// `(pin, report, polarities)` per reached endpoint; `assemble_sta_report`
+/// sorts by pin name and reduces to the report.
+type EndpointEntries = Vec<(PinId, EndpointReport, EndpointPolarities)>;
+
 fn collect_endpoints(
     cx: &Context,
     graph: &TimingGraph,
@@ -2557,7 +2723,7 @@ fn collect_endpoints(
     state: &[PinTimingState],
     clock_parity: Option<&[[u8; 2]]>,
     mut skipped: SkipReport,
-) -> Result<(StaReport, Vec<EndpointPolarities>)> {
+) -> Result<(EndpointEntries, SkipReport)> {
     let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
     skipped.total_endpoints = graph.checks.len()
         + graph.gating_enables.len()
@@ -2937,24 +3103,7 @@ fn collect_endpoints(
         );
     }
 
-    entries.sort_by(|a, b| a.0.pin.cmp(&b.0.pin));
-    let (endpoints, polarities): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-    let wns = |f: fn(&EndpointReport) -> f32| endpoints.iter().map(f).fold(f32::INFINITY, f32::min);
-    let tns =
-        |f: fn(&EndpointReport) -> f32| endpoints.iter().map(f).map(|s| s.min(0.0)).sum::<f32>();
-    Ok((
-        StaReport {
-            wns_max_ns: wns(|e| e.max_slack_ns),
-            tns_max_ns: tns(|e| e.max_slack_ns),
-            wns_min_ns: wns(|e| e.min_slack_ns),
-            tns_min_ns: tns(|e| e.min_slack_ns),
-            setup_violations: endpoints.iter().filter(|e| e.max_slack_ns < 0.0).count() as u32,
-            hold_violations: endpoints.iter().filter(|e| e.min_slack_ns < 0.0).count() as u32,
-            endpoints,
-            skipped,
-        },
-        polarities,
-    ))
+    Ok((entries, skipped))
 }
 
 fn endpoint_report(pin: String, max: &Worst, min: &Worst) -> EndpointReport {
