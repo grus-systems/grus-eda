@@ -597,6 +597,30 @@ Resolved by the async/latch delay probe set (2026-11-19):
   Committed: `delay_max`, `delay_min`, `delay_ln`, `delay_from`,
   `delay_allregs`, `delay_prop` on `sta_edge/latch_borrow`.
 
+Known gaps in that resolution (reachable but ungoldened — review
+2026-11-19):
+
+- the `D -> Q` borrow cap clamps `dly_max` through the same
+  absolute-time window as `arrival_max` (`open + k*period + pulse -
+  unc - t_setup`). Exact wherever `dly == arr` — every goldened case,
+  since covered launches are port/flop seeds — but a through-latch
+  launch feeds a launch-edge-relative `dly` into the absolute
+  window; whether OpenSTA re-bases before clamping is unverified.
+  The fixture has no latch-Q -> latch-D chain, so no covered
+  endpoint reports a borrow-capped `dly`.
+- the delay check's CRPR credit reads `crpr_max`/`crpr_min` — the
+  *arrival* winner's launch tag — while the reported `arr` is the
+  independently merged `dly` winner. The winners diverge only via a
+  through-latch launch and the credit is nonzero only under
+  `set_propagated_clock` + `set_timing_derate`; `pcr_*` has no
+  latches and `latch_borrow` no derate, so the divergent case is
+  ungoldened.
+- `set_min_delay` is golden-verified only on `dlxtp` latch-D
+  (`u_lp/D`) and `dfrtp` `RESET_B` (`u_ff0/RESET_B`); the same code
+  serves `dlxtn` latch-D and latch-cell `RESET_B` removal
+  (`u_rbn`/`u_rbp`/`u_rt*`, covered max-side only by
+  `delay_allregs`) unverified.
+
 Still open:
 
 1. A literal two-clock-domain `set_min_delay` anchoring fixture —

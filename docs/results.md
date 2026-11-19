@@ -3004,3 +3004,11 @@ compose → `delay_allregs` goes red on 17 rows (`u_f0/D` reports
   multi-clock SDC support (`docs/path-delays.md` §5).
 - Clock-gate enable endpoints — remain counted in
   `unsupported_path_delay_endpoints`.
+- Borrow-capped `dly` on through-latch launches (relative value
+  against the absolute clamp window; no latch-Q -> latch-D path in
+  the fixture — docs/path-delays.md §5 known gaps).
+- Delay-check CRPR tag under divergent `arr`/`dly` winners (tag
+  follows the arrival winner; needs through-latch launch under
+  propagated clock + derate — ungoldened).
+- `set_min_delay` on `dlxtn` latch-D and latch-cell `RESET_B`
+  (golden-verified on `dlxtp`/`dfrtp` only).
