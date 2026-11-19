@@ -3125,7 +3125,24 @@ corrupting only one is a no-op, verified) to `(TC 398)` turns the test
 red (`Sequential internal: ours 4.136e-6 vs opensta 2.079167e-6`);
 restored via `vcd2saif.py`, suite green.
 
-**Checks run**: `cargo test --workspace` (285+3 pass), `cargo clippy
---workspace --all-targets -- -D warnings` clean; `grus-eda power --saif
-tests/designs/microbench/mb.saif` end-to-end (stderr reports `1
-unmatched SAIF scopes` from the ghost).
+**Second-pass tightenings** (review fix, no semantic change): two latent
+`vcd2saif.py` bugs fixed — `name.rstrip("$end")` treated `"$end"` as a
+character set (a name ending in `e`/`n`/`d`/`$` would lose its tail);
+now a literal `removesuffix`. The emitted `(TIMESCALE 1 ns)` was
+hardcoded; now the parsed `$timescale` `(num, unit)` pair is emitted
+verbatim, with `die()` on an unknown unit. Container `python3 --version`
+= 3.13.9. `generate_saif_ref.sh` re-run end-to-end: `mb.saif`,
+`mb.saif.reference.json` and `mb.saif.openroad.txt` regenerated
+byte-identical (both fixes are no-ops on this input — no signal name
+ends in the `rstrip` set, and mb.vcd's `$timescale 1ns` emits the same
+line). Two reader tightenings in `saif.rs`: `DURATION` parses as `u64`
+— float literals (`1980.5`, `1980.0`) and negatives are hard errors,
+matching the `<int>` grammar and OpenSTA's rejection of `(DURATION
+1990.0)`; and `\` now escapes the next byte inside quoted strings (`\"`,
+`\\`), the same convention as atoms.
+
+**Checks run**: `cargo test --workspace` (287+3 pass, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`grus-eda power --saif tests/designs/microbench/mb.saif` end-to-end
+(stderr reports `1 unmatched SAIF scopes` from the ghost);
+`generate_saif_ref.sh` re-run end-to-end, artifacts byte-identical.

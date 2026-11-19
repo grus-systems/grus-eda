@@ -73,8 +73,9 @@ enum Sexpr {
     List(Vec<Sexpr>),
 }
 
-/// SAIF tokens: `(`, `)`, quoted strings, and atoms. `\` inside an atom escapes
-/// the next character, so `a\[0\]` reads as `a[0]` (DEF bus-bit form).
+/// SAIF tokens: `(`, `)`, quoted strings, and atoms. `\` escapes the next
+/// character inside both atoms and quoted strings, so `a\[0\]` reads as
+/// `a[0]` (DEF bus-bit form) and `\"` cannot end a string early.
 fn tokenize(text: &str) -> Result<Vec<Sexpr>> {
     let bytes = text.as_bytes();
     let mut stack: Vec<Vec<Sexpr>> = vec![Vec::new()];
@@ -97,19 +98,29 @@ fn tokenize(text: &str) -> Result<Vec<Sexpr>> {
                 i += 1;
             }
             b'"' => {
-                let start = i + 1;
-                let mut j = start;
-                while j < bytes.len() && bytes[j] != b'"' {
-                    j += 1;
+                // `\` escapes the next byte inside quotes, same convention
+                // as atoms: \" and \\ cannot terminate the string early.
+                let mut s = String::new();
+                i += 1;
+                loop {
+                    if i == bytes.len() {
+                        bail!("SAIF: unterminated quoted string");
+                    }
+                    match bytes[i] {
+                        b'"' => break,
+                        b'\\' => {
+                            i += 1;
+                            if i == bytes.len() {
+                                bail!("SAIF: unterminated quoted string");
+                            }
+                            s.push(bytes[i] as char);
+                        }
+                        b => s.push(b as char),
+                    }
+                    i += 1;
                 }
-                if j == bytes.len() {
-                    bail!("SAIF: unterminated quoted string");
-                }
-                stack
-                    .last_mut()
-                    .unwrap()
-                    .push(Sexpr::Atom(text[start..j].to_string()));
-                i = j + 1;
+                stack.last_mut().unwrap().push(Sexpr::Atom(s));
+                i += 1;
             }
             c if c.is_ascii_whitespace() => i += 1,
             _ => {
@@ -264,8 +275,10 @@ pub fn parse_saif(text: &str) -> Result<SaifActivity> {
                 let Some(Sexpr::Atom(v)) = list.get(1) else {
                     bail!("malformed SAIF DURATION");
                 };
+                // The grammar says <int> and OpenSTA rejects (DURATION
+                // 1990.0); any float literal or negative is a hard error.
                 duration = Some(
-                    v.parse::<f64>()
+                    v.parse::<u64>()
                         .with_context(|| format!("bad SAIF DURATION `{v}`"))?,
                 );
             }
@@ -275,7 +288,7 @@ pub fn parse_saif(text: &str) -> Result<SaifActivity> {
     }
     let timescale_s = timescale_s.context("SAIF has no TIMESCALE")?;
     let duration = duration.context("SAIF has no DURATION")?;
-    let duration_s = duration * timescale_s;
+    let duration_s = duration as f64 * timescale_s;
     if duration_s <= 0.0 {
         bail!("SAIF DURATION is not positive ({duration} ticks)");
     }
@@ -548,6 +561,40 @@ mod tests {
             "(INSTANCE dut (NET (clk (T0 0) (T1 0) (TC 4.5))))",
         );
         assert!(parse_saif(&text).is_err());
+    }
+
+    #[test]
+    fn test_fractional_duration_is_error() {
+        // The grammar says (DURATION <int>) and OpenSTA rejects a float
+        // literal — even an integral-valued one.
+        for v in ["1980.5", "1980.0", "-5"] {
+            let text = format!("(SAIFILE (TIMESCALE 1 ns) (DURATION {v}) (INSTANCE dut))");
+            assert!(parse_saif(&text).is_err(), "DURATION {v} accepted");
+        }
+    }
+
+    #[test]
+    fn test_quoted_string_escapes() {
+        // `\` escapes the next byte inside quotes, same as in atoms:
+        // \" stays literal, \\ is one backslash — neither ends the string.
+        let items =
+            tokenize("(VERSION \"a \\\"b\\\" c\" (VERSION \"x\\\\y\"))").expect("tokenize");
+        let Sexpr::List(top) = &items[0] else {
+            panic!("expected list");
+        };
+        // The escaped quotes stay inside the first string; the sibling list
+        // parses as a sibling, not trailing junk.
+        let Sexpr::Atom(q) = &top[1] else {
+            panic!("expected quoted atom");
+        };
+        assert_eq!(q, "a \"b\" c");
+        let Sexpr::List(inner) = &top[2] else {
+            panic!("expected nested list");
+        };
+        let Sexpr::Atom(bs) = &inner[1] else {
+            panic!("expected quoted atom");
+        };
+        assert_eq!(bs, "x\\y");
     }
 
     #[test]

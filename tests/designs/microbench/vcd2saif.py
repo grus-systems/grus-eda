@@ -24,10 +24,13 @@ def die(msg):
 
 
 def parse_vcd(path):
-    """Returns (scope_tree, timescale_s, first_ts, last_ts).
+    """Returns (scope_tree, ts_num, ts_unit, first_ts, last_ts).
 
     scope_tree: {name: {"signals": [decl], "children": {name: subtree}}}
     decl: {"name": str, "id": str, "events": [(ts, state)]}  state in {0,1,2,3}
+    (ts_num, ts_unit): the $timescale emission pair ("1ns" -> ("1", "ns")).
+    All timestamps/durations are in VCD-timestamp units, which equal SAIF
+    TIMESCALE units by construction — no rescaling anywhere.
     """
     decls = {}  # id -> decl
     scopes = {}  # tuple path -> node
@@ -38,7 +41,7 @@ def parse_vcd(path):
     ts = 0
     first_ts = None
     last_ts = None
-    timescale_s = None
+    timescale = None
 
     def node_for(path):
         node = root
@@ -56,16 +59,20 @@ def parse_vcd(path):
         elif words[0] == "$upscope":
             cur_path.pop()
         elif words[0] == "$timescale":
-            nonlocal timescale_s
+            nonlocal timescale
             spec = item.split("$timescale", 1)[1].split("$end", 1)[0].split("/")[0].strip()
             i = next((k for k, c in enumerate(spec) if c.isalpha()), len(spec))
-            timescale_s = float(spec[:i]) * UNITS[spec[i:].strip().lower()]
+            num, unit = spec[:i].strip(), spec[i:].strip().lower()
+            if unit not in UNITS:
+                die(f"unknown $timescale unit {unit!r}")
+            float(num)  # numeric validation only; the pair is emitted verbatim
+            timescale = (num, unit)
         elif words[0] == "$var":
             # $var <type> <size> <id> <name> [msb lsb] $end
             kind, size, ident, name = words[1], words[2], words[3], words[4]
             if int(size) != 1:
                 die(f"vector signal {name} ({size} bits) unsupported")
-            decl = {"name": name.rstrip("$end").strip(), "id": ident, "events": []}
+            decl = {"name": name.removesuffix("$end"), "id": ident, "events": []}
             decls[ident] = decl
             node_for(cur_path)["signals"].append(decl)
 
@@ -105,11 +112,11 @@ def parse_vcd(path):
             state = {"0": 0, "1": 1}.get(v, 3 if v in "zZ" else 2)
             decl["events"].append((ts, state))
 
-    if timescale_s is None:
+    if timescale is None:
         die("no $timescale directive")
     if first_ts is None:
         die("no timestamps")
-    return root, timescale_s, first_ts, last_ts
+    return root, timescale[0], timescale[1], first_ts, last_ts
 
 
 def aggregate(events, t0, t1):
@@ -188,7 +195,7 @@ def main():
     )
     args = ap.parse_args()
 
-    root, _timescale_s, first_ts, last_ts = parse_vcd(args.vcd)
+    root, ts_num, ts_unit, first_ts, last_ts = parse_vcd(args.vcd)
     if args.window_end is not None:
         last_ts = args.window_end
     duration = last_ts - first_ts
@@ -217,7 +224,7 @@ def main():
         '  (PROGRAM_NAME "vcd2saif.py")',
         '  (VERSION "vcd2saif")',
         "  (DIVIDER / )",
-        "  (TIMESCALE 1 ns)",
+        f"  (TIMESCALE {ts_num} {ts_unit})",
         f"  (DURATION {fmt(duration)})",
     ]
     for name, node in root["children"].items():
