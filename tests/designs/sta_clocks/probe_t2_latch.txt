@@ -1,0 +1,324 @@
+warning: `/var/empty/.tclsh-history' is not writable.
+openroad> <y130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+1
+openroad> <f/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef, created 14 layers, 25 vias
+openroad> <0A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+[WARNING ODB-0220] WARNING (LEFPARS-2008): NOWIREEXTENSIONATPIN statement is obsolete in version 5.6 or later.
+The NOWIREEXTENSIONATPIN statement will be ignored. See file /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef at line 2.
+
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef, created 437 library cells
+openroad> read_def /work/tests/designs/sta_clocks/two_clock_latch.def
+[INFO ODB-0127] Reading DEF file: /work/tests/designs/sta_clocks/two_clock_latch.def
+[INFO ODB-0128] Design: sta_clocks_latch
+[INFO ODB-0130]     Created 5 pins.
+[INFO ODB-0131]     Created 5 components and 33 component-terminals.
+[INFO ODB-0133]     Created 8 nets and 12 connections.
+[INFO ODB-0134] Finished DEF file: /work/tests/designs/sta_clocks/two_clock_latch.def
+openroad> 
+openroad> puts "=== scenario t2_latch.sdc ==="
+=== scenario t2_latch.sdc ===
+openroad> <work/tests/designs/sta_clocks/t2_latch.sdc} err]} {
+...>     puts "SDC error: $err"
+...>     exit 0
+...> }
+openroad> <endpoint_path_count 1 -group_path_count 100000 ==="
+=== report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000 ===
+openroad> <ull -endpoint_path_count 1 -group_path_count 100000
+Startpoint: u_fa0 (rising edge-triggered flip-flop clocked by cka)
+Endpoint: ya (output port clocked by cka)
+Path Group: cka
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock cka (rise edge)
+   0.60    0.60   clock network delay (ideal)
+   0.00    0.60 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.59    1.19 ^ u_fa0/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    1.19 ^ ya (out)
+           1.19   data arrival time
+
+   2.00    2.00   clock cka (rise edge)
+   0.60    2.60   clock network delay (ideal)
+  -0.05    2.55   clock uncertainty
+   0.00    2.55   clock reconvergence pessimism
+  -0.50    2.05   output external delay
+           2.05   data required time
+---------------------------------------------------------
+           2.05   data required time
+          -1.19   data arrival time
+---------------------------------------------------------
+           0.86   slack (MET)
+
+
+Startpoint: d1 (input port clocked by cka)
+Endpoint: u_fa0 (rising edge-triggered flip-flop clocked by cka)
+Path Group: cka
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock cka (rise edge)
+   0.60    0.60   clock network delay (ideal)
+   0.50    1.10 v input external delay
+   0.00    1.10 v d1 (in)
+   0.00    1.10 v u_fa0/D (sky130_fd_sc_hd__dfxtp_1)
+           1.10   data arrival time
+
+   2.00    2.00   clock cka (rise edge)
+   0.60    2.60   clock network delay (ideal)
+  -0.05    2.55   clock uncertainty
+   0.00    2.55   clock reconvergence pessimism
+           2.55 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.15    2.40   library setup time
+           2.40   data required time
+---------------------------------------------------------
+           2.40   data required time
+          -1.10   data arrival time
+---------------------------------------------------------
+           1.30   slack (MET)
+
+
+Startpoint: u_ln (negative level-sensitive latch clocked by ckb)
+Endpoint: u_fb0 (rising edge-triggered flip-flop clocked by ckb)
+Path Group: ckb
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.50    0.50   clock ckb (fall edge)
+   0.20    0.70   clock network delay (ideal)
+   0.17    0.87   time given to startpoint
+   0.00    0.87 ^ u_ln/D (sky130_fd_sc_hd__dlxtn_1)
+   0.33    1.20 ^ u_ln/Q (sky130_fd_sc_hd__dlxtn_1)
+   0.00    1.20 ^ u_fb0/D (sky130_fd_sc_hd__dfxtp_1)
+           1.20   data arrival time
+
+   1.00    1.00   clock ckb (rise edge)
+   0.20    1.20   clock network delay (ideal)
+  -0.15    1.05   clock uncertainty
+   0.00    1.05   clock reconvergence pessimism
+           1.05 ^ u_fb0/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.06    0.99   library setup time
+           0.99   data required time
+---------------------------------------------------------
+           0.99   data required time
+          -1.20   data arrival time
+---------------------------------------------------------
+          -0.21   slack (VIOLATED)
+
+
+Startpoint: d2 (input port clocked by ckb)
+Endpoint: u_ln (negative level-sensitive latch clocked by ckb)
+Path Group: ckb
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock ckb (rise edge)
+   0.20    0.20   clock network delay (ideal)
+   0.70    0.90 ^ input external delay
+   0.00    0.90 ^ d2 (in)
+   0.00    0.90 ^ u_ln/D (sky130_fd_sc_hd__dlxtn_1)
+           0.90   data arrival time
+
+   0.50    0.50   clock ckb (fall edge)
+   0.20    0.70   clock network delay (ideal)
+  -0.15    0.55   clock uncertainty
+   0.00    0.55   clock reconvergence pessimism
+           0.55 v u_ln/GATE_N (sky130_fd_sc_hd__dlxtn_1)
+   0.32    0.87   time borrowed from endpoint
+           0.87   data required time
+---------------------------------------------------------
+           0.87   data required time
+          -0.90   data arrival time
+---------------------------------------------------------
+          -0.03   slack (VIOLATED)
+
+Time Borrowing Information
+--------------------------------------------
+ckb pulse width                         0.50
+library setup time                     -0.18
+--------------------------------------------
+max time borrow                         0.32
+--------------------------------------------
+actual time borrow                      0.32
+open edge uncertainty                  -0.15
+--------------------------------------------
+time given to startpoint                0.17
+--------------------------------------------
+
+
+openroad> <endpoint_path_count 1 -group_path_count 100000 ==="
+=== report_checks -path_delay min -format full -endpoint_path_count 1 -group_path_count 100000 ===
+openroad> <ull -endpoint_path_count 1 -group_path_count 100000
+Startpoint: d1 (input port clocked by cka)
+Endpoint: u_fa0 (rising edge-triggered flip-flop clocked by cka)
+Path Group: cka
+Path Type: min
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock cka (rise edge)
+   0.60    0.60   clock network delay (ideal)
+   0.10    0.70 ^ input external delay
+   0.00    0.70 ^ d1 (in)
+   0.00    0.70 ^ u_fa0/D (sky130_fd_sc_hd__dfxtp_1)
+           0.70   data arrival time
+
+   0.00    0.00   clock cka (rise edge)
+   0.60    0.60   clock network delay (ideal)
+   0.00    0.60   clock reconvergence pessimism
+           0.60 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.05    0.55   library hold time
+           0.55   data required time
+---------------------------------------------------------
+           0.55   data required time
+          -0.70   data arrival time
+---------------------------------------------------------
+           0.15   slack (MET)
+
+
+Startpoint: u_fa0 (rising edge-triggered flip-flop clocked by cka)
+Endpoint: ya (output port clocked by cka)
+Path Group: cka
+Path Type: min
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock cka (rise edge)
+   0.60    0.60   clock network delay (ideal)
+   0.00    0.60 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.44    1.04 v u_fa0/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    1.04 v ya (out)
+           1.04   data arrival time
+
+   0.00    0.00   clock cka (rise edge)
+   0.60    0.60   clock network delay (ideal)
+   0.00    0.60   clock reconvergence pessimism
+  -0.10    0.50   output external delay
+           0.50   data required time
+---------------------------------------------------------
+           0.50   data required time
+          -1.04   data arrival time
+---------------------------------------------------------
+           0.54   slack (MET)
+
+
+Startpoint: d2 (input port clocked by ckb)
+Endpoint: u_ln (negative level-sensitive latch clocked by ckb)
+Path Group: ckb
+Path Type: min
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock ckb (rise edge)
+   0.20    0.20   clock network delay (ideal)
+   0.10    0.30 v input external delay
+   0.00    0.30 v d2 (in)
+   0.00    0.30 v u_ln/D (sky130_fd_sc_hd__dlxtn_1)
+           0.30   data arrival time
+
+   0.00    0.00   clock ckb (rise edge)
+   0.20    0.20   clock network delay (ideal)
+   0.00    0.20   clock reconvergence pessimism
+           0.20 ^ u_ln/GATE_N (sky130_fd_sc_hd__dlxtn_1)
+  -0.13    0.07   library hold time
+           0.07   data required time
+---------------------------------------------------------
+           0.07   data required time
+          -0.30   data arrival time
+---------------------------------------------------------
+           0.23   slack (MET)
+
+
+Startpoint: u_ln (negative level-sensitive latch clocked by ckb)
+Endpoint: u_fb0 (rising edge-triggered flip-flop clocked by ckb)
+Path Group: ckb
+Path Type: min
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.50    0.50   clock ckb (fall edge)
+   0.20    0.70   clock network delay (ideal)
+   0.00    0.70 v u_ln/GATE_N (sky130_fd_sc_hd__dlxtn_1)
+   0.23    0.93 v u_ln/Q (sky130_fd_sc_hd__dlxtn_1)
+   0.00    0.93 v u_fb0/D (sky130_fd_sc_hd__dfxtp_1)
+           0.93   data arrival time
+
+   0.00    0.00   clock ckb (rise edge)
+   0.20    0.20   clock network delay (ideal)
+   0.00    0.20   clock reconvergence pessimism
+           0.20 ^ u_fb0/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.05    0.15   library hold time
+           0.15   data required time
+---------------------------------------------------------
+           0.15   data required time
+          -0.93   data arrival time
+---------------------------------------------------------
+           0.78   slack (MET)
+
+
+openroad> puts "=== report_checks -unconstrained ==="
+=== report_checks -unconstrained ===
+openroad> report_checks -unconstrained
+Startpoint: u_fa0 (rising edge-triggered flip-flop clocked by cka)
+Endpoint: ya (output port clocked by cka)
+Path Group: cka
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock cka (rise edge)
+   0.60    0.60   clock network delay (ideal)
+   0.00    0.60 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.59    1.19 ^ u_fa0/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    1.19 ^ ya (out)
+           1.19   data arrival time
+
+   2.00    2.00   clock cka (rise edge)
+   0.60    2.60   clock network delay (ideal)
+  -0.05    2.55   clock uncertainty
+   0.00    2.55   clock reconvergence pessimism
+  -0.50    2.05   output external delay
+           2.05   data required time
+---------------------------------------------------------
+           2.05   data required time
+          -1.19   data arrival time
+---------------------------------------------------------
+           0.86   slack (MET)
+
+
+Startpoint: u_ln (negative level-sensitive latch clocked by ckb)
+Endpoint: u_fb0 (rising edge-triggered flip-flop clocked by ckb)
+Path Group: ckb
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.50    0.50   clock ckb (fall edge)
+   0.20    0.70   clock network delay (ideal)
+   0.17    0.87   time given to startpoint
+   0.00    0.87 ^ u_ln/D (sky130_fd_sc_hd__dlxtn_1)
+   0.33    1.20 ^ u_ln/Q (sky130_fd_sc_hd__dlxtn_1)
+   0.00    1.20 ^ u_fb0/D (sky130_fd_sc_hd__dfxtp_1)
+           1.20   data arrival time
+
+   1.00    1.00   clock ckb (rise edge)
+   0.20    1.20   clock network delay (ideal)
+  -0.15    1.05   clock uncertainty
+   0.00    1.05   clock reconvergence pessimism
+           1.05 ^ u_fb0/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.06    0.99   library setup time
+           0.99   data required time
+---------------------------------------------------------
+           0.99   data required time
+          -1.20   data arrival time
+---------------------------------------------------------
+          -0.21   slack (VIOLATED)
+
+
+openroad> exit
+unable to write history to `/var/empty/.tclsh-history'
+

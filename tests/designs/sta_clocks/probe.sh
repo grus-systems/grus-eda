@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Multi-clock SDC probe: two-clock semantics measured against OpenSTA on the
 # hand-written two-domain fixture two_clock.def (cka on clk1 -> u_fa0/u_fa1/u_fy,
-# ckb on clk2 -> u_fb0/u_fb1/u_fx, cross-domain paths in both directions).
+# ckb on clk2 -> u_fb0/u_fb1/u_fx, cross-domain paths in both directions),
+# plus the second-domain latch fixture two_clock_latch.def (a dlxtn on ckb
+# feeding a ckb flop, cka flop feeding ya — every endpoint same-domain).
 # Each t2_*.sdc scenario runs in its own OpenSTA process because read_sdc
 # accumulates. Two artifacts per scenario: ref_<name>.json (wns/tns/violations
 # + per-endpoint max/min arr/req/slack/slew, same shape as the sta_exceptions
@@ -40,8 +42,9 @@ if [ ! -d "${PDK_ROOT}/sky130A/libs.ref/sky130_fd_sc_hd" ]; then
 fi
 
 run_sta () {
-    local sdc_file="$1"
-    local out_file="$2"
+    local def_file="$1"
+    local sdc_file="$2"
+    local out_file="$3"
     openroad -no_init -no_splash << EOF
 proc count_violations {paths} {
     array set seen {}
@@ -100,7 +103,7 @@ proc collect_endpoints_json {} {
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
-read_def /work/tests/designs/sta_clocks/two_clock.def
+read_def /work/tests/designs/sta_clocks/$def_file
 
 set sdc_err ""
 if {[catch {read_sdc /work/tests/designs/sta_clocks/$sdc_file} err]} {
@@ -145,13 +148,14 @@ EOF
 # times per path, plus the unconstrained listing that shows which endpoints
 # left the timed set.
 run_report () {
-    local sdc_file="$1"
-    local out_file="$2"
+    local def_file="$1"
+    local sdc_file="$2"
+    local out_file="$3"
     openroad -no_init -no_splash << EOF > "/work/tests/designs/sta_clocks/$out_file" 2>&1
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
-read_def /work/tests/designs/sta_clocks/two_clock.def
+read_def /work/tests/designs/sta_clocks/$def_file
 
 puts "=== scenario $sdc_file ==="
 if {[catch {read_sdc /work/tests/designs/sta_clocks/$sdc_file} err]} {
@@ -168,11 +172,11 @@ exit
 EOF
 }
 
-SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp"
+SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds"
 
 for name in $SCENARIOS; do
-    run_sta "$name.sdc" "ref_$name.json"
-    run_report "$name.sdc" "probe_$name.txt"
+    run_sta "two_clock.def" "$name.sdc" "ref_$name.json"
+    run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
 done
 
 {
@@ -186,5 +190,18 @@ done
     done
     printf '\n  }\n}\n'
 } > two_clock.probe.json
+
+# Second-domain latch fixture: every endpoint is same-domain, so the probe
+# covers the borrow window on ckb's own lattice end to end.
+run_sta "two_clock_latch.def" "t2_latch.sdc" "ref_t2_latch.json"
+run_report "two_clock_latch.def" "t2_latch.sdc" "probe_t2_latch.txt"
+
+{
+    printf '{\n  "design": "sta_clocks_latch",\n  "scenarios": {\n'
+    printf '    "%s": ' "t2_latch"
+    cat "ref_t2_latch.json"
+    printf '\n  }\n}\n'
+} > two_clock_latch.probe.json
+
 rm -f ref_*.json
-echo "Wrote two_clock.probe.json"
+echo "Wrote two_clock.probe.json and two_clock_latch.probe.json"
