@@ -4,7 +4,7 @@ Status: **implemented** (v1 2026-11-18; output-port endpoints 2026-11-19;
 multi-launch port coverage 2026-11-19) —
 parser and signature-class
 composition live in `crates/grus-core/src/sta/{sdc,analysis}.rs`; every
-committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*`/`ml_*`/`pml_*`/`pmp_*`
+committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*`/`ml_*`/`pml_*`/`pmp_*`/`pcr_*`
 scenario
 matches OpenSTA
 (`test_sta_exceptions_match_opensta`). This document records the OpenSTA
@@ -65,9 +65,13 @@ one net arrival — the split-clock-buffer fixture (`pm2_both`) separates
 them: `u_ff1/D` reports `req = 1.013333` (anchored at `u_ff1/CLK` on `c1`),
 not the launch-referenced ~1.082 the arrival winner `u_ff2`'s launch on
 `c3` (~69 ps later, behind the extra `u_clkb3` stage) would give. The CRPR
-credit the clock check adds is not applied to delay checks (unexercised:
-the per-class merge does not keep the winning path's clock net, and this
-fixture's clock nets carry zero late/early spread).
+credit **is** applied to delay checks (measured 2026-11-19 on the
+`pcr_*` spread fixture, section 4): `pcr_max`'s `u_ff0 -> u_ff1` check
+reports `req = capture_early - unc - t_setup + N + S` where
+`S = 0.031507` is the early/late spread at the shared clock-net driver
+`u_clkb/X`, and `pcr_min` shows the hold delay check's required time
+moves by `-S`; `pcr_off` (covered launch on `c3`, sharing only the
+`clk` root with `c1`) confirms no credit on a non-shared path.
 
 - Replace semantics proven by `md_loose` (`N = 5.0` >> setup budget): the
   covered `u_ff0` source's req became `capture - unc - t_setup + 5.0` —
@@ -211,14 +215,22 @@ arr_reported = the class's ordinary max arrival at the endpoint
                (each covered source's launch already paired with its
                data delay by the per-class propagation)
 req_reported = capture_arrival_min[check.edge] - unc_setup - t_setup + N
+               + crpr_credit
 slack        = req_reported - arr_reported
 ```
 
 with the capture arrival read at the endpoint register's own clock pin —
 it coincides with a launch reference only when launch and capture clocks
-see equal arrivals. No per-pin delay domain is needed: the reported
-arrival is the covered-source **arrival** winner, which the
-signature-class eval run computes directly.
+see equal arrivals. `crpr_credit` is the same shared-net driver spread
+the clock check adds: the pin's `crpr_max` tag mask records which
+launch produced the extreme (bits interned per run as `(clock net,
+clock edge)` pairs, bit 0 a no-credit sentinel for ports/latch
+launches/contested or unresolvable sources), and the covered class's
+filter leaves that mask holding only the covered launch's tag. The min
+side needs no term of its own — `req_hold_base` already carries `-S`
+from the class's hold required time. No per-pin delay domain is
+needed: the reported arrival is the covered-source **arrival** winner,
+which the signature-class eval run computes directly.
 
 An earlier v1 tracked a separate delay domain on `PinTimingState`
 (`delay_max` = max `arrival - launch` per transition, plus
@@ -256,8 +268,9 @@ Per side independently (max and min compose separately):
 1. false_path covering (s, e): drop candidate (existing).
 2. else max_delay covering (s, e): keep the covered candidate's ordinary
    arrival and slew, replace its required time with
-   `req = capture_clk_arrival_min[check.edge] - unc_setup - t_setup + N`,
-   `slack = req - arr`.
+   `req = capture_clk_arrival_min[check.edge] - unc_setup - t_setup + N
+   + crpr_credit` (the class's data-pin `crpr_max` tag against the
+   capture net/edge), `slack = req - arr`.
 3. else multicycle covering (s, e): existing req shift.
 4. min side: min_delay covering (s, e) -> `req = req_hold_base + N` (the
    pre-MCP hold required); else existing hold/multicycle handling.
@@ -317,7 +330,7 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
 
 ## 4. Validation plan
 
-Golden scenarios in `exceptions.reference.json` (106 entries: 102 evaluated +
+Golden scenarios in `exceptions.reference.json` (111 entries: 107 evaluated +
 4 OpenSTA error records): `md_*` ideal-clock set including order/precedence
 variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 `mhu_*` uncertainty variants, `base_prop` / `pmd_*` propagated-clock set,
@@ -329,7 +342,14 @@ section 1), the `ml_*`/`pml_*` multi-launch port set (merged two-source
 checks at `y2`, per-source probes, `all_outputs`, min side — section 1),
 and the `pmp_*` propagated-clock port-launch set (`set_max_delay` /
 `set_min_delay` `-from [get_ports d_in]`, the `-from [all_inputs]` sweep,
-and the network-latency null-diff probe — section 1).
+and the network-latency null-diff probe — section 1). The `pcr_*` set
+adds clock-net early/late spread via `set_timing_derate -early 0.80` /
+`-late 1.20` on `-clock -cell_delay` (spread `S = 0.4 * d(u_clkb)` =
+0.031507 ns at the `c1` driver): `pcr_clk` proves the spread by the
+opposite-direction `max_req`-down/`min_req`-up pair, `pcr_clkfp` forces
+the shared-tree `u_ff0` launch to win `u_ff1/D` (per-path credit on the
+ordinary check), `pcr_max`/`pcr_min` measure the credit on the delay
+checks themselves, and `pcr_off` is the non-shared-path control.
 
 Since 2026-11-19 the fixture drives `u_ff1/D` from a `mux2` with two FF
 inputs (`u_ff0`, `u_ff2`) and a constrained input port (`sel`), assigns
@@ -355,9 +375,8 @@ delay/arrival winners split — `pm2_both` reports the arrival winner
 split falsified the earlier delay-winner pairing — `arr = delay_launch +
 delay_max` went red by exactly that gap — and established that OpenSTA
 reports the covered-source arrival winner (a wrong-arrival mutation was
-also checked red, per the fail-proof rule). The delay check's CRPR credit
-remains unexercised (zero late/early spread on this fixture's clock
-nets). The `pmp_*` set exercises the propagated input-port launch anchor:
+also checked red, per the fail-proof rule). The `pmp_*` set exercises
+the propagated input-port launch anchor:
 `pmp_port`/`pmp_minport` report the ordinary propagated port seed
 (0.8/0.1) on the delay check and `pmp_port2`'s null diff proves the
 anchor carries no network-latency term — with the caveat that the SDC
@@ -451,10 +470,23 @@ Resolved by the propagated port-launch set (`pmp_*`, 2026-11-19):
   (`y2` reports a real −0.683130 delay-check violation); `clk` is inert
   as a launch source in both engines.
 
+Resolved by the `pcr_*` spread fixture (2026-11-19):
+
+- ~~CRPR credit on delay checks~~ — `set_timing_derate -early 0.80` /
+  `-late 1.20 -clock -cell_delay` puts `S = 0.031507` of spread on the
+  `c1`/`c3` drivers (`pcr_clk` opposite-direction required-time pair).
+  OpenSTA credits delay checks the same shared-net driver spread the
+  clock check adds (`pcr_max` req `+S`, `pcr_min` req `-S`; `pcr_off`
+  non-shared control `+0`) — and it credits **per path**: `pcr_clkfp`
+  shows the winning `u_ff0` launch credited on `u_ff1/D` even though
+  the endpoint's other sources are not shared. Implemented as
+  per-extreme launch-tag masks (`crpr_max`/`crpr_min`, interned
+  `(clock net, clock edge)` bits, sentinel for non-FF/contested
+  sources) replacing the all-source cone consensus; the delay check
+  adds the same credit term. See `docs/results.md`.
+
 Still open:
 
 1. A literal two-clock-domain `set_min_delay` anchoring fixture;
    async-reset endpoint probe; latch-borrow delay fixture — all need
    DEF/SDC additions.
-2. CRPR credit on delay checks needs a fixture with nonzero clock-net
-   late/early spread.

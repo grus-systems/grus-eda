@@ -104,6 +104,13 @@ struct PinTimingState {
     /// worst slack across them.
     par_max: [u8; 2],
     par_min: [u8; 2],
+    /// Bitmask of the CRPR launch tags (bits into `StaPrepared::crpr_tags`) that
+    /// produced the corresponding arrival extreme; same winner-replace/tie-union
+    /// discipline as `par_*`. OpenSTA credits a path the launch/capture clock
+    /// spread at their last shared point, so the credit must know which launch
+    /// won each extreme — the merged state alone does not remember.
+    crpr_max: [u8; 2],
+    crpr_min: [u8; 2],
 }
 
 impl PinTimingState {
@@ -114,6 +121,8 @@ impl PinTimingState {
         slew_min: [f32::INFINITY; 2],
         par_max: [0; 2],
         par_min: [0; 2],
+        crpr_max: [0; 2],
+        crpr_min: [0; 2],
     };
 
     fn reached(&self, pol: usize) -> bool {
@@ -130,21 +139,27 @@ impl PinTimingState {
         slew_min: f32,
         par_max: u8,
         par_min: u8,
+        crpr_max: u8,
+        crpr_min: u8,
     ) {
         // Slews are merged independently of which arc wins the arrival (OpenSTA GraphDelayCalc).
-        // The parity arguments are masks: a strictly better arrival replaces the mask,
-        // an equal one unions it so endpoint checks see every tying launch parity.
+        // The parity and tag arguments are masks: a strictly better arrival replaces
+        // the mask, an equal one unions it so endpoint checks see every tying launch.
         if arr_max > self.arrival_max[pol] {
             self.arrival_max[pol] = arr_max;
             self.par_max[pol] = par_max;
+            self.crpr_max[pol] = crpr_max;
         } else if arr_max == self.arrival_max[pol] {
             self.par_max[pol] |= par_max;
+            self.crpr_max[pol] |= crpr_max;
         }
         if arr_min < self.arrival_min[pol] {
             self.arrival_min[pol] = arr_min;
             self.par_min[pol] = par_min;
+            self.crpr_min[pol] = crpr_min;
         } else if arr_min == self.arrival_min[pol] {
             self.par_min[pol] |= par_min;
+            self.crpr_min[pol] |= crpr_min;
         }
         self.slew_max[pol] = self.slew_max[pol].max(slew_max);
         self.slew_min[pol] = self.slew_min[pol].min(slew_min);
@@ -161,6 +176,8 @@ impl PinTimingState {
             self.slew_min[pol] = self.slew_min[pol].min(o.slew_min[pol]);
             self.par_max[pol] |= o.par_max[pol];
             self.par_min[pol] |= o.par_min[pol];
+            self.crpr_max[pol] |= o.crpr_max[pol];
+            self.crpr_min[pol] |= o.crpr_min[pol];
         }
     }
 }
@@ -1710,8 +1727,8 @@ fn propagate_clock(
     let lat = sdc.clock_source_latency_ns;
     let tr = sdc.input_transition_ns(cx.port_name(port));
     let p = port.0 as usize;
-    clk[p].merge(RISE, lat, lat, tr, tr, 1, 1);
-    clk[p].merge(FALL, lat + half_period, lat + half_period, tr, tr, 2, 2);
+    clk[p].merge(RISE, lat, lat, tr, tr, 1, 1, 0, 0);
+    clk[p].merge(FALL, lat + half_period, lat + half_period, tr, tr, 2, 2, 0, 0);
     parity[p] = [0, 1];
 
     for lvl in 1..levelized.level_offsets.len() - 1 {
@@ -1789,6 +1806,8 @@ fn propagate_clock(
                             early_slew,
                             1 << src_par[src_pol],
                             1 << src_par[src_pol],
+                            0,
+                            0,
                         );
                         changed = true;
                     }
@@ -2032,10 +2051,12 @@ impl LaunchPair {
 }
 
 /// One launch's precomputed output pairs plus the clock-edge parity that
-/// launched them. `pairs` is indexed by output transition.
+/// launched them. `pairs` is indexed by output transition. `tag` is the CRPR
+/// launch-tag bitmask for every arrival this seed produces.
 struct LaunchSeed {
     q: PinId,
     par: u8,
+    tag: u8,
     pairs: [LaunchPair; 2],
 }
 
@@ -2056,6 +2077,12 @@ struct StaPrepared<'a> {
     latch_seeds: Vec<LaunchSeed>,
     clock_parity: Option<Vec<[u8; 2]>>,
     clock_state: Option<Vec<PinTimingState>>,
+    /// CRPR launch-tag table: index 0 is the no-credit sentinel (bit 0 of every
+    /// `crpr_*` mask — ports, latch clock-to-Q launches, unresolvable or
+    /// contested sources); entries 1.. are a launch's `(clock net, clock edge)`
+    /// pair. `u8` masks cap the table at 8 entries — past that, launches are
+    /// seeded with the sentinel bit (conservative: no credit).
+    crpr_tags: Vec<(NetId, usize)>,
 }
 
 struct EvalOutcome {
@@ -2157,6 +2184,8 @@ fn prepare_sta<'a>(
                 per_pol[pol].3,
                 1,
                 0,
+                1,
+                1,
             );
         }
         port_seeds.push(PortSeed { pin, per_pol });
@@ -2241,6 +2270,8 @@ fn prepare_sta<'a>(
                     sdc.clock_transition_ns,
                     1 << edge_par,
                     1 << edge_par,
+                    0,
+                    0,
                 );
             }
         }
@@ -2308,6 +2339,34 @@ fn prepare_sta<'a>(
             .filter(|&v| v <= 1)
             .unwrap_or(edge as u8)
     };
+    // CRPR launch tags: each distinct `(launch clock net, launch edge)` gets a
+    // bit so a data-pin extreme records which clock network launched it — the
+    // credit is per path, not per cone. Launches whose clock pin sits on no
+    // net, and every launch once the table overflows the `u8` mask, degrade to
+    // the sentinel bit (no credit).
+    let mut crpr_tags: Vec<(NetId, usize)> = vec![(NetId(u32::MAX), usize::MAX)];
+    for l in &graph.launches {
+        let Some(net) = design.pin_nets[l.clk.0 as usize] else {
+            continue;
+        };
+        let tag = (net, l.edge);
+        if !crpr_tags.contains(&tag) {
+            crpr_tags.push(tag);
+        }
+    }
+    let launch_tag = |l: &LaunchArc| -> u8 {
+        if crpr_tags.len() > u8::BITS as usize {
+            return 1;
+        }
+        let Some(net) = design.pin_nets[l.clk.0 as usize] else {
+            return 1;
+        };
+        let idx = crpr_tags
+            .iter()
+            .position(|&t| t == (net, l.edge))
+            .expect("tag interned above");
+        1 << idx
+    };
     // Launch and latch-open contributions are run-invariant — they read only
     // clock-pin state, which `base_state` already carries — so the pairs are
     // computed once here; `eval_sta` merges them filtered by allowed source.
@@ -2318,6 +2377,7 @@ fn prepare_sta<'a>(
             .map(|l| LaunchSeed {
                 q: l.q,
                 par: launch_parity(l.clk, l.edge),
+                tag: launch_tag(l),
                 pairs: eval_launch(l.q, base_state[l.clk.0 as usize], l.lib_arc, l.edge),
             })
             .collect()
@@ -2328,6 +2388,7 @@ fn prepare_sta<'a>(
             .map(|l| LaunchSeed {
                 q: l.q,
                 par: launch_parity(l.clk, l.edge),
+                tag: launch_tag(l),
                 pairs: eval_launch(l.q, base_state[l.clk.0 as usize], l.lib_arc, l.edge),
             })
             .collect()
@@ -2342,6 +2403,9 @@ fn prepare_sta<'a>(
         .map(|open| LaunchSeed {
             q: open.q,
             par: launch_parity(open.enable, open.open_pol),
+            // Latch clock-to-Q launches take the sentinel: latch CRPR is not
+            // modelled, so arrivals through the open edge claim no credit.
+            tag: 1,
             pairs: eval_launch(
                 open.q,
                 base_state[open.enable.0 as usize],
@@ -2363,6 +2427,7 @@ fn prepare_sta<'a>(
         latch_seeds,
         clock_parity,
         clock_state,
+        crpr_tags,
     })
 }
 
@@ -2386,7 +2451,8 @@ fn eval_sta(
         for pol in [RISE, FALL] {
             let (arr_max, arr_min, slew_max, slew_min) = seed.per_pol[pol];
             if ok {
-                state[p].merge(pol, arr_max, arr_min, slew_max, slew_min, 1, 0);
+                // A port is no flip-flop launch: the CRPR sentinel bit.
+                state[p].merge(pol, arr_max, arr_min, slew_max, slew_min, 1, 0, 1, 1);
             } else {
                 state[p].merge(
                     pol,
@@ -2394,6 +2460,8 @@ fn eval_sta(
                     f32::INFINITY,
                     slew_max,
                     slew_min,
+                    0,
+                    0,
                     0,
                     0,
                 );
@@ -2413,6 +2481,8 @@ fn eval_sta(
                         pair.slew_min,
                         1 << seed.par,
                         1 << seed.par,
+                        seed.tag,
+                        seed.tag,
                     );
                 } else {
                     state[pair.q.0 as usize].merge(
@@ -2421,6 +2491,8 @@ fn eval_sta(
                         f32::INFINITY,
                         pair.slew_max,
                         pair.slew_min,
+                        0,
+                        0,
                         0,
                         0,
                     );
@@ -2553,6 +2625,8 @@ fn eval_sta(
                             early_slew,
                             src.par_max[src_pol],
                             src.par_min[src_pol],
+                            src.crpr_max[src_pol],
+                            src.crpr_min[src_pol],
                         );
                         changed = true;
                     }
@@ -2586,6 +2660,7 @@ fn eval_sta(
         prepared.clock_state.as_deref(),
         &state,
         prepared.clock_parity.as_deref(),
+        &prepared.crpr_tags,
         skipped_seed,
     )?;
     Ok(EvalOutcome {
@@ -3236,18 +3311,29 @@ fn run_sta_partitioned(
                     // register's own clock pin (the early capture arrival,
                     // like the setup check), not the launch source's clock:
                     // under `set_propagated_clock` with skewed clock trees
-                    // the two differ. The CRPR credit the clock check adds
-                    // is not reproduced here: the shared launch/capture
-                    // clock-net test needs the winning path's clock net,
-                    // which the per-class merge does not keep (unexercised:
-                    // zero spread in this fixture).
+                    // the two differ. The delay check takes the same CRPR
+                    // credit the clock check adds (measured `pcr_max`/
+                    // `pcr_min`: req moves by exactly the shared-net driver
+                    // spread): the tag comes from this class's data-pin
+                    // extreme, which the covered-source filter leaves holding
+                    // only the covered launch's tag.
                     let t_setup = eval_nldm_constraint(
                         table,
                         s.slew_max[pol],
                         class_states[ci][clk.0 as usize].slew_max[check.edge],
                     ) * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
                     let capture = class_states[ci][clk.0 as usize].arrival_min[check.edge];
-                    let req = capture - sdc.setup_uncertainty_ns - t_setup + n;
+                    let credit = design.pin_nets[clk.0 as usize].map_or(0.0, |capture_net| {
+                        crpr_credit(
+                            design,
+                            prepared.clock_state.as_deref(),
+                            &prepared.crpr_tags,
+                            s.crpr_max[pol],
+                            capture_net,
+                            check.edge,
+                        )
+                    });
+                    let req = capture - sdc.setup_uncertainty_ns - t_setup + n + credit;
                     pols.max[pol] = Some(Worst {
                         req,
                         slack: req - w.arr,
@@ -3544,68 +3630,44 @@ fn record_endpoint(
     }
 }
 
-/// Sentinel for `crpr_*` resolution: the pin's value is not provably launched by
-/// flip-flops clocked on a single net (port, latch, undriven or mixed sources), so no
-/// common-path credit is safe.
-const CRPR_BAD: i64 = -2;
-
-/// Follows `pin`'s net driver back to the pin that sources its value. The result packs
-/// the launch clock's `NetId` and the clock-edge polarity that launched the data as
-/// `net * 2 + edge` (`CRPR_BAD` on failure): the early/late spread being credited is a
-/// per-transition quantity, so a launch on a different transition shares nothing.
-fn crpr_sink_net(
-    levelized: &LevelizedGraph,
+/// CRPR credit for one required-time term: the early/late spread at the shared
+/// clock-net driver, granted only when `tag_mask` is a single non-sentinel
+/// launch tag whose `(clock net, clock edge)` equals `(capture_net, trans)`.
+/// A contested or sentinel-tagged extreme is credited nothing — the same
+/// conservative answer the old all-source cone consensus gave.
+fn crpr_credit(
     design: &DesignDb,
-    ff_clk: &HashMap<u32, (PinId, usize)>,
-    latch_q: &HashSet<u32>,
-    memo: &mut [i64],
-    pin: PinId,
-) -> i64 {
-    match levelized.pin_driver[pin.0 as usize] {
-        Some((_, _, driver)) => crpr_driver_net(levelized, design, ff_clk, latch_q, memo, driver),
-        None => CRPR_BAD,
+    clock_state: Option<&[PinTimingState]>,
+    tags: &[(NetId, usize)],
+    tag_mask: u8,
+    capture_net: NetId,
+    trans: usize,
+) -> f32 {
+    if tag_mask.count_ones() != 1 || tag_mask & 1 != 0 {
+        return 0.0;
     }
-}
-
-/// Follows a net-driving pin back through combinational arcs. Returns the packed
-/// launch clock net and edge when every path ends at a flip-flop whose clock pin sits
-/// on that net, `CRPR_BAD` otherwise. Memoized per pin in `memo` (`-1` = unvisited).
-fn crpr_driver_net(
-    levelized: &LevelizedGraph,
-    design: &DesignDb,
-    ff_clk: &HashMap<u32, (PinId, usize)>,
-    latch_q: &HashSet<u32>,
-    memo: &mut [i64],
-    pin: PinId,
-) -> i64 {
-    let p = pin.0 as usize;
-    if memo[p] != -1 {
-        return memo[p];
-    }
-    let result = if let Some(&(clk, edge)) = ff_clk.get(&pin.0) {
-        design.pin_nets[clk.0 as usize].map_or(CRPR_BAD, |n| n.0 as i64 * 2 + edge as i64)
-    } else if latch_q.contains(&pin.0) || design.pin_cells[p].is_none() {
-        CRPR_BAD
-    } else {
-        let mut net: i64 = -1;
-        for &(src, _) in levelized.incoming_to(pin) {
-            let r = crpr_sink_net(levelized, design, ff_clk, latch_q, memo, src);
-            if r == CRPR_BAD || (net != -1 && net != r) {
-                net = CRPR_BAD;
-                break;
-            }
-            net = r;
-        }
-        if net == -1 { CRPR_BAD } else { net }
+    let Some(&(net, edge)) = tags.get(tag_mask.trailing_zeros() as usize) else {
+        return 0.0;
     };
-    memo[p] = result;
-    result
+    if net != capture_net || edge != trans {
+        return 0.0;
+    }
+    let (Some(clock_state), Some(driver)) = (clock_state, design.net_driver(net)) else {
+        return 0.0;
+    };
+    let ds = clock_state[driver.0 as usize];
+    if ds.reached(trans) {
+        (ds.arrival_max[trans] - ds.arrival_min[trans]).max(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// `(pin, report, polarities)` per reached endpoint; `assemble_sta_report`
 /// sorts by pin name and reduces to the report.
 type EndpointEntries = Vec<(PinId, EndpointReport, EndpointPolarities)>;
 
+#[allow(clippy::too_many_arguments)]
 fn collect_endpoints(
     cx: &Context,
     graph: &TimingGraph,
@@ -3613,6 +3675,7 @@ fn collect_endpoints(
     clock_state: Option<&[PinTimingState]>,
     state: &[PinTimingState],
     clock_parity: Option<&[[u8; 2]]>,
+    crpr_tags: &[(NetId, usize)],
     mut skipped: SkipReport,
 ) -> Result<(EndpointEntries, SkipReport)> {
     let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
@@ -3633,18 +3696,11 @@ fn collect_endpoints(
     // parity on each arrival extreme, so inverting launch paths are handled per endpoint.
     // Common-path pessimism removal (CRPR): when launch and capture clocks share a net,
     // the shared prefix is counted late on the launch side and early on the capture side.
-    // OpenSTA credits the early/late spread at the last shared point — the net driver —
-    // back to both required times. Only a propagated clock carries that spread; the ideal
-    // clock seeds identical arrivals. The launch side must resolve to flip-flops on the
-    // capture clock's net launching the same clock transition, otherwise the credit is
-    // unsafe and stays zero.
-    let ff_clk: HashMap<u32, (PinId, usize)> = graph
-        .launches
-        .iter()
-        .map(|l| (l.q.0, (l.clk, l.edge)))
-        .collect();
-    let latch_q: HashSet<u32> = graph.latch_opens.iter().map(|o| o.q.0).collect();
-    let mut crpr_memo = vec![-1i64; design.num_pins()];
+    // OpenSTA credits each *path* the early/late spread at the last shared point — the
+    // net driver — back to both required times. Only a propagated clock carries that
+    // spread; the ideal clock seeds identical arrivals. Which launch won each arrival
+    // extreme is recorded in the pin's `crpr_*` tag mask; the credit applies only when
+    // the winning launch's clock net and edge match the capture's.
     let edge_parity = |pin: PinId, pol: usize| -> usize {
         clock_parity
             .and_then(|p| p.get(pin.0 as usize).map(|e| e[pol]))
@@ -3706,34 +3762,19 @@ fn collect_endpoints(
         // 0, the pre-tracking assumption.
         let c0 = edge_parity(clk, edge);
         // `trans` is the clock transition the credit is evaluated for: the check edge for
-        // the closing/setup required times, FALL for a latch's opening edge. The packed
-        // launch value must match both the capture net and the transition.
-        let mut credit_for = |trans: usize| -> f32 {
+        // the closing/setup required times, the opening polarity for a latch's opening
+        // edge. `tag_mask` is the launch-tag mask of the data extreme being composed
+        // (`crpr_max[pol]` for closing req, `crpr_min[pol]` for hold req): it must
+        // resolve to one tag matching both the capture net and the transition.
+        let credit_for = |trans: usize, tag_mask: u8| -> f32 {
             if !sdc.propagated_clock {
                 return 0.0;
             }
             let Some(capture_net) = design.pin_nets[clk.0 as usize] else {
                 return 0.0;
             };
-            let launch = crpr_sink_net(levelized, design, &ff_clk, &latch_q, &mut crpr_memo, data);
-            if launch == CRPR_BAD
-                || launch / 2 != capture_net.0 as i64
-                || launch % 2 != trans as i64
-            {
-                return 0.0;
-            }
-            let (Some(clock_state), Some(driver)) = (clock_state, design.net_driver(capture_net))
-            else {
-                return 0.0;
-            };
-            let ds = clock_state[driver.0 as usize];
-            if ds.reached(trans) {
-                (ds.arrival_max[trans] - ds.arrival_min[trans]).max(0.0)
-            } else {
-                0.0
-            }
+            crpr_credit(design, clock_state, crpr_tags, tag_mask, capture_net, trans)
         };
-        let credit = credit_for(edge);
         let (late, early) = (&lib.arcs[late_arc as usize], &lib.arcs[early_arc as usize]);
         let mut cands = EndpointPolarities {
             max: [None; 2],
@@ -3769,7 +3810,7 @@ fn collect_endpoints(
                 let closing_max = capture_extra + clk_state.arrival_min[edge]
                     - late_time
                     - sdc.setup_uncertainty_ns
-                    + credit;
+                    + credit_for(edge, s.crpr_max[pol]);
                 // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
                 // is reported at the opening edge and the slack is what remains before the closing edge.
                 // The opening edge is the latest opening-polarity arrival before the
@@ -3790,7 +3831,7 @@ fn collect_endpoints(
                         .max(0.0);
                     clk_state.arrival_min[open_pol] + periods * sdc.period_ns
                         - sdc.setup_uncertainty_ns
-                        + credit_for(open_pol)
+                        + credit_for(open_pol, s.crpr_max[pol])
                 };
                 let arr_max = s.arrival_max[pol];
                 let (req, slack) = if !check.latch {
@@ -3818,8 +3859,8 @@ fn collect_endpoints(
             let early_time =
                 eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[edge])
                     * sdc.derate(false, DERATE_CHECK, false, check_transition(early));
-            let req_min =
-                clk_state.arrival_max[edge] + early_time + sdc.hold_uncertainty_ns - credit;
+            let req_min = clk_state.arrival_max[edge] + early_time + sdc.hold_uncertainty_ns
+                - credit_for(edge, s.crpr_min[pol]);
             // Hold pairs the capture edge with the next launch edge of the same polarity:
             // the arrival shifts one period when the launch edge parity precedes the
             // capture pin's first edge of this polarity.
@@ -6979,24 +7020,31 @@ mod tests {
 
     /// Equal arrivals from different launch-edge parities must keep both parity bits:
     /// the endpoint required time shifts by a period per parity, so dropping one would
-    /// report the wrong slack (external review S1).
+    /// report the wrong slack (external review S1). The CRPR launch-tag masks follow
+    /// the same replace/union discipline.
     #[test]
     fn test_parity_mask_keeps_tied_arrivals() {
         let mut s = PinTimingState::UNREACHED;
-        s.merge(RISE, 1.0, 0.5, 0.1, 0.1, 0b01, 0b01);
+        s.merge(RISE, 1.0, 0.5, 0.1, 0.1, 0b01, 0b01, 0b010, 0b010);
         // Same max arrival, opposite parity: both bits survive.
-        s.merge(RISE, 1.0, 0.4, 0.1, 0.1, 0b10, 0b10);
+        s.merge(RISE, 1.0, 0.4, 0.1, 0.1, 0b10, 0b10, 0b100, 0b100);
         assert_eq!(s.par_max[RISE], 0b11);
+        assert_eq!(s.crpr_max[RISE], 0b110);
         // The better min arrival replaces its mask entirely.
         assert_eq!(s.par_min[RISE], 0b10);
+        assert_eq!(s.crpr_min[RISE], 0b100);
         // A strictly better max replaces the mask; an equal max unions again. The
         // equal min arrival also unions its parity bit.
-        s.merge(RISE, 1.2, 0.4, 0.1, 0.1, 0b10, 0b01);
+        s.merge(RISE, 1.2, 0.4, 0.1, 0.1, 0b10, 0b01, 0b100, 0b010);
         assert_eq!(s.par_max[RISE], 0b10);
         assert_eq!(s.par_min[RISE], 0b11);
-        s.merge(RISE, 1.2, 0.45, 0.1, 0.1, 0b01, 0b10);
+        assert_eq!(s.crpr_max[RISE], 0b100);
+        assert_eq!(s.crpr_min[RISE], 0b110);
+        s.merge(RISE, 1.2, 0.45, 0.1, 0.1, 0b01, 0b10, 0b010, 0b100);
         assert_eq!(s.par_max[RISE], 0b11);
         assert_eq!(s.par_min[RISE], 0b11);
+        assert_eq!(s.crpr_max[RISE], 0b110);
+        assert_eq!(s.crpr_min[RISE], 0b110);
     }
 
     /// OpenSTA's ideal clock still tracks edge inversion through cell-driven clock
@@ -8260,7 +8308,7 @@ mod tests {
 
     /// `tests/designs/sta_exceptions`: a three-flop DEF (muxed `u_ff1/D`,
     /// a second mux driving `y2` from the same two FF sources, split clock
-    /// buffers) plus 106 SDC scenarios.
+    /// buffers) plus 111 SDC scenarios.
     /// `exceptions.reference.json` was emitted by the committed
     /// `generate_ref.sh` running OpenSTA inside the pinned LibreLane image.
     /// Four scenarios carry `error` records: a combined `-setup X -hold Y`
