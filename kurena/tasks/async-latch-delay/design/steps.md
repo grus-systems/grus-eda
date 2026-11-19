@@ -19,7 +19,7 @@ touch fixtures, goldens, docs, or the version.
 The bound is `pulse - t_setup`, not `pulse + t_setup` — the compose
 comment at ~3609 (`max_borrow = pulse - t_setup`), `docs/path-delays.md`
 §1 (`base + pulse - t_setup`), and the `delay_allregs` golden
-(`u_ln2/D`: `0.9 + 3.4 - 0.1645 = 3.235511`) all agree. Minimal fix:
+(`u_ln2/D`: `0.9 + 2.5 - 0.164489 = 3.235511`) all agree. Minimal fix:
 change `+ pulse + t_setup` to `+ pulse - t_setup`. Nothing else in the
 docstring moves.
 

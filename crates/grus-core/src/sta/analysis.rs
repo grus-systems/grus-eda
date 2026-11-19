@@ -3495,8 +3495,10 @@ fn run_sta_partitioned(
     // edge (measured: `delay_allregs`'s `u_rbp/RESET_B` anchors at RISE while
     // its recovery check edge is FALL). Decoded from `clock_parity` — a RISE
     // state on edge parity 0 means the edge-0 transition is RISE; parity 1
-    // (inverted clock net) makes it FALL. Contested or absent parity falls
-    // back to RISE.
+    // (inverted clock net) makes it FALL. Absent parity falls back to RISE;
+    // contested parity was already resolved by the parity walk — earliest
+    // arrival under the propagated clock, first-written source under the
+    // ideal one — and can be FALL.
     let edge0_pol = |clk: PinId| -> usize {
         match prepared
             .clock_parity

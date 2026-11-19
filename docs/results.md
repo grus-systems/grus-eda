@@ -2889,8 +2889,9 @@ exactly 0 — the check lets the latch borrow up to its own cap, so
 `base = 1.0 + 0 - 0.1 = 0.9`, `max_borrow = 2.5 - 0.0412 = 2.4588`
 (dlxtp). `u_ln/D` (`delay_ln`, N=1.5): `req 1.400000` — `arr_dly
 0.656302 < base 1.4`, borrow clamps at 0. `delay_allregs` clamps
-`u_ln2/D` at `base + pulse - t_setup = 0.9 + 3.4 - 0.1645 = 3.235511`
-(dlxtn) and `u_rtn/D` at `0.9 + 2.5 - 0.1755 = 3.224545` (dlrtn — the
+`u_ln2/D` at `base + pulse - t_setup = 0.9 + 2.5 - 0.164489 = 3.235511`
+(dlxtn — pulse is the clock's low half-period on the ideal `ck`) and
+`u_rtn/D` at `0.9 + 2.5 - 0.175455 = 3.224545` (dlrtn — the
 sign on `t_setup` was verified against `report_checks`, which prints
 "library setup time -0.18" for this arc; the bound is `pulse -
 t_setup`). `delay_min` on `u_lp/D`: `req 0.566443 = 0.5 (N) + 0 (lat0)
@@ -2917,13 +2918,52 @@ edge0-anchored).
 
 ### Negative controls (ad hoc, not committed)
 
-Same container session, `async_reset` + `delay_max`-shaped rules:
+Same container session, `async_reset` + `delay_max`-shaped rules (the
+`delay_max` scenario SDC with only the `-from` selector swapped). Both
+verdicts: **ignored** — the endpoint stays at the unconstrained
+`ideal` value.
 
-- `set_max_delay 1.0 -from [get_ports d_in] -to [get_pins
-  u_ff0/RESET_B]` → endpoint byte-identical to `ideal` (the port does
-  not launch the async pin).
-- `set_max_delay 1.0 -from [get_pins u_ff0/CLK] -to [get_pins
-  u_ff0/RESET_B]` → byte-identical to `ideal`.
+`set_max_delay 1.0 -from [get_ports d_in] -to [get_pins u_ff0/RESET_B]`:
+
+```
+endpoint u_ff0/RESET_B max: arr 1.313763 req 4.900132 slack 3.586369
+endpoint u_ff0/RESET_B min: arr 1.313763 req 1.132095 slack 0.181668
+Startpoint: rst_n (input port clocked by core_clk)
+Endpoint: u_ff0 (recovery check against rising-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.50    1.20 ^ input external delay
+   0.00    1.20 ^ rst_n (in)
+   0.11    1.31 ^ u_rst/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.31 ^ u_ff0/RESET_B (sky130_fd_sc_hd__dfrtp_1)
+           1.31   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.70    4.70   clock network delay (ideal)
+  -0.05    4.65   clock uncertainty
+   0.00    4.65   clock reconvergence pessimism
+           4.65 ^ u_ff0/CLK (sky130_fd_sc_hd__dfrtp_1)
+   0.25    4.90   library recovery time
+           4.90   data required time
+---------------------------------------------------------
+           4.90   data required time
+          -1.31   data arrival time
+---------------------------------------------------------
+           3.59   slack (MET)
+```
+
+`set_max_delay 1.0 -from [get_pins u_ff0/CLK] -to [get_pins
+u_ff0/RESET_B]` printed the identical endpoint lines and `report_checks`
+table — `arr 1.313763`, `req 4.900132` (max) / `1.132095` (min) — the
+clock pin does not launch the async pin either. Both outputs are
+field-for-field the `ideal` baseline (max `req 4.900132`, min `req
+1.132095`), i.e. per-source replace semantics: a `-from` that matches
+no launch leaves the check untouched rather than masking it.
 
 OpenSTA warnings during generation: none delay-specific — only the
 pre-existing `[WARNING ODB-0220]` LEF noise and the fixture's baseline
