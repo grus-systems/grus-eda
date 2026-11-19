@@ -278,8 +278,8 @@ Remaining:
 
 - `get_pins`/`get_nets`/`all_fanouts` selections in *other* commands
   (`set_load`, `set_fanout_load`), and the path-delay follow-ups in
-  `docs/path-delays.md` section 5 (multi-driver output-port, two-clock
-  and latch fixtures). These select pins/nets the port-based delay model
+  `docs/path-delays.md` section 5 (two-clock and latch fixtures). These
+  select pins/nets the port-based delay model
   cannot honour yet; options are symbolic selections plus counted-skip,
   or deferring until a stage needs them.
 
