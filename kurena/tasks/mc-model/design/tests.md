@@ -58,6 +58,15 @@ Keep verbatim-message assertions for:
   `set_propagated_clock does not apply to the virtual clock`
 - `create_clock -period 0` (any row) → `finish()` period error
 
+Plus one standalone test (the `multi_clock_bails` fixtures always
+declare a clock first, so this cannot be another case row):
+
+- `clock_commands_before_create_clock_bail`: `set_clock_latency 0.5`
+  and `set_clock_uncertainty 0.5` on an empty table →
+  `no design clock declared yet` — pins the ordering edge (a no-target
+  clock command needs a port-bearing row at apply time; previously it
+  wrote the scalar fields unconditionally).
+
 ## 5. Eval gate (analysis.rs tests)
 
 ```rust

@@ -51,8 +51,10 @@ single-domain and refuses a multi-clock SDC loudly.
 - The single-clock-SDC-on-multi-clock-DEF silent fold (a register on a
   net the declared clock never reaches still gets the domain-0 seed).
   Detecting it needs domain tags — `mc-eval` owns it. This ticket only
-  gates the SDC side (declared second domain). Record as remaining in
-  `docs/multi-clock.md` §2.
+  gates the SDC side (declared second domain). It must stay recorded as
+  a remaining hazard under `docs/multi-clock.md` §2's still-unsupported
+  list — one explicit line (wording in steps.md §8). The pre-`mc-model`
+  §2 carried this bullet; do not drop it when rewriting the section.
 
 ## Golden-identity invariants
 
@@ -97,11 +99,13 @@ in `docs/results.md`):
 - `all_clock_names()` order changes to file order (was: virtuals then
   design). All consumers are order-agnostic (per-name writes,
   `remove_from_collection` by name). Note it in the commit message.
-- A `set_clock_*` command with no clock target executes before the
-  `create_clock` it names — today it writes the scalar fields
-  unconditionally. With the table there may be no row yet: apply to the
-  first port-bearing row *at apply time*; if none exists yet, bail
-  (ordering-dependent SDCs that `finish()` would reject anyway).
+- A `set_clock_latency`/`set_clock_uncertainty` with no clock target can
+  run before the `create_clock` it means — today it writes the scalar
+  fields unconditionally. With the table there may be no row yet: apply
+  to the first port-bearing row *at apply time*; if none exists yet,
+  bail `no design clock declared yet` (ordering-dependent SDCs that
+  `finish()` would reject anyway). Record the new ordering constraint
+  in `docs/results.md` and pin it with a test (tests.md §4).
 
 ## Files
 

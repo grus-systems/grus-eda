@@ -142,8 +142,10 @@ struct ClockId(usize);
 
 - `-source` handling unchanged; `-early`/`-late`/other dash-flags still
   `bail!("unsupported option …")`.
-- Targets: `[value]` → first port-bearing row (bail if none declared
-  yet — ordering edge case, see overview risks); `[value, Clocks(ns)]`
+- Targets: `[value]` → first port-bearing row via a shared
+  `Interp::design_clock_id() -> Result<ClockId>` helper (first
+  port-bearing row, else `bail!("no design clock declared yet")` —
+  ordering edge case, see overview risks); `[value, Clocks(ns)]`
   → apply to **every** resolved row (multi-name now accepted);
   `[value, Str(name)]` → single resolved row (bare write_sdc form).
 - Write `row.latency_ns` or `row.source_latency_ns` per `-source`.
@@ -164,8 +166,8 @@ struct ClockId(usize);
   wrong-target fix: `[get_clocks vclk]` writes the vclk row, never the
   design row.
 - No clock target (`set_clock_uncertainty 0.25`) writes the design
-  clock — the first port-bearing row at apply time, same rule as
-  `set_clock_latency` (bail if none declared yet).
+  clock — `design_clock_id()`, same rule and same
+  `no design clock declared yet` bail as `set_clock_latency`.
 
 ### `set_clock_transition` (sdc.rs:1034-1055)
 

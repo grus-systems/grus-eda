@@ -76,6 +76,10 @@ sdc` after steps 2–4, `cargo test --workspace` + clippy at the end.
   row-targeting regression.
 - Update `multi_clock_bails` (drop the now-accepted multi-name latency
   row; keep the still-bailing rows) and add the accepted-surface tests.
+- Pin the ordering bail: `set_clock_latency`/`set_clock_uncertainty`
+  with no target before any `create_clock` → `no design clock declared
+  yet` (standalone test — the `multi_clock_bails` fixtures always
+  declare a clock first).
 - New analysis test: `run_sta` on `two_clock.def` + `t2_int.sdc`
   errors.
 
@@ -95,13 +99,28 @@ sdc` after steps 2–4, `cargo test --workspace` + clippy at the end.
 
 ## 8. Docs + version
 
-- `Cargo.toml` `[workspace.package] version`: `0.1.98` → `0.1.99`
-  (feature patch bump; `Cargo.lock` regenerates).
+- `Cargo.toml` `[workspace.package] version`: `0.1.98` → `0.2.0`
+  (minor, not patch — the public `Sdc` clock fields are replaced by the
+  table + accessors, a breaking API change; 0.x breaking → minor per
+  the workspace versioning rule). `Cargo.lock` regenerates.
 - `docs/multi-clock.md`: status line → mc-model landed; §3 item 1 ticked
   done; §2 break-matrix rows updated (2nd `create_clock` accepted,
   multi-name latency accepted, virtual uncertainty lands on its row,
-  virtual periods free-form, transition on virtual row stored; the
-  single-clock-SDC-on-multi-clock-DEF fold remains → mc-eval).
+  virtual periods free-form, transition on virtual row stored).
+  Under §2's still-unsupported list, keep the eval-gate bullet **and**
+  carry over the remaining silent-mis-timing hazard the old §2 had —
+  the rewrite must not drop it. One line, e.g.:
+
+  > A single-clock SDC on a multi-clock DEF still silently folds the
+  > undeclared domain's pins onto domain 0's lattice (no warning);
+  > detection needs domain tags — `mc-eval` owns it.
+
+  It is a silent hazard, not a loud parse error — word the list
+  lead-in accordingly (e.g. "Still unsupported / remaining hazard").
 - `docs/results.md`: new dated entry — commands run (CLI bail
   verbatim), the accepted/still-bailing parse surface, golden-identity
-  statement, version bump. Follow the existing entry shape.
+  statement, version bump. Include the ordering note: a
+  `set_clock_latency`/`set_clock_uncertainty` with no clock target
+  issued before the first `create_clock` now bails `no design clock
+  declared yet` (was: silently wrote the single-clock fields). Follow
+  the existing entry shape.
