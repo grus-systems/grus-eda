@@ -3166,4 +3166,15 @@ mod tests {
         .unwrap();
         assert_eq!(sdc.output_clock_latency_ns("yb"), 0.2);
     }
+
+    /// A `set_clock_*` without a clock target writes the first port-bearing row at apply
+    /// time; issued before the first `create_clock` there is no such row (the single-clock
+    /// fields used to absorb the write unconditionally).
+    #[test]
+    fn clock_commands_before_create_clock_bail() {
+        for snippet in ["set_clock_latency 0.5", "set_clock_uncertainty 0.5"] {
+            let err = format!("{:#}", parse_sdc(&format!("{snippet}\n")).unwrap_err());
+            assert!(err.contains("no design clock declared yet"), "{snippet}: {err}");
+        }
+    }
 }

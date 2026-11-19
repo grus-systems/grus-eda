@@ -3454,15 +3454,16 @@ commands resolve `[get_clocks {...}]` against the table row-wise.
 | `set_clock_groups` | parse bail: ``unsupported command `set_clock_groups` `` |
 | unknown `-clock` name / `set_propagated_clock` on a virtual clock / `create_clock -period 0` | parse bail (`multi_clock_bails` pins each message) |
 | `sta` on a >1-design-clock SDC | eval bail before graph prep (message above) — no silent fold |
+| no-target `set_clock_latency`/`set_clock_uncertainty` before the first `create_clock` | parse bail: `no design clock declared yet` (was: silently wrote the single-clock fields; `clock_commands_before_create_clock_bail`) |
 
 New parse/model tests in `sdc.rs::tests`: `second_design_clock_appends_a_row`,
 `virtual_clock_keeps_its_own_period`, `uncertainty_lands_on_the_named_row`,
 `multi_name_clock_lists_apply_to_every_row`,
 `clock_commands_target_second_domain_rows`, `propagated_clock_is_per_domain`,
-`delay_clock_references_a_domain_row`; `multi_clock_bails` updated to pin
-only the still-unsupported forms.
+`delay_clock_references_a_domain_row`, `clock_commands_before_create_clock_bail`;
+`multi_clock_bails` updated to pin only the still-unsupported forms.
 
-**Checks run**: `cargo test --workspace` (298+3 pass, 2 ignored — includes
+**Checks run**: `cargo test --workspace` (299+3 pass, 2 ignored — includes
 all existing goldens, unchanged inputs and expected outputs),
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 `git status` shows no modifications under `tests/` or `kurena/`.

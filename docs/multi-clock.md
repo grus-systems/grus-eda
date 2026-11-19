@@ -137,12 +137,12 @@ Now accepted (the probe's parse breaks are fixed):
 - `set_input_delay`/`set_output_delay -clock <name>` and delay exceptions
   resolve any row, not just the design clock.
 
-Still unsupported — all loud parse errors:
+Still unsupported / remaining hazard:
 
 - `set_clock_latency -early`/`-late`, `set_clock_uncertainty -from ... -to
   ...`, `create_clock -waveform`, `set_clock_groups`, unknown `-clock`
   names, `set_propagated_clock` on a virtual clock, `create_clock` with
-  `period 0`.
+  `period 0` — all loud parse errors.
 - Eval: `sta` on an SDC with more than one design clock bails before
   graph preparation — `sta: 2 design clocks declared (cka, ckb);
   multi-clock analysis is not implemented yet` — instead of folding the
@@ -150,6 +150,9 @@ Still unsupported — all loud parse errors:
   `analysis.rs::tests::sta_bails_on_a_two_clock_sdc` and a scratch run with
   the gate disabled (all 8 endpoints reported against `cka`, domains
   folded).
+- A single-clock SDC on a multi-clock DEF still silently folds the
+  undeclared domain's pins onto domain 0's lattice (no warning);
+  detection needs domain tags — `mc-eval` owns it.
 
 ## 3. Ticket sequence
 
