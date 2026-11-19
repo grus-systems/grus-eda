@@ -1,10 +1,13 @@
 # Multi-clock SDC support — measured rules and ticket sequence
 
-Status: probe complete (2026-11-19), implementation not started. The current
-model is single-clock: `Sdc` keeps one `clock_name`/`clock_port`/`period_ns`
-and one pair of uncertainty/latency/transition fields; a second
-`create_clock` on a port bails at parse (`sdc.rs`: "a second design clock is
-not supported"). This document is the target spec for closing that gap.
+Status: probe complete (2026-11-19), `mc-model` landed (2026-11-20).
+`Sdc` now keeps a clock table — one row per `create_clock`, in file order,
+holding name/optional port/period/network+source latencies/setup+hold
+uncertainties/transition/propagated — and every clock-targeting command
+resolves its names against the table. Eval is still single-domain: `sta`
+bails on more than one design clock (`analysis.rs`: "sta: N design clocks
+declared ...; multi-clock analysis is not implemented yet"). This document
+remains the target spec for the remaining tickets.
 
 Evidence: `tests/designs/sta_clocks/` — `two_clock.def` (clock domains `cka`
 2.0 ns on `clk1`, `ckb` 1.4/1.0 ns on `clk2`, same-domain and both-direction
@@ -117,28 +120,36 @@ Output-port form (`t2_mdo`, `set_max_delay 0.8 -to yb`):
   ckb edge 1.0 to **2.0** (req 0.885446→1.885446); `-hold 1` moves it back
   one ckb period (min req −0.037585→−1.037585).
 
-## 2. Where grus-eda stands (parse-level break matrix)
+## 2. Where grus-eda stands (after `mc-model`, 2026-11-20)
 
-Probe: `cargo test -p grus-core multi_clock_bails` pins these verbatim;
-full table with commands in `docs/results.md`.
+`cargo test -p grus-core multi_clock_bails` pins the remaining bail
+messages verbatim; full table with commands in `docs/results.md`.
 
-- Second `create_clock` on a port → `a second design clock is not supported`.
-- Multi-clock `set_clock_latency`, `-early`/`-late`, `-from`/`-to`
-  uncertainty, `create_clock -waveform`, `set_clock_groups`, unknown
-  `-clock` names → all hard parse errors (loud, good).
-- `set_clock_uncertainty <v> [get_clocks <virtual>]` **silently writes the
-  design-clock fields** regardless of the named clock (`sdc.rs` writes
-  `setup_uncertainty_ns`/`hold_uncertainty_ns` unconditionally).
-- `set_clock_transition` on `{design virtual}` applies the design part and
-  counts the virtual part as ignored.
-- Virtual `create_clock` period must equal the design period.
-- Silent mis-timing: a single-clock SDC on a two-clock DEF parses and
-  completes — the unseeded domain's pins fold onto the one clock lattice
-  (`base_state` merge at `ideal_latency`, `analysis.rs`) and every endpoint
-  is reported against the wrong clock. No warning.
-- Scratch check (guard removed, never committed): the second
-  `create_clock` overwrites `clock_port`/`clock_name`/`period_ns` — the
-  whole design then times against the last clock.
+Now accepted (the probe's parse breaks are fixed):
+
+- N `create_clock`s on ports and any number of virtual clocks append rows
+  to `Sdc::clocks`; a virtual period no longer has to equal the design
+  period.
+- `set_clock_uncertainty`/`-latency` (`-source` included)/`-transition`/
+  `set_propagated_clock` resolve `[get_clocks {a b ...}]` row-wise —
+  multi-name lists apply to every selected row; uncertainty on a virtual
+  clock lands on its own row (the probe's silent wrong-target bug).
+- `set_input_delay`/`set_output_delay -clock <name>` and delay exceptions
+  resolve any row, not just the design clock.
+
+Still unsupported — all loud parse errors:
+
+- `set_clock_latency -early`/`-late`, `set_clock_uncertainty -from ... -to
+  ...`, `create_clock -waveform`, `set_clock_groups`, unknown `-clock`
+  names, `set_propagated_clock` on a virtual clock, `create_clock` with
+  `period 0`.
+- Eval: `sta` on an SDC with more than one design clock bails before
+  graph preparation — `sta: 2 design clocks declared (cka, ckb);
+  multi-clock analysis is not implemented yet` — instead of folding the
+  unseeded domain onto the first clock's lattice. Verified by
+  `analysis.rs::tests::sta_bails_on_a_two_clock_sdc` and a scratch run with
+  the gate disabled (all 8 endpoints reported against `cka`, domains
+  folded).
 
 ## 3. Ticket sequence
 
@@ -146,14 +157,15 @@ The gap is structural (one slot for every clock attribute + one lattice),
 not a patch — implementation goes in five gated tickets, each its own
 kurena spec:
 
-1. **`mc-model`** — `Sdc` keeps a clock table: per-domain
+1. **`mc-model`** — **done 2026-11-20** (`docs/results.md` entry of the
+   same date). `Sdc` keeps a clock table: per-domain
    name/port/period/latencies (network+source)/uncertainties/transition/
-   propagated flag; `ClockRef` becomes a domain index; `create_clock`
-   accepts N design clocks and virtual clocks join the table.
-   `set_clock_uncertainty`/`-latency`/`-transition` target table rows;
-   multi-name lists allowed. Eval still single-domain: unseeded domains
-   fail loudly, never silently fold. Parse + model tests; existing goldens
-   must be bit-identical.
+   propagated flag; clock references are table indices (`ClockId`);
+   `create_clock` accepts N design clocks and virtual clocks join the
+   table. `set_clock_uncertainty`/`-latency`/`-transition` target table
+   rows; multi-name lists allowed. Eval still single-domain: `sta` bails
+   on >1 design clock, never silently folds. Parse + model tests in
+   `sdc.rs::tests`; existing goldens bit-identical.
 2. **`mc-eval`** — domain tagging: per-port clock-net seeding (propagated
    and `ideal_clock_parity`), domain tags on launch seeds and clock pins,
    non-first clock ports excluded from data seeding; same-domain pairing

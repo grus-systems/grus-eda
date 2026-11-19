@@ -17,16 +17,16 @@ pub enum PortSel {
 }
 
 impl PortSel {
-    /// `clock_port` is needed because `-no_clocks` excludes the clock source, which the selector cannot see.
-    pub fn matches(&self, port: &str, is_input: bool, clock_port: Option<&str>) -> bool {
+    /// `sdc` is needed because `-no_clocks` excludes every clock source, which the selector cannot see.
+    pub fn matches(&self, port: &str, is_input: bool, sdc: &Sdc) -> bool {
         match self {
             PortSel::AllInputs { no_clocks } => {
-                is_input && !(*no_clocks && clock_port == Some(port))
+                is_input && !(*no_clocks && sdc.is_clock_port(port))
             }
             PortSel::AllOutputs => !is_input,
             PortSel::Ports(names) => names.iter().any(|n| n == port),
             PortSel::Except { base, excluded } => {
-                base.matches(port, is_input, clock_port) && !excluded.iter().any(|n| n == port)
+                base.matches(port, is_input, sdc) && !excluded.iter().any(|n| n == port)
             }
         }
     }
@@ -154,12 +154,9 @@ pub struct TimingException {
     pub hold_n: Option<i32>,
 }
 
-/// Which clock a delay is referenced to: the design clock, or the virtual I/O clock.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ClockRef {
-    Design,
-    Virtual,
-}
+/// Index into `Sdc::clocks`. Private: `DelayRule` is private.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClockId(usize);
 
 /// Which analysis corner a delay applies to. `Both` is a plain `set_input_delay`; `Min`/`Max`
 /// come from the `-min`/`-max` flags and feed the early/late checks respectively.
@@ -174,7 +171,8 @@ enum DelaySense {
 struct DelayRule {
     sel: PortSel,
     value_ns: f32,
-    clock: ClockRef,
+    /// `-clock` target; `None` is the design clock (the first port-bearing row).
+    clock: Option<ClockId>,
     sense: DelaySense,
     /// `-add_delay`: accumulate onto the port's current delay instead of replacing it.
     add: bool,
@@ -235,30 +233,38 @@ pub struct LoadRule {
     pub value_pf: f32,
 }
 
+/// One `create_clock` row: a design clock when `port` names a source port, a virtual
+/// I/O clock when `port` is `None`.
+#[derive(Clone, Debug, Default)]
+pub struct Clock {
+    /// `-name`, or the source port name when `-name` is absent — the handle
+    /// `get_clocks`/`all_clocks` resolve.
+    pub name: String,
+    /// Source port of a design clock; `None` for a virtual clock.
+    pub port: Option<String>,
+    pub period_ns: f32,
+    /// `set_clock_latency` — ideal network latency; a propagated clock ignores it.
+    pub latency_ns: f32,
+    /// `set_clock_latency -source`; sums with the network latency for a non-propagated
+    /// clock, is the only latency applied when propagated.
+    pub source_latency_ns: f32,
+    /// `set_clock_uncertainty -setup`: subtracted from required times.
+    pub setup_uncertainty_ns: f32,
+    /// `set_clock_uncertainty -hold`: added to required times.
+    pub hold_uncertainty_ns: f32,
+    /// `set_clock_transition`: slew seeded on clock pins; 0 without the command.
+    pub transition_ns: f32,
+    /// `set_propagated_clock` on this domain.
+    pub propagated: bool,
+}
+
 /// The SDC subset the benchmark flow uses. Commands are applied in file order, so a later
 /// command overrides an earlier one on the same port.
 #[derive(Clone, Debug, Default)]
 pub struct Sdc {
-    pub clock_name: Option<String>,
-    pub clock_port: Option<String>,
-    pub period_ns: f32,
-    /// Setup-side clock uncertainty: subtracted from required times.
-    pub setup_uncertainty_ns: f32,
-    /// Hold-side clock uncertainty: added to required times.
-    pub hold_uncertainty_ns: f32,
-    pub clock_latency_ns: f32,
-    pub io_clock_latency_ns: f32,
-    /// `set_propagated_clock` on the design clock: clock arrival is propagated through the
-    /// clock network instead of every clock pin seeing the ideal clock latency.
-    pub propagated_clock: bool,
-    /// `set_clock_latency -source` on the design clock: added on top of the propagated
-    /// arrival, and summed with the network latency when the clock is not propagated.
-    pub clock_source_latency_ns: f32,
-    /// `set_clock_latency -source` on the virtual I/O clock; a virtual clock is never
-    /// propagated, so it always sums with `io_clock_latency_ns`.
-    pub io_clock_source_latency_ns: f32,
-    /// Slew seeded on clock pins (`set_clock_transition`); zero without the command.
-    pub clock_transition_ns: f32,
+    /// One row per `create_clock`, in file order. Eval is single-domain: the first
+    /// port-bearing row is the design clock.
+    pub clocks: Vec<Clock>,
     /// Early/late derating of propagated delays (`set_timing_derate`), per delay kind,
     /// clock/data path and transition. Unset entries stay at 1.0 (no derate).
     pub derate_early: DerateCorner,
@@ -281,8 +287,8 @@ pub struct Sdc {
     /// endpoint matching, so the restriction is dropped and the delay applies to every
     /// selected port.
     pub ignored_options: BTreeMap<String, usize>,
-    /// Commands accepted but not applied to the timing model (`set_max_*`, a
-    /// `set_clock_transition` on a virtual clock), by command name.
+    /// Commands accepted but not applied to the timing model (`set_max_*`,
+    /// `set_fanout_load`, unresolvable exception/delay forms), by command name.
     pub ignored_commands: BTreeMap<String, usize>,
     /// Top-level commands evaluated while parsing; the denominator for `ignored_options`.
     pub commands: usize,
@@ -298,14 +304,11 @@ fn delay_at(
     rules: &[DelayRule],
     port: &str,
     is_input: bool,
-    clock_port: Option<&str>,
-) -> Option<(f32, f32, ClockRef)> {
+    sdc: &Sdc,
+) -> Option<(f32, f32, Option<ClockId>)> {
     let (mut min_v, mut max_v, mut min_set, mut max_set, mut clock, mut matched) =
-        (0.0, 0.0, false, false, ClockRef::Design, false);
-    for r in rules
-        .iter()
-        .filter(|r| r.sel.matches(port, is_input, clock_port))
-    {
+        (0.0, 0.0, false, false, None, false);
+    for r in rules.iter().filter(|r| r.sel.matches(port, is_input, sdc)) {
         matched = true;
         clock = r.clock;
         let apply = |cur: &mut f32, set: &mut bool, widen: fn(f32, f32) -> f32| {
@@ -328,36 +331,109 @@ fn delay_at(
     matched.then_some((min_v, max_v, clock))
 }
 
-fn last_value(
-    rules: &[(PortSel, f32)],
-    port: &str,
-    is_input: bool,
-    clock_port: Option<&str>,
-) -> Option<f32> {
+fn last_value(rules: &[(PortSel, f32)], port: &str, is_input: bool, sdc: &Sdc) -> Option<f32> {
     rules
         .iter()
         .rev()
-        .find(|(sel, _)| sel.matches(port, is_input, clock_port))
+        .find(|(sel, _)| sel.matches(port, is_input, sdc))
         .map(|&(_, v)| v)
 }
 
 impl Sdc {
-    fn latency_ns(&self, clock: ClockRef) -> f32 {
-        match clock {
-            // A propagated clock ignores the ideal network latency; `-source` latency is
-            // what remains, and it is what I/O delays are referenced against. OpenSTA sums
-            // source and network latency when the clock is not propagated (measured:
-            // `set_clock_latency 1.0` + `-source 0.2` reports 1.20 ns ideal delay).
-            ClockRef::Design if self.propagated_clock => self.clock_source_latency_ns,
-            ClockRef::Design => self.clock_source_latency_ns + self.clock_latency_ns,
-            ClockRef::Virtual => self.io_clock_latency_ns + self.io_clock_source_latency_ns,
+    /// First port-bearing row — the domain eval times against. `None` on an empty or
+    /// virtual-only table (pre-`finish` state).
+    pub fn design_clock(&self) -> Option<&Clock> {
+        self.clocks.iter().find(|c| c.port.is_some())
+    }
+
+    /// Number of design (port-bearing) clock rows. The eval gate.
+    pub fn design_clock_count(&self) -> usize {
+        self.clocks.iter().filter(|c| c.port.is_some()).count()
+    }
+
+    /// A row by handle (`name`), or by source port. Used by tests and later tickets;
+    /// parse-side code uses `resolve_clock`, which matches names only.
+    pub fn clock(&self, name: &str) -> Option<&Clock> {
+        self.clocks
+            .iter()
+            .find(|c| c.name == name || c.port.as_deref() == Some(name))
+    }
+
+    /// `port` is a source port of any design clock — the `-no_clocks` predicate and the
+    /// data-seeding exclusion.
+    pub fn is_clock_port(&self, port: &str) -> bool {
+        self.clocks.iter().any(|c| c.port.as_deref() == Some(port))
+    }
+
+    /// The design clock's handle (`-name`, or the source port name).
+    pub fn clock_name(&self) -> Option<&str> {
+        self.design_clock().map(|c| c.name.as_str())
+    }
+
+    /// The design clock's source port.
+    pub fn clock_port(&self) -> Option<&str> {
+        self.design_clock().and_then(|c| c.port.as_deref())
+    }
+
+    /// The design clock's period; 0.0 when no design row exists.
+    pub fn period_ns(&self) -> f32 {
+        self.design_clock().map_or(0.0, |c| c.period_ns)
+    }
+
+    /// The design clock's `set_clock_uncertainty -setup` value.
+    pub fn setup_uncertainty_ns(&self) -> f32 {
+        self.design_clock().map_or(0.0, |c| c.setup_uncertainty_ns)
+    }
+
+    /// The design clock's `set_clock_uncertainty -hold` value.
+    pub fn hold_uncertainty_ns(&self) -> f32 {
+        self.design_clock().map_or(0.0, |c| c.hold_uncertainty_ns)
+    }
+
+    /// The design clock's `set_clock_latency` (network) value.
+    pub fn clock_latency_ns(&self) -> f32 {
+        self.design_clock().map_or(0.0, |c| c.latency_ns)
+    }
+
+    /// The design clock's `set_clock_latency -source` value.
+    pub fn clock_source_latency_ns(&self) -> f32 {
+        self.design_clock().map_or(0.0, |c| c.source_latency_ns)
+    }
+
+    /// `set_propagated_clock` on the design clock: clock arrival is propagated through
+    /// the clock network instead of every clock pin seeing the ideal clock latency.
+    pub fn propagated_clock(&self) -> bool {
+        self.design_clock().is_some_and(|c| c.propagated)
+    }
+
+    /// The design clock's `set_clock_transition` slew; zero without the command.
+    pub fn clock_transition_ns(&self) -> f32 {
+        self.design_clock().map_or(0.0, |c| c.transition_ns)
+    }
+
+    /// Effective latency an I/O delay is referenced to: `source_latency` when the row is
+    /// propagated, else `latency + source_latency`. `None` resolves to the design clock.
+    /// OpenSTA sums source and network latency when the clock is not propagated
+    /// (measured: `set_clock_latency 1.0` + `-source 0.2` reports 1.20 ns ideal delay).
+    fn latency_ns(&self, clock: Option<ClockId>) -> f32 {
+        let Some(c) = clock.map_or_else(|| self.design_clock(), |id| self.clocks.get(id.0))
+        else {
+            return 0.0;
+        };
+        // A propagated clock ignores the ideal network latency; `-source` latency is
+        // what remains, and it is what I/O delays are referenced against.
+        if c.propagated {
+            c.source_latency_ns
+        } else {
+            c.latency_ns + c.source_latency_ns
         }
     }
 
     /// Latency every clock pin sees in ideal-clock mode: `-source` and network latencies
     /// sum (OpenSTA reports 1.20 ns for `set_clock_latency 1.0` + `-source 0.2`).
     pub fn design_clock_latency_ns(&self) -> f32 {
-        self.clock_source_latency_ns + self.clock_latency_ns
+        self.design_clock()
+            .map_or(0.0, |c| c.latency_ns + c.source_latency_ns)
     }
 
     /// Derate factor for one propagated delay. `late` selects the max-analysis corner,
@@ -374,36 +450,30 @@ impl Sdc {
 
     /// `(min, max)` input delay in ns; both equal the plain value when no `-min`/`-max` was given.
     pub fn input_delay_ns(&self, port: &str) -> (f32, f32) {
-        delay_at(&self.input_delays, port, true, self.clock_port.as_deref())
+        delay_at(&self.input_delays, port, true, self)
             .map_or((0.0, 0.0), |(min_v, max_v, _)| (min_v, max_v))
     }
 
     /// Latency of the clock that the port's input delay is referenced to.
     pub fn input_clock_latency_ns(&self, port: &str) -> f32 {
-        delay_at(&self.input_delays, port, true, self.clock_port.as_deref())
+        delay_at(&self.input_delays, port, true, self)
             .map_or(0.0, |(_, _, clock)| self.latency_ns(clock))
     }
 
     /// `(min, max)` output delay in ns.
     pub fn output_delay_ns(&self, port: &str) -> (f32, f32) {
-        delay_at(&self.output_delays, port, false, self.clock_port.as_deref())
+        delay_at(&self.output_delays, port, false, self)
             .map_or((0.0, 0.0), |(min_v, max_v, _)| (min_v, max_v))
     }
 
     /// Latency of the clock that the port's output delay is referenced to.
     pub fn output_clock_latency_ns(&self, port: &str) -> f32 {
-        delay_at(&self.output_delays, port, false, self.clock_port.as_deref())
+        delay_at(&self.output_delays, port, false, self)
             .map_or(0.0, |(_, _, clock)| self.latency_ns(clock))
     }
 
     pub fn input_transition_ns(&self, port: &str) -> f32 {
-        last_value(
-            &self.input_transitions,
-            port,
-            true,
-            self.clock_port.as_deref(),
-        )
-        .unwrap_or(0.0)
+        last_value(&self.input_transitions, port, true, self).unwrap_or(0.0)
     }
 
     pub fn output_load_pf(&self, port: &str) -> f32 {
@@ -411,9 +481,7 @@ impl Sdc {
             .iter()
             .rev()
             .find(|r| match &r.sel {
-                LoadSel::Ports(sel) => {
-                    sel.matches(port, false, self.clock_port.as_deref())
-                }
+                LoadSel::Ports(sel) => sel.matches(port, false, self),
                 LoadSel::Nets(_) => false,
             })
             .map(|r| r.value_pf)
@@ -434,7 +502,7 @@ impl Sdc {
         self.driving_cells
             .iter()
             .rev()
-            .find(|(sel, _)| sel.matches(port, is_input, self.clock_port.as_deref()))
+            .find(|(sel, _)| sel.matches(port, is_input, self))
             .map(|(_, d)| d)
     }
 }
@@ -480,7 +548,6 @@ struct Interp {
     pos: usize,
     vars: HashMap<String, Value>,
     sdc: Sdc,
-    virtual_clocks: Vec<(String, f32)>,
 }
 
 impl Interp {
@@ -490,7 +557,6 @@ impl Interp {
             pos: 0,
             vars: HashMap::new(),
             sdc: Sdc::default(),
-            virtual_clocks: Vec::new(),
         }
     }
 
@@ -836,8 +902,9 @@ impl Interp {
         Ok(value.clone())
     }
 
-    /// `create_clock -name N -period P [source]`. A clock with a source port is the design clock;
-    /// one without is the virtual I/O clock that the ibex SDC references its I/O delays to.
+    /// `create_clock -name N -period P [source]`. A clock with a source port is a design
+    /// clock; one without is a virtual I/O clock that I/O delays can be referenced to.
+    /// Every clock — design or virtual — appends a row to `Sdc::clocks`.
     fn create_clock(&mut self, args: &[Value]) -> Result<()> {
         let name = flag_value(args, "-name")?.map(str::to_string);
         let period_ns = parse_f32(flag_value(args, "-period")?.context("missing -period")?)?;
@@ -854,19 +921,23 @@ impl Interp {
                 let Some(name) = name else {
                     bail!("a virtual clock needs -name");
                 };
-                self.virtual_clocks.push((name, period_ns));
+                self.sdc.clocks.push(Clock {
+                    name,
+                    port: None,
+                    period_ns,
+                    ..Clock::default()
+                });
             }
             [Value::Ports(PortSel::Ports(ports))] => {
                 let [port] = ports.as_slice() else {
                     bail!("create_clock takes one source port");
                 };
-                // A second design clock would overwrite the first one's port, name and period.
-                if self.sdc.clock_port.is_some() {
-                    bail!("a second design clock is not supported");
-                }
-                self.sdc.clock_name = name;
-                self.sdc.clock_port = Some(port.clone());
-                self.sdc.period_ns = period_ns;
+                self.sdc.clocks.push(Clock {
+                    name: name.unwrap_or_else(|| port.clone()),
+                    port: Some(port.clone()),
+                    period_ns,
+                    ..Clock::default()
+                });
             }
             _ => bail!("unsupported create_clock argument"),
         }
@@ -899,29 +970,30 @@ impl Interp {
         if setup && hold {
             bail!("set_clock_uncertainty takes at most one of -setup/-hold");
         }
-        let value_ns = match rest.as_slice() {
-            [Value::Str(value)] => parse_f32(value)?,
+        let (value, targets) = match rest.as_slice() {
+            [Value::Str(value)] => (value, vec![self.design_clock_id()?]),
             [Value::Str(value), Value::Clocks(names)] => {
+                let mut ids = Vec::with_capacity(names.len());
                 for name in names {
-                    self.resolve_clock(name)?;
+                    ids.push(self.resolve_clock(name)?);
                 }
-                parse_f32(value)?
+                (value, ids)
             }
             // `set_clock_uncertainty 0.25 clk`: write_sdc emits the clock as a bare name.
             [Value::Str(value), Value::Str(name)] => {
-                self.resolve_clock(name)?;
-                parse_f32(value)?
+                (value, vec![self.resolve_clock(name)?])
             }
             _ => bail!("set_clock_uncertainty takes a value and optional clock names"),
         };
-        match (setup, hold) {
-            (false, false) => {
-                self.sdc.setup_uncertainty_ns = value_ns;
-                self.sdc.hold_uncertainty_ns = value_ns;
+        let value_ns = parse_f32(value)?;
+        for id in targets {
+            let row = &mut self.sdc.clocks[id.0];
+            if !hold {
+                row.setup_uncertainty_ns = value_ns;
             }
-            (true, false) => self.sdc.setup_uncertainty_ns = value_ns,
-            (false, true) => self.sdc.hold_uncertainty_ns = value_ns,
-            (true, true) => unreachable!(),
+            if !setup {
+                row.hold_uncertainty_ns = value_ns;
+            }
         }
         Ok(())
     }
@@ -947,45 +1019,37 @@ impl Interp {
                 value => rest.push(value),
             }
         }
-        let (value, clock) = match rest.as_slice() {
-            [Value::Str(value)] => (value, None),
-            [Value::Str(value), Value::Clocks(names)] => match names.as_slice() {
-                [name] => (value, Some(name.as_str())),
-                _ => bail!("set_clock_latency takes one clock"),
-            },
+        let (value, targets) = match rest.as_slice() {
+            [Value::Str(value)] => (value, vec![self.design_clock_id()?]),
+            [Value::Str(value), Value::Clocks(names)] => {
+                let mut ids = Vec::with_capacity(names.len());
+                for name in names {
+                    ids.push(self.resolve_clock(name)?);
+                }
+                (value, ids)
+            }
             // `set_clock_latency 0.5 clk`: write_sdc emits the clock as a bare name.
-            [Value::Str(value), Value::Str(name)] => (value, Some(name.as_str())),
+            [Value::Str(value), Value::Str(name)] => {
+                (value, vec![self.resolve_clock(name)?])
+            }
             _ => bail!("set_clock_latency takes a value and optional clock names"),
         };
         let latency = parse_f32(value)?;
-        let clock = clock
-            .map(|n| self.resolve_clock(n))
-            .transpose()?
-            .unwrap_or(ClockRef::Design);
-        match clock {
-            ClockRef::Design => {
-                if source {
-                    self.sdc.clock_source_latency_ns = latency;
-                } else {
-                    self.sdc.clock_latency_ns = latency;
-                }
-            }
-            // A virtual clock is never propagated, so source and network latency sum for
-            // the I/O checks that read `io_clock_latency_ns`.
-            ClockRef::Virtual => {
-                if source {
-                    self.sdc.io_clock_source_latency_ns = latency;
-                } else {
-                    self.sdc.io_clock_latency_ns = latency;
-                }
+        for id in targets {
+            let row = &mut self.sdc.clocks[id.0];
+            if source {
+                row.source_latency_ns = latency;
+            } else {
+                row.latency_ns = latency;
             }
         }
         Ok(())
     }
 
-    /// `set_propagated_clock|unset_propagated_clock <clock objects>`. Only the design clock
-    /// is modelled; unsetting a clock that was never propagated is a no-op. The virtual I/O
-    /// clock cannot be propagated: naming it in `set` is an error.
+    /// `set_propagated_clock|unset_propagated_clock <clock objects>`. The flag is set on
+    /// every named design-clock row; unsetting a clock that was never propagated is a
+    /// no-op. A virtual clock cannot be propagated: naming it in `set` is an error, in
+    /// `unset` it is skipped.
     fn propagated_clock(&mut self, command: &str, args: &[Value]) -> Result<()> {
         let mut names = Vec::new();
         for arg in args {
@@ -1002,35 +1066,33 @@ impl Interp {
         if names.is_empty() {
             bail!("{command} takes clock objects");
         }
-        let mut design = false;
         for clock in &names {
-            match self.resolve_clock(clock) {
-                Ok(ClockRef::Design) => design = true,
-                Ok(ClockRef::Virtual) if command == "set_propagated_clock" => {
+            // `get_ports {clk}` names the clock's source port; the clock handle is `-name`.
+            let id = match self.resolve_clock(clock) {
+                Ok(id) => id,
+                Err(e) => match self
+                    .sdc
+                    .clocks
+                    .iter()
+                    .position(|c| c.port.as_deref() == Some(clock.as_str()))
+                {
+                    Some(i) => ClockId(i),
+                    None => return Err(e),
+                },
+            };
+            if self.sdc.clocks[id.0].port.is_none() {
+                if command == "set_propagated_clock" {
                     bail!("set_propagated_clock does not apply to the virtual clock `{clock}`")
                 }
-                Ok(ClockRef::Virtual) => {}
-                Err(e) => {
-                    // `get_ports {clk}` names the clock's source port; the clock handle is `-name`.
-                    if self.sdc.clock_port.as_deref() == Some(clock.as_str()) {
-                        design = true;
-                    } else {
-                        return Err(e);
-                    }
-                }
+                continue;
             }
-        }
-        if command == "set_propagated_clock" && !design {
-            bail!("set_propagated_clock needs the design clock");
-        }
-        if design {
-            self.sdc.propagated_clock = command == "set_propagated_clock";
+            self.sdc.clocks[id.0].propagated = command == "set_propagated_clock";
         }
         Ok(())
     }
 
-    /// `set_clock_transition <ns> [get_clocks <name>...]`. Only the design clock's slew is
-    /// modelled; a virtual clock's transition is counted as ignored.
+    /// `set_clock_transition <ns> [get_clocks <name>...]`. The slew lands on every named
+    /// clock's row, virtual rows included.
     fn set_clock_transition(&mut self, args: &[Value]) -> Result<()> {
         let (value, names) = match args {
             [Value::Str(v)] => (v, None),
@@ -1040,16 +1102,8 @@ impl Interp {
         };
         let transition = parse_f32(value)?;
         for name in names.unwrap_or_else(|| self.all_clock_names()) {
-            match self.resolve_clock(&name)? {
-                ClockRef::Design => self.sdc.clock_transition_ns = transition,
-                ClockRef::Virtual => {
-                    *self
-                        .sdc
-                        .ignored_options
-                        .entry("set_clock_transition (virtual clock)".to_string())
-                        .or_default() += 1;
-                }
-            }
+            let id = self.resolve_clock(&name)?;
+            self.sdc.clocks[id.0].transition_ns = transition;
         }
         Ok(())
     }
@@ -1240,15 +1294,9 @@ impl Interp {
         Ok(())
     }
 
-    /// Clock names `all_clocks` resolves to at this point in the file.
+    /// Clock names `all_clocks` resolves to at this point in the file, in file order.
     fn all_clock_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.virtual_clocks.iter().map(|(n, _)| n.clone()).collect();
-        if let Some(name) = &self.sdc.clock_name {
-            names.push(name.clone());
-        } else if let Some(port) = &self.sdc.clock_port {
-            names.push(port.clone());
-        }
-        names
+        self.sdc.clocks.iter().map(|c| c.name.clone()).collect()
     }
 
     /// `get_cells`/`get_instance`/`get_inst`: explicit instance names. Any
@@ -1659,10 +1707,10 @@ impl Interp {
             &mut self.sdc.ignored_options,
         )?;
         let clock = match flag_arg(args, "-clock")? {
-            None => ClockRef::Design,
-            Some(Value::Str(name)) => self.resolve_clock(name)?,
+            None => None,
+            Some(Value::Str(name)) => Some(self.resolve_clock(name)?),
             Some(Value::Clocks(names)) => match names.as_slice() {
-                [name] => self.resolve_clock(name)?,
+                [name] => Some(self.resolve_clock(name)?),
                 _ => bail!("-clock takes one clock"),
             },
             Some(_) => bail!("-clock needs a clock name"),
@@ -1676,33 +1724,40 @@ impl Interp {
         })
     }
 
-    fn resolve_clock(&self, name: &str) -> Result<ClockRef> {
-        // `create_clock` without `-name` leaves the port name as the clock's handle, the same
-        // fallback `all_clock_names` uses.
-        let design_name = self
-            .sdc
-            .clock_name
-            .as_deref()
-            .or(self.sdc.clock_port.as_deref());
-        if design_name == Some(name) {
-            return Ok(ClockRef::Design);
+    /// The row a clock handle resolves to. The match is by `name` only — `create_clock`
+    /// stores `name.unwrap_or(port)`, so the port-name fallback is covered — and stays
+    /// deliberately absent of a port match: `set_clock_latency 1.0 clk` on a `-name`d
+    /// clock is `unknown clock`, matching OpenSTA (the port form is honoured only by
+    /// `propagated_clock`).
+    fn resolve_clock(&self, name: &str) -> Result<ClockId> {
+        match self.sdc.clocks.iter().position(|c| c.name == name) {
+            Some(i) => Ok(ClockId(i)),
+            None => bail!("unknown clock `{name}`"),
         }
-        if self.virtual_clocks.iter().any(|(n, _)| n == name) {
-            return Ok(ClockRef::Virtual);
-        }
-        bail!("unknown clock `{name}`")
+    }
+
+    /// The design clock's row — the target of a `set_clock_*` command without a clock
+    /// argument. Bails when no port-bearing row has been declared yet; such an SDC would
+    /// fail `finish` anyway.
+    fn design_clock_id(&self) -> Result<ClockId> {
+        self.sdc
+            .clocks
+            .iter()
+            .position(|c| c.port.is_some())
+            .map(ClockId)
+            .ok_or_else(|| anyhow::anyhow!("no design clock declared yet"))
     }
 
     fn finish(self) -> Result<Sdc> {
-        if self.sdc.period_ns <= 0.0 {
+        if self.sdc.design_clock_count() == 0 {
             bail!("SDC defines no clock period");
         }
-        // The analysis uses one period for the design and the virtual I/O clock.
-        for (name, period_ns) in &self.virtual_clocks {
-            if *period_ns != self.sdc.period_ns {
+        for clock in &self.sdc.clocks {
+            if clock.period_ns <= 0.0 {
                 bail!(
-                    "virtual clock `{name}` has period {period_ns}, not the design period {}",
-                    self.sdc.period_ns
+                    "clock `{}` has period {}; a clock period must be positive",
+                    clock.name,
+                    clock.period_ns
                 );
             }
         }
@@ -2056,8 +2111,8 @@ mod tests {
     #[test]
     fn parses_the_gcd_constraints() {
         let sdc = parse_sdc(GCD).unwrap();
-        assert_eq!(sdc.clock_port.as_deref(), Some("clk"));
-        assert_eq!(sdc.period_ns, 5.0);
+        assert_eq!(sdc.clock_port(), Some("clk"));
+        assert_eq!(sdc.period_ns(), 5.0);
         assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0));
         assert_eq!(sdc.output_delay_ns("resp_val"), (1.0, 1.0));
         assert_eq!(sdc.input_transition_ns("req_val"), 0.15);
@@ -2350,11 +2405,11 @@ mod tests {
     #[test]
     fn parses_the_ibex_tcl_sdc() {
         let sdc = parse_sdc(IBEX).unwrap();
-        assert_eq!(sdc.period_ns, 8.0);
-        assert_eq!(sdc.clock_name.as_deref(), Some("core_clock"));
-        assert_eq!(sdc.clock_port.as_deref(), Some("clk_i"));
-        assert_eq!(sdc.clock_latency_ns, 1.095);
-        assert_eq!(sdc.io_clock_latency_ns, 1.095);
+        assert_eq!(sdc.period_ns(), 8.0);
+        assert_eq!(sdc.clock_name(), Some("core_clock"));
+        assert_eq!(sdc.clock_port(), Some("clk_i"));
+        assert_eq!(sdc.design_clock().unwrap().latency_ns, 1.095);
+        assert_eq!(sdc.clock("vclk_core_clock").unwrap().latency_ns, 1.095);
         assert_eq!(sdc.input_delay_ns("instr_rdata_i"), (1.6, 1.6));
         assert_eq!(
             sdc.input_delay_ns("clk_i"),
@@ -2409,15 +2464,14 @@ mod tests {
         ];
         for (text, period_ns, io_ns) in cases {
             let sdc = parse_sdc(text).unwrap();
-            assert_eq!(sdc.clock_name.as_deref(), Some("core_clk"));
-            assert_eq!(sdc.clock_port.as_deref(), Some("clk"));
-            assert_eq!(sdc.period_ns, period_ns);
+            assert_eq!(sdc.clock_name(), Some("core_clk"));
+            assert_eq!(sdc.clock_port(), Some("clk"));
+            assert_eq!(sdc.period_ns(), period_ns);
             assert_eq!(sdc.input_delay_ns("req_val"), (io_ns, io_ns));
             assert_eq!(sdc.output_delay_ns("resp_val"), (io_ns, io_ns));
             assert_eq!(sdc.input_transition_ns("req_val"), 0.15);
             assert_eq!(sdc.output_load_pf("resp_val"), 0.05);
-            assert_eq!(sdc.clock_latency_ns, 0.0);
-            assert_eq!(sdc.io_clock_latency_ns, 0.0);
+            assert!(sdc.clocks.iter().all(|c| c.latency_ns == 0.0));
         }
     }
 
@@ -2441,15 +2495,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_virtual_clock_with_another_period() {
-        let text = format!("{GCD}create_clock -name vclk -period 4.0\n");
-        assert!(parse_sdc(&text).is_err());
+    fn virtual_clock_keeps_its_own_period() {
+        // Virtual periods are free-form (measured OpenSTA behaviour); only a
+        // non-positive period is an error, at `finish`.
+        let sdc = parse_sdc(&format!("{GCD}create_clock -name vclk -period 4.0\n")).unwrap();
+        let vclk = sdc.clock("vclk").unwrap();
+        assert_eq!(vclk.period_ns, 4.0);
+        assert_eq!(vclk.port, None);
     }
 
     #[test]
-    fn rejects_a_second_design_clock() {
-        let text = format!("{GCD}create_clock -name core_clk2 -period 5.0 [get_ports other]\n");
-        assert!(parse_sdc(&text).is_err());
+    fn second_design_clock_appends_a_row() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}create_clock -name core_clk2 -period 5.0 [get_ports other]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.clocks.len(), 2);
+        let second = &sdc.clocks[1];
+        assert_eq!(second.name, "core_clk2");
+        assert_eq!(second.port.as_deref(), Some("other"));
+        assert_eq!(second.period_ns, 5.0);
+        assert_eq!(sdc.design_clock_count(), 2);
     }
 
     #[test]
@@ -2511,7 +2577,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sdc.input_delay_ns("a"), (1.0, 1.0));
-        assert_eq!(sdc.clock_transition_ns, 0.1);
+        assert_eq!(sdc.clock_transition_ns(), 0.1);
     }
 
     #[test]
@@ -2534,7 +2600,7 @@ mod tests {
              set_max_transition 0.75 [current_design]\n"
         ))
         .unwrap();
-        assert!(sdc.propagated_clock);
+        assert!(sdc.propagated_clock());
         assert_eq!(sdc.ignored_commands["set_max_transition"], 1);
     }
 
@@ -2547,9 +2613,9 @@ mod tests {
              set_propagated_clock [get_clocks core_clk]\n"
         ))
         .unwrap();
-        assert!(sdc.propagated_clock);
-        assert_eq!(sdc.clock_latency_ns, 1.0);
-        assert_eq!(sdc.clock_source_latency_ns, 0.2);
+        assert!(sdc.propagated_clock());
+        assert_eq!(sdc.clock_latency_ns(), 1.0);
+        assert_eq!(sdc.clock_source_latency_ns(), 0.2);
 
         let sdc = parse_sdc(&format!(
             "{GCD}\
@@ -2557,7 +2623,7 @@ mod tests {
              unset_propagated_clock [get_clocks core_clk]\n"
         ))
         .unwrap();
-        assert!(!sdc.propagated_clock);
+        assert!(!sdc.propagated_clock());
 
         for snippet in [
             // The virtual I/O clock cannot be propagated.
@@ -2597,10 +2663,10 @@ mod tests {
              set_max_fanout 10.0 [current_design]\n",
         )
         .unwrap();
-        assert_eq!(sdc.clock_transition_ns, 0.15);
+        assert_eq!(sdc.clock_transition_ns(), 0.15);
         assert_eq!(sdc.derate_early.factors[DERATE_CELL][1][0], 0.95);
         assert_eq!(sdc.derate_late.factors[DERATE_CELL][1][0], 1.05);
-        assert_eq!(sdc.setup_uncertainty_ns, 0.25);
+        assert_eq!(sdc.setup_uncertainty_ns(), 0.25);
         assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0));
         assert_eq!(sdc.output_load_pf("resp_val"), 0.0334);
         let drv = sdc.driving_cell("req_val", true).unwrap();
@@ -2692,9 +2758,9 @@ mod tests {
         // The N2 criterion: a `write_sdc` file emitted by a stock LibreLane/OpenSTA run on a
         // public design parses without error and without dropping any command.
         let sdc = parse_sdc(GCD_WRITE_SDC).unwrap();
-        assert_eq!(sdc.period_ns, 5.0);
-        assert!(sdc.propagated_clock);
-        assert_eq!(sdc.clock_name.as_deref(), Some("core_clk"));
+        assert_eq!(sdc.period_ns(), 5.0);
+        assert!(sdc.propagated_clock());
+        assert_eq!(sdc.clock_name(), Some("core_clk"));
         assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0));
         assert_eq!(sdc.output_delay_ns("resp_val"), (1.0, 1.0));
         assert_eq!(sdc.output_load_pf("resp_msg[0]"), 0.05);
@@ -2794,8 +2860,8 @@ mod tests {
         .unwrap();
         assert_eq!(sdc.input_delay_ns("req_val"), (-0.5, -0.5));
         let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty 0.1\n")).unwrap();
-        assert_eq!(sdc.setup_uncertainty_ns, 0.1);
-        assert_eq!(sdc.hold_uncertainty_ns, 0.1);
+        assert_eq!(sdc.setup_uncertainty_ns(), 0.1);
+        assert_eq!(sdc.hold_uncertainty_ns(), 0.1);
     }
 
     #[test]
@@ -2804,20 +2870,20 @@ mod tests {
             "{GCD}set_clock_uncertainty -setup 0.2 [get_clocks core_clk]\n"
         ))
         .unwrap();
-        assert_eq!(sdc.setup_uncertainty_ns, 0.2);
-        assert_eq!(sdc.hold_uncertainty_ns, 0.0);
+        assert_eq!(sdc.setup_uncertainty_ns(), 0.2);
+        assert_eq!(sdc.hold_uncertainty_ns(), 0.0);
         let sdc = parse_sdc(&format!(
             "{GCD}set_clock_uncertainty -hold 0.1 [get_clocks core_clk]\n"
         ))
         .unwrap();
-        assert_eq!(sdc.setup_uncertainty_ns, 0.0);
-        assert_eq!(sdc.hold_uncertainty_ns, 0.1);
+        assert_eq!(sdc.setup_uncertainty_ns(), 0.0);
+        assert_eq!(sdc.hold_uncertainty_ns(), 0.1);
         let sdc = parse_sdc(&format!(
             "{GCD}set_clock_uncertainty 0.3 [get_clocks core_clk]\n"
         ))
         .unwrap();
-        assert_eq!(sdc.setup_uncertainty_ns, 0.3);
-        assert_eq!(sdc.hold_uncertainty_ns, 0.3);
+        assert_eq!(sdc.setup_uncertainty_ns(), 0.3);
+        assert_eq!(sdc.hold_uncertainty_ns(), 0.3);
     }
 
     #[test]
@@ -2963,18 +3029,14 @@ mod tests {
         assert_eq!(eval_arith("1 + "), None);
     }
 
-    /// The single-clock SDC model refuses multi-clock constructs at parse time; the
-    /// documented break points for the `mc-*` tickets (docs/multi-clock.md). The second
-    /// `create_clock` bail and the virtual-period bail are already covered by
-    /// `rejects_a_second_design_clock` / `rejects_a_virtual_clock_with_another_period`.
+    /// The clock-table model accepts multiple domains at parse time; the remaining
+    /// bail surface (unmodelled qualifiers and commands) still fails with named
+    /// errors — the documented break points for the `mc-*` tickets
+    /// (`docs/multi-clock.md`).
     #[test]
     fn multi_clock_bails() {
         let with_vclk = format!("{GCD}create_clock -name vclk -period 5.0\n");
         let cases = [
-            (
-                "set_clock_latency 0.5 [get_clocks {core_clk vclk}]",
-                "set_clock_latency takes one clock",
-            ),
             (
                 "set_clock_latency -early 0.5 [get_clocks core_clk]",
                 "unsupported option `-early`",
@@ -2999,6 +3061,14 @@ mod tests {
                 "set_propagated_clock [get_clocks other]",
                 "unknown clock `other`",
             ),
+            (
+                "set_propagated_clock [get_clocks vclk]",
+                "set_propagated_clock does not apply to the virtual clock",
+            ),
+            (
+                "create_clock -name bad -period 0 [get_ports other]",
+                "has period 0",
+            ),
         ];
         for (snippet, want) in cases {
             let err = format!("{:#}", parse_sdc(&format!("{with_vclk}{snippet}\n")).unwrap_err());
@@ -3006,17 +3076,94 @@ mod tests {
         }
     }
 
-    /// Uncertainty has a single pair of fields for the whole design: naming the virtual
-    /// clock still writes the design-clock values (silent wrong target until `mc-model`
-    /// gives every clock its own row).
+    /// A two-design-clock SDC (`t2_int.sdc` minus the port delays): rows in file order.
+    const TWO_DESIGN: &str = "create_clock -name cka -period 2.0 [get_ports clk1]\n\
+        create_clock -name ckb -period 1.0 [get_ports clk2]\n";
+
+    /// The probe's silent wrong-target bug: uncertainty on a virtual clock must land on
+    /// that clock's own row, never on the design clock's.
     #[test]
-    fn uncertainty_on_virtual_clock_writes_design_fields() {
-        let text = format!(
+    fn uncertainty_lands_on_the_named_row() {
+        let sdc = parse_sdc(&format!(
             "{GCD}\
             create_clock -name vclk -period 5.0\n\
             set_clock_uncertainty -setup 0.20 [get_clocks vclk]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.clock("vclk").unwrap().setup_uncertainty_ns, 0.20);
+        assert_eq!(sdc.design_clock().unwrap().setup_uncertainty_ns, 0.0);
+    }
+
+    #[test]
+    fn multi_name_clock_lists_apply_to_every_row() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+            create_clock -name vclk -period 5.0\n\
+            set_clock_latency 0.5 [get_clocks {{core_clk vclk}}]\n\
+            set_clock_latency -source 0.1 [get_clocks {{core_clk vclk}}]\n\
+            set_clock_transition 0.1 [get_clocks {{core_clk vclk}}]\n"
+        ))
+        .unwrap();
+        for name in ["core_clk", "vclk"] {
+            let row = sdc.clock(name).unwrap();
+            assert_eq!(row.latency_ns, 0.5, "{name}");
+            assert_eq!(row.source_latency_ns, 0.1, "{name}");
+            assert_eq!(row.transition_ns, 0.1, "{name}");
+        }
+        // The virtual row's transition is stored, not counted as ignored.
+        assert!(!sdc
+            .ignored_options
+            .contains_key("set_clock_transition (virtual clock)"));
+    }
+
+    #[test]
+    fn clock_commands_target_second_domain_rows() {
+        // The `t2_unc` shape: per-name uncertainty and latency on two design clocks.
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_clock_latency 0.5 [get_clocks {{cka ckb}}]\n\
+            set_clock_uncertainty -setup 0.05 [get_clocks cka]\n\
+            set_clock_uncertainty -setup 0.20 [get_clocks ckb]\n\
+            set_clock_uncertainty -hold 0.10 [get_clocks cka]\n"
+        ))
+        .unwrap();
+        let (a, b) = (sdc.clock("cka").unwrap(), sdc.clock("ckb").unwrap());
+        assert_eq!((a.latency_ns, b.latency_ns), (0.5, 0.5));
+        assert_eq!((a.setup_uncertainty_ns, a.hold_uncertainty_ns), (0.05, 0.10));
+        assert_eq!((b.setup_uncertainty_ns, b.hold_uncertainty_ns), (0.20, 0.0));
+    }
+
+    #[test]
+    fn propagated_clock_is_per_domain() {
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}set_propagated_clock [get_clocks cka]\n"
+        ))
+        .unwrap();
+        assert!(sdc.clock("cka").unwrap().propagated);
+        assert!(!sdc.clock("ckb").unwrap().propagated);
+
+        // `all_clocks` covers every design row; a virtual row still bails.
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}set_propagated_clock [all_clocks]\n"
+        ))
+        .unwrap();
+        assert!(sdc.clocks.iter().all(|c| c.propagated));
+        let text = format!("{TWO_DESIGN}create_clock -name vclk -period 3.0\n");
+        assert!(
+            parse_sdc(&format!("{text}set_propagated_clock [all_clocks]\n")).is_err()
         );
-        let sdc = parse_sdc(&text).unwrap();
-        assert_eq!(sdc.setup_uncertainty_ns, 0.20);
+    }
+
+    #[test]
+    fn delay_clock_references_a_domain_row() {
+        // `-clock ckb` resolves to the second row: its latency, not the design clock's.
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_clock_latency 0.6 [get_clocks cka]\n\
+            set_clock_latency 0.2 [get_clocks ckb]\n\
+            set_output_delay 0.7 -clock ckb [get_ports yb]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.output_clock_latency_ns("yb"), 0.2);
     }
 }
