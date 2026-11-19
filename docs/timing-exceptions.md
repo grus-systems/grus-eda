@@ -145,7 +145,7 @@ if no surviving group produced a candidate). Run-invariant diagnostics
 Probe: `tests/designs/sta_exceptions/` (3-FF design with `u_ff1/D` driven
 by a `mux2` from `u_ff0`/`u_ff2` plus a `sel` input, `u_ff2`'s clock split
 onto a second buffer stage `c2 -> u_clkb3 -> c3`, and a second `mux2`
-driving output `y2` from the same two FF sources, 102 SDC scenarios,
+driving output `y2` from the same two FF sources, 111 SDC scenarios,
 `generate_ref.sh` inside the pinned LibreLane image →
 `exceptions.reference.json`). Period `T = 2.0 ns`. Required-time
 shifts measured per endpoint (`u_ff1/D`, the only MCP target):
@@ -199,14 +199,19 @@ endpoints get the exception, the rest are counted in a new diagnostic —
 same partial-with-count precedent as `-lib_cell`/`-pin` drops. `false_path`
 has no such limit (it only removes groups).
 
-### CRPR safety (verified by both reviewers)
+### CRPR safety
 
-`crpr_sink_net`/`crpr_driver_net` trace the endpoint's comb cone
-structurally and return a value only when every launch in the cone agrees on
-(clock net, edge). A single-signature run's arrival must come through that
-class's sources, so the traced value either matches or the trace returns
-`CRPR_BAD` — identical conservatism to the unfiltered run. No change needed;
-regression test covers it.
+Each arrival extreme carries a `crpr_*` launch-tag mask (interned
+`(clock net, clock edge)` bits plus a sentinel bit for ports, latch
+clock-to-Q launches and unresolvable sources). A required time takes the
+shared-net driver spread only when the mask is a single non-sentinel tag
+matching the capture net and edge — contested masks and non-shared
+winners get zero, the same conservative answer as the old
+all-source cone consensus (`crpr_sink_net`/`CRPR_BAD`, retired
+2026-11-19 with the `pcr_*` fixture). A single-signature run's arrival
+must come through that class's sources, so a delay-covered class's mask
+holds only the covered launch's tag — which is what lets the delay
+check read the same per-path credit (`docs/path-delays.md`).
 
 ## SDC parsing
 
