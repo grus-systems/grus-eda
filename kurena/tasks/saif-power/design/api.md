@@ -65,8 +65,10 @@ Rules (measured semantics are `saif-format.md`; these are *our* rules):
   top-level port name → its net. Each hit yields `(rise, fall)` from `tc`:
   even → `tc/2` each; odd → `rise` gets the extra edge iff `t0 >= t1`,
   else `fall` (odd TC ⇒ start ≠ end; the majority-time state is taken as
-  the start state, and a low start's unpaired toggle is a rise. `clk` on
-  mb verifies: TC=199, T0>T1 → (100,99) = the VCD counts). A heuristic
+  the start state, and a low start's unpaired toggle is a rise). A duty
+  **tie** (`t0 == t1`) resolves to `rise` — the start-low assumption —
+  and is golden-covered: `clk` on the truncated-window `mb.saif` carries
+  `TC=199, T0=T1=990` → `(100,99)`, the in-window truth. A heuristic
   bounded at ±1 edge per net — see `overview.md` §Rise/fall split.
 - Nested `INSTANCE name`: `design` cell by name; each signal →
   `<inst>/<pin>` pin lookup → `design.pin_nets[pin]` → net. Unknown instance
@@ -123,15 +125,19 @@ comment → "from VCD or SAIF switching activity".
 
 - `saif.rs` unit tests (no PDK): header/timescale/duration, nested scopes,
   NET vs PORT groups both collected, escaped names (`a\[0\]` → `a[0]`),
-  fractional-TC error, missing-DURATION error, odd-TC duty split,
-  auto-scope single-chain descent + ambiguous → error.
+  fractional-TC error, missing-DURATION error, odd-TC duty split
+  **including the `t0 == t1` tie → `(100,99)` case**, auto-scope
+  single-chain descent + ambiguous → error.
 - `power.rs` integration test `test_saif_power_mb_matches_opensta`
   (`test_support` helpers; fails loudly on missing PDK/files): load
   mb.def/mb.sdc/lib/lef → `sta_pin_slews` → `load_saif(mb.saif)` → resolve
   → `estimate_power` → deserialize `mb.saif.reference.json` `power_saif`
-  block and assert every group field at `POWER_SAIF` tolerance; assert
-  `saif_unmatched_*` counts; assert our SAIF report equals our VCD report
-  on the same window (same net counts → identical totals).
-- Tolerance `POWER_SAIF`: tightest honest per-field bounds measured during
-  implementation (floor: internal/leakage/total ~1-2%, Sequential switching
-  up to ~5% with named root cause — see `overview.md` and `probe.md`).
+  block and assert every group field at the named tolerance; assert
+  `saif_unmatched_*` counts; **per-net** compare the resolved SAIF activity
+  against `load_vcd(mb.vcd)` — every net's `(rise, fall)` identical except
+  `clk` = `(vcd.rise, vcd.fall - 1)` (the `#2000` fall is outside the
+  `[10,1990]` SAIF window; the report-level delta is recorded in
+  `results.md`, see `fixture.md` §Test).
+- Tolerance: tightest honest per-field bounds measured during
+  implementation (current: internal 2%, switching 5%, total 1%, leakage
+  25% with a 1.5e-12 W abs floor — see `overview.md` and `probe.md`).

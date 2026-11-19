@@ -56,7 +56,7 @@ Reader rules:
 | `VIRTUAL_INSTANCE` | STA-0169 parse error; annotations before it survive |
 | `read_saif` without `-scope` | "cannot read file" (scope effectively required) |
 | `TC` scale | linear in switching power (4 → 40 = 10x) |
-| `T0`/`T1` swap | changes **leakage** (state-dependent), not internal/switching |
+| `T0`/`T1` swap | early probe: changes **leakage** (state-dependent) only; committed run: identical columns — record the committed run's result |
 | `IG=40`, `TX=40` vs 0 | no change to `report_power` |
 | `estimate_parasitics -placement` before `report_power` | no change on mb |
 
@@ -67,3 +67,11 @@ the four top-level signals (`clk`, `a`, `q`, `y`) — `q` is dropped by
 OpenSTA but consumed by us — plus `(INSTANCE _d_)`/`(INSTANCE _i_)` scopes
 with `NET` groups named by **pin names** (`D`,`CLK`,`Q` / `A`,`Y`), which is
 the only form OpenSTA 3.0.16 annotates. All fields integer.
+
+With `--window-end 1990` (see `fixture.md`) the committed file carries
+`(DURATION 1980)`; `clk`/`CLK` get `(T0 990) (T1 990) (TC 199)` — odd `TC`
+with a duty tie, so the golden exercises both the odd-split and the
+tie→rise rule. `a`/`q`/`D`/`Q`/`A` keep `TC 4` (`T0 1180`, `T1 800`);
+`y`/`Y` get `T1 1180` — every tail-state duration loses the last 10 ns of
+the truncated window. Confirm against the regenerated file; these numbers
+are expected values, not commitments.

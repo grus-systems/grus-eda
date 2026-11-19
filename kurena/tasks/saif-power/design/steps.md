@@ -1,54 +1,62 @@
-# Implementation steps
+# Implementation steps — revision fix pass
 
-One logical unit per commit; workspace version bump lands in the functional
-commit (patch → 0.1.96). Commit messages: Conventional Commits + agent
-trailer per `AGENTS.md` §5.
+The feature is already implemented (`kurena: implement saif-power`,
+v0.1.96). This pass applies the rejected-review fixes: the verification
+record must match what was measured, and the odd-TC split must be
+golden-covered. One logical unit per commit; Conventional Commits + agent
+trailer per `AGENTS.md` §5. No version bump — `0.1.96` already carries
+this in-flight change.
 
-## Step 1 — measured semantics + fixture generation (container work first)
+## Step 1 — fixture + script fixes (container work)
 
-Write `tests/designs/microbench/vcd2saif.py` and
-`tests/designs/microbench/generate_saif_ref.sh` (`fixture.md`), run them
-inside `ghcr.io/librelane/librelane:3.0.16` via Colima, inspect `mb.saif`
-plus `mb.saif.reference.json` against `mb.openroad.txt`, then commit:
+- `vcd2saif.py`: add `--window-end <ts>` overriding aggregation `last_ts`
+  and `DURATION`.
+- `generate_saif_ref.sh`:
+  - invoke `python3 vcd2saif.py --ghost-scope tb/dut --window-end 1990
+    mb.vcd mb.saif`; fix the header comment's window wording;
+  - fix the session-B comment: committed `mb.saif.openroad.txt` is
+    `grep -v`-filtered stdout (INFO/WARNING/banner/blank), not "whole
+    stdout";
+  - rewrite §5 probe variants to mutate via name-anchored regexes
+    (`fixture.md` §3): `tc10`, `duty_a`, `duty_y`, `igtx` (on `y`),
+    `port`, `noghost`.
+- Run the committed script end-to-end inside
+  `ghcr.io/librelane/librelane:3.0.16` (Colima). Verify the regenerated
+  `mb.saif` (`clk`/`CLK` `TC 199 T0 990 T1 990`; `a`/`q` `T0 1180`;
+  `y`/`Y` `T1 1180`; `DURATION 1980`), then rerun and confirm `git diff`
+  is empty (AGENTS §7 rule 1).
+- Commit: `test: regenerate microbench SAIF fixture with odd-TC window`
+  — regenerated `mb.saif`, `mb.saif.openroad.txt`, `mb.saif.reference.json`
+  + script/converter changes.
 
-```
-test: add microbench SAIF fixture and OpenSTA-SAIF golden
-- vcd2saif.py converts mb.vcd waveform to SAIF aggregates (T0/T1/TX/TC)
-- generate_saif_ref.sh: container run emits mb.saif + mb.saif.reference.json
-  (power_saif + power_vcd blocks, parsed from report_power -digits 6)
-```
+## Step 2 — test updates
 
-Confirm before commit: rerun the committed script end-to-end and `git diff`
-is empty (AGENTS §7 rule 1).
+- `saif.rs`: `test_split_tc` gains the `t0 == t1` tie case → `(100,99)`;
+  `test_resolve_nets_ports_pins_and_drops` mirrors the committed fixture
+  (`clk`/`CLK` `sig(199, 990, 990)` → `(100,99)`).
+- `power.rs`: replace the bit-for-bit SAIF==VCD report assertion with the
+  per-net comparison (`fixture.md` §Test) + a named bound on the report
+  delta; fix the stale `clk TC=200` comment.
+- `cargo test --workspace`, `cargo clippy --workspace --all-targets --
+  -D warnings`.
+- Commit: `test: cover odd-TC split and window delta in SAIF golden test`.
 
-## Step 2 — SAIF reader
+## Step 3 — `docs/results.md` correction
 
-`readers/saif.rs` per `api.md` + `readers/mod.rs` wiring. Parser unit tests
-cover the `saif-format.md` grammar and the error/edge cases listed there.
-Commit: `feat: add SAIF switching-activity reader`.
+Update the 2026-11-19 entry (still in-flight on this branch — correct in
+place) per `probe.md` P4:
 
-## Step 3 — wiring: resolver + diagnostics + CLI
-
-`power.rs` diagnostics rename + two SAIF counters; `saif.rs::resolve`;
-`main.rs` `--saif`/`--saif-scope` args and the merge into
-`report.diagnostics`; print line source-neutral. Regenerate `mb.power.json`
-in this commit. Unit/integration coverage per `api.md` (without the golden
-assertion yet if the reference file landed in step 1 — the strict test comes
-in step 4). Bump `[workspace.package] version` → 0.1.96 in this commit and
-let `Cargo.lock` follow. Commit: `feat: power --saif input with scope diagnostics`.
-(If steps 2 and 3 land as one commit, the single bump lives there —
-the reader alone is dead code until wired, so folding them is fine.)
-
-## Step 4 — STRICT golden test + docs
-
-`test_saif_power_mb_matches_opensta` (`fixture.md`): measure actual
-residuals, set `POWER_SAIF` to the tightest honest bounds, name any residual
-> ~2% in `docs/results.md` before writing the bound. Fail-proof check
-(corrupt TC → red → restore). `docs/results.md` dated entry per `probe.md`
-P4; `docs/roadmap.md` N7 → SAIF struck (`when`-blocks and statistical
-activity propagation stay open); `README.md`/`main.rs` help only where the
-CLI surface is documented. Commit: `test: SAIF power golden at POWER_SAIF
-tolerance` (+ `docs:` if separate).
+- window `[10, 1990]` = `DURATION 1980`; `clk TC 199` odd, tie→rise →
+  `(100,99)`; SAIF window is 10 ns shorter than the VCD annotation window
+  and the `clk` per-net delta (one `#2000` fall) is named;
+- `igtx` probe recorded as mutating `y` — now true of the script;
+  `duty_a`/`duty_y` replace `duty_clk` (clk duty is degenerate under the
+  truncated window — say so);
+- note the `grep -v` WARNING/INFO filter on `mb.saif.openroad.txt`;
+- refreshed measured table + golden numbers from the regen;
+- "Checks run" gains `cargo test --workspace` (full suite);
+- `docs/roadmap.md` N7: adjust wording if it cites the old window.
+- Commit: `docs: correct SAIF probe targets and window in results`.
 
 ## Verification gates
 
@@ -56,7 +64,8 @@ tolerance` (+ `docs:` if separate).
 - `bash tests/designs/microbench/generate_saif_ref.sh` idempotent (rerun →
   clean `git status`)
 - `grus-eda power --saif tests/designs/microbench/mb.saif` end-to-end CLI
-  run recorded (stderr shows unmatched counts if ghost included)
+  run recorded (stderr shows `saif_unmatched_scopes = 1` from the ghost)
+- Prove the test can fail: corrupt `clk` `TC 199`→`398` → red → restore.
 
 ## Out of scope (stays open)
 

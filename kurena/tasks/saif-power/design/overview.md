@@ -1,5 +1,28 @@
 # SAIF power input — design overview
 
+## Revision note
+
+This revision addresses the rejected-review memo. Four corrections to the
+committed fixture/scripts/record — the reader and CLI design are unchanged:
+
+1. **`generate_saif_ref.sh` `igtx` probe targets `y`, not clk.** The probe did
+   `text.replace("(TX 0)", "(TX 40)", 1)`, which hits the *first* `(TX 0)` in
+   file order — `clk`'s line — while `docs/results.md` recorded the probe as
+   "on `y`". Probe mutations must be anchored to a named signal's line; see
+   `fixture.md`/`probe.md`.
+2. **`mb.saif` clk `TC 200` → odd.** `vcd2saif.py` gains `--window-end`;
+   aggregating over `[10, 1990]` drops clk's final `#2000` fall, giving
+   `TC 199` so the odd-TC rise/fall split is golden-covered, not only
+   unit-tested. Consequence: the SAIF window is 10 ns shorter than the VCD
+   window — recorded honestly (`probe.md` P3/P4).
+3. **Record the WARNING-line filter.** The committed `mb.saif.openroad.txt`
+   is `openroad` stdout filtered by `grep -v` (INFO/WARNING/banner/blank
+   lines) — the script comment saying "whole stdout" and the results entry
+   must say filtered, not verbatim.
+4. **`cargo test --workspace` in the results entry.** The "Checks run" line
+   listed only package-scoped test runs; the acceptance requires the full
+   workspace suite recorded.
+
 ## Context
 
 `grus-eda power` estimates leakage/switching/internal power from VCD switching
@@ -16,7 +39,8 @@ All findings below come from `openroad`/`sta` runs inside
 `ghcr.io/librelane/librelane:3.0.16`; details and the required reproduction
 runs are in `probe.md`. They decide the reader's shape and the golden's
 tolerance — they are facts already measured, but `results.md` must record the
-runs that produce the committed numbers (per `AGENTS.md` §7 rule 1).
+runs that produce the committed numbers (per `AGENTS.md` §7 rule 1), and each
+probe variant must be recorded against the signal it actually mutates.
 
 1. **Resolution model**: `read_saif -scope <path>` selects an `INSTANCE` subtree.
    Only `NET`-grouped signals annotate anything; names resolve to **pins/ports
@@ -26,18 +50,21 @@ runs that produce the committed numbers (per `AGENTS.md` §7 rule 1).
    `PORT` groups annotate **nothing** in this build. Unmatched scopes and
    signal names are dropped with no warning and no count. `VIRTUAL_INSTANCE`
    is a parse error (STA-0169) after partial annotation.
-2. **Field semantics**: `TC` scales switching power linearly (TC 4→40 = 10x).
-   `T0`/`T1` duty changes **state-dependent leakage only** (internal/switching
-   unchanged). `IG` and `TX` measured no effect on `report_power`. Field values
-   are integers; floats are syntax errors. Unannotated pins get statistical
-   activity propagation (annotating `a` alone ≈ full annotation on mb).
-3. **SAIF-vs-VCD on mb**: SAIF total 2.2552e-6 vs VCD 2.25e-6 (hand-converted
-   probe file); per-group deltas < 4%. `estimate_parasitics -placement` before
-   `report_power` changed nothing on mb.
+2. **Field semantics**: `TC` scales switching power linearly (TC ×10 =
+   switching ×10). `T0`/`T1` duty changes **state-dependent leakage only** on
+   the early probes — on the committed fixture's run the swap left every
+   column identical (see `results.md`); either way internal/switching do not
+   consume duty. `IG` and `TX` measured no effect on `report_power`. Field
+   values are integers; floats are syntax errors. Unannotated pins get
+   statistical activity propagation.
+3. **SAIF-vs-VCD on mb**: SAIF total `2.2552e-6` vs VCD `2.2541e-6` (~0.05%) on
+   the previous `[10,2000]` fixture; the truncated-window regen re-measures
+   this. `read_vcd` and `read_saif` feed different annotation paths, so a
+   small OpenSTA-side delta is expected even with identical activity.
 4. **No SAIF emitter exists in the container**: verilator `--trace-saif` needs
-   `make`+`gcc` (absent), iverilog dumps VCD only (ignores `.saif` suffix),
-   yosys 0.62 has no `vcd2saif`. `mb.saif` must be produced by a committed
-   conversion script (python3 is in the container) — see `fixture.md`.
+   `make`+`gcc` (absent), iverilog dumps VCD only, yosys 0.62 has no
+   `vcd2saif`. `mb.saif` is produced by the committed `vcd2saif.py`
+   (python3 is in the container) — see `fixture.md`.
 
 ## Design decision
 
@@ -48,10 +75,9 @@ resolver produces a `VcdActivity` keyed by net name. `estimate_power` keeps its
 signature; power math is untouched. This matches the goal: "the activity
 structure `estimate_power` already consumes".
 
-Duty (`T0`/`T1`) is parsed and carried but not consumed: our leakage model is
-per-cell flat (`leakage_power_w`), not state-dependent. The measured effect of
-duty on OpenSTA's state-dependent leakage (~15% of a ~1e-11 term on mb) is
-recorded as a residual divergence, not modeled.
+Duty (`T0`/`T1`) is parsed and carried but not consumed by the power model:
+our leakage is per-cell flat (`leakage_power_w`), not state-dependent. Duty
+still drives the odd-TC split inference below.
 
 ## Rise/fall split
 
@@ -59,15 +85,19 @@ SAIF gives `TC` (total clean toggles), not per-direction counts. Rule:
 `rise = fall = TC/2` when even; when odd, start ≠ end and the extra edge is
 the last toggle — a `rise` iff the signal started low. The start state is
 inferred from durations: the majority-time state is likelier the start
-state, so the extra edge goes to `rise` iff `t0 >= t1`, else `fall`. This is
-still a heuristic on duty-skewed signals (bounded at ±1 edge per net; the
-limitation is stated honestly in `results.md`).
+state, so the extra edge goes to `rise` iff `t0 >= t1`, else `fall`. **A
+duty tie (`t0 == t1`) resolves to `rise`** — the start-low assumption; on
+mb's clk this happens to be the truth. This is still a heuristic on
+duty-skewed signals (bounded at ±1 edge per net; limitation stated in
+`results.md`).
 
-`mb` *does* exercise the rule: `clk`'s TC is 199 (toggles at every 10 ns
-step from #10 to #1990), with `t0 = 1000 ns`, `t1 = 990 ns` → inferred
-start-low → (100 rises, 99 falls), exactly the `mb.vcd` counts. Every
-annotated net reconstructs its VCD counts, so the SAIF-vs-VCD
-exact-equality check holds on this fixture.
+`mb` exercises the rule: with `--window-end 1990` the SAIF window is
+`[10, 1990]` (`DURATION 1980` ns). `clk` toggles at every 10 ns step from
+`#10` to `#1990` → `TC 199`, and its duty degenerates to `T0 = T1 = 990` →
+the tie-break sends the extra edge to `rise` → `(100, 99)`, exactly the
+in-window VCD counts. The `#2000` fall lies outside the SAIF window, so the
+resolved `clk` differs from the full-file VCD count by exactly one fall —
+asserted per-net in the test, recorded in `results.md`.
 
 ## Resolution rules (ours)
 
@@ -88,40 +118,42 @@ At the selected scope (default: auto-descend, see `api.md`):
 ## Tolerance
 
 `STRICT` on this task means the golden-comparison test style with named
-per-field bounds (`POWER_SAIF`), set to the tightest honest bounds after
-measurement. Expected floor from probes: internal ≤ 2%, leakage ≤ 2%,
-total ≤ 1%; switching needs ≤ 5% on the Sequential group (known ~3.7%
-residual vs OpenSTA — root cause must be **named** in `results.md` before
-the bound is loosened, per `AGENTS.md` §7 rule 5; likely a pin-cap or
-wire-load modeling delta, not an activity defect, since it exists on the
-VCD path too).
+per-field bounds, set to the tightest honest bounds after measurement.
+Bounds measured on the current fixture: internal ≤ 2%, switching ≤ 5%,
+total ≤ 1%, leakage ≤ 25% with a `1.5e-12` W absolute floor (the
+Combinational leakage term is pW-class — ~23% relative but ~1e-12 W
+absolute). The Sequential-switching ~3.7% residual is the same
+driver-pin-cap delta the VCD path carries — root cause named in
+`docs/results.md`, not an activity defect.
 
 ## Risks
 
 - **mb.saif hand-vs-converted**: spec requires values from a tool run.
-  Mitigation: `vcd2saif.py` (committed) computes T0/T1/TX/TZ/TB/TC from the
-  mb.vcd waveform; `generate_saif_ref.sh` runs it + the OpenSTA Tcl in the
+  `vcd2saif.py` (committed) computes T0/T1/TX/TZ/TB/TC from the mb.vcd
+  waveform; `generate_saif_ref.sh` runs it + the OpenSTA Tcl in the
   container, emitting `mb.saif` and `mb.saif.reference.json` — nothing typed
-  by hand.
+  by hand, including the `--window-end` truncation.
 - **`q` divergence**: OpenSTA drops the `q` NET entry (pin-name resolution)
   and propagates instead. On mb propagated ≈ exact; on other designs it could
   diverge like gcd's. Recorded in results.md; same caveat class as VCD.
-- **Clap arg change**: `--vcd` becomes `Option` + `conflicts_with`; a missing
-  both-args case must fail loudly at CLI parse.
+- **Clap arg change**: `--vcd` became `Option` + `conflicts_with`; a missing
+  both-args case fails loudly at CLI parse.
+- **Probe positional fragility** (the rejected-review bug): probe variants
+  must mutate fields via regexes anchored on the signal *name*, never
+  positional `replace` on shared substrings like `(TX 0)` — the same T0/T1
+  values appear on the `y` net and `_i_`'s `Y` pin line.
 
 ## Files
 
-- `crates/grus-core/src/readers/saif.rs` (new)
-- `crates/grus-core/src/readers/mod.rs`
-- `crates/grus-core/src/power.rs`
-- `crates/grus-eda/src/main.rs`
+- `crates/grus-core/src/readers/saif.rs` (exists; test expectations updated)
+- `crates/grus-core/src/power.rs` (test updated: per-net comparison)
 - `tests/designs/microbench/` (`vcd2saif.py`, `generate_saif_ref.sh`,
-  `mb.saif`, `mb.saif.reference.json`, `mb.saif.openroad.txt`;
-  `mb.openroad.txt` stays as the VCD raw report;
-  `mb.power.json` regenerated for renamed diagnostics)
-- `docs/results.md`
-- `docs/roadmap.md`
-- `README.md` (only if the power CLI surface is documented there — check;
-  it is not today, so likely untouched)
-- `Cargo.toml` (workspace version bump, same commit)
-- `Cargo.lock`
+  `mb.saif`, `mb.saif.reference.json`, `mb.saif.openroad.txt` —
+  regenerated; `mb.power.json` unchanged)
+- `docs/results.md` (2026-11-19 entry corrected)
+- `docs/roadmap.md` (N7 wording if the window description changes)
+- `crates/grus-core/src/readers/mod.rs` (unchanged)
+- `crates/grus-eda/src/main.rs` (unchanged)
+- `README.md` (unchanged — power CLI surface not documented there)
+- `Cargo.toml` / `Cargo.lock` (no further bump: `0.1.96` already carries
+  this in-flight change)
