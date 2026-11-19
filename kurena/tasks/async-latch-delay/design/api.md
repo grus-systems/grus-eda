@@ -1,4 +1,8 @@
-# async-latch-delay — Implementation shape (plan, not yet written)
+# async-latch-delay — Implementation shape
+
+> **Status**: implemented in `e530643` as described below and
+> STRICT-green against the committed goldens. The only outstanding delta
+> is the docstring sign fix at `analysis.rs:7754` (see `steps.md`).
 
 All changes live in `crates/grus-core/src/sta/analysis.rs`. The aborted run
 left a draft implementing the recorded rules end-to-end; it is gone, but the

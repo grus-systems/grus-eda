@@ -1,5 +1,10 @@
 # async-latch-delay — OpenSTA probe record & residual checks
 
+> **Status**: verified — the committed `generate_ref.sh` regen in
+> `e530643` reproduced every verdict below; the record is evidence, not
+> hypothesis. The residual ad-hoc probes also ran (outputs in
+> `docs/results.md`).
+
 The aborted executor pass ran the probe inside the LibreLane container
 (`ghcr.io/librelane/librelane:3.0.16`): scenario SDCs equivalent to
 `fixture.md` §1 were fed to OpenSTA and the verdicts below are what its

@@ -1,5 +1,9 @@
 # async-latch-delay — Fixture & golden layout
 
+> **Status**: landed in `e530643` — all 11 scenario SDCs, both extended
+> `generate_ref.sh` scripts, and the golden sections are committed and
+> STRICT-green. Kept for the record; do not recreate.
+
 Both fixtures carry the DEF, baseline SDCs, `generate_ref.sh`, and
 `*.reference.json` — nothing else. The scenario SDCs below **must be
 created** (the aborted run's copies are gone; this table is the spec). Each
