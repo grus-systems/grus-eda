@@ -1865,7 +1865,19 @@ fn propagate_clock(
     let tr = sdc.input_transition_ns(cx.port_name(port));
     let p = port.0 as usize;
     clk[p].merge(RISE, lat, lat, lat, lat, tr, tr, 1, 1, 0, 0);
-    clk[p].merge(FALL, lat + half_period, lat + half_period, lat + half_period, lat + half_period, tr, tr, 2, 2, 0, 0);
+    clk[p].merge(
+        FALL,
+        lat + half_period,
+        lat + half_period,
+        lat + half_period,
+        lat + half_period,
+        tr,
+        tr,
+        2,
+        2,
+        0,
+        0,
+    );
     parity[p] = [0, 1];
 
     for lvl in 1..levelized.level_offsets.len() - 1 {
@@ -2488,64 +2500,68 @@ fn prepare_sta<'a>(
     // opening clock edge (measured on `latch_borrow` `delay_allregs`:
     // `u_f0/D` reports `u_ln`'s clock-to-Q delay alone). Flop and port
     // launches keep their clock edge, so their `dly` equals `arr`.
-    let eval_launch =
-        |q: PinId, clk_state: PinTimingState, lib_arc: u32, edge_pol: usize, delay_edge: bool| -> [LaunchPair; 2] {
-            let q_net = design.pin_nets[q.0 as usize];
-            let arc = &lib.arcs[lib_arc as usize];
-            let mut res = [LaunchPair::UNREACHED; 2];
-            // An unreached clock edge has infinite slew; do not feed it to the delay calculator.
-            if !clk_state.reached(edge_pol) {
-                return res;
-            }
-            if let Some(q_net) = q_net {
-                for dst_pol in [RISE, FALL] {
-                    if let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) {
-                        let (late_delay, late_slew) = cx.driver_response(
-                            q_net,
-                            dst_pol,
-                            delay_table,
-                            slew_table,
-                            clk_state.slew_max[edge_pol],
-                        );
-                        let (early_delay, early_slew) =
-                            if clk_state.slew_min[edge_pol] == clk_state.slew_max[edge_pol] {
-                                (late_delay, late_slew)
-                            } else {
-                                cx.driver_response(
-                                    q_net,
-                                    dst_pol,
-                                    delay_table,
-                                    slew_table,
-                                    clk_state.slew_min[edge_pol],
-                                )
-                            };
-                        let arr_max = clk_state.arrival_max[edge_pol]
-                            + late_delay * sdc.derate(true, DERATE_CELL, false, edge_pol);
-                        let arr_min = clk_state.arrival_min[edge_pol]
-                            + early_delay * sdc.derate(false, DERATE_CELL, false, edge_pol);
-                        let (dly_max, dly_min) = if delay_edge {
-                            (
-                                arr_max - clk_state.arrival_max[edge_pol],
-                                arr_min - clk_state.arrival_min[edge_pol],
-                            )
+    let eval_launch = |q: PinId,
+                       clk_state: PinTimingState,
+                       lib_arc: u32,
+                       edge_pol: usize,
+                       delay_edge: bool|
+     -> [LaunchPair; 2] {
+        let q_net = design.pin_nets[q.0 as usize];
+        let arc = &lib.arcs[lib_arc as usize];
+        let mut res = [LaunchPair::UNREACHED; 2];
+        // An unreached clock edge has infinite slew; do not feed it to the delay calculator.
+        if !clk_state.reached(edge_pol) {
+            return res;
+        }
+        if let Some(q_net) = q_net {
+            for dst_pol in [RISE, FALL] {
+                if let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) {
+                    let (late_delay, late_slew) = cx.driver_response(
+                        q_net,
+                        dst_pol,
+                        delay_table,
+                        slew_table,
+                        clk_state.slew_max[edge_pol],
+                    );
+                    let (early_delay, early_slew) =
+                        if clk_state.slew_min[edge_pol] == clk_state.slew_max[edge_pol] {
+                            (late_delay, late_slew)
                         } else {
-                            (arr_max, arr_min)
+                            cx.driver_response(
+                                q_net,
+                                dst_pol,
+                                delay_table,
+                                slew_table,
+                                clk_state.slew_min[edge_pol],
+                            )
                         };
-                        res[dst_pol] = LaunchPair {
-                            q,
-                            dst_pol,
-                            arr_max,
-                            arr_min,
-                            dly_max,
-                            dly_min,
-                            slew_max: late_slew,
-                            slew_min: early_slew,
-                        };
-                    }
+                    let arr_max = clk_state.arrival_max[edge_pol]
+                        + late_delay * sdc.derate(true, DERATE_CELL, false, edge_pol);
+                    let arr_min = clk_state.arrival_min[edge_pol]
+                        + early_delay * sdc.derate(false, DERATE_CELL, false, edge_pol);
+                    let (dly_max, dly_min) = if delay_edge {
+                        (
+                            arr_max - clk_state.arrival_max[edge_pol],
+                            arr_min - clk_state.arrival_min[edge_pol],
+                        )
+                    } else {
+                        (arr_max, arr_min)
+                    };
+                    res[dst_pol] = LaunchPair {
+                        q,
+                        dst_pol,
+                        arr_max,
+                        arr_min,
+                        dly_max,
+                        dly_min,
+                        slew_max: late_slew,
+                        slew_min: early_slew,
+                    };
                 }
             }
-            res
-        };
+        }
+        res
+    };
     // Clock-edge parity (mod 2) of the edge that launches `edge` at clock pin `clk`:
     // the propagated clock's tracked parity, or the ideal clock's parity walk
     // (which sees inverting paths). Recorded on the launched arrivals so endpoint
@@ -2678,7 +2694,9 @@ fn eval_sta(
             let (arr_max, arr_min, slew_max, slew_min) = seed.per_pol[pol];
             if ok {
                 // A port is no flip-flop launch: the CRPR sentinel bit.
-                state[p].merge(pol, arr_max, arr_min, arr_max, arr_min, slew_max, slew_min, 1, 0, 1, 1);
+                state[p].merge(
+                    pol, arr_max, arr_min, arr_max, arr_min, slew_max, slew_min, 1, 0, 1, 1,
+                );
             } else {
                 state[p].merge(
                     pol,
@@ -2850,10 +2868,7 @@ fn eval_sta(
                                         - setup,
                                 )
                             };
-                            (
-                                cap(src.arrival_max[src_pol]),
-                                cap(src.dly_max[src_pol]),
-                            )
+                            (cap(src.arrival_max[src_pol]), cap(src.dly_max[src_pol]))
                         } else {
                             (src.arrival_max[src_pol], src.dly_max[src_pol])
                         };
@@ -3453,7 +3468,12 @@ fn run_sta_partitioned(
                 }
             }
         }
-        let outcome = eval_sta(prepared, Some(keys), &disabled_borrow, SkipReport::default())?;
+        let outcome = eval_sta(
+            prepared,
+            Some(keys),
+            &disabled_borrow,
+            SkipReport::default(),
+        )?;
         class_maps.push(
             outcome
                 .entries
@@ -3594,11 +3614,9 @@ fn run_sta_partitioned(
                         continue;
                     };
                     let clk_s = class_states[ci][clk.0 as usize];
-                    let t_setup = eval_nldm_constraint(
-                        table,
-                        s.slew_max[pol],
-                        clk_s.slew_max[check.edge],
-                    ) * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
+                    let t_setup =
+                        eval_nldm_constraint(table, s.slew_max[pol], clk_s.slew_max[check.edge])
+                            * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
                     if check.latch && check.setup_arc.is_some() {
                         // Latch-D delay check (measured `latch_borrow`
                         // `delay_*`): the delay edge opens a borrow window of
@@ -3615,11 +3633,8 @@ fn run_sta_partitioned(
                         if close <= open {
                             close += sdc.period_ns;
                         }
-                        let base =
-                            n + clk_s.arrival_min[edge0_pol(clk)] - sdc.setup_uncertainty_ns;
-                        let req = w
-                            .dly
-                            .clamp(base, base + (close - open - t_setup).max(0.0));
+                        let base = n + clk_s.arrival_min[edge0_pol(clk)] - sdc.setup_uncertainty_ns;
+                        let req = w.dly.clamp(base, base + (close - open - t_setup).max(0.0));
                         pols.max[pol] = Some(Worst {
                             arr: w.dly,
                             req,
@@ -3706,8 +3721,7 @@ fn run_sta_partitioned(
                     if let Some(c) = check
                         && c.latch
                         && let (Some(hold_arc), Some(clk)) = (c.hold_arc, c.clk)
-                        && let Some(table) =
-                            constraint_table(&lib.arcs[hold_arc as usize], pol)
+                        && let Some(table) = constraint_table(&lib.arcs[hold_arc as usize], pol)
                     {
                         // Latch-D min delay check (measured `delay_min` on
                         // `u_lp/D`): delay-edge anchored —
@@ -3715,11 +3729,9 @@ fn run_sta_partitioned(
                         // `arr = dly`, `slack = dly - req`.
                         let hold = &lib.arcs[hold_arc as usize];
                         let clk_s = class_states[ci][clk.0 as usize];
-                        let t_hold = eval_nldm_constraint(
-                            table,
-                            s.slew_min[pol],
-                            clk_s.slew_min[c.edge],
-                        ) * sdc.derate(false, DERATE_CHECK, false, check_transition(hold));
+                        let t_hold =
+                            eval_nldm_constraint(table, s.slew_min[pol], clk_s.slew_min[c.edge])
+                                * sdc.derate(false, DERATE_CHECK, false, check_transition(hold));
                         let req = n
                             + clk_s.arrival_max[edge0_pol(clk)]
                             + t_hold
@@ -7685,7 +7697,9 @@ mod tests {
         assert_eq!(s.par_min[RISE], 0b11);
         assert_eq!(s.crpr_max[RISE], 0b100);
         assert_eq!(s.crpr_min[RISE], 0b110);
-        s.merge(RISE, 1.2, 0.45, 1.2, 0.45, 0.1, 0.1, 0b01, 0b10, 0b010, 0b100);
+        s.merge(
+            RISE, 1.2, 0.45, 1.2, 0.45, 0.1, 0.1, 0b01, 0b10, 0b010, 0b100,
+        );
         assert_eq!(s.par_max[RISE], 0b11);
         assert_eq!(s.par_min[RISE], 0b11);
         assert_eq!(s.crpr_max[RISE], 0b110);
@@ -7751,7 +7765,7 @@ mod tests {
 
     /// `set_max_delay`/`set_min_delay` on latch-D pins: OpenSTA applies the
     /// delay check — `req` clamps the delay arrival into the borrow window
-    /// `[N + lat0 - unc, + pulse + t_setup]` on the max side and
+    /// `[N + lat0 - unc, + pulse - t_setup]` on the max side and
     /// `N + lat0 + t_hold + hold_unc` on the min side. A covered `-to` also
     /// silences the latch's `D -> Q` borrow arc for the whole signature
     /// class, and paths launched through a latch open edge re-base their
