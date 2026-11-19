@@ -2691,6 +2691,14 @@ composite key.
   dependency, and every clock pin's slew — all the consumers need — is
   exact either way. The retry only fires where the precise order already
   fails, so all existing goldens are unchanged (the full suite re-passed).
+- **Runtime cost (measured 2026-11-19, debug build, `sta` elapsed on
+  `--def`+`--sdc` runs)**: the extra `propagate_slew` + `propagate_clock`
+  under the ideal clock roughly doubles eval time — ibex 62.0 → 114.6 ms,
+  picorv32 31.7 → 64.2 ms (median of 3, same binary `target/debug/grus-eda`
+  on unchanged vs this checkout; reported timing identical on both). The
+  slew pass covers all pins because `propagate_clock` needs input slews on
+  every clock-net driver; pruning to the clock subgraph is possible future
+  work if this cost ever matters — absolute times stay in the tens of ms.
 
 ### Comparison vs golden (committed `compare_sta_edge`, `Tol::STRICT`)
 

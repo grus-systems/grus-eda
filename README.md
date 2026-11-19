@@ -12,8 +12,10 @@ its numbers agree with that tool's.
 > SDC (stock LibreLane `write_sdc` output parses unchanged) and models clocks
 > both ideally and via `set_propagated_clock`, including latch `D -> Q` and
 > time borrowing for `sky130_fd_sc_hd` shapes. Recognised check arcs the
-> endpoint model does not evaluate (`non_seq_*`,
-> `three_state_*`, `preserve`, async `Clear`/`Preset`) are counted and shown
+> endpoint model does not evaluate (`non_seq_*`, `three_state_*`, `preserve`,
+> async `Clear`/`Preset`, and `min_pulse_width` arcs whose pin is off the
+> clock network — clock-pin `min_pulse_width` arcs are evaluated) are counted
+> and shown
 > but exempt from `--strict`: they add checks outside the reported set rather
 > than altering an arrival. Cells driven far outside their Liberty timing
 > tables can diverge from OpenSTA. Every run prints what it left out as

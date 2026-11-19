@@ -3437,16 +3437,25 @@ fn run_sta_partitioned(
                         class_states[ci][clk.0 as usize].slew_max[check.edge],
                     ) * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
                     let capture = class_states[ci][clk.0 as usize].arrival_min[check.edge];
-                    let credit = design.pin_nets[clk.0 as usize].map_or(0.0, |capture_net| {
-                        crpr_credit(
-                            design,
-                            prepared.clock_state.as_deref(),
-                            &prepared.crpr_tags,
-                            s.crpr_max[pol],
-                            capture_net,
-                            check.edge,
-                        )
-                    });
+                    // `clock_state` is also filled under the ideal clock for
+                    // the pulse-width checks, so gate on the clock mode like
+                    // `credit_for` does — the credit is zero under ideal
+                    // (measured: `pcr_*` scenarios all use
+                    // `set_propagated_clock`).
+                    let credit = if sdc.propagated_clock {
+                        design.pin_nets[clk.0 as usize].map_or(0.0, |capture_net| {
+                            crpr_credit(
+                                design,
+                                prepared.clock_state.as_deref(),
+                                &prepared.crpr_tags,
+                                s.crpr_max[pol],
+                                capture_net,
+                                check.edge,
+                            )
+                        })
+                    } else {
+                        0.0
+                    };
                     let req = capture - sdc.setup_uncertainty_ns - t_setup + n + credit;
                     pols.max[pol] = Some(Worst {
                         req,
@@ -3850,11 +3859,13 @@ fn eval_pulse_width_checks(
             let reached = c.is_some_and(|s| s.reached(open) && s.reached(close));
             if !reached {
                 skipped.unreached_endpoints += 1;
+                // `pin` stays a bare pin name like every other skipped
+                // endpoint; the pulse edge goes in `related`.
                 skipped.skipped_endpoints.push(SkippedEndpoint {
-                    pin: format!("{} ({})", cx.pin_name(pin), edge_label(edge)),
+                    pin: cx.pin_name(pin),
                     kind: EndpointKind::MinPulseWidth,
                     reason: SkipReason::NoClock,
-                    related: Some(cx.pin_name(pin)),
+                    related: Some(edge_label(edge).to_string()),
                 });
                 continue;
             }

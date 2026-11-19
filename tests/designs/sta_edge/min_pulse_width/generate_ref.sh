@@ -31,6 +31,11 @@ if [ ! -f /.dockerenv ] && [ ! -f /nix/var/nix/profiles/default/bin/openroad ]; 
     exit 0
 fi
 
+# Per-scenario intermediates live in a scratch dir so a mid-run failure
+# leaves no stale untracked files in the fixture dir.
+SCRATCH_DIR="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+
 run_sta () {
     local sdc_file="$1"
     local out_file="$2"
@@ -125,7 +130,7 @@ set viol_min [count_violations [find_timing_paths -path_delay min -endpoint_path
 set endpoints [collect_endpoints_json]
 set pulse_width [collect_pulse_width_json "/tmp/pw_rows.txt"]
 
-set fp [open "/work/tests/designs/sta_edge/min_pulse_width/$out_file" "w"]
+set fp [open "$SCRATCH_DIR/$out_file" "w"]
 puts \$fp "{"
 puts \$fp "    \"wns_max_ns\": \$wns_max,"
 puts \$fp "    \"tns_max_ns\": \$tns_max,"
@@ -159,9 +164,8 @@ done
         if [ $first -eq 0 ]; then printf ',\n'; fi
         first=0
         printf '  "%s": ' "$name"
-        cat "ref_$name.json"
+        cat "$SCRATCH_DIR/ref_$name.json"
     done
     printf '\n}\n'
 } > min_pulse_width.reference.json
-rm -f ref_*.json
 echo "Wrote min_pulse_width.reference.json"
