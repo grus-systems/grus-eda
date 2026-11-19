@@ -3012,3 +3012,94 @@ compose → `delay_allregs` goes red on 17 rows (`u_f0/D` reports
   propagated clock + derate — ungoldened).
 - `set_min_delay` on `dlxtn` latch-D and latch-cell `RESET_B`
   (golden-verified on `dlxtp`/`dfrtp` only).
+
+### 2026-11-19 — N7 — SAIF-driven power estimation vs OpenROAD `read_saif` + `report_power` (v0.1.96)
+
+Adds `grus-eda power --saif <file> [--saif-scope <a/b>]` next to `--vcd`
+(exactly one required). `readers/saif.rs` parses the SAIF S-expression
+tree (header `TIMESCALE`/`DURATION`, `INSTANCE`/`VIRTUAL INSTANCE`
+scopes, `NET`/`PORT` signal groups with `T0 T1 TX TZ TB TC IG`), resolves
+the selected scope's nets against `DesignDb`, and converts `TC` into the
+same per-net rise/fall `VcdActivity` the estimator already consumes —
+power math unchanged.
+
+**Reference**: committed `tests/designs/microbench/generate_saif_ref.sh`
+inside `ghcr.io/librelane/librelane:3.0.16`. It converts `mb.vcd` to
+`mb.saif` (`vcd2saif.py`, window `[10, 2000]` = `DURATION 1990` at
+`TIMESCALE 1 ns`), runs `read_vcd -scope tb/dut` + `read_saif -scope
+tb/dut` in two `openroad -exit` sessions on identical lib/LEF/DEF/SDC,
+cross-checks the VCD table against committed `mb.openroad.txt`
+("session-A table agrees … (print rounding)"), and writes
+`mb.saif.openroad.txt` + `mb.saif.reference.json` from the tool output.
+Re-run end-to-end on this change; the committed files were regenerated
+by the script, not hand-edited.
+
+#### Measured SAIF semantics (probe variants in `generate_saif_ref.sh` §5)
+
+- **`TC` drives activity.** All `TC` x10: switching exactly x10
+  (Sequential `7.782512e-09`→`7.782512e-08`, Combinational
+  `1.628141e-07`→`1.628141e-06`), Combinational internal x10
+  (`5.640221e-09`→`5.640221e-08`). Sequential internal only rose
+  `2.078949e-06`→`2.467381e-06` (~1.19x): the `dfxtp` clock-pin internal
+  energy follows the SDC clock frequency, not the `clk` net's `TC` — on
+  clock nets OpenSTA's own clock activity wins over SAIF.
+- **`T0`/`T1` unused by `report_power`.** Swapping duty on `clk`
+  (`T0 990/T1 1000` ↔ `1000/990`) and on `y` (`800/1190` ↔ `1190/800`)
+  left every column identical.
+- **`TX`/`IG` ignored.** `TX 0`→`40` + `IG 0`→`40` on `y`: identical
+  report.
+- **`TZ`/`TB`** carry no measured effect either; the fixture keeps them 0.
+- **Ports vs pins.** Rewriting the two `INSTANCE` `NET` blocks as `PORT`
+  groups dropped annotation to `saif 3 / unannotated 5` yet the report
+  was identical — OpenSTA annotates *pins*, and unannotated pins fall
+  back to propagated/default activity rather than zero.
+- **Unmatched scopes are silently dropped** by `read_saif`: the fixture's
+  `(INSTANCE ghost …)` under `dut` produced no warning and `saif 8 /
+  unannotated 0` either way. Our resolver instead counts it:
+  `saif_unmatched_scopes = 1`.
+- **`TIMESCALE`/`DURATION`** set the window; `DURATION 1990` ns here.
+  `TC` is a count over the window, so rate = `TC / DURATION`.
+
+#### Ours vs golden (`power::tests::test_saif_power_mb_matches_opensta`)
+
+| quantity | grus-eda | OpenROAD SAIF | diff |
+|---|---|---|---|
+| Sequential internal | 2.089179e-6 | 2.078949e-6 | +0.5% |
+| Sequential switching | 7.495960e-9 | 7.782512e-9 | -3.7% |
+| Sequential leakage | 8.438634e-12 | 8.420037e-12 | +0.2% |
+| Combinational internal | 5.713997e-9 | 5.640221e-9 | +1.3% |
+| Combinational switching | 1.628141e-7 | 1.628141e-7 | -0.0004% |
+| Combinational leakage | 5.326682e-12 | 4.321106e-12 | +23% (~1.0e-12) |
+| Total internal | 2.094893e-6 | 2.084589e-6 | +0.5% |
+| Total switching | 1.703100e-7 | 1.705966e-7 | -0.17% |
+| Total leakage | 1.376532e-11 | 1.274114e-11 | +8% (~1.0e-12) |
+| **Total** | **2.265217e-6** | **2.255199e-6** | **+0.4%** |
+
+Test bounds: internal 2%, switching 5%, total 1%, leakage 25% with a
+1.5e-12 absolute floor (pW-class terms where relative error is large but
+the absolute gap is ~1e-12 W). Residuals are the same ones the VCD run
+showed — the sequential switching undercount and the seq-internal
+overcount trace to OpenSTA's per-pin activity/slew handling, not to SAIF
+decoding; the estimator and its divergences are unchanged.
+
+**SAIF-vs-VCD agreement on the same window**: OpenROAD itself reports
+slightly different totals for the two inputs (VCD `2.254101e-6` vs SAIF
+`2.255199e-6`, ~0.05%) — `read_vcd` and `read_saif` feed different
+annotation paths. Our converter reconstructs the exact edge counts, so
+our SAIF report equals our VCD report bit-for-bit (asserted in the
+test).
+
+**Hierarchy resolution**: `--saif-scope tb/dut` mirrors `read_saif
+-scope`; with no flag the resolver auto-selects when exactly one
+top-level scope chain exists (errors on ambiguity). `INSTANCE` names
+resolve against DEF cells, `NET`/`PORT` names against their pins/nets;
+anything unmatched is counted (`saif_unmatched_scopes`,
+`saif_unmatched_signals`), never silently dropped — one stricter
+behaviour than OpenROAD.
+
+**Fail-proof**: rewriting `clk` `TC 200`→`400` in `mb.saif` turns the
+test red (`Sequential internal: ours 4.135e-6 vs opensta 2.078949e-6`);
+restored via `vcd2saif.py`, suite green.
+
+**Checks run**: `cargo test -p grus-core saif`/`power` (12+2 pass),
+`cargo clippy --workspace --all-targets -- -D warnings` clean.

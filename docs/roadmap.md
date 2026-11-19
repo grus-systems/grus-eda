@@ -407,11 +407,15 @@ Remaining:
 - VCD/SAIF-driven power estimation checked against OpenROAD
   `report_power` within a stated tolerance. Largest item; only if power
   estimation is in scope for the project.
-- **Status (2026-11-18)**: VCD path implemented and formula-validated
-  against a clocked micro-benchmark (<2% on every metric vs
-  `report_power`). On `gcd` the totals diverge because OpenSTA propagates
-  activity statistically (BDD + `findSeqActivity`) rather than reading
-  per-net VCD counts; our exact per-net counts are reported instead, and
-  the residual is documented in `docs/results.md`. Still open: SAIF input,
-  `when`-conditional power blocks, and matching OpenSTA's activity
-  propagation if a closer `report_power` agreement is ever required.
+- **Status (2026-11-19)**: VCD and SAIF paths implemented and
+  formula-validated against a clocked micro-benchmark. `--saif` reads
+  `TC` aggregates, reconstructs the same per-net edge counts as `--vcd`,
+  and matches OpenROAD `read_saif` + `report_power` within ~0.5% total
+  on the committed golden (`mb.saif.reference.json`); OpenSTA SAIF
+  field semantics were measured in-container (docs/results.md). On `gcd`
+  the totals diverge because OpenSTA propagates activity statistically
+  (BDD + `findSeqActivity`) rather than reading per-net VCD counts; our
+  exact per-net counts are reported instead, and the residual is
+  documented in `docs/results.md`. Still open: `when`-conditional power
+  blocks, and matching OpenSTA's activity propagation if a closer
+  `report_power` agreement is ever required.
