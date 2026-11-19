@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Reference generation for the microbench SAIF power fixture. Converts mb.vcd to
-# mb.saif via vcd2saif.py, then runs two OpenROAD sessions on identical design
-# inputs: `read_vcd -scope tb/dut` + `report_power -digits 6` (checked against
-# the committed mb.openroad.txt table) and `read_saif -scope tb/dut` +
-# `report_power -digits 6` (committed as mb.saif.openroad.txt). Both tables are
-# parsed into mb.saif.reference.json. A final section re-measures the SAIF
-# field semantics (TC scaling, T0/T1 duty, IG/TX, PORT groups, ghost scopes);
-# its output is recorded in docs/results.md, not committed.
+# mb.saif via vcd2saif.py over the truncated window [10, 1990] (DURATION 1980,
+# --window-end 1990: dropping clk's final #2000 fall makes its TC odd, so the
+# golden exercises the odd-TC rise/fall split), then runs two OpenROAD sessions
+# on identical design inputs: `read_vcd -scope tb/dut` + `report_power -digits 6`
+# (checked against the committed mb.openroad.txt table) and `read_saif -scope
+# tb/dut` + `report_power -digits 6` (filtered stdout committed as
+# mb.saif.openroad.txt). Both tables are parsed into mb.saif.reference.json.
+# A final section re-measures the SAIF field semantics (TC scaling, T0/T1 duty,
+# IG/TX, PORT groups, ghost scopes); its output is recorded in docs/results.md,
+# not committed.
 # Runs inside ghcr.io/librelane/librelane:3.0.16.
 set -euo pipefail
 
@@ -34,9 +37,11 @@ fi
 
 cd /work/tests/designs/microbench
 
-# 1. Convert the VCD window to SAIF aggregates; --ghost-scope adds an
-#    unmatched (INSTANCE ghost ...) under dut to exercise drop diagnostics.
-python3 vcd2saif.py --ghost-scope tb/dut mb.vcd mb.saif
+# 1. Convert the VCD window [10, 1990] to SAIF aggregates (DURATION 1980);
+#    --window-end drops clk's last #2000 fall so its TC is odd, exercising
+#    the rise/fall split. --ghost-scope adds an unmatched (INSTANCE ghost ...)
+#    under dut to exercise drop diagnostics.
+python3 vcd2saif.py --ghost-scope tb/dut --window-end 1990 mb.vcd mb.saif
 
 cat > /tmp/mb_reads.tcl <<'TCL'
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
@@ -54,7 +59,10 @@ TCL
 } > /tmp/session_vcd.tcl
 openroad -no_init -no_splash -exit /tmp/session_vcd.tcl > /tmp/mb_vcd_power.txt
 
-# 3. Session B: SAIF-driven report_power; whole stdout is the committed raw file.
+# 3. Session B: SAIF-driven report_power. The committed mb.saif.openroad.txt is
+#    FILTERED stdout — grep -v drops INFO/WARNING/banner/blank lines so the file
+#    keeps the annotation count, report table, and annotation split without
+#    tool-version noise. It is not verbatim stdout.
 {
     cat /tmp/mb_reads.tcl
     echo "read_saif -scope tb/dut /work/tests/designs/microbench/mb.saif"
@@ -123,15 +131,45 @@ print("wrote mb.saif.reference.json")
 PY
 
 # 5. Field-semantics probes (recorded in docs/results.md; no committed output).
+#    Every variant mutates fields via a regex anchored on the signal NAME —
+#    positional replaces hit the first matching field values in file order,
+#    which are shared across the net and pin views of clk/q/y.
 python3 - <<'PY'
 import re
 
 text = open("/work/tests/designs/microbench/mb.saif").read()
+
+
+def sig_fields(text, name):
+    """Return the re.Match of the `(<name> (T0 ..) ..)` line."""
+    m = re.search(rf"\({re.escape(name)} \(T0 (\d+)\) \(T1 (\d+)\) "
+                  rf"\(TX (\d+)\) \(TZ (\d+)\) \(TB (\d+)\) \(TC (\d+)\) "
+                  rf"\(IG (\d+)\)\)", text)
+    assert m, f"signal {name} not found"
+    return m
+
+
+# Duty swap anchored on the signal name. `a` and `y` carry asymmetric duty;
+# clk's is degenerate (T0 == T1) under the truncated window, so swapping it
+# would measure nothing.
+def duty_swap(text, name):
+    m = sig_fields(text, name)
+    new = m.group(0).replace(f"(T0 {m.group(1)}) (T1 {m.group(2)})",
+                             f"(T0 {m.group(2)}) (T1 {m.group(1)})")
+    return text[:m.start()] + new + text[m.end():]
+
+
+def igtx(text, name):
+    m = sig_fields(text, name)
+    new = m.group(0).replace("(TX 0)", "(TX 40)").replace("(IG 0)", "(IG 40)")
+    return text[:m.start()] + new + text[m.end():]
+
+
 variants = {
     "tc10": re.sub(r"\(TC (\d+)\)", lambda m: f"(TC {int(m.group(1)) * 10})", text),
-    "duty_clk": text.replace("(T0 990) (T1 1000)", "(T0 1000) (T1 990)", 1),
-    "duty_y": text.replace("(T0 800) (T1 1190)", "(T0 1190) (T1 800)", 1),
-    "igtx": text.replace("(TX 0)", "(TX 40)", 1).replace("(IG 0)", "(IG 40)", 1),
+    "duty_a": duty_swap(text, "a"),
+    "duty_y": duty_swap(text, "y"),
+    "igtx": igtx(text, "y"),
     "port": text.replace(
         "(INSTANCE _d_\n        (NET", "(INSTANCE _d_\n        (PORT"
     ).replace("(INSTANCE _i_\n        (NET", "(INSTANCE _i_\n        (PORT"),
@@ -151,7 +189,7 @@ for name, body in variants.items():
 print("wrote probe variants:", ", ".join(variants))
 PY
 
-for v in tc10 duty_clk duty_y igtx port noghost; do
+for v in tc10 duty_a duty_y igtx port noghost; do
     echo "===== probe: $v ====="
     {
         cat /tmp/mb_reads.tcl

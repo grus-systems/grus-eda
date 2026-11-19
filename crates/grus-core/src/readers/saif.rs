@@ -595,6 +595,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(split_tc(&high), (99, 100));
+        // Duty tie resolves to rise (the start-low assumption); mb's clk hits
+        // this case under the truncated [10,1990] window.
+        let tie = SaifFields {
+            tc: 199,
+            t0: 990.0,
+            t1: 990.0,
+            ..Default::default()
+        };
+        assert_eq!(split_tc(&tie), (100, 99));
     }
 
     #[test]
@@ -646,20 +655,22 @@ mod tests {
         let text = saif(&format!(
             "(INSTANCE tb (INSTANCE dut (NET {} {} {} {} {}) \
              (INSTANCE _d_ (NET {} {} {})) (INSTANCE ghost (NET {}))))",
-            sig("clk", 200, 990, 1000),
-            sig("a", 4, 1190, 800),
-            sig("q", 4, 1190, 800),
-            sig("y", 4, 800, 1190),
+            // Mirrors the committed mb.saif (window [10,1990]): clk/CLK carry
+            // the odd TC=199 with a duty tie -> (100,99).
+            sig("clk", 199, 990, 990),
+            sig("a", 4, 1180, 800),
+            sig("q", 4, 1180, 800),
+            sig("y", 4, 800, 1180),
             sig("dut_sig", 4, 100, 100), // matches no net or port
-            sig("D", 4, 1190, 800),
-            sig("CLK", 200, 990, 1000),
-            sig("Q", 4, 1190, 800),
+            sig("D", 4, 1180, 800),
+            sig("CLK", 199, 990, 990),
+            sig("Q", 4, 1180, 800),
             sig("ghost_sig", 2, 10, 10),
         ));
         let act = parse_saif(&text).expect("parse");
         let design = mini_design();
         let (vcd, diag) = act.resolve(&design, None).expect("resolve");
-        assert_eq!((vcd.signals["clk"].rise, vcd.signals["clk"].fall), (100, 100));
+        assert_eq!((vcd.signals["clk"].rise, vcd.signals["clk"].fall), (100, 99));
         assert_eq!((vcd.signals["a"].rise, vcd.signals["a"].fall), (2, 2));
         assert_eq!((vcd.signals["q"].rise, vcd.signals["q"].fall), (2, 2));
         assert_eq!((vcd.signals["y"].rise, vcd.signals["y"].fall), (2, 2));

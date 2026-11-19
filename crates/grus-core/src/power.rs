@@ -513,16 +513,32 @@ mod tests {
         );
         check("total", report.total_w, t["total_w"].as_f64().unwrap(), 0.01, 0.0);
 
-        // Every mb.saif net reconstructs its VCD edge count (clk TC=200 ->
-        // (100,100), the others TC=4 -> (2,2)), so the SAIF-driven report must
-        // equal the VCD-driven report exactly.
+        // Per-net comparison against the VCD annotation (AGENTS §7 rule 5):
+        // every net reconstructs its VCD edge counts except clk, whose TC=199
+        // covers the truncated [10,1990] SAIF window — the #2000 fall is
+        // outside it, so resolved clk differs by exactly one fall.
         let vcd = crate::readers::load_vcd(&vcd_path).expect("vcd");
-        let vcd_report = estimate_power(&design, &lib, &sdc, None, &vcd, &pin_slews);
-        assert_eq!(report.total_w, vcd_report.total_w);
-        for (a, b) in report.groups.iter().zip(&vcd_report.groups) {
-            assert_eq!(a.internal_w, b.internal_w);
-            assert_eq!(a.switching_w, b.switching_w);
-            assert_eq!(a.leakage_w, b.leakage_w);
+        for (name, sa) in &activity.signals {
+            let va = vcd
+                .signals
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("net {name} missing from VCD activity"));
+            let expected = if name == "clk" {
+                (va.rise, va.fall - 1)
+            } else {
+                (va.rise, va.fall)
+            };
+            assert_eq!((sa.rise, sa.fall), expected, "net {name}");
         }
+        assert_eq!(
+            (activity.signals["clk"].rise, activity.signals["clk"].fall),
+            (100, 99)
+        );
+
+        // The reports differ only by clk's one dropped fall over a window
+        // 10ns shorter; the measured delta is recorded in docs/results.md.
+        let vcd_report = estimate_power(&design, &lib, &sdc, None, &vcd, &pin_slews);
+        let rel = (report.total_w - vcd_report.total_w).abs() / vcd_report.total_w;
+        assert!(rel < 0.01, "SAIF-vs-VCD total delta {rel:e} exceeds 1%");
     }
 }

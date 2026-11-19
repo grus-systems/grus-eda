@@ -39,16 +39,16 @@
   },
   "power_saif": {
     "Sequential": {
-      "internal_w": 2.078949e-06,
-      "switching_w": 7.782512e-09,
-      "leakage_w": 8.420037e-12,
-      "total_w": 2.08674e-06
+      "internal_w": 2.079167e-06,
+      "switching_w": 7.821818e-09,
+      "leakage_w": 8.420709e-12,
+      "total_w": 2.086997e-06
     },
     "Combinational": {
-      "internal_w": 5.640221e-09,
-      "switching_w": 1.628141e-07,
-      "leakage_w": 4.321106e-12,
-      "total_w": 1.684586e-07
+      "internal_w": 5.668707e-09,
+      "switching_w": 1.636363e-07,
+      "leakage_w": 4.341941e-12,
+      "total_w": 1.693094e-07
     },
     "Clock": {
       "internal_w": 0.0,
@@ -69,10 +69,10 @@
       "total_w": 0.0
     },
     "total": {
-      "internal_w": 2.084589e-06,
-      "switching_w": 1.705966e-07,
-      "leakage_w": 1.274114e-11,
-      "total_w": 2.255199e-06
+      "internal_w": 2.084836e-06,
+      "switching_w": 1.714582e-07,
+      "leakage_w": 1.276265e-11,
+      "total_w": 2.256307e-06
     }
   }
 }

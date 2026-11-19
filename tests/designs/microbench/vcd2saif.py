@@ -9,7 +9,8 @@ Vector signals and real-valued changes bail loudly: mb.vcd is all scalars.
 The scope tree mirrors the VCD `$scope` hierarchy and every signal lands in
 a `NET` group, the only form OpenSTA 3.0.16 annotates. An optional
 `--ghost-scope <path>` adds an unmatched `(INSTANCE ghost ...)` to exercise
-annotation-drop diagnostics.
+annotation-drop diagnostics; `--window-end <ts>` truncates the aggregation
+window (and DURATION) before the dump's last timestamp.
 """
 
 import argparse
@@ -177,10 +178,22 @@ def main():
         help="instance path (e.g. tb/dut) under which to add an unmatched "
         "(INSTANCE ghost ...) scope for diagnostics testing",
     )
+    ap.add_argument(
+        "--window-end",
+        type=int,
+        default=None,
+        metavar="TS",
+        help="VCD timestamp overriding the aggregation window's last_ts "
+        "(and DURATION); later events are ignored",
+    )
     args = ap.parse_args()
 
     root, _timescale_s, first_ts, last_ts = parse_vcd(args.vcd)
+    if args.window_end is not None:
+        last_ts = args.window_end
     duration = last_ts - first_ts
+    if duration <= 0:
+        die(f"window [{first_ts}, {last_ts}] is not positive")
 
     def walk(node):
         for d in node["signals"]:

@@ -409,9 +409,10 @@ Remaining:
   estimation is in scope for the project.
 - **Status (2026-11-19)**: VCD and SAIF paths implemented and
   formula-validated against a clocked micro-benchmark. `--saif` reads
-  `TC` aggregates, reconstructs the same per-net edge counts as `--vcd`,
-  and matches OpenROAD `read_saif` + `report_power` within ~0.5% total
-  on the committed golden (`mb.saif.reference.json`); OpenSTA SAIF
+  `TC` aggregates and reconstructs the per-net edge counts (`--vcd`
+  counts minus clk's one fall outside the truncated `[10,1990]` SAIF
+  window), matching OpenROAD `read_saif` + `report_power` within ~0.4%
+  total on the committed golden (`mb.saif.reference.json`); OpenSTA SAIF
   field semantics were measured in-container (docs/results.md). On `gcd`
   the totals diverge because OpenSTA propagates activity statistically
   (BDD + `findSeqActivity`) rather than reading per-net VCD counts; our
