@@ -3412,3 +3412,60 @@ list updated in `fixture.md` and `probe.sh` accordingly.
 `probe.sh` re-run produced byte-identical `two_clock.probe.json` +
 `probe_*.txt` (`diff -r` against the first run). No existing goldens
 touched (fixture is probe-only, no regression target yet).
+
+### 2026-11-20 — `mc-model`: SDC clock table + single-domain STA gate (v0.2.0)
+
+First ticket of the `docs/multi-clock.md` sequence. `Sdc`'s single clock
+slot is replaced by `clocks: Vec<Clock>` — one row per `create_clock` in
+file order (name, optional port, period, network+source latency,
+setup+hold uncertainty, transition, propagated flag). Internal clock
+references are row indices (`ClockId`); `Sdc::design_clock()` returns the
+first port-bearing row for the single-domain evaluator. All clock-targeting
+commands resolve `[get_clocks {...}]` against the table row-wise.
+
+#### Commands run
+
+- `grus-eda sta --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef .../sky130_fd_sc_hd__nom.tlef --lef .../sky130_fd_sc_hd.lef --def tests/designs/sta_clocks/two_clock.def --sdc tests/designs/sta_clocks/t2_int.sdc` (release binary, exit code 1) — stderr, verbatim:
+
+  ```
+  Error: sta: 2 design clocks declared (cka, ckb); multi-clock analysis is not implemented yet
+  ```
+
+  The gate sits in `run_sta_detail`, so `run_sta`, `run_sta_quiet` and
+  `sta_pin_slews` share it; pinned by
+  `sta::analysis::tests::sta_bails_on_a_two_clock_sdc`.
+- Fail-proof: the gate temporarily disabled (`if false && ...`) —
+  `sta_bails_on_a_two_clock_sdc` goes red and `run_sta` returns a full
+  report with all 8 endpoints timed against `cka`'s lattice (the silent
+  fold this gate exists to prevent). Gate restored, test green again.
+
+#### Post-change break table (grus-eda, HEAD)
+
+| SDC construct | behaviour |
+|---|---|
+| 2nd+ `create_clock` on a port / virtual clock with any period | accepted — appends a table row |
+| `set_clock_latency`/`-transition`/`set_clock_uncertainty` on `[get_clocks {a b}]` | applied to every named row |
+| `set_clock_uncertainty 0.20 [get_clocks vclk]` | lands on `vclk`'s row only (probe's silent wrong-target bug fixed; `uncertainty_lands_on_the_named_row`) |
+| `set_input_delay`/`-output_delay -clock <name>` | resolves any row (`delay_clock_references_a_domain_row`) |
+| `set_propagated_clock [get_clocks {<subset>}]` | per-row flag (`propagated_clock_is_per_domain`) |
+| `set_clock_latency -early`/`-late` | parse bail: ``unsupported option `-early` `` |
+| `set_clock_uncertainty -from ... -to ...` | parse bail: `set_clock_uncertainty takes a value and optional clock names` |
+| `create_clock -waveform` | parse bail: ``unsupported option `-waveform` `` |
+| `set_clock_groups` | parse bail: ``unsupported command `set_clock_groups` `` |
+| unknown `-clock` name / `set_propagated_clock` on a virtual clock / `create_clock -period 0` | parse bail (`multi_clock_bails` pins each message) |
+| `sta` on a >1-design-clock SDC | eval bail before graph prep (message above) — no silent fold |
+| no-target `set_clock_latency`/`set_clock_uncertainty` before the first `create_clock` | parse bail: `no design clock declared yet` (was: silently wrote the single-clock fields; `clock_commands_before_create_clock_bail`) |
+
+New parse/model tests in `sdc.rs::tests`: `second_design_clock_appends_a_row`,
+`virtual_clock_keeps_its_own_period`, `uncertainty_lands_on_the_named_row`,
+`multi_name_clock_lists_apply_to_every_row`,
+`clock_commands_target_second_domain_rows`, `propagated_clock_is_per_domain`,
+`delay_clock_references_a_domain_row`, `clock_commands_before_create_clock_bail`;
+`multi_clock_bails` updated to pin only the still-unsupported forms.
+
+**Checks run**: `cargo test --workspace` (299+3 pass, 2 ignored — includes
+all existing goldens, unchanged inputs and expected outputs),
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+`git status` shows no modifications under `tests/` or `kurena/`.
+Version 0.1.98 → 0.2.0 (`Sdc`'s public clock fields were replaced by the
+table + accessors — breaking for direct field users).
