@@ -120,6 +120,12 @@ EOF
 
 run_sta latch.sdc ideal.json
 run_sta prop.sdc propagated.json
+run_sta delay_max.sdc delay_max.json
+run_sta delay_min.sdc delay_min.json
+run_sta delay_ln.sdc delay_ln.json
+run_sta delay_from.sdc delay_from.json
+run_sta delay_allregs.sdc delay_allregs.json
+run_sta delay_prop.sdc delay_prop.json
 
 MODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 {
@@ -128,7 +134,22 @@ MODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     cat "${MODE_DIR}/ideal.json"
     printf ',\n  "propagated": '
     cat "${MODE_DIR}/propagated.json"
+    printf ',\n  "delay_max": '
+    cat "${MODE_DIR}/delay_max.json"
+    printf ',\n  "delay_min": '
+    cat "${MODE_DIR}/delay_min.json"
+    printf ',\n  "delay_ln": '
+    cat "${MODE_DIR}/delay_ln.json"
+    printf ',\n  "delay_from": '
+    cat "${MODE_DIR}/delay_from.json"
+    printf ',\n  "delay_allregs": '
+    cat "${MODE_DIR}/delay_allregs.json"
+    printf ',\n  "delay_prop": '
+    cat "${MODE_DIR}/delay_prop.json"
     printf '\n}\n'
 } > "${MODE_DIR}/latch_borrow.reference.json"
-rm -f "${MODE_DIR}/ideal.json" "${MODE_DIR}/propagated.json"
+rm -f "${MODE_DIR}/ideal.json" "${MODE_DIR}/propagated.json" \
+    "${MODE_DIR}/delay_max.json" "${MODE_DIR}/delay_min.json" \
+    "${MODE_DIR}/delay_ln.json" "${MODE_DIR}/delay_from.json" \
+    "${MODE_DIR}/delay_allregs.json" "${MODE_DIR}/delay_prop.json"
 echo "Wrote latch_borrow.reference.json"

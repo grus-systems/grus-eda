@@ -38,7 +38,7 @@ max_arr 1.655783`, slack 0).
 
 | scenario | verdict | measured req rule |
 |---|---|---|
-| `delay_max` (B1) `set_max_delay 1.0 -to u_lp/D` | applied | `req = clamp(arr_dly, base, base + pulse + t_setup)`, `base = N + lat0 − setup_uncertainty` — the delay edge opens a window of the latch's own pulse width; borrowing stops at `pulse + t_setup`, not at the clock closing edge |
+| `delay_max` (B1) `set_max_delay 1.0 -to u_lp/D` | applied | `req = clamp(arr_dly, base, base + pulse − t_setup)`, `base = N + lat0 − setup_uncertainty` — the delay edge opens a window of the latch's own pulse width; borrowing stops at `pulse − t_setup`, not at the clock closing edge. **Sign corrected at regen**: OpenSTA prints the setup term negated ("library setup time -0.18"), which misled the original `pulse + t_setup` note; `delay_allregs` measured the bound (e.g. `u_ln2/D` `0.9 + 3.4 − 0.1645 = 3.235511`) |
 | `delay_min` (B2) `set_min_delay 0.5 -to u_lp/D` | applied | `req = N + lat0 + t_hold + hold_uncertainty` — delay-edge anchored, not closing-edge |
 | `delay_ln` (B3) `set_max_delay 1.5 -to u_ln/D` | applied | same clamp rule on a non-borrowing shape (`arr_dly < base` clamps at `base`) |
 | `delay_from` (B4) `-from [get_ports p_lp]` | applied | port-seed coverage of the latch launch |

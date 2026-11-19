@@ -2839,3 +2839,128 @@ missing-name warning matters); our side counts `set_load` ignored.
   fails `test_sta_exceptions_match_opensta` on `ld_badnet u_ff1/D.max_arr_ns`
   (ours `1.3133256` vs ref `1.710434`, rel 2.3e-1) — the applied path is
   what the golden measures.
+
+## 2026-11-19 — path delays on async-check and latch-D endpoints (v0.1.95)
+
+Probe of `docs/path-delays.md` §5 item 1's measurable half: does OpenSTA
+honour `set_max_delay`/`set_min_delay` on the two endpoint kinds counted
+in `unsupported_path_delay_endpoints`? Reference command = the committed
+`tests/designs/sta_edge/{async_reset,latch_borrow}/generate_ref.sh`, run
+as written inside `ghcr.io/librelane/librelane:3.0.16` (`openroad
+-no_init -no_splash`). Baselines `ideal`/`propagated`/`prop` regenerated
+byte-identical; all new values are the `delay_*` sections of
+`async_reset.reference.json` / `latch_borrow.reference.json`.
+
+### Verdict table (kind, side)
+
+| endpoint kind | max | min |
+|---|---|---|
+| async-check (`u_ff0/RESET_B`, dfrtp) | **applied** | **applied** |
+| latch-D (`u_lp/D` dlxtp, `u_ln/D` dlxtn) | **applied** | **applied** |
+| clock-gate enable | not probed — stays counted | not probed |
+
+No (kind, side) came back ignored or errored — both halves resolve to
+implementation, not kept skips.
+
+### Async-check — applied, FF formula with edge0 anchor
+
+`u_ff0/RESET_B` (`delay_max`, `-to [get_pins u_ff0/RESET_B]`):
+`req 4.900132 -> 1.900132 = 0.7 (capture_min[RISE]) - 0.05 (unc) -
+(-0.250132) (t_recovery) + 1.0 (N)` — the recovery arc plays `late_arc`.
+`delay_min`: `req 1.132095 -> 1.632095 = removal_base + 0.5` — the
+removal arc plays `early_arc`. `delay_from` (`-from [get_ports rst_n]`)
+is byte-identical to `delay_max` on that pin — the port seed covers the
+launch. `delay_cell` (`-to [get_cells u_ff0]`) moves both `u_ff0/D`
+(req `1.524392`) and `u_ff0/RESET_B`. `delay_prop` anchors on the
+propagated capture arrival (`req 1.404679`).
+
+Anchor correction vs the pre-commit record: the delay req anchors at
+the **first edge reaching the clock pin** (`edge0`), not `check.edge`.
+On `u_rbp/RESET_B` (dlrbp, recovery fires FALL) `delay_allregs` reports
+req `0.912087` — RISE-anchored — where `check.edge`-anchored would give
+3.412; on `dfrtp` both are RISE and coincide.
+
+### Latch-D — applied, delay-edge borrow window
+
+`u_lp/D` (`delay_max`, N=1.0): `req = arr_dly = 3.156276`, slack
+exactly 0 — the check lets the latch borrow up to its own cap, so
+`req = N + lat0 - unc_setup + actual_borrow`,
+`actual_borrow = clamp(arr_dly - base, 0, pulse - t_setup)`,
+`base = 1.0 + 0 - 0.1 = 0.9`, `max_borrow = 2.5 - 0.0412 = 2.4588`
+(dlxtp). `u_ln/D` (`delay_ln`, N=1.5): `req 1.400000` — `arr_dly
+0.656302 < base 1.4`, borrow clamps at 0. `delay_allregs` clamps
+`u_ln2/D` at `base + pulse - t_setup = 0.9 + 3.4 - 0.1645 = 3.235511`
+(dlxtn) and `u_rtn/D` at `0.9 + 2.5 - 0.1755 = 3.224545` (dlrtn — the
+sign on `t_setup` was verified against `report_checks`, which prints
+"library setup time -0.18" for this arc; the bound is `pulse -
+t_setup`). `delay_min` on `u_lp/D`: `req 0.566443 = 0.5 (N) + 0 (lat0)
+- 0.033557 (t_hold) + 0.1 (unc_hold)` — delay-edge anchored, no
+launch-parity realignment (`arr_dly 3.156276`, not the hold-aligned
+`8.156276`).
+
+Arrival re-basing (`arr_dly`): under `delay_allregs`, `u_f0/D` (fed by
+`u_ln/Q`) reports `arr 0.361663` = baseline `2.861663` minus the `u_ln`
+open-edge arrival `2.5` — through-latch launches report at the delay
+edge. FF/port launches keep `dly = arr` (`u_f2/D` unchanged shape).
+Class-wide borrow silencing: `delay_from` (`-from p_lp -to u_lp/D`) and
+`delay_max` drop `u_f2/D`'s `arr` from `2.562374` to `0.244362` — the
+covered `-to` selector disables `u_lp`'s `D -> Q` transparent arc for
+the whole signature class, so the uncovered endpoint keeps only the
+clock-to-Q launch. `delay_min` coverage does not silence it (u_f2/D
+stays `2.562374`). `delay_prop` anchors `lat0` at the propagated
+first-edge latency.
+
+`all_registers` covers FF-D, latch-D and latch `RESET_B` rows in one
+rule (`delay_allregs`: `u_rbn/RESET_B` req `0.943786`,
+`u_rbp/RESET_B` `0.912087`, `u_rtn/RESET_B` `0.956716` — all
+edge0-anchored).
+
+### Negative controls (ad hoc, not committed)
+
+Same container session, `async_reset` + `delay_max`-shaped rules:
+
+- `set_max_delay 1.0 -from [get_ports d_in] -to [get_pins
+  u_ff0/RESET_B]` → endpoint byte-identical to `ideal` (the port does
+  not launch the async pin).
+- `set_max_delay 1.0 -from [get_pins u_ff0/CLK] -to [get_pins
+  u_ff0/RESET_B]` → byte-identical to `ideal`.
+
+OpenSTA warnings during generation: none delay-specific — only the
+pre-existing `[WARNING ODB-0220]` LEF noise and the fixture's baseline
+`STA-0441` SDC note.
+
+### Ours vs. golden
+
+11 new `compare_sta_edge` calls at `Tol::STRICT` (`analysis.rs`
+`test_sta_edge_async_reset_delay_{max,min,from,cell,prop}` and
+`test_sta_edge_latch_borrow_delay_{max,min,ln,from,allregs,prop}`) —
+`cargo test -p grus-core sta_edge`: 32 passed, 0 failed. Every field of
+every endpoint row matches, including the re-based `arr` values and the
+silenced `u_f2/D`. `unsupported_path_delay_endpoints` now counts
+`ClockGate` only.
+
+`cargo test --workspace`: passed in this worktree after copying the
+gitignored generated artifacts (`*.placed.def`, `*.routed.spef`,
+`*.sta.reference.json` for aes/ibex/jpeg/picorv32) from the main
+checkout — they are build products, not tracked inputs; 273 `grus-core`
++ 3 `grus-eda` tests, 0 failures, 2 `#[ignore]`d. `cargo clippy
+--workspace --all-targets -- -D warnings` clean.
+
+### Fail-proof
+
+(a) Reverting `delay_supported` to FF-D/output only → all 11 new tests
+go red on the async/latch rows (e.g. `delay_max` `u_ff0/RESET_B` req
+stays `4.900132`). (b) Substituting `w.arr` for `w.dly` in the delay
+compose → `delay_allregs` goes red on 17 rows (`u_f0/D` reports
+`2.861663` instead of `0.361663`) and `delay_min` on `u_lp/D` (`arr`
+`8.156276` vs `3.156276`). Restored after each; suite green again.
+
+### Not run
+
+- Negative-parity clock pins under delay coverage: `edge0_pol`'s
+  fallback (RISE on contested parity) is unexercised — `async_fall`'s
+  `dfrtn` carries no delay scenario.
+- Literal two-clock-domain `set_min_delay` anchoring — still blocked on
+  multi-clock SDC support (`docs/path-delays.md` §5).
+- Clock-gate enable endpoints — remain counted in
+  `unsupported_path_delay_endpoints`.

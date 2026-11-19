@@ -61,11 +61,14 @@ lines 84-89), and latch-D. `ClockGate` stays `false` → still counted in
   — except `arr`/`slack` now read `w.dly` (a through-latch launch re-bases;
   identical when `dly == arr`). The recovery table flows through
   `late_arc` + `check.clk` with no new branch.
-- **Latch-D, max**: `req = w.dly.clamp(base, base + (close − open +
+- **Latch-D, max**: `req = w.dly.clamp(base, base + (close − open −
   t_setup).max(0))` where `base = N + clk_state.arrival_min[edge0_pol] −
-  setup_uncertainty`, `open = arrival_min[1 − check.edge]`, `close =
-  arrival_min[check.edge]` (+period when it wraps). Reports `arr = w.dly`,
-  `slack = req − w.dly`.
+  setup_uncertainty` — **sign correction** (golden regen): the bound is
+  `pulse − t_setup`, not `pulse + t_setup`; OpenSTA's
+  `report_checks` prints the setup term negated ("library setup time
+  -0.18"), which is what misled the first record. `open`/`close` are
+  `arrival_min[1 − check.edge]` / `arrival_min[check.edge]` (+period when
+  it wraps). Reports `arr = w.dly`, `slack = req − w.dly`.
 - **Latch-D, min**: dedicated branch — `req = N +
   clk_state.arrival_max[edge0_pol] + t_hold + hold_uncertainty` (delay
   edge anchored); `arr = w.dly`, `slack = w.dly − req`.
