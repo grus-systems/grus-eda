@@ -1,17 +1,12 @@
 # async-latch-delay — Fixture & golden layout
 
-Both fixtures already carry the DEF, baseline SDCs, `generate_ref.sh`, and
-`*.reference.json`. This task adds delay-check scenario SDCs (the probe
-questions committed as files) and extends each `generate_ref.sh` with a
-scenario list. The committed set is verdict-independent: an "ignored"
-verdict produces a golden section byte-identical to the baseline —
-permanent, reproducible evidence — so the same scenarios ship either way.
+Both fixtures carry the DEF, baseline SDCs, `generate_ref.sh`, and
+`*.reference.json` — nothing else. The scenario SDCs below **must be
+created** (the aborted run's copies are gone; this table is the spec). Each
+file = its base SDC verbatim plus the delay command; basenames become the
+golden section keys, matching the `sta_edge` descriptive naming.
 
-## 1. New SDC scenarios
-
-Each file = the baseline SDC verbatim plus the delay commands. Basenames
-become the golden section keys, matching the `sta_edge` descriptive naming
-(`ideal.sdc`, `propagated.sdc`, `viol.sdc`).
+## 1. Scenario SDCs (to create)
 
 ### `tests/designs/sta_edge/async_reset/` (base `ideal.sdc` unless noted)
 
@@ -34,54 +29,61 @@ become the golden section keys, matching the `sta_edge` descriptive naming
 | `delay_allregs.sdc` | `set_max_delay 1.0 -to [all_registers]` | B5 |
 | `delay_prop.sdc` | base `prop.sdc` + `set_max_delay 1.0 -to [get_pins u_lp/D]` | B6 |
 
-Negative-control probes (`-from [get_ports d_in]`, `-from [get_pins
-u_ff0/CLK]`) stay ad-hoc: they assert *no* change, which the applied
-scenarios already pin down; record their output in `results.md` without
-committing goldens for them.
+Negative controls (`-from [get_ports d_in]`, `-from [get_pins
+u_ff0/CLK]`) stay ad-hoc — they assert *no* change, which the applied
+scenarios already pin down; their output goes in `results.md` without
+goldens (`probe.md` §Residual).
 
-## 2. `generate_ref.sh` changes
+## 2. `generate_ref.sh` extension
 
-Both scripts today call `run_sta` twice and merge `ideal`+`propagated`.
-Extend each to a scenario list in the same style:
+Both scripts today call `run_sta` twice and merge two JSONs. Extend each:
 
 ```bash
-run_sta ideal.sdc ideal.json
-run_sta propagated.sdc propagated.json
+run_sta ideal.sdc ideal.json          # latch_borrow: latch.sdc
+run_sta propagated.sdc propagated.json # latch_borrow: prop.sdc
 run_sta delay_max.sdc delay_max.json
-# … one per scenario …
+# … one per scenario, same basename → same key …
 ```
 
 then merge each `delay_*.json` as a new top-level key alongside `ideal` /
-`propagated` in `*.reference.json` (same `printf`/`cat` assembly, same
-intermediate-file cleanup). For `delay_prop.sdc` emit the key `delay_prop`.
+`propagated` in `*.reference.json`, reusing the existing `printf`/`cat`
+assembly and intermediate-file cleanup. Two per-script details:
 
-If OpenSTA errors on a scenario (errored verdict), that scenario produces
-no endpoint JSON: emit a `{"error": "<verbatim STA-#### message>"}`
-section for it instead — the `sta_exceptions` fixture already carries
-error-record sections (`md_early`, `md_datapath`), so the schema has
-precedent. `compare_sta_edge` is only pointed at sections with
-`endpoints`; error sections exist for reproduction, not comparison.
+- `async_reset` keys: `delay_max`, `delay_min`, `delay_from`,
+  `delay_cell`, `delay_prop`.
+- `latch_borrow` keys: `delay_max`, `delay_min`, `delay_ln`,
+  `delay_from`, `delay_allregs`, `delay_prop`. **Watch the emit key**:
+  this script's `run_sta` writes `"latch_borrows"` where `async_reset`'s
+  writes `"hold_violations"` — copy nothing across scripts; extend each
+  in its own style.
+- Scenario files sit in the same dir; the container `-w` and the
+  `read_sdc …/$sdc_file` line already resolve any basename — no path
+  changes needed.
+
+If a scenario raises inside OpenSTA (none expected — the recorded probe
+showed applied), emit `{"error": "<verbatim STA-####>"}` for its section
+instead of endpoint JSON (`sta_exceptions` `md_early`/`md_datapath`
+precedent) and point `compare_sta_edge` only at sections with
+`endpoints`.
 
 ## 3. Tests
 
-One `compare_sta_edge` call per scenario section with an `endpoints`
-array, all at `Tol::STRICT`, added next to the existing
-`test_sta_edge_async_reset_*` (~`analysis.rs:7572`) and
-`test_sta_edge_latch_borrow_*` (~`analysis.rs:7513`) tests:
+One `compare_sta_edge` call per scenario section, all `Tol::STRICT`, next
+to the existing tests (`test_sta_edge_latch_borrow_*` ~line 7513,
+`test_sta_edge_async_reset_*` ~line 7572 in `analysis.rs`). Signature
+(existing, ~line 7136):
+`compare_sta_edge(case, "case/case.def", sdc_file, None, golden_key,
+Tol::STRICT)`.
 
 - `test_sta_edge_async_reset_{delay_max,delay_min,delay_from,delay_cell,delay_prop}`
 - `test_sta_edge_latch_borrow_{delay_max,delay_min,delay_ln,delay_from,delay_allregs,delay_prop}`
 
-An "ignored" verdict leaves our report identical to baseline (the counted
-skip keeps clock-check values), so the same tests pass in every branch —
-they pin the evidence, not just the new code.
-
 ## 4. Coverage notes
 
-- `delay_allregs.sdc` exercises latch-D *and* latch-async (`RESET_B`)
-  endpoints plus FF-D in one run — if the async verdict on `async_reset`
-  is "ignored" but `all_registers` moves the latch `RESET_B` rows, record
-  the selector-dependence rather than treating the kinds as one.
+- `delay_allregs` exercises latch-D *and* latch `RESET_B` endpoints plus
+  FF-D in one run — `all_registers` resolves to check pins of every
+  sequential cell, so selector coverage is measured at scale.
 - `u_iso/D` (baseline slack exactly 0 via the borrow clamp) is the
-  sharpest discriminator for whether a delay check on latch-D keeps
-  borrow semantics; it sits inside `delay_allregs` coverage.
+  sharpest discriminator of the clamp formula's upper bound.
+- `delay_cell` covers `u_ff0/D` (FF-D, long supported) and
+  `u_ff0/RESET_B` in one rule — a mixed-kind golden in one section.

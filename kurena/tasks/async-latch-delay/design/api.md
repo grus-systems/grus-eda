@@ -1,112 +1,109 @@
-# async-latch-delay — Implementation shape (per verdict)
+# async-latch-delay — Implementation shape (plan, not yet written)
 
-All changes live in `run_sta_partitioned`'s composition loop
-(`analysis.rs:3373-3605`). The signature-class machinery, selector
-resolution, `Worst`/`EndpointPolarities` composition, and the skip pass
-need no structural change — a delay check on a new endpoint kind is a
-new arm of the same composition.
+All changes live in `crates/grus-core/src/sta/analysis.rs`. The aborted run
+left a draft implementing the recorded rules end-to-end; it is gone, but the
+shape below is what it did and remains the plan — to be written fresh and
+verified against the committed-script goldens, never trusted on its own.
+Line references are to the current file.
 
-## Verdict: applied on async-check pins
+## 1. `dly` arrival extremes (the new plumbing)
 
-`u_ff0/RESET_B`-type endpoints are `Check { latch: false }` carrying
-`recovery_arc`/`removal_arc` (never `setup_arc`/`hold_arc`) — they fail
-the `delay_supported` predicate at `analysis.rs:3426-3432`.
+`PinTimingState` (~line 94) gains `dly_max: [f32; 2]` / `dly_min: [f32; 2]`
+— arrival extremes that re-base a latch open-edge launch to the delay edge,
+merged independently of which source wins `arr` (same discipline as
+`slew`):
 
-- **Gate**: widen the `Check { latch: false }` arm from
-  `c.setup_arc.is_some() || c.hold_arc.is_some()` to
-  `c.late_arc().is_some() || c.early_arc().is_some()`
-  (`late_arc() = setup_arc.or(recovery_arc)`, `early_arc() =
-  hold_arc.or(removal_arc)` — `analysis.rs:84-90`).
-- **Max side**: if the measured rule is the FF formula verbatim
-  (`req = capture_min[check.edge] − unc_setup − t_late + N + crpr`),
-  the existing block (`analysis.rs:3456-3521`) needs no change — it
-  already reads `check.late_arc()` and `check.clk`, so the recovery
-  table and the async pin's clock pin flow through. If measurement
-  shows a different rule, add the branch here with the measured
-  formula, not an approximation.
-- **Min side**: `req_hold_base + N` is already generic for non-port
-  kinds (`analysis.rs:3536-3546`, `w.req += n`); the removal required
-  time is `pols.min`'s base. Same caveat: measured rule only.
-- **Per-transition tables**: the loop requires `constraint_table(late,
-  pol)` per transition (`analysis.rs:3462-3470`); a missing fall
-  recovery table just skips that polarity — matches the endpoint's
-  ordinary candidate generation.
+- `PinTimingState::merge` (~line 133, currently 9 args) takes
+  `dly_max`/`dly_min` arguments; every call site updated (port seeds pass
+  `arr`, unreachable passes ±∞, `sink_state_with_wire` ~1573 adds the same
+  net delay as `arrival`, `propagate_clock` ~1814 / `prepare_sta`
+  clock-state merges pass the edge latency).
+- `eval_launch` (a closure inside `prepare_sta`, ~line 2450) gains a
+  `delay_edge: bool` — `true` only for `graph.latch_opens` (clock-to-Q
+  open-edge launches): `dly = arr − clk_state.arrival[edge_pol]` strips the
+  clock-edge term so the launch reports at the delay edge. FF/port launches
+  pass `false` → `dly = arr`. `LaunchPair` (~2146) carries the two new
+  fields through `LaunchSeed` (~2169) into `eval_sta`'s merges.
+- Transparent `D -> Q` borrow propagation (`eval_sta` ~2701 reads
+  `graph.latch_borrow`) caps `src.dly_max` through the same borrow `cap()`
+  as `arrival_max`; `dly_min` through a borrow arc contributes nothing
+  (`f32::INFINITY`, matching the early side's clock-to-Q-only launch rule).
+- `Worst` (~3771) gains `dly`; `collect_endpoints` (~3957) fills it from
+  the state; cross-class `pick_worst_polarity`/best-slack merge carries it
+  inside `Worst` untouched.
 
-## Verdict: applied on latch-D pins
+## 2. `disabled_borrow` (measured D→Q silencing)
 
-`Check { latch: true }` currently falls through to `false`.
+`eval_sta` (~2602) gains a `disabled_borrow: &HashSet<(u32, u32)>` of
+`(D_pin, Q_pin)` borrow arcs. `run_sta_partitioned` (~3194) builds it per
+signature class: for every `ResolvedRule::Delay` with `kind ==
+PathDelayKind::Max` in the signature, each `graph.latch_borrow` key whose D
+pin is covered by the rule's `to` (universal or `contains`) is disabled for
+the whole class — uncovered endpoints included (measured). Inside the eval
+loop, a disabled borrow arc merges slew only (±∞ arrivals) and `continue`s.
+`run_sta_detail`'s non-partitioned call (~2125: `eval_sta(&prepared, None,
+…)`) passes `&HashSet::new()` — no delay rules ever reach it (the
+partitioned path owns `path_delays`, gated at ~2123).
 
-- **Gate**: `Check { latch: true } => true` in `delay_supported`.
-- **Max side**: three measured-rule branches, pick what the probe shows:
-  - *closing-anchored (FF verbatim)*: no new code — `check.late_arc()`
-    is the latch's setup arc and `check.clk` its gate pin;
-  - *opening-edge anchored*: add a `check.latch` branch mirroring the
-    borrow code's opening-edge computation
-    (`analysis.rs:4111-4121`: `arrival_min[open_pol]` aligned by whole
-    periods to the closing edge), then substitute N for the period
-    term per the measured formula;
-  - *edge-referenced*: `w.req = n − unc_setup`-style, like the
-    output-port arm at `analysis.rs:3441-3455`.
-  The delay check's slack is rigid (`slack = req − arr`) — no borrow
-  clamp — which composing a `Worst{req, slack}` gives for free.
-- **Min side**: the generic `w.req += n` block covers `hold_base + N`;
-  a different measured rule gets its own branch.
-- **`-to` coverage**: `resolve_to` already maps `get_pins u_lp/D`,
-  `get_cells u_lp`, and `all_registers` (latch cells are `seq_cells`)
-  to the latch endpoint pins — no selector work expected. Confirm the
-  `delay_allregs` golden rows match, especially `u_iso/D` whose
-  baseline slack is a pure borrow clamp.
+## 3. Gate: `delay_supported`
 
-## Verdict: ignored or errored
+`Check { latch: false }` predicate (~3428: `c.setup_arc.is_some() ||
+c.hold_arc.is_some()`) widens to `Check { .. }` with
+`c.late_arc().is_some() || c.early_arc().is_some()` — covers FF-D, async
+recovery/removal (`late_arc = recovery_arc`, `early_arc = removal_arc`,
+lines 84-89), and latch-D. `ClockGate` stays `false` → still counted in
+`unsupported_path_delay_endpoints`.
 
-No `analysis.rs` behaviour change for that kind:
-`unsupported_path_delay_endpoints` keeps counting it, the endpoint
-keeps its clock-check values — which already reproduces OpenSTA's
-"ignored" (values unchanged). For "errored", record the error in
-`docs/results.md`; our engine still counts the endpoint rather than
-failing, which is the louder behaviour and consistent with the counted-
-skip contract. Update the predicate's comment and the
-`unsupported_path_delay_endpoints` doc comment (`analysis.rs:337-341`)
-to name the measured verdict, and the scope lists in
-`docs/path-delays.md` §3.
+## 4. Req composition per endpoint kind
 
-## Mixed verdicts
+- **FF-D & async-check, max**: existing block (~3457-3521) unchanged in
+  shape — `req = capture_min[check.edge] − unc_setup − t_late + N + crpr`
+  — except `arr`/`slack` now read `w.dly` (a through-latch launch re-bases;
+  identical when `dly == arr`). The recovery table flows through
+  `late_arc` + `check.clk` with no new branch.
+- **Latch-D, max**: `req = w.dly.clamp(base, base + (close − open +
+  t_setup).max(0))` where `base = N + clk_state.arrival_min[edge0_pol] −
+  setup_uncertainty`, `open = arrival_min[1 − check.edge]`, `close =
+  arrival_min[check.edge]` (+period when it wraps). Reports `arr = w.dly`,
+  `slack = req − w.dly`.
+- **Latch-D, min**: dedicated branch — `req = N +
+  clk_state.arrival_max[edge0_pol] + t_hold + hold_uncertainty` (delay
+  edge anchored); `arr = w.dly`, `slack = w.dly − req`.
+- **FF-D & async-check, min**: unchanged generic `req += N` on the
+  pre-MCP hold/removal required time (~3537), plus `arr = w.dly`.
+- **OutputPort**: unchanged formula, `arr = w.dly` for uniformity.
+- `edge0_pol(clk)`: first edge reaching the clock pin, decoded from
+  `clock_parity` (parity of the pin's RISE state — `0` ⇒ the pin edge at
+  nominal 0 is RISE, `1` ⇒ inverted net ⇒ FALL); contested/absent parity
+  falls back to RISE.
 
-Per-side and per-kind independence: the gate is `(kind, side)`-local in
-the composition loop, so "applied on max, ignored on min" or "applied
-on async, ignored on latch" each map to exactly the branches above —
-no all-or-nothing switch.
+## 5. What to scrutinize before trusting the model
 
-## Tests & diagnostics
+- **`dly` as an independent extreme**: merged like slew, it can pick the
+  `dly` of a different source than the `arr` winner. If a golden `arr`
+  mismatches, the alternative model is `dly`-of-the-`arr`-winner — decide
+  by OpenSTA, not by fit.
+- **`disabled_borrow` breadth**: class-wide silencing off one `-to`
+  selector is the bold claim. `delay_allregs` (every latch D covered) and
+  `delay_max` (only `u_lp/D`) are the discriminators — watch `u_lp`-
+  downstream endpoints' `arr`.
+- **`edge0_pol` fallback**: `async_fall`'s `dfrtn` (inverting clock) has
+  no committed delay scenario — the fallback path is exercised only if a
+  negative-parity clock pin meets a delay check; note the gap in
+  `results.md` rather than invent coverage.
+- **Existing-golden regression**: `arr = w.dly` is a no-op unless a
+  covered path launches through a latch open edge. `sta_exceptions` has
+  no latches, so `md_*`/`pm*`/`m2_*`/`pmp_*`/`pml_*`/`pmd_*` goldens
+  should be byte-identical — any diff there is a bug, not a tolerance.
 
-- New `compare_sta_edge` calls per `fixture.md` §3 at `Tol::STRICT`.
-- `unsupported_path_delay_endpoints` shrinks for applied kinds; keep a
-  diagnostic assertion — e.g. run the `delay_allregs` SDC and assert
-  the count covers exactly the still-deferred kinds (clock-gate always;
-  async/latch only if ignored).
-- Fail-proof (AGENTS.md §7.7): for each applied kind, revert the gate
-  or substitute a wrong req candidate (e.g. edge-referenced when
-  capture-anchored was measured) and confirm the new scenarios go red;
-  restore. For "ignored" verdicts the committed scenario is the
-  fail-proof: it must stay byte-identical to baseline.
-- `merge_corner_reports` (`analysis.rs:4476-4478`) merges the counter by
-  max — unchanged.
+## 6. Tests & fail-proof
 
-## Docs deltas
-
-- `docs/path-delays.md` §3: move applied kinds from "v1 diagnoses" /
-  "Explicitly out of scope" into "v1 supports" with the measured req
-  rule; reword ignored/errored kinds as measured outcomes, not
-  unmeasured limits. §5 item 1: strike the async-reset and
-  latch-borrow halves with the verdict and pointer to §1 (applied) or
-  the results entry (ignored); keep the two-clock-domain half open
-  with the blocker restated (multi-clock SDC unsupported). Add the
-  measured req rule to §1 alongside the FF/output-port formulas.
-- `docs/results.md`: dated entry with the probe record and, for applied
-  kinds, our values vs golden and the fail-proof result.
-- `docs/timing-exceptions.md`: only if the skip surface changes — its
-  out-of-scope list names multicycle endpoint limits and delay-command
-  qualifiers, not delay endpoint kinds; expected unchanged.
-- `Cargo.toml` `0.1.94` → `0.1.95` (+ `Cargo.lock`) in the same commit
-  as the functional change — or, if nothing applied, in the
-  fixture+docs commit.
+- `fixture.md` §3's `compare_sta_edge` calls, all `Tol::STRICT`.
+- `unsupported_path_delay_endpoints` shrinks to clock-gate-only on
+  `delay_allregs`/`delay_cell` — assert the count if a cheap hook exists,
+  else note it in `results.md`.
+- Fail-proof (AGENTS.md §7.7): (a) revert `delay_supported` to
+  FF-only → the new scenarios must go red on the async/latch endpoints;
+  (b) substitute `w.arr` for `w.dly` in the latch compose → `delay_max`
+  must go red on `u_lp/D`. Restore after each.
+- `merge_skip_reports` (~4436) merges the counter by `max` — unchanged.

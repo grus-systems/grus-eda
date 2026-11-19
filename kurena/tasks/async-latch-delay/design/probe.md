@@ -1,121 +1,97 @@
-# async-latch-delay — OpenSTA probe
+# async-latch-delay — OpenSTA probe record & residual checks
 
-Step 0, run before any implementation (AGENTS.md §2: reference values come
-from the committed script run inside `ghcr.io/librelane/librelane:3.0.16`;
-stdin Tcl must not use `!` — write `[…] == 0`). Every answer lands in the
-dated `docs/results.md` entry; nothing is implemented from guesswork.
+The aborted executor pass ran the probe inside the LibreLane container
+(`ghcr.io/librelane/librelane:3.0.16`): scenario SDCs equivalent to
+`fixture.md` §1 were fed to OpenSTA and the verdicts below are what its
+(lost) `analysis.rs` draft encoded. **The numbers were never committed** —
+no scenario SDCs, no `*.reference.json` section, no `docs/results.md` entry;
+the SDCs and the draft are gone with the run. What survives is this record,
+whose baseline values were spot-checked against the committed goldens and
+match. The new run must still reproduce every verdict through the committed
+`generate_ref.sh` scripts (AGENTS.md §7.1: reference values come from the
+committed script run as written) and record everything in
+`docs/results.md`. Where regen disagrees with this record, regen wins —
+see "If regen contradicts" below.
 
-## Probe mechanics
+## Measured verdicts (to be re-confirmed by golden regen)
 
-Reuse the fixture `generate_ref.sh` collection procs verbatim — the
-`find_timing_paths -path_delay max|min` + `data_arrival_time` /
-`data_required_time` / `slack` / `slew` accessors already capture every
-field a delay check moves. For the first pass, feed one-off heredocs to
-`openroad -no_init -no_splash` loading lib/lef/def + `ideal.sdc` (or
-`latch.sdc`) plus inline `set_max_delay`/`set_min_delay` commands, and
-dump the target endpoint's arr/req/slack next to the baseline values in
-`*.reference.json`. Once the verdict is known, the committed scenario
-SDCs (`fixture.md`) regenerate the same numbers through the committed
-script — the probe pass and the golden pass must agree.
+### A. async-check pin — `sta_edge/async_reset` on `u_ff0/RESET_B`
 
-Verdict per (kind, side): **applied** = reported `req`/`slack` differ
-from baseline at the target pin; **ignored** = byte-identical endpoint
-set; **errored** = `read_sdc` or eval raises (record the `STA-####`
-message verbatim, and whether the run still produced the rest of the
-report). Also record any `WARNING`/`ERROR` lines OpenSTA prints for the
-commands.
+Baseline (`ideal`): `max_req 4.900132` (`capture 0.7 + T 4.0 − unc 0.05 −
+t_recovery`, t_recovery ≈ −0.250132), `min_req 1.132095`,
+`max_arr 1.313763`; launch is the `rst_n` port seed.
 
-## A. async-check pin — `sta_edge/async_reset` on `ideal.sdc`
+| scenario | verdict | measured req rule |
+|---|---|---|
+| `delay_max` (A1) `set_max_delay 1.0 -to u_ff0/RESET_B` | applied | FF formula verbatim: `capture_min[check.edge] − unc_setup − t_recovery + N` — the recovery arc plays `late_arc` |
+| `delay_min` (A2) `set_min_delay 0.5 -to …` | applied | `removal_req_base + N` — same `req += N` shift as hold |
+| `delay_from` (A3) `-from [get_ports rst_n]` | applied | same rule; the port seed covers the async launch |
+| `delay_cell` (A4) `-to [get_cells u_ff0]` | applied on both rows | `u_ff0/D` and `u_ff0/RESET_B` each take their own check's rule |
+| `delay_prop` (A6) on `propagated.sdc` | applied | anchor follows the propagated capture arrival |
 
-Target: `u_ff0/RESET_B` (dfrtp recovery/removal endpoint). Baseline:
-`max_req 4.900132` (`capture 0.7 + T 4.0 − unc 0.05 − t_recovery`,
-t_recovery ≈ −0.250132), `min_req 1.132095`, `max_arr 1.313763` —
-launch is the `rst_n` port seed (`set_input_delay 0.5`).
+### B. latch-D pin — `sta_edge/latch_borrow`
 
-- **A1** `set_max_delay 1.0 -to [get_pins u_ff0/RESET_B]` —
-  applied/ignored/errored? If applied, discriminate the req rule:
-  - (a) recovery-anchored (the FF formula verbatim):
-    `req = capture_min[edge] − unc_setup − t_recovery + N`
-    ≈ `0.7 − 0.05 + 0.250132 + 1.0 = 1.900132`;
-  - (b) edge-referenced (the output-port shape): `req = N − unc_setup`
-    = `0.95`;
-  - (c) clock-check req shifted: `req = baseline + N` = `5.900132`;
-  - (d) other — solve for the term and record.
-  Also note whether `arr` is unchanged (expected: replace semantics —
-  candidate keeps its ordinary arrival).
-- **A2** `set_min_delay 0.5 -to [get_pins u_ff0/RESET_B]` — candidates:
-  (a) `req_min_delay = removal_req_base + N` ≈ `1.132095 + 0.5`;
-  (b) `req = N + unc_hold`; (c) unchanged.
-- **A3** `set_max_delay 1.0 -from [get_ports rst_n] -to [get_pins
-  u_ff0/RESET_B]` — does the `-from` port selector cover the async
-  check's launch? Verdict + same req decomposition.
-- **A4** `set_max_delay 1.0 -to [get_cells u_ff0]` — `get_cells`
-  resolves to every endpoint pin of the instance, i.e. `u_ff0/D` (FF-D,
-  known supported) *and* `u_ff0/RESET_B`. If OpenSTA applies to both,
-  two rows change; if only to `D`, the async kind is selectively
-  skipped — a clean discriminator independent of pin selectors.
-- **A5** negative `-from`: `set_max_delay 1.0 -from [get_ports d_in] -to
-  [get_pins u_ff0/RESET_B]` — the delay rule's source does not launch
-  the async pin; expect the endpoint unchanged (replace semantics is
-  per-source). Also `-from [get_pins u_ff0/CLK]`: OpenSTA launch objects
-  are clock pins but the async check's launch is the port — expect no
-  coverage.
-- **A6** repeat A1 on `propagated.sdc` — does the anchor move to the
-  propagated capture arrival (`u_ff0/CLK` ≈ 0.713763-ish early arrival
-  vs the ideal 0.7)?
+Targets: `u_lp/D` (dlxtp, borrows: baseline `max_req 2.200711`,
+`max_arr 3.122415`, slack −0.921703), `u_ln/D` (dlxtn, non-borrowing:
+`max_req 2.4`, slack +1.743699), `u_iso/D` (borrow-clamped: `max_req =
+max_arr 1.655783`, slack 0).
 
-## B. latch-D pin — `sta_edge/latch_borrow` on `latch.sdc`
+| scenario | verdict | measured req rule |
+|---|---|---|
+| `delay_max` (B1) `set_max_delay 1.0 -to u_lp/D` | applied | `req = clamp(arr_dly, base, base + pulse + t_setup)`, `base = N + lat0 − setup_uncertainty` — the delay edge opens a window of the latch's own pulse width; borrowing stops at `pulse + t_setup`, not at the clock closing edge |
+| `delay_min` (B2) `set_min_delay 0.5 -to u_lp/D` | applied | `req = N + lat0 + t_hold + hold_uncertainty` — delay-edge anchored, not closing-edge |
+| `delay_ln` (B3) `set_max_delay 1.5 -to u_ln/D` | applied | same clamp rule on a non-borrowing shape (`arr_dly < base` clamps at `base`) |
+| `delay_from` (B4) `-from [get_ports p_lp]` | applied | port-seed coverage of the latch launch |
+| `delay_allregs` (B5) `-to [all_registers]` | applied | covers FF-D, latch-D, and latch `RESET_B` rows |
+| `delay_prop` (B6) on `prop.sdc` | applied | `lat0` is the propagated first-edge latency at the clock pin |
 
-Targets: `u_lp/D` (dlxtp, borrows: baseline `max_req 2.200711`
-opening-edge, `max_arr 3.122415`, slack −0.921703), `u_ln/D` (dlxtn,
-non-borrowing: `max_req 2.400000`, slack +1.743699), `u_iso/D`
-(isolation latch: `max_req = max_arr = 1.655783`, slack exactly 0 — the
-stark borrow-clamp case). Launch per pin: `p_lp`/`p_ln`/`p_iso` port
-seeds.
+Cross-cutting measured facts the implementation encodes:
 
-- **B1** `set_max_delay 1.0 -to [get_pins u_lp/D]` — verdict. If
-  applied, discriminate:
-  - (a) closing-edge FF formula verbatim (`check.edge` = FALL for
-    dlxtp): `req = capture_min[FALL] − unc − t_setup + N`
-    ≈ `2.5 − 0.1 − t_setup + 1.0`;
-  - (b) opening-edge anchored: `req = opening_edge_min − unc −
-    t_setup + N` ≈ `0 − 0.1 − t_setup + 1.0`;
-  - (c) edge-referenced: `req = N − unc` = `0.9`;
-  - (d) baseline shifted: `req = 2.200711 + 1.0`.
-  And critically: does `slack = req − arr` hold rigidly, or does the
-  borrow clamp survive (`req = arr` when inside the window)? The slack
-  sign discriminates all four candidates.
-- **B2** `set_min_delay 0.5 -to [get_pins u_lp/D]` — candidates:
-  (a) `hold_base + N` (`2.566444 + 0.5`); (b) edge-referenced
-  `N + unc_hold`; (c) unchanged.
-- **B3** `set_max_delay 1.5 -to [get_pins u_ln/D]` — non-borrowing
-  latch; separates "delay check anchored like the ordinary check" from
-  "delay check is a new check family" and uses a different N for
-  attribution clarity.
-- **B4** `set_max_delay 1.0 -from [get_ports p_lp] -to [get_pins
-  u_lp/D]` — `-from` port coverage on the latch launch.
-- **B5** `set_max_delay 1.0 -to [all_registers]` — universal `-to`:
-  covers every FF-D (`u_f*`/`u_fn*`), every latch-D (`u_*n`/`u_*p`/
-  `u_iso`), and the latch-async pins (`u_rt*/u_rb*/RESET_B`). Per-kind
-  verdict at scale; the RESET_B rows double-cover the async verdict on
-  latch cells. Record which rows move.
-- **B6** B1 on `prop.sdc` — anchor under `set_propagated_clock`.
+1. **Delay-check arrival (`dly`)**: a path launched through a latch's
+   open edge re-bases to the delay edge — the launch reports at the
+   edge's own latency (`lat0`), not the data's open-edge wait. Flop and
+   port launches keep their clock edge, so `dly == arr` for them.
+   `slack = req − arr_dly` rigidly (no borrow clamp on slack).
+2. **`disabled_borrow`**: a `set_max_delay` whose `-to` covers a latch's
+   D pin stops the transparent `D -> Q` forward for *every* downstream
+   path of the signature class — uncovered endpoints included; only the
+   gate's clock-to-Q launch still arrives. `set_min_delay` coverage does
+   not disable. Slew still propagates (slew is physical, not
+   path-scoped).
+3. **Delay edge**: nominal time 0 at the check pin = the *first* edge
+   reaching its clock pin (`edge0_pol` resolves it from clock parity —
+   matters on inverted clock nets; `async_fall`'s `dfrtn` is the
+   regression case for the fallback path).
 
-## What the verdict decides
+## Residual ad-hoc probes (still to run — no golden needed)
 
-| outcome | consequence |
-|---|---|
-| applied (any side) | implement the measured req rule per `api.md`; committed scenario goldens at STRICT |
-| ignored / errored | kind stays in `unsupported_path_delay_endpoints`; scenario SDCs + verdict committed as evidence |
+Run during the same container session as the golden regen; record outputs
+verbatim in `docs/results.md`:
 
-If OpenSTA applies on one side only (e.g. max yes, min no), implement the
-applied side and keep the other counted — record the asymmetry
-explicitly; do not extrapolate one side's verdict to the other.
+- **A5 negative `-from`**: `set_max_delay 1.0 -from [get_ports d_in] -to
+  [get_pins u_ff0/RESET_B]` — the source does not launch the async pin;
+  expect the endpoint unchanged. Also `-from [get_pins u_ff0/CLK]`: clock
+  pins are launch objects but the async launch is the port — expect no
+  coverage. Both discriminate per-source replace semantics.
+- **`report_checks -path_delay max`** (or `find_timing_paths` field dump)
+  on `delay_max`/`delay_allregs` if any golden field mismatches — the
+  fastest way to decompose an unexpected `req` into its terms
+  (AGENTS.md §7.6).
+
+## If regen contradicts the record
+
+Per (kind, side): an endpoint that comes back byte-identical to baseline
+is **ignored** — keep it in `unsupported_path_delay_endpoints`, keep the
+committed scenario as the evidence. An `STA-####` raise is **errored** —
+emit a `{"error": "<verbatim>"}` section (`sta_exceptions` precedent:
+`md_early`, `md_datapath`), pointed at by `results.md`. Never extrapolate
+one side's verdict to the other.
 
 ## Recording format
 
-One dated `docs/results.md` entry: exactly which Tcl ran (the committed
-scenario SDCs once they exist; name the ad-hoc commands verbatim
-otherwise), the baseline vs reported `arr`/`req`/`slack` at each target
-pin, the verdict per (kind, side), the winning req rule with its numeric
-decomposition, any OpenSTA warnings, and what was not run.
+One dated `docs/results.md` entry (style: the `pcr_*`/`ld_*` entries):
+the committed scenario SDC names + `generate_ref.sh` as the reference
+command, the verdict table per (kind, side), each applied rule with its
+numeric decomposition at the target pin, the negative-control outputs,
+OpenSTA warnings verbatim, ours-vs-golden STRICT comparison, the
+fail-proof result, and what was not run.
