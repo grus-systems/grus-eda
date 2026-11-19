@@ -144,7 +144,8 @@ if no surviving group produced a candidate). Run-invariant diagnostics
 
 Probe: `tests/designs/sta_exceptions/` (3-FF design with `u_ff1/D` driven
 by a `mux2` from `u_ff0`/`u_ff2` plus a `sel` input, `u_ff2`'s clock split
-onto a second buffer stage `c2 -> u_clkb3 -> c3`, 72 SDC scenarios,
+onto a second buffer stage `c2 -> u_clkb3 -> c3`, and a second `mux2`
+driving output `y2` from the same two FF sources, 102 SDC scenarios,
 `generate_ref.sh` inside the pinned LibreLane image →
 `exceptions.reference.json`). Period `T = 2.0 ns`. Required-time
 shifts measured per endpoint (`u_ff1/D`, the only MCP target):

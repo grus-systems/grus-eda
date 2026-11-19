@@ -10,7 +10,7 @@ ROW ROW_2 unithd 0 5440 N DO 43 BY 1 STEP 460 2720 ;
 ROW ROW_3 unithd 0 8160 N DO 43 BY 1 STEP 460 2720 ;
 TRACKS X 170 DO 100 STEP 340 LAYER met1 ;
 TRACKS Y 140 DO 100 STEP 340 LAYER met2 ;
-COMPONENTS 7 ;
+COMPONENTS 8 ;
 - u_clkb sky130_fd_sc_hd__clkbuf_2 + PLACED ( 4600 0 ) N ;
 - u_clkb2 sky130_fd_sc_hd__clkbuf_2 + PLACED ( 4600 2720 ) N ;
 - u_clkb3 sky130_fd_sc_hd__clkbuf_2 + PLACED ( 9200 2720 ) N ;
@@ -18,23 +18,26 @@ COMPONENTS 7 ;
 - u_ff1 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 13800 0 ) N ;
 - u_ff2 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 18400 0 ) N ;
 - u_mux sky130_fd_sc_hd__mux2_1 + PLACED ( 11500 2720 ) N ;
+- u_mux2 sky130_fd_sc_hd__mux2_1 + PLACED ( 11500 5440 ) N ;
 END COMPONENTS
-PINS 4 ;
+PINS 5 ;
 - clk + NET clk + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 0 ) N ;
 - d_in + NET din + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 2720 ) N ;
 - sel + NET sel + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 4080 ) N ;
 - y + NET y + DIRECTION OUTPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 5440 ) N ;
+- y2 + NET y2 + DIRECTION OUTPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 6800 ) N ;
 END PINS
-NETS 10 ;
+NETS 11 ;
 - clk ( PIN clk ) ( u_clkb A ) ( u_clkb2 A ) + USE SIGNAL ;
 - c1 ( u_clkb X ) ( u_ff0 CLK ) ( u_ff1 CLK ) + USE SIGNAL ;
 - c2 ( u_clkb2 X ) ( u_clkb3 A ) + USE SIGNAL ;
 - c3 ( u_clkb3 X ) ( u_ff2 CLK ) + USE SIGNAL ;
 - din ( PIN d_in ) ( u_ff0 D ) ( u_ff2 D ) + USE SIGNAL ;
-- sel ( PIN sel ) ( u_mux S ) + USE SIGNAL ;
-- d0 ( u_ff0 Q ) ( u_mux A1 ) + USE SIGNAL ;
-- d2 ( u_ff2 Q ) ( u_mux A0 ) + USE SIGNAL ;
+- sel ( PIN sel ) ( u_mux S ) ( u_mux2 S ) + USE SIGNAL ;
+- d0 ( u_ff0 Q ) ( u_mux A1 ) ( u_mux2 A1 ) + USE SIGNAL ;
+- d2 ( u_ff2 Q ) ( u_mux A0 ) ( u_mux2 A0 ) + USE SIGNAL ;
 - d1 ( u_mux X ) ( u_ff1 D ) + USE SIGNAL ;
 - y ( u_ff1 Q ) ( PIN y ) + USE SIGNAL ;
+- y2 ( u_mux2 X ) ( PIN y2 ) + USE SIGNAL ;
 END NETS
 END DESIGN

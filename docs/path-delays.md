@@ -1,9 +1,11 @@
 # Path delay constraints (`set_max_delay` / `set_min_delay`)
 
-Status: **implemented** (v1 2026-11-18; output-port endpoints 2026-11-19) —
+Status: **implemented** (v1 2026-11-18; output-port endpoints 2026-11-19;
+multi-launch port coverage 2026-11-19) —
 parser and signature-class
 composition live in `crates/grus-core/src/sta/{sdc,analysis}.rs`; every
-committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*` scenario
+committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*`/`ml_*`/`pml_*`
+scenario
 matches OpenSTA
 (`test_sta_exceptions_match_opensta`). This document records the OpenSTA
 semantics measured on the `sta_exceptions` fixture (see
@@ -127,9 +129,19 @@ the ideal-clock required times exactly):
   `mdo_min_mch`/`mdo_min_mcs` keep the min delay req off MCP shifts;
   `mdo_both` composes per side).
 
-Coverage note: `y` is driven by `u_ff1/Q` alone, so the covered-candidate
-winner rule is exercised per transition only; a multi-driver port fixture
-stays open (section 5).
+Coverage note: `y` is driven by `u_ff1/Q` alone, so on `y` the
+covered-candidate winner rule is exercised per transition only. The
+second output `y2` (`u_mux2` driven by `u_ff0/Q` and `u_ff2/Q`,
+`sel`-launched too) covers it per source: `ml_both` merges both FF
+launches in one delay check and reports the arrival winner `u_ff0`
+(1.508460 — identical to the isolated `ml_max0` check, 16.2 ps above
+`ml_max2`); `pml_both` shows the propagated-clock winner flips to
+`u_ff2` (1.015388, equal to `base_prop`'s ordinary arrival winner at
+`y2`). `ml_all` (`-to [all_outputs]`) also covers the `sel` launch at
+`y2`, so its report is `sel`'s candidate (1.533129), not `ml_both`'s —
+universal `-from` coverage measured there. `ml_min`/`pml_min` carry the
+merged min-side check (`pml_min` reports the delay check's hold
+violation, slack -0.109318).
 
 ### Selectors
 
@@ -294,7 +306,7 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
 
 ## 4. Validation plan
 
-Golden scenarios in `exceptions.reference.json` (95 entries: 91 evaluated +
+Golden scenarios in `exceptions.reference.json` (102 entries: 98 evaluated +
 4 OpenSTA error records): `md_*` ideal-clock set including order/precedence
 variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 `mhu_*` uncertainty variants, `base_prop` / `pmd_*` propagated-clock set,
@@ -302,7 +314,8 @@ variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 qualifier-diagnostic coverage, the `m2_*`/`pm2_*` two-source set, and the
 `mdo_*`/`pmo_*` output-port set (N sweeps, min-side attribution probes,
 `all_outputs`/`-from` coverage, precedence, and propagated-clock anchors —
-section 1).
+section 1), and the `ml_*`/`pml_*` multi-launch port set (merged two-source
+checks at `y2`, per-source probes, `all_outputs`, min side — section 1).
 
 Since 2026-11-19 the fixture drives `u_ff1/D` from a `mux2` with two FF
 inputs (`u_ff0`, `u_ff2`) and a constrained input port (`sel`), assigns
@@ -315,7 +328,10 @@ command — the signature-class form that actually merges); `pm2_both` under
 `set_propagated_clock` showed the required time anchors to the **capture**
 clock pin, not the launch's. `pm2_min2` covers the min side under skewed
 launches. `pmd_multi` (two commands) and `md_nofrom` (universal `-from`)
-became multi-source delay scenarios for free.
+became multi-source delay scenarios for free. A second `mux2` (`u_mux2`,
+same A0/A1 orientation) drives the new output port `y2` from `u_ff0/Q` and
+`u_ff2/Q` — with `sel` on its select — reproducing the diverging-winner
+geometry at a port for the `ml_*`/`pml_*` scenarios.
 
 Honest coverage note: the merged delay check runs on golden data with the
 delay/arrival winners split — `pm2_both` reports the arrival winner
@@ -327,9 +343,10 @@ delay_max` went red by exactly that gap — and established that OpenSTA
 reports the covered-source arrival winner (a wrong-arrival mutation was
 also checked red, per the fail-proof rule). The delay check's CRPR credit
 remains unexercised (zero late/early spread on this fixture's clock
-nets). On the port side, `y` has exactly one launch (`u_ff1/Q`), so the
-same winner rule is exercised per transition only — the multi-launch
-winner at a port is unverified, not assumed.
+nets). On the port side the same rule is now exercised per source: `y2`
+is driven from two FF launches through `u_mux2`, and `ml_both` /
+`pml_both` merge them in one delay check against the per-source probes
+`ml_max0`/`ml_max2` (see the coverage note in section 1).
 
 ## 5. Open questions / follow-ups
 
@@ -389,13 +406,20 @@ Resolved by the output-port probe set (2026-11-19):
   `mdo_mindl`/`mdo_minhu` attribution); `set_propagated_clock` does not
   move the anchor (`pmo_*` identical to the ideal required times).
 
+Resolved by the multi-launch port fixture (2026-11-19):
+
+- ~~multi-driver output-port winner rule~~ — `y2` (`u_mux2` from
+  `u_ff0/Q`/`u_ff2/Q`) exercises the covered-candidate winner per source:
+  `ml_both` reports the `u_ff0` candidate (decomposed by `ml_max0`/
+  `ml_max2`, 16.2 ps split), `pml_both` the propagated arrival winner
+  `u_ff2`; `ml_min`/`pml_min` cover the merged min-side check and
+  `ml_all` the `-to [all_outputs]` selector.
+
 Still open:
 
 1. A literal two-clock-domain `set_min_delay` anchoring fixture;
    async-reset endpoint probe; latch-borrow delay fixture — all need
    DEF/SDC additions.
-2. A multi-driver output-port fixture for the covered-candidate winner
-   rule (one launch reaches `y` today; exercised per transition only).
-3. CRPR credit on delay checks needs a fixture with nonzero clock-net
+2. CRPR credit on delay checks needs a fixture with nonzero clock-net
    late/early spread.
-4. Propagated-clock input-port launch anchor (see above).
+3. Propagated-clock input-port launch anchor (see above).
