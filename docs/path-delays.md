@@ -4,7 +4,7 @@ Status: **implemented** (v1 2026-11-18; output-port endpoints 2026-11-19;
 multi-launch port coverage 2026-11-19) —
 parser and signature-class
 composition live in `crates/grus-core/src/sta/{sdc,analysis}.rs`; every
-committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*`/`ml_*`/`pml_*`
+committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*`/`ml_*`/`pml_*`/`pmp_*`
 scenario
 matches OpenSTA
 (`test_sta_exceptions_match_opensta`). This document records the OpenSTA
@@ -78,9 +78,20 @@ fixture's clock nets carry zero late/early spread).
   by `md_tight`/`md_basic`, where the delay check wins.
 - Input-port sources work identically: `md_port` (`-from [get_ports d_in]`)
   gave `req = 0.528237 + 1.0 - adjustments` on `u_ff0/D`; the port launch
-  reference is the I/O clock edge the input delay is anchored to (exact
-  anchor TBD during implementation — candidate: referenced clock's arrival
-  at the clock port pin; `ClockRef::Virtual` needs a defined fallback).
+  reference is the I/O clock edge the input delay is anchored to. Under
+  `set_propagated_clock` the `pmp_*` scenarios measured the launch anchor
+  at the SDC `-source` latency: `pmp_port`'s `u_ff0/D` reports the
+  ordinary propagated port seed `arr 0.8` (`0.1` source latency + `0.7`
+  input delay), not the `1.4` an ideal-latency anchor (`source + network`)
+  would give nor the ~`0.87` a capture-pin-propagated anchor would; and
+  `pmp_port2` (network latency 0.6 -> 1.1) is byte-identical to
+  `pmp_port`, so the anchor carries no network-latency term. On this
+  fixture that anchor is numerically identical to the propagated arrival
+  at the `clk` port pin — `clk` is the propagation root, so its pin sees
+  source latency plus zero insertion delay; separating the two named
+  candidates needs insertion upstream of a root and is out of scope.
+  The delay check shares the port's ordinary propagated arrival — the
+  same `input_clock_latency_ns` seed `base_prop` reports.
 
 ### `set_min_delay N` (hold side)
 
@@ -306,7 +317,7 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
 
 ## 4. Validation plan
 
-Golden scenarios in `exceptions.reference.json` (102 entries: 98 evaluated +
+Golden scenarios in `exceptions.reference.json` (106 entries: 102 evaluated +
 4 OpenSTA error records): `md_*` ideal-clock set including order/precedence
 variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 `mhu_*` uncertainty variants, `base_prop` / `pmd_*` propagated-clock set,
@@ -314,8 +325,11 @@ variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 qualifier-diagnostic coverage, the `m2_*`/`pm2_*` two-source set, and the
 `mdo_*`/`pmo_*` output-port set (N sweeps, min-side attribution probes,
 `all_outputs`/`-from` coverage, precedence, and propagated-clock anchors —
-section 1), and the `ml_*`/`pml_*` multi-launch port set (merged two-source
-checks at `y2`, per-source probes, `all_outputs`, min side — section 1).
+section 1), the `ml_*`/`pml_*` multi-launch port set (merged two-source
+checks at `y2`, per-source probes, `all_outputs`, min side — section 1),
+and the `pmp_*` propagated-clock port-launch set (`set_max_delay` /
+`set_min_delay` `-from [get_ports d_in]`, the `-from [all_inputs]` sweep,
+and the network-latency null-diff probe — section 1).
 
 Since 2026-11-19 the fixture drives `u_ff1/D` from a `mux2` with two FF
 inputs (`u_ff0`, `u_ff2`) and a constrained input port (`sel`), assigns
@@ -343,7 +357,13 @@ delay_max` went red by exactly that gap — and established that OpenSTA
 reports the covered-source arrival winner (a wrong-arrival mutation was
 also checked red, per the fail-proof rule). The delay check's CRPR credit
 remains unexercised (zero late/early spread on this fixture's clock
-nets). On the port side the same rule is now exercised per source: `y2`
+nets). The `pmp_*` set exercises the propagated input-port launch anchor:
+`pmp_port`/`pmp_minport` report the ordinary propagated port seed
+(0.8/0.1) on the delay check and `pmp_port2`'s null diff proves the
+anchor carries no network-latency term — with the caveat that the SDC
+`-source` latency and the propagated `clk`-port-pin arrival coincide
+numerically here because `clk` is the propagation root. On the port side
+the same rule is now exercised per source: `y2`
 is driven from two FF launches through `u_mux2`, and `ml_both` /
 `pml_both` merge them in one delay check against the per-source probes
 `ml_max0`/`ml_max2` (see the coverage note in section 1).
@@ -368,9 +388,8 @@ stays):
   (`clk_state.arrival_max[edge]`) for sequential launches; verified against
   `pmd_*`/`md_*` goldens.
 - ~~Port launch reference~~ — `input_clock_latency_ns`, the same I/O clock
-  anchor the port's own input delay uses (`md_port`/`md_minport` match). The
-  propagated-clock port anchor (source latency vs propagated clock-port
-  arrival) is unverified — no golden exercises it.
+  anchor the port's own input delay uses (`md_port`/`md_minport` match;
+  the propagated-clock anchor is measured by `pmp_*`, resolved below).
 - ~~`delay_max` tie-breaking~~ — keep-first implemented, matching the
   arrival merge order; OpenSTA tie-break remains unmeasured.
 - ~~Signature-class split~~ — implemented as chosen: delay coverage joins
@@ -415,6 +434,23 @@ Resolved by the multi-launch port fixture (2026-11-19):
   `u_ff2`; `ml_min`/`pml_min` cover the merged min-side check and
   `ml_all` the `-to [all_outputs]` selector.
 
+Resolved by the propagated port-launch set (`pmp_*`, 2026-11-19):
+
+- ~~propagated-clock input-port launch anchor~~ — the delay check shares
+  the port's ordinary propagated arrival (`pmp_port`: `u_ff0/D` arr 0.8;
+  `pmp_minport`: arr 0.1), i.e. the SDC `-source` latency anchor our
+  `input_clock_latency_ns` already returns — the ideal-latency
+  (arr 1.4) and capture-pin-propagated (arr ~0.87) anchors are
+  falsified, and `pmp_port2` (network latency 0.6 -> 1.1) is
+  byte-identical, so no network term is carried. Caveat recorded in
+  section 1: `-source` latency and the propagated `clk`-port-pin arrival
+  are numerically identical on this fixture (`clk` is the propagation
+  root) — the two named candidates were not separable. `pmp_alls`
+  (`-from [all_inputs]`) additionally covers the port launch at the
+  skewed `u_ff2` capture pin and the `sel` launch at `u_ff1/D` and `y2`
+  (`y2` reports a real −0.683130 delay-check violation); `clk` is inert
+  as a launch source in both engines.
+
 Still open:
 
 1. A literal two-clock-domain `set_min_delay` anchoring fixture;
@@ -422,4 +458,3 @@ Still open:
    DEF/SDC additions.
 2. CRPR credit on delay checks needs a fixture with nonzero clock-net
    late/early spread.
-3. Propagated-clock input-port launch anchor (see above).

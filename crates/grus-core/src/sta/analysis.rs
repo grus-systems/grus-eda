@@ -8260,7 +8260,7 @@ mod tests {
 
     /// `tests/designs/sta_exceptions`: a three-flop DEF (muxed `u_ff1/D`,
     /// a second mux driving `y2` from the same two FF sources, split clock
-    /// buffers) plus 102 SDC scenarios.
+    /// buffers) plus 106 SDC scenarios.
     /// `exceptions.reference.json` was emitted by the committed
     /// `generate_ref.sh` running OpenSTA inside the pinned LibreLane image.
     /// Four scenarios carry `error` records: a combined `-setup X -hold Y`
