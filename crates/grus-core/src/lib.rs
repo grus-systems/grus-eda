@@ -20,3 +20,5 @@ pub use lib_db::*;
 pub use placement::*;
 pub use readers::*;
 pub use tech_db::*;
+
+// seed/STA smoke test
