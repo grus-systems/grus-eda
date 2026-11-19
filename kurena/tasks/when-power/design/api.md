@@ -165,3 +165,27 @@ Unchanged — the diagnostics line already prints
 - Existing tests keep passing: `mb`/`mb.saif` fixtures have no `when`
   cells; `SignalActivity` gains fields so literal constructors get
   `..Default::default()`.
+
+## Implementation addendum — measured verdict folded in
+
+Probing inside the container refined the model beyond the sketch above;
+`docs/results.md` (2026-11-19, N7) is the record. What the code does now:
+
+- `SignalActivity` also carries `xtrans` (x/z-involved edges, 0.5 weight
+  each) and `other_s` (x/z/never-defined time); `P(net=1)` =
+  `t1/(t0+t1+other)` — OpenSTA counts x/z time in the denominator.
+- `net_activity` stores `Option<SignalActivity>`; `net_p1` became
+  `prob_one()` on the stored activity (no separate vector).
+- The count-net knob landed on the **owning pin's net** (as sketched),
+  but transitions are *apportioned* over the block set's distinct
+  `related_pin`s by their activity rates — a block contributes nothing
+  while its trigger pin is idle. Each direction consumes half the net's
+  effective toggles.
+- `total_output_net_capacitance` and switching `C_load` both include the
+  driver pin's own `capacitance` (mbw: 0.05 + 0.00226).
+- P4 measured **state-weighted leakage**, so `readers/liberty.rs` entered
+  scope: `leakage_power () { when; value }` groups parse into
+  `LibCell::leakage_states` (Liberty cache 6→7) and evaluate
+  `Σ P(state)·value`, uncovered mass at `cell_leakage_power`.
+- `conditional_power_blocks` counts inexpressible `when` forms in both
+  `internal_power` and `leakage_power`.

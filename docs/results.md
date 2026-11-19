@@ -3146,3 +3146,142 @@ matching the `<int>` grammar and OpenSTA's rejection of `(DURATION
 `grus-eda power --saif tests/designs/microbench/mb.saif` end-to-end
 (stderr reports `1 unmatched SAIF scopes` from the ghost);
 `generate_saif_ref.sh` re-run end-to-end, artifacts byte-identical.
+### 2026-11-19 — N7 — `when`-qualified `internal_power`/`leakage_power` evaluation (v0.1.97)
+
+`power.rs` no longer skips every `when`-carrying `internal_power` block:
+supported `when` forms (conjunctions of pin literals) now evaluate at the
+measured OpenSTA marginal probability, and `leakage_power` `when` states are
+state-weighted. `conditional_power_blocks` narrows to inexpressible forms
+(outside the literal-conjunction grammar, no matching sibling pin, or a
+literal net with no measured state). `LibDb` gained
+`LibCell::leakage_states` (Liberty cache version 6→7); `SignalActivity`
+gained `xtrans` (half-weight x/z edges) and `other_s` (x/z/never-defined
+time) so `P(net=1) = t1/(t0+t1+other)` exists for every annotated net.
+
+**Reference**: committed `tests/designs/microbench/generate_when_ref.sh`
+inside `ghcr.io/librelane/librelane:3.0.16` — same lib/LEF/DEF/SDC reads,
+`read_vcd -scope tb/dut mbw.vcd` and `read_saif -scope tb/dut mbw.saif`
+(the SAIF emitted by committed `vcd2saif.py`, no flags) +
+`report_power -digits 6`, tables parsed into `mbw.reference.json`
+(`power_vcd` + `power_saif`); filtered stdout committed as
+`mbw.openroad.txt`. Re-run end-to-end on this change: regenerated files
+byte-identical. The probe section (§5) also ran; tables below are its
+console output.
+
+**Fixture**: `mbw` = one `sky130_fd_sc_hd__ebufn_1` (`Z = A` while `TE_B`
+low, hi-Z while high). `Z` carries an unconditional `related_pin:"A"`
+`internal_power` block plus `related_pin:"TE_B"` blocks gated
+`when:"A"`/`when:"!A"` — the library's only `internal_power` `when`
+shape. `mbw.sdc` needs a real port-backed clock for our SDC subset, so a
+dedicated `clk` input port carries `create_clock -period 20` and drives no
+cell. `mbw.vcd`/`mbw.saif` exercise both `when` branches (P(A)=0.55) and
+z-excursions on `z` in both A states (TE_B pulses).
+
+#### P0 — `when` inventory on `sky130_fd_sc_hd__tt_025C_1v80.lib`
+
+`awk` scans of the pinned lib: `internal_power` `when` = 26 blocks / 13
+cells (`ebufn_{1,2,4,8}`, `einvn_{0,1,2,4,8}`, `einvp_{1,2,4,8}`), only
+the literals `"A"`/`"!A"`, all on `Z` with `related_pin` = the enable pin.
+`leakage_power` `when` = 6244 groups library-wide — literal conjunctions
+(up to ~8 literals, e.g. `!A&TE_B`, DFF `IQ` state vars) plus the non-pin
+literals `SHORT`/`DIODE`. `timing` `when`: none.
+
+#### Measured OpenSTA activity model (`get_property $pin activity`)
+
+`<rate/s> <P(1)> <source>`: clean 0↔1 edges count 1.0 toggle, x/z-involved
+edges **0.5** (mbw `z`: 6 clean + 4 z-edges → rate 8/2000ns = 4e6/s);
+`P(1)` = time-in-1 over the whole annotated window (x/z time excluded
+from the numerator but present in the denominator — mbw `z` reads 0.475
+= 950/2000, not 950/1650).
+
+#### P1 — count net, apportioning, z edges
+
+`mbw_a0` (A≡0, TE_B 8 edges → `z` gets 0→z→0 excursions): Combinational
+internal **−6.979485e-08**. `mbw_a0te16` (16 edges):
+**−1.395897e-07** ≈ 2×. `mbw_a1` (A≡1, same TE_B edges → 1→z→1
+excursions): **+9.872135e-08**. Verdicts:
+
+- The owning pin's net (`z`) drives the count (z excursions = the TE_B
+  event); the `when` branch selects by `P(A)` — `!A` table (negative
+  energy) fires under a0, `A` table under a1, each ~100%.
+- Blocks are eligible only while their `related_pin` carries activity —
+  `qe`-style probes with TE_B idle + `a` active give zero contribution
+  from the `when` blocks; both related pins active → `z`'s rate splits
+  by related-pin rate share (a 6:4 A:TE_B probe gives the 0.6/0.4
+  weighted sum, ~3.44e-08).
+- Each direction consumes half the net's effective toggles
+  (`(E_rise + E_fall)·density/2`), and the table's
+  `total_output_net_capacitance` axis — like switching's `C_load` —
+  includes the **driver pin's own `capacitance`**: `set_load 0.05` + Z
+  cap 0.00226 = 0.05226 reproduces every block's table readout to ~0.01%.
+- z excursions count for switching too: `a0` switching 1.693224e-07
+  (eff 4 toggles × 0.05226 pF), `a0te16` exactly 2×.
+
+#### P2/P3 — marginal, not joint
+
+`mbw_duty55` vs `mbw_duty80` (same `a`/`z` edges, P(A) 0.55 vs 0.80,
+TE_B idle): internal **identical** at 3.502020e-08 — not because `when`
+is ignored (TE_B-inactive blocks contribute nothing either way), but the
+discriminating evidence is the golden itself: mbw's `TE_B`-related
+blocks fire at `P(A)=0.55`/`P(!A)=0.45` marginal weights (verified by
+recomputation of all probe tables to ~0.004%). SAIF `mbw.saif` (T0/T1
+marginals only) reproduces the same per-state leakage and the same model
+— VCD internal 5.006255e-08 vs SAIF 4.221585e-08 differ **only** because
+the SAIF encodes clean `TC` counts without the z-edge half-toggles (6 vs
+8) and a `TZ`-inclusive duty; OpenSTA applies the same marginal model to
+both. Verdict: `P(when)` = product of literal pin marginals —
+independence, no joint correlation.
+
+#### P4 — `leakage_power` `when` states are weighted
+
+Static-state probes (`mbw_s00`..`s11`, zero edges): the Combinational
+leakage column reads the lib's state values directly — 2.7640e-12
+(`!A&!TE_B`), 2.5423e-12 (`!A&TE_B`), 2.8469e-12 (`A&!TE_B`), 4.2767e-12
+(`A&TE_B`) — vs flat `cell_leakage_power` 3.107474e-12 (−12%/+38%).
+mbw's annotated states give Σ P(state)·value = 2.929754e-12; `duty80`
+gives 2.830320e-12 — marginal weighting, implemented.
+
+#### Implemented model
+
+Per `internal_power` block on a pin: energy =
+table(trigger-pin's per-direction slew, own-net load incl. driver pin
+cap) × (own net effective toggles / 2) × (related pin's activity share
+of all distinct related pins) × `P(when)` — where `P(when)` = product of
+literal pin marginals from `t1/(t0+t1+other)`. Unsupported forms
+(`|`, `^`, parens, unresolved pins, unmeasured state — includes
+`SHORT`/`DIODE`/`IQ` literals with no net) stay counted. Leakage:
+Σ P(state)·value, uncovered mass at `cell_leakage_power`.
+
+#### Ours vs golden (`power::tests::test_when_power_mbw_matches_opensta`)
+
+STRICT bounds: internal/switching/total 0.1%, leakage 1% + 1.5e-12 W
+floor.
+
+| quantity | grus-eda | OpenROAD | diff |
+|---|---|---|---|
+| VCD internal | 5.006255e-08 | 5.006255e-08 | ~1e-7% |
+| VCD switching | 3.386448e-07 | 3.386448e-07 | ~1e-7% |
+| VCD leakage | 2.929754e-12 | 2.929754e-12 | ~1e-7% |
+| VCD total | 3.887103e-07 | 3.887103e-07 | ~1e-7% |
+| SAIF internal | 4.221584e-08 | 4.221585e-08 | ~1e-7% |
+| SAIF switching | 2.539836e-07 | 2.539836e-07 | ~1e-7% |
+| SAIF leakage | 2.929754e-12 | 2.929754e-12 | ~1e-7% |
+| SAIF total | 2.962024e-07 | 2.962024e-07 | ~1e-7% |
+
+`conditional_power_blocks == 0` on both paths; `grus-eda power --vcd
+mbw.vcd` end-to-end clean. `mb` VCD rerun under the new model: leakage
+improves to 4.30e-12 vs golden 4.34e-12 (the old state-vs-flat residual
+closes); switching unchanged — sky130 output pins declare no
+`capacitance` except tristate `Z` pins, so `q`/`y` driver caps are 0 and
+the documented −3.7% sequential-switching residual remains (not the
+driver-pin-cap previously guessed — Q declares none; cause still open).
+
+**Fail-proof**: `weight = 1.0` in the `when` path →
+`vcd Combinational internal: ours 5.489250e-08 vs opensta 5.006255e-08`
+red; corrupting `power_vcd` Combinational internal in the golden → red;
+both restored, suite green.
+
+**Checks run**: `cargo test --workspace` (291+3 pass, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`generate_when_ref.sh` re-run end-to-end, `mbw.*` artifacts
+byte-identical.

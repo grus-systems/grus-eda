@@ -15,9 +15,11 @@
 //! put pin data under `PORT`), resolves top-scope names to design nets *and*
 //! ports, and counts every unmatched scope/signal in [`SaifDiagnostics`].
 //!
-//! Duty (`T0`/`T1`) is parsed and carried in [`SaifFields`] but the power model
-//! does not consume it: our leakage is per-cell flat `leakage_power_w`, not the
-//! state-dependent form OpenSTA reads duty for.
+//! Duty (`T0`/`T1`) and x/z/bus durations (`TX`/`TZ`/`TB`) are parsed in
+//! [`SaifFields`] and carried into [`SignalActivity::t0_s`],
+//! [`SignalActivity::t1_s`] and [`SignalActivity::other_s`]: the power model
+//! consumes them as the state probabilities a `when` weight needs — including
+//! state-weighted `leakage_power` (docs/results.md).
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -430,13 +432,24 @@ impl SaifActivity {
             design: &DesignDb,
             net: NetId,
             f: &SaifFields,
+            timescale_s: f64,
         ) {
             let name = design
                 .strings
                 .resolve(design.net_names[net.0 as usize])
                 .to_string();
             let (rise, fall) = split_tc(f);
-            signals.insert(name, SignalActivity { rise, fall });
+            signals.insert(
+                name,
+                SignalActivity {
+                    rise,
+                    fall,
+                    xtrans: 0,
+                    t0_s: f.t0 * timescale_s,
+                    t1_s: f.t1 * timescale_s,
+                    other_s: (f.tx + f.tz + f.tb) * timescale_s,
+                },
+            );
         }
 
         for (name, f) in &selected.signals {
@@ -445,7 +458,7 @@ impl SaifActivity {
                 .copied()
                 .or_else(|| port_net_of.get(name.as_str()).copied().flatten());
             match net {
-                Some(net) => annotate(&mut signals, design, net, f),
+                Some(net) => annotate(&mut signals, design, net, f, self.timescale_s),
                 None => diag.unmatched_signals += 1,
             }
         }
@@ -456,6 +469,7 @@ impl SaifActivity {
             cell_of: &HashMap<&str, CellId>,
             signals: &mut HashMap<String, SignalActivity>,
             diag: &mut SaifDiagnostics,
+            timescale_s: f64,
         ) {
             let Some(&cell) = cell_of.get(scope.name.as_str()) else {
                 diag.unmatched_scopes += 1;
@@ -471,16 +485,23 @@ impl SaifActivity {
                     .get(name.as_str())
                     .and_then(|&p| design.pin_nets[p.0 as usize]);
                 match net {
-                    Some(net) => annotate(signals, design, net, f),
+                    Some(net) => annotate(signals, design, net, f, timescale_s),
                     None => diag.unmatched_signals += 1,
                 }
             }
             for child in &scope.instances {
-                resolve_instance(child, design, cell_of, signals, diag);
+                resolve_instance(child, design, cell_of, signals, diag, timescale_s);
             }
         }
         for inst in &selected.instances {
-            resolve_instance(inst, design, &cell_of, &mut signals, &mut diag);
+            resolve_instance(
+                inst,
+                design,
+                &cell_of,
+                &mut signals,
+                &mut diag,
+                self.timescale_s,
+            );
         }
 
         Ok((

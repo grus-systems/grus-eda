@@ -7660,6 +7660,7 @@ mod tests {
                 arc_offset: 0,
                 arc_count: 0,
                 leakage_power_w: None,
+                leakage_states: Vec::new(),
             });
             let cell = &lib.cells[0];
             gate_kind(&lib, cell, &lib.pins[2])

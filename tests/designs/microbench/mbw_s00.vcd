@@ -1,0 +1,27 @@
+$timescale 1ns $end
+$scope module tb $end
+$scope module dut $end
+$var wire 1 ! a $end
+$var wire 1 " teb $end
+$var wire 1 # z $end
+$var wire 1 $ clk $end
+$scope module u_t $end
+$var wire 1 % A $end
+$var wire 1 & TE_B $end
+$var wire 1 ' Z $end
+$upscope $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+0!
+0"
+0#
+0$
+0%
+0&
+0'
+$end
+#2000
+$finish
