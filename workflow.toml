@@ -11,14 +11,9 @@ timeout_sec = 1800       # per subprocess invocation
 # main checkout at worktree creation.
 # Generated artifacts are gitignored — seed copies them from the
 # main checkout into each task worktree (sta tests panic without
-# them). jpeg is skipped: its tests are #[ignore]d today; add it
-# back if a spec needs it (~125 MB).
-worktree_seed = [
-  "tests/designs/aes/",
-  "tests/designs/gcd/",
-  "tests/designs/ibex/",
-  "tests/designs/picorv32/",
-]
+# them). ~255 MB per worktree: every design dir is needed — even
+# non-#[ignore] tests read jpeg artifacts.
+worktree_seed = ["tests/designs/"]
 
 # Host-capability runners (routing tokens, no container exec):
 [runner.eda]
