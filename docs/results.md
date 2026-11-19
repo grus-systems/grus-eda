@@ -2507,3 +2507,215 @@ vs ref 2.029087); restored and green.
 gcd/picorv32/aes/ibex/jpeg STA goldens — single-clock designs see the
 same credit the consensus gave) and
 `cargo clippy --workspace --all-targets -- -D warnings` pass.
+
+## 2026-11-19 — N3 follow-up: `min_pulse_width` OpenSTA surface probe
+
+Probe for the deferred `min_pulse_width` check arcs (roadmap N3). Fixture:
+`tests/designs/sta_edge/min_pulse_width/` — `mpw.def` (buf `u_dbuf`,
+clkbuf `u_clkb` on `c1`, clkinv `u_clkinv` on `c2`, clkbuf `u_clkb2` on
+`c3`; FFs `u_ff0/1/2` `dfxtp_1`, `u_dfr` `dfrtn_1`, latch `u_lt` `dlxtn_1`)
+plus `ideal.sdc` (P=5.0, ideal clock), `propagated.sdc` (+ propagated
+clock, `-clock -cell_delay` derates 0.80/1.20, `-cell_check` 0.90/1.10),
+`viol.sdc` (P=0.6, transition 0.3). All commands run inside
+`ghcr.io/librelane/librelane:3.0.16` via `openroad -no_init -no_splash`
+heredocs (not yet via a committed `generate_ref.sh` — the probe only).
+
+### Command surface (Q1/Q2)
+
+- `report_pulse_width_checks -digits 6` emits **one row per
+  (clock pin, pulse)** — fields: pin name with a `(high)`/`(low)` suffix,
+  `Required Width`, `Actual Width`, `Slack`, `(MET)`/`(VIOLATED)`; sorted
+  by slack ascending. `report_... > file` redirection works, so a
+  generator can capture and parse the rows in-process.
+- `report_check_types -min_pulse_width` prints only the **worst row**;
+  with `-violators` it prints every violating row (same table format).
+- `find_timing_paths -path_delay min_pulse_width` and
+  `report_checks -path_delay min_pulse_width` both error `STA-0510`
+  (accepted: `min`, `min_rise`, `min_fall`, `max`, `max_rise`,
+  `max_fall`, `min_max`) — pulse checks are **not** a path-delay kind.
+- Programmatic surface exists (`sta::min_pulse_width_checks <corner>` →
+  `MinPulseWidthCheckSeq`, `sta::min_pulse_width_check_slack <corner>`,
+  `sta::min_pulse_width_check_pins <pins> <corner>`,
+  `sta::min_pulse_width_violations <corner>`,
+  `sta::set_min_pulse_width*`) but the seq/iterator types have no Tcl
+  constructor — the usable golden surface is the report text.
+
+### Measured rules (ideal + propagated goldens)
+
+- **Row granularity**: one row per (pin, pulse) for which the Liberty
+  `min_pulse_width` arc carries the constraint table. `dlxtn_1` has only
+  `fall_constraint` → only a `(low)` row (9 rows total for 5 check pins).
+- **Constraint mapping (Q3)**: `rise_constraint` → `high` pulse,
+  `fall_constraint` → `low` pulse (values + the `dlxtn` row shape both
+  confirm).
+- **Actual width corner rule (Q4)**: `actual = min(early_pair,
+  late_pair)`, each pair `arr_<corner>[close] − arr_<corner>[open]` —
+  NOT a single corner: `u_ff0/CLK (high)` used the early pair
+  (2.505748481 → reported 2.505749), `u_ff2/CLK (high)` behind `u_clkinv`
+  used the late pair (2.496332675 → 2.496333). Mixed-corner combos
+  (`min[close] − max[open]` etc.) are ruled out numerically.
+- **Edge pairing / wrap (Q8)**: `width = arrive(close) − arrive(open)`,
+  wrapped `+period` once when `<= 0`. `u_ff2/CLK` first-occurrence
+  arrivals are `fall 0.36 / rise 2.86`; the high pulse is
+  `(fall + P) − rise` — the *next* opposite edge, not `|diff|`.
+- **Arrival source**: the check reads the *propagated* clock-network
+  arrivals even under the ideal clock (`report_arrival` on clock pins
+  shows source-latency + cell-delay values — e.g. `u_ff0/CLK` rise
+  0.36 / fall 2.87 under `ideal.sdc`; and `viol.sdc`, an ideal-clock
+  scenario, reports skewed propagated widths like 0.289639).
+- **Required width slew arg (Q5)**: the constraint table evaluated at
+  the check pin's own slew of the constraint-named transition — under
+  the ideal clock that is `set_clock_transition` (0.1 → e.g. `dfxtp`
+  rise_constraint 0.290764; 0.3 under `viol.sdc` → 0.562049), under a
+  propagated clock the propagated pin slew (0.0734743 → 0.254784).
+  `slew_min`/`slew_max` coincide at every fixture pin so the corner is
+  not discriminable; implementation takes `slew_max` (conservative).
+- **Derate/uncertainty on required (Q6)**: none — `-cell_check`
+  0.90/1.10 and `set_clock_uncertainty 0.1` are both present in
+  `propagated.sdc`, yet `Required Width` equals the raw table lookup.
+- **WNS/TNS inclusion (Q7)**: pulse slacks do **not** enter
+  `find_timing_paths` endpoints, `worst_slack`, or
+  `total_negative_slack` — `viol.sdc` reports all 9 rows `VIOLATED`
+  while `total_negative_slack -min` is 0.0 and the min/max endpoint
+  lists stay at the 7 ordinary checks/ports. They are a separate
+  report family (`sta::min_pulse_width_violations <corner>` returns
+  the violating check seq). Report shape: a separate
+  `pulse_width_checks` list, excluded from `endpoints`/WNS/TNS and
+  the setup/hold violation counts.
+- **Deferred-type census (Q9)**: the sky130 hd lib carries
+  `non_seq_setup_rising`/`non_seq_hold_rising` on `dfbb*`/`sdfbb*` cells
+  (12 arcs each) and `three_state_enable`/`disable` on `ebuf*`/`einv*`
+  (13 arcs each); `preserve` has zero arcs. None of those cells are
+  instantiated in our designs (`ibex` skip map is
+  `Clear=1655 MinPulseWidth=3602 Preset=9`) — they stay deferred and
+  counted in `recognized_check_arcs`.
+
+### `viol.sdc` excerpt (`report_pulse_width_checks -digits 6`)
+
+```
+                                        Required      Actual
+Pin                                        Width       Width       Slack
+------------------------------------------------------------------------
+u_ff1/CLK (low)                         0.578190    0.289639   -0.288551 (VIOLATED)
+u_ff0/CLK (low)                         0.578190    0.292814   -0.285376 (VIOLATED)
+u_dfr/CLK_N (low)                       0.568326    0.292814   -0.275512 (VIOLATED)
+u_ff2/CLK (low)                         0.578190    0.303056   -0.275134 (VIOLATED)
+u_dfr/CLK_N (high)                      0.577742    0.307186   -0.270556 (VIOLATED)
+u_ff2/CLK (high)                        0.562049    0.296944   -0.265105 (VIOLATED)
+u_lt/GATE_N (low)                       0.549943    0.289639   -0.260303 (VIOLATED)
+u_ff0/CLK (high)                        0.562049    0.307186   -0.254863 (VIOLATED)
+u_ff1/CLK (high)                        0.562049    0.310361   -0.251688 (VIOLATED)
+```
+
+All 9 rows violated by ~0.25–0.29 ns — margin comfortable (fixture.md §2
+contingency not needed). Note the probe used `sta::worst_slack` wrapped
+in `time_sta_ui` once by mistake (double unit conversion); raw
+`sta::worst_slack -max` for this scenario is −0.683834 ns (`y`'s slack),
+`total_negative_slack -min` 0.0 as stated above.
+
+## 2026-11-19 — `min_pulse_width` promoted to an evaluated check family (v0.1.93)
+
+Fixture `tests/designs/sta_edge/min_pulse_width/` (`mpw.def` + `ideal.sdc` /
+`propagated.sdc` / `viol.sdc`); golden `min_pulse_width.reference.json` was
+emitted by the committed `generate_ref.sh`, run as written from the repo
+root inside `ghcr.io/librelane/librelane:3.0.16`:
+
+```bash
+bash tests/designs/sta_edge/min_pulse_width/generate_ref.sh
+```
+
+The generator re-execs into the container, runs `openroad -no_init
+-no_splash` once per scenario, reads the design, then collects ordinary
+endpoints via `find_timing_paths` and pulse rows by parsing
+`report_pulse_width_checks -digits 6` output (redirected to a file inside
+the same Tcl session — OpenSTA's `MinPulseWidthCheckSeq` iterator is not
+Tcl-constructible, see the probe entry above). Rows are sorted by pin then
+edge; two generator bugs found and fixed before the committed golden was
+produced: a backtick inside an unquoted heredoc comment tripped shell
+command substitution, and the row sort used an index path instead of a
+composite key.
+
+### Implementation notes
+
+- `TimingType::MinPulseWidth` left `is_deferred_check()`; `build_graph`
+  collects `PulseWidthCheck{pin, lib_arc}` before the latch arm.
+- **Check existence**: only arcs whose pin sits on a `clock_net` produce
+  rows. `dfrtn` carries a second `min_pulse_width` arc on `RESET_B`
+  (`fall_constraint` only) and OpenSTA emits no row for it — measured: 9
+  rows golden, not 10. An earlier iteration instead seeded/marked
+  pulse-check pins as clock consumers wholesale; that marked the `d1`
+  data net a clock net, blocked data arrivals on it (5 `*_check` skips
+  `no_path`) and seeded `RESET_B` with a phantom clock arrival that
+  produced a bogus recovery endpoint (`max_arr 1.2`). Fixed by keeping
+  pulse pins in the useful-consumer set only (a clock branch ending at a
+  bare pulse check is not pruned) and filtering checks to clock-network
+  pins after pruning.
+- `eval_pulse_width_checks` applies the measured rules from the probe
+  entry: `rise_constraint`→high/`fall_constraint`→low, actual =
+  `min(early_pair, late_pair)` of propagated arrivals wrapped `+period`
+  when `<= 0`, required = raw table lookup at the check pin's
+  `slew_max[open]`, slack = actual − required. Under the ideal clock the
+  propagated `clock_state` is computed additionally so widths use the
+  same network arrivals OpenSTA measures (`viol.sdc` is an ideal-clock
+  scenario and reports skewed propagated widths).
+- Report shape: `StaReport::pulse_width_checks` (separate from
+  `endpoints`, out of WNS/TNS and violation counts, matching the measured
+  `total_negative_slack -min = 0.0` under 9 violations), sorted pin
+  then `High`/`Low`; `EndpointKind::MinPulseWidth` for unreached rows;
+  `merge_corner_reports` merges rows on `(pin, edge)` keeping the smaller
+  slack; CLI prints `pulse-width checks: n (v violating)`.
+- `total_endpoints` counts every emitted pulse row; the in-test recount
+  reproduces it from the graph's retained checks plus the deferred count
+  for dropped arcs.
+- **Non-clock-pin arcs stay deferred**: a `min_pulse_width` arc whose pin
+  net is not a clock net produces no row and instead counts into
+  `recognized_check_arcs["MinPulseWidth"]`, so `arcs_skipped()` still
+  covers every instantiated arc. ibex instantiates 3602 arcs: 1938 on
+  clock-network pins emit the 3875 report rows, the remaining 1664 on
+  async set/reset pins (`sdf*`/`dfr*` `RESET_B|SET_B`) count as deferred
+  (`recognized_check_arcs[Clear=1655, MinPulseWidth=1664, Preset=9]`);
+  the fixture's `u_dfr/RESET_B` arc shows up as `MinPulseWidth: 1` next
+  to `Clear: 1`.
+- **ibex seq-edge cycle in `propagate_slew`**: the first run of
+  `test_skip_report_counts_latch_arcs` on the newly generated
+  `ibex.placed.def` failed with `combinational loop: 41913 of 107242 pins
+  could not be levelized` while the same file passed on the unchanged
+  checkout. Root cause: the ideal-mode pulse evaluation newly calls
+  `propagate_slew`, which levelizes with clk→Q ordering edges
+  (`include_seq=true`). On ibex a clock-gate latch's Q fans into the
+  gated clock net, and every downstream launch's ordering edge closes a
+  giant strongly-connected component — a latent limitation that also
+  affects `set_propagated_clock` runs, exposed here for the first time.
+  Fix: on that levelization error `propagate_slew` retries with the
+  data-edge order (`include_seq=false`); the seq edges only order a slew
+  dependency, and every clock pin's slew — all the consumers need — is
+  exact either way. The retry only fires where the precise order already
+  fails, so all existing goldens are unchanged (the full suite re-passed).
+
+### Comparison vs golden (committed `compare_sta_edge`, `Tol::STRICT`)
+
+`test_sta_edge_min_pulse_width_{ideal,propagated,viol}` — every pin/edge
+row, `required_ns`/`actual_ns`/`slack_ns`, plus the ordinary endpoints,
+WNS/TNS and the integer violation counts:
+
+- `ideal`: 9/9 rows, all met; e.g. `u_ff0/CLK (high)` required 0.290764 /
+  actual 2.507186 / slack 2.216422.
+- `propagated`: 9/9 rows, all met; asymmetric widths across the three
+  clock branches (u_ff0 2.505749 vs u_ff2 2.496333 actual), inverted
+  branch wrapped correctly.
+- `viol`: 9/9 rows violated (slacks −0.25…−0.29), ordinary endpoints
+  still 7, `setup_violations=7`, `wns_max −0.683834`.
+
+Fail-proof: swapping the `rise_constraint`/`fall_constraint` mapping sent
+all three tests red — `required_ns`/`slack_ns` mismatches on every row
+plus `u_lt/GATE_N (low): missing` (the dlxtn arc is fall-only, so a
+swapped row lands on the wrong edge). Restored; green again.
+
+`cargo test --workspace`: first run failed 58 tests on
+`test_support::require` panics for gitignored generated artifacts
+(`*.placed.def`, `*.routed.spef`, `*.sta.reference.json` for
+aes/ibex/jpeg/picorv32) absent in this worktree — environmental, not
+the change. After copying the gitignored artifacts from the main
+checkout (bit-identical inputs the committed `generate_ref.sh` flows
+produce), the full suite passes: 259 run, 0 failed, 2 `#[ignore]`d.
+`cargo clippy --workspace --all-targets -- -D warnings` clean.

@@ -217,7 +217,9 @@ generic text above disagree, this section wins.
 3. **Ideal clock.** The clock net is not propagated. Every register `CLK` pin has
    `arrival = 0.0` (rise edge at t=0) and **`slew = 0.0`** for both max and min, even though
    `set_input_transition 0.15 [all_inputs]` matches `clk`. Only `RisingEdge` arcs are used
-   for `dfxtp`; `min_pulse_width` and other non-delay arcs are ignored.
+   for `dfxtp`; `min_pulse_width` is a separate evaluated check family (`v0.1.93`,
+   `StaReport::pulse_width_checks`, measured OpenSTA semantics in `docs/results.md`
+   2026-11-19) and other non-delay arcs are deferred and counted.
    `set_propagated_clock` switches to the propagated mode (`v0.1.60`, roadmap R2): a separate
    pass walks clock nets through combinational arcs and computes arrival/slew per transition
    at every consumer clock pin, tracking the clock-edge index parity so inverting paths pick
