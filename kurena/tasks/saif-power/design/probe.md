@@ -83,6 +83,15 @@ wins — emit the evidence verbatim in `results.md`, adjust reader/tolerance
 to the *measured* semantics, and correct these design docs in the same
 change.
 
+**Regeneration after the `vcd2saif.py` fixes is expected byte-identical.**
+Both fixes are no-ops on this input: no committed signal name ends in the
+`rstrip("$end")` character set, and mb.vcd's `$timescale 1ns` emits the
+same `(TIMESCALE 1 ns)` line the code hardcoded. After rerunning
+`generate_saif_ref.sh` end-to-end, `git diff` on `mb.saif`,
+`mb.saif.reference.json`, and `mb.saif.openroad.txt` must be empty. If any
+of them changes, the results entry names what changed and why before the
+commit lands — no silent regeneration (the review memo's requirement).
+
 ## P4 — results.md entry (required content)
 
 Dated entry covering:
@@ -107,3 +116,7 @@ Dated entry covering:
 7. **Checks run — include the full suite**: `cargo test --workspace`
    (whole workspace, not only `-p grus-core saif`/`power`) and
    `cargo clippy --workspace --all-targets -- -D warnings`.
+8. **Converter fixes + regen outcome**: one line recording the two
+   `vcd2saif.py` fixes (literal `$end` suffix, parsed `$timescale`), the
+   container `python3 --version` used, and whether `mb.saif` regenerated
+   identically (expected) or what changed and why.

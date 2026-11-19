@@ -1,6 +1,6 @@
 # API design — readers/saif.rs, power.rs, main.rs
 
-## `crates/grus-core/src/readers/saif.rs` (new)
+## `crates/grus-core/src/readers/saif.rs` (exists; two leniency nits this pass)
 
 Mirror `vcd.rs`: parse function + `load_*` path wrapper, `anyhow` errors at
 the boundary.
@@ -41,7 +41,9 @@ pub fn load_saif(path: &Path) -> Result<SaifActivity>;
 
 Tokenizer: `(`, `)`, atoms, `"quoted"`, `\`-escaped names. One pass; the
 grammar in `saif-format.md` is small enough for a hand recursive-descent
-parser like the VCD reader's.
+parser like the VCD reader's. Inside a quoted string `\` escapes the next
+byte (`\"` → `"`, `\\` → `\`) — the same convention as atom escapes, so an
+escaped quote cannot terminate the string early.
 
 ### Scope selection + resolution
 
@@ -78,6 +80,9 @@ Rules (measured semantics are `saif-format.md`; these are *our* rules):
 - `--saif-scope` path components that match no `INSTANCE` → hard error
   listing available paths (loud, not "annotated nothing").
 - Missing `DURATION`/`TIMESCALE` → error. `duration_s <= 0` → error.
+  `DURATION` parses as `u64`: any float literal (`1980.0`, `1980.5`) is a
+  hard error — the grammar says `<int>` and OpenSTA rejects `(DURATION
+  1990.0)` (measured, `saif-format.md`).
 
 ## `crates/grus-core/src/readers/mod.rs`
 
@@ -125,9 +130,10 @@ comment → "from VCD or SAIF switching activity".
 
 - `saif.rs` unit tests (no PDK): header/timescale/duration, nested scopes,
   NET vs PORT groups both collected, escaped names (`a\[0\]` → `a[0]`),
-  fractional-TC error, missing-DURATION error, odd-TC duty split
-  **including the `t0 == t1` tie → `(100,99)` case**, auto-scope
-  single-chain descent + ambiguous → error.
+  fractional-TC error, missing-DURATION error, fractional-DURATION error
+  (`1980.5` and `1980.0` both reject), quoted-string escapes (`\"`, `\\`),
+  odd-TC duty split **including the `t0 == t1` tie → `(100,99)` case**,
+  auto-scope single-chain descent + ambiguous → error.
 - `power.rs` integration test `test_saif_power_mb_matches_opensta`
   (`test_support` helpers; fails loudly on missing PDK/files): load
   mb.def/mb.sdc/lib/lef → `sta_pin_slews` → `load_saif(mb.saif)` → resolve

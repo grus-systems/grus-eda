@@ -2,26 +2,36 @@
 
 ## Revision note
 
-This revision addresses the rejected-review memo. Four corrections to the
-committed fixture/scripts/record — the reader and CLI design are unchanged:
+This revision addresses the second rejected-review memo: two latent bugs in
+the committed `vcd2saif.py` converter and two leniency nits in `saif.rs`.
+No semantic change — `mb.saif` is expected to regenerate byte-identical.
 
-1. **`generate_saif_ref.sh` `igtx` probe targets `y`, not clk.** The probe did
-   `text.replace("(TX 0)", "(TX 40)", 1)`, which hits the *first* `(TX 0)` in
-   file order — `clk`'s line — while `docs/results.md` recorded the probe as
-   "on `y`". Probe mutations must be anchored to a named signal's line; see
-   `fixture.md`/`probe.md`.
-2. **`mb.saif` clk `TC 200` → odd.** `vcd2saif.py` gains `--window-end`;
-   aggregating over `[10, 1990]` drops clk's final `#2000` fall, giving
-   `TC 199` so the odd-TC rise/fall split is golden-covered, not only
-   unit-tested. Consequence: the SAIF window is 10 ns shorter than the VCD
-   window — recorded honestly (`probe.md` P3/P4).
-3. **Record the WARNING-line filter.** The committed `mb.saif.openroad.txt`
-   is `openroad` stdout filtered by `grep -v` (INFO/WARNING/banner/blank
-   lines) — the script comment saying "whole stdout" and the results entry
-   must say filtered, not verbatim.
-4. **`cargo test --workspace` in the results entry.** The "Checks run" line
-   listed only package-scoped test runs; the acceptance requires the full
-   workspace suite recorded.
+1. **`vcd2saif.py` name mangling** (line ~68): `name.rstrip("$end")` treats
+   `"$end"` as a *character set*, not a suffix — a signal ending in `e`,
+   `n`, `d`, or `$` loses its tail (`mode` → `mo`, `en` → ``). Strip the
+   literal suffix (`str.removesuffix`). Latent only: mb's names (`clk`,
+   `a`, `q`, `y`, `D`, `CLK`, `Q`, `A`, `Y`) end in none of those
+   characters, and `$end` already arrives as its own `words` token.
+2. **`vcd2saif.py` hardcoded timescale**: `parse_vcd` splits `$timescale`
+   into `timescale_s`, then `main` discards it and emits `(TIMESCALE
+   1 ns)`. Emit the parsed `(num, unit)` pair instead; `DURATION` and all
+   field durations need no rescaling — they are already in VCD-timestamp
+   units, which equal TIMESCALE units by construction. mb.vcd is
+   `$timescale 1ns`, so the emitted line is identical to the hardcoded one.
+3. **`saif.rs` fractional `DURATION`** (leniency nit): the documented
+   grammar says `(DURATION <int>)` and OpenSTA rejects `(DURATION 1990.0)`
+   (measured, `saif-format.md`), but `parse_saif` accepts float literals.
+   Parse the atom as `u64` — any float literal is a hard error.
+4. **`saif.rs` quoted-string escapes** (leniency nit): the tokenizer's `"`
+   branch scanned to the next `"`, so `\"` inside a quoted string ended it
+   early. `\` now escapes the next byte inside quotes, same convention as
+   atoms. Header strings only — robustness, not semantics.
+
+If regeneration changes `mb.saif`/`mb.saif.reference.json` (it should not —
+see `fixture.md`/`probe.md`), the results entry explains why.
+
+The first revision (committed): name-anchored probe mutations, `--window-end`
+odd-TC golden coverage, filtered-stdout record, full-suite checks.
 
 ## Context
 
@@ -145,15 +155,17 @@ driver-pin-cap delta the VCD path carries — root cause named in
 
 ## Files
 
-- `crates/grus-core/src/readers/saif.rs` (exists; test expectations updated)
-- `crates/grus-core/src/power.rs` (test updated: per-net comparison)
-- `tests/designs/microbench/` (`vcd2saif.py`, `generate_saif_ref.sh`,
-  `mb.saif`, `mb.saif.reference.json`, `mb.saif.openroad.txt` —
-  regenerated; `mb.power.json` unchanged)
-- `docs/results.md` (2026-11-19 entry corrected)
-- `docs/roadmap.md` (N7 wording if the window description changes)
+- `tests/designs/microbench/vcd2saif.py` (the two bug fixes)
+- `crates/grus-core/src/readers/saif.rs` (the two leniency nits + tests)
+- `tests/designs/microbench/` (`mb.saif`, `mb.saif.reference.json`,
+  `mb.saif.openroad.txt` — regenerated, expected byte-identical;
+  `generate_saif_ref.sh` unchanged)
+- `docs/results.md` (2026-11-19 entry: fixes + regen outcome recorded)
+- `crates/grus-core/src/power.rs` (unchanged)
 - `crates/grus-core/src/readers/mod.rs` (unchanged)
 - `crates/grus-eda/src/main.rs` (unchanged)
-- `README.md` (unchanged — power CLI surface not documented there)
-- `Cargo.toml` / `Cargo.lock` (no further bump: `0.1.96` already carries
-  this in-flight change)
+- `README.md` (unchanged)
+- `docs/roadmap.md` (unchanged)
+- `Cargo.toml` (no further bump: `0.1.96` already carries this in-flight
+  change)
+- `Cargo.lock` (unchanged)

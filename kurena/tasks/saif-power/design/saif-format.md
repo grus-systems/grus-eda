@@ -28,9 +28,14 @@ S-expressions. Header items we consume; everything else is ignored.
 Reader rules:
 
 - `TIMESCALE` + `DURATION` are required; `duration_s = DURATION * timescale_s`.
+  `DURATION` parses as `u64` — a float literal is a hard error (the grammar
+  says `<int>`; OpenSTA rejects `(DURATION 1990.0)`, quirks table below).
 - Durations (`T0`,`T1`,`TX`,`TZ`,`TB`) parse as `f64`; `TC`,`IG` as `u64` —
   a fractional `TC` is a hard error (OpenSTA rejects all floats; we allow
   float durations but not a fractional toggle count).
+- Inside `"quoted"` strings, `\` escapes the next byte (`\"` → `"`,
+  `\\` → `\`) — same convention as atom escapes; an escaped quote cannot
+  terminate the string early.
 - `VIRTUAL_INSTANCE` and unknown `(KEYWORD ...)` items inside an `INSTANCE`
   body are skipped (counted nowhere — parser-level, like `readers/vcd.rs`).
   OpenSTA hard-errors on `VIRTUAL_INSTANCE`; we are lenient and document it.
