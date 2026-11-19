@@ -3176,13 +3176,16 @@ fn run_sta_partitioned(
             }
             survived = true;
             let mut pols = *pols;
-            // Delay checks are modelled for FF setup/hold endpoints only —
-            // output ports, clock gates, latch-D and async recovery/removal
+            // Delay checks are modelled for FF setup/hold endpoints and
+            // output ports; clock gates, latch-D and async recovery/removal
             // checks keep their clock-check values and are diagnosed.
-            let delay_supported = matches!(kind, ExceptionEndpointKind::Check { latch: false })
-                && check_by_pin
+            let delay_supported = match kind {
+                ExceptionEndpointKind::OutputPort => true,
+                ExceptionEndpointKind::Check { latch: false } => check_by_pin
                     .get(&ep)
-                    .is_some_and(|c| c.setup_arc.is_some() || c.hold_arc.is_some());
+                    .is_some_and(|c| c.setup_arc.is_some() || c.hold_arc.is_some()),
+                _ => false,
+            };
             if (delay_max_n.is_some() || delay_min_n.is_some()) && !delay_supported {
                 unsupported_pd.insert(ep);
                 delay_max_n = None;
@@ -3192,6 +3195,22 @@ fn run_sta_partitioned(
             // constraint replaces the clock check on its side, absorbing the
             // multicycle shift that side would otherwise take.
             if let Some(n) = delay_max_n
+                && kind == ExceptionEndpointKind::OutputPort
+            {
+                // Measured (`mdo_max*`, `pmo_max*`): the port delay check is
+                // referenced to the delay edge itself —
+                // req = N - output_delay_max - setup_uncertainty in both
+                // clock modes (no latency or period term; `pmo_*` shows the
+                // propagated clock does not move the anchor). The candidate
+                // keeps its ordinary arrival and slew.
+                let (_, delay_max) = sdc.output_delay_ns(cx.port_name(PinId(ep)));
+                for w in pols.max.iter_mut().flatten() {
+                    w.req = n - delay_max - sdc.setup_uncertainty_ns;
+                    w.slack = w.req - w.arr;
+                }
+            }
+            if let Some(n) = delay_max_n
+                && kind != ExceptionEndpointKind::OutputPort
                 && let Some(&check) = check_by_pin.get(&ep)
             {
                 let s = class_states[ci][ep as usize];
@@ -3236,7 +3255,23 @@ fn run_sta_partitioned(
                     });
                 }
             }
-            if let Some(n) = delay_min_n {
+            if let Some(n) = delay_min_n
+                && kind == ExceptionEndpointKind::OutputPort
+            {
+                // Measured (`mdo_min*`, `pmo_min*`): req =
+                // N - output_delay_min + hold_uncertainty — the same edge-0
+                // reference as the max side. `mdo_mindl`/`mdo_minhu` vary one
+                // term at a time to separate delay_min from hold_uncertainty
+                // (they cancel at the preamble's 0.1/0.1).
+                let (delay_min, _) = sdc.output_delay_ns(cx.port_name(PinId(ep)));
+                for w in pols.min.iter_mut().flatten() {
+                    w.req = n - delay_min + sdc.hold_uncertainty_ns;
+                    w.slack = w.arr - w.req;
+                }
+            }
+            if let Some(n) = delay_min_n
+                && kind != ExceptionEndpointKind::OutputPort
+            {
                 // The min-side delay check takes the pre-MCP hold required
                 // time plus N (measured `md_min_mcp_*`): the multicycle shift
                 // never feeds it.
@@ -8224,7 +8259,7 @@ mod tests {
     }
 
     /// `tests/designs/sta_exceptions`: a three-flop DEF (muxed `u_ff1/D`,
-    /// split clock buffers) plus 72 SDC scenarios.
+    /// split clock buffers) plus 95 SDC scenarios.
     /// `exceptions.reference.json` was emitted by the committed
     /// `generate_ref.sh` running OpenSTA inside the pinned LibreLane image.
     /// Four scenarios carry `error` records: a combined `-setup X -hold Y`

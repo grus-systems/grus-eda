@@ -1,13 +1,15 @@
 # Path delay constraints (`set_max_delay` / `set_min_delay`)
 
-Status: **implemented v1** (2026-11-18) — parser and signature-class
+Status: **implemented** (v1 2026-11-18; output-port endpoints 2026-11-19) —
+parser and signature-class
 composition live in `crates/grus-core/src/sta/{sdc,analysis}.rs`; every
-committed `md_*`/`pmd_*`/`mhu_*` scenario matches OpenSTA
+committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*` scenario
+matches OpenSTA
 (`test_sta_exceptions_match_opensta`). This document records the OpenSTA
 semantics measured on the `sta_exceptions` fixture (see
 `tests/designs/sta_exceptions/generate_ref.sh`) and the implementation shape.
 Sections 3's "v1 diagnoses" and "explicitly out of scope" lists still apply;
-the follow-ups in section 5 are open.
+the remaining follow-ups in section 5 are open.
 
 ## 1. What OpenSTA does (measured)
 
@@ -102,15 +104,32 @@ two-clock-domain fixture is listed as follow-up work in section 5.
 
 ### Output ports (`-to [get_ports ...]`)
 
-Different anchor, measured ad hoc but **out of v1 scope** (see section 3):
+Supported since 2026-11-19 (`mdo_*`/`pmo_*` committed scenarios). The port
+delay check is referenced to the delay edge itself — no latency or period
+term, and `set_propagated_clock` does not move the anchor (`pmo_*` reproduces
+the ideal-clock required times exactly):
 
-- max side: `req = N - output_delay_max - setup_uncertainty` (edge reference 0;
-  verified at N = 0.5/1.0/2.0)
-- min side: `req ~= N` (exact additive constant TBD)
+- max side: `req = N - output_delay_max - setup_uncertainty` — `mdo_max05`/
+  `mdo_max1`/`mdo_max2`/`mdo_max3` read `N - 0.75` at all four N points;
+  `mdo_max3`'s delay req (2.25) is looser than the ordinary output req
+  (1.95) and still replaces it — same replace semantics as FF checks.
+- min side: `req = N - output_delay_min + hold_uncertainty`. The preamble's
+  0.1/0.1 values make the two terms cancel, so `mdo_min0` alone reads
+  `req = N`; the attribution probes `mdo_mindl` (delay_min 0.4 -> req -0.3)
+  and `mdo_minhu` (hold_unc 0.35 -> req +0.25) isolate each term.
+- The candidate keeps its ordinary arrival and slew. `-from` coverage is the
+  launch-source model unchanged: `mdo_from1` (`-from u_ff1`) and
+  `mdo_from2` (`-from {u_ff0 u_ff1}`) apply the check, `mdo_from0`
+  (`-from u_ff0` — its fanout ends at `u_ff1/D`) leaves `y` byte-identical
+  to `base`. `all_outputs` resolves (`mdo_all`), and the measured precedence
+  false_path > delay > multicycle holds on the port side (`mdo_fp` removes
+  `y`; `mdo_mc`/`mdo_mc_rev` order-independently keep the delay req;
+  `mdo_min_mch`/`mdo_min_mcs` keep the min delay req off MCP shifts;
+  `mdo_both` composes per side).
 
-The `md_toy*` probes were run ad hoc and intentionally left out of the
-committed golden set for v1 (same for `md_fromall`, `md_maxrise`, `md_fall` —
-see section 3 scope notes).
+Coverage note: `y` is driven by `u_ff1/Q` alone, so the covered-candidate
+winner rule is exercised per transition only; a multi-driver port fixture
+stays open (section 5).
 
 ### Selectors
 
@@ -220,6 +239,11 @@ Per side independently (max and min compose separately):
 4. min side: min_delay covering (s, e) -> `req = req_hold_base + N` (the
    pre-MCP hold required); else existing hold/multicycle handling.
 
+Output-port endpoints compose the same way, with the edge-referenced
+required times of section 1 substituted in steps 2 and 4
+(`req = N - output_delay_max - unc_setup`, `req = N - output_delay_min +
+unc_hold` — no capture term, so nothing is read from `check_by_pin`).
+
 Multiple max_delay (or min_delay) rules on overlapping pairs fold by
 **file-order last-wins per (from, to) signature** before composition.
 False-path precedence over delay is measured (`md_fp`); delay-over-multicycle
@@ -238,6 +262,8 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
 - Endpoint kind `Check { latch: false }` for **flip-flop D-pin setup/hold
   checks only** — asynchronous recovery/removal checks share that variant
   and are excluded (counted in `unsupported_path_delay_endpoints`).
+- Endpoint kind `OutputPort` — the edge-referenced formulas in section 1
+  (`mdo_*`/`pmo_*` committed scenarios).
 - Universal (no `-from`/`-to`) rules.
 - Interaction with false_path / multicycle per section 1 precedence.
 - Propagated and ideal clocks.
@@ -255,7 +281,7 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
   path-membership selectors we cannot resolve.
 - `-clock <name>` (consumes its argument), `-datapath_only` — OpenSTA
   rejects these anyway (`STA-0563`); counted ignored.
-- Delay constraints reaching `OutputPort`, `ClockGate`, latch-D, or
+- Delay constraints reaching `ClockGate`, latch-D, or
   async-recovery/removal endpoints: counted in a new
   `unsupported_path_delay_endpoints` skip field (same pattern as
   `unsupported_multicycle_endpoints`); the endpoint keeps its clock-check
@@ -263,19 +289,20 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
 
 **Explicitly out of scope (documented, not approximated)**
 
-- Output-port delay semantics (measured formulas in section 1; need dedicated
-  scenarios + multi-source probing before implementing).
 - Latch-D and clock-gate delay checks.
 - `-rise`/`-fall` and other edge qualifiers.
 
 ## 4. Validation plan
 
-Golden scenarios in `exceptions.reference.json` (72 entries: 68 evaluated +
+Golden scenarios in `exceptions.reference.json` (95 entries: 91 evaluated +
 4 OpenSTA error records): `md_*` ideal-clock set including order/precedence
 variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 `mhu_*` uncertainty variants, `base_prop` / `pmd_*` propagated-clock set,
 `md_early` / `md_datapath` OpenSTA-rejection records, `md_through`
-qualifier-diagnostic coverage, and the `m2_*`/`pm2_*` two-source set.
+qualifier-diagnostic coverage, the `m2_*`/`pm2_*` two-source set, and the
+`mdo_*`/`pmo_*` output-port set (N sweeps, min-side attribution probes,
+`all_outputs`/`-from` coverage, precedence, and propagated-clock anchors —
+section 1).
 
 Since 2026-11-19 the fixture drives `u_ff1/D` from a `mux2` with two FF
 inputs (`u_ff0`, `u_ff2`) and a constrained input port (`sel`), assigns
@@ -300,7 +327,9 @@ delay_max` went red by exactly that gap — and established that OpenSTA
 reports the covered-source arrival winner (a wrong-arrival mutation was
 also checked red, per the fail-proof rule). The delay check's CRPR credit
 remains unexercised (zero late/early spread on this fixture's clock
-nets).
+nets). On the port side, `y` has exactly one launch (`u_ff1/Q`), so the
+same winner rule is exercised per transition only — the multi-launch
+winner at a port is unverified, not assumed.
 
 ## 5. Open questions / follow-ups
 
@@ -352,13 +381,21 @@ Resolved by the diverging-winner regen (2026-11-19):
   covered-source arrival winner, so the delay domain was retired and the
   delay check now keeps the covered candidate's ordinary arrival.
 
+Resolved by the output-port probe set (2026-11-19):
+
+- ~~output-port delay semantics~~ — edge-referenced required times measured
+  and implemented: `req_max = N - output_delay_max - unc_setup`,
+  `req_min = N - output_delay_min + unc_hold` (`mdo_*` sweeps,
+  `mdo_mindl`/`mdo_minhu` attribution); `set_propagated_clock` does not
+  move the anchor (`pmo_*` identical to the ideal required times).
+
 Still open:
 
 1. A literal two-clock-domain `set_min_delay` anchoring fixture;
    async-reset endpoint probe; latch-borrow delay fixture — all need
    DEF/SDC additions.
-2. Output-port delay semantics (formulas measured ad hoc in section 1;
-   dedicated scenarios + multi-source probing before implementing).
+2. A multi-driver output-port fixture for the covered-candidate winner
+   rule (one launch reaches `y` today; exercised per transition only).
 3. CRPR credit on delay checks needs a fixture with nonzero clock-net
    late/early spread.
 4. Propagated-clock input-port launch anchor (see above).

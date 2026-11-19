@@ -2218,3 +2218,66 @@ itself the divergence proof; restored and green.
 `4.562147` literal in the `test_sta_exception_diagnostics` comment was
 corrected to `4.550057` (winner req 2.550057 + one period; the req is
 data-net independent and unchanged in the new golden).
+
+### 2026-11-19 — output-port `-to` delay checks (`mdo_*`/`pmo_*`)
+
+Implements `set_max_delay`/`set_min_delay` checks whose `-to` selects an
+output port — `docs/path-delays.md` section 5 item 2, on the existing
+signature-class machinery. 23 new scenarios probe `-to [get_ports y]` /
+`-to [all_outputs]`, `-from` subsets, propagated clocks, and precedence;
+`generate_ref.sh`'s `SCENARIOS` grew from 72 to 95 names.
+
+- **Reference command**: `bash tests/designs/sta_exceptions/generate_ref.sh`
+  run in full inside `ghcr.io/librelane/librelane:3.0.16`. The existing 72
+  entries came back byte-identical (`git diff` shows only the 23 new keys).
+- **Our command**: `cargo test -p grus-core test_sta_exceptions_match_opensta`
+  (STRICT: rel 1%, abs 5 ps).
+
+**Measured formulas** (fixture preamble: `output_delay` 0.1/0.7,
+`setup_unc` 0.05, `hold_unc` 0.1, output latency 0.7 ideal / 0.1
+propagated):
+
+- max side: `req = N - output_delay_max - setup_unc` — `mdo_max05`/`1`/`2`/`3`
+  read `-0.25`/`0.25`/`1.25`/`2.25` (`N - 0.75` at every point). `mdo_max3`
+  is the loose-replace probe: the delay req (2.25) is looser than the
+  ordinary output req (1.95) and OpenSTA still reports it — replace
+  semantics, same as FF endpoints.
+- min side: `req = N - output_delay_min + hold_unc`. `mdo_min0`/`05`/`1`
+  read `0.0`/`0.5`/`1.0` — ambiguous alone because the preamble's
+  delay_min = hold_unc = 0.1 cancels, so `mdo_mindl` (delay_min raised to
+  0.4 -> req `-0.3`) and `mdo_minhu` (hold_unc raised to 0.35 -> req
+  `+0.25`) isolate each term; the value matches only the
+  `N - delay_min + hold_unc` decomposition of the decision table.
+- propagated clock (`pmo_*`): required times identical to the ideal-clock
+  `mdo_*` values — no latency term, the anchor stays at the delay edge
+  (edge reference 0) in both clock modes.
+- `-from` coverage: `mdo_from1` (`-from u_ff1`, `y`'s only launch) and
+  `mdo_from2` (`-from {u_ff0 u_ff1}`, mixed objects) report the delay req
+  0.25; `mdo_from0` (`-from u_ff0`, whose fanout terminates at `u_ff1/D`)
+  leaves `y` byte-identical to `base` — the launch-source coverage model
+  holds at ports. `mdo_all` (`-to [all_outputs]`) resolves.
+- precedence: `mdo_fp` removes `y` entirely (false_path > delay);
+  `mdo_mc`/`mdo_mc_rev` keep the delay req 0.25 order-independently while
+  the uncovered min side takes the MCP shift (2.7); `mdo_min_mch`/
+  `mdo_min_mcs` keep the min delay req 0.5 off the MCP shifts;
+  `mdo_both` composes per side (0.25/0.5).
+- coverage limit: `y` has exactly one launch (`u_ff1/Q`), so the
+  covered-candidate winner rule is exercised per transition only — a
+  multi-driver port fixture remains open (docs/path-delays.md section 5).
+
+**Implementation**: `run_sta_partitioned`'s `delay_supported` gate admits
+`ExceptionEndpointKind::OutputPort`; the `delay_max_n`/`delay_min_n`
+blocks branch on the endpoint kind — `Check` keeps the capture-anchored
+formula, `OutputPort` replaces `req`/`slack` per the formulas above and
+keeps the candidate's `arr`/`slew`. `unsupported_path_delay_endpoints`
+now counts only clock gates, latch-D and arc-less checks. MCP/false-path
+handling needed no change (the MCP shift was already per-side gated on
+`delay_*_n.is_none()`).
+
+**Result**: all 91 non-error scenarios pass STRICT tolerances; the 4
+OpenSTA-rejection records unchanged. Fail-proof: keeping `latency +
+period` in the max req and `req += n` on the min side turns the `mdo_*`
+set red (`mdo_all` first); restored and green.
+
+**Regression**: `cargo test --workspace` (252 + 3 tests) and
+`cargo clippy --workspace --all-targets -- -D warnings` pass.
