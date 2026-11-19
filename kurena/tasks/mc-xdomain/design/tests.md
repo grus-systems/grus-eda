@@ -30,7 +30,7 @@ Pure functions, no fixture needed:
 | `setup_edge_pair(1.0, 2.0, 0, 0)` | `(1.0, 2.0)` — equal-grid min-gap, not edge 0 |
 | `setup_edge_pair(2.0, 1.0, 0, 0)` | `(0.0, 1.0)` |
 | `setup_edge_pair(2.0, 2.0, 0, 0)` | `(0.0, 2.0)` — same-domain degeneration |
-| `setup_edge_pair(2.0, 2.0, 1, 0)` | `(1.0, 2.0)` — `c0 <= g` parity case |
+| `setup_edge_pair(2.0, 2.0, 1, 0)` | `(0.0, 2.0)` — `c0 <= g` parity case; returns additive shifts, and the g=1 first edge is already inside the recorded arrival (the pair's absolute edge times are 1.0/2.0) |
 | `hold_edge_pair(2.0, 1.4, 0, 0)` | `(0.0, 0.0)` |
 | `hold_edge_pair(2.0, 1.4, 1, 0)` | `(6.0, 7.0)` — first coincidence at T=7.0 |
 | `hold_edge_pair(1.4, 2.0, 1, 0)` | `None` — no coincident capture edge (defer path) |

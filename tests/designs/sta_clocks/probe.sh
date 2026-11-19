@@ -172,7 +172,7 @@ exit
 EOF
 }
 
-SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds"
+SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx"
 
 for name in $SCENARIOS; do
     run_sta "two_clock.def" "$name.sdc" "ref_$name.json"

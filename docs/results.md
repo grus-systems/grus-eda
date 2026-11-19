@@ -3572,3 +3572,112 @@ extended to the domain masks.
 **Checks run**: `cargo test --workspace` (301 passed, 0 failed, 2 ignored in grus-core; 3 passed in grus-eda),
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 Version 0.2.0 → 0.2.1 (additive feature, no API break).
+
+### 2026-11-20 — `mc-xdomain`: cross-domain edge pairing + inter-clock uncertainty (v0.2.2)
+
+Third ticket of the `docs/multi-clock.md` sequence. `foreign_launch`'s
+whole-endpoint defer is now `xdomain_defer`: a reached endpoint defers
+`CrossDomain` only when a side genuinely cannot pair — undeclared launch
+(`<undeclared>`), a latch-D check with a foreign launch (borrow pairing
+parked), a min-side tying parity with no coincident capture edge in the
+LCM window (hold selection parked), or a non-converging `grid_lcm`
+(defensive). Everything else evaluates per `(domain, parity)` candidate
+and keeps the worst slack:
+
+- **Setup** (`setup_edge_pair`): each launch edge `g·PL/2 + m·PL` in the
+  period-LCM window pairs with the smallest capture `check.edge` edge
+  strictly after it; the winner minimises `capture − launch`. `arr`
+  shifts `+ m·PL`, `req` shifts `+ j·PC` — no CRPR credit on a foreign
+  branch (the launch never shares the capture clock net).
+- **Hold** (`hold_edge_pair`): coincident edges only, as measured;
+  a non-coincident tying parity defers (parked).
+- **Uncertainty**: `set_clock_uncertainty -from/-to` stores directed
+  inter-clock rules (`Sdc::inter_clock_uncertainty`); every eval-side
+  read goes through `Sdc::uncertainty_ns(launch, cap, side)` — the last
+  matching rule *replaces* the capture row's value for that direction
+  and side only. Delay-check rewrites and mixed tying masks use the
+  worst-over-bits form. `-rise_from` etc. bail `unsupported option`;
+  positional clocks with `-from`/`-to` bail `cannot name clocks with
+  -from/-to`.
+- **Delay checks**: covered cross-domain endpoints report on the
+  capture domain's edge-0 anchor — no pairing needed. A `-from
+  [get_pins inst/Q]` is a path *startpoint* (measured on `t2_mdx`):
+  the pin's clocked launch is replaced by pin-segment paths —
+  `arr = w.dly − pin.dly`, `req = N ∓ constraint`, no clock anchor,
+  no uncertainty — and endpoints no covering rule's `-to` names lose
+  the check on that side entirely.
+- **MCP on a foreign min candidate**: `d_min = −nh·Pc` (measured
+  `t2_mcp` −1.037585), not the same-domain `((ns−1)−nh)·Pc`; mixed
+  masks take the cross form. `d_max` unchanged.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` as committed in
+  `ghcr.io/librelane/librelane:3.0.16` (all 16 scenarios re-run).
+  `git diff`: `two_clock.probe.json` gained only the `t2_mdx` block;
+  every other scenario block and every existing `probe_t2_*.txt` is
+  byte-identical. New artifacts: `t2_mdx.sdc`, `probe_t2_mdx.txt`.
+- `cargo test --workspace`: 305 passed, 0 failed, 2 ignored
+  (grus-core) + 3 passed (grus-eda).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+
+#### Cross-domain comparison vs OpenSTA (`test_sta_clocks_match_opensta`)
+
+All 15 parseable `t2_*` scenarios on `two_clock.def` plus `t2_latch` on
+`two_clock_latch.def` compare per-endpoint/per-field at `Tol::STRICT`
+(1% rel / 5 ps); `cross_domain_endpoints == 0` on every committed
+scenario, so wns/tns/violation counts compare everywhere. `t2_grp`
+remains parse-gated (`mc-selectors`).
+
+| scenario | cross-domain rows now evaluated | what it pins |
+|---|---|---|
+| `t2_int` | `u_fx/D`, `u_fy/D`, `u_fb0/D` | equal-grid min-gap: B→A launch 1.0→capture 2.0, not edge 0 |
+| `t2_frac` | same set | LCM-14 pairing: launch 4.0/capture 4.2 (A→B), 9.8→10.0 (B→A) |
+| `t2_prop`, `t2_prop1`, `t2_lat` | same set | pairing independent of propagated/declared latency (source grids) |
+| `t2_unc` | same set | capture-row uncertainty on foreign checks |
+| `t2_uncx` | same set | `-setup 0.30 -from cka -to ckb` → `u_fx/D` req 3.785446; B→A keeps cka's 0.05, hold sides keep row values (replacement, not additive, not symmetric) |
+| `t2_mcp` | same set | `d_max` on the paired req; `d_min = −nh·Pc` → `u_fx/D` min req −1.037585 |
+| `t2_md`, `t2_mdl` | covered cross endpoints | capture edge-0 anchor reads per-domain latency+uncertainty |
+| `t2_mdo` | — | same-domain output delay check (unchanged) |
+| `t2_mds` | — | same-domain delay checks (unchanged) |
+| `t2_mdx` (new) | `u_fy/D` both sides | pin-startpoint `-from`: `arr 0.0` from the pin, `req 0.885446/0.962415`; `u_fb1/D` loses both checks (unconstrained — absent from OpenSTA's table and ours) |
+| `t2_latch` | 0 | full-table match incl. wns/tns/violations (unchanged) |
+
+New unit tests: `test_edge_pairing_unit_cases` (the `pairing.md` table,
+incl. `setup_edge_pair(2.0, 2.0, 1, 0) -> (0.0, 2.0)` — additive shifts,
+the parity-1 first edge is already inside the recorded arrival),
+`set_clock_uncertainty_directional{,_bails}`,
+`uncertainty_ns_directional_lookup`.
+
+#### Fail-proof mutation (E0 rule 7)
+
+`setup_edge_pair` forced to keep the *first* enumerated pair instead of
+the min-gap pair (`best.is_none_or(...)` → `best.is_none()`):
+`test_sta_clocks_match_opensta` went red — `t2_frac` `u_fx/D`
+`max_arr_ns: ours=0.277469 ref=4.27747`, `u_fy/D` `0.277469` vs
+`10.07747`, `u_fb0/D` `0.7` vs `4.7`, plus matching req/slack/wns/tns/
+violation diffs (12 mismatches). Restored; test green again.
+
+#### Coverage notes (what ran vs not)
+
+- Single-clock goldens byte-identical by construction: the per-domain
+  candidate loops take the same-domain branch verbatim when every tying
+  bit is the capture bit; `uncertainty_ns` falls back to the capture row
+  with an empty rule table; `unc_worst` equals the row read when the
+  mask is the capture bit alone. `cargo test --workspace` above covers
+  every committed single-clock golden.
+- Cross-domain **gating-enable** and **output-port** pairing share the
+  same candidate-loop code but no committed fixture exercises them (all
+  `sta_clocks` output ports anchor same-domain) — noted as spec'd-but-
+  unmeasured, matching the design's own admission.
+- `dom_*`/`par_*` masks union independently; the candidate loop is the
+  cross product — every committed fixture ties single-bit masks, where
+  the product is exact. A multi-bit tie could enumerate a phantom
+  (domain, parity) pair (conservative worst-slack; recorded in
+  `api.md` §3).
+- Inter-clock matching is on folded domain tags: a virtual row folded
+  onto a design row by `launch_domain` shares that row's `-from`/`-to`
+  rules (`overview.md` out-of-scope list).
+- `probe_t2_mdx.txt` carries OpenSTA's `u_fb0/Q is not a valid start
+  point` warning — yet it reports the pin-startpoint delay check; the
+  measured numbers are what the golden asserts.

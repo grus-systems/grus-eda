@@ -110,9 +110,15 @@ in `tests.md` §3.
 ///   * non-converging `grid_lcm`            -> defensive
 /// `None` = every tying (domain, parity) pairs — evaluate.
 fn xdomain_defer(
-    s: PinTimingState, sdc: &Sdc, cap_tag: u8, cap_period: f32,
-    c0: usize, latch: bool,
+    s: PinTimingState, sdc: &Sdc, cap_bit: u8, cap_period: f32,
+    setup_c0: usize, hold_c0: usize, hold_next: bool, latch: bool,
 ) -> Option<String>;
+// `hold_next` picks the min-side pairing rule: register checks and
+// output ports pair coincident edges (`hold_edge_pair`); a gating
+// enable's hold edge *follows* the launch on the opposite-polarity
+// grid, so it uses the strictly-after rule (`setup_edge_pair` —
+// always pairs). `setup_c0`/`hold_c0` are the capture pin's first-edge
+// parities on the two grids (identical `c0` for checks/ports).
 ```
 
 Then, per `(data, check)` in the existing loop, after the `NoClock`
