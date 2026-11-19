@@ -9,7 +9,16 @@ timeout_sec = 1800       # per subprocess invocation
 # Generated picorv32 artifacts (gitignored) must be present in each
 # task worktree or the sta tests panic — seed copies them from the
 # main checkout at worktree creation.
-worktree_seed = ["tests/designs/picorv32/"]
+# Generated artifacts are gitignored — seed copies them from the
+# main checkout into each task worktree (sta tests panic without
+# them). jpeg is skipped: its tests are #[ignore]d today; add it
+# back if a spec needs it (~125 MB).
+worktree_seed = [
+  "tests/designs/aes/",
+  "tests/designs/gcd/",
+  "tests/designs/ibex/",
+  "tests/designs/picorv32/",
+]
 
 # Host-capability runners (routing tokens, no container exec):
 [runner.eda]
