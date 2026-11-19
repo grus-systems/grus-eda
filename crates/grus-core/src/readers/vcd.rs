@@ -1,26 +1,56 @@
 //! Value-change-dump (IEEE 1364) reader for switching-activity annotation.
 //!
-//! Produces per-signal rise/fall transition counts over the dumped window. Vector
-//! signals are expanded to per-bit names (`data[3]`) so they line up with the
-//! per-bit net names DEF uses. Only clean 0<->1 edges are counted; transitions
-//! involving x/z update the last state without counting, since a glitch through
-//! x is not a defined logic edge. Scope paths are ignored: DEF net names are flat
-//! leaf names, and directly-connected ports share their driver's transitions.
+//! Produces per-signal rise/fall transition counts and per-state durations
+//! over the dumped window. Vector signals are expanded to per-bit names
+//! (`data[3]`) so they line up with the per-bit net names DEF uses. Only
+//! clean 0<->1 edges count one toggle each; transitions involving x/z update
+//! the last state and count in `xtrans` (OpenSTA weighs each such edge as
+//! half a toggle). Durations charge similarly: time in 0/1 lands in
+//! `t0_s`/`t1_s` and x/z/never-defined time lands in `other_s`, so
+//! `t1/(t0+t1+other)` is the time-in-1 probability a `when` weight consumes. Every declared signal
+//! earns a `signals` entry — a constant dumped net is annotated with zero
+//! edges and a measured duty. Scope paths are ignored: DEF net names are
+//! flat leaf names, and directly-connected ports share their driver's
+//! transitions.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Edge counts for one dumped signal (or one bit of a vector signal).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Edge counts and state durations for one dumped signal (or one bit of a
+/// vector signal).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SignalActivity {
     pub rise: u64,
     pub fall: u64,
+    /// Edges where either endpoint is x/z. OpenSTA's activity model weighs
+    /// each as half a toggle, so the effective transition count is
+    /// `rise + fall + xtrans / 2`.
+    pub xtrans: u64,
+    /// Seconds in state 0 / state 1 within the dump window; x/z and
+    /// never-defined time lands in `other_s`.
+    pub t0_s: f64,
+    pub t1_s: f64,
+    /// Seconds spent in x/z or never defined. `t0_s + t1_s + other_s == 0`
+    /// means the signal was never defined — the probability is unknown.
+    pub other_s: f64,
 }
 
 impl SignalActivity {
     pub fn toggles(&self) -> u64 {
         self.rise + self.fall
+    }
+
+    /// Effective toggle count under OpenSTA's weighting (x/z edges count half).
+    pub fn eff_toggles(&self) -> f64 {
+        self.rise as f64 + self.fall as f64 + self.xtrans as f64 * 0.5
+    }
+
+    /// Time-in-1 probability over the whole annotated window, `None` when the
+    /// signal was never defined (`t1/(t0+t1+other)`).
+    pub fn prob_one(&self) -> Option<f64> {
+        let total = self.t0_s + self.t1_s + self.other_s;
+        (total > 0.0).then(|| self.t1_s / total)
     }
 }
 
@@ -77,11 +107,33 @@ struct SignalDecl {
     depth: usize,
 }
 
+/// Per-identifier waveform state: last value per bit, the timestamp it last
+/// changed, and ticks accumulated per state (0 / 1 / x|z|never-seen). `when`
+/// power weights need time-in-state, which edge counts alone do not carry.
+/// `last` uses 3 for "no value written yet" so a first write counts as
+/// initialization, not a half-weighted x/z edge.
+#[derive(Default)]
+struct IdActivity {
+    last: Vec<u8>,
+    since: Vec<u64>,
+    dur: Vec<[u64; 3]>,
+}
+
+impl IdActivity {
+    fn with_bits(nbits: usize) -> Self {
+        Self {
+            last: vec![3; nbits],
+            since: vec![0; nbits],
+            dur: vec![[0; 3]; nbits],
+        }
+    }
+}
+
 /// Header-parse state shared by `$var`/`$scope`/`$upscope` items.
 struct VcdHeaders {
     decls: HashMap<String, SignalDecl>,
-    /// Per-identifier last definite state, one slot per bit.
-    last_state: HashMap<String, Vec<u8>>,
+    /// Per-identifier waveform state, one slot per bit.
+    activity: HashMap<String, IdActivity>,
     scope_depth: usize,
 }
 
@@ -90,7 +142,7 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
     let timescale_s = parse_timescale(text)?;
     let mut headers = VcdHeaders {
         decls: HashMap::new(),
-        last_state: HashMap::new(),
+        activity: HashMap::new(),
         scope_depth: 0,
     };
     let mut signals: HashMap<String, SignalActivity> = HashMap::new();
@@ -143,17 +195,53 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
             continue; // $dumpvars/$dumpoff/$dumpon/$end/$finish
         }
         if let Some((v, id)) = parse_scalar_change(line) {
-            apply_change(v, id, &headers.decls, &mut headers.last_state, &mut signals);
+            apply_change(
+                v,
+                id,
+                &headers.decls,
+                &mut headers.activity,
+                &mut signals,
+                last_ts,
+            );
         } else if let Some((bits, id)) = parse_vector_change(line) {
             apply_vector_change(
                 bits,
                 id,
                 &headers.decls,
-                &mut headers.last_state,
+                &mut headers.activity,
                 &mut signals,
+                last_ts,
             );
         }
         // Anything else (r<real>, malformed) is ignored.
+    }
+
+    // Close every declared signal's last open state interval and fold
+    // durations into `signals` — including edge-free signals, so a dumped
+    // constant net reads as annotated with a measured duty.
+    for (id, decl) in &headers.decls {
+        let Some(act) = headers.activity.get(id) else {
+            continue;
+        };
+        for (pos, (&state, &since)) in act.last.iter().zip(&act.since).enumerate() {
+            let mut dur = act.dur[pos];
+            dur[(state.min(2)) as usize] += last_ts.saturating_sub(since);
+            let name = match decl.range {
+                Some((left, right)) => {
+                    let bit_idx = if left >= right {
+                        left - pos as i64
+                    } else {
+                        left + pos as i64
+                    };
+                    format!("{}[{}]", decl.name, bit_idx)
+                }
+                None => decl.name.clone(),
+            };
+            let e = signals.entry(name).or_default();
+            e.t0_s = dur[0] as f64 * timescale_s;
+            e.t1_s = dur[1] as f64 * timescale_s;
+            e.other_s = dur[2] as f64 * timescale_s;
+        }
     }
 
     let duration_s = match first_ts {
@@ -247,7 +335,9 @@ fn parse_var_decl(item: &str, headers: &mut VcdHeaders) -> Result<()> {
                     depth: headers.scope_depth,
                 },
             );
-            headers.last_state.insert(id_key, vec![2u8; nbits]);
+            headers
+                .activity
+                .insert(id_key, IdActivity::with_bits(nbits));
         }
     }
     Ok(())
@@ -341,11 +431,13 @@ fn bit_state(c: u8) -> u8 {
 }
 
 fn record_edge(name: &str, old: u8, new: u8, signals: &mut HashMap<String, SignalActivity>) {
-    if old == new || old == 2 || new == 2 {
+    if old == new || old == 3 {
         return;
     }
     let e = signals.entry(name.to_string()).or_default();
-    if old == 0 && new == 1 {
+    if old == 2 || new == 2 {
+        e.xtrans += 1;
+    } else if old == 0 && new == 1 {
         e.rise += 1;
     } else {
         e.fall += 1;
@@ -356,8 +448,9 @@ fn apply_change(
     v: char,
     id: &str,
     decls: &HashMap<String, SignalDecl>,
-    last_state: &mut HashMap<String, Vec<u8>>,
+    activity: &mut HashMap<String, IdActivity>,
     signals: &mut HashMap<String, SignalActivity>,
+    cur_ts: u64,
 ) {
     let Some(decl) = decls.get(id) else {
         return;
@@ -365,21 +458,24 @@ fn apply_change(
     if decl.range.is_some() {
         return; // scalar write to a vector id is malformed
     }
-    let states = last_state.entry(id.to_string()).or_default();
-    if states.is_empty() {
-        states.push(2);
+    let act = activity.entry(id.to_string()).or_default();
+    if act.last.is_empty() {
+        *act = IdActivity::with_bits(1);
     }
-    let old = states[0];
-    states[0] = bit_state(v as u8);
-    record_edge(&decl.name.clone(), old, states[0], signals);
+    let old = act.last[0];
+    act.dur[0][old.min(2) as usize] += cur_ts.saturating_sub(act.since[0]);
+    act.since[0] = cur_ts;
+    act.last[0] = bit_state(v as u8);
+    record_edge(&decl.name.clone(), old, act.last[0], signals);
 }
 
 fn apply_vector_change(
     bits: &str,
     id: &str,
     decls: &HashMap<String, SignalDecl>,
-    last_state: &mut HashMap<String, Vec<u8>>,
+    activity: &mut HashMap<String, IdActivity>,
     signals: &mut HashMap<String, SignalActivity>,
+    cur_ts: u64,
 ) {
     let Some(decl) = decls.get(id) else {
         return;
@@ -391,9 +487,9 @@ fn apply_vector_change(
     if chars.len() != decl.nbits {
         return;
     }
-    let states = last_state.entry(id.to_string()).or_default();
-    if states.len() != decl.nbits {
-        states.resize(decl.nbits, 2);
+    let act = activity.entry(id.to_string()).or_default();
+    if act.last.len() != decl.nbits {
+        *act = IdActivity::with_bits(decl.nbits);
     }
     for (pos, &ch) in chars.iter().enumerate() {
         // chars[0] is the leftmost = first index of the declared range; for an
@@ -404,10 +500,12 @@ fn apply_vector_change(
         } else {
             left + pos as i64
         };
-        let old = states[pos];
+        let old = act.last[pos];
         let new = bit_state(ch);
-        states[pos] = new;
-        if old != new && old != 2 && new != 2 {
+        act.dur[pos][old.min(2) as usize] += cur_ts.saturating_sub(act.since[pos]);
+        act.since[pos] = cur_ts;
+        act.last[pos] = new;
+        if old != new {
             record_edge(&format!("{}[{}]", decl.name, bit_idx), old, new, signals);
         }
     }
@@ -456,12 +554,16 @@ $finish
 
         let clk = act.signals.get("clk").expect("clk");
         assert_eq!((clk.rise, clk.fall), (1, 1)); // 0->1 @10, 1->0 @20
+        // clk: 0 over [0,10) and [20,50] -> 40 ns low, 10 ns high.
+        assert!((clk.t0_s - 40e-9).abs() < 1e-20);
+        assert!((clk.t1_s - 10e-9).abs() < 1e-20);
 
-        // reset stays 1 the whole window -> zero counted edges -> absent entry
-        assert_eq!(
-            act.signals.get("reset").map(|s| s.toggles()).unwrap_or(0),
-            0
-        );
+        // reset stays 1 the whole window -> zero counted edges but a real
+        // duty: declared signals always earn a `signals` entry.
+        let reset = act.signals.get("reset").expect("reset");
+        assert_eq!(reset.toggles(), 0);
+        assert_eq!(reset.t0_s, 0.0);
+        assert!((reset.t1_s - 50e-9).abs() < 1e-20);
 
         // data[3:0]: 0000 -> 1010 -> 0101
         let d3 = act.signals.get("data[3]").expect("data[3]");
@@ -472,6 +574,35 @@ $finish
         assert_eq!((d1.rise, d1.fall), (1, 1));
         let d0 = act.signals.get("data[0]").expect("data[0]");
         assert_eq!((d0.rise, d0.fall), (1, 0));
+        // Per-bit durations: data[3] toggles 0->1 @30 ->0 @40 (t0=40, t1=10);
+        // data[0] rises @40 and stays (t0=40, t1=10).
+        assert!((d3.t0_s - 40e-9).abs() < 1e-20 && (d3.t1_s - 10e-9).abs() < 1e-20);
+        assert!((d0.t0_s - 40e-9).abs() < 1e-20 && (d0.t1_s - 10e-9).abs() < 1e-20);
+    }
+
+    #[test]
+    fn test_state_durations() {
+        // 0 for [0,10), 1 for [10,30), x for [30,40), 0 for [40,60]:
+        // x time enters neither bucket; a trailing constant run closes at
+        // the last timestamp.
+        let vcd = "$timescale 1ns $end\n\
+                   $var wire 1 ! a $end\n\
+                   $var wire 1 \" b $end\n\
+                   $enddefinitions $end\n\
+                   #0\n0!\n1\"\n#10\n1!\n#30\nx!\n#40\n0!\n#60\n";
+        let act = parse_vcd(vcd).expect("parse");
+        let a = act.signals.get("a").expect("a");
+        // The 1->0 return passes through x: only the rise is clean; the two
+        // x-involved edges land in `xtrans` (OpenSTA counts each as 0.5).
+        assert_eq!((a.rise, a.fall, a.xtrans), (1, 0, 2));
+        assert!((a.t0_s - 30e-9).abs() < 1e-20); // [0,10) + [40,60]
+        assert!((a.t1_s - 20e-9).abs() < 1e-20); // [10,30)
+        assert!((a.other_s - 10e-9).abs() < 1e-20); // x over [30,40)
+        // Constant-1 signal: no edges, full-window t1.
+        let b = act.signals.get("b").expect("b");
+        assert_eq!(b.toggles(), 0);
+        assert_eq!(b.t0_s, 0.0);
+        assert!((b.t1_s - 60e-9).abs() < 1e-20);
     }
 
     #[test]
@@ -481,9 +612,16 @@ $finish
                    $enddefinitions $end\n\
                    #0\n0!\n#5\nx!\n#10\n1!\n#15\nz!\n#20\n0!\n";
         let act = parse_vcd(vcd).expect("parse");
-        // 0->x, x->1, 1->z, z->0: none are clean 0<->1 edges, so the signal
-        // never earns a map entry (absent == zero counted activity).
-        assert_eq!(act.signals.get("a").map(|s| s.toggles()).unwrap_or(0), 0);
+        // 0->x, x->1, 1->z, z->0: none are clean 0<->1 edges; all four are
+        // x/z-involved, so `xtrans` counts them at half weight each.
+        let a = act.signals.get("a").expect("a");
+        assert_eq!(a.toggles(), 0);
+        assert_eq!(a.xtrans, 4);
+        assert_eq!(a.eff_toggles(), 2.0);
+        // x time [5,10) + z time [15,20) is not 0/1 state time.
+        assert!((a.other_s - 10e-9).abs() < 1e-20);
+        assert!((a.t0_s - 5e-9).abs() < 1e-20);
+        assert!((a.t1_s - 5e-9).abs() < 1e-20);
     }
 
     #[test]

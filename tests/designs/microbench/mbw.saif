@@ -1,0 +1,29 @@
+(SAIFILE
+  (SAIFVERSION "2.0")
+  (DIRECTION "backward")
+  (DESIGN)
+  (DATE "vcd2saif")
+  (VENDOR "grus-eda")
+  (PROGRAM_NAME "vcd2saif.py")
+  (VERSION "vcd2saif")
+  (DIVIDER / )
+  (TIMESCALE 1 ns)
+  (DURATION 2000)
+  (INSTANCE tb
+    (INSTANCE dut
+      (NET
+        (a (T0 900) (T1 1100) (TX 0) (TZ 0) (TB 0) (TC 6) (IG 0))
+        (teb (T0 1650) (T1 350) (TX 0) (TZ 0) (TB 0) (TC 4) (IG 0))
+        (z (T0 700) (T1 950) (TX 0) (TZ 350) (TB 0) (TC 6) (IG 0))
+        (clk (T0 2000) (T1 0) (TX 0) (TZ 0) (TB 0) (TC 0) (IG 0))
+      )
+      (INSTANCE u_t
+        (NET
+          (A (T0 900) (T1 1100) (TX 0) (TZ 0) (TB 0) (TC 6) (IG 0))
+          (TE_B (T0 1650) (T1 350) (TX 0) (TZ 0) (TB 0) (TC 4) (IG 0))
+          (Z (T0 700) (T1 950) (TX 0) (TZ 350) (TB 0) (TC 6) (IG 0))
+        )
+      )
+    )
+  )
+)

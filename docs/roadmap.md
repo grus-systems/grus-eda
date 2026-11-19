@@ -417,6 +417,11 @@ Remaining:
   the totals diverge because OpenSTA propagates activity statistically
   (BDD + `findSeqActivity`) rather than reading per-net VCD counts; our
   exact per-net counts are reported instead, and the residual is
-  documented in `docs/results.md`. Still open: `when`-conditional power
-  blocks, and matching OpenSTA's activity propagation if a closer
-  `report_power` agreement is ever required.
+  documented in `docs/results.md`. `when`-conditional `internal_power`
+  and `leakage_power` blocks now evaluate at the measured OpenSTA model
+  — marginal `P(when)` products, related-pin activity apportioning,
+  half-weight x/z edges — verified at ~1e-7% on the `mbw` ebufn fixture
+  in both VCD and SAIF paths (docs/results.md 2026-11-19); only
+  inexpressible `when` forms remain counted. Still open: matching
+  OpenSTA's activity propagation if a closer `report_power` agreement is
+  ever required.
