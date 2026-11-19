@@ -1,20 +1,26 @@
 # Multi-clock SDC support — measured rules and ticket sequence
 
-Status: probe complete (2026-11-19), `mc-model` landed (2026-11-20).
-`Sdc` now keeps a clock table — one row per `create_clock`, in file order,
-holding name/optional port/period/network+source latencies/setup+hold
-uncertainties/transition/propagated — and every clock-targeting command
-resolves its names against the table. Eval is still single-domain: `sta`
-bails on more than one design clock (`analysis.rs`: "sta: N design clocks
-declared ...; multi-clock analysis is not implemented yet"). This document
-remains the target spec for the remaining tickets.
+Status: probe complete (2026-11-19), `mc-model` landed (2026-11-20),
+`mc-eval` landed (2026-11-20). `Sdc` keeps a clock table — one row per
+`create_clock`, in file order, holding name/optional port/period/
+network+source latencies/setup+hold uncertainties/transition/propagated —
+and every clock-targeting command resolves its names against the table.
+Eval is domain-aware: each design clock seeds its own net, every data
+arrival carries a launch-domain tag, and same-domain paths evaluate on the
+capture domain's own lattice (period, latency, uncertainty, propagated/
+ideal mode). A launch/capture pair in different domains defers with a
+`CrossDomain` diagnostic naming both clocks — never a silent fold. This
+document remains the target spec for the remaining tickets.
 
 Evidence: `tests/designs/sta_clocks/` — `two_clock.def` (clock domains `cka`
 2.0 ns on `clk1`, `ckb` 1.4/1.0 ns on `clk2`, same-domain and both-direction
-cross-domain paths), twelve `t2_*.sdc` scenarios, `probe.sh` (runs OpenSTA in
-`ghcr.io/librelane/librelane:3.0.16`), `two_clock.probe.json` + `probe_*.txt`
-(byte-identical on re-run). Raw numbers and the grus-eda break table are in
-`docs/results.md` (2026-11-19 entry); scenario→question mapping is in
+cross-domain paths), `two_clock_latch.def` (a `dlxtn` on `ckb` feeding a
+`ckb` flop — every endpoint same-domain), fourteen `t2_*.sdc` scenarios on
+`two_clock.def` plus `t2_latch.sdc`, `probe.sh` (runs OpenSTA in
+`ghcr.io/librelane/librelane:3.0.16`), `two_clock.probe.json` +
+`two_clock_latch.probe.json` + `probe_*.txt` (byte-identical on re-run).
+Raw numbers and the grus-eda break table are in `docs/results.md`
+(2026-11-19 and 2026-11-20 entries); scenario→question mapping is in
 `kurena/tasks/multi-clock-probe/design/probe.md`.
 
 ## 1. Measured OpenSTA rules (all from container runs)
@@ -120,7 +126,7 @@ Output-port form (`t2_mdo`, `set_max_delay 0.8 -to yb`):
   ckb edge 1.0 to **2.0** (req 0.885446→1.885446); `-hold 1` moves it back
   one ckb period (min req −0.037585→−1.037585).
 
-## 2. Where grus-eda stands (after `mc-model`, 2026-11-20)
+## 2. Where grus-eda stands (after `mc-eval`, 2026-11-20)
 
 `cargo test -p grus-core multi_clock_bails` pins the remaining bail
 messages verbatim; full table with commands in `docs/results.md`.
@@ -137,22 +143,41 @@ Now accepted (the probe's parse breaks are fixed):
 - `set_input_delay`/`set_output_delay -clock <name>` and delay exceptions
   resolve any row, not just the design clock.
 
+Now evaluated (same-domain pairing only):
+
+- Every design clock row seeds its own clock net — propagated via
+  `propagate_clock`, ideal via the parity walk — and every data arrival
+  carries a `u8` launch-domain mask alongside the parity/CRPR masks
+  (winner-replace/tie-union semantics). A port's tag is its resolved
+  `set_input_delay -clock` row, mapped through `launch_domain`: a virtual
+  row whose period equals a design row's pairs same-domain (coincident
+  edge grids), a unique virtual row stays foreign everywhere.
+- Same-domain checks read the capture row's period, latency, uncertainty
+  and propagated/ideal mode: register checks, latch-borrow windows,
+  delay-check anchors, MCP multipliers, min-pulse-width wrap and output
+  ports (`-clock` row anchoring) are all per-domain. Verified
+  per-endpoint at STRICT tolerance on all parseable `t2_*` scenarios
+  (`test_sta_clocks_match_opensta`); `two_clock_latch`'s whole table —
+  wns/tns/violations included — matches.
+- A launch/capture pair in different domains counts
+  `skipped.cross_domain_endpoints` and lands in `skipped_endpoints` with
+  `reason: cross_domain` and `related: "launch <clocks> -> capture
+  <clock>"`. `--strict` fails (`is_clean` counts them). A reached
+  extreme with a zero mask — a launch on a clock net no declared clock
+  seeds — defers as `launch <undeclared>`: the undeclared-domain fold is
+  detected, not folded.
+
 Still unsupported / remaining hazard:
 
 - `set_clock_latency -early`/`-late`, `set_clock_uncertainty -from ... -to
   ...`, `create_clock -waveform`, `set_clock_groups`, unknown `-clock`
   names, `set_propagated_clock` on a virtual clock, `create_clock` with
   `period 0` — all loud parse errors.
-- Eval: `sta` on an SDC with more than one design clock bails before
-  graph preparation — `sta: 2 design clocks declared (cka, ckb);
-  multi-clock analysis is not implemented yet` — instead of folding the
-  unseeded domain onto the first clock's lattice. Verified by
-  `analysis.rs::tests::sta_bails_on_a_two_clock_sdc` and a scratch run with
-  the gate disabled (all 8 endpoints reported against `cka`, domains
-  folded).
-- A single-clock SDC on a multi-clock DEF still silently folds the
-  undeclared domain's pins onto domain 0's lattice (no warning);
-  detection needs domain tags — `mc-eval` owns it.
+- More than 8 clock rows (design + virtual) bail before graph prep: the
+  domain mask is `u8` (`sta: N clocks declared; at most 8 domains can be
+  tagged`).
+- Cross-domain pairing itself: deferred to `mc-xdomain` (§1.2 edge
+  search, §1.3 inter-clock uncertainty).
 
 ## 3. Ticket sequence
 
@@ -169,11 +194,12 @@ kurena spec:
    rows; multi-name lists allowed. Eval still single-domain: `sta` bails
    on >1 design clock, never silently folds. Parse + model tests in
    `sdc.rs::tests`; existing goldens bit-identical.
-2. **`mc-eval`** — domain tagging: per-port clock-net seeding (propagated
-   and `ideal_clock_parity`), domain tags on launch seeds and clock pins,
-   non-first clock ports excluded from data seeding; same-domain pairing
-   with distinct periods; per-domain period in MCP/borrow windows and
-   I/O anchors.
+2. **`mc-eval`** — **done 2026-11-20** (`docs/results.md` entry of the
+   same date). Domain tagging: per-port clock-net seeding (propagated and
+   ideal parity walk), domain tags on launch seeds and clock pins, clock
+   ports excluded from data seeding; same-domain pairing with distinct
+   periods; per-domain period in MCP/borrow windows and I/O anchors.
+   Cross-domain pairs defer as named `CrossDomain` skips.
 3. **`mc-xdomain`** — cross-domain launch/capture edge-pair search per the
    measured rule (§1.2: min `capture − launch` over the LCM window);
    inter-clock `-from`/`-to` uncertainty (§1.3).

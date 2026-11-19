@@ -3469,3 +3469,106 @@ all existing goldens, unchanged inputs and expected outputs),
 `git status` shows no modifications under `tests/` or `kurena/`.
 Version 0.1.98 → 0.2.0 (`Sdc`'s public clock fields were replaced by the
 table + accessors — breaking for direct field users).
+
+### 2026-11-20 — `mc-eval`: domain-tagged same-domain multi-clock STA (v0.2.1)
+
+Second ticket of the `docs/multi-clock.md` sequence. The
+`design_clock_count() > 1` eval gate is gone: every design clock row seeds
+its own clock net (propagated via `propagate_clock`, ideal via the parity
+walk), every data arrival carries a `u8` launch-domain mask alongside the
+parity/CRPR masks (winner-replace/tie-union), and a check evaluates only
+when every reached extreme's mask is exactly the capture domain's bit.
+Capture-side period, latency, uncertainty, propagated/ideal mode and
+MCP/borrow/delay-check anchors all read the capture row. A virtual
+`-clock` I/O row whose period equals a design row pairs same-domain
+(ibex's `vclk` case — coincident edge grids); a unique virtual row stays
+foreign everywhere.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` as committed — the whole script in
+  `ghcr.io/librelane/librelane:3.0.16`; `git diff` on `two_clock.probe.json`
+  is additive only (new `t2_mcps`/`t2_mds` blocks after `t2_mcp`; the 12
+  existing scenario blocks and every existing `probe_t2_*.txt` are
+  byte-identical). New artifacts: `t2_mcps.sdc`, `t2_mds.sdc`,
+  `probe_t2_mcps.txt`, `probe_t2_mds.txt`, `two_clock_latch.def`,
+  `t2_latch.sdc`, `two_clock_latch.probe.json`, `probe_t2_latch.txt`.
+- `grus-eda sta --lib ... --tlef ... --lef ... --def tests/designs/sta_clocks/two_clock.def --sdc tests/designs/sta_clocks/t2_int.sdc --json /tmp/t2_int.json --strict` (debug binary, exit code 1) — verbatim:
+
+  ```
+  warning: STA skipped cross_domain_endpoints=3; the report does not model these
+  warning: STA skipped cell_driven_clock_nets=2; the report does not model these
+  STA (zero wire): endpoints=5, setup wns=-0.287329 tns=-0.287329 viol=1, hold wns=0.148797 tns=0.000000 viol=0, elapsed=0.44ms
+  pulse-width checks: 12 (0 violating)
+  skipped: 0/26 arcs (0.00%), 3/20 endpoints (15.00%)
+    cross_domain_endpoints=3
+    cell_driven_clock_nets=2
+      endpoint u_fx/D Check: CrossDomain (launch cka -> capture ckb)
+      endpoint u_fy/D Check: CrossDomain (launch ckb -> capture cka)
+      endpoint u_fb0/D Check: CrossDomain (launch cka -> capture ckb)
+  Wrote STA report JSON to "/tmp/t2_int.json"
+  Error: strict: the run skipped inputs; see the summary above
+  ```
+
+  `--strict` fails loudly on the deferrals (`cross_domain_endpoints`
+  enters `is_clean`), as intended — `mc-xdomain` owns the pairing.
+- Parse bails, verbatim (`grus-eda sta ... --sdc t2_<x>.sdc`):
+  - `t2_grp`: `unsupported command `set_clock_groups`` (`mc-selectors`)
+  - `t2_uncx`: `set_clock_uncertainty takes a value and optional clock names` (`mc-xdomain` inter-clock uncertainty)
+
+#### Same-domain comparison vs OpenSTA (`test_sta_clocks_match_opensta`)
+
+Per-endpoint fields (`arr`/`req`/`slack`/`slew`, max and min) at
+`Tol::STRICT` (1% rel / 5 ps abs); every reported pin present in the
+golden, every unreported golden pin a named `CrossDomain` skip. wns/tns
+and violation counts compare only where the endpoint set is complete.
+
+| scenario | evaluated | cross-domain deferred | what it pins |
+|---|---|---|---|
+| `t2_int` | 5 endpoints | 3 (`u_fb0/D`, `u_fx/D`, `u_fy/D`) | both lattices: `u_fb1/D` req 0.885446 vs `u_fa1/D` 1.885446 |
+| `t2_frac` | 5 | 3 | non-integer `ckb` 1.4 ns lattice |
+| `t2_prop` | 5 | 3 | both domains propagated |
+| `t2_prop1` | 5 | 3 | mixed `cka` propagated / `ckb` ideal |
+| `t2_lat` | 5 | 3 | per-domain network+source latency in arrivals |
+| `t2_unc` | 5 | 3 | capture-row uncertainty (`ckb` 0.20 vs `cka` 0.05) |
+| `t2_mcp` | 5 | 3 | cross MCP covered endpoint still defers |
+| `t2_mcps` | 5 | 3 | **same-domain MCP**: `u_fb1/D` req 1.885446 = 0.885446 + (2−1)·1.0 — capture-row period |
+| `t2_md` | 5 | 3 | delay-check-covered cross endpoints still defer (uncovered side can't pair) |
+| `t2_mdl` | 5 | 3 | per-domain latency+uncertainty delay anchors read |
+| `t2_mdo` | 5 | 3 | `yb` through the output-port `-to` delay-check branch on `ckb` |
+| `t2_mds` | 5 | 3 | same-domain delay checks: `u_fb1/D` req 0.935446 = 1.0 + 0.2 − 0.15 − 0.114554 |
+| `t2_latch` (`two_clock_latch.def`) | 4 + wns/tns/violations | 0 | second-domain `dlxtn` borrow window on `ckb`'s lattice; full-table match |
+
+#### Fail-proof mutation (E0 rule 7)
+
+`collect_endpoints`'s capture row forced to domain 0
+(`let cap_clk = sdc.design_clock().unwrap();`): `t2_frac` went red —
+`u_fb1/D.max_req_ns: ours=1.8854457 ref=1.285446` (the `cka` 2.0 ns read
+replacing `ckb`'s 1.4 ns) plus the matching slack shift. Restored, test
+green again.
+
+#### Golden-identity invariants — the two intended non-golden-visible changes
+
+- A clock pin no declared domain reaches stays unseeded → `NoClock`
+  skip instead of folding onto domain 0's lattice. Pinned by
+  `one_clock_sdc_on_two_clock_def` (single-clock SDC on `two_clock.def`:
+  `u_fa0/D`, `u_fa1/D`, `ya` evaluate; `u_fb*/D`, `u_fx/D` skip
+  `NoClock`; `u_fy/D`, `yb` skip `NoPath` — their launches are dead).
+- `sta` on a >1-design-clock SDC produces a report instead of the
+  `multi-clock analysis is not implemented yet` error.
+  `sta_bails_on_a_two_clock_sdc` was replaced by
+  `sta_evaluates_two_clock_same_domain`.
+
+Existing single-clock goldens are byte-identical: on one design row
+every tag is 0, every mask is `{0}`, every `cap` read is the design row.
+More than 8 clock rows bail before graph prep (`u8` masks):
+`sta: N clocks declared; at most 8 domains can be tagged`.
+
+New tests: `test_sta_clocks_match_opensta` (13 evaluated scenarios across
+both probe JSONs), `sta_evaluates_two_clock_same_domain`,
+`one_clock_sdc_on_two_clock_def`; `test_parity_mask_keeps_tied_arrivals`
+extended to the domain masks.
+
+**Checks run**: `cargo test --workspace` (301 passed, 0 failed, 2 ignored in grus-core; 3 passed in grus-eda),
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+Version 0.2.0 → 0.2.1 (additive feature, no API break).

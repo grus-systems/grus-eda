@@ -448,6 +448,31 @@ impl Sdc {
         corner.factors[kind][usize::from(!clock_path)][transition]
     }
 
+    /// Index of the first design (port-bearing) clock row — the row an
+    /// absent or `-clock`-less delay rule anchors to. 0 on an empty or
+    /// virtual-only table.
+    fn design_row(&self) -> usize {
+        self.clocks
+            .iter()
+            .position(|c| c.port.is_some())
+            .unwrap_or(0)
+    }
+
+    /// Resolved `set_input_delay -clock` row for `port`, as an index into
+    /// `clocks`; absent or `-clock`-less rules resolve to the first design row.
+    pub fn input_clock_row(&self, port: &str) -> usize {
+        delay_at(&self.input_delays, port, true, self)
+            .and_then(|(_, _, clock)| clock)
+            .map_or_else(|| self.design_row(), |id| id.0)
+    }
+
+    /// Same as [`Sdc::input_clock_row`] for `set_output_delay`.
+    pub fn output_clock_row(&self, port: &str) -> usize {
+        delay_at(&self.output_delays, port, false, self)
+            .and_then(|(_, _, clock)| clock)
+            .map_or_else(|| self.design_row(), |id| id.0)
+    }
+
     /// `(min, max)` input delay in ns; both equal the plain value when no `-min`/`-max` was given.
     pub fn input_delay_ns(&self, port: &str) -> (f32, f32) {
         delay_at(&self.input_delays, port, true, self)
