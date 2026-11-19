@@ -743,6 +743,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 report.hold_violations,
                 t0.elapsed().as_secs_f64() * 1000.0,
             );
+            if !report.pulse_width_checks.is_empty() {
+                let violating = report
+                    .pulse_width_checks
+                    .iter()
+                    .filter(|r| r.slack_ns < 0.0)
+                    .count();
+                println!(
+                    "pulse-width checks: {} ({} violating)",
+                    report.pulse_width_checks.len(),
+                    violating,
+                );
+            }
             print_skip_summary(&report);
             if let Some(path) = &args.json {
                 let json = serde_json::to_string_pretty(&report)?;

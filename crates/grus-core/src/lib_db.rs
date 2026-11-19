@@ -29,7 +29,8 @@ pub enum TimingType {
     RemovalFalling,
     RecoveryFalling,
     /// Minimum clock-pulse width at the related pin (`min_pulse_width`): an
-    /// intra-cell check, never a data-propagation arc.
+    /// intra-cell check, never a data-propagation arc. Evaluated as an STA
+    /// endpoint family since v0.1.93 — see `TimingGraph::pulse_width_checks`.
     MinPulseWidth,
     /// Setup/hold checks on non-sequential pins (`non_seq_*`): like the D-pin
     /// checks but without a `CLK -> Q` launch, deferred from the endpoint model.
@@ -48,14 +49,15 @@ pub enum TimingType {
 
 impl TimingType {
     /// Liberty `timing_type` names that are recognised check arcs: they constrain a
-    /// pin (pulse width, non-sequential setup/hold, tristate, preserve, async
-    /// clear/preset) rather than propagate data, so the endpoint model defers them
-    /// into `SkipReport::recognized_check_arcs` instead of dropping them as unknown.
+    /// pin (non-sequential setup/hold, tristate, preserve, async clear/preset)
+    /// rather than propagate data, so the endpoint model defers them into
+    /// `SkipReport::recognized_check_arcs` instead of dropping them as unknown.
+    /// `min_pulse_width` left this list when it became an evaluated endpoint
+    /// family in v0.1.93.
     pub fn is_deferred_check(self) -> bool {
         matches!(
             self,
-            Self::MinPulseWidth
-                | Self::NonSeqSetupRising
+            Self::NonSeqSetupRising
                 | Self::NonSeqSetupFalling
                 | Self::NonSeqHoldRising
                 | Self::NonSeqHoldFalling

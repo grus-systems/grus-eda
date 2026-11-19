@@ -125,8 +125,10 @@ The items below close these gaps, in the order proposed at the end.
 - Restriction recorded in `docs/results.md`: latch loops are *not* phase-iterated —
   a `D -> Q` cycle is a combinational cycle and levelisation rejects it as an error,
   matching the tool's honest-failure rule instead of inventing a fixed point.
-- Remaining skip counts: `min_pulse_width` arcs and `Clear`/`Preset` arcs (OpenSTA
-  3.0.16 does not propagate them, R6) are counted in `latch_arcs_dropped`.
+- Remaining skip counts: deferred check arcs (`non_seq_*` etc.) and `Clear`/`Preset`
+  arcs (OpenSTA 3.0.16 does not propagate them, R6) are counted in
+  `latch_arcs_dropped`/`recognized_check_arcs`. `min_pulse_width` arcs left the
+  deferred set when they became evaluated checks in `v0.1.93` (N3).
 
 ### R6. Asynchronous arcs
 
@@ -299,12 +301,24 @@ Remaining:
   an arrival or slack; `unsupported_arcs` and `latch_arcs_dropped` still
   fail strict, and the CLI summary lists deferred arcs even on a clean run
   ("skipped: none affecting reported timing").
-- `ibex` now reports `recognized_check_arcs[Clear=1655, MinPulseWidth=3602,
+- `ibex` then reported `recognized_check_arcs[Clear=1655, MinPulseWidth=3602,
   Preset=9]` with `unsupported_arcs`/`latch_arcs_dropped` empty;
   `sta_edge/non_dlxtn_latch --strict` passes.
-- Deferred: actually evaluating these checks (pulse width between clock
-  edges, `non_seq_*` vs the clock) is future work — until then the counts
-  stay visible in every summary and the JSON report.
+- `min_pulse_width` is evaluated as of `v0.1.93` (see `docs/results.md`
+  2026-11-19 entry): `StaReport::pulse_width_checks` carries one row per
+  (check pin, high/low) with OpenSTA's measured semantics — widths between
+  consecutive opposite clock edges on the propagated network, the
+  early/late pair producing the smaller width, period wrap behind inverting
+  cells, constraint table at the check pin's own slew, and slack that never
+  enters ordinary WNS/TNS. Only arcs on clock-network pins produce rows
+  (`dfrtn`'s RESET_B arc emits none). Verified at strict tolerance against
+  `sta_edge/min_pulse_width` goldens (ideal, propagated+derated, violating);
+  `merge_corner_reports` merges rows by `(pin, edge)` min slack.
+- Still deferred: `non_seq_*`, `three_state_*`, `preserve`, and async
+  `Clear`/`Preset` stay counted in `recognized_check_arcs`. A
+  `min_pulse_width` arc whose pin is not on the clock network (e.g.
+  `dfrtn` `RESET_B`) emits no check row — matching OpenSTA — and counts
+  into `recognized_check_arcs[MinPulseWidth]` instead (ibex: 1664).
 
 ### N4. SPEF write-out — DONE (v0.1.75)
 
