@@ -161,7 +161,11 @@ To ensure `grus-eda sta` and OpenSTA evaluate the exact same boundary conditions
 - `set_input_delay <delay_ns> [-clock <clk>] <port_pattern_or_all_inputs>`
 - `set_output_delay <delay_ns> [-clock <clk>] <port_pattern_or_all_outputs>`
 - `set_input_transition <slew_ns> <port_pattern_or_all_inputs>` (or `set_driving_cell -lib_cell <cell> -pin <pin>`)
-- `set_load [-pin_load] <cap_pf> <port_pattern_or_all_outputs>`
+- `set_load [-pin_load] <cap_pf> <port_pattern_or_all_outputs>`; `[get_nets <names>]` annotates the
+  net's *wire* capacitance (replaces the parasitic term in the lumped model, last-wins per net;
+  counted unresolved under `--spef` parasitics). Pin/cell/cone object sets and
+  `-min`/`-max`/`-rise`/`-fall`/`-subtract_pin_load` are counted in `sdc_ignored_commands`;
+  `set_fanout_load <n> <objects>` parses and is counted (inert in OpenSTA, `STA-0461`).
 - `set_clock_uncertainty [-setup|-hold] <unc_ns> [get_clocks <clk>]` (no flag sets both; the clock list is validated but the design has a single clock)
 
 #### Dual Polarity Propagation & OpenSTA Worst-Slew Merge Rule (`propagate.rs`)
@@ -212,6 +216,8 @@ generic text above disagree, this section wins.
 2. **Net load is per transition.** For an output pin `y` driving net `e` with transition `pol`:
    `load(e, RISE) = Σ_sinks cap_rise + port_load`, `load(e, FALL) = Σ_sinks cap_fall + port_load`,
    where `port_load` is the SDC `set_load` value on any primary-output port on `e` (0.05 pF in gcd).
+   A `set_load [get_nets e]` annotation replaces the wire-capacitance term of `load(e, pol)`
+   (measured override, not sum — `docs/results.md` 2026-11-19, `ld_*` scenarios).
    Check: `_384_/Q` rise load `0.008223 = 0.001689 + 0.001614 + 0.002495 + 0.002425`; fall
    `0.007406`. Zero-wire mode adds no wire cap, no wire delay, and sink slew = driver slew.
 3. **Ideal clock.** The clock net is not propagated. Every register `CLK` pin has

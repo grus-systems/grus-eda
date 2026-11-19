@@ -342,6 +342,13 @@ pub struct SkipReport {
     /// `-from`/`-to` selector sides that resolved to no launch source or no
     /// endpoint, plus bare selector names matching nothing.
     pub unresolved_exception_selectors: usize,
+    /// `set_load` `get_nets` names that do not resolve in the design (OpenSTA
+    /// warns per missing name and applies the rest — `ld_badnet`), plus net
+    /// annotations the parasitic path cannot honour: the measured net
+    /// annotation replaces the net's wire capacitance, which the distributed
+    /// RC model does not represent, so under `NetParasitics` every selected
+    /// net counts here instead of being approximated.
+    pub unresolved_load_selectors: usize,
 }
 
 impl SkipReport {
@@ -380,6 +387,10 @@ impl SkipReport {
                 "unresolved_exception_selectors",
                 self.unresolved_exception_selectors,
             ),
+            (
+                "unresolved_load_selectors",
+                self.unresolved_load_selectors,
+            ),
         ] {
             if count > 0 {
                 out.push(format!("{name}={count}"));
@@ -404,16 +415,19 @@ impl SkipReport {
     }
 
     /// True when the run left nothing out. Two kinds of skip are exempt because they cannot
-    /// change a compared number: SDC design-rule commands (`set_max_*`), which never feed the
-    /// timing model, and `recognized_check_arcs`, recognised Liberty check arcs deferred from
+    /// change a compared number: SDC design-rule commands (`set_max_*`) and
+    /// `set_fanout_load` — OpenSTA accepts it but warns it is unsupported (STA-0461)
+    /// and applies nothing, so ignoring it reproduces the reference — and
+    /// `recognized_check_arcs`, recognised Liberty check arcs deferred from
     /// the endpoint model — they add checks outside the reported endpoint set rather than
-    /// altering an arrival or slack the report does produce. Both stay visible in the
+    /// altering an arrival or slack the report does produce. All stay visible in the
     /// summary; `--strict` only fails on skips that can make a reported number wrong.
     pub fn is_clean(&self) -> bool {
-        const DESIGN_RULES: [&str; 3] = [
+        const DESIGN_RULES: [&str; 4] = [
             "set_max_transition",
             "set_max_capacitance",
             "set_max_fanout",
+            "set_fanout_load",
         ];
         self.unmapped_cells == 0
             && self.unmodelled_latch_cells == 0
@@ -425,6 +439,7 @@ impl SkipReport {
             && self.unsupported_multicycle_endpoints == 0
             && self.unsupported_path_delay_endpoints == 0
             && self.unresolved_exception_selectors == 0
+            && self.unresolved_load_selectors == 0
             && self.unsupported_arcs.is_empty()
             && self.latch_arcs_dropped.is_empty()
             && self.sdc_ignored_options.is_empty()
@@ -459,6 +474,12 @@ struct Context<'a> {
     parasitics: Option<&'a NetParasitics>,
     /// Driving-point pi model of every net with parasitics, per output transition.
     pi_models: Vec<Option<[PiModel; 2]>>,
+    /// `set_load` wire-capacitance override per net (measured OpenSTA
+    /// semantics: the annotation *replaces* the net's wire capacitance,
+    /// last-wins per net, additive to pin capacitance). Empty under
+    /// `NetParasitics` — the override cannot be injected into the distributed
+    /// RC model, so those nets count as `unresolved_load_selectors` instead.
+    net_wire_loads: Vec<Option<f32>>,
 }
 
 impl Context<'_> {
@@ -506,10 +527,13 @@ impl Context<'_> {
 
     /// Total capacitance on the net driven by an output pin for one output transition.
     fn net_load(&self, net: NetId, pol: usize) -> f32 {
-        let wire = self
-            .parasitics
-            .and_then(|par| par.net(net))
-            .map_or(0.0, |t| t.total_wire_cap_pf);
+        // A `set_load` net annotation replaces the net's wire capacitance
+        // (measured: an SPEF wire cap is overridden, not summed).
+        let wire = self.net_wire_loads[net.0 as usize].unwrap_or_else(|| {
+            self.parasitics
+                .and_then(|par| par.net(net))
+                .map_or(0.0, |t| t.total_wire_cap_pf)
+        });
         wire + self
             .design
             .net_pins(net)
@@ -2200,7 +2224,35 @@ fn prepare_sta<'a>(
         sdc,
         parasitics,
         pi_models: Vec::new(),
+        net_wire_loads: vec![None; design.num_nets()],
     };
+    // Resolve `set_load` `get_nets` rules once, before any net capacitance
+    // consumer: exact names only, file order (last-wins per net), missing
+    // names counted like OpenSTA's per-name warning. Under parasitics the
+    // annotation's replace-wire-cap semantics do not map onto the distributed
+    // RC model, so resolved nets count as unresolved instead of being
+    // approximated (measured restriction, `docs/results.md` 2026-11-19).
+    let mut unresolved_load_selectors = 0;
+    if sdc.net_loads().next().is_some() {
+        let net_by_name: HashMap<_, u32> = design
+            .net_names
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (s, i as u32))
+            .collect();
+        for (names, value_pf) in sdc.net_loads() {
+            for name in names {
+                match design.strings.get(name).and_then(|s| net_by_name.get(&s)) {
+                    Some(&net) => cx.net_wire_loads[net as usize] = Some(value_pf),
+                    None => unresolved_load_selectors += 1,
+                }
+            }
+        }
+        if parasitics.is_some() {
+            unresolved_load_selectors += cx.net_wire_loads.iter().flatten().count();
+            cx.net_wire_loads.fill(None);
+        }
+    }
     let build_pi = |n: usize| {
         let net = NetId(n as u32);
         let tree = parasitics?.net(net)?;
@@ -2239,7 +2291,10 @@ fn prepare_sta<'a>(
         Vec::new()
     };
 
-    let mut skipped = SkipReport::default();
+    let mut skipped = SkipReport {
+        unresolved_load_selectors,
+        ..Default::default()
+    };
     let graph = build_graph(&cx, &mut skipped);
     let levelized = topological_levels(&cx, &graph, false)?;
     // Primary inputs: ideal drivers. The clock port is not a data startpoint.
@@ -4424,6 +4479,9 @@ fn merge_skip_reports(a: SkipReport, b: SkipReport) -> SkipReport {
         unresolved_exception_selectors: a
             .unresolved_exception_selectors
             .max(b.unresolved_exception_selectors),
+        unresolved_load_selectors: a
+            .unresolved_load_selectors
+            .max(b.unresolved_load_selectors),
     }
 }
 
@@ -5073,6 +5131,7 @@ mod tests {
                 sdc: &sdc,
                 parasitics: None,
                 pi_models: Vec::new(),
+            net_wire_loads: vec![None; design.num_nets()],
             };
             let (cells, arcs) = expected_latch_skips(&cx, &design, &lib);
             assert_eq!((cells, arcs), (want_cells, want_arcs), "{design_name}");
@@ -5181,6 +5240,7 @@ mod tests {
             sdc: &sdc,
             parasitics: Some(&par),
             pi_models: Vec::new(),
+            net_wire_loads: vec![None; design.num_nets()],
         };
         let graph = build_graph(&cx, &mut SkipReport::default());
         let find_pin = |name: &str| {
@@ -5442,6 +5502,7 @@ mod tests {
             sdc: &sdc,
             parasitics: Some(&par),
             pi_models: Vec::new(),
+            net_wire_loads: vec![None; design.num_nets()],
         };
         let graph = build_graph(&cx, &mut SkipReport::default());
         let find_pin = |name: &str| {
@@ -5595,6 +5656,7 @@ mod tests {
             sdc: &sdc,
             parasitics: Some(&par),
             pi_models: Vec::new(),
+            net_wire_loads: vec![None; design.num_nets()],
         };
         let graph = build_graph(&cx, &mut SkipReport::default());
         let by_name: std::collections::HashMap<String, PinId> = (0..design.num_pins())
@@ -5935,6 +5997,7 @@ mod tests {
             sdc: &sdc,
             parasitics: Some(&par),
             pi_models: Vec::new(),
+            net_wire_loads: vec![None; design.num_nets()],
         };
         let by_name: std::collections::HashMap<String, PinId> = (0..design.num_pins())
             .map(|i| PinId(i as u32))
@@ -6136,6 +6199,7 @@ mod tests {
                 sdc: &sdc,
                 parasitics: Some(&par),
                 pi_models: Vec::new(),
+            net_wire_loads: vec![None; design.num_nets()],
             };
             // pin name -> [slew_max rise, fall, arrival_max rise, fall]
             let mut ref_pins: std::collections::HashMap<&str, [f64; 4]> =
@@ -6933,6 +6997,7 @@ mod tests {
                 sdc: &sdc,
                 parasitics: parasitics.as_ref(),
                 pi_models: Vec::new(),
+            net_wire_loads: vec![None; design.num_nets()],
             };
             let by_name: std::collections::HashMap<String, PinId> = (0..design.num_pins())
                 .map(|i| PinId(i as u32))
@@ -8534,6 +8599,7 @@ mod tests {
             sdc: &sdc,
             parasitics: None,
             pi_models: vec![None; design.num_nets()],
+            net_wire_loads: vec![None; design.num_nets()],
         };
         let mut skipped = SkipReport::default();
         let graph = build_graph(&cx, &mut skipped);
@@ -8930,5 +8996,38 @@ mod tests {
             Some(&1)
         );
         assert!(!report.skipped.is_clean());
+
+        // `set_load` load selectors: a missing net name is counted as an
+        // unresolved load selector while the resolvable net still applies;
+        // pin/cell/fanout selections count under `sdc_ignored_commands`.
+        let (report, _, _) = run("ld_badnet");
+        assert_eq!(report.skipped.unresolved_load_selectors, 1);
+        assert!(!report.skipped.is_clean());
+        let (report, _, _) = run("ld_net");
+        assert_eq!(report.skipped.unresolved_load_selectors, 0);
+        assert!(!report.skipped.sdc_ignored_commands.contains_key("set_load"));
+        for (name, want) in [
+            ("ld_pins", 1),
+            ("ld_pin_sink", 1),
+            ("ld_pin_drv", 1),
+            ("ld_badpin", 1),
+            ("ld_cells", 1),
+            ("ld_afo", 1),
+            ("ld_afi", 1),
+        ] {
+            let (report, _, _) = run(name);
+            assert_eq!(
+                report.skipped.sdc_ignored_commands.get("set_load"),
+                Some(&want),
+                "{name}: set_load ignored count"
+            );
+        }
+        // `set_fanout_load` is accepted and inert in OpenSTA (STA-0461);
+        // counted ignored, timing identical to base.
+        let (report, _, _) = run("ld_fo");
+        assert_eq!(
+            report.skipped.sdc_ignored_commands.get("set_fanout_load"),
+            Some(&1)
+        );
     }
 }

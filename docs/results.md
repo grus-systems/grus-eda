@@ -2727,3 +2727,115 @@ the change. After copying the gitignored artifacts from the main
 checkout (bit-identical inputs the committed `generate_ref.sh` flows
 produce), the full suite passes: 259 run, 0 failed, 2 `#[ignore]`d.
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+## 2026-11-19 — N2: `set_load` net selectors and `set_fanout_load` (load-selectors)
+
+### Before failure mode
+
+`target/release/grus-eda sta --lib $PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef .../sky130_fd_sc_hd__nom.tlef --lef .../sky130_fd_sc_hd.lef --def tests/designs/sta_exceptions/exceptions.def --sdc <scenario>`:
+
+- `set_load 0.10 [get_nets d1]` → whole-SDC parse abort:
+  `SDC line 20: set_load: expected a numeric value and a port selector`.
+  Same abort for `[get_pins u_ff1/D]` and `[all_fanouts ...]` (the latter
+  degrades to `Value::Opaque` inside `value_and_ports`).
+- `set_fanout_load 4 [get_ports y]` → `unsupported command set_fanout_load`.
+
+### Probe (OpenSTA inside `ghcr.io/librelane/librelane:3.0.16`)
+
+Heredoc-free probe scripts under `~/tmp_loadprobe/*.tcl` run with
+`openroad -no_init -no_splash` on `exceptions.def`, one process per SDC
+(read_sdc state accumulates). Baseline: `u_mux/X` drives `d1` with
+Cap `0.001681` (only the `u_ff1/D` pin cap).
+
+- **Q1 `set_load v [get_nets n]`**: accepted; sets the net's *wire
+  capacitance* attribute (a separate domain from pin capacitance).
+  `set_load 0.10 [get_nets d1]` → `report_net d1` wire cap `0.10`,
+  driver-stage Cap `0.101681` = wire `0.10` + pin `0.001681`; `u_ff1/D`
+  max arrival moves `1.313326 → 1.710434` ns (well past STRICT).
+- **Assignment, last-wins**: `0.10` then `0.02` on `d1` leaves wire cap
+  `0.02` (Cap `0.021681`). Duplicate names in one collection
+  (`{d1 d1}`) set once (wire cap `0.10`).
+- **Missing net in a collection**: `WARNING STA-0361 net 'no_such_net'
+  not found` — warning only; the resolvable members still apply
+  (partial apply, warn per missing name).
+- **Net annotation vs port load**: additive domains.
+  `set_load 0.03 [get_nets y]` on top of `set_load 0.05 [get_ports y]`
+  gives Cap `0.08` (pin `0.05` + wire `0.03`).
+- **Q2 `get_pins` objects**: OpenSTA *rejects*
+  `set_load <v> [get_pins u_ff1/D]` — `[ERROR STA-0100] unsupported
+  object type Pin` (sink, driver, or multi-pin collections alike).
+  `get_cells` is rejected too (`STA-0100` ... `Instance`). The reference
+  semantics for pin/cell load objects do not exist in this OpenSTA —
+  our parser accepts and counts the whole command instead of guessing.
+- **Q4 `all_fanouts`/`all_fanins`**: not commands at all in this build —
+  `invalid command name "all_fanouts"` / `"all_fanins"` (both singular
+  spellings too). `read_sdc` fails on the command substitution; golden
+  records `{"error": ...}`. Our side: `Value::Opaque` → counted
+  `set_load` skip.
+- **Q5 `set_fanout_load`**: accepted but inert —
+  `[WARNING STA-0461] set_fanout_load not supported.` Timing identical
+  to `base` (every arrival byte-equal). OpenSTA applies nothing, so the
+  command cannot change a compared number; counted in
+  `sdc_ignored_commands["set_fanout_load"]` and exempt from `is_clean`
+  like the `set_max_*` design rules.
+- **Q6 qualifiers**: `-pin_load` / `-wire_load` / `-rise` / `-fall` on
+  *net* objects warn (`STA-0464/0465/0466` "not allowed for net objects")
+  but still apply the full value as wire cap. `-min`/`-max` select a
+  corner (`wire cap 0.10-0.00` / `0.00-0.10`) — unmodelled, counted
+  skip. `-subtract_pin_load` subtracts pin caps from the annotated value
+  (Cap `0.100000`) — unmodelled, counted skip. On *port* objects
+  `-wire_load` writes the attached net's wire cap (a different domain
+  than the port pin load) and `-min`/`-rise` select corner/transition —
+  all counted skips rather than applied to both transitions.
+- **Q7 parasitic interaction**: on a `d1` net annotated with 0.05 pF
+  wire cap via a hand-written SPEF (`~/tmp_loadprobe/exc.spef`), a
+  `set_load 0.10` replaced the SPEF wire cap entirely
+  (`report_net` wire `0.10`, arrival identical to the zero-wire run).
+  How the annotation maps onto a distributed RC pi model was not
+  measured beyond the lumped override; our parasitic mode therefore does
+  not apply net annotations — it counts each selected net in
+  `unresolved_load_selectors` instead of approximating.
+
+### Scenarios (ld_*)
+
+Applied: `ld_net`, `ld_nets`, `ld_portnet`, `ld_last`,
+`ld_badnet` (partial apply + 1 unresolved name).
+OpenSTA-error goldens (`{"error": ...}`, compared for diagnostics only):
+`ld_pin_sink`, `ld_pin_drv`, `ld_pins`, `ld_cells`, `ld_afo`, `ld_afi`.
+Counted no-op: `ld_fo` (`set_fanout_load` inert in OpenSTA; baseline
+timing, `sdc_ignored_commands["set_fanout_load"]=1`, `is_clean`-exempt).
+`ld_badpin` errors in OpenSTA (STA-0100, pins rejected before the
+missing-name warning matters); our side counts `set_load` ignored.
+
+### Implementation notes
+
+- `sdc.rs`: `get_nets`/`get_net` parse to a new `Value::Nets(Vec<String>)`;
+  `set_load` stores `(LoadSel, value)` load rules — `LoadSel::Ports` keeps
+  the existing last-match port mechanism, `LoadSel::Nets` lists raw net
+  names in command order (last-wins per net at resolution). `get_pins`,
+  `get_cells`, `all_fanouts`/`all_fanins` (unknown commands in this
+  OpenSTA), `all_clocks`/`get_clocks`, opaque collections, and the
+  `-min`/`-max`/`-rise`/`-fall`/`-subtract_pin_load` qualifiers are
+  accepted and counted in `sdc_ignored_commands["set_load"]` (one count
+  per command). `-pin_load`/`-wire_load` on net objects apply the value
+  (OpenSTA warns but applies). `set_fanout_load` parses
+  `<float> <collection>` and is counted once per command.
+- `analysis.rs`: `Context::net_wire_loads` carries resolved `get_nets`
+  annotations; `net_load` lets the annotation *replace* the wire
+  capacitance term (measured override semantics), summed with sink pin
+  caps. Under `NetParasitics` the distributed RC path is left untouched
+  and each annotated net counts once in the new
+  `SkipReport::unresolved_load_selectors` (missing names count one per
+  name; merged across corners via `merge_skip_reports` max).
+- `is_clean` exempts `set_fanout_load` (measured inert, like the
+  `set_max_*` design rules) but not `unresolved_load_selectors` or
+  `set_load` ignores — those can change a reported number.
+- Golden: `generate_ref.sh` SCENARIOS extended with the 13 `ld_*`
+  files, `exceptions.reference.json` regenerated inside the pinned
+  container by the committed script unchanged (per-scenario `ref_ld_*`
+  files merged as before); 6 scenarios compared numerically at STRICT,
+  7 carry `error` records and exercise diagnostics only.
+- Fail-proof: zeroing `net_wire_loads` in `net_load` (`None.unwrap_or_else`)
+  fails `test_sta_exceptions_match_opensta` on `ld_badnet u_ff1/D.max_arr_ns`
+  (ours `1.3133256` vs ref `1.710434`, rel 2.3e-1) — the applied path is
+  what the golden measures.

@@ -276,14 +276,30 @@ Done since (path-delay checks, `docs/path-delays.md`):
   async checks) are counted, never silently applied
   (`unsupported_path_delay_endpoints`).
 
+Done since (load selectors, `docs/results.md` 2026-11-19 entry):
+
+- `set_load <pf> [get_nets {...}]` applies the OpenSTA-measured
+  semantics: the annotation replaces the net's *wire* capacitance in the
+  lumped load (last-wins per net, partial apply with one
+  `unresolved_load_selectors` count per missing name). Measured against
+  OpenSTA goldens at STRICT (`ld_net`, `ld_nets`, `ld_portnet`,
+  `ld_last`, `ld_badnet`). Under `--spef` distributed parasitics the
+  annotation is counted unresolved rather than approximated.
+- `set_load` on `get_pins`/`get_cells`/`all_fanouts`/`all_fanins`/
+  `get_clocks` object sets and the `-min`/`-max`/`-rise`/`-fall`/
+  `-subtract_pin_load` qualifiers no longer abort the parse; each is
+  counted in `sdc_ignored_commands["set_load"]` (OpenSTA rejects the
+  pin/cell objects outright — `STA-0100` — and does not know the cone
+  commands at all).
+- `set_fanout_load <n> <objects>` parses and is counted in
+  `sdc_ignored_commands`; OpenSTA accepts it but warns it is unsupported
+  (`STA-0461`) and applies nothing, so the count is `is_clean`-exempt
+  like the `set_max_*` design rules.
+
 Remaining:
 
-- `get_pins`/`get_nets`/`all_fanouts` selections in *other* commands
-  (`set_load`, `set_fanout_load`), and the path-delay follow-ups in
-  `docs/path-delays.md` section 5 (two-clock and latch fixtures). These
-  select pins/nets the port-based delay model
-  cannot honour yet; options are symbolic selections plus counted-skip,
-  or deferring until a stage needs them.
+- The path-delay follow-ups in `docs/path-delays.md` section 5
+  (two-clock and latch fixtures).
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 
