@@ -59,7 +59,7 @@ enum Commands {
     /// E3: Static timing analysis (zero-wire, placement-based RC, or SPEF)
     Sta(StaArgs),
 
-    /// N7: Power estimation from VCD switching activity (leakage + switching + internal)
+    /// N7: Power estimation from VCD or SAIF switching activity (leakage + switching + internal)
     #[command(name = "power")]
     Power(PowerArgs),
 }
@@ -290,8 +290,23 @@ struct PowerArgs {
     )]
     sdc: PathBuf,
 
-    #[arg(long, help = "Path to VCD (.vcd) switching-activity dump")]
-    vcd: PathBuf,
+    #[arg(
+        long,
+        help = "Path to VCD (.vcd) switching-activity dump",
+        conflicts_with = "saif",
+        required_unless_present = "saif"
+    )]
+    vcd: Option<PathBuf>,
+
+    #[arg(long, help = "Path to SAIF (.saif) switching-activity file")]
+    saif: Option<PathBuf>,
+
+    #[arg(
+        long,
+        requires = "saif",
+        help = "SAIF instance scope path (e.g. tb/dut); default: outermost scope containing signal groups"
+    )]
+    saif_scope: Option<String>,
 
     #[arg(
         long,
@@ -797,17 +812,32 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let t0 = std::time::Instant::now();
             let pin_slews =
                 grus_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?;
-            let vcd = grus_core::readers::load_vcd(&args.vcd)?;
-            let report = grus_core::power::estimate_power(
+            let (activity, saif_diag) = match (&args.vcd, &args.saif) {
+                (Some(vcd_path), _) => {
+                    (grus_core::readers::load_vcd(vcd_path)?, None)
+                }
+                (None, Some(saif_path)) => {
+                    let saif = grus_core::readers::load_saif(saif_path)?;
+                    let (activity, diag) =
+                        saif.resolve(&design, args.saif_scope.as_deref())?;
+                    (activity, Some(diag))
+                }
+                (None, None) => unreachable!("clap requires --vcd or --saif"),
+            };
+            let mut report = grus_core::power::estimate_power(
                 &design,
                 &lib_db,
                 &sdc,
                 parasitics.as_ref(),
-                &vcd,
+                &activity,
                 &pin_slews,
             );
+            if let Some(d) = saif_diag {
+                report.diagnostics.saif_unmatched_scopes = d.unmatched_scopes;
+                report.diagnostics.saif_unmatched_signals = d.unmatched_signals;
+            }
             println!(
-                "Power ({} parasitics, VCD {:.3} s): internal={:.6e} W, switching={:.6e} W, leakage={:.6e} W, total={:.6e} W ({:.2} ms)",
+                "Power ({} parasitics, activity window {:.3e} s): internal={:.6e} W, switching={:.6e} W, leakage={:.6e} W, total={:.6e} W ({:.2} ms)",
                 mode,
                 report.duration_s,
                 report.internal_w,
@@ -828,20 +858,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             let d = &report.diagnostics;
             if d.cells_without_lib_cell > 0
-                || d.driven_nets_without_vcd > 0
+                || d.driven_nets_without_activity > 0
                 || d.active_nets_without_cell_driver > 0
                 || d.internal_power_without_slew > 0
                 || d.unresolved_related_pin > 0
                 || d.conditional_power_blocks > 0
+                || d.saif_unmatched_scopes > 0
+                || d.saif_unmatched_signals > 0
             {
                 eprintln!(
-                    "power: {} cells without lib cell, {} driven nets without VCD activity, {} active nets without cell driver, {} internal-power lookups missing slew, {} unresolved related pins, {} conditional power blocks",
+                    "power: {} cells without lib cell, {} driven nets without recorded activity, {} active nets without cell driver, {} internal-power lookups missing slew, {} unresolved related pins, {} conditional power blocks, {} unmatched SAIF scopes, {} unmatched SAIF signals",
                     d.cells_without_lib_cell,
-                    d.driven_nets_without_vcd,
+                    d.driven_nets_without_activity,
                     d.active_nets_without_cell_driver,
                     d.internal_power_without_slew,
                     d.unresolved_related_pin,
                     d.conditional_power_blocks,
+                    d.saif_unmatched_scopes,
+                    d.saif_unmatched_signals,
                 );
             }
             if let Some(path) = &args.json {

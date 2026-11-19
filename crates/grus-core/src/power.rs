@@ -1,4 +1,4 @@
-//! Power estimation driven by VCD switching activity.
+//! Power estimation driven by switching-activity annotation (VCD or SAIF).
 //!
 //! Reports the same three components as OpenSTA's `report_power`:
 //! - **Leakage**: `cell_leakage_power` summed over instances.
@@ -38,8 +38,8 @@ pub struct PowerGroup {
 pub struct PowerDiagnostics {
     /// Instances whose LEF cell has no Liberty counterpart (no leakage/pin data).
     pub cells_without_lib_cell: usize,
-    /// Driven nets absent from the VCD (treated as zero activity).
-    pub driven_nets_without_vcd: usize,
+    /// Driven nets absent from the activity input (treated as zero activity).
+    pub driven_nets_without_activity: usize,
     /// Nets with VCD activity but no cell-output driver (input ports, undriven);
     /// their switching power is not attributed anywhere, as in OpenSTA.
     pub active_nets_without_cell_driver: usize,
@@ -49,6 +49,11 @@ pub struct PowerDiagnostics {
     pub unresolved_related_pin: usize,
     /// `internal_power` blocks skipped because of a `when` state expression.
     pub conditional_power_blocks: usize,
+    /// SAIF `INSTANCE` scopes matching no design cell (0 on the VCD path;
+    /// merged in from `SaifDiagnostics` by the caller).
+    pub saif_unmatched_scopes: usize,
+    /// SAIF signal names matching no design net, port or pin (0 on the VCD path).
+    pub saif_unmatched_signals: usize,
 }
 
 /// Estimated power over the VCD window, grouped like `report_power`.
@@ -293,7 +298,7 @@ pub fn estimate_power(
             .map(|s| (s.rise, s.fall))
             .unwrap_or((0, 0));
         if design.net_driver(net).is_some() && !vcd.signals.contains_key(name) {
-            cx.diagnostics.driven_nets_without_vcd += 1;
+            cx.diagnostics.driven_nets_without_activity += 1;
         }
         cx.net_activity.push((rise, fall));
         for pol in [RISE, FALL] {
@@ -378,6 +383,7 @@ pub fn estimate_power(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{design_dir, require, sky130_hd};
 
     #[test]
     fn group_of_classifies_by_cell_kind() {
@@ -400,5 +406,139 @@ mod tests {
         cell.is_sequential = false;
         cell.is_latch = true;
         assert_eq!(group_of(&cell), SEQ);
+    }
+
+    /// `grus-eda power --saif mb.saif` vs the OpenROAD `read_saif` +
+    /// `report_power` golden (`mb.saif.reference.json`, emitted by the
+    /// committed `generate_saif_ref.sh` inside LibreLane 3.0.16).
+    /// POWER_SAIF per-field bounds: rel/internal 2%, switching 5% (the
+    /// Sequential-group ~3.7% residual is the same driver-pin-cap delta the
+    /// VCD path carries — root cause named in docs/results.md), total 1%;
+    /// leakage uses a 1.5e-12 W abs floor because the Combinational term is a
+    /// state-dependent-vs-flat difference (~23% of a ~5e-12 W quantity).
+    #[test]
+    fn test_saif_power_mb_matches_opensta() {
+        let hd = sky130_hd();
+        let lib_path = require(hd.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
+        let tlef_path = require(hd.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(hd.join("lef/sky130_fd_sc_hd.lef"));
+        let dir = design_dir("microbench");
+        let def_path = require(dir.join("mb.def"));
+        let sdc_path = require(dir.join("mb.sdc"));
+        let saif_path = require(dir.join("mb.saif"));
+        let vcd_path = require(dir.join("mb.vcd"));
+        let ref_path = require(dir.join("mb.saif.reference.json"));
+
+        let lib = crate::readers::load_liberty(&lib_path).expect("liberty");
+        let mut interner = crate::interner::StringInterner::new();
+        let (tech_db, _report) =
+            crate::readers::load_tech_db(&tlef_path, &lef_path, &mut interner)
+                .expect("tech db");
+        let design = crate::readers::parse_def(&def_path, &tech_db, Some(&lib)).expect("def");
+        let sdc = crate::sta::load_sdc(&sdc_path).expect("sdc");
+        let pin_slews =
+            crate::sta::sta_pin_slews(&design, &lib, &sdc, None).expect("pin slews");
+
+        let saif = crate::readers::load_saif(&saif_path).expect("saif");
+        let (activity, diag) = saif.resolve(&design, None).expect("resolve");
+        let mut report = estimate_power(&design, &lib, &sdc, None, &activity, &pin_slews);
+        report.diagnostics.saif_unmatched_scopes = diag.unmatched_scopes;
+        report.diagnostics.saif_unmatched_signals = diag.unmatched_signals;
+
+        // The fixture carries one ghost scope so the unmatched counters are
+        // exercised end-to-end; OpenSTA drops it silently (docs/results.md).
+        assert_eq!(diag.unmatched_scopes, 1);
+        assert_eq!(diag.unmatched_signals, 0);
+
+        let ref_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&ref_path).expect("reference json"),
+        )
+        .expect("parse reference json");
+        let golden = &ref_json["power_saif"];
+        let check = |label: &str, ours: f64, reference: f64, rel: f64, abs_floor: f64| {
+            let bound = (reference.abs() * rel).max(abs_floor);
+            assert!(
+                (ours - reference).abs() <= bound,
+                "{label}: ours {ours:e} vs opensta {reference:e} (|diff| {:.3e} > bound {bound:.3e})",
+                (ours - reference).abs()
+            );
+        };
+        let group_of_name = |name: &str| {
+            report
+                .groups
+                .iter()
+                .find(|g| g.name == name)
+                .unwrap_or_else(|| panic!("group {name} missing"))
+        };
+        for name in ["Sequential", "Combinational", "Clock"] {
+            let g = group_of_name(name);
+            let r = &golden[name];
+            check(
+                &format!("{name} internal"),
+                g.internal_w,
+                r["internal_w"].as_f64().unwrap(),
+                0.02,
+                0.0,
+            );
+            check(
+                &format!("{name} switching"),
+                g.switching_w,
+                r["switching_w"].as_f64().unwrap(),
+                0.05,
+                0.0,
+            );
+            check(
+                &format!("{name} leakage"),
+                g.leakage_w,
+                r["leakage_w"].as_f64().unwrap(),
+                0.25,
+                1.5e-12,
+            );
+        }
+        let t = &golden["total"];
+        check("total internal", report.internal_w, t["internal_w"].as_f64().unwrap(), 0.02, 0.0);
+        check(
+            "total switching",
+            report.switching_w,
+            t["switching_w"].as_f64().unwrap(),
+            0.05,
+            0.0,
+        );
+        check(
+            "total leakage",
+            report.leakage_w,
+            t["leakage_w"].as_f64().unwrap(),
+            0.25,
+            1.5e-12,
+        );
+        check("total", report.total_w, t["total_w"].as_f64().unwrap(), 0.01, 0.0);
+
+        // Per-net comparison against the VCD annotation (AGENTS §7 rule 5):
+        // every net reconstructs its VCD edge counts except clk, whose TC=199
+        // covers the truncated [10,1990] SAIF window — the #2000 fall is
+        // outside it, so resolved clk differs by exactly one fall.
+        let vcd = crate::readers::load_vcd(&vcd_path).expect("vcd");
+        for (name, sa) in &activity.signals {
+            let va = vcd
+                .signals
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("net {name} missing from VCD activity"));
+            let expected = if name == "clk" {
+                (va.rise, va.fall - 1)
+            } else {
+                (va.rise, va.fall)
+            };
+            assert_eq!((sa.rise, sa.fall), expected, "net {name}");
+        }
+        assert_eq!(
+            (activity.signals["clk"].rise, activity.signals["clk"].fall),
+            (100, 99)
+        );
+
+        // The reports differ only by clk's one dropped fall over a window
+        // 10ns shorter; the measured delta is recorded in docs/results.md.
+        let vcd_report = estimate_power(&design, &lib, &sdc, None, &vcd, &pin_slews);
+        let rel = (report.total_w - vcd_report.total_w).abs() / vcd_report.total_w;
+        assert!(rel < 0.01, "SAIF-vs-VCD total delta {rel:e} exceeds 1%");
     }
 }
