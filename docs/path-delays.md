@@ -624,6 +624,14 @@ Known gaps in that resolution (reachable but ungoldened — review
 Still open:
 
 1. A literal two-clock-domain `set_min_delay` anchoring fixture —
-   blocked on multi-clock SDC support (our SDC accepts a single
+   still blocked on multi-clock SDC support (our SDC accepts a single
    `create_clock` domain; the skewed-launch coverage `pm2_min2`
-   exercises is inside one domain).
+   exercises is inside one domain). The anchor question itself is now
+   answered by the `sta_clocks` probe (2026-11-19): on a second-domain
+   endpoint OpenSTA anchors the delay-check required time at the
+   **capture domain's** edge-0 arrival — `req = N + capture_latency ∓
+   capture_uncertainty ∓ t_check`, with the launch domain's latency on
+   the arrival side only (`t2_md`/`t2_mdl`, `docs/multi-clock.md` §1.5).
+   The fixture and OpenSTA artifacts are committed as probe evidence;
+   golden coverage lands with the `mc-*` sequence in
+   `docs/multi-clock.md`.

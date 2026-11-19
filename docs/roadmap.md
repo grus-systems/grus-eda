@@ -299,7 +299,11 @@ Done since (load selectors, `docs/results.md` 2026-11-19 entry):
 Remaining:
 
 - The path-delay follow-ups in `docs/path-delays.md` section 5
-  (two-clock and latch fixtures).
+  (two-clock and latch fixtures). Multi-clock SDC support is scoped in
+  `docs/multi-clock.md`: OpenSTA's two-clock rules are measured on the
+  committed `sta_clocks` probe (2026-11-19) and the implementation is a
+  five-ticket sequence (`mc-model` → `mc-eval` → `mc-xdomain` →
+  `mc-selectors` → `mc-golden`).
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 

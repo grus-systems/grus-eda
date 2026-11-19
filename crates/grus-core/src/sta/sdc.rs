@@ -2962,4 +2962,61 @@ mod tests {
         assert_eq!(eval_arith("8 / 2 "), None);
         assert_eq!(eval_arith("1 + "), None);
     }
+
+    /// The single-clock SDC model refuses multi-clock constructs at parse time; the
+    /// documented break points for the `mc-*` tickets (docs/multi-clock.md). The second
+    /// `create_clock` bail and the virtual-period bail are already covered by
+    /// `rejects_a_second_design_clock` / `rejects_a_virtual_clock_with_another_period`.
+    #[test]
+    fn multi_clock_bails() {
+        let with_vclk = format!("{GCD}create_clock -name vclk -period 5.0\n");
+        let cases = [
+            (
+                "set_clock_latency 0.5 [get_clocks {core_clk vclk}]",
+                "set_clock_latency takes one clock",
+            ),
+            (
+                "set_clock_latency -early 0.5 [get_clocks core_clk]",
+                "unsupported option `-early`",
+            ),
+            (
+                "set_clock_uncertainty -setup 0.30 -from [get_clocks core_clk] -to [get_clocks vclk]",
+                "set_clock_uncertainty takes a value and optional clock names",
+            ),
+            (
+                "create_clock -waveform {0 0.5} -period 2.0 [get_ports other]",
+                "unsupported option `-waveform`",
+            ),
+            (
+                "set_clock_groups -asynchronous -group [get_clocks core_clk] -group [get_clocks vclk]",
+                "unsupported command `set_clock_groups`",
+            ),
+            (
+                "set_input_delay 1.0 -clock other [get_ports d_in]",
+                "unknown clock `other`",
+            ),
+            (
+                "set_propagated_clock [get_clocks other]",
+                "unknown clock `other`",
+            ),
+        ];
+        for (snippet, want) in cases {
+            let err = format!("{:#}", parse_sdc(&format!("{with_vclk}{snippet}\n")).unwrap_err());
+            assert!(err.contains(want), "{snippet}: {err}");
+        }
+    }
+
+    /// Uncertainty has a single pair of fields for the whole design: naming the virtual
+    /// clock still writes the design-clock values (silent wrong target until `mc-model`
+    /// gives every clock its own row).
+    #[test]
+    fn uncertainty_on_virtual_clock_writes_design_fields() {
+        let text = format!(
+            "{GCD}\
+            create_clock -name vclk -period 5.0\n\
+            set_clock_uncertainty -setup 0.20 [get_clocks vclk]\n"
+        );
+        let sdc = parse_sdc(&text).unwrap();
+        assert_eq!(sdc.setup_uncertainty_ns, 0.20);
+    }
 }

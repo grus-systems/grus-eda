@@ -104,6 +104,7 @@ set_load 0.05 [get_ports yb]
 | `t2_uncx.sdc` | `t2_unc` + `set_clock_uncertainty -setup 0.30 -from [get_clocks cka] -to [get_clocks ckb]` | inter-clock uncertainty override on the A->B cross paths |
 | `t2_lat.sdc` | Pa=2.0, Pb=1.4 + `set_clock_latency 0.6 [get_clocks cka]`, `set_clock_latency 0.2 [get_clocks ckb]`, `set_clock_latency -source 0.1 [get_clocks cka]` | per-clock latency: launch uses launch clock's, capture uses capture clock's |
 | `t2_md.sdc` | `t2_int` + `set_max_delay 1.0 -from [get_cells u_fa0] -to [get_cells u_fx]` and `set_min_delay 0.5 -from [get_cells u_fb0] -to [get_cells u_fy]` | the §5 question: delay-check capture anchor on a second-domain endpoint, both directions |
+| `t2_mdl.sdc` | `t2_md` + `set_clock_latency 0.6 [get_clocks cka]`, `0.2 [get_clocks ckb]`, distinct per-clock setup/hold uncertainties | which domain's latency/uncertainty the delay-check anchor picks up (t2_md has both at 0) |
 | `t2_mdo.sdc` | `t2_int` + `set_max_delay 0.8 -to [get_ports yb]` and `set_min_delay 0.2 -to [get_ports yb]` | output-port delay check anchored to `ckb` |
 | `t2_prop.sdc` | `t2_int` + `set_propagated_clock [all_clocks]` | per-domain propagation |
 | `t2_prop1.sdc` | `t2_int` + `set_propagated_clock [get_clocks cka]` | mixed ideal/propagated domains |

@@ -3285,3 +3285,130 @@ both restored, suite green.
 `cargo clippy --workspace --all-targets -- -D warnings` clean;
 `generate_when_ref.sh` re-run end-to-end, `mbw.*` artifacts
 byte-identical.
+### 2026-11-19 — multi-clock SDC probe (`sta_clocks` fixture; scope ticket, no implementation)
+
+Probe-only ticket for the `docs/path-delays.md` §5 blocker (literal
+two-clock-domain `set_min_delay` fixture) and the real gap on any multi-clock
+design. New hand-written fixture `tests/designs/sta_clocks/`:
+`two_clock.def` (domains `cka` on `clk1`, `ckb` on `clk2`, same-domain plus
+both-direction cross paths), twelve `t2_*.sdc` scenarios, `probe.sh` inside
+`ghcr.io/librelane/librelane:3.0.16` (OpenSTA via `openroad -no_init`),
+artifacts `two_clock.probe.json` + `probe_<name>.txt`. Measured rules and the
+implementation sequence are in `docs/multi-clock.md`; this entry records the
+commands and raw findings.
+
+#### Commands run
+
+- Our-side break probe (release binary, exit code 1):
+  `grus-eda sta --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef .../sky130_fd_sc_hd__nom.tlef --lef .../sky130_fd_sc_hd.lef --def tests/designs/sta_clocks/two_clock.def --sdc tests/designs/sta_clocks/t2_int.sdc`
+  stderr, verbatim:
+
+  ```
+  Error: SDC line 2: `create_clock`
+
+  Caused by:
+      a second design clock is not supported
+  ```
+
+- Parse-level rows via a temporary `--nocapture` probe (output below), then
+  pinned as the committed test `sdc.rs::tests::multi_clock_bails`.
+- Single-clock SDC on the two-clock DEF (clk1 clock only): parses, completes,
+  all 8 endpoints timed.
+- Scratch experiment: the `create_clock` guard commented out, same command —
+  second clock silently overwrites `clock_port`/`clock_name`/`period_ns`
+  (the whole design then times against `ckb`). **Reverted, never committed.**
+- OpenSTA: `bash tests/designs/sta_clocks/probe.sh` (12 scenarios, one
+  OpenSTA process each); re-run after artifact write —
+  `diff -r` of `two_clock.probe.json` + `probe_*.txt` **byte-identical**.
+
+#### Break-point table (grus-eda, HEAD)
+
+| SDC construct | behaviour | verbatim message |
+|---|---|---|
+| `create_clock ... [get_ports clk2]` (2nd design clock) | parse bail | `a second design clock is not supported` |
+| `set_clock_latency 0.5 [get_clocks {a b}]` | parse bail | `set_clock_latency takes one clock` |
+| `set_clock_latency -early ...` | parse bail | ``unsupported option `-early` `` |
+| `set_clock_uncertainty -from ... -to ...` | parse bail | `set_clock_uncertainty takes a value and optional clock names` |
+| `set_clock_uncertainty 0.20 [get_clocks vclk]` | **silent wrong target** — parses and writes the design-clock `setup/hold_uncertainty_ns` fields regardless of the named clock (no per-clock store) |
+| `create_clock -name v2 -period 3.0` (virtual, period != design) | parse bail | `virtual clock `vclk2` has period 3, not the design period 5` |
+| `create_clock -waveform {0 0.5} ...` | parse bail | ``unsupported option `-waveform` `` |
+| `set_clock_groups -asynchronous ...` | parse bail | `unsupported command `set_clock_groups`` |
+| `set_input_delay -clock other` / `set_propagated_clock [get_clocks other]` | parse bail | `unknown clock `other`` |
+| `set_clock_transition 0.1 [get_clocks {design virtual}]` | partial apply — design side set, virtual side counted in `ignored_options` (`set_clock_transition (virtual clock)`: 1); `--strict` exits 1 |
+| single `create_clock` + two-clock DEF | **silent mis-timing** — parses and completes; the unseeded domain's clock pins fold onto the one lattice (`base_state` merge at `ideal_latency`, `analysis.rs`) and all 8 endpoints report against `clk1`'s clock |
+
+So: the failure mode on a real two-clock SDC is a parse error (loud) — but
+only when the SDC actually declares a second clock. The dangerous modes are
+the silent ones: a single-clock SDC on a multi-clock netlist produces a
+full, wrong report with no warning.
+
+#### Measured OpenSTA rules (container runs; per-endpoint numbers in `two_clock.probe.json`)
+
+Q1 — cross-domain paths are timed by default, both directions. `probe_t2_int.txt`
+full-format reports name launch clock at the startpoint and the endpoint's
+clock at capture (`u_fa0` clocked by `cka` → `u_fx` clocked by `ckb`;
+`u_fb0` by `ckb` → `u_fy` by `cka`).
+
+Q2 — setup pairing picks the **most restrictive edge pair**, not
+launch-edge-0: for each launch edge, the smallest capture-domain edge
+strictly after it; the reported path minimises `capture − launch` over the
+common period (H-window won; H-first falsified). `cka` 2.0 / `ckb` 1.4
+(`t2_frac`, LCM 14 ns):
+
+| path | launch edge | capture edge | arr | req |
+|---|---|---|---|---|
+| `u_fa0`→`u_fx/D` (A→B) | cka 4.0 | ckb 4.2 | 4.277469 | 4.085446 |
+| `u_fb0`→`u_fy/D` (B→A) | ckb 9.8 | cka 10.0 | 10.07747 | 9.885446 |
+| `d_in`→`u_fb0/D` (in, cka→ckb) | 4.0 + 0.7 | ckb 4.2 | 4.7 | 4.054762 |
+
+`t2_int` (2.0/1.0) B→A reports launch **1.0**→capture 2.0 (Δ1.0) rather than
+edge 0 (Δ2.0) — min-gap pair wins on equal grids too. Hold pairs stay on
+coincident edges (edge 0 everywhere here).
+
+Q3 — uncertainty is per-clock, applied on the **capture** side
+(`t2_unc`: `u_fx/D req = 4.2 − 0.20 − setup` = ckb's; `u_fy/D req = 10.0 −
+0.05 − setup` = cka's; output checks take their `-clock`'s value).
+`-from cka -to ckb -setup 0.30` (`t2_uncx`) **replaces** the capture value
+for that direction only: `u_fx/D req 3.785446 = 4.2 − 0.30 − setup`, `u_fy/D`
+and same-domain checks unchanged. Hold uses the capture clock's `-hold`.
+
+Q4 — latency is per-clock: `t2_lat` arrivals carry the launch domain's
+latency (`u_fx/D arr 4.977469 = 4.0 + 0.6+0.1 + 0.277469`), required times
+the capture domain's (`req 4.285446 = 4.2 + 0.2 − setup`). `-source` sums
+with network latency in ideal mode (cka total 0.7).
+
+Q5 — `set_max_delay`/`set_min_delay` on a second-domain endpoint anchors at
+the **capture domain's** edge-0 arrival (H-capture-domain won):
+`req = N + capture_latency ∓ capture_uncertainty ∓ t_check`. `t2_mdl`
+(distinct latencies/uncertainties per domain):
+
+- `u_fx/D` (capture ckb, `set_max_delay 1.0`): `req 0.935446 = 1.0 + 0.2 −
+  0.15 − 0.114554`
+- `u_fy/D` (capture cka, `set_min_delay 0.5`): `req 1.162415 = 0.5 + 0.6 +
+  0.10 − 0.037585`
+- report text (`probe_t2_mdl.txt`) shows `max_delay`/`min_delay` followed
+  by the capture domain's own `clock network delay`/`clock uncertainty`
+  lines, no capture-edge line; the arrival side keeps the covered source's
+  ordinary arrival including the launch domain's latency (`u_fx/D arr
+  0.877469 = 0.6 + 0.277469`).
+- port form (`t2_mdo`): `yb req 0.1 = 0.8 − out_delay 0.7`.
+
+Q6 — `set_clock_groups -asynchronous` drops **all** cross checks incl.
+I/O-anchored (`t2_grp` endpoint table 8→5: `u_fb0/D`, `u_fx/D`, `u_fy/D`
+gone, same-domain untouched). `set_propagated_clock` is per-domain
+(`t2_prop1`: cka propagated `u_fa1/D arr 0.379373`, ckb ideal `u_fb1/D arr
+0.277469`, in the same run). MCP multiplies the **capture** domain's period
+(`t2_mcp`: `-setup 2` moves capture ckb 1.0→2.0, req 0.885446→1.885446;
+`-hold 1` moves it back one ckb period, min req −0.037585→−1.037585).
+
+Not run / not discriminated: cross-domain hold-pair selection beyond
+coincident edges; `-waveform` duty cycles; `-early`/`-late` latency splits;
+generated clocks. `t2_mdl` was added during the probe (the `t2_md` anchor
+question is degenerate when both domains' edge-0 arrivals are 0); scenario
+list updated in `fixture.md` and `probe.sh` accordingly.
+
+**Checks run**: `cargo test --workspace` (293+3 pass, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`probe.sh` re-run produced byte-identical `two_clock.probe.json` +
+`probe_*.txt` (`diff -r` against the first run). No existing goldens
+touched (fixture is probe-only, no regression target yet).
