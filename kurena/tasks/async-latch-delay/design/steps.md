@@ -1,47 +1,46 @@
-# async-latch-delay — Remaining steps (post-review fixup)
+# async-latch-delay — Remaining steps (review-2 fixup)
 
-The implementation landed as `e530643` and passed its own verification
-(`docs/results.md` "path delays on async-check and latch-D endpoints
-(v0.1.95)": 32 `sta_edge` tests STRICT-green, workspace suite green,
-clippy clean, fail-proof recorded). The human review rejected on a
-single docstring sign error. Everything below is that delta — do not
-touch fixtures, goldens, docs, or the version.
+The implementation landed as `e530643` + `76ae0c4` + `a356baf` and is
+STRICT-green (`docs/results.md` "path delays on async-check and latch-D
+endpoints (v0.1.95)"). The second human review rejected on one
+docs-only point: three reachable-but-ungoldened delay-check semantics
+must be recorded so the coverage claim is honest per AGENTS.md §7.4.
+Everything below is that delta — do not touch code, fixtures, goldens,
+`docs/timing-exceptions.md` (the skip surface did not change), or the
+version (`0.1.95` already shipped the functional change).
 
-## Step 1 — Fix the docstring
+## Step 1 — `docs/path-delays.md` §5 known-gaps note
 
-`crates/grus-core/src/sta/analysis.rs:7754`, the doc comment on
-`test_sta_edge_latch_borrow_delay_max` currently reads:
+Append the "Known gaps" block from `known-gaps.md` ("Proposed wording —
+`docs/path-delays.md` §5") directly after the `latch-borrow delay
+fixture` resolved bullet, before `Still open:`. Keep the file's ~66-col
+wrap and bullet style; the `Still open` list (two-clock-domain fixture)
+is unchanged.
 
-```rust
-/// `[N + lat0 - unc, + pulse + t_setup]` on the max side and
-```
+## Step 2 — `docs/results.md` `### Not run` mirror
 
-The bound is `pulse - t_setup`, not `pulse + t_setup` — the compose
-comment at ~3609 (`max_borrow = pulse - t_setup`), `docs/path-delays.md`
-§1 (`base + pulse - t_setup`), and the `delay_allregs` golden
-(`u_ln2/D`: `0.9 + 2.5 - 0.164489 = 3.235511`) all agree. Minimal fix:
-change `+ pulse + t_setup` to `+ pulse - t_setup`. Nothing else in the
-docstring moves.
-
-## Step 2 — Optional fmt nit
-
-`cargo fmt` **only** the hunks `e530643` introduced — the review marked
-this "if cheap". `analysis.rs` has pre-existing non-fmt-clean spots (17
-flagged before the commit; `rustfmt --edition 2024 --check` shows them);
-reformatting the whole file adds unrelated churn. rustfmt's
-`--file-lines` range mode is nightly-only, so either hand-apply the
-suggested formatting inside the new hunks (`eval_launch` ~2488, the
-borrow/`disabled_borrow` edits ~2678/2850, req compose ~3453-3715,
-`Worst` ~4072, test block ~7685) or skip — do not let this step touch
-pre-existing code.
+Append the three one-line bullets from `known-gaps.md` ("Proposed
+wording — `docs/results.md`") to the `### Not run` list of the
+"2026-11-19 — path delays on async-check and latch-D endpoints
+(v0.1.95)" entry, after the existing edge0/two-clock/clock-gate items.
 
 ## Step 3 — Verify & commit
 
-- `cargo test -p grus-core sta_edge` — comment-only change, still cheap.
-- `cargo clippy --workspace --all-targets -- -D warnings`.
-- One `docs:` commit, explicit path staging, agent trailer. No version
-  bump: the change is comment-only, and `0.1.95` already shipped in the
-  same commit as the functional change (acceptance criterion met).
+- Docs-only change: `cargo test -p grus-core sta_edge` (cheap) and
+  `cargo clippy --workspace --all-targets -- -D warnings` to confirm
+  nothing regressed; the full workspace suite was green at `a356baf`
+  and is not affected by doc edits.
+- One `docs:`-type commit (the kurena pipeline commits as
+  `kurena: implement async-latch-delay`), explicit path staging of the
+  two doc files plus the design dir, agent trailer. No version bump —
+  docs-only, and `0.1.95` already shipped with the functional change.
+
+## Prior fixups (executed — kept for the record)
+
+- Review 1 (docstring sign): `test_sta_edge_latch_borrow_delay_max`'s
+  docstring claimed `pulse + t_setup`; corrected to `pulse - t_setup`
+  in `76ae0c4`, with an `edge0_pol` contested-parity comment and the
+  residual negative-control probe outputs committed in `a356baf`.
 
 ## Full procedure (executed — kept for the record)
 

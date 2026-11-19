@@ -37,20 +37,19 @@ fail-proof runs.
 
 ## Current state
 
-Implemented and committed as `e530643` (fixtures, goldens, `analysis.rs`,
-docs, `0.1.95` bump). The human review rejected on **one** point:
+Implemented and committed: `e530643` (fixtures, goldens, `analysis.rs`,
+docs, `0.1.95` bump), `76ae0c4` + `a356baf` (review-1 fixup: the
+`pulse − t_setup` docstring correction, `edge0_pol` contested-parity
+comment, residual negative-control probes recorded in `results.md`).
 
-- The docstring on `test_sta_edge_latch_borrow_delay_max`
-  (`analysis.rs:7754`) says the borrow-window bound is `pulse + t_setup`;
-  the implemented — and golden-verified — formula is `pulse − t_setup`
-  (see `api.md` §4 sign correction: OpenSTA's `report_checks` prints the
-  setup term negated, "library setup time -0.18", which is what keeps
-  reintroducing this error). Fix only that docstring; keep everything
-  else. Optional low nit: `rustfmt` the hunks `e530643` touched — `cargo
-  fmt --check` flags pre-existing spots in `analysis.rs` too; reformat
-  only the new code, not the untouched file.
-- Steps: `steps.md`. Nothing else moves — no fixture, golden, docs, or
-  version changes.
+The second human review rejected on **one** point, docs-only: the
+reviewer flagged three latent, reachable-but-ungoldened delay-check
+semantics that the record does not currently acknowledge, which leaves
+the coverage claim dishonest per AGENTS.md §7.4. Add a short "known
+gaps" note recording them (see `known-gaps.md` for the gaps, the code
+evidence, and the proposed wording; `steps.md` for the delta). No code,
+fixture, golden, or version changes — `0.1.95` already shipped the
+functional change.
 
 ## Plan shape (executed — kept for the record)
 
@@ -82,5 +81,6 @@ scope here.
 
 ## Files
 
-- `crates/grus-core/src/sta/analysis.rs` (remaining delta: docstring at
-  ~7754 + optional fmt on the hunks `e530643` touched)
+- `docs/path-delays.md` (§5 known-gaps note — primary location)
+- `docs/results.md` (v0.1.95 entry `### Not run` — three short bullets
+  mirroring the note)
