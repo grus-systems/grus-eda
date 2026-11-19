@@ -267,15 +267,18 @@ Done since (path-delay checks, `docs/path-delays.md`):
   last-wins within a kind. An earlier per-pin delay domain
   (`delay_max`/`delay_launch_max`) was retired on 2026-11-19 when the
   diverging-winner fixture falsified its pairing (`docs/path-delays.md`
-  section 5). Unsupported qualifiers and out-of-model endpoints (output
-  ports, clock gates, latch-D, async checks) are counted, never silently
-  applied (`unsupported_path_delay_endpoints`).
+  section 5). Output-port `-to` endpoints compose with the edge-referenced
+  formulas (`req = N - output_delay_max - unc_setup`, `req = N -
+  output_delay_min + unc_hold`; measured 2026-11-19, `mdo_*`/`pmo_*`).
+  Unsupported qualifiers and out-of-model endpoints (clock gates, latch-D,
+  async checks) are counted, never silently applied
+  (`unsupported_path_delay_endpoints`).
 
 Remaining:
 
 - `get_pins`/`get_nets`/`all_fanouts` selections in *other* commands
   (`set_load`, `set_fanout_load`), and the path-delay follow-ups in
-  `docs/path-delays.md` section 5 (output-port delay checks, two-driver
+  `docs/path-delays.md` section 5 (multi-driver output-port, two-clock
   and latch fixtures). These select pins/nets the port-based delay model
   cannot honour yet; options are symbolic selections plus counted-skip,
   or deferring until a stage needs them.
