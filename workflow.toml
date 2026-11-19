@@ -1,7 +1,7 @@
 # kurena pipeline configuration.
 [kurena]
-executor = "devin"       # driver for implementation (and planning when planner is unset)
-reviewer = "devin"       # driver for diff review
+executor = { driver = "devin", model = "swe-2" }       # driver for implementation (and planning when planner is unset)
+reviewer = { driver = "devin", model = "swe-2" }       # driver for diff review
 max_verify_attempts = 3  # verify self-fix loop bound
 max_revises = 2          # reviewer revise loop bound
 max_implement_retries = 1  # implement executor-failure retry bound
