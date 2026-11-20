@@ -151,6 +151,18 @@ Clock selectors anchor on the clocked object, not the clock pin:
   (`t2_selbare`); `[all_clocks]` and `[get_clocks {cka ckb}]` give union
   coverage; `[get_clocks nope]` parses to a dead rule — OpenSTA warns
   and applies nothing, matching the empty-row selector here.
+- Bare names resolve against the *object* namespaces, and a clock's
+  `-name` and its source port are different objects (`t2_selport`/
+  `t2_selpto`, measured in the revision): `-from clk1` resolves to the
+  **port** object — an input port starts no data path, so the rule
+  covers nothing and OpenSTA warns nothing (the full 8-endpoint table).
+  `-to clk2` resolves the same way and warns `STA-1551 'clk2' is not a
+  valid endpoint` — a dead rule, still the full table. Clock matching
+  is on `-name` only — `clk1` is never a `cka` handle — the same rule
+  `resolve_clock` already measured (`set_clock_latency 1.0 clk1` on a
+  `-name`d clock → `unknown clock`). OpenSTA's `no valid objects
+  specified` fires only when a selector resolves zero objects; a
+  resolved-but-dead selector (`clk1`, a non-launch pin) is silent.
 - Delay checks keep the ordinary clocked launch (`t2_selmd`):
   `u_fx/D arr 0.277469` = `t2_int`, required on the capture edge-0
   anchor per §1.5. A covered launch whose net fans out to no surviving
@@ -219,9 +231,10 @@ Now accepted (the probe's parse breaks are fixed):
   resolve any row, not just the design clock.
 - `set_false_path`/`set_max_delay`/`set_min_delay`/
   `set_multicycle_path` accept `[get_clocks ...]`/`[all_clocks]`/bare
-  clock names on `-from`/`-to` (§1.7); `set_clock_groups` with any mode
-  flag parses multi-`-group` forms; `create_clock -waveform {r f}`
-  stores the two instants on the row (odd counts, non-increasing
+  clock `-name`s on `-from`/`-to` (§1.7 — a clock's source-port name
+  resolves to the port object, not the clock); `set_clock_groups` with
+  any mode flag parses multi-`-group` forms; `create_clock -waveform
+  {r f}` stores the two instants on the row (odd counts, non-increasing
   instants and >2 instants stay named bails; instants past the period
   wrap).
 
@@ -321,7 +334,12 @@ kurena spec:
    shared exclusion path for all three modes; a lone group cuts against
    every other clock); `create_clock -waveform` drives the edge lattice
    via `Clock::edge_offset` — hold pairing generalized to the min
-   non-negative gap. 30 `sta_clocks` scenarios match at STRICT.
+   non-negative gap. The same-day revision (v0.2.5) pins the bare-name
+   rule (`-name` only; a source-port name resolves to the port object —
+   measured `t2_selport`/`t2_selpto`), recounts the unresolved
+   diagnostic on zero-resolved-object selectors, and gates the
+   internal-path-endpoint fanout traversal on delay-rule classes. 40
+   `sta_clocks` scenarios match at STRICT.
 5. **`mc-golden`** — `sta_clocks` promoted to `two_clock.reference.json` +
    `test_sta_clocks_match_opensta`, closing `docs/path-delays.md` §5 item 1
    (the literal two-clock `set_min_delay` fixture is `t2_md`/`t2_mdl`).

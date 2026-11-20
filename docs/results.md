@@ -3788,3 +3788,87 @@ than `-from`/`-to`; >2-instant waveforms (named bail); group
 precedence vs `set_false_path` ordering below the measured surface;
 the fall instant is exercised only through cross-domain hold pairing
 on this fixture.
+
+### 2026-11-20 — `mc-selectors` revision: port-name selectors, golden re-fold (v0.2.5)
+
+Same-day review fix-up of the v0.2.4 entry. One new measurement, one
+golden re-fold, three code corrections; no feature change.
+
+#### New measurement: bare port names in `-from`/`-to`
+
+`ExceptionCtx::clock_row` accepted `c.port` as well as `c.name`, so
+`set_false_path -from clk1` — `clk1` is `cka`'s *source port*, not its
+`-name` — cut every cka launch. Probed (`t2_selport`/`t2_selpto`, new
+scenarios run through `probe.sh` as committed):
+
+- `-from clk1` resolves to the **port object** — a resolved-but-dead
+  selector: the full 8-endpoint table, no warning. An input port starts
+  no data path.
+- `-to clk2` resolves the same way; OpenSTA warns `STA-1551 'clk2' is
+  not a valid endpoint` and applies nothing — still the full table, and
+  *not* `STA-0471 no valid objects` (the object resolved).
+- `clock_row` now matches `c.name` only — the same lookup
+  `resolve_clock`/`clock_rows` already apply. `ObjSel::Names` resolves a
+  bare io-pin name to the port object on either side (direction does not
+  gate resolution).
+
+`unresolved_exception_selectors` now counts **zero-resolved-object**
+selector sides, not empty coverage: a resolved-but-dead selector
+(`clk1`, `[get_pins u_fa0/D]`, `[get_cells u_buf]`) is a silent dead
+rule, matching OpenSTA's `no valid objects specified`. `exc_diag`'s
+pinned `== 4` is preserved (each all-miss `get_cells` side still counts
+per-name miss + zero-objects = 2).
+
+#### Golden re-fold (`probe.sh` as committed, whole script re-run)
+
+`SCENARIOS` 29 → 39: promoted `t2_selbare`, `t2_selac`, `t2_selunion`,
+`t2_selunk`, `t2_grp1`, `t2_grpe`, `t2_grpb`, `t2_wavebig` from
+`PROBE_ONLY`, plus new `t2_selport`/`t2_selpto`. `PROBE_ONLY` keeps only
+the four bail-pinned forms (`t2_grpn`, `t2_wave3`, `t2_wave4`,
+`t2_waverev`). `run_sta` gained an empty-table guard: `t2_selac`/
+`t2_selunion` cut every launch (`No paths found.`), where `worst_slack`
+returns `Inf` — the ref block emits `null` wns/tns and `0` violations;
+the endpoint list is the measurement. `git diff` audit: the 29
+pre-existing `two_clock.probe.json` blocks, `two_clock_latch.probe.json`
+and every pre-existing `probe_t2_*.txt` byte-identical; only new blocks
+and the two new report files appear. `test_sta_clocks_match_opensta`
+now evaluates 40 scenarios (39 + `t2_latch`) and skips aggregate
+comparison on an empty golden table.
+
+Notable measured rows in the new blocks: `t2_grpe` (`-group {}` +
+`-group ckb`) confirms the empty-group arm contributes nothing — the
+same 5-endpoint table as `t2_grp`; `t2_wavebig` (`-waveform {0 2.5}` on
+2.0) wraps to `{0 0.5}` and reproduces `t2_int` exactly on this
+all-rise fixture.
+
+#### Code corrections
+
+- `clock_row` name-only (above).
+- The `dead_ends` fanout traversal is gated per signature class on a
+  `ResolvedRule::Delay` in the signature — the leaf pass only ever
+  produced a row under a delay rule, so group/false-path-only scenarios
+  no longer walk every launch cone (`dead_end_leaves` extracted;
+  behaviour-preserving).
+- Stale comments fixed: `hold_edge_pair` is min-gap since `t2_wave`;
+  four spots still describing the hold pair as *coincident* now say
+  min-gap/`edge_offset`. `test_edge_pairing_unit_cases` gained the
+  `edge_offset` table and the non-uniform `setup_edge_pair`/
+  `hold_edge_pair` rows the first pass promised.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` whole, in
+  `ghcr.io/librelane/librelane:3.0.16` (all 39 + 4 + latch runs).
+- `cargo test -p grus-core sta_clocks_match`,
+  `cargo test -p grus-core edge_pairing`,
+  `cargo test -p grus-core exception_diagnostics` — green.
+
+#### Fail-proof mutations (E0 rule 7)
+
+- `clock_row` with `|| c.port == name` restored: red — `t2_selport`
+  drops the cka-anchored checks OpenSTA keeps (`u_fa0/D`, `u_fa1/D`,
+  `u_fb0/D`, `u_fx/D`, `ya` missing). Restored, green.
+- The `resolved_any` recount has no golden-visible mutation: skip counts
+  are not golden-compared — the `t2_selport`
+  `unresolved_exception_selectors == 0` assert in
+  `test_sta_clocks_match_opensta` is the pin.

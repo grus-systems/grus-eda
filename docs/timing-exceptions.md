@@ -227,11 +227,14 @@ check read the same per-path credit (`docs/path-delays.md`).
   `PinId` map — `-from` keeps only pins that launch (clock/enable pins,
   mapped to their launch keys), `-to` keeps endpoint pins; bare names
   (`-from a`) resolve against both namespaces once the design is loaded.
-- Clock-object selectors (`get_clocks`, `all_clocks`, bare clock names)
-  in `-from`/`-to`: resolved to `ObjSel::Clocks(rows)` — `-from` covers
-  launch keys tagged to the rows, `-to` covers endpoints capturing on
-  the rows (`docs/multi-clock.md` §1.7; unknown names give an empty
-  row set — a dead rule, not an error).
+- Clock-object selectors (`get_clocks`, `all_clocks`, bare clock
+  `-name`s) in `-from`/`-to`: resolved to `ObjSel::Clocks(rows)` —
+  `-from` covers launch keys tagged to the rows, `-to` covers endpoints
+  capturing on the rows (`docs/multi-clock.md` §1.7; unknown names give
+  an empty row set — a dead rule, not an error). A bare name matches a
+  clock `-name` only: a clock's source-port name resolves to the port
+  object instead (a resolved-but-dead selector, measured
+  `t2_selport`/`t2_selpto`).
 - Unsupported qualifiers (`-through`, `-start`, `-end`, `-rise`, `-fall`,
   `-edge`, `-lib_cell`, `-pin`, `-points`) → whole command to
   `ignored_commands`: loud in the skip summary, fails `--strict`, never
@@ -249,8 +252,12 @@ check read the same per-path credit (`docs/path-delays.md`).
   semantics cannot be verified — it is reported, not guessed.
   `-setup`/`-hold`/`-both` flags on `set_false_path` are accepted as
   no-ops (the path is removed regardless).
-- Empty selector resolution (typo'd cell, input port as `-to`) → diagnostic
-  count, matching OpenSTA's warn-not-silent behavior.
+- Selector sides resolving zero objects (typo'd cell, unknown
+  port/pin/clock name) → diagnostic count, matching OpenSTA's
+  warn-not-silent `no valid objects specified` form. A resolved-but-dead
+  selector (`-from clk1` — the port object exists but launches nothing;
+  an input port on `-to`) is a silent dead rule, counted nowhere
+  (`t2_selport`/`t2_selpto`).
 
 ## Out of scope for v1 (diagnosed, not approximated)
 

@@ -3161,7 +3161,7 @@ struct ExceptionCtx<'p, 'd> {
     /// Launch key -> `Sdc::clocks` row of the clock launching it: the raw
     /// `-clock` row for an input port (a virtual row keeps its identity),
     /// the clock pin's domain row for a register output. `ObjSel::Clocks`
-    /// and bare clock names select through it (measured `t2_selfa`,
+    /// and bare clock `-name`s select through it (measured `t2_selfa`,
     /// `t2_selbare`); an unclocked port has no entry and is never covered.
     key_dom: HashMap<u32, usize>,
     /// Endpoint pin -> `Sdc::clocks` row it is captured/anchored on: check
@@ -3238,17 +3238,16 @@ impl ExceptionCtx<'_, '_> {
         }
     }
 
-    /// A clock name's `Sdc::clocks` row, matched by `-name` or source port —
-    /// the same lookup `Sdc::clock` applies.
+    /// A clock `-name`'s `Sdc::clocks` row — the same name-only lookup
+    /// `Parser::resolve_clock`/`clock_rows` apply (measured: a clock's
+    /// source-port name is not a clock handle; `-from clk1` resolves to
+    /// the port object, `t2_selport`).
     fn clock_row(&self, name: &str) -> Option<usize> {
-        self.sdc()
-            .clocks
-            .iter()
-            .position(|c| c.name == name || c.port.as_deref() == Some(name))
+        self.sdc().clocks.iter().position(|c| c.name == name)
     }
 
     /// Launch keys anchored on the given clock rows (`ObjSel::Clocks` and
-    /// bare clock names resolve here).
+    /// bare clock `-name`s resolve here).
     fn keys_on_clocks(&self, rows: &[usize]) -> HashSet<u32> {
         self.launch_keys
             .iter()
@@ -3266,42 +3265,68 @@ impl ExceptionCtx<'_, '_> {
             .collect()
     }
 
-    /// `ObjSel` -> the launch-source pins it covers. Ports match only seeded
-    /// data inputs (the clock port is never a launch source); cells match
-    /// launch pins owned by the resolved instances.
-    fn resolve_from(&mut self, sel: &ObjSel) -> HashSet<u32> {
+    /// `ObjSel` -> `(launch-source pin coverage, resolved_any)`. Ports match
+    /// only seeded data inputs (the clock port is never a launch source);
+    /// cells match launch pins owned by the resolved instances.
+    /// `resolved_any` is whether the selector resolved at least one object —
+    /// OpenSTA's `no valid objects specified` fires only on zero resolved
+    /// objects; a resolved object that covers nothing is a silent dead rule
+    /// (measured `t2_selport`: `-from clk1` resolves to the port object,
+    /// covers nothing, warns nothing).
+    fn resolve_from(&mut self, sel: &ObjSel) -> (HashSet<u32>, bool) {
         let prepared = self.prepared;
+        let design = prepared.cx.design;
         match sel {
-            ObjSel::Ports(ps) => prepared
-                .port_seeds
-                .iter()
-                .filter(|s| ps.matches(prepared.cx.port_name(s.pin), true, self.sdc()))
-                .map(|s| s.pin.0)
-                .collect(),
+            ObjSel::Ports(ps) => {
+                let resolved_any = design.io_pins.iter().any(|&p| {
+                    ps.matches(
+                        prepared.cx.port_name(p),
+                        design.pin_dirs[p.0 as usize] == PinDir::Input,
+                        self.sdc(),
+                    )
+                });
+                (
+                    prepared
+                        .port_seeds
+                        .iter()
+                        .filter(|s| ps.matches(prepared.cx.port_name(s.pin), true, self.sdc()))
+                        .map(|s| s.pin.0)
+                        .collect(),
+                    resolved_any,
+                )
+            }
             ObjSel::Cells(cs) => {
                 let ids = self.cell_sel_ids(cs);
-                self.launch_keys
-                    .iter()
-                    .copied()
-                    .filter(|&k| {
-                        self.design().pin_cells[k as usize].is_some_and(|c| ids.contains(&c))
-                    })
-                    .collect()
+                let resolved_any = !ids.is_empty();
+                (
+                    self.launch_keys
+                        .iter()
+                        .copied()
+                        .filter(|&k| {
+                            self.design().pin_cells[k as usize].is_some_and(|c| ids.contains(&c))
+                        })
+                        .collect(),
+                    resolved_any,
+                )
             }
             ObjSel::Pins(specs) => {
                 let mut out = HashSet::new();
+                let mut resolved_any = false;
                 for spec in specs {
+                    resolved_any |= self.pin_by_path.contains_key(spec);
                     self.pin_launches(spec, &mut out);
                 }
-                out
+                (out, resolved_any)
             }
-            ObjSel::Clocks(rows) => self.keys_on_clocks(rows),
+            ObjSel::Clocks(rows) => (self.keys_on_clocks(rows), !rows.is_empty()),
             ObjSel::Names(names) => {
                 let mut out = HashSet::new();
+                let mut resolved_any = false;
                 for n in names {
                     // Bare `instance/pin` names are pin specs, the same
                     // objects `get_pins` returns.
                     if n.contains('/') {
+                        resolved_any |= self.pin_by_path.contains_key(n);
                         self.pin_launches(n, &mut out);
                         continue;
                     }
@@ -3312,24 +3337,34 @@ impl ExceptionCtx<'_, '_> {
                             hit = true;
                         }
                     }
+                    // A bare port name resolves to the port object whether
+                    // or not it launches anything — resolved but dead when
+                    // it is not a launch source (measured `t2_selport`).
+                    if !hit && design.io_pins.iter().any(|&p| prepared.cx.port_name(p) == n) {
+                        hit = true;
+                    }
                     if let Some(&c) = self.cell_by_name.get(n)
                         && let Some(ks) = self.keys_by_cell.get(&c)
                     {
                         out.extend(ks.iter().copied());
                         hit = true;
                     }
-                    // A bare clock name resolves as the clock object
+                    // A bare clock `-name` resolves as the clock object
                     // (measured `t2_selbare`: `-from cka` cuts the same
-                    // launches as `-from [get_clocks cka]`).
+                    // launches as `-from [get_clocks cka]`). A clock's
+                    // source-port name is a port object, not a clock
+                    // handle (`t2_selport`), so `clock_row` matches `-name`
+                    // only.
                     if let Some(row) = self.clock_row(n) {
                         out.extend(self.keys_on_clocks(&[row]));
                         hit = true;
                     }
+                    resolved_any |= hit;
                     if !hit {
                         self.unresolved += 1;
                     }
                 }
-                out
+                (out, resolved_any)
             }
         }
     }
@@ -3354,25 +3389,32 @@ impl ExceptionCtx<'_, '_> {
         }
     }
 
-    /// `ObjSel` -> `(launch keys, startpoint pins)` for a path-delay `-from`.
-    /// Ports and cells resolve like the exception commands; pin specs go
-    /// through [`Self::delay_pin_spec`].
-    fn resolve_delay_from(&mut self, sel: &ObjSel) -> (HashSet<u32>, HashSet<u32>) {
+    /// `ObjSel` -> `(launch keys, startpoint pins, resolved_any)` for a
+    /// path-delay `-from`. Ports and cells resolve like the exception
+    /// commands; pin specs go through [`Self::delay_pin_spec`].
+    /// `resolved_any` has the same zero-resolved-objects meaning as
+    /// [`Self::resolve_from`].
+    fn resolve_delay_from(&mut self, sel: &ObjSel) -> (HashSet<u32>, HashSet<u32>, bool) {
         let prepared = self.prepared;
+        let design = prepared.cx.design;
         match sel {
             ObjSel::Pins(specs) => {
                 let mut out = HashSet::new();
                 let mut pins = HashSet::new();
+                let mut resolved_any = false;
                 for spec in specs {
+                    resolved_any |= self.pin_by_path.contains_key(spec);
                     self.delay_pin_spec(spec, &mut out, &mut pins);
                 }
-                (out, pins)
+                (out, pins, resolved_any)
             }
             ObjSel::Names(names) => {
                 let mut out = HashSet::new();
                 let mut pins = HashSet::new();
+                let mut resolved_any = false;
                 for n in names {
                     if n.contains('/') {
+                        resolved_any |= self.pin_by_path.contains_key(n);
                         self.delay_pin_spec(n, &mut out, &mut pins);
                         continue;
                     }
@@ -3382,6 +3424,9 @@ impl ExceptionCtx<'_, '_> {
                             out.insert(s.pin.0);
                             hit = true;
                         }
+                    }
+                    if !hit && design.io_pins.iter().any(|&p| prepared.cx.port_name(p) == n) {
+                        hit = true;
                     }
                     if let Some(&c) = self.cell_by_name.get(n)
                         && let Some(ks) = self.keys_by_cell.get(&c)
@@ -3393,50 +3438,79 @@ impl ExceptionCtx<'_, '_> {
                         out.extend(self.keys_on_clocks(&[row]));
                         hit = true;
                     }
+                    resolved_any |= hit;
                     if !hit {
                         self.unresolved += 1;
                     }
                 }
-                (out, pins)
+                (out, pins, resolved_any)
             }
-            _ => (self.resolve_from(sel), HashSet::new()),
+            _ => {
+                let (out, resolved_any) = self.resolve_from(sel);
+                (out, HashSet::new(), resolved_any)
+            }
         }
     }
 
-    /// `ObjSel` -> the endpoint pins it covers. Ports match output ports
-    /// only; cells match endpoint pins owned by the resolved instances
-    /// (register checks and clock-gate enables alike).
-    fn resolve_to(&mut self, sel: &ObjSel) -> HashSet<u32> {
+    /// `ObjSel` -> `(endpoint pin coverage, resolved_any)`. Ports match
+    /// output ports only; cells match endpoint pins owned by the resolved
+    /// instances (register checks and clock-gate enables alike). A bare
+    /// port name resolves to the port object regardless of direction —
+    /// `-to clk2` resolves dead (measured `t2_selpto`: OpenSTA warns
+    /// `not a valid endpoint` and covers nothing).
+    fn resolve_to(&mut self, sel: &ObjSel) -> (HashSet<u32>, bool) {
         let prepared = self.prepared;
+        let design = prepared.cx.design;
         match sel {
-            ObjSel::Ports(ps) => self
-                .output_ports
-                .iter()
-                .copied()
-                .filter(|&p| ps.matches(prepared.cx.port_name(PinId(p)), false, self.sdc()))
-                .collect(),
+            ObjSel::Ports(ps) => {
+                let resolved_any = design.io_pins.iter().any(|&p| {
+                    ps.matches(
+                        prepared.cx.port_name(p),
+                        design.pin_dirs[p.0 as usize] == PinDir::Input,
+                        self.sdc(),
+                    )
+                });
+                (
+                    self.output_ports
+                        .iter()
+                        .copied()
+                        .filter(|&p| {
+                            ps.matches(prepared.cx.port_name(PinId(p)), false, self.sdc())
+                        })
+                        .collect(),
+                    resolved_any,
+                )
+            }
             ObjSel::Cells(cs) => {
                 let ids = self.cell_sel_ids(cs);
-                self.endpoint_pins
-                    .iter()
-                    .copied()
-                    .filter(|&p| {
-                        self.design().pin_cells[p as usize].is_some_and(|c| ids.contains(&c))
-                    })
-                    .collect()
+                let resolved_any = !ids.is_empty();
+                (
+                    self.endpoint_pins
+                        .iter()
+                        .copied()
+                        .filter(|&p| {
+                            self.design().pin_cells[p as usize].is_some_and(|c| ids.contains(&c))
+                        })
+                        .collect(),
+                    resolved_any,
+                )
             }
             ObjSel::Pins(specs) => {
                 let mut out = HashSet::new();
+                let mut resolved_any = false;
                 for spec in specs {
+                    resolved_any |= self.pin_by_path.contains_key(spec);
                     self.pin_endpoints(spec, &mut out);
                 }
-                out
+                (out, resolved_any)
             }
-            ObjSel::Clocks(rows) => self.eps_on_clocks(rows),
+            ObjSel::Clocks(rows) => (self.eps_on_clocks(rows), !rows.is_empty()),
             ObjSel::Names(names) => {
                 let mut out = HashSet::new();
+                let mut resolved_any = false;
                 for n in names {
                     if n.contains('/') {
+                        resolved_any |= self.pin_by_path.contains_key(n);
                         self.pin_endpoints(n, &mut out);
                         continue;
                     }
@@ -3446,6 +3520,9 @@ impl ExceptionCtx<'_, '_> {
                             out.insert(p);
                             hit = true;
                         }
+                    }
+                    if !hit && design.io_pins.iter().any(|&p| prepared.cx.port_name(p) == n) {
+                        hit = true;
                     }
                     if let Some(&c) = self.cell_by_name.get(n)
                         && let Some(eps) = self.eps_by_cell.get(&c)
@@ -3457,11 +3534,12 @@ impl ExceptionCtx<'_, '_> {
                         out.extend(self.eps_on_clocks(&[row]));
                         hit = true;
                     }
+                    resolved_any |= hit;
                     if !hit {
                         self.unresolved += 1;
                     }
                 }
-                out
+                (out, resolved_any)
             }
         }
     }
@@ -3556,6 +3634,40 @@ fn endpoint_skip_reason(
         }
         None => (SkipReason::NoPath, None),
     }
+}
+
+/// Fanout-cone leaves of one launch key: pins with neither net sinks nor
+/// outgoing graph edges. A `set_max_delay`/`set_min_delay` whose `-from`
+/// covers the key produces an "internal path endpoint" row on each leaf
+/// (measured `t2_selmd`: `u_fy/Q`, a fanout-free net driver).
+fn dead_end_leaves(design: &DesignDb, graph: &TimingGraph, start: PinId) -> Vec<u32> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![start];
+    let mut seen = HashSet::new();
+    while let Some(pin) = stack.pop() {
+        if !seen.insert(pin) {
+            continue;
+        }
+        let mut fwd = false;
+        if let Some(net) = design.pin_nets[pin.0 as usize]
+            && design.net_driver(net) == Some(pin)
+        {
+            for &sink in design.net_pins(net).iter().skip(1) {
+                if sink != pin {
+                    stack.push(sink);
+                    fwd = true;
+                }
+            }
+        }
+        for &e in graph.outgoing(pin) {
+            stack.push(graph.edges[e as usize].dst);
+            fwd = true;
+        }
+        if !fwd {
+            leaves.push(pin.0);
+        }
+    }
+    leaves
 }
 
 fn emit_sta_warnings(report: &StaReport) {
@@ -3707,15 +3819,20 @@ fn run_sta_partitioned(
     };
 
     let mut rules = Vec::with_capacity(sdc.exceptions.len() + sdc.path_delays.len());
+    // A selector side is unresolved only when it resolves zero objects —
+    // OpenSTA's `no valid objects specified` form. A resolved object that
+    // covers nothing is a silent dead rule, not a diagnostic.
     let mut resolve_sides = |from_sel: Option<&ObjSel>, to_sel: Option<&ObjSel>| {
-        let from = from_sel.map(|sel| ctx.resolve_from(sel));
-        if from.as_ref().is_some_and(|f| f.is_empty()) {
-            ctx.unresolved += 1;
-        }
-        let to = to_sel.map(|sel| ctx.resolve_to(sel));
-        if to.as_ref().is_some_and(|t| t.is_empty()) {
-            ctx.unresolved += 1;
-        }
+        let from = from_sel.map(|sel| {
+            let (keys, resolved_any) = ctx.resolve_from(sel);
+            ctx.unresolved += usize::from(!resolved_any);
+            keys
+        });
+        let to = to_sel.map(|sel| {
+            let (eps, resolved_any) = ctx.resolve_to(sel);
+            ctx.unresolved += usize::from(!resolved_any);
+            eps
+        });
         (from, to)
     };
     for ex in &sdc.exceptions {
@@ -3729,18 +3846,19 @@ fn run_sta_partitioned(
         }));
     }
     for pd in &sdc.path_delays {
-        let (from, from_pins) = pd
+        let (from, from_pins, resolved_any) = pd
             .from
             .as_ref()
             .map(|sel| ctx.resolve_delay_from(sel))
             .unwrap_or_default();
-        if pd.from.is_some() && from.is_empty() {
+        if pd.from.is_some() && !resolved_any {
             ctx.unresolved += 1;
         }
-        let to = pd.to.as_ref().map(|sel| ctx.resolve_to(sel));
-        if to.as_ref().is_some_and(|t| t.is_empty()) {
-            ctx.unresolved += 1;
-        }
+        let to = pd.to.as_ref().map(|sel| {
+            let (eps, resolved_any) = ctx.resolve_to(sel);
+            ctx.unresolved += usize::from(!resolved_any);
+            eps
+        });
         rules.push(ResolvedRule::Delay(ResolvedPathDelay {
             kind: pd.kind,
             from: pd.from.as_ref().map(|_| from),
@@ -4282,7 +4400,7 @@ fn run_sta_partitioned(
                         }
                     }
                     if delay_min_n.is_none() {
-                        // A cross-domain hold pair lives on the coincident
+                        // A cross-domain hold pair lives on the min-gap
                         // grid — the setup multiplier does not carry into it
                         // (measured `t2_mcp`: `d_min = -nh·Pc`). Mixed masks
                         // take the cross-domain form, conservative.
@@ -4361,39 +4479,17 @@ fn run_sta_partitioned(
     // covers a leaf the same way it covers an endpoint; a resolved `-to`
     // set only ever holds declared endpoints, so a leaf is reachable only
     // through an absent `-to` (measured `t2_mdo`: no internal row).
-    let mut dead_ends: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &k in &ctx.launch_keys {
-        let mut leaves = Vec::new();
-        let mut stack = vec![PinId(k)];
-        let mut seen = HashSet::new();
-        while let Some(pin) = stack.pop() {
-            if !seen.insert(pin) {
-                continue;
-            }
-            let mut fwd = false;
-            if let Some(net) = design.pin_nets[pin.0 as usize]
-                && design.net_driver(net) == Some(pin)
-            {
-                for &sink in design.net_pins(net).iter().skip(1) {
-                    if sink != pin {
-                        stack.push(sink);
-                        fwd = true;
-                    }
-                }
-            }
-            for &e in graph.outgoing(pin) {
-                stack.push(graph.edges[e as usize].dst);
-                fwd = true;
-            }
-            if !fwd {
-                leaves.push(pin.0);
-            }
-        }
-        dead_ends.insert(k, leaves);
-    }
     for (ci, (sigma, keys)) in classes.iter().enumerate() {
+        // The leaf pass only ever produces a row under a delay rule — a
+        // signature class without one never traverses the fanout cone.
+        if !sigma
+            .iter()
+            .any(|&ri| matches!(rules[ri as usize], ResolvedRule::Delay(_)))
+        {
+            continue;
+        }
         for &k in keys {
-            for &leaf in &dead_ends[&k] {
+            for leaf in dead_end_leaves(design, graph, PinId(k)) {
                 if ctx.endpoint_pins.contains(&leaf) {
                     continue;
                 }
@@ -5096,7 +5192,7 @@ fn hold_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f3
 /// `None` = every tying (domain, parity) pairs — evaluate.
 ///
 /// The min-side pairing rule is `hold_next`-selected: register checks and
-/// output ports pair coincident edges on the check/anchor grid; a gating
+/// output ports pair min-gap edges on the check/anchor grid; a gating
 /// enable's hold edge *follows* the launch on the opposite-polarity grid, so
 /// it uses the strictly-after rule (always pairs).
 #[allow(clippy::too_many_arguments)]
@@ -5333,7 +5429,7 @@ fn collect_endpoints(
         let c0 = edge_parity(clk, edge);
         // Cross-domain launch/capture pairing (mc-xdomain): every reached
         // extreme's (domain, parity) must pair on the two period grids —
-        // min-gap on setup, coincident on hold. Anything unpairable defers
+        // min-gap on setup and hold alike. Anything unpairable defers
         // with the domains named — never folds onto the capture lattice.
         if let Some(launch) = xdomain_defer(
             s,
@@ -5492,10 +5588,11 @@ fn collect_endpoints(
                 eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[edge])
                     * sdc.derate(false, DERATE_CHECK, false, check_transition(early));
             // Same (domain, parity) candidate shape on the early side. The
-            // same-domain branch holds the measured formula verbatim —
-            // coincident hold edges, realigned +P when the launch parity
-            // precedes the capture pin's first check edge; a foreign bit pairs
-            // on the coincident grid (`hold_edge_pair`) instead.
+            // same-domain branch holds the measured formula verbatim — the
+            // hold realign on waveform instants, `+P` when the launch
+            // parity's edge precedes the capture pin's first check edge
+            // (`cap_clk.edge_offset(c0) > cap_clk.edge_offset(g)`); a
+            // foreign bit pairs min-gap (`hold_edge_pair`) instead.
             let min_mask = if s.par_min[pol] == 0 {
                 1
             } else {
@@ -6172,12 +6269,20 @@ mod tests {
         };
         assert!(lcm(2.0, 1.4, 14.0));
         assert!(lcm(2.0, 1.0, 2.0));
-        let clk = |period: f32| Clock {
+        let clk = |period: f32, waveform_ns: Option<[f32; 2]>| Clock {
             period_ns: period,
+            waveform_ns,
             ..Clock::default()
         };
+        // `edge_offset` is the declared waveform instant, the `p·P/2`
+        // uniform grid when no `-waveform` was declared.
+        assert_eq!(clk(2.0, None).edge_offset(0), 0.0);
+        assert_eq!(clk(2.0, None).edge_offset(1), 1.0);
+        assert_eq!(clk(2.0, Some([0.0, 0.5])).edge_offset(1), 0.5);
+        assert_eq!(clk(2.0, Some([0.3, 1.7])).edge_offset(0), 0.3);
+        assert_eq!(clk(2.0, Some([0.3, 1.7])).edge_offset(1), 1.7);
         let pair = |a: f32, b: f32, c: f32, d: f32| {
-            setup_edge_pair(&clk(a), &clk(b), c as usize, d as usize)
+            setup_edge_pair(&clk(a, None), &clk(b, None), c as usize, d as usize)
                 .map(|(l, c)| ((l * 1e4).round() / 1e4, (c * 1e4).round() / 1e4))
         };
         // A->B on the 2.0/1.4 grids: launch 4.0, capture 4.2 (`t2_frac`).
@@ -6194,7 +6299,7 @@ mod tests {
         assert_eq!(pair(2.0, 2.0, 0.0, 0.0), Some((0.0, 2.0)));
         assert_eq!(pair(2.0, 2.0, 1.0, 0.0), Some((0.0, 2.0)));
         let hold = |a: f32, b: f32, c: f32, d: f32| {
-            hold_edge_pair(&clk(a), &clk(b), c as usize, d as usize)
+            hold_edge_pair(&clk(a, None), &clk(b, None), c as usize, d as usize)
                 .map(|(l, c)| ((l * 1e4).round() / 1e4, (c * 1e4).round() / 1e4))
         };
         assert_eq!(hold(2.0, 1.4, 0.0, 0.0), Some((0.0, 0.0)));
@@ -6205,6 +6310,40 @@ mod tests {
         // non-negative gap is launch 2.1 / capture 2.0 (`t2_wave` measured
         // a non-coincident hold pair on ckb->cka).
         assert_eq!(hold(1.4, 2.0, 1.0, 0.0), Some((1.4, 2.0)));
+
+        // Non-uniform grids (measured `t2_wave`): the pair searches run on
+        // the declared waveform instants, not `p·P/2`.
+        let pairw = |a: &Clock, b: &Clock, c: usize, d: usize| {
+            setup_edge_pair(a, b, c, d)
+                .map(|(l, c)| ((l * 1e4).round() / 1e4, (c * 1e4).round() / 1e4))
+        };
+        let holdw = |a: &Clock, b: &Clock, c: usize, d: usize| {
+            hold_edge_pair(a, b, c, d)
+                .map(|(l, c)| ((l * 1e4).round() / 1e4, (c * 1e4).round() / 1e4))
+        };
+        let cka_w = clk(2.0, Some([0.3, 1.7]));
+        let ckb = clk(1.0, None);
+        // Setup cka{0.3,1.7}->ckb: the 0.3 rise launch pairs with the first
+        // ckb edge strictly after (1.0); the 1.7 fall launch with 2.0.
+        assert_eq!(pairw(&cka_w, &ckb, 0, 0), Some((0.0, 1.0)));
+        assert_eq!(pairw(&cka_w, &ckb, 1, 0), Some((0.0, 2.0)));
+        // Hold ckb->cka{0.3,1.7} — the `t2_wave` measurement: ckb's 1.0
+        // launch pairs with cka's 0.3 capture edge, a non-coincident
+        // minimum gap.
+        assert_eq!(holdw(&ckb, &cka_w, 0, 0), Some((1.0, 0.0)));
+        // Hold cka{0.3,1.7}->ckb: the 0.3 launch pairs with the ckb edge 0
+        // at-or-before it — zero shifts even though the instants differ.
+        assert_eq!(holdw(&cka_w, &ckb, 0, 0), Some((0.0, 0.0)));
+        // Identical waveforms degenerate to the same-domain pair.
+        assert_eq!(pairw(&cka_w, &cka_w, 0, 0), Some((0.0, 2.0)));
+        // A waveform restating the uniform grid ([0, P/2]) is the `None`
+        // lattice.
+        let cka_flat = clk(2.0, Some([0.0, 1.0]));
+        assert_eq!(pairw(&cka_flat, &ckb, 0, 0), Some((0.0, 1.0)));
+        assert_eq!(
+            pairw(&cka_flat, &ckb, 1, 0),
+            pairw(&clk(2.0, None), &ckb, 1, 0)
+        );
     }
 
     #[test]
@@ -9208,7 +9347,10 @@ mod tests {
                 // Aggregates only when the endpoint set is complete — OpenSTA's
                 // wns/tns/violation counts span the cross-domain paths that
                 // defer, so a scenario with `CrossDomain` skips cannot compare.
-                if report.skipped.cross_domain_endpoints == 0 {
+                // An empty golden table (`t2_selac`/`t2_selunion` cut every
+                // launch) carries `null` aggregates — the endpoint list is
+                // the measurement there.
+                if report.skipped.cross_domain_endpoints == 0 && !golden_eps.is_empty() {
                     for (ours, key) in [
                         (report.wns_max_ns, "wns_max_ns"),
                         (report.tns_max_ns, "tns_max_ns"),
@@ -9245,10 +9387,16 @@ mod tests {
                     failures.len(),
                     failures.join("\n")
                 );
+                if name == "t2_selport" {
+                    // `-from clk1` resolves to the port object — a resolved
+                    // but dead selector, so no diagnostic (OpenSTA warns
+                    // nothing either).
+                    assert_eq!(report.skipped.unresolved_exception_selectors, 0);
+                }
                 evaluated += 1;
             }
         }
-        assert_eq!(evaluated, 30, "every scenario must evaluate");
+        assert_eq!(evaluated, 40, "every scenario must evaluate");
     }
 
     /// Undeclared-domain hazard (`docs/multi-clock.md` §2): a single-clock

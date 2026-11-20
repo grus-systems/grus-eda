@@ -119,13 +119,25 @@ if {\$sdc_err ne ""} {
     exit 0
 }
 
-set wns_max [format "%.6f" [sta::worst_slack -max]]
-set tns_max [format "%.6f" [sta::total_negative_slack -max]]
-set wns_min [format "%.6f" [sta::worst_slack -min]]
-set tns_min [format "%.6f" [sta::total_negative_slack -min]]
-set viol_max [count_violations [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 100000]]
-set viol_min [count_violations [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 100000]]
 set endpoints [collect_endpoints_json]
+# A false path that cuts every launch leaves "No paths found." — worst_slack
+# returns Inf there, which is not valid JSON, so emit null aggregates; the
+# empty endpoint list is the measurement.
+if {\$endpoints eq ""} {
+    set wns_max "null"
+    set tns_max "null"
+    set wns_min "null"
+    set tns_min "null"
+    set viol_max 0
+    set viol_min 0
+} else {
+    set wns_max [format "%.6f" [sta::worst_slack -max]]
+    set tns_max [format "%.6f" [sta::total_negative_slack -max]]
+    set wns_min [format "%.6f" [sta::worst_slack -min]]
+    set tns_min [format "%.6f" [sta::total_negative_slack -min]]
+    set viol_max [count_violations [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 100000]]
+    set viol_min [count_violations [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 100000]]
+}
 
 puts \$fp "{"
 puts \$fp "  \"wns_max_ns\": \$wns_max,"
@@ -172,18 +184,20 @@ exit
 EOF
 }
 
-SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05"
+SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05 t2_selbare t2_selac t2_selunion t2_selunk t2_selport t2_selpto t2_grp1 t2_grpe t2_grpb t2_wavebig"
 
 for name in $SCENARIOS; do
     run_sta "two_clock.def" "$name.sdc" "ref_$name.json"
     run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
 done
 
-# Probe-only scenarios: degenerate/error forms whose acceptance is itself the
-# question. `run_report` records the outcome ("SDC error:" or a table) without
-# folding a ref_*.json block into two_clock.probe.json — an error block has no
-# endpoints and must not enter the golden.
-PROBE_ONLY="t2_selbare t2_selac t2_selunion t2_selunk t2_grp1 t2_grpe t2_grpb t2_grpn t2_wave3 t2_wave4 t2_wavebig t2_waverev"
+# Probe-only scenarios: the error/divergence forms, kept out of the golden.
+# t2_grpn (missing mode flag) / t2_wave3 (odd instant count) / t2_waverev
+# (non-increasing instants) are SDC errors in OpenSTA and named bails in ours;
+# t2_wave4 (>2 instants) is accepted by OpenSTA but a deliberate named bail in
+# ours. `run_report` records the outcome ("SDC error:" or a table) without
+# folding a ref_*.json block into two_clock.probe.json.
+PROBE_ONLY="t2_grpn t2_wave3 t2_wave4 t2_waverev"
 
 for name in $PROBE_ONLY; do
     run_report "two_clock.def" "$name.sdc" "probe_$name.txt"

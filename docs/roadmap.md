@@ -307,8 +307,8 @@ Remaining:
   `mc-eval` (domain tagging + same-domain pairing, v0.2.1),
   `mc-xdomain` (cross-domain min-gap edge pairing + inter-clock
   uncertainty, v0.2.2) and `mc-selectors` (clock-object selectors,
-  `set_clock_groups`, `create_clock -waveform`, v0.2.4) are done —
-  every parseable `sta_clocks` scenario matches OpenSTA at strict
+  `set_clock_groups`, `create_clock -waveform`, v0.2.5) are done —
+  all 40 golden `sta_clocks` scenarios match OpenSTA at strict
   tolerance with `cross_domain == 0`.
   Remaining: golden promotion (`mc-golden`).
 
