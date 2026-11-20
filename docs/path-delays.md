@@ -230,7 +230,10 @@ at the delay edge (the first clock edge at the latch's enable pin,
 
 Identical machinery to timing exceptions: `-from`/`-to` accept the same object
 selectors (`get_cells`, `get_ports`, `all_registers`, `all_inputs`,
-`all_registers`-style collections, `get_pins inst/pin`, bare `inst/pin`).
+`all_registers`-style collections, `get_pins inst/pin`, bare `inst/pin`,
+and since `mc-selectors` `get_clocks`/`all_clocks`/bare clock names —
+a clock `-from` keeps the ordinary clocked launch, `docs/multi-clock.md`
+§1.7).
 
 - `all_registers` covers sequential cells only — input-port launches are not
   covered (same as exceptions; verified for exceptions by the committed
@@ -624,14 +627,18 @@ Known gaps in that resolution (reachable but ungoldened — review
 Still open:
 
 1. A literal two-clock-domain `set_min_delay` anchoring fixture —
-   still blocked on multi-clock SDC support (our SDC accepts a single
-   `create_clock` domain; the skewed-launch coverage `pm2_min2`
-   exercises is inside one domain). The anchor question itself is now
-   answered by the `sta_clocks` probe (2026-11-19): on a second-domain
-   endpoint OpenSTA anchors the delay-check required time at the
-   **capture domain's** edge-0 arrival — `req = N + capture_latency ∓
-   capture_uncertainty ∓ t_check`, with the launch domain's latency on
-   the arrival side only (`t2_md`/`t2_mdl`, `docs/multi-clock.md` §1.5).
-   The fixture and OpenSTA artifacts are committed as probe evidence;
-   golden coverage lands with the `mc-*` sequence in
-   `docs/multi-clock.md`.
+   answered and covered by `mc-xdomain` (v0.2.2, 2026-11-20): on a
+   second-domain endpoint OpenSTA anchors the delay-check required time
+   at the **capture domain's** edge-0 arrival — `req = N +
+   capture_latency ∓ capture_uncertainty ∓ t_check`, with the launch
+   domain's latency on the arrival side only (`t2_md`/`t2_mdl`/
+   `t2_mdx`, `docs/multi-clock.md` §1.5). `t2_mdx` additionally measured
+   the `get_pins inst/Q` `-from` startpoint form: the pin replaces its
+   clocked launch with pin-segment paths (`arr` from the pin,
+   `req = N ∓ constraint`, no clock anchor). `mc-selectors` (v0.2.4)
+   added the internal-path-endpoint form: a `-from [get_clocks cka]`
+   delay rule covering a dangling launch reports the leaf as
+   `u_fy/Q (internal path endpoint)` with `req = N` and no clock terms
+   (`t2_selmd`, `docs/multi-clock.md` §1.7). Golden coverage runs at
+   STRICT in `test_sta_clocks_match_opensta`; formal promotion to
+   `two_clock.reference.json` stays with `mc-golden`.

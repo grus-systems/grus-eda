@@ -3412,3 +3412,463 @@ list updated in `fixture.md` and `probe.sh` accordingly.
 `probe.sh` re-run produced byte-identical `two_clock.probe.json` +
 `probe_*.txt` (`diff -r` against the first run). No existing goldens
 touched (fixture is probe-only, no regression target yet).
+
+### 2026-11-20 — `mc-model`: SDC clock table + single-domain STA gate (v0.2.0)
+
+First ticket of the `docs/multi-clock.md` sequence. `Sdc`'s single clock
+slot is replaced by `clocks: Vec<Clock>` — one row per `create_clock` in
+file order (name, optional port, period, network+source latency,
+setup+hold uncertainty, transition, propagated flag). Internal clock
+references are row indices (`ClockId`); `Sdc::design_clock()` returns the
+first port-bearing row for the single-domain evaluator. All clock-targeting
+commands resolve `[get_clocks {...}]` against the table row-wise.
+
+#### Commands run
+
+- `grus-eda sta --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef .../sky130_fd_sc_hd__nom.tlef --lef .../sky130_fd_sc_hd.lef --def tests/designs/sta_clocks/two_clock.def --sdc tests/designs/sta_clocks/t2_int.sdc` (release binary, exit code 1) — stderr, verbatim:
+
+  ```
+  Error: sta: 2 design clocks declared (cka, ckb); multi-clock analysis is not implemented yet
+  ```
+
+  The gate sits in `run_sta_detail`, so `run_sta`, `run_sta_quiet` and
+  `sta_pin_slews` share it; pinned by
+  `sta::analysis::tests::sta_bails_on_a_two_clock_sdc`.
+- Fail-proof: the gate temporarily disabled (`if false && ...`) —
+  `sta_bails_on_a_two_clock_sdc` goes red and `run_sta` returns a full
+  report with all 8 endpoints timed against `cka`'s lattice (the silent
+  fold this gate exists to prevent). Gate restored, test green again.
+
+#### Post-change break table (grus-eda, HEAD)
+
+| SDC construct | behaviour |
+|---|---|
+| 2nd+ `create_clock` on a port / virtual clock with any period | accepted — appends a table row |
+| `set_clock_latency`/`-transition`/`set_clock_uncertainty` on `[get_clocks {a b}]` | applied to every named row |
+| `set_clock_uncertainty 0.20 [get_clocks vclk]` | lands on `vclk`'s row only (probe's silent wrong-target bug fixed; `uncertainty_lands_on_the_named_row`) |
+| `set_input_delay`/`-output_delay -clock <name>` | resolves any row (`delay_clock_references_a_domain_row`) |
+| `set_propagated_clock [get_clocks {<subset>}]` | per-row flag (`propagated_clock_is_per_domain`) |
+| `set_clock_latency -early`/`-late` | parse bail: ``unsupported option `-early` `` |
+| `set_clock_uncertainty -from ... -to ...` | parse bail: `set_clock_uncertainty takes a value and optional clock names` |
+| `create_clock -waveform` | parse bail: ``unsupported option `-waveform` `` |
+| `set_clock_groups` | parse bail: ``unsupported command `set_clock_groups` `` |
+| unknown `-clock` name / `set_propagated_clock` on a virtual clock / `create_clock -period 0` | parse bail (`multi_clock_bails` pins each message) |
+| `sta` on a >1-design-clock SDC | eval bail before graph prep (message above) — no silent fold |
+| no-target `set_clock_latency`/`set_clock_uncertainty` before the first `create_clock` | parse bail: `no design clock declared yet` (was: silently wrote the single-clock fields; `clock_commands_before_create_clock_bail`) |
+
+New parse/model tests in `sdc.rs::tests`: `second_design_clock_appends_a_row`,
+`virtual_clock_keeps_its_own_period`, `uncertainty_lands_on_the_named_row`,
+`multi_name_clock_lists_apply_to_every_row`,
+`clock_commands_target_second_domain_rows`, `propagated_clock_is_per_domain`,
+`delay_clock_references_a_domain_row`, `clock_commands_before_create_clock_bail`;
+`multi_clock_bails` updated to pin only the still-unsupported forms.
+
+**Checks run**: `cargo test --workspace` (299+3 pass, 2 ignored — includes
+all existing goldens, unchanged inputs and expected outputs),
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+`git status` shows no modifications under `tests/` or `kurena/`.
+Version 0.1.98 → 0.2.0 (`Sdc`'s public clock fields were replaced by the
+table + accessors — breaking for direct field users).
+
+### 2026-11-20 — `mc-eval`: domain-tagged same-domain multi-clock STA (v0.2.1)
+
+Second ticket of the `docs/multi-clock.md` sequence. The
+`design_clock_count() > 1` eval gate is gone: every design clock row seeds
+its own clock net (propagated via `propagate_clock`, ideal via the parity
+walk), every data arrival carries a `u8` launch-domain mask alongside the
+parity/CRPR masks (winner-replace/tie-union), and a check evaluates only
+when every reached extreme's mask is exactly the capture domain's bit.
+Capture-side period, latency, uncertainty, propagated/ideal mode and
+MCP/borrow/delay-check anchors all read the capture row. A virtual
+`-clock` I/O row whose period equals a design row pairs same-domain
+(ibex's `vclk` case — coincident edge grids); a unique virtual row stays
+foreign everywhere.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` as committed — the whole script in
+  `ghcr.io/librelane/librelane:3.0.16`; `git diff` on `two_clock.probe.json`
+  is additive only (new `t2_mcps`/`t2_mds` blocks after `t2_mcp`; the 12
+  existing scenario blocks and every existing `probe_t2_*.txt` are
+  byte-identical). New artifacts: `t2_mcps.sdc`, `t2_mds.sdc`,
+  `probe_t2_mcps.txt`, `probe_t2_mds.txt`, `two_clock_latch.def`,
+  `t2_latch.sdc`, `two_clock_latch.probe.json`, `probe_t2_latch.txt`.
+- `grus-eda sta --lib ... --tlef ... --lef ... --def tests/designs/sta_clocks/two_clock.def --sdc tests/designs/sta_clocks/t2_int.sdc --json /tmp/t2_int.json --strict` (debug binary, exit code 1) — verbatim:
+
+  ```
+  warning: STA skipped cross_domain_endpoints=3; the report does not model these
+  warning: STA skipped cell_driven_clock_nets=2; the report does not model these
+  STA (zero wire): endpoints=5, setup wns=-0.287329 tns=-0.287329 viol=1, hold wns=0.148797 tns=0.000000 viol=0, elapsed=0.44ms
+  pulse-width checks: 12 (0 violating)
+  skipped: 0/26 arcs (0.00%), 3/20 endpoints (15.00%)
+    cross_domain_endpoints=3
+    cell_driven_clock_nets=2
+      endpoint u_fx/D Check: CrossDomain (launch cka -> capture ckb)
+      endpoint u_fy/D Check: CrossDomain (launch ckb -> capture cka)
+      endpoint u_fb0/D Check: CrossDomain (launch cka -> capture ckb)
+  Wrote STA report JSON to "/tmp/t2_int.json"
+  Error: strict: the run skipped inputs; see the summary above
+  ```
+
+  `--strict` fails loudly on the deferrals (`cross_domain_endpoints`
+  enters `is_clean`), as intended — `mc-xdomain` owns the pairing.
+- Parse bails, verbatim (`grus-eda sta ... --sdc t2_<x>.sdc`):
+  - `t2_grp`: `unsupported command `set_clock_groups`` (`mc-selectors`)
+  - `t2_uncx`: `set_clock_uncertainty takes a value and optional clock names` (`mc-xdomain` inter-clock uncertainty)
+
+#### Same-domain comparison vs OpenSTA (`test_sta_clocks_match_opensta`)
+
+Per-endpoint fields (`arr`/`req`/`slack`/`slew`, max and min) at
+`Tol::STRICT` (1% rel / 5 ps abs); every reported pin present in the
+golden, every unreported golden pin a named `CrossDomain` skip. wns/tns
+and violation counts compare only where the endpoint set is complete.
+
+| scenario | evaluated | cross-domain deferred | what it pins |
+|---|---|---|---|
+| `t2_int` | 5 endpoints | 3 (`u_fb0/D`, `u_fx/D`, `u_fy/D`) | both lattices: `u_fb1/D` req 0.885446 vs `u_fa1/D` 1.885446 |
+| `t2_frac` | 5 | 3 | non-integer `ckb` 1.4 ns lattice |
+| `t2_prop` | 5 | 3 | both domains propagated |
+| `t2_prop1` | 5 | 3 | mixed `cka` propagated / `ckb` ideal |
+| `t2_lat` | 5 | 3 | per-domain network+source latency in arrivals |
+| `t2_unc` | 5 | 3 | capture-row uncertainty (`ckb` 0.20 vs `cka` 0.05) |
+| `t2_mcp` | 5 | 3 | cross MCP covered endpoint still defers |
+| `t2_mcps` | 5 | 3 | **same-domain MCP**: `u_fb1/D` req 1.885446 = 0.885446 + (2−1)·1.0 — capture-row period |
+| `t2_md` | 5 | 3 | delay-check-covered cross endpoints still defer (uncovered side can't pair) |
+| `t2_mdl` | 5 | 3 | per-domain latency+uncertainty delay anchors read |
+| `t2_mdo` | 5 | 3 | `yb` through the output-port `-to` delay-check branch on `ckb` |
+| `t2_mds` | 5 | 3 | same-domain delay checks: `u_fb1/D` req 0.935446 = 1.0 + 0.2 − 0.15 − 0.114554 |
+| `t2_latch` (`two_clock_latch.def`) | 4 + wns/tns/violations | 0 | second-domain `dlxtn` borrow window on `ckb`'s lattice; full-table match |
+
+#### Fail-proof mutation (E0 rule 7)
+
+`collect_endpoints`'s capture row forced to domain 0
+(`let cap_clk = sdc.design_clock().unwrap();`): `t2_frac` went red —
+`u_fb1/D.max_req_ns: ours=1.8854457 ref=1.285446` (the `cka` 2.0 ns read
+replacing `ckb`'s 1.4 ns) plus the matching slack shift. Restored, test
+green again.
+
+#### Golden-identity invariants — the two intended non-golden-visible changes
+
+- A clock pin no declared domain reaches stays unseeded → `NoClock`
+  skip instead of folding onto domain 0's lattice. Pinned by
+  `one_clock_sdc_on_two_clock_def` (single-clock SDC on `two_clock.def`:
+  `u_fa0/D`, `u_fa1/D`, `ya` evaluate; `u_fb*/D`, `u_fx/D` skip
+  `NoClock`; `u_fy/D`, `yb` skip `NoPath` — their launches are dead).
+- `sta` on a >1-design-clock SDC produces a report instead of the
+  `multi-clock analysis is not implemented yet` error.
+  `sta_bails_on_a_two_clock_sdc` was replaced by
+  `sta_evaluates_two_clock_same_domain`.
+
+Existing single-clock goldens are byte-identical: on one design row
+every tag is 0, every mask is `{0}`, every `cap` read is the design row.
+More than 8 clock rows bail before graph prep (`u8` masks):
+`sta: N clocks declared; at most 8 domains can be tagged`.
+
+New tests: `test_sta_clocks_match_opensta` (13 evaluated scenarios across
+both probe JSONs), `sta_evaluates_two_clock_same_domain`,
+`one_clock_sdc_on_two_clock_def`; `test_parity_mask_keeps_tied_arrivals`
+extended to the domain masks.
+
+**Checks run**: `cargo test --workspace` (301 passed, 0 failed, 2 ignored in grus-core; 3 passed in grus-eda),
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+Version 0.2.0 → 0.2.1 (additive feature, no API break).
+
+### 2026-11-20 — `mc-xdomain`: cross-domain edge pairing + inter-clock uncertainty (v0.2.2)
+
+Third ticket of the `docs/multi-clock.md` sequence. `foreign_launch`'s
+whole-endpoint defer is now `xdomain_defer`: a reached endpoint defers
+`CrossDomain` only when a side genuinely cannot pair — undeclared launch
+(`<undeclared>`), a latch-D check with a foreign launch (borrow pairing
+parked), a min-side tying parity with no coincident capture edge in the
+LCM window (hold selection parked), or a non-converging `grid_lcm`
+(defensive). Everything else evaluates per `(domain, parity)` candidate
+and keeps the worst slack:
+
+- **Setup** (`setup_edge_pair`): each launch edge `g·PL/2 + m·PL` in the
+  period-LCM window pairs with the smallest capture `check.edge` edge
+  strictly after it; the winner minimises `capture − launch`. `arr`
+  shifts `+ m·PL`, `req` shifts `+ j·PC` — no CRPR credit on a foreign
+  branch (the launch never shares the capture clock net).
+- **Hold** (`hold_edge_pair`): coincident edges only, as measured;
+  a non-coincident tying parity defers (parked).
+- **Uncertainty**: `set_clock_uncertainty -from/-to` stores directed
+  inter-clock rules (`Sdc::inter_clock_uncertainty`); every eval-side
+  read goes through `Sdc::uncertainty_ns(launch, cap, side)` — the last
+  matching rule *replaces* the capture row's value for that direction
+  and side only. Delay-check rewrites and mixed tying masks use the
+  worst-over-bits form. `-rise_from` etc. bail `unsupported option`;
+  positional clocks with `-from`/`-to` bail `cannot name clocks with
+  -from/-to`.
+- **Delay checks**: covered cross-domain endpoints report on the
+  capture domain's edge-0 anchor — no pairing needed. A `-from
+  [get_pins inst/Q]` is a path *startpoint* (measured on `t2_mdx`):
+  the pin's clocked launch is replaced by pin-segment paths —
+  `arr = w.dly − pin.dly`, `req = N ∓ constraint`, no clock anchor,
+  no uncertainty — and endpoints no covering rule's `-to` names lose
+  the check on that side entirely.
+- **MCP on a foreign min candidate**: `d_min = −nh·Pc` (measured
+  `t2_mcp` −1.037585), not the same-domain `((ns−1)−nh)·Pc`; mixed
+  masks take the cross form. `d_max` unchanged.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` as committed in
+  `ghcr.io/librelane/librelane:3.0.16` (all 16 scenarios re-run).
+  `git diff`: `two_clock.probe.json` gained only the `t2_mdx` block;
+  every other scenario block and every existing `probe_t2_*.txt` is
+  byte-identical. New artifacts: `t2_mdx.sdc`, `probe_t2_mdx.txt`.
+- `cargo test --workspace`: 305 passed, 0 failed, 2 ignored
+  (grus-core) + 3 passed (grus-eda).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+
+#### Cross-domain comparison vs OpenSTA (`test_sta_clocks_match_opensta`)
+
+All 15 parseable `t2_*` scenarios on `two_clock.def` plus `t2_latch` on
+`two_clock_latch.def` compare per-endpoint/per-field at `Tol::STRICT`
+(1% rel / 5 ps); `cross_domain_endpoints == 0` on every committed
+scenario, so wns/tns/violation counts compare everywhere. `t2_grp`
+remains parse-gated (`mc-selectors`).
+
+| scenario | cross-domain rows now evaluated | what it pins |
+|---|---|---|
+| `t2_int` | `u_fx/D`, `u_fy/D`, `u_fb0/D` | equal-grid min-gap: B→A launch 1.0→capture 2.0, not edge 0 |
+| `t2_frac` | same set | LCM-14 pairing: launch 4.0/capture 4.2 (A→B), 9.8→10.0 (B→A) |
+| `t2_prop`, `t2_prop1`, `t2_lat` | same set | pairing independent of propagated/declared latency (source grids) |
+| `t2_unc` | same set | capture-row uncertainty on foreign checks |
+| `t2_uncx` | same set | `-setup 0.30 -from cka -to ckb` → `u_fx/D` req 3.785446; B→A keeps cka's 0.05, hold sides keep row values (replacement, not additive, not symmetric) |
+| `t2_mcp` | same set | `d_max` on the paired req; `d_min = −nh·Pc` → `u_fx/D` min req −1.037585 |
+| `t2_md`, `t2_mdl` | covered cross endpoints | capture edge-0 anchor reads per-domain latency+uncertainty |
+| `t2_mdo` | — | same-domain output delay check (unchanged) |
+| `t2_mds` | — | same-domain delay checks (unchanged) |
+| `t2_mdx` (new) | `u_fy/D` both sides | pin-startpoint `-from`: `arr 0.0` from the pin, `req 0.885446/0.962415`; `u_fb1/D` loses both checks (unconstrained — absent from OpenSTA's table and ours) |
+| `t2_latch` | 0 | full-table match incl. wns/tns/violations (unchanged) |
+
+New unit tests: `test_edge_pairing_unit_cases` (the `pairing.md` table,
+incl. `setup_edge_pair(2.0, 2.0, 1, 0) -> (0.0, 2.0)` — additive shifts,
+the parity-1 first edge is already inside the recorded arrival),
+`set_clock_uncertainty_directional{,_bails}`,
+`uncertainty_ns_directional_lookup`.
+
+#### Fail-proof mutation (E0 rule 7)
+
+`setup_edge_pair` forced to keep the *first* enumerated pair instead of
+the min-gap pair (`best.is_none_or(...)` → `best.is_none()`):
+`test_sta_clocks_match_opensta` went red — `t2_frac` `u_fx/D`
+`max_arr_ns: ours=0.277469 ref=4.27747`, `u_fy/D` `0.277469` vs
+`10.07747`, `u_fb0/D` `0.7` vs `4.7`, plus matching req/slack/wns/tns/
+violation diffs (12 mismatches). Restored; test green again.
+
+#### Coverage notes (what ran vs not)
+
+- Single-clock goldens byte-identical by construction: the per-domain
+  candidate loops take the same-domain branch verbatim when every tying
+  bit is the capture bit; `uncertainty_ns` falls back to the capture row
+  with an empty rule table; `unc_worst` equals the row read when the
+  mask is the capture bit alone. `cargo test --workspace` above covers
+  every committed single-clock golden.
+- Cross-domain **gating-enable** and **output-port** pairing share the
+  same candidate-loop code but no committed fixture exercises them (all
+  `sta_clocks` output ports anchor same-domain) — noted as spec'd-but-
+  unmeasured, matching the design's own admission.
+- `dom_*`/`par_*` masks union independently; the candidate loop is the
+  cross product — every committed fixture ties single-bit masks, where
+  the product is exact. A multi-bit tie could enumerate a phantom
+  (domain, parity) pair (conservative worst-slack; recorded in
+  `api.md` §3).
+- Inter-clock matching is on folded domain tags: a virtual row folded
+  onto a design row by `launch_domain` shares that row's `-from`/`-to`
+  rules (`overview.md` out-of-scope list).
+- `probe_t2_mdx.txt` carries OpenSTA's `u_fb0/Q is not a valid start
+  point` warning — yet it reports the pin-startpoint delay check; the
+  measured numbers are what the golden asserts.
+
+### 2026-11-20 — `mc-xdomain` review fixes: unreached `-from` pin guard (v0.2.3)
+
+Residual delta from the 2026-11-20 design review of `3f45194`:
+
+- **`pin_segment_arrival`** (`analysis.rs`): all four pin-startpoint
+  segment-fold sites — check-pin max/min and output-port max/min — now
+  skip `-from` pins still `UNREACHED` in the signature class
+  (`dly_max = NEG_INFINITY` / `dly_min = INFINITY`) instead of folding
+  the sentinel into a `±∞` segment arrival. When no `-from` pin is
+  reached the polarity's `Worst` candidate drops — a named skip through
+  the ordinary skip diagnosis, never an infinite arrival and never a
+  silent `w.dly` fallback (the pin `-from` already replaced the clocked
+  launch). No committed fixture has an unreached `-from` pin, so this
+  is a correctness guard with no golden-visible change.
+- **`eval_sta` latch-borrow cap**: both reads of
+  `en_clk.setup_uncertainty_ns` now go through
+  `unc_worst(sdc, src.dom_max[src_pol], en_dom, false)` — the same
+  accessor every other eval-side uncertainty read uses. Identical
+  values on rule-free SDCs (all committed latch fixtures).
+- `sta_evaluates_two_clock_same_domain` renamed
+  `sta_evaluates_two_clock` — the test has asserted the cross-domain
+  min-gap pairs since `3f45194`, so `same_domain` was stale.
+- New unit test `test_pin_segment_arrival`: reached+unreached pin sets
+  fold only the reached segment on both sides; an all-unreached set
+  yields `None`.
+
+Ran: `cargo test --workspace` (306 + 3 tests, all green incl.
+`test_sta_clocks_match_opensta` at STRICT and
+`sta_evaluates_two_clock`), `cargo clippy --workspace --all-targets --
+-D warnings` (clean). Goldens byte-identical — no fixture or probe
+artifact touched.
+
+### 2026-11-20 — `mc-selectors`: clock selectors, `set_clock_groups`, `-waveform` (v0.2.4)
+
+Fourth multi-clock ticket (`docs/multi-clock.md` §3 item 4, §1.7 for the
+measured rules). Probe first, then eval:
+
+#### New probe scenarios (OpenSTA measured, `probe.sh` as committed)
+
+`SCENARIOS` gained 14 names folded into `two_clock.probe.json`;
+`PROBE_ONLY` carries 12 degenerate/error forms (report text only, no
+golden block). `git diff` after regen: every pre-existing scenario
+block and `probe_t2_*.txt` byte-identical; only new blocks/files
+appear.
+
+- Selectors: `-from [get_clocks cka]` drops the 5 checks launched on
+  the cka row including the `d_in` port check at `u_fb0/D` (`t2_selfa`;
+  `u_fy/D` survives — launched by ckb). `-to [get_clocks ckb]` drops
+  all 4 ckb captures including output `yb` (`t2_selfb`). Bare `cka` =
+  `[get_clocks cka]` (`t2_selbare`); `[all_clocks]`/`{cka ckb}` = union
+  (`t2_selac`/`t2_selunion`); `[get_clocks nope]` = warn + dead rule
+  (`t2_selunk`), matched by an empty-row `ObjSel::Clocks`. Delay checks
+  keep the clocked launch (`t2_selmd`/`t2_selmdt`); a covered dangling
+  launch reports its leaf as `internal path endpoint` `u_fy/Q`. MCP
+  forms `t2_selmc`/`t2_selmct` scale the capture period; a cross-domain
+  hold with no explicit `-hold` keeps `(ns−1)·Pc` (vs `−nh·Pc` when
+  given — `t2_mcp`/`t2_selmc`).
+- Groups: `t2_grp` re-confirmed 8→5. `-logically_exclusive`/
+  `-physically_exclusive` = identical table (`t2_grpl`/`t2_grpp` — one
+  shared exclusion path). A single `-group` cuts members vs **all**
+  other clocks (`t2_grp1`). `-allow_paths` = no cut (`t2_grpa`).
+  `-name`/bare names/empty `-group {}` parse (`t2_grpnm`/`t2_grpb`/
+  `t2_grpe`); missing mode flag errors STA-0400 (`t2_grpn`). Groups
+  beat an explicit `set_max_delay` in either file order
+  (`t2_grpd`/`t2_grpd2` both drop `u_fx/D`).
+- Waveform: `{0.3 1.7}` on cka (`t2_wave`) shifts every cka-anchored
+  time +0.3 (`u_fa0/D arr 0.7→1.0`, `ya req 1.3→1.6`); ckb captures
+  untouched. The fall instant shows in ckb→cka hold pairing — a
+  non-coincident min-gap pair (launch 1.0 / capture 0.3), so
+  `hold_edge_pair` is gap-minimising, not coincidence-only (uniform
+  grids unchanged). `{0 0.5}` (`t2_wave05`) is identical to `t2_int` on
+  this all-rise fixture. Degenerate: odd count → STA-0371
+  (`t2_wave3`), non-increasing → STA-0372 (`t2_waverev`), >2 instants
+  accepted in OpenSTA (`t2_wave4`) — here a named bail; instants past
+  the period accepted (`t2_wavebig` `{0 2.5}` → wrapped mod period).
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` as committed in
+  `ghcr.io/librelane/librelane:3.0.16` — the whole script, all 42
+  scenario/report runs.
+- `cargo test --workspace`: 309 passed, 0 failed, 2 ignored
+  (grus-core) + 3 passed (grus-eda) — incl.
+  `test_sta_clocks_match_opensta` at STRICT on all 30 golden
+  `two_clock` scenarios + `t2_latch`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `two_clock_latch.probe.json` and every pre-existing probe artifact:
+  byte-identical (`git diff` shows only additive blocks).
+
+#### Fail-proof mutations (E0 rule 7)
+
+- Group desugar no-op'd (`for grp in &cg.groups` → `.iter().take(0)`):
+  red — `t2_grp` reports `u_fb0/D`, `u_fx/D`, `u_fy/D` back. Restored,
+  green.
+- `resolve_from(ObjSel::Clocks)` forced to `HashSet::new()`: red —
+  `t2_selfa` drop set collapses (6 mismatches incl. `u_fb0/D`, `ya`,
+  `wns_min`). Restored, green.
+- `Clock::edge_offset` forced to `p·P/2`: red — `t2_wave` arr/req
+  mismatches on every cka-anchored endpoint. Restored, green.
+
+Not pinned / out of scope: `-through` and other unsupported
+qualifiers still count ignored; `[get_clocks]` on qualifiers other
+than `-from`/`-to`; >2-instant waveforms (named bail); group
+precedence vs `set_false_path` ordering below the measured surface;
+the fall instant is exercised only through cross-domain hold pairing
+on this fixture.
+
+### 2026-11-20 — `mc-selectors` revision: port-name selectors, golden re-fold (v0.2.5)
+
+Same-day review fix-up of the v0.2.4 entry. One new measurement, one
+golden re-fold, three code corrections; no feature change.
+
+#### New measurement: bare port names in `-from`/`-to`
+
+`ExceptionCtx::clock_row` accepted `c.port` as well as `c.name`, so
+`set_false_path -from clk1` — `clk1` is `cka`'s *source port*, not its
+`-name` — cut every cka launch. Probed (`t2_selport`/`t2_selpto`, new
+scenarios run through `probe.sh` as committed):
+
+- `-from clk1` resolves to the **port object** — a resolved-but-dead
+  selector: the full 8-endpoint table, no warning. An input port starts
+  no data path.
+- `-to clk2` resolves the same way; OpenSTA warns `STA-1551 'clk2' is
+  not a valid endpoint` and applies nothing — still the full table, and
+  *not* `STA-0471 no valid objects` (the object resolved).
+- `clock_row` now matches `c.name` only — the same lookup
+  `resolve_clock`/`clock_rows` already apply. `ObjSel::Names` resolves a
+  bare io-pin name to the port object on either side (direction does not
+  gate resolution).
+
+`unresolved_exception_selectors` now counts **zero-resolved-object**
+selector sides, not empty coverage: a resolved-but-dead selector
+(`clk1`, `[get_pins u_fa0/D]`, `[get_cells u_buf]`) is a silent dead
+rule, matching OpenSTA's `no valid objects specified`. `exc_diag`'s
+pinned `== 4` is preserved (each all-miss `get_cells` side still counts
+per-name miss + zero-objects = 2).
+
+#### Golden re-fold (`probe.sh` as committed, whole script re-run)
+
+`SCENARIOS` 29 → 39: promoted `t2_selbare`, `t2_selac`, `t2_selunion`,
+`t2_selunk`, `t2_grp1`, `t2_grpe`, `t2_grpb`, `t2_wavebig` from
+`PROBE_ONLY`, plus new `t2_selport`/`t2_selpto`. `PROBE_ONLY` keeps only
+the four bail-pinned forms (`t2_grpn`, `t2_wave3`, `t2_wave4`,
+`t2_waverev`). `run_sta` gained an empty-table guard: `t2_selac`/
+`t2_selunion` cut every launch (`No paths found.`), where `worst_slack`
+returns `Inf` — the ref block emits `null` wns/tns and `0` violations;
+the endpoint list is the measurement. `git diff` audit: the 29
+pre-existing `two_clock.probe.json` blocks, `two_clock_latch.probe.json`
+and every pre-existing `probe_t2_*.txt` byte-identical; only new blocks
+and the two new report files appear. `test_sta_clocks_match_opensta`
+now evaluates 40 scenarios (39 + `t2_latch`) and skips aggregate
+comparison on an empty golden table.
+
+Notable measured rows in the new blocks: `t2_grpe` (`-group {}` +
+`-group ckb`) confirms the empty-group arm contributes nothing — the
+same 5-endpoint table as `t2_grp`; `t2_wavebig` (`-waveform {0 2.5}` on
+2.0) wraps to `{0 0.5}` and reproduces `t2_int` exactly on this
+all-rise fixture.
+
+#### Code corrections
+
+- `clock_row` name-only (above).
+- The `dead_ends` fanout traversal is gated per signature class on a
+  `ResolvedRule::Delay` in the signature — the leaf pass only ever
+  produced a row under a delay rule, so group/false-path-only scenarios
+  no longer walk every launch cone (`dead_end_leaves` extracted;
+  behaviour-preserving).
+- Stale comments fixed: `hold_edge_pair` is min-gap since `t2_wave`;
+  four spots still describing the hold pair as *coincident* now say
+  min-gap/`edge_offset`. `test_edge_pairing_unit_cases` gained the
+  `edge_offset` table and the non-uniform `setup_edge_pair`/
+  `hold_edge_pair` rows the first pass promised.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` whole, in
+  `ghcr.io/librelane/librelane:3.0.16` (all 39 + 4 + latch runs).
+- `cargo test -p grus-core sta_clocks_match`,
+  `cargo test -p grus-core edge_pairing`,
+  `cargo test -p grus-core exception_diagnostics` — green.
+
+#### Fail-proof mutations (E0 rule 7)
+
+- `clock_row` with `|| c.port == name` restored: red — `t2_selport`
+  drops the cka-anchored checks OpenSTA keeps (`u_fa0/D`, `u_fa1/D`,
+  `u_fb0/D`, `u_fx/D`, `ya` missing). Restored, green.
+- The `resolved_any` recount has no golden-visible mutation: skip counts
+  are not golden-compared — the `t2_selport`
+  `unresolved_exception_selectors == 0` assert in
+  `test_sta_clocks_match_opensta` is the pin.

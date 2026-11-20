@@ -1,17 +1,30 @@
 # Multi-clock SDC support — measured rules and ticket sequence
 
-Status: probe complete (2026-11-19), implementation not started. The current
-model is single-clock: `Sdc` keeps one `clock_name`/`clock_port`/`period_ns`
-and one pair of uncertainty/latency/transition fields; a second
-`create_clock` on a port bails at parse (`sdc.rs`: "a second design clock is
-not supported"). This document is the target spec for closing that gap.
+Status: probe complete (2026-11-19), `mc-model` landed (2026-11-20),
+`mc-eval` landed (2026-11-20), `mc-xdomain` landed (2026-11-20). `Sdc`
+keeps a clock table — one row per
+`create_clock`, in file order, holding name/optional port/period/
+network+source latencies/setup+hold uncertainties/transition/propagated —
+and every clock-targeting command resolves its names against the table.
+Eval is domain-aware: each design clock seeds its own net, every data
+arrival carries a launch-domain tag, and same-domain paths evaluate on the
+capture domain's own lattice (period, latency, uncertainty, propagated/
+ideal mode). Cross-domain setup pairs report on the min-gap edge pair
+over the period LCM (§1.2) with per-direction inter-clock uncertainty
+(§1.3); delay-check-covered endpoints anchor at the capture domain's
+edge 0 (§1.5). A pair that still cannot be evaluated defers with a
+`CrossDomain` diagnostic naming both clocks — never a silent fold. This
+document remains the target spec for the remaining tickets.
 
 Evidence: `tests/designs/sta_clocks/` — `two_clock.def` (clock domains `cka`
 2.0 ns on `clk1`, `ckb` 1.4/1.0 ns on `clk2`, same-domain and both-direction
-cross-domain paths), twelve `t2_*.sdc` scenarios, `probe.sh` (runs OpenSTA in
-`ghcr.io/librelane/librelane:3.0.16`), `two_clock.probe.json` + `probe_*.txt`
-(byte-identical on re-run). Raw numbers and the grus-eda break table are in
-`docs/results.md` (2026-11-19 entry); scenario→question mapping is in
+cross-domain paths), `two_clock_latch.def` (a `dlxtn` on `ckb` feeding a
+`ckb` flop — every endpoint same-domain), fifteen `t2_*.sdc` scenarios on
+`two_clock.def` plus `t2_latch.sdc`, `probe.sh` (runs OpenSTA in
+`ghcr.io/librelane/librelane:3.0.16`), `two_clock.probe.json` +
+`two_clock_latch.probe.json` + `probe_*.txt` (byte-identical on re-run).
+Raw numbers and the grus-eda break table are in `docs/results.md`
+(2026-11-19 and 2026-11-20 entries); scenario→question mapping is in
 `kurena/tasks/multi-clock-probe/design/probe.md`.
 
 ## 1. Measured OpenSTA rules (all from container runs)
@@ -115,30 +128,178 @@ Output-port form (`t2_mdo`, `set_max_delay 0.8 -to yb`):
 - MCP multiplies the **capture** domain's period (`t2_mcp`,
   `set_multicycle_path -setup 2 -from u_fa0 -to u_fx`): capture moved from
   ckb edge 1.0 to **2.0** (req 0.885446→1.885446); `-hold 1` moves it back
-  one ckb period (min req −0.037585→−1.037585).
+  one ckb period (min req −0.037585→−1.037585). On a cross-domain min
+  candidate the shift is `d_min = −nh·Pc` when `-hold` is explicit and
+  `(ns−1)·Pc` (the setup carry) when it is absent (`t2_mcp`,
+  `t2_selmc`) — the same-domain `((ns−1)−nh)·P` does not apply, since
+  the cross hold pair is selected by gap, not by the shifted setup
+  edge. A mixed tying mask takes the cross-domain form (conservative).
 
-## 2. Where grus-eda stands (parse-level break matrix)
+### 1.7 Clock selectors, groups, waveforms (`mc-selectors` probe, 2026-11-20)
 
-Probe: `cargo test -p grus-core multi_clock_bails` pins these verbatim;
-full table with commands in `docs/results.md`.
+Clock selectors anchor on the clocked object, not the clock pin:
 
-- Second `create_clock` on a port → `a second design clock is not supported`.
-- Multi-clock `set_clock_latency`, `-early`/`-late`, `-from`/`-to`
-  uncertainty, `create_clock -waveform`, `set_clock_groups`, unknown
-  `-clock` names → all hard parse errors (loud, good).
-- `set_clock_uncertainty <v> [get_clocks <virtual>]` **silently writes the
-  design-clock fields** regardless of the named clock (`sdc.rs` writes
-  `setup_uncertainty_ns`/`hold_uncertainty_ns` unconditionally).
-- `set_clock_transition` on `{design virtual}` applies the design part and
-  counts the virtual part as ignored.
-- Virtual `create_clock` period must equal the design period.
-- Silent mis-timing: a single-clock SDC on a two-clock DEF parses and
-  completes — the unseeded domain's pins fold onto the one clock lattice
-  (`base_state` merge at `ideal_latency`, `analysis.rs`) and every endpoint
-  is reported against the wrong clock. No warning.
-- Scratch check (guard removed, never committed): the second
-  `create_clock` overwrites `clock_port`/`clock_name`/`period_ns` — the
-  whole design then times against the last clock.
+- `-from [get_clocks cka]` (`t2_selfa`) covers every launch tagged to
+  the cka row — the cka registers **and** the `d_in` port seed (its
+  `set_input_delay -clock` resolves to cka): `u_fa0/D`, `u_fa1/D`,
+  `u_fb0/D`, `u_fx/D`, `ya` leave the table. `u_fy/D` survives — its
+  only launch is `u_fb0` on ckb (a ckb→cka check, not a cka launch).
+- `-to [get_clocks ckb]` (`t2_selfb`) covers every ckb-capture
+  endpoint — `u_fb0/D`, `u_fb1/D`, `u_fx/D`, `yb` (the output port
+  anchors on its `set_output_delay -clock` row).
+- A bare `-from cka` resolves exactly like `[get_clocks cka]`
+  (`t2_selbare`); `[all_clocks]` and `[get_clocks {cka ckb}]` give union
+  coverage; `[get_clocks nope]` parses to a dead rule — OpenSTA warns
+  and applies nothing, matching the empty-row selector here.
+- Bare names resolve against the *object* namespaces, and a clock's
+  `-name` and its source port are different objects (`t2_selport`/
+  `t2_selpto`, measured in the revision): `-from clk1` resolves to the
+  **port** object — an input port starts no data path, so the rule
+  covers nothing and OpenSTA warns nothing (the full 8-endpoint table).
+  `-to clk2` resolves the same way and warns `STA-1551 'clk2' is not a
+  valid endpoint` — a dead rule, still the full table. Clock matching
+  is on `-name` only — `clk1` is never a `cka` handle — the same rule
+  `resolve_clock` already measured (`set_clock_latency 1.0 clk1` on a
+  `-name`d clock → `unknown clock`). OpenSTA's `no valid objects
+  specified` fires only when a selector resolves zero objects; a
+  resolved-but-dead selector (`clk1`, a non-launch pin) is silent.
+- Delay checks keep the ordinary clocked launch (`t2_selmd`):
+  `u_fx/D arr 0.277469` = `t2_int`, required on the capture edge-0
+  anchor per §1.5. A covered launch whose net fans out to no surviving
+  endpoint reports its leaf as an `internal path endpoint` —
+  `t2_selmd` gains `u_fy/Q` (`req` = the raw delay value, no clock
+  terms).
+- `set_multicycle_path -setup 2 -from [get_clocks cka]` (`t2_selmc`,
+  `-to` mirror `t2_selmct`) scales the capture row's period like a pin
+  selector.
+
+`set_clock_groups` (`t2_grp` + probe forms):
+
+- `-asynchronous`, `-logically_exclusive`, `-physically_exclusive`
+  produce the identical table (`t2_grpl`/`t2_grpp`) — one shared
+  exclusion path.
+- A single `-group` cuts its members against **every clock not in the
+  group** (`t2_grp1`: `-group [get_clocks cka]` alone gives the same
+  8→5 as the two-group form).
+- `-allow_paths` records no exclusion at all (`t2_grpa`: full
+  8-endpoint table); `-name` is accepted for reporting only; bare
+  `-group cka` names and empty `-group {}` lists parse; a missing mode
+  flag errors (STA-0400, `t2_grpn`).
+- A group cut wins over an explicit `set_max_delay` crossing the same
+  pair in either file order (`t2_grpd`/`t2_grpd2` both drop `u_fx/D`).
+
+`create_clock -waveform` (`t2_wave`, `t2_wave05`, probe-only degenerate
+forms):
+
+- `{0.3 1.7}` on cka (`t2_wave`): every cka-anchored time moves by the
+  rise instant — `u_fa0/D arr 0.7→1.0`, `req 1.8548→2.1548`; ckb
+  captures are untouched (`u_fx/D req` same, `arr` +0.3 on the cka
+  launch). I/O anchors follow the reference clock's rise instant
+  (`ya req` +0.3).
+- The fall instant matters in cross-domain hold pairing: `t2_wave`'s
+  ckb→cka hold evaluates on a **non-coincident minimum-gap pair**
+  (launch 1.0 vs capture 0.3) — the hold rule is gap-minimising over
+  the LCM window, not coincidence-only; on uniform grids it returns
+  the same coincident pair as before.
+- `{0 0.5}` (`t2_wave05`) is identical to `t2_int` on this
+  all-rise-triggered fixture — the rise instant stays 0 and the fall
+  instant is only observable through hold pairing.
+- Degenerate forms measured: odd instant count → STA-0371
+  (`t2_wave3`), non-increasing instants → STA-0372 (`t2_waverev`), >2
+  instants accepted in OpenSTA (`t2_wave4`; here a named bail — the
+  model is the rise/fall pair), instants past the period accepted and
+  wrapped (`t2_wavebig` `{0 2.5}` on 2.0).
+
+## 2. Where grus-eda stands (after `mc-selectors`, 2026-11-20)
+
+`cargo test -p grus-core multi_clock_bails` pins the remaining bail
+messages verbatim; full table with commands in `docs/results.md`.
+
+Now accepted (the probe's parse breaks are fixed):
+
+- N `create_clock`s on ports and any number of virtual clocks append rows
+  to `Sdc::clocks`; a virtual period no longer has to equal the design
+  period.
+- `set_clock_uncertainty`/`-latency` (`-source` included)/`-transition`/
+  `set_propagated_clock` resolve `[get_clocks {a b ...}]` row-wise —
+  multi-name lists apply to every selected row; uncertainty on a virtual
+  clock lands on its own row (the probe's silent wrong-target bug).
+  `set_clock_uncertainty -from`/`-to` stores directed inter-clock rules
+  that replace the capture row's value for the matching direction and
+  side only (§1.3; last matching rule wins, empty selector = wildcard).
+- `set_input_delay`/`set_output_delay -clock <name>` and delay exceptions
+  resolve any row, not just the design clock.
+- `set_false_path`/`set_max_delay`/`set_min_delay`/
+  `set_multicycle_path` accept `[get_clocks ...]`/`[all_clocks]`/bare
+  clock `-name`s on `-from`/`-to` (§1.7 — a clock's source-port name
+  resolves to the port object, not the clock); `set_clock_groups` with
+  any mode flag parses multi-`-group` forms; `create_clock -waveform
+  {r f}` stores the two instants on the row (odd counts, non-increasing
+  instants and >2 instants stay named bails; instants past the period
+  wrap).
+
+Now evaluated:
+
+- Every design clock row seeds its own clock net — propagated via
+  `propagate_clock`, ideal via the parity walk — and every data arrival
+  carries a `u8` launch-domain mask alongside the parity/CRPR masks
+  (winner-replace/tie-union semantics). A port's tag is its resolved
+  `set_input_delay -clock` row, mapped through `launch_domain`: a virtual
+  row whose period equals a design row's pairs same-domain (coincident
+  edge grids), a unique virtual row stays foreign everywhere.
+- Checks read the capture row's period, latency, uncertainty and
+  propagated/ideal mode: register checks, latch-borrow windows,
+  delay-check anchors, MCP multipliers, min-pulse-width wrap and output
+  ports (`-clock` row anchoring) are all per-domain. Verified
+  per-endpoint at STRICT tolerance on all parseable `t2_*` scenarios
+  (`test_sta_clocks_match_opensta`); `two_clock_latch`'s whole table —
+  wns/tns/violations included — matches.
+- Cross-domain setup pairs evaluate on the min-gap edge pair over the
+  period LCM (§1.2): launch `arr` shifts by `m·PL`, required by `j·PC`,
+  uncertainty per directed pair (§1.3). Hold pairs minimise the
+  non-negative `launch − capture` gap — coincident on uniform grids,
+  non-coincident under `-waveform` phase shifts (§1.7).
+  Cross-domain endpoints covered by `set_max_delay`/`set_min_delay`
+  report on the capture domain's edge-0 anchor without pairing (§1.5);
+  a `get_pins inst/Q` `-from` is a path startpoint — the clocked launch
+  out of that pin is replaced by pin-segment paths, and endpoints no
+  covering rule's `-to` names lose the check on that side (`t2_mdx`).
+- Clock-object selectors cover by **clock row**, not folded domain
+  tags: `key_dom` maps launch keys (clock pins and `-clock`-anchored
+  port seeds) and `ep_cap` maps endpoints to their capture row, so
+  `-from`/`-to` `[get_clocks <name>]` behaves per §1.7.
+  `set_clock_groups` desugars to pairwise false-path rules on the same
+  row-keyed coverage — same signature partitioning, precedence and
+  `is_clean` accounting as a hand-written exception.
+- `create_clock -waveform` replaces the `parity · P/2` edge lattice
+  with the two stored instants everywhere edges are seeded or paired:
+  clock-net propagation, ideal seeding, setup/hold pairing, same-domain
+  phase tests and I/O anchors (`Clock::edge_offset`; degenerates to
+  the uniform grid when `waveform_ns` is `None`, so pre-waveform
+  SDCs are unchanged). A covered dangling launch reports its fanout
+  leaf as an internal path endpoint (`u_fy/Q`, §1.7).
+- A pair that still cannot be evaluated counts
+  `skipped.cross_domain_endpoints` and lands in `skipped_endpoints` with
+  `reason: cross_domain` and `related: "launch <clocks> -> capture
+  <clock>"`. `--strict` fails (`is_clean` counts them). The remaining
+  deferrals: a reached extreme with a zero mask (`launch <undeclared>`),
+  a latch-D check with a foreign launch (borrow pairing parked), a
+  min-side tying parity with no capture edge at-or-before any launch
+  edge in the LCM window (hold selection parked), and a non-converging
+  `grid_lcm` (defensive — unreachable for `f32` periods).
+
+Still unsupported / remaining hazard:
+
+- `set_clock_latency -early`/`-late`, unknown `-clock` names,
+  `set_propagated_clock` on a virtual clock, `create_clock` with
+  `period 0`, `set_clock_groups` with no mode flag, `create_clock
+  -waveform` with an odd count, non-increasing instants or more than
+  two instants — all loud parse errors.
+- More than 8 clock rows (design + virtual) bail before graph prep: the
+  domain mask is `u8` (`sta: N clocks declared; at most 8 domains can be
+  tagged`).
+- `-waveform` support is the two-instant alternating rise/fall form:
+  OpenSTA accepts longer lists (`t2_wave4`), this model bails.
 
 ## 3. Ticket sequence
 
@@ -146,32 +307,47 @@ The gap is structural (one slot for every clock attribute + one lattice),
 not a patch — implementation goes in five gated tickets, each its own
 kurena spec:
 
-1. **`mc-model`** — `Sdc` keeps a clock table: per-domain
+1. **`mc-model`** — **done 2026-11-20** (`docs/results.md` entry of the
+   same date). `Sdc` keeps a clock table: per-domain
    name/port/period/latencies (network+source)/uncertainties/transition/
-   propagated flag; `ClockRef` becomes a domain index; `create_clock`
-   accepts N design clocks and virtual clocks join the table.
-   `set_clock_uncertainty`/`-latency`/`-transition` target table rows;
-   multi-name lists allowed. Eval still single-domain: unseeded domains
-   fail loudly, never silently fold. Parse + model tests; existing goldens
-   must be bit-identical.
-2. **`mc-eval`** — domain tagging: per-port clock-net seeding (propagated
-   and `ideal_clock_parity`), domain tags on launch seeds and clock pins,
-   non-first clock ports excluded from data seeding; same-domain pairing
-   with distinct periods; per-domain period in MCP/borrow windows and
-   I/O anchors.
-3. **`mc-xdomain`** — cross-domain launch/capture edge-pair search per the
+   propagated flag; clock references are table indices (`ClockId`);
+   `create_clock` accepts N design clocks and virtual clocks join the
+   table. `set_clock_uncertainty`/`-latency`/`-transition` target table
+   rows; multi-name lists allowed. Eval still single-domain: `sta` bails
+   on >1 design clock, never silently folds. Parse + model tests in
+   `sdc.rs::tests`; existing goldens bit-identical.
+2. **`mc-eval`** — **done 2026-11-20** (`docs/results.md` entry of the
+   same date). Domain tagging: per-port clock-net seeding (propagated and
+   ideal parity walk), domain tags on launch seeds and clock pins, clock
+   ports excluded from data seeding; same-domain pairing with distinct
+   periods; per-domain period in MCP/borrow windows and I/O anchors.
+   Cross-domain pairs defer as named `CrossDomain` skips.
+3. **`mc-xdomain`** — **done 2026-11-20** (`docs/results.md` entry of the
+   same date). Cross-domain launch/capture edge-pair search per the
    measured rule (§1.2: min `capture − launch` over the LCM window);
-   inter-clock `-from`/`-to` uncertainty (§1.3).
-4. **`mc-selectors`** — clock-object selectors in exceptions (`-from
-   [get_clocks cka]` etc.), `set_clock_latency` multi-name (already
-   row-wise after `mc-model`), `set_clock_groups` (measured: drops all
-   cross checks, I/O-anchored included, §1.6), `create_clock -waveform`.
+   inter-clock `-from`/`-to` uncertainty (§1.3); delay-check-covered
+   cross endpoints report on the capture edge-0 anchor (§1.5).
+4. **`mc-selectors`** — **done 2026-11-20** (`docs/results.md` entry of
+   the same date). Clock-object selectors in exceptions (`-from
+   [get_clocks cka]` etc.) resolve through `key_dom`/`ep_cap` row maps;
+   `set_clock_groups` desugars to pairwise row-keyed false paths (one
+   shared exclusion path for all three modes; a lone group cuts against
+   every other clock); `create_clock -waveform` drives the edge lattice
+   via `Clock::edge_offset` — hold pairing generalized to the min
+   non-negative gap. The same-day revision (v0.2.5) pins the bare-name
+   rule (`-name` only; a source-port name resolves to the port object —
+   measured `t2_selport`/`t2_selpto`), recounts the unresolved
+   diagnostic on zero-resolved-object selectors, and gates the
+   internal-path-endpoint fanout traversal on delay-rule classes. 40
+   `sta_clocks` scenarios match at STRICT.
 5. **`mc-golden`** — `sta_clocks` promoted to `two_clock.reference.json` +
    `test_sta_clocks_match_opensta`, closing `docs/path-delays.md` §5 item 1
    (the literal two-clock `set_min_delay` fixture is `t2_md`/`t2_mdl`).
 
-Open sub-questions parked for the implementation tickets: cross-domain
-hold-pair selection beyond coincident edges (§1.2 — fixture holds at
-edge 0); `-waveform`-defined duty cycles; `-early`/`-late` latency splits;
-generated clocks; `set_clock_latency` on a delay check's *launch* side vs
-the measured capture anchor.
+Open sub-questions parked: the equal-gap setup tie keeps the smallest
+launch edge (OpenSTA's tie-break unmeasured); `-waveform` lists longer
+than two instants (OpenSTA accepts — `t2_wave4` — here a named bail);
+`-early`/`-late` latency splits; generated clocks; `set_clock_latency` on
+a delay check's *launch* side vs the measured capture anchor; inter-clock
+uncertainty matching is on folded domain tags — a virtual clock that
+folds onto a design row shares that row's `-from`/`-to` rules.

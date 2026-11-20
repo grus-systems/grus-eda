@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Multi-clock SDC probe: two-clock semantics measured against OpenSTA on the
 # hand-written two-domain fixture two_clock.def (cka on clk1 -> u_fa0/u_fa1/u_fy,
-# ckb on clk2 -> u_fb0/u_fb1/u_fx, cross-domain paths in both directions).
+# ckb on clk2 -> u_fb0/u_fb1/u_fx, cross-domain paths in both directions),
+# plus the second-domain latch fixture two_clock_latch.def (a dlxtn on ckb
+# feeding a ckb flop, cka flop feeding ya — every endpoint same-domain).
 # Each t2_*.sdc scenario runs in its own OpenSTA process because read_sdc
 # accumulates. Two artifacts per scenario: ref_<name>.json (wns/tns/violations
 # + per-endpoint max/min arr/req/slack/slew, same shape as the sta_exceptions
@@ -40,8 +42,9 @@ if [ ! -d "${PDK_ROOT}/sky130A/libs.ref/sky130_fd_sc_hd" ]; then
 fi
 
 run_sta () {
-    local sdc_file="$1"
-    local out_file="$2"
+    local def_file="$1"
+    local sdc_file="$2"
+    local out_file="$3"
     openroad -no_init -no_splash << EOF
 proc count_violations {paths} {
     array set seen {}
@@ -100,7 +103,7 @@ proc collect_endpoints_json {} {
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
-read_def /work/tests/designs/sta_clocks/two_clock.def
+read_def /work/tests/designs/sta_clocks/$def_file
 
 set sdc_err ""
 if {[catch {read_sdc /work/tests/designs/sta_clocks/$sdc_file} err]} {
@@ -116,13 +119,25 @@ if {\$sdc_err ne ""} {
     exit 0
 }
 
-set wns_max [format "%.6f" [sta::worst_slack -max]]
-set tns_max [format "%.6f" [sta::total_negative_slack -max]]
-set wns_min [format "%.6f" [sta::worst_slack -min]]
-set tns_min [format "%.6f" [sta::total_negative_slack -min]]
-set viol_max [count_violations [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 100000]]
-set viol_min [count_violations [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 100000]]
 set endpoints [collect_endpoints_json]
+# A false path that cuts every launch leaves "No paths found." — worst_slack
+# returns Inf there, which is not valid JSON, so emit null aggregates; the
+# empty endpoint list is the measurement.
+if {\$endpoints eq ""} {
+    set wns_max "null"
+    set tns_max "null"
+    set wns_min "null"
+    set tns_min "null"
+    set viol_max 0
+    set viol_min 0
+} else {
+    set wns_max [format "%.6f" [sta::worst_slack -max]]
+    set tns_max [format "%.6f" [sta::total_negative_slack -max]]
+    set wns_min [format "%.6f" [sta::worst_slack -min]]
+    set tns_min [format "%.6f" [sta::total_negative_slack -min]]
+    set viol_max [count_violations [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 100000]]
+    set viol_min [count_violations [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 100000]]
+}
 
 puts \$fp "{"
 puts \$fp "  \"wns_max_ns\": \$wns_max,"
@@ -145,13 +160,14 @@ EOF
 # times per path, plus the unconstrained listing that shows which endpoints
 # left the timed set.
 run_report () {
-    local sdc_file="$1"
-    local out_file="$2"
+    local def_file="$1"
+    local sdc_file="$2"
+    local out_file="$3"
     openroad -no_init -no_splash << EOF > "/work/tests/designs/sta_clocks/$out_file" 2>&1
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
-read_def /work/tests/designs/sta_clocks/two_clock.def
+read_def /work/tests/designs/sta_clocks/$def_file
 
 puts "=== scenario $sdc_file ==="
 if {[catch {read_sdc /work/tests/designs/sta_clocks/$sdc_file} err]} {
@@ -168,11 +184,23 @@ exit
 EOF
 }
 
-SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp"
+SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05 t2_selbare t2_selac t2_selunion t2_selunk t2_selport t2_selpto t2_grp1 t2_grpe t2_grpb t2_wavebig"
 
 for name in $SCENARIOS; do
-    run_sta "$name.sdc" "ref_$name.json"
-    run_report "$name.sdc" "probe_$name.txt"
+    run_sta "two_clock.def" "$name.sdc" "ref_$name.json"
+    run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
+done
+
+# Probe-only scenarios: the error/divergence forms, kept out of the golden.
+# t2_grpn (missing mode flag) / t2_wave3 (odd instant count) / t2_waverev
+# (non-increasing instants) are SDC errors in OpenSTA and named bails in ours;
+# t2_wave4 (>2 instants) is accepted by OpenSTA but a deliberate named bail in
+# ours. `run_report` records the outcome ("SDC error:" or a table) without
+# folding a ref_*.json block into two_clock.probe.json.
+PROBE_ONLY="t2_grpn t2_wave3 t2_wave4 t2_waverev"
+
+for name in $PROBE_ONLY; do
+    run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
 done
 
 {
@@ -186,5 +214,18 @@ done
     done
     printf '\n  }\n}\n'
 } > two_clock.probe.json
+
+# Second-domain latch fixture: every endpoint is same-domain, so the probe
+# covers the borrow window on ckb's own lattice end to end.
+run_sta "two_clock_latch.def" "t2_latch.sdc" "ref_t2_latch.json"
+run_report "two_clock_latch.def" "t2_latch.sdc" "probe_t2_latch.txt"
+
+{
+    printf '{\n  "design": "sta_clocks_latch",\n  "scenarios": {\n'
+    printf '    "%s": ' "t2_latch"
+    cat "ref_t2_latch.json"
+    printf '\n  }\n}\n'
+} > two_clock_latch.probe.json
+
 rm -f ref_*.json
-echo "Wrote two_clock.probe.json"
+echo "Wrote two_clock.probe.json and two_clock_latch.probe.json"

@@ -2,7 +2,8 @@ use super::dmp::{PiModel, driver_waveform_slew, solve_dmp};
 use super::nldm::{eval_nldm_constraint, eval_nldm_delay_or_slew};
 use super::parasitics::NetParasitics;
 use super::sdc::{
-    CellSel, DERATE_CELL, DERATE_CHECK, DERATE_NET, ExceptionKind, ObjSel, PathDelayKind, Sdc,
+    CellSel, Clock, DERATE_CELL, DERATE_CHECK, DERATE_NET, ExceptionKind, ObjSel, PathDelayKind,
+    Sdc,
 };
 use crate::design_db::DesignDb;
 use crate::interner::{CellId, LibPinId, NetId, PinDir, PinId};
@@ -120,6 +121,13 @@ struct PinTimingState {
     /// won each extreme — the merged state alone does not remember.
     crpr_max: [u8; 2],
     crpr_min: [u8; 2],
+    /// Bitmask of the launch clock-domain tags (`Sdc::clocks` row indices) that
+    /// produced `arrival_max` / `arrival_min` at this pin and transition; same
+    /// winner-replace/tie-union discipline as `par_*`. An endpoint check may be
+    /// evaluated only when the mask is exactly the capture domain's bit —
+    /// anything else is a cross-domain contribution mc-xdomain must pair.
+    dom_max: [u8; 2],
+    dom_min: [u8; 2],
 }
 
 impl PinTimingState {
@@ -134,6 +142,8 @@ impl PinTimingState {
         par_min: [0; 2],
         crpr_max: [0; 2],
         crpr_min: [0; 2],
+        dom_max: [0; 2],
+        dom_min: [0; 2],
     };
 
     fn reached(&self, pol: usize) -> bool {
@@ -154,6 +164,8 @@ impl PinTimingState {
         par_min: u8,
         crpr_max: u8,
         crpr_min: u8,
+        dom_max: u8,
+        dom_min: u8,
     ) {
         // Slews are merged independently of which arc wins the arrival (OpenSTA GraphDelayCalc).
         // The parity and tag arguments are masks: a strictly better arrival replaces
@@ -162,17 +174,21 @@ impl PinTimingState {
             self.arrival_max[pol] = arr_max;
             self.par_max[pol] = par_max;
             self.crpr_max[pol] = crpr_max;
+            self.dom_max[pol] = dom_max;
         } else if arr_max == self.arrival_max[pol] {
             self.par_max[pol] |= par_max;
             self.crpr_max[pol] |= crpr_max;
+            self.dom_max[pol] |= dom_max;
         }
         if arr_min < self.arrival_min[pol] {
             self.arrival_min[pol] = arr_min;
             self.par_min[pol] = par_min;
             self.crpr_min[pol] = crpr_min;
+            self.dom_min[pol] = dom_min;
         } else if arr_min == self.arrival_min[pol] {
             self.par_min[pol] |= par_min;
             self.crpr_min[pol] |= crpr_min;
+            self.dom_min[pol] |= dom_min;
         }
         self.dly_max[pol] = self.dly_max[pol].max(dly_max);
         self.dly_min[pol] = self.dly_min[pol].min(dly_min);
@@ -195,6 +211,8 @@ impl PinTimingState {
             self.par_min[pol] |= o.par_min[pol];
             self.crpr_max[pol] |= o.crpr_max[pol];
             self.crpr_min[pol] |= o.crpr_min[pol];
+            self.dom_max[pol] |= o.dom_max[pol];
+            self.dom_min[pol] |= o.dom_min[pol];
         }
     }
 }
@@ -274,11 +292,17 @@ pub enum SkipReason {
     /// The endpoint pin was reached but none of its arrived transitions had a
     /// usable NLDM constraint table, so no setup/hold bound could be evaluated.
     NoConstraintTable,
+    /// An arrival extreme tying this endpoint was launched on a different
+    /// clock domain than the capture. Cross-domain launch/capture pairing is
+    /// not implemented yet (mc-xdomain owns the edge-pair search), so the
+    /// endpoint is deferred with the launch and capture clocks named in
+    /// `related` instead of being folded onto the capture domain's lattice.
+    CrossDomain,
 }
 
 /// One endpoint candidate that produced no check, with the pin and the reason.
 /// `skipped_endpoints` holds one entry per `incomplete_checks` +
-/// `unreached_endpoints` count.
+/// `unreached_endpoints` + `cross_domain_endpoints` count.
 #[derive(Clone, Debug, Serialize)]
 pub struct SkippedEndpoint {
     /// Endpoint pin name (`inst/pin` for cell pins, port name for top-level pins).
@@ -321,6 +345,11 @@ pub struct SkipReport {
     pub incomplete_checks: usize,
     /// Checks and outputs that no polarity of a path reached.
     pub unreached_endpoints: usize,
+    /// Endpoints whose launch domain differs from their capture domain:
+    /// cross-domain edge pairing is mc-xdomain's job, so these are deferred
+    /// (named in `skipped_endpoints` with reason `CrossDomain`) rather than
+    /// timed on a wrong lattice.
+    pub cross_domain_endpoints: usize,
     /// Per-endpoint detail for every `incomplete_checks` + `unreached_endpoints`
     /// skip: which pin produced no check and why.
     pub skipped_endpoints: Vec<SkippedEndpoint>,
@@ -390,6 +419,7 @@ impl SkipReport {
             ("unresolved_arcs", self.unresolved_arcs),
             ("incomplete_checks", self.incomplete_checks),
             ("unreached_endpoints", self.unreached_endpoints),
+            ("cross_domain_endpoints", self.cross_domain_endpoints),
             ("cell_driven_clock_nets", self.cell_driven_clock_nets),
             ("unresolved_driving_cells", self.unresolved_driving_cells),
             (
@@ -426,9 +456,10 @@ impl SkipReport {
             + self.latch_arcs_dropped.values().sum::<usize>()
     }
 
-    /// Endpoint candidates that produced no check: incomplete pairs or unreached pins.
+    /// Endpoint candidates that produced no check: incomplete pairs, unreached
+    /// pins, or cross-domain launch/capture pairs that defer to mc-xdomain.
     pub fn endpoints_skipped(&self) -> usize {
-        self.incomplete_checks + self.unreached_endpoints
+        self.incomplete_checks + self.unreached_endpoints + self.cross_domain_endpoints
     }
 
     /// True when the run left nothing out. Two kinds of skip are exempt because they cannot
@@ -451,6 +482,7 @@ impl SkipReport {
             && self.unresolved_arcs == 0
             && self.incomplete_checks == 0
             && self.unreached_endpoints == 0
+            && self.cross_domain_endpoints == 0
             && self.cell_driven_clock_nets == 0
             && self.unresolved_driving_cells == 0
             && self.unsupported_multicycle_endpoints == 0
@@ -1286,15 +1318,19 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
             stack.push(net);
         }
     };
-    if let Some(port) = cx.sdc.clock_port.as_deref().and_then(|name| {
-        design
-            .io_pins
-            .iter()
-            .copied()
-            .find(|&p| cx.port_name(p) == name)
-    }) && let Some(net) = design.pin_nets[port.0 as usize]
-    {
-        mark_clock_net(net, &mut graph, &mut clock_stack);
+    // Every design clock port seeds the walk; each domain's tree is marked on
+    // its own, so a second clock network is never mistaken for data logic.
+    for clock in &cx.sdc.clocks {
+        if let Some(port) = clock.port.as_deref().and_then(|name| {
+            design
+                .io_pins
+                .iter()
+                .copied()
+                .find(|&p| cx.port_name(p) == name)
+        }) && let Some(net) = design.pin_nets[port.0 as usize]
+        {
+            mark_clock_net(net, &mut graph, &mut clock_stack);
+        }
     }
     // Pulse-check pins are deliberately absent: a `min_pulse_width` arc can
     // sit on a non-clock pin (`dfrtn`'s RESET_B arc) and marking that net a
@@ -1384,8 +1420,10 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
         keep
     });
     // Under `set_propagated_clock` these nets are modelled by `propagate_clock` instead;
-    // the ones it cannot reach are counted there.
-    if !cx.sdc.propagated_clock {
+    // `prepare_sta` counts per domain the ones it cannot reach. The gate is
+    // "any propagated row", not "the design row is propagated": a mixed-mode
+    // design must not count its propagated domain's nets here.
+    if !cx.sdc.clocks.iter().any(|c| c.propagated) {
         for (net, _) in graph
             .clock_net
             .iter()
@@ -1712,7 +1750,7 @@ fn propagate_slew(
         if design.pin_dirs[p] != PinDir::Input {
             continue;
         }
-        if sdc.clock_port.as_deref() == Some(cx.port_name(pin)) {
+        if sdc.is_clock_port(cx.port_name(pin)) {
             let tr = sdc.input_transition_ns(cx.port_name(pin));
             for pol in [RISE, FALL] {
                 slew[p].slew_max[pol] = tr;
@@ -1846,39 +1884,40 @@ fn propagate_clock(
     let sdc = cx.sdc;
     let mut clk = vec![PinTimingState::UNREACHED; design.num_pins()];
     let mut parity = vec![[u8::MAX; 2]; design.num_pins()];
-    let Some(port) = sdc.clock_port.as_deref().and_then(|name| {
-        design
+    // Every design row seeds its own port with that row's source latency,
+    // half period and `set_input_transition` slew — the walk is
+    // mode-independent: consumer seeding picks propagated vs. ideal per
+    // domain, and the pulse-width oracle needs propagated arrivals on ideal
+    // domains too. The dom bits ride along (harmless downstream: capture
+    // identity comes from `clock_domain`, not from `clk_state`).
+    for (row, clock) in sdc.clocks.iter().enumerate() {
+        let Some(port_name) = clock.port.as_deref() else {
+            continue;
+        };
+        let Some(port) = design
             .io_pins
             .iter()
             .copied()
-            .find(|&p| cx.port_name(p) == name)
-    }) else {
-        return (clk, parity);
-    };
-    // The fall edge leaves the source half a period after the rise (50% duty cycle).
-    // The propagated slew starts at the clock port's `set_input_transition` (the port is
-    // an input): `set_input_transition 0.15 [all_inputs]` gives 0.15 at directly connected
-    // clock pins, while `set_clock_transition` does not reach the propagated network at
-    // all (measured on sta_edge/hold_violation and sta_edge/propagated_clock).
-    let half_period = 0.5 * sdc.period_ns;
-    let lat = sdc.clock_source_latency_ns;
-    let tr = sdc.input_transition_ns(cx.port_name(port));
-    let p = port.0 as usize;
-    clk[p].merge(RISE, lat, lat, lat, lat, tr, tr, 1, 1, 0, 0);
-    clk[p].merge(
-        FALL,
-        lat + half_period,
-        lat + half_period,
-        lat + half_period,
-        lat + half_period,
-        tr,
-        tr,
-        2,
-        2,
-        0,
-        0,
-    );
-    parity[p] = [0, 1];
+            .find(|&p| cx.port_name(p) == port_name)
+        else {
+            continue;
+        };
+        // Each edge leaves the source at its waveform instant
+        // (`edge_offset` — P/2 apart for the default 50% duty cycle).
+        // The propagated slew starts at the clock port's `set_input_transition` (the port is
+        // an input): `set_input_transition 0.15 [all_inputs]` gives 0.15 at directly connected
+        // clock pins, while `set_clock_transition` does not reach the propagated network at
+        // all (measured on sta_edge/hold_violation and sta_edge/propagated_clock).
+        let lat = clock.source_latency_ns;
+        let tr = sdc.input_transition_ns(port_name);
+        let p = port.0 as usize;
+        let dom = dom_bit(row);
+        let rise = lat + clock.edge_offset(0);
+        let fall = lat + clock.edge_offset(1);
+        clk[p].merge(RISE, rise, rise, rise, rise, tr, tr, 1, 1, 0, 0, dom, dom);
+        clk[p].merge(FALL, fall, fall, fall, fall, tr, tr, 2, 2, 0, 0, dom, dom);
+        parity[p] = [0, 1];
+    }
 
     for lvl in 1..levelized.level_offsets.len() - 1 {
         for &pin in levelized.level(lvl) {
@@ -1960,6 +1999,8 @@ fn propagate_clock(
                             1 << src_par[src_pol],
                             0,
                             0,
+                            src.dom_max[src_pol],
+                            src.dom_min[src_pol],
                         );
                         changed = true;
                     }
@@ -1975,38 +2016,54 @@ fn propagate_clock(
     (clk, parity)
 }
 
-/// Edge parity (source clock-edge index mod 2) of every pin transition under
-/// the ideal clock. The clock network is traversed exactly like
-/// `propagate_clock` but with no timing: every reached transition keeps the
-/// parity of the source edge that produces it, so a pin behind an odd number
-/// of inverting cells sees its rise on clock edge 1. `u8::MAX` = unreached;
-/// consumers fall back to the source-port convention (rise 0, fall 1).
+/// Edge parity (source clock-edge index mod 2) and owning clock domain of every
+/// pin transition under the ideal clock. The clock network is traversed exactly
+/// like `propagate_clock` but with no timing: every reached transition keeps
+/// the parity of the source edge that produces it, so a pin behind an odd
+/// number of inverting cells sees its rise on clock edge 1. `u8::MAX` =
+/// unreached; consumers fall back to the source-port convention (rise 0, fall 1).
 /// Ties (a transition reachable from both parities, e.g. non-unate logic)
 /// resolve to the first candidate in levelized order — the same
 /// earliest-wins policy `propagate_clock` applies to equal arrivals.
-fn ideal_clock_parity(cx: &Context, levelized: &LevelizedGraph) -> Vec<[u8; 2]> {
+///
+/// The second return value tags each pin with the `Sdc::clocks` row whose port
+/// seed reached it (`u8::MAX` when no seed did). Seeding every design row keeps
+/// a second domain's clock network on its own lattice instead of folding it
+/// onto the first row's, and gives every clock consumer its capture domain.
+fn ideal_clock_parity(
+    cx: &Context,
+    levelized: &LevelizedGraph,
+) -> (Vec<[u8; 2]>, Vec<u8>) {
     let design = cx.design;
     let mut par = vec![[u8::MAX; 2]; design.num_pins()];
-    let Some(port) = cx.sdc.clock_port.as_deref().and_then(|name| {
-        design
+    let mut dom = vec![u8::MAX; design.num_pins()];
+    for (row, clock) in cx.sdc.clocks.iter().enumerate() {
+        let Some(port_name) = clock.port.as_deref() else {
+            continue;
+        };
+        let Some(port) = design
             .io_pins
             .iter()
             .copied()
-            .find(|&p| cx.port_name(p) == name)
-    }) else {
-        return par;
-    };
-    par[port.0 as usize] = [0, 1];
+            .find(|&p| cx.port_name(p) == port_name)
+        else {
+            continue;
+        };
+        par[port.0 as usize] = [0, 1];
+        dom[port.0 as usize] = row as u8;
+    }
     for lvl in 1..levelized.level_offsets.len() - 1 {
         for &pin in levelized.level(lvl) {
             let p = pin.0 as usize;
             let mut next = par[p];
+            let mut next_dom = dom[p];
             if !design.pin_is_driver[p]
                 && let Some((_, _, drv)) = levelized.pin_driver[p]
             {
                 let d = par[drv.0 as usize];
                 if d[RISE] != u8::MAX || d[FALL] != u8::MAX {
                     next = d;
+                    next_dom = dom[drv.0 as usize];
                 }
             }
             for &(src_pin, lib_arc) in levelized.incoming_to(pin) {
@@ -2020,13 +2077,15 @@ fn ideal_clock_parity(cx: &Context, levelized: &LevelizedGraph) -> Vec<[u8; 2]> 
                     }
                     if src_par[src_pol] != u8::MAX && next[dst_pol] == u8::MAX {
                         next[dst_pol] = src_par[src_pol];
+                        next_dom = dom[src_pin.0 as usize];
                     }
                 }
             }
             par[p] = next;
+            dom[p] = next_dom;
         }
     }
-    par
+    (par, dom)
 }
 
 fn polarities(sense: TimingSense) -> &'static [(usize, usize)] {
@@ -2159,7 +2218,7 @@ fn run_sta_detail(
     emit_warnings: bool,
 ) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
     let prepared = prepare_sta(design, lib, sdc, parasitics)?;
-    if !sdc.exceptions.is_empty() || !sdc.path_delays.is_empty() {
+    if !sdc.exceptions.is_empty() || !sdc.path_delays.is_empty() || !sdc.clock_groups.is_empty() {
         return run_sta_partitioned(&prepared, emit_warnings);
     }
     let outcome = eval_sta(&prepared, None, &HashSet::new(), prepared.skipped.clone())?;
@@ -2175,8 +2234,12 @@ fn run_sta_detail(
 /// `(arr_max, arr_min, slew_max, slew_min)`. `eval_sta` merges the arrival
 /// fields only for ports in the run's allowed set but always merges slew —
 /// downstream delay lookups depend on the physical slew at the pin.
+/// `dom` is the `Sdc::clocks` row the port's `set_input_delay -clock`
+/// resolved to — the launch-domain tag every arrival this port produces
+/// carries.
 struct PortSeed {
     pin: PinId,
+    dom: u8,
     per_pol: [(f32, f32, f32, f32); 2],
 }
 
@@ -2209,11 +2272,14 @@ impl LaunchPair {
 
 /// One launch's precomputed output pairs plus the clock-edge parity that
 /// launched them. `pairs` is indexed by output transition. `tag` is the CRPR
-/// launch-tag bitmask for every arrival this seed produces.
+/// launch-tag bitmask for every arrival this seed produces; `dom` is the
+/// `Sdc::clocks` row of the clock pin's domain — `u8::MAX` when no design
+/// clock reached the pin, in which case `pairs` is all-`UNREACHED` anyway.
 struct LaunchSeed {
     q: PinId,
     par: u8,
     tag: u8,
+    dom: u8,
     pairs: [LaunchPair; 2],
 }
 
@@ -2233,6 +2299,11 @@ struct StaPrepared<'a> {
     launch_seeds: Vec<LaunchSeed>,
     latch_seeds: Vec<LaunchSeed>,
     clock_parity: Option<Vec<[u8; 2]>>,
+    /// Capture-domain identity per pin: the `Sdc::clocks` row whose port seed
+    /// reached the pin through the clock network, `u8::MAX` on pins no design
+    /// clock reaches. Register/gate checks and latch enables read their row's
+    /// period, latency and uncertainty through it.
+    clock_domain: Vec<u8>,
     clock_state: Option<Vec<PinTimingState>>,
     /// CRPR launch-tag table: index 0 is the no-credit sentinel (bit 0 of every
     /// `crpr_*` mask — ports, latch clock-to-Q launches, unresolvable or
@@ -2262,6 +2333,15 @@ fn prepare_sta<'a>(
     sdc: &'a Sdc,
     parasitics: Option<&'a NetParasitics>,
 ) -> Result<StaPrepared<'a>> {
+    // Domain tags ride in `u8` masks on every arrival extreme; more than 8
+    // clock rows (design and virtual) cannot be tagged.
+    if sdc.clocks.len() > u8::BITS as usize {
+        anyhow::bail!(
+            "sta: {} clocks declared; at most {} domains can be tagged",
+            sdc.clocks.len(),
+            u8::BITS
+        );
+    }
     let mut cx = Context {
         design,
         lib,
@@ -2341,28 +2421,40 @@ fn prepare_sta<'a>(
     };
     let graph = build_graph(&cx, &mut skipped);
     let levelized = topological_levels(&cx, &graph, false)?;
-    // Primary inputs: ideal drivers. The clock port is not a data startpoint.
-    // Seeds are stored unfiltered; `eval_sta` re-merges them per allowed set.
-    // `state_ports` additionally feeds `propagate_slew`, which must see every
-    // source's slew regardless of exception filtering.
+    // Primary inputs: ideal drivers. No clock port is a data startpoint —
+    // `is_clock_port` covers every design row, so a second domain's source
+    // port stays out of the data seeds too. Seeds are stored unfiltered;
+    // `eval_sta` re-merges them per allowed set. `state_ports` additionally
+    // feeds `propagate_slew`, which must see every source's slew regardless
+    // of exception filtering.
     let mut port_seeds = Vec::new();
     let mut state_ports = vec![PinTimingState::UNREACHED; design.num_pins()];
     for &pin in &design.io_pins {
         let p = pin.0 as usize;
         let name = cx.port_name(pin);
-        if design.pin_dirs[p] != PinDir::Input || sdc.clock_port.as_deref() == Some(name) {
+        if design.pin_dirs[p] != PinDir::Input || sdc.is_clock_port(name) {
             continue;
         }
+        // The port launches on the domain its `set_input_delay -clock` row
+        // resolves to — `launch_domain` maps a virtual row onto the design
+        // grid it coincides with, so an I/O clock sharing the design period
+        // pairs same-domain instead of deferring every endpoint.
+        let clock_row = sdc.input_clock_row(name);
+        let dom = launch_domain(sdc, clock_row) as u8;
         let (in_min, in_max) = sdc.input_delay_ns(name);
         let latency = sdc.input_clock_latency_ns(name);
+        // The delay is referenced to the `-clock` row's own rising edge —
+        // a `-waveform` instant, 0 for the default duty cycle (measured
+        // `t2_wave`: `d_in`'s arrival shifts by cka's 0.3 rise instant).
+        let launch_edge = sdc.clocks.get(clock_row).map_or(0.0, |c| c.edge_offset(0));
         let drive = cx.port_drive(pin, &mut skipped);
         let mut per_pol = [(0.0f32, 0.0, 0.0, 0.0); 2];
         for pol in [RISE, FALL] {
             let (slew_max, slew_min, drv_early, drv_late) = drive[pol];
             // An input delay is referenced to the clock's rising edge: launch parity 0.
             per_pol[pol] = (
-                latency + in_max + drv_late,
-                latency + in_min + drv_early,
+                latency + launch_edge + in_max + drv_late,
+                latency + launch_edge + in_min + drv_early,
                 slew_max,
                 slew_min,
             );
@@ -2378,23 +2470,36 @@ fn prepare_sta<'a>(
                 0,
                 1,
                 1,
+                dom_bit(dom as usize),
+                dom_bit(dom as usize),
             );
         }
-        port_seeds.push(PortSeed { pin, per_pol });
+        port_seeds.push(PortSeed { pin, dom, per_pol });
     }
 
     let mut base_state = vec![PinTimingState::UNREACHED; design.num_pins()];
-    let clock_parity: Option<Vec<[u8; 2]>>;
+    // The ideal walk runs unconditionally: `clock_domain` is every consumer's
+    // capture-domain identity in both clock modes, and `ideal_par` supplies
+    // parity wherever the propagated walk does not reach (ideal domains, and
+    // pins behind cells `propagate_clock` cannot cross).
+    let (ideal_par, clock_domain) = ideal_clock_parity(&cx, &levelized);
+    let mut clock_parity = ideal_par.clone();
     let mut clock_state: Option<Vec<PinTimingState>> = None;
-    if sdc.propagated_clock {
-        // Propagated clock: arrival at each consumer pin comes from the clock network
-        // itself. `set_clock_latency` without `-source` is ideal network latency and does
-        // not apply; `-source` latency and `set_clock_transition` seed the source port.
-        // Slew comes from the unified pass: OpenSTA merges clock and data arcs at
-        // every vertex, so a clock gate's enable arc can dominate the slew its output
-        // pin (and downstream clock pins) see. `propagate_clock` uses those slews for
-        // delay lookups; the returned states carry arrival, and their slew fields are
-        // overwritten with the unified values below.
+    let any_propagated = sdc.clocks.iter().any(|c| c.propagated);
+    // OpenSTA's clock-pin vertices carry propagated source-latency +
+    // cell-delay arrivals even under the ideal clock — `report_arrival`
+    // shows them and `report_pulse_width_checks` measures pulse widths
+    // from them. The walk therefore runs whenever any row is propagated or
+    // any pulse-width check exists; it seeds every design row's port, so a
+    // mixed-mode design still gets real arrivals on each clock network.
+    if any_propagated || !graph.pulse_width_checks.is_empty() {
+        // `set_clock_latency` without `-source` is ideal network latency and does
+        // not apply; `-source` latency and `set_clock_transition` seed the source
+        // port. Slew comes from the unified pass: OpenSTA merges clock and data
+        // arcs at every vertex, so a clock gate's enable arc can dominate the
+        // slew its output pin (and downstream clock pins) see. `propagate_clock`
+        // uses those slews for delay lookups; the returned states carry arrival,
+        // and their slew fields are overwritten with the unified values below.
         let unified_slew = propagate_slew(&cx, &graph, &wire_delays_per_net, &state_ports)?;
         let (mut clk_state, clk_parity) =
             propagate_clock(&cx, &levelized, &wire_delays_per_net, &unified_slew);
@@ -2402,93 +2507,108 @@ fn prepare_sta<'a>(
             c.slew_max = u.slew_max;
             c.slew_min = u.slew_min;
         }
-        clock_parity = Some(clk_parity);
-        let consumers = graph
-            .launches
-            .iter()
-            .map(|l| l.clk)
-            .chain(graph.checks.iter().filter_map(|(_, c)| c.clk))
-            .chain(graph.latch_opens.iter().map(|o| o.enable))
-            .chain(graph.gating_enables.iter().map(|g| g.clk_pin))
-            .chain(graph.pulse_width_checks.iter().map(|c| c.pin));
-        for pin in consumers {
-            let s = clk_state[pin.0 as usize];
-            if s.reached(RISE) || s.reached(FALL) {
-                base_state[pin.0 as usize] = s;
+        if any_propagated {
+            // The propagated parity is authoritative only on propagated rows;
+            // ideal domains keep the ideal walk's answer so a clock pin on an
+            // unpropagated domain reads parity exactly as the all-ideal mode
+            // reports it.
+            for (i, p) in clk_parity.iter().enumerate() {
+                let propagated = clock_domain[i] != u8::MAX
+                    && sdc.clocks[clock_domain[i] as usize].propagated;
+                if propagated && (p[RISE] != u8::MAX || p[FALL] != u8::MAX) {
+                    clock_parity[i] = *p;
+                }
             }
-        }
-        // Clock nets the propagation did not reach (e.g. behind a latch or an unmapped
-        // cell) keep no timing; their endpoints surface as unreached.
-        for (net, _) in graph.clock_net.iter().enumerate().filter(|(_, c)| **c) {
-            if let Some(d) = design.net_driver(NetId(net as u32))
-                && design.pin_cells[d.0 as usize].is_some()
-            {
-                let s = clk_state[d.0 as usize];
-                if !s.reached(RISE) && !s.reached(FALL) {
-                    skipped.cell_driven_clock_nets += 1;
+            let consumers = graph
+                .launches
+                .iter()
+                .map(|l| l.clk)
+                .chain(graph.checks.iter().filter_map(|(_, c)| c.clk))
+                .chain(graph.latch_opens.iter().map(|o| o.enable))
+                .chain(graph.gating_enables.iter().map(|g| g.clk_pin))
+                .chain(graph.pulse_width_checks.iter().map(|c| c.pin));
+            for pin in consumers {
+                let idx = pin.0 as usize;
+                let dom = clock_domain[idx];
+                if dom == u8::MAX || !sdc.clocks[dom as usize].propagated {
+                    continue;
+                }
+                let s = clk_state[idx];
+                if s.reached(RISE) || s.reached(FALL) {
+                    base_state[idx] = s;
+                }
+            }
+            // Clock nets on propagated domains the propagation did not reach
+            // (e.g. behind a latch or an unmapped cell) keep no timing; their
+            // endpoints surface as unreached. A cell-driven net on an ideal
+            // domain is the same approximation the all-ideal mode reports in
+            // `build_graph`, so it counts here too.
+            for (net, _) in graph.clock_net.iter().enumerate().filter(|(_, c)| **c) {
+                if let Some(d) = design.net_driver(NetId(net as u32))
+                    && design.pin_cells[d.0 as usize].is_some()
+                {
+                    let idx = d.0 as usize;
+                    let dom = clock_domain[idx];
+                    let modelled = dom != u8::MAX
+                        && sdc.clocks[dom as usize].propagated
+                        && (clk_state[idx].reached(RISE) || clk_state[idx].reached(FALL));
+                    if !modelled {
+                        skipped.cell_driven_clock_nets += 1;
+                    }
                 }
             }
         }
         clock_state = Some(clk_state);
-    } else {
-        // Ideal clock: every register clock pin, latch enable and clock-gate
-        // clock pin sees an edge at the clock latency (source + network), but
-        // the edge's phase still follows the clock network: `ideal_clock_parity`
-        // tracks inverting cells so a transition produced by clock-edge parity
-        // `p` is seeded half a period later per unit of `p` (rise on edge 0 at
-        // the latency, fall on edge 1 half a period on). `set_clock_transition`
-        // is the clock pin's slew; without it the slew is zero.
-        let ideal_par = ideal_clock_parity(&cx, &levelized);
-        clock_parity = Some(ideal_par.clone());
-        let ideal_latency = sdc.design_clock_latency_ns();
-        let half_period = 0.5 * sdc.period_ns;
-        let clock_pins = graph
-            .launches
-            .iter()
-            .map(|l| l.clk)
-            .chain(graph.checks.iter().filter_map(|(_, c)| c.clk))
-            .chain(graph.latch_opens.iter().map(|o| o.enable))
-            .chain(graph.gating_enables.iter().map(|g| g.clk_pin))
-            .chain(graph.pulse_width_checks.iter().map(|c| c.pin));
-        for clk in clock_pins {
-            for pol in [RISE, FALL] {
-                // Unreached pins keep the source-port convention: transition
-                // `pol` sits on clock-edge parity `pol`.
-                let p = ideal_par[clk.0 as usize][pol];
-                let edge_par = if p <= 1 { p as usize } else { pol };
-                base_state[clk.0 as usize].merge(
-                    pol,
-                    ideal_latency + edge_par as f32 * half_period,
-                    ideal_latency + edge_par as f32 * half_period,
-                    ideal_latency + edge_par as f32 * half_period,
-                    ideal_latency + edge_par as f32 * half_period,
-                    sdc.clock_transition_ns,
-                    sdc.clock_transition_ns,
-                    1 << edge_par,
-                    1 << edge_par,
-                    0,
-                    0,
-                );
-            }
+    }
+    // Ideal-clock seeding: every consumer whose domain row is not propagated
+    // sees an edge at that row's clock latency (source + network), but the
+    // edge's phase still follows the clock network: `ideal_clock_parity`
+    // tracks inverting cells so a transition produced by clock-edge parity
+    // `p` is seeded half a period later per unit of `p` (rise on edge 0 at
+    // the latency, fall on edge 1 half a period on). `set_clock_transition`
+    // is the clock pin's slew; without it the slew is zero. A propagated row
+    // whose network did not reach the pin leaves it UNREACHED — the NoClock
+    // skip — rather than silently taking an ideal edge.
+    let clock_pins = graph
+        .launches
+        .iter()
+        .map(|l| l.clk)
+        .chain(graph.checks.iter().filter_map(|(_, c)| c.clk))
+        .chain(graph.latch_opens.iter().map(|o| o.enable))
+        .chain(graph.gating_enables.iter().map(|g| g.clk_pin))
+        .chain(graph.pulse_width_checks.iter().map(|c| c.pin));
+    for clk in clock_pins {
+        let idx = clk.0 as usize;
+        let dom = clock_domain[idx];
+        if dom == u8::MAX || sdc.clocks[dom as usize].propagated {
+            continue;
         }
-        // OpenSTA's clock-pin vertices carry propagated source-latency +
-        // cell-delay arrivals even under the ideal clock — `report_arrival`
-        // shows them and `report_pulse_width_checks` measures pulse widths
-        // from them. Propagate them when the design has pulse-width checks;
-        // required widths still read the ideal seeds above (measured
-        // `viol.sdc`: skewed propagated widths, table at `set_clock_transition`).
-        if !graph.pulse_width_checks.is_empty() {
-            let unified_slew =
-                propagate_slew(&cx, &graph, &wire_delays_per_net, &state_ports)?;
-            let (mut clk_state, _) =
-                propagate_clock(&cx, &levelized, &wire_delays_per_net, &unified_slew);
-            for (c, u) in clk_state.iter_mut().zip(unified_slew.iter()) {
-                c.slew_max = u.slew_max;
-                c.slew_min = u.slew_min;
-            }
-            clock_state = Some(clk_state);
+        let row = &sdc.clocks[dom as usize];
+        let ideal_latency = row.latency_ns + row.source_latency_ns;
+        let transition = row.transition_ns;
+        for pol in [RISE, FALL] {
+            // Unreached pins keep the source-port convention: transition
+            // `pol` sits on clock-edge parity `pol`.
+            let p = ideal_par[idx][pol];
+            let edge_par = if p <= 1 { p as usize } else { pol };
+            base_state[idx].merge(
+                pol,
+                ideal_latency + row.edge_offset(edge_par),
+                ideal_latency + row.edge_offset(edge_par),
+                ideal_latency + row.edge_offset(edge_par),
+                ideal_latency + row.edge_offset(edge_par),
+                transition,
+                transition,
+                1 << edge_par,
+                1 << edge_par,
+                0,
+                0,
+                dom_bit(dom as usize),
+                dom_bit(dom as usize),
+            );
         }
     }
+    let clock_parity = Some(clock_parity);
 
     // A launch produces separate late/early arrivals: the clock edge time is not
     // derated, but the cell arc delay is, per `set_timing_derate`. `edge_pol` selects which
@@ -2612,6 +2732,7 @@ fn prepare_sta<'a>(
                 q: l.q,
                 par: launch_parity(l.clk, l.edge),
                 tag: launch_tag(l),
+                dom: clock_domain[l.clk.0 as usize],
                 pairs: eval_launch(l.q, base_state[l.clk.0 as usize], l.lib_arc, l.edge, false),
             })
             .collect()
@@ -2623,6 +2744,7 @@ fn prepare_sta<'a>(
                 q: l.q,
                 par: launch_parity(l.clk, l.edge),
                 tag: launch_tag(l),
+                dom: clock_domain[l.clk.0 as usize],
                 pairs: eval_launch(l.q, base_state[l.clk.0 as usize], l.lib_arc, l.edge, false),
             })
             .collect()
@@ -2640,6 +2762,7 @@ fn prepare_sta<'a>(
             // Latch clock-to-Q launches take the sentinel: latch CRPR is not
             // modelled, so arrivals through the open edge claim no credit.
             tag: 1,
+            dom: clock_domain[open.enable.0 as usize],
             pairs: eval_launch(
                 open.q,
                 base_state[open.enable.0 as usize],
@@ -2661,6 +2784,7 @@ fn prepare_sta<'a>(
         launch_seeds,
         latch_seeds,
         clock_parity,
+        clock_domain,
         clock_state,
         crpr_tags,
     })
@@ -2695,7 +2819,19 @@ fn eval_sta(
             if ok {
                 // A port is no flip-flop launch: the CRPR sentinel bit.
                 state[p].merge(
-                    pol, arr_max, arr_min, arr_max, arr_min, slew_max, slew_min, 1, 0, 1, 1,
+                    pol,
+                    arr_max,
+                    arr_min,
+                    arr_max,
+                    arr_min,
+                    slew_max,
+                    slew_min,
+                    1,
+                    0,
+                    1,
+                    1,
+                    dom_bit(seed.dom as usize),
+                    dom_bit(seed.dom as usize),
                 );
             } else {
                 state[p].merge(
@@ -2706,6 +2842,8 @@ fn eval_sta(
                     f32::INFINITY,
                     slew_max,
                     slew_min,
+                    0,
+                    0,
                     0,
                     0,
                     0,
@@ -2731,6 +2869,8 @@ fn eval_sta(
                         1 << seed.par,
                         seed.tag,
                         seed.tag,
+                        dom_bit(seed.dom as usize),
+                        dom_bit(seed.dom as usize),
                     );
                 } else {
                     state[pair.q.0 as usize].merge(
@@ -2741,6 +2881,8 @@ fn eval_sta(
                         f32::INFINITY,
                         pair.slew_max,
                         pair.slew_min,
+                        0,
+                        0,
                         0,
                         0,
                         0,
@@ -2835,13 +2977,22 @@ fn eval_sta(
                             let info = &graph.latch_info[li as usize];
                             let en = state[info.enable.0 as usize];
                             let close_pol = 1 - info.open_pol;
-                            if !en.reached(info.open_pol) || !en.reached(close_pol) {
+                            let en_dom = prepared.clock_domain[info.enable.0 as usize];
+                            if !en.reached(info.open_pol)
+                                || !en.reached(close_pol)
+                                || en_dom == u8::MAX
+                            {
                                 continue;
                             }
+                            // The borrow window and cap read the enable's own
+                            // domain row — a latch on a second clock borrows
+                            // against its period and uncertainty, not the
+                            // design clock's.
+                            let en_clk = &sdc.clocks[en_dom as usize];
                             let open = en.arrival_min[info.open_pol];
                             let mut close = en.arrival_min[close_pol];
                             if close <= open {
-                                close += sdc.period_ns;
+                                close += en_clk.period_ns;
                             }
                             let pulse = close - open;
                             let Some(setup_table) =
@@ -2857,15 +3008,20 @@ fn eval_sta(
                                         false,
                                         check_transition(&lib.arcs[info.setup_arc as usize]),
                                     );
-                            if src.arrival_max[src_pol] <= open - sdc.setup_uncertainty_ns {
+                            // Same accessor as every other eval-side
+                            // uncertainty read: the arriving data's launch
+                            // mask against the latch enable's domain row —
+                            // identical to the row field on rule-free SDCs.
+                            let unc =
+                                unc_worst(sdc, src.dom_max[src_pol], en_dom as usize, false);
+                            if src.arrival_max[src_pol] <= open - unc {
                                 continue;
                             }
                             let cap = |arr: f32| {
-                                let k = ((arr - open) / sdc.period_ns).floor().max(0.0);
+                                let k =
+                                    ((arr - open) / en_clk.period_ns).floor().max(0.0);
                                 arr.min(
-                                    open + k * sdc.period_ns + pulse
-                                        - sdc.setup_uncertainty_ns
-                                        - setup,
+                                    open + k * en_clk.period_ns + pulse - unc - setup,
                                 )
                             };
                             (cap(src.arrival_max[src_pol]), cap(src.dly_max[src_pol]))
@@ -2894,6 +3050,8 @@ fn eval_sta(
                             src.par_min[src_pol],
                             src.crpr_max[src_pol],
                             src.crpr_min[src_pol],
+                            src.dom_max[src_pol],
+                            src.dom_min[src_pol],
                         );
                         changed = true;
                     }
@@ -2927,6 +3085,7 @@ fn eval_sta(
         prepared.clock_state.as_deref(),
         &state,
         prepared.clock_parity.as_deref(),
+        &prepared.clock_domain,
         &prepared.crpr_tags,
         skipped_seed,
     )?;
@@ -2999,6 +3158,17 @@ struct ExceptionCtx<'p, 'd> {
     /// OpenSTA semantics: `-from [get_pins inst/CLK]` selects the launches,
     /// while `inst/Q` and `inst/D` cover nothing.
     clk_launch: HashMap<u32, Vec<u32>>,
+    /// Launch key -> `Sdc::clocks` row of the clock launching it: the raw
+    /// `-clock` row for an input port (a virtual row keeps its identity),
+    /// the clock pin's domain row for a register output. `ObjSel::Clocks`
+    /// and bare clock `-name`s select through it (measured `t2_selfa`,
+    /// `t2_selbare`); an unclocked port has no entry and is never covered.
+    key_dom: HashMap<u32, usize>,
+    /// Endpoint pin -> `Sdc::clocks` row it is captured/anchored on: check
+    /// and gate rows come from `clock_domain`, an output port's from its
+    /// declared `-clock` row. `-to [get_clocks]` selects through it
+    /// (measured `t2_selfb`).
+    ep_cap: HashMap<u32, usize>,
     unresolved: usize,
 }
 
@@ -3068,44 +3238,95 @@ impl ExceptionCtx<'_, '_> {
         }
     }
 
-    /// `ObjSel` -> the launch-source pins it covers. Ports match only seeded
-    /// data inputs (the clock port is never a launch source); cells match
-    /// launch pins owned by the resolved instances.
-    fn resolve_from(&mut self, sel: &ObjSel) -> HashSet<u32> {
+    /// A clock `-name`'s `Sdc::clocks` row — the same name-only lookup
+    /// `Parser::resolve_clock`/`clock_rows` apply (measured: a clock's
+    /// source-port name is not a clock handle; `-from clk1` resolves to
+    /// the port object, `t2_selport`).
+    fn clock_row(&self, name: &str) -> Option<usize> {
+        self.sdc().clocks.iter().position(|c| c.name == name)
+    }
+
+    /// Launch keys anchored on the given clock rows (`ObjSel::Clocks` and
+    /// bare clock `-name`s resolve here).
+    fn keys_on_clocks(&self, rows: &[usize]) -> HashSet<u32> {
+        self.launch_keys
+            .iter()
+            .copied()
+            .filter(|k| self.key_dom.get(k).is_some_and(|r| rows.contains(r)))
+            .collect()
+    }
+
+    /// Endpoint pins captured on the given clock rows.
+    fn eps_on_clocks(&self, rows: &[usize]) -> HashSet<u32> {
+        self.endpoint_pins
+            .iter()
+            .copied()
+            .filter(|p| self.ep_cap.get(p).is_some_and(|r| rows.contains(r)))
+            .collect()
+    }
+
+    /// `ObjSel` -> `(launch-source pin coverage, resolved_any)`. Ports match
+    /// only seeded data inputs (the clock port is never a launch source);
+    /// cells match launch pins owned by the resolved instances.
+    /// `resolved_any` is whether the selector resolved at least one object —
+    /// OpenSTA's `no valid objects specified` fires only on zero resolved
+    /// objects; a resolved object that covers nothing is a silent dead rule
+    /// (measured `t2_selport`: `-from clk1` resolves to the port object,
+    /// covers nothing, warns nothing).
+    fn resolve_from(&mut self, sel: &ObjSel) -> (HashSet<u32>, bool) {
         let prepared = self.prepared;
+        let design = prepared.cx.design;
         match sel {
             ObjSel::Ports(ps) => {
-                let clock = self.sdc().clock_port.as_deref();
-                prepared
-                    .port_seeds
-                    .iter()
-                    .filter(|s| ps.matches(prepared.cx.port_name(s.pin), true, clock))
-                    .map(|s| s.pin.0)
-                    .collect()
+                let resolved_any = design.io_pins.iter().any(|&p| {
+                    ps.matches(
+                        prepared.cx.port_name(p),
+                        design.pin_dirs[p.0 as usize] == PinDir::Input,
+                        self.sdc(),
+                    )
+                });
+                (
+                    prepared
+                        .port_seeds
+                        .iter()
+                        .filter(|s| ps.matches(prepared.cx.port_name(s.pin), true, self.sdc()))
+                        .map(|s| s.pin.0)
+                        .collect(),
+                    resolved_any,
+                )
             }
             ObjSel::Cells(cs) => {
                 let ids = self.cell_sel_ids(cs);
-                self.launch_keys
-                    .iter()
-                    .copied()
-                    .filter(|&k| {
-                        self.design().pin_cells[k as usize].is_some_and(|c| ids.contains(&c))
-                    })
-                    .collect()
+                let resolved_any = !ids.is_empty();
+                (
+                    self.launch_keys
+                        .iter()
+                        .copied()
+                        .filter(|&k| {
+                            self.design().pin_cells[k as usize].is_some_and(|c| ids.contains(&c))
+                        })
+                        .collect(),
+                    resolved_any,
+                )
             }
             ObjSel::Pins(specs) => {
                 let mut out = HashSet::new();
+                let mut resolved_any = false;
                 for spec in specs {
+                    resolved_any |= self.pin_by_path.contains_key(spec);
                     self.pin_launches(spec, &mut out);
                 }
-                out
+                (out, resolved_any)
             }
+            ObjSel::Clocks(rows) => (self.keys_on_clocks(rows), !rows.is_empty()),
             ObjSel::Names(names) => {
                 let mut out = HashSet::new();
+                let mut resolved_any = false;
                 for n in names {
                     // Bare `instance/pin` names are pin specs, the same
                     // objects `get_pins` returns.
                     if n.contains('/') {
+                        resolved_any |= self.pin_by_path.contains_key(n);
                         self.pin_launches(n, &mut out);
                         continue;
                     }
@@ -3116,56 +3337,180 @@ impl ExceptionCtx<'_, '_> {
                             hit = true;
                         }
                     }
+                    // A bare port name resolves to the port object whether
+                    // or not it launches anything — resolved but dead when
+                    // it is not a launch source (measured `t2_selport`).
+                    if !hit && design.io_pins.iter().any(|&p| prepared.cx.port_name(p) == n) {
+                        hit = true;
+                    }
                     if let Some(&c) = self.cell_by_name.get(n)
                         && let Some(ks) = self.keys_by_cell.get(&c)
                     {
                         out.extend(ks.iter().copied());
                         hit = true;
                     }
+                    // A bare clock `-name` resolves as the clock object
+                    // (measured `t2_selbare`: `-from cka` cuts the same
+                    // launches as `-from [get_clocks cka]`). A clock's
+                    // source-port name is a port object, not a clock
+                    // handle (`t2_selport`), so `clock_row` matches `-name`
+                    // only.
+                    if let Some(row) = self.clock_row(n) {
+                        out.extend(self.keys_on_clocks(&[row]));
+                        hit = true;
+                    }
+                    resolved_any |= hit;
                     if !hit {
                         self.unresolved += 1;
                     }
                 }
-                out
+                (out, resolved_any)
             }
         }
     }
 
-    /// `ObjSel` -> the endpoint pins it covers. Ports match output ports
-    /// only; cells match endpoint pins owned by the resolved instances
-    /// (register checks and clock-gate enables alike).
-    fn resolve_to(&mut self, sel: &ObjSel) -> HashSet<u32> {
+    /// One `instance/pin` spec inside a path-delay `-from`: a clock pin keeps
+    /// the launch-key expansion (`pin_launches`); a pin that is itself a
+    /// launch element (a Q pin) is a startpoint pin — the delay check then
+    /// times the segment from it (measured `t2_mdx`). Any other pin covers
+    /// nothing. `out` gets the signature-coverage keys, `pins` the
+    /// startpoints.
+    fn delay_pin_spec(&mut self, spec: &str, out: &mut HashSet<u32>, pins: &mut HashSet<u32>) {
+        match self.pin_by_path.get(spec) {
+            Some(&pid) => {
+                if let Some(qs) = self.clk_launch.get(&pid) {
+                    out.extend(qs.iter().copied());
+                } else if self.launch_keys.contains(&pid) {
+                    out.insert(pid);
+                    pins.insert(pid);
+                }
+            }
+            None => self.unresolved += 1,
+        }
+    }
+
+    /// `ObjSel` -> `(launch keys, startpoint pins, resolved_any)` for a
+    /// path-delay `-from`. Ports and cells resolve like the exception
+    /// commands; pin specs go through [`Self::delay_pin_spec`].
+    /// `resolved_any` has the same zero-resolved-objects meaning as
+    /// [`Self::resolve_from`].
+    fn resolve_delay_from(&mut self, sel: &ObjSel) -> (HashSet<u32>, HashSet<u32>, bool) {
         let prepared = self.prepared;
+        let design = prepared.cx.design;
         match sel {
-            ObjSel::Ports(ps) => {
-                let clock = self.sdc().clock_port.as_deref();
-                self.output_ports
-                    .iter()
-                    .copied()
-                    .filter(|&p| ps.matches(prepared.cx.port_name(PinId(p)), false, clock))
-                    .collect()
-            }
-            ObjSel::Cells(cs) => {
-                let ids = self.cell_sel_ids(cs);
-                self.endpoint_pins
-                    .iter()
-                    .copied()
-                    .filter(|&p| {
-                        self.design().pin_cells[p as usize].is_some_and(|c| ids.contains(&c))
-                    })
-                    .collect()
-            }
             ObjSel::Pins(specs) => {
                 let mut out = HashSet::new();
+                let mut pins = HashSet::new();
+                let mut resolved_any = false;
                 for spec in specs {
-                    self.pin_endpoints(spec, &mut out);
+                    resolved_any |= self.pin_by_path.contains_key(spec);
+                    self.delay_pin_spec(spec, &mut out, &mut pins);
                 }
-                out
+                (out, pins, resolved_any)
             }
             ObjSel::Names(names) => {
                 let mut out = HashSet::new();
+                let mut pins = HashSet::new();
+                let mut resolved_any = false;
                 for n in names {
                     if n.contains('/') {
+                        resolved_any |= self.pin_by_path.contains_key(n);
+                        self.delay_pin_spec(n, &mut out, &mut pins);
+                        continue;
+                    }
+                    let mut hit = false;
+                    for s in &prepared.port_seeds {
+                        if prepared.cx.port_name(s.pin) == n {
+                            out.insert(s.pin.0);
+                            hit = true;
+                        }
+                    }
+                    if !hit && design.io_pins.iter().any(|&p| prepared.cx.port_name(p) == n) {
+                        hit = true;
+                    }
+                    if let Some(&c) = self.cell_by_name.get(n)
+                        && let Some(ks) = self.keys_by_cell.get(&c)
+                    {
+                        out.extend(ks.iter().copied());
+                        hit = true;
+                    }
+                    if let Some(row) = self.clock_row(n) {
+                        out.extend(self.keys_on_clocks(&[row]));
+                        hit = true;
+                    }
+                    resolved_any |= hit;
+                    if !hit {
+                        self.unresolved += 1;
+                    }
+                }
+                (out, pins, resolved_any)
+            }
+            _ => {
+                let (out, resolved_any) = self.resolve_from(sel);
+                (out, HashSet::new(), resolved_any)
+            }
+        }
+    }
+
+    /// `ObjSel` -> `(endpoint pin coverage, resolved_any)`. Ports match
+    /// output ports only; cells match endpoint pins owned by the resolved
+    /// instances (register checks and clock-gate enables alike). A bare
+    /// port name resolves to the port object regardless of direction —
+    /// `-to clk2` resolves dead (measured `t2_selpto`: OpenSTA warns
+    /// `not a valid endpoint` and covers nothing).
+    fn resolve_to(&mut self, sel: &ObjSel) -> (HashSet<u32>, bool) {
+        let prepared = self.prepared;
+        let design = prepared.cx.design;
+        match sel {
+            ObjSel::Ports(ps) => {
+                let resolved_any = design.io_pins.iter().any(|&p| {
+                    ps.matches(
+                        prepared.cx.port_name(p),
+                        design.pin_dirs[p.0 as usize] == PinDir::Input,
+                        self.sdc(),
+                    )
+                });
+                (
+                    self.output_ports
+                        .iter()
+                        .copied()
+                        .filter(|&p| {
+                            ps.matches(prepared.cx.port_name(PinId(p)), false, self.sdc())
+                        })
+                        .collect(),
+                    resolved_any,
+                )
+            }
+            ObjSel::Cells(cs) => {
+                let ids = self.cell_sel_ids(cs);
+                let resolved_any = !ids.is_empty();
+                (
+                    self.endpoint_pins
+                        .iter()
+                        .copied()
+                        .filter(|&p| {
+                            self.design().pin_cells[p as usize].is_some_and(|c| ids.contains(&c))
+                        })
+                        .collect(),
+                    resolved_any,
+                )
+            }
+            ObjSel::Pins(specs) => {
+                let mut out = HashSet::new();
+                let mut resolved_any = false;
+                for spec in specs {
+                    resolved_any |= self.pin_by_path.contains_key(spec);
+                    self.pin_endpoints(spec, &mut out);
+                }
+                (out, resolved_any)
+            }
+            ObjSel::Clocks(rows) => (self.eps_on_clocks(rows), !rows.is_empty()),
+            ObjSel::Names(names) => {
+                let mut out = HashSet::new();
+                let mut resolved_any = false;
+                for n in names {
+                    if n.contains('/') {
+                        resolved_any |= self.pin_by_path.contains_key(n);
                         self.pin_endpoints(n, &mut out);
                         continue;
                     }
@@ -3176,17 +3521,25 @@ impl ExceptionCtx<'_, '_> {
                             hit = true;
                         }
                     }
+                    if !hit && design.io_pins.iter().any(|&p| prepared.cx.port_name(p) == n) {
+                        hit = true;
+                    }
                     if let Some(&c) = self.cell_by_name.get(n)
                         && let Some(eps) = self.eps_by_cell.get(&c)
                     {
                         out.extend(eps.iter().copied());
                         hit = true;
                     }
+                    if let Some(row) = self.clock_row(n) {
+                        out.extend(self.eps_on_clocks(&[row]));
+                        hit = true;
+                    }
+                    resolved_any |= hit;
                     if !hit {
                         self.unresolved += 1;
                     }
                 }
-                out
+                (out, resolved_any)
             }
         }
     }
@@ -3205,11 +3558,17 @@ struct ResolvedException {
 }
 
 /// A `set_max_delay`/`set_min_delay` with its selectors resolved to concrete
-/// pin sets — the same `from`/`to` convention as [`ResolvedException`].
+/// pin sets — the same `from`/`to` convention as [`ResolvedException`], plus
+/// `from_pins`: `get_pins inst/<non-clock-pin>` `-from` specs are startpoint
+/// pins, not launch selectors — measured OpenSTA semantics (`t2_mdx`): the
+/// pin itself becomes the path startpoint, so the delay check times the
+/// segment from it (arrival measured from the pin, no clock anchor at all).
+/// `None` when the rule has no pin-startpoint `-from`.
 struct ResolvedPathDelay {
     kind: PathDelayKind,
     from: Option<HashSet<u32>>,
     to: Option<HashSet<u32>>,
+    from_pins: Option<HashSet<u32>>,
     value_ns: f32,
 }
 
@@ -3277,6 +3636,40 @@ fn endpoint_skip_reason(
     }
 }
 
+/// Fanout-cone leaves of one launch key: pins with neither net sinks nor
+/// outgoing graph edges. A `set_max_delay`/`set_min_delay` whose `-from`
+/// covers the key produces an "internal path endpoint" row on each leaf
+/// (measured `t2_selmd`: `u_fy/Q`, a fanout-free net driver).
+fn dead_end_leaves(design: &DesignDb, graph: &TimingGraph, start: PinId) -> Vec<u32> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![start];
+    let mut seen = HashSet::new();
+    while let Some(pin) = stack.pop() {
+        if !seen.insert(pin) {
+            continue;
+        }
+        let mut fwd = false;
+        if let Some(net) = design.pin_nets[pin.0 as usize]
+            && design.net_driver(net) == Some(pin)
+        {
+            for &sink in design.net_pins(net).iter().skip(1) {
+                if sink != pin {
+                    stack.push(sink);
+                    fwd = true;
+                }
+            }
+        }
+        for &e in graph.outgoing(pin) {
+            stack.push(graph.edges[e as usize].dst);
+            fwd = true;
+        }
+        if !fwd {
+            leaves.push(pin.0);
+        }
+    }
+    leaves
+}
+
 fn emit_sta_warnings(report: &StaReport) {
     for category in report.skipped.nonzero() {
         // Deferred check arcs are a documented, counted deferral shown in the report —
@@ -3324,11 +3717,21 @@ fn run_sta_partitioned(
 
     let mut launch_keys = HashSet::new();
     let mut keys_by_cell: HashMap<CellId, Vec<u32>> = HashMap::new();
+    // Clock rows each launch key is anchored on: a port reads its declared
+    // `-clock` (a virtual row keeps its identity for `get_clocks` matching),
+    // a register output the domain row of its clock pin.
+    let mut key_dom: HashMap<u32, usize> = HashMap::new();
     for s in &prepared.port_seeds {
         launch_keys.insert(s.pin.0);
+        if let Some(row) = sdc.declared_input_clock_row(cx.port_name(s.pin)) {
+            key_dom.insert(s.pin.0, row);
+        }
     }
     for s in prepared.launch_seeds.iter().chain(&prepared.latch_seeds) {
         launch_keys.insert(s.q.0);
+        if s.dom != u8::MAX {
+            key_dom.insert(s.q.0, s.dom as usize);
+        }
         if let Some(c) = design.pin_cells[s.q.0 as usize] {
             keys_by_cell.entry(c).or_default().push(s.q.0);
         }
@@ -3337,9 +3740,18 @@ fn run_sta_partitioned(
     let mut endpoint_pins = HashSet::new();
     let mut eps_by_cell: HashMap<CellId, Vec<u32>> = HashMap::new();
     let mut ep_kinds = HashMap::new();
+    // Clock rows each endpoint is captured/anchored on — the `-to`
+    // `[get_clocks]`/group side of the launch/capture pair.
+    let mut ep_cap: HashMap<u32, usize> = HashMap::new();
     for &(d, check) in &graph.checks {
         endpoint_pins.insert(d);
         ep_kinds.insert(d, ExceptionEndpointKind::Check { latch: check.latch });
+        if let Some(clk) = check.clk {
+            let row = prepared.clock_domain[clk.0 as usize];
+            if row != u8::MAX {
+                ep_cap.insert(d, row as usize);
+            }
+        }
         if let Some(c) = design.pin_cells[d as usize] {
             eps_by_cell.entry(c).or_default().push(d);
         }
@@ -3350,6 +3762,10 @@ fn run_sta_partitioned(
         ep_kinds
             .entry(e)
             .or_insert(ExceptionEndpointKind::ClockGate);
+        let row = prepared.clock_domain[g.clk_pin.0 as usize];
+        if row != u8::MAX {
+            ep_cap.insert(e, row as usize);
+        }
         if let Some(c) = design.pin_cells[e as usize] {
             eps_by_cell.entry(c).or_default().push(e);
         }
@@ -3362,6 +3778,9 @@ fn run_sta_partitioned(
             ep_kinds
                 .entry(p.0)
                 .or_insert(ExceptionEndpointKind::OutputPort);
+            if let Some(row) = sdc.declared_output_clock_row(cx.port_name(p)) {
+                ep_cap.insert(p.0, row);
+            }
         }
     }
 
@@ -3394,19 +3813,26 @@ fn run_sta_partitioned(
         ep_kinds,
         pin_by_path,
         clk_launch,
+        key_dom,
+        ep_cap,
         unresolved: 0,
     };
 
     let mut rules = Vec::with_capacity(sdc.exceptions.len() + sdc.path_delays.len());
+    // A selector side is unresolved only when it resolves zero objects —
+    // OpenSTA's `no valid objects specified` form. A resolved object that
+    // covers nothing is a silent dead rule, not a diagnostic.
     let mut resolve_sides = |from_sel: Option<&ObjSel>, to_sel: Option<&ObjSel>| {
-        let from = from_sel.map(|sel| ctx.resolve_from(sel));
-        if from.as_ref().is_some_and(|f| f.is_empty()) {
-            ctx.unresolved += 1;
-        }
-        let to = to_sel.map(|sel| ctx.resolve_to(sel));
-        if to.as_ref().is_some_and(|t| t.is_empty()) {
-            ctx.unresolved += 1;
-        }
+        let from = from_sel.map(|sel| {
+            let (keys, resolved_any) = ctx.resolve_from(sel);
+            ctx.unresolved += usize::from(!resolved_any);
+            keys
+        });
+        let to = to_sel.map(|sel| {
+            let (eps, resolved_any) = ctx.resolve_to(sel);
+            ctx.unresolved += usize::from(!resolved_any);
+            eps
+        });
         (from, to)
     };
     for ex in &sdc.exceptions {
@@ -3420,13 +3846,70 @@ fn run_sta_partitioned(
         }));
     }
     for pd in &sdc.path_delays {
-        let (from, to) = resolve_sides(pd.from.as_ref(), pd.to.as_ref());
+        let (from, from_pins, resolved_any) = pd
+            .from
+            .as_ref()
+            .map(|sel| ctx.resolve_delay_from(sel))
+            .unwrap_or_default();
+        if pd.from.is_some() && !resolved_any {
+            ctx.unresolved += 1;
+        }
+        let to = pd.to.as_ref().map(|sel| {
+            let (eps, resolved_any) = ctx.resolve_to(sel);
+            ctx.unresolved += usize::from(!resolved_any);
+            eps
+        });
         rules.push(ResolvedRule::Delay(ResolvedPathDelay {
             kind: pd.kind,
-            from,
+            from: pd.from.as_ref().map(|_| from),
             to,
+            from_pins: (!from_pins.is_empty()).then_some(from_pins),
             value_ns: pd.value_ns,
         }));
+    }
+
+    // `set_clock_groups` desugars to false-path pairs on clock rows
+    // (measured `t2_grp`, `t2_grp1`): each `-group` makes its members
+    // exclusive against every clock not in that group — same-group pairs
+    // stay synchronous, and a lone group cuts its members against all other
+    // clocks. The three mode flags share this exclusion path
+    // (`t2_grpl`/`t2_grpp` measured identical); `-allow_paths` stores no
+    // group at all. Group coverage anchors on the same declared rows the
+    // selectors use, so a group cut also voids a delay rule crossing the
+    // pair (`t2_grpd`/`t2_grpd2`).
+    for cg in &sdc.clock_groups {
+        for grp in &cg.groups {
+            let in_group = |row: &usize| grp.contains(row);
+            let keys_where = |member: bool| {
+                ctx.launch_keys
+                    .iter()
+                    .copied()
+                    .filter(|k| ctx.key_dom.get(k).is_some_and(|r| in_group(r) == member))
+                    .collect::<HashSet<u32>>()
+            };
+            let eps_where = |member: bool| {
+                ctx.endpoint_pins
+                    .iter()
+                    .copied()
+                    .filter(|p| ctx.ep_cap.get(p).is_some_and(|r| in_group(r) == member))
+                    .collect::<HashSet<u32>>()
+            };
+            for (from, to) in [
+                (keys_where(true), eps_where(false)),
+                (keys_where(false), eps_where(true)),
+            ] {
+                if from.is_empty() || to.is_empty() {
+                    continue;
+                }
+                rules.push(ResolvedRule::Exception(ResolvedException {
+                    kind: ExceptionKind::FalsePath,
+                    from: Some(from),
+                    to: Some(to),
+                    setup_n: None,
+                    hold_n: None,
+                }));
+            }
+        }
     }
 
     // A launch source's signature is the file-ordered rule indices whose
@@ -3533,8 +4016,24 @@ fn run_sta_partitioned(
             let mut mc_hold: Option<i32> = None;
             let mut delay_max_n: Option<f32> = None;
             let mut delay_min_n: Option<f32> = None;
+            let mut delay_max_pins: Option<HashSet<u32>> = None;
+            let mut delay_min_pins: Option<HashSet<u32>> = None;
+            // A pin-startpoint `-from` (`get_pins inst/Q`) replaces the
+            // clocked launch of every source in the class with paths starting
+            // at the pin (measured `t2_mdx`): an endpoint the rule's `-to`
+            // does not cover loses the clocked check on that side entirely.
+            let mut pin_from_sig_max = false;
+            let mut pin_from_sig_min = false;
             for &ri in sigma {
                 let rule = &rules[ri as usize];
+                if let ResolvedRule::Delay(d) = rule
+                    && d.from_pins.is_some()
+                {
+                    match d.kind {
+                        PathDelayKind::Max => pin_from_sig_max = true,
+                        PathDelayKind::Min => pin_from_sig_min = true,
+                    }
+                }
                 if !rule.to().as_ref().is_none_or(|s| s.contains(&ep)) {
                     continue;
                 }
@@ -3554,8 +4053,14 @@ fn run_sta_partitioned(
                         }
                     },
                     ResolvedRule::Delay(d) => match d.kind {
-                        PathDelayKind::Max => delay_max_n = Some(d.value_ns),
-                        PathDelayKind::Min => delay_min_n = Some(d.value_ns),
+                        PathDelayKind::Max => {
+                            delay_max_n = Some(d.value_ns);
+                            delay_max_pins = d.from_pins.clone();
+                        }
+                        PathDelayKind::Min => {
+                            delay_min_n = Some(d.value_ns);
+                            delay_min_pins = d.from_pins.clone();
+                        }
                     },
                 }
             }
@@ -3564,6 +4069,12 @@ fn run_sta_partitioned(
             }
             survived = true;
             let mut pols = *pols;
+            if pin_from_sig_max && delay_max_n.is_none() {
+                pols.max = [None; 2];
+            }
+            if pin_from_sig_min && delay_min_n.is_none() {
+                pols.min = [None; 2];
+            }
             // Delay checks are modelled for every check pin carrying a check
             // arc — FF setup/hold, latch-D, and async recovery/removal — plus
             // output ports (measured `delay_*` goldens). Clock-gate enables
@@ -3594,10 +4105,28 @@ fn run_sta_partitioned(
                 // arrival is the delay arrival (identical to `arr` unless the
                 // path launched through a latch open edge).
                 let (_, delay_max) = sdc.output_delay_ns(cx.port_name(PinId(ep)));
-                for w in pols.max.iter_mut().flatten() {
-                    w.arr = w.dly;
-                    w.req = n - delay_max - sdc.setup_uncertainty_ns;
+                let out_row = sdc.output_clock_row(cx.port_name(PinId(ep)));
+                let s = class_states[ci][ep as usize];
+                // Cross-domain launch bits anchor at the capture domain's
+                // edge 0 (delay checks skip pairing); each polarity's tying
+                // launch mask picks the worst matching inter-clock rule.
+                for pol in [RISE, FALL] {
+                    let Some(mut w) = pols.max[pol] else { continue };
+                    let unc = unc_worst(sdc, s.dom_max[pol], out_row, false);
+                    if let Some(pins) = &delay_max_pins {
+                        let Some(arr) =
+                            pin_segment_arrival(pins, &class_states[ci], w.dly, pol, false)
+                        else {
+                            pols.max[pol] = None;
+                            continue;
+                        };
+                        w.arr = arr;
+                    } else {
+                        w.arr = w.dly;
+                    }
+                    w.req = n - delay_max - unc;
                     w.slack = w.req - w.arr;
+                    pols.max[pol] = Some(w);
                 }
             }
             if let Some(n) = delay_max_n
@@ -3616,9 +4145,36 @@ fn run_sta_partitioned(
                         continue;
                     };
                     let clk_s = class_states[ci][clk.0 as usize];
+                    // The delay check rewrites the required time on the
+                    // endpoint register's own capture row.
+                    let cap_row = prepared.clock_domain[clk.0 as usize] as usize;
+                    let cap_clk = &sdc.clocks[cap_row];
                     let t_setup =
                         eval_nldm_constraint(table, s.slew_max[pol], clk_s.slew_max[check.edge])
                             * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
+                    if let Some(pins) = &delay_max_pins {
+                        // Pin `-from` startpoint (measured `t2_mdx`): the
+                        // check times the segment from the pin — arrival is
+                        // the endpoint's delay minus the pin's own, required
+                        // time `N - t_setup` with no clock anchor, latency,
+                        // or uncertainty. Each reached pin yields its own
+                        // constrained path; the largest segment arrival is
+                        // worst, and with none reached the polarity drops.
+                        let Some(arr) =
+                            pin_segment_arrival(pins, &class_states[ci], w.dly, pol, false)
+                        else {
+                            pols.max[pol] = None;
+                            continue;
+                        };
+                        let req = n - t_setup;
+                        pols.max[pol] = Some(Worst {
+                            arr,
+                            req,
+                            slack: req - arr,
+                            ..w
+                        });
+                        continue;
+                    }
                     if check.latch && check.setup_arc.is_some() {
                         // Latch-D delay check (measured `latch_borrow`
                         // `delay_*`): the delay edge opens a borrow window of
@@ -3633,9 +4189,10 @@ fn run_sta_partitioned(
                         let open = clk_s.arrival_min[1 - check.edge];
                         let mut close = clk_s.arrival_min[check.edge];
                         if close <= open {
-                            close += sdc.period_ns;
+                            close += cap_clk.period_ns;
                         }
-                        let base = n + clk_s.arrival_min[edge0_pol(clk)] - sdc.setup_uncertainty_ns;
+                        let base = n + clk_s.arrival_min[edge0_pol(clk)]
+                            - unc_worst(sdc, s.dom_max[pol], cap_row, false);
                         let req = w.dly.clamp(base, base + (close - open - t_setup).max(0.0));
                         pols.max[pol] = Some(Worst {
                             arr: w.dly,
@@ -3673,7 +4230,7 @@ fn run_sta_partitioned(
                     // `credit_for` does — the credit is zero under ideal
                     // (measured: `pcr_*` scenarios all use
                     // `set_propagated_clock`).
-                    let credit = if sdc.propagated_clock {
+                    let credit = if cap_clk.propagated {
                         design.pin_nets[clk.0 as usize].map_or(0.0, |capture_net| {
                             crpr_credit(
                                 design,
@@ -3687,7 +4244,8 @@ fn run_sta_partitioned(
                     } else {
                         0.0
                     };
-                    let req = capture - sdc.setup_uncertainty_ns - t_setup + n + credit;
+                    let req = capture - unc_worst(sdc, s.dom_max[pol], cap_row, false) - t_setup
+                        + n + credit;
                     pols.max[pol] = Some(Worst {
                         arr: w.dly,
                         req,
@@ -3705,10 +4263,25 @@ fn run_sta_partitioned(
                 // term at a time to separate delay_min from hold_uncertainty
                 // (they cancel at the preamble's 0.1/0.1).
                 let (delay_min, _) = sdc.output_delay_ns(cx.port_name(PinId(ep)));
-                for w in pols.min.iter_mut().flatten() {
-                    w.arr = w.dly;
-                    w.req = n - delay_min + sdc.hold_uncertainty_ns;
+                let out_row = sdc.output_clock_row(cx.port_name(PinId(ep)));
+                let s = class_states[ci][ep as usize];
+                for pol in [RISE, FALL] {
+                    let Some(mut w) = pols.min[pol] else { continue };
+                    let unc = unc_worst(sdc, s.dom_min[pol], out_row, true);
+                    if let Some(pins) = &delay_min_pins {
+                        let Some(arr) =
+                            pin_segment_arrival(pins, &class_states[ci], w.dly, pol, true)
+                        else {
+                            pols.min[pol] = None;
+                            continue;
+                        };
+                        w.arr = arr;
+                    } else {
+                        w.arr = w.dly;
+                    }
+                    w.req = n - delay_min + unc;
                     w.slack = w.arr - w.req;
+                    pols.min[pol] = Some(w);
                 }
             }
             if let Some(n) = delay_min_n
@@ -3720,6 +4293,34 @@ fn run_sta_partitioned(
                     let Some(w) = pols.min[pol] else {
                         continue;
                     };
+                    if let Some(pins) = &delay_min_pins
+                        && let Some(c) = check
+                        && let (Some(hold_arc), Some(clk)) = (c.hold_arc, c.clk)
+                        && let Some(table) = constraint_table(&lib.arcs[hold_arc as usize], pol)
+                    {
+                        // Pin `-from` startpoint, hold side: smallest segment
+                        // arrival is worst; `req = N + t_hold` (no anchor).
+                        let clk_s = class_states[ci][clk.0 as usize];
+                        let t_hold =
+                            eval_nldm_constraint(table, s.slew_min[pol], clk_s.slew_min[c.edge])
+                                * sdc.derate(false, DERATE_CHECK, false, check_transition(
+                                    &lib.arcs[hold_arc as usize],
+                                ));
+                        let Some(arr) =
+                            pin_segment_arrival(pins, &class_states[ci], w.dly, pol, true)
+                        else {
+                            pols.min[pol] = None;
+                            continue;
+                        };
+                        let req = n + t_hold;
+                        pols.min[pol] = Some(Worst {
+                            arr,
+                            req,
+                            slack: arr - req,
+                            ..w
+                        });
+                        continue;
+                    }
                     if let Some(c) = check
                         && c.latch
                         && let (Some(hold_arc), Some(clk)) = (c.hold_arc, c.clk)
@@ -3734,10 +4335,11 @@ fn run_sta_partitioned(
                         let t_hold =
                             eval_nldm_constraint(table, s.slew_min[pol], clk_s.slew_min[c.edge])
                                 * sdc.derate(false, DERATE_CHECK, false, check_transition(hold));
+                        let cap_row = prepared.clock_domain[clk.0 as usize] as usize;
                         let req = n
                             + clk_s.arrival_max[edge0_pol(clk)]
                             + t_hold
-                            + sdc.hold_uncertainty_ns;
+                            + unc_worst(sdc, s.dom_min[pol], cap_row, true);
                         pols.min[pol] = Some(Worst {
                             arr: w.dly,
                             req,
@@ -3772,7 +4374,24 @@ fn run_sta_partitioned(
                 ) {
                     let ns = mc_setup.unwrap_or(1) as f32;
                     let nh = mc_hold.unwrap_or(0) as f32;
-                    let period = sdc.period_ns;
+                    // The multiplier scales the endpoint's own capture period:
+                    // a register reads the row its clock pin's domain reached,
+                    // an output port the row its `-clock` resolved to.
+                    let period = match kind {
+                        ExceptionEndpointKind::OutputPort => sdc
+                            .clocks
+                            .get(sdc.output_clock_row(cx.port_name(PinId(ep))))
+                            .map_or(0.0, |c| c.period_ns),
+                        _ => check_by_pin
+                            .get(&ep)
+                            .and_then(|c| c.clk)
+                            .and_then(|clk| {
+                                sdc.clocks
+                                    .get(prepared.clock_domain[clk.0 as usize] as usize)
+                                    .map(|c| c.period_ns)
+                            })
+                            .unwrap_or_else(|| sdc.period_ns()),
+                    };
                     if delay_max_n.is_none() {
                         let d_max = (ns - 1.0) * period;
                         for w in pols.max.iter_mut().flatten() {
@@ -3781,8 +4400,40 @@ fn run_sta_partitioned(
                         }
                     }
                     if delay_min_n.is_none() {
-                        let d_min = ((ns - 1.0) - nh) * period;
-                        for w in pols.min.iter_mut().flatten() {
+                        // A cross-domain hold pair lives on the min-gap
+                        // grid — the setup multiplier does not carry into it
+                        // (measured `t2_mcp`: `d_min = -nh·Pc`). Mixed masks
+                        // take the cross-domain form, conservative.
+                        let s = class_states[ci][ep as usize];
+                        let cap_tag = match kind {
+                            ExceptionEndpointKind::OutputPort => launch_domain(
+                                sdc,
+                                sdc.output_clock_row(cx.port_name(PinId(ep))),
+                            ),
+                            _ => check_by_pin
+                                .get(&ep)
+                                .and_then(|c| c.clk)
+                                .map_or(usize::MAX, |clk| {
+                                    prepared.clock_domain[clk.0 as usize] as usize
+                                }),
+                        };
+                        let cap_bit = dom_bit(cap_tag);
+                        for (pol, w) in pols.min.iter_mut().enumerate() {
+                            let Some(w) = w else { continue };
+                            let d_min = if s.dom_min[pol] & !cap_bit != 0 {
+                                // A cross-domain hold pair on the min-gap
+                                // grid: an explicit `-hold` replaces the
+                                // hold edge outright (measured `t2_mcp`:
+                                // `-nh·Pc`); an absent one leaves the
+                                // setup multiplier's one-cycle carry
+                                // (`t2_selmc`: `(ns-1)·Pc`).
+                                match mc_hold {
+                                    Some(_) => -nh * period,
+                                    None => (ns - 1.0) * period,
+                                }
+                            } else {
+                                ((ns - 1.0) - nh) * period
+                            };
                             w.req += d_min;
                             w.slack = w.arr - w.req;
                         }
@@ -3820,6 +4471,95 @@ fn run_sta_partitioned(
         );
     }
 
+    // Internal path endpoints (measured `t2_selmd`): a delay rule whose
+    // `-from` covers a launch key also covers the path that ends at a
+    // dead-end pin in its fanout cone — OpenSTA reports it as an
+    // "internal path endpoint" row (`u_fy/Q`, a fanout-free net driver).
+    // A leaf is a pin with neither net sinks nor outgoing arcs. `-to`
+    // covers a leaf the same way it covers an endpoint; a resolved `-to`
+    // set only ever holds declared endpoints, so a leaf is reachable only
+    // through an absent `-to` (measured `t2_mdo`: no internal row).
+    for (ci, (sigma, keys)) in classes.iter().enumerate() {
+        // The leaf pass only ever produces a row under a delay rule — a
+        // signature class without one never traverses the fanout cone.
+        if !sigma
+            .iter()
+            .any(|&ri| matches!(rules[ri as usize], ResolvedRule::Delay(_)))
+        {
+            continue;
+        }
+        for &k in keys {
+            for leaf in dead_end_leaves(design, graph, PinId(k)) {
+                if ctx.endpoint_pins.contains(&leaf) {
+                    continue;
+                }
+                // Same per-class fold as the endpoint compose: last-wins
+                // per kind, a covering false path drops the leaf outright.
+                let covers = |t: &Option<HashSet<u32>>| {
+                    t.as_ref().is_none_or(|s| s.contains(&leaf))
+                };
+                let mut drop = false;
+                let mut delay_max_n = None;
+                let mut delay_min_n = None;
+                for &ri in sigma {
+                    match &rules[ri as usize] {
+                        ResolvedRule::Exception(ex)
+                            if ex.kind == ExceptionKind::FalsePath && covers(&ex.to) =>
+                        {
+                            drop = true;
+                        }
+                        ResolvedRule::Delay(d) if covers(&d.to) => match d.kind {
+                            PathDelayKind::Max => delay_max_n = Some(d.value_ns),
+                            PathDelayKind::Min => delay_min_n = Some(d.value_ns),
+                        },
+                        _ => {}
+                    }
+                }
+                if drop || (delay_max_n.is_none() && delay_min_n.is_none()) {
+                    continue;
+                }
+                let s = class_states[ci][leaf as usize];
+                let pols = composed.entry(leaf).or_insert_with(|| EndpointPolarities {
+                    max: [None; 2],
+                    min: [None; 2],
+                });
+                // The check anchors at the delay edge itself: `req = N`,
+                // no capture clock, uncertainty, or constraint term —
+                // the arrival is the pin's own (clk->Q for a register
+                // startpoint).
+                for pol in [RISE, FALL] {
+                    if !s.reached(pol) {
+                        continue;
+                    }
+                    if let Some(n) = delay_max_n {
+                        let cand = Worst {
+                            arr: s.arrival_max[pol],
+                            dly: s.dly_max[pol],
+                            req: n,
+                            slack: n - s.arrival_max[pol],
+                            slew: s.slew_max[pol],
+                        };
+                        if pols.max[pol].is_none_or(|w| cand.slack < w.slack) {
+                            pols.max[pol] = Some(cand);
+                        }
+                    }
+                    if let Some(n) = delay_min_n {
+                        let cand = Worst {
+                            arr: s.arrival_min[pol],
+                            dly: s.dly_min[pol],
+                            req: n,
+                            slack: s.arrival_min[pol] - n,
+                            slew: s.slew_min[pol],
+                        };
+                        if pols.min[pol].is_none_or(|w| cand.slack < w.slack) {
+                            pols.min[pol] = Some(cand);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut entries = EndpointEntries::new();
     let mut reported = HashSet::new();
     for (&ep, &pols) in &composed {
@@ -3854,6 +4594,62 @@ fn run_sta_partitioned(
     skipped.unsupported_path_delay_endpoints = unsupported_pd.len();
     skipped.unresolved_exception_selectors = ctx.unresolved;
 
+    // Re-diagnosis of an unreported endpoint against the union of every
+    // class's arrival state — the same pairability test `collect_endpoints`
+    // applies per run: only a foreign launch domain that cannot pair
+    // (undeclared, latch borrow, non-coincident hold parity, non-converging
+    // LCM) lands here; pairable foreign domains reported already.
+    // `cap_row` names the capture in the skip line while `cap_tag` is the
+    // pairing domain (`launch_domain`-resolved, equal to `cap_row` on
+    // checks/gates; distinct for a virtual output-port anchor sharing a
+    // design grid — equal periods by construction, so `cap_tag`'s row also
+    // supplies the pairing period).
+    let parity_at = |clk: PinId, pol: usize| -> usize {
+        prepared
+            .clock_parity
+            .as_deref()
+            .and_then(|p| p.get(clk.0 as usize).map(|e| e[pol]))
+            .filter(|&v| v <= 1)
+            .unwrap_or(pol as u8) as usize
+    };
+    #[allow(clippy::too_many_arguments)]
+    let xdomain_skip = |skipped: &mut SkipReport,
+                        kind: EndpointKind,
+                        pin: PinId,
+                        s: PinTimingState,
+                        cap_row: usize,
+                        cap_tag: usize,
+                        setup_c0: usize,
+                        hold_c0: usize,
+                        hold_next: bool,
+                        latch: bool|
+     -> bool {
+        let empty = Clock::default();
+        let cap_clk = sdc.clocks.get(cap_tag).unwrap_or(&empty);
+        let Some(launch) = xdomain_defer(
+            s,
+            sdc,
+            dom_bit(cap_tag),
+            cap_clk,
+            setup_c0,
+            hold_c0,
+            hold_next,
+            latch,
+        ) else {
+            return false;
+        };
+        skipped.cross_domain_endpoints += 1;
+        skipped.skipped_endpoints.push(SkippedEndpoint {
+            pin: cx.pin_name(pin),
+            kind,
+            reason: SkipReason::CrossDomain,
+            related: Some(format!(
+                "launch {launch} -> capture {}",
+                sdc.clocks[cap_row].name
+            )),
+        });
+        true
+    };
     let skip_endpoint = |skipped: &mut SkipReport,
                          kind: EndpointKind,
                          pin: PinId,
@@ -3892,8 +4688,12 @@ fn run_sta_partitioned(
             continue;
         };
         let clk_s = merged[clk.0 as usize];
-        if !clk_s.reached(check.edge)
-            || (check.latch && sdc.propagated_clock && !clk_s.reached(1 - check.edge))
+        let cap = prepared.clock_domain[clk.0 as usize];
+        if cap == u8::MAX
+            || !clk_s.reached(check.edge)
+            || (check.latch
+                && sdc.clocks[cap as usize].propagated
+                && !clk_s.reached(1 - check.edge))
         {
             skip_endpoint(
                 &mut skipped,
@@ -3902,6 +4702,21 @@ fn run_sta_partitioned(
                 SkipReason::NoClock,
                 Some(cx.pin_name(clk)),
             );
+            continue;
+        }
+        let c0 = parity_at(clk, check.edge);
+        if xdomain_skip(
+            &mut skipped,
+            EndpointKind::Check,
+            PinId(d),
+            merged[d as usize],
+            cap as usize,
+            cap as usize,
+            c0,
+            c0,
+            false,
+            check.latch,
+        ) {
             continue;
         }
         let (reason, related) = endpoint_skip_reason(
@@ -3919,7 +4734,11 @@ fn run_sta_partitioned(
             continue;
         }
         let c = merged[g.clk_pin.0 as usize];
-        if sdc.propagated_clock && (!c.reached(RISE) || !c.reached(FALL)) {
+        let cap = prepared.clock_domain[g.clk_pin.0 as usize];
+        if cap == u8::MAX
+            || (sdc.clocks[cap as usize].propagated
+                && (!c.reached(RISE) || !c.reached(FALL)))
+        {
             skip_endpoint(
                 &mut skipped,
                 EndpointKind::ClockGate,
@@ -3927,6 +4746,24 @@ fn run_sta_partitioned(
                 SkipReason::NoClock,
                 Some(cx.pin_name(g.clk_pin)),
             );
+            continue;
+        }
+        let (setup_edge, hold_edge) = match g.kind {
+            GateKind::Rising => (RISE, FALL),
+            GateKind::Falling => (FALL, RISE),
+        };
+        if xdomain_skip(
+            &mut skipped,
+            EndpointKind::ClockGate,
+            g.enable,
+            merged[e as usize],
+            cap as usize,
+            cap as usize,
+            parity_at(g.clk_pin, setup_edge),
+            parity_at(g.clk_pin, hold_edge),
+            true,
+            false,
+        ) {
             continue;
         }
         let (reason, related) = endpoint_skip_reason(
@@ -3946,6 +4783,21 @@ fn run_sta_partitioned(
     }
     for &p in &ctx.output_ports {
         if reported.contains(&p) || fp_endpoints.contains(&p) {
+            continue;
+        }
+        let out_row = sdc.output_clock_row(cx.port_name(PinId(p)));
+        if xdomain_skip(
+            &mut skipped,
+            EndpointKind::OutputPort,
+            PinId(p),
+            merged[p as usize],
+            out_row,
+            launch_domain(sdc, out_row),
+            0,
+            0,
+            false,
+            false,
+        ) {
             continue;
         }
         let (reason, related) = endpoint_skip_reason(
@@ -3971,6 +4823,7 @@ fn run_sta_partitioned(
         cx,
         graph,
         prepared.clock_state.as_deref(),
+        &prepared.clock_domain,
         &merged,
         &mut skipped,
         &mut pulse_rows,
@@ -4115,6 +4968,7 @@ fn eval_pulse_width_checks(
     cx: &Context,
     graph: &TimingGraph,
     clock_state: Option<&[PinTimingState]>,
+    clock_domain: &[u8],
     state: &[PinTimingState],
     skipped: &mut SkipReport,
     out: &mut Vec<PulseWidthCheckReport>,
@@ -4124,6 +4978,11 @@ fn eval_pulse_width_checks(
         let pin = check.pin;
         let arc = &cx.lib.arcs[check.lib_arc as usize];
         let c = clock_state.map(|s| s[pin.0 as usize]);
+        // The wrap period is the check pin's own domain's.
+        let period = clock_domain
+            .get(pin.0 as usize)
+            .filter(|&&d| d != u8::MAX)
+            .map_or_else(|| sdc.period_ns(), |&d| sdc.clocks[d as usize].period_ns);
         for (edge, open, close, table) in [
             (PulseEdge::High, RISE, FALL, arc.rise_constraint.as_ref()),
             (PulseEdge::Low, FALL, RISE, arc.fall_constraint.as_ref()),
@@ -4148,7 +5007,7 @@ fn eval_pulse_width_checks(
             let width = |arr: &[f32; 2]| {
                 let mut w = arr[close] - arr[open];
                 if w <= 0.0 {
-                    w += sdc.period_ns;
+                    w += period;
                 }
                 w
             };
@@ -4173,6 +5032,298 @@ fn edge_label(edge: PulseEdge) -> &'static str {
     }
 }
 
+/// Comma-joined names of the clock rows set in a domain mask — the launch
+/// side of a `CrossDomain` skip's `related` text.
+fn clock_names(sdc: &Sdc, mask: u8) -> String {
+    sdc.clocks
+        .iter()
+        .enumerate()
+        .filter(|(d, _)| *d < 8 && mask & (1 << d) != 0)
+        .map(|(_, c)| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Domain tag → mask bit. Tags are `Sdc::clocks` rows (so at most 8 rows
+/// carry a bit — a row ≥ 8 and the `u8::MAX` unreached sentinel both map to
+/// 0, the "no domain" mask, which defers at every capture instead of folding).
+fn dom_bit(tag: usize) -> u8 {
+    if tag < 8 { 1 << tag } else { 0 }
+}
+
+/// Launch-domain row for pairing: a port-bearing row pairs as itself; a
+/// virtual row maps to the first design row whose period equals the virtual
+/// clock's — same-period grids share edge times, so the pair is the
+/// coincident-edge pair the same-domain evaluator already computes. A
+/// virtual row matching no design grid keeps its own row: foreign to every
+/// capture, deferred to mc-xdomain's LCM search.
+fn launch_domain(sdc: &Sdc, row: usize) -> usize {
+    let Some(clk) = sdc.clocks.get(row) else {
+        return row;
+    };
+    if clk.port.is_some() {
+        return row;
+    }
+    sdc.clocks
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.port.is_some() && c.period_ns == clk.period_ns)
+        .map(|(r, _)| r)
+        .unwrap_or(row)
+}
+
+/// `lcm(a, b)` of two clock periods via f64 Euclid. The remainder test is
+/// relative to the *input* periods (~1e-6 of the smaller one), not to the
+/// running residue: `1.4f32` is `1.399999976…` in f64, so an exact-Euclid
+/// gcd would sink to the f32 rounding residue (~1.19e-7) and report an
+/// absurd LCM (~2.3e7) — the window must accept the f32-scale gcd `0.2`
+/// instead. `None` when the residue never drops to f32 resolution within
+/// the bound — periods incommensurate at our precision, a defensive bail,
+/// not a model case.
+fn grid_lcm(a: f32, b: f32) -> Option<f64> {
+    let (mut x, mut y) = (a as f64, b as f64);
+    let tol = 1e-6 * (a as f64).min(b as f64);
+    for _ in 0..32 {
+        if y <= 0.0 {
+            return None;
+        }
+        let r = x % y;
+        if r <= tol {
+            // `y` divides both periods at f32 resolution: lcm = a / gcd * b.
+            return Some(a as f64 / y * b as f64);
+        }
+        if y <= tol {
+            return None;
+        }
+        x = y;
+        y = r;
+    }
+    None
+}
+
+/// Launch-edge window bound shared by the pair searches: edges repeat at the
+/// period-LCM boundary, so launch edges `launch0 + m·PL < lcm` enumerate the
+/// full residue pattern (`launch0` is the launch edge's waveform instant).
+/// The bound carries f32-scale noise (`grid_lcm` tolerance), so the margin
+/// is 1e-6-relative, not edge-exact.
+fn launch_window(launch0: f64, pl: f64, lcm: f64) -> impl Iterator<Item = (usize, f64)> {
+    (0usize..)
+        .map(move |m| (m, launch0 + m as f64 * pl))
+        .take_while(move |&(_, tl)| tl < lcm * (1.0 - 1e-6))
+}
+
+/// Setup pair (measured `docs/multi-clock.md` §1.2): every launch edge
+/// `edge_offset(g) + m·PL` inside the period-LCM window pairs with the
+/// smallest capture edge `edge_offset(c0) + j·PC` strictly after it; the
+/// winner minimises `capture − launch`. Returns `(m·PL, j·PC)` — additive
+/// shifts on the recorded arrivals, which are referenced to each parity's
+/// first edge. `None` only when `grid_lcm` fails. Equal gaps keep the
+/// first found (smallest launch edge); OpenSTA's tie-break is unmeasured.
+fn setup_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f32, f32)> {
+    let lcm = grid_lcm(lclk.period_ns, cclk.period_ns)?;
+    let (pl, pc) = (lclk.period_ns as f64, cclk.period_ns as f64);
+    let launch0 = lclk.edge_offset(g) as f64;
+    let phase_c = cclk.edge_offset(c0) as f64;
+    // A capture edge coincident with the launch edge is not strictly after;
+    // the tolerance keeps f64 noise at grid points from picking it, and a
+    // degenerate sub-eps gap is treated as coincidence either way.
+    let eps = 1e-9 * pc.max(pl);
+    let mut best: Option<(f64, f64, f64)> = None;
+    for (m, tl) in launch_window(launch0, pl, lcm) {
+        let mut j = ((tl - phase_c) / pc).floor().max(-1.0) as i64 + 1;
+        j = j.max(0);
+        while j > 0 && phase_c + (j - 1) as f64 * pc > tl + eps {
+            j -= 1;
+        }
+        while phase_c + j as f64 * pc <= tl + eps {
+            j += 1;
+        }
+        let gap = phase_c + j as f64 * pc - tl;
+        if best.is_none_or(|(g0, _, _)| gap < g0 - 1e-9) {
+            best = Some((gap, m as f64 * pl, j as f64 * pc));
+        }
+    }
+    best.map(|(_, lsh, csh)| (lsh as f32, csh as f32))
+}
+
+/// Hold pair (§1.2): each launch edge `edge_offset(g) + m·PL` pairs with the
+/// largest capture edge `edge_offset(c0) + j·PC` at-or-before it; the winner
+/// minimises `launch − capture`. Measured on `t2_wave` (ckb→cka launch 1.0 /
+/// capture 0.3): a non-coincident minimum-gap pair is real, so the rule is
+/// gap-minimising, not coincidence — the coincident grids of every
+/// pre-waveform scenario still return the same pair (gap 0, earliest
+/// launch). `None` when `grid_lcm` fails or no non-negative capture edge
+/// sits at-or-before any launch edge.
+fn hold_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f32, f32)> {
+    let lcm = grid_lcm(lclk.period_ns, cclk.period_ns)?;
+    let (pl, pc) = (lclk.period_ns as f64, cclk.period_ns as f64);
+    let launch0 = lclk.edge_offset(g) as f64;
+    let phase_c = cclk.edge_offset(c0) as f64;
+    let eps = 1e-9 * pc.max(pl);
+    let mut best: Option<(f64, f64, f64)> = None;
+    for (m, tl) in launch_window(launch0, pl, lcm) {
+        // Largest j >= 0 with `phase_c + j·PC <= tl`.
+        let mut j = ((tl - phase_c) / pc).floor() as i64;
+        while j > 0 && phase_c + j as f64 * pc > tl + eps {
+            j -= 1;
+        }
+        if j < 0 || phase_c + j as f64 * pc > tl + eps {
+            continue;
+        }
+        let gap = tl - (phase_c + j as f64 * pc);
+        if best.is_none_or(|(g0, _, _)| gap < g0 - 1e-9) {
+            best = Some((gap, m as f64 * pl, j as f64 * pc));
+        }
+    }
+    best.map(|(_, lsh, csh)| (lsh as f32, csh as f32))
+}
+
+/// Whole-endpoint `CrossDomain` deferral predicate, shared between
+/// `collect_endpoints` and the partitioned skip pass. `Some(launch names)`
+/// when any reached arrival extreme cannot be evaluated against `cap_bit` —
+/// the whole endpoint defers (both max and min sides are needed to report):
+///   * reached extreme, empty dom mask      -> `<undeclared>` (the fold
+///     `mc-eval` exists to catch)
+///   * latch-D check, any foreign bit       -> parked borrow pairing
+///   * min-side (d, g) with no capture edge
+///     at-or-before a launch edge           -> parked hold selection
+///   * non-converging `grid_lcm`            -> defensive
+///
+/// `None` = every tying (domain, parity) pairs — evaluate.
+///
+/// The min-side pairing rule is `hold_next`-selected: register checks and
+/// output ports pair min-gap edges on the check/anchor grid; a gating
+/// enable's hold edge *follows* the launch on the opposite-polarity grid, so
+/// it uses the strictly-after rule (always pairs).
+#[allow(clippy::too_many_arguments)]
+fn xdomain_defer(
+    s: PinTimingState,
+    sdc: &Sdc,
+    cap_bit: u8,
+    cap_clk: &Clock,
+    setup_c0: usize,
+    hold_c0: usize,
+    hold_next: bool,
+    latch: bool,
+) -> Option<String> {
+    let mut foreign = 0u8;
+    let mut undeclared = false;
+    for pol in [RISE, FALL] {
+        if s.arrival_max[pol] > f32::NEG_INFINITY {
+            if s.dom_max[pol] == 0 {
+                undeclared = true;
+            } else {
+                foreign |= s.dom_max[pol] & !cap_bit;
+            }
+        }
+        if s.arrival_min[pol] < f32::INFINITY {
+            if s.dom_min[pol] == 0 {
+                undeclared = true;
+            } else {
+                foreign |= s.dom_min[pol] & !cap_bit;
+            }
+        }
+    }
+    if foreign == 0 && !undeclared {
+        return None;
+    }
+    let mut names = clock_names(sdc, foreign);
+    if undeclared {
+        if !names.is_empty() {
+            names.push_str(", ");
+        }
+        names.push_str("<undeclared>");
+    }
+    if undeclared || (latch && foreign != 0) {
+        return Some(names);
+    }
+    // Every foreign (domain, parity) on a reached extreme must pair.
+    let pair_ok = |dom: u8, par: u8, c0: usize, min_side: bool| -> bool {
+        let par = if par == 0 { 1 } else { par };
+        for d in 0..8usize {
+            if dom & !cap_bit & (1 << d) == 0 {
+                continue;
+            }
+            let Some(lclk) = sdc.clocks.get(d) else {
+                return false;
+            };
+            for g in 0..2usize {
+                if par & (1 << g) == 0 {
+                    continue;
+                }
+                let ok = if min_side && !hold_next {
+                    hold_edge_pair(lclk, cap_clk, g, c0).is_some()
+                } else {
+                    setup_edge_pair(lclk, cap_clk, g, c0).is_some()
+                };
+                if !ok {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+    for pol in [RISE, FALL] {
+        if s.arrival_max[pol] > f32::NEG_INFINITY
+            && !pair_ok(s.dom_max[pol], s.par_max[pol], setup_c0, false)
+        {
+            return Some(names.clone());
+        }
+        if s.arrival_min[pol] < f32::INFINITY
+            && !pair_ok(s.dom_min[pol], s.par_min[pol], hold_c0, true)
+        {
+            return Some(names.clone());
+        }
+    }
+    None
+}
+
+/// Worst inter-clock uncertainty for a `launch-mask -> capture` read: setup
+/// subtracts and hold adds the value, so the largest match across the tying
+/// launch bits is the worst either way. An empty mask falls back to the
+/// capture row's own value.
+fn unc_worst(sdc: &Sdc, mask: u8, cap: usize, hold: bool) -> f32 {
+    if mask == 0 {
+        return sdc.uncertainty_ns(cap, cap, hold);
+    }
+    let mut worst = 0.0f32;
+    for d in 0..8usize {
+        if mask & (1 << d) != 0 {
+            worst = worst.max(sdc.uncertainty_ns(d, cap, hold));
+        }
+    }
+    worst
+}
+
+/// `ep_dly − pin_dly` over the `-from` pins reached in this class on
+/// (pol, side): a pin whose own delay arrival is still the sentinel
+/// contributes no constrained path and is skipped. `None` when no pin in
+/// the set is reached — the caller drops the polarity's candidate rather
+/// than report an infinite segment or fall back to the clocked `w.dly`
+/// (the pin `-from` already replaced that launch).
+fn pin_segment_arrival(
+    pins: &HashSet<u32>,
+    states: &[PinTimingState],
+    ep_dly: f32,
+    pol: usize,
+    min_side: bool,
+) -> Option<f32> {
+    let mut seg: Option<f32> = None;
+    for &fp in pins {
+        let pin_dly = if min_side {
+            states[fp as usize].dly_min[pol]
+        } else {
+            states[fp as usize].dly_max[pol]
+        };
+        if !pin_dly.is_finite() {
+            continue;
+        }
+        let v = ep_dly - pin_dly;
+        seg = Some(seg.map_or(v, |a| if min_side { a.min(v) } else { a.max(v) }));
+    }
+    seg
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_endpoints(
     cx: &Context,
@@ -4181,6 +5332,7 @@ fn collect_endpoints(
     clock_state: Option<&[PinTimingState]>,
     state: &[PinTimingState],
     clock_parity: Option<&[[u8; 2]]>,
+    clock_domain: &[u8],
     crpr_tags: &[(NetId, usize)],
     mut skipped: SkipReport,
 ) -> Result<(EndpointEntries, Vec<PulseWidthCheckReport>, SkipReport)> {
@@ -4245,11 +5397,17 @@ fn collect_endpoints(
         // The check fires on `check.edge`: RISE for `*Rising` cells, FALL for inverting-clock
         // cells (`dfrtn`). The clock pin's seeded arrival already carries the edge's phase.
         let edge = check.edge;
+        // The capture domain is the clock row whose port seed reached the
+        // clock pin; `u8::MAX` means none did (unreached clock — NoClock).
+        let cap = clock_domain[clk.0 as usize];
         // A propagated clock can leave a clock pin unreached; the ideal seed always reaches.
         // A latch check also needs the opening edge (the opposite polarity of the
         // setup check edge): the borrow branch reads its arrival.
-        if !clk_state.reached(edge)
-            || (check.latch && sdc.propagated_clock && !clk_state.reached(1 - edge))
+        if cap == u8::MAX
+            || !clk_state.reached(edge)
+            || (check.latch
+                && sdc.clocks[cap as usize].propagated
+                && !clk_state.reached(1 - edge))
         {
             skipped.unreached_endpoints += 1;
             skipped.skipped_endpoints.push(SkippedEndpoint {
@@ -4260,6 +5418,7 @@ fn collect_endpoints(
             });
             continue;
         }
+        let cap_clk = &sdc.clocks[cap as usize];
         // The setup capture edge is the first edge of `edge` polarity strictly after the
         // launch edge. `c0` is the clock-edge index parity of the capture pin's first edge
         // of that polarity; each arrival extreme carries the parity of the launch edge
@@ -4268,13 +5427,36 @@ fn collect_endpoints(
         // edge is one period later. An extreme with no recorded parity falls back to edge
         // 0, the pre-tracking assumption.
         let c0 = edge_parity(clk, edge);
+        // Cross-domain launch/capture pairing (mc-xdomain): every reached
+        // extreme's (domain, parity) must pair on the two period grids —
+        // min-gap on setup and hold alike. Anything unpairable defers
+        // with the domains named — never folds onto the capture lattice.
+        if let Some(launch) = xdomain_defer(
+            s,
+            sdc,
+            dom_bit(cap as usize),
+            cap_clk,
+            c0,
+            c0,
+            false,
+            check.latch,
+        ) {
+            skipped.cross_domain_endpoints += 1;
+            skipped.skipped_endpoints.push(SkippedEndpoint {
+                pin: cx.pin_name(data),
+                kind: EndpointKind::Check,
+                reason: SkipReason::CrossDomain,
+                related: Some(format!("launch {launch} -> capture {}", cap_clk.name)),
+            });
+            continue;
+        }
         // `trans` is the clock transition the credit is evaluated for: the check edge for
         // the closing/setup required times, the opening polarity for a latch's opening
         // edge. `tag_mask` is the launch-tag mask of the data extreme being composed
         // (`crpr_max[pol]` for closing req, `crpr_min[pol]` for hold req): it must
         // resolve to one tag matching both the capture net and the transition.
         let credit_for = |trans: usize, tag_mask: u8| -> f32 {
-            if !sdc.propagated_clock {
+            if !cap_clk.propagated {
                 return 0.0;
             }
             let Some(capture_net) = design.pin_nets[clk.0 as usize] else {
@@ -4299,99 +5481,173 @@ fn collect_endpoints(
             let late_time =
                 eval_nldm_constraint(late_table, s.slew_max[pol], clk_state.slew_max[edge])
                     * sdc.derate(true, DERATE_CHECK, false, check_transition(late));
-            // Equal arrivals from different launch-edge parities tie `arrival_max`;
-            // each tying parity can shift the capture edge by a period, so evaluate
-            // the required time per parity bit and keep the worst slack. An empty
-            // mask cannot occur on a reached pin; parity 0 is the fallback anyway.
+            // Equal arrivals from different launch-edge parities/domains tie
+            // `arrival_max`; each tying (domain, parity) can shift both edges,
+            // so evaluate the required time per bit pair and keep the worst
+            // slack. The masks are independent unions over the tying launches,
+            // so the cross product can name a combination no single launch
+            // produced — conservative, and exact on single-bit masks (every
+            // committed fixture). Empty masks cannot occur on a reached pin
+            // post-`xdomain_defer`; parity 0 and the capture bit are the
+            // fallbacks anyway.
             let max_mask = if s.par_max[pol] == 0 {
                 1
             } else {
                 s.par_max[pol]
             };
-            let mut max_pick: Option<(f32, f32)> = None;
-            for g in 0..2usize {
-                if max_mask & (1 << g) == 0 {
+            let max_dom = if s.dom_max[pol] == 0 {
+                dom_bit(cap as usize)
+            } else {
+                s.dom_max[pol]
+            };
+            let mut max_pick: Option<(f32, f32, f32)> = None;
+            for d in 0..8usize {
+                if max_dom & (1 << d) == 0 {
                     continue;
                 }
-                let capture_extra = if c0 <= g { sdc.period_ns } else { 0.0 };
-                let closing_max = capture_extra + clk_state.arrival_min[edge]
-                    - late_time
-                    - sdc.setup_uncertainty_ns
-                    + credit_for(edge, s.crpr_max[pol]);
-                // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
-                // is reported at the opening edge and the slack is what remains before the closing edge.
-                // The opening edge is the latest opening-polarity arrival before the
-                // closing edge; edges recur every period, so align by whole periods —
-                // the first arrival alone sits one period early when the closing edge
-                // was shifted (inverting clock, parity-1 launch). Both clock modes read
-                // the same seeded/propagated arrivals here.
-                // The latch's opening edge is the opposite polarity of the setup check
-                // edge (`dlxtn`: setup at rise, opens on fall; `dlxtp`: setup at fall,
-                // opens on rise).
-                let opening_max = if !check.latch {
-                    0.0 // only read on the latch branch below
-                } else {
-                    let closing = clk_state.arrival_min[edge] + capture_extra;
-                    let open_pol = 1 - edge;
-                    let periods = ((closing - clk_state.arrival_min[open_pol]) / sdc.period_ns)
-                        .floor()
-                        .max(0.0);
-                    clk_state.arrival_min[open_pol] + periods * sdc.period_ns
-                        - sdc.setup_uncertainty_ns
-                        + credit_for(open_pol, s.crpr_max[pol])
-                };
-                let arr_max = s.arrival_max[pol];
-                let (req, slack) = if !check.latch {
-                    (closing_max, closing_max - arr_max)
-                } else if arr_max <= opening_max {
-                    // The data waits for the latch to open; the margin is the time until
-                    // the opening edge.
-                    (opening_max, opening_max - arr_max)
-                } else {
-                    // OpenSTA latch model: arrival inside the transparent window borrows
-                    // time, so the required time equals the arrival (zero slack) until the
-                    // borrow cap — the closing required time of this transition (closing
-                    // edge minus uncertainty and the transition's setup constraint).
-                    let req = arr_max.min(closing_max);
-                    (req, req - arr_max)
-                };
-                if max_pick.is_none_or(|(_, sl)| slack < sl) {
-                    max_pick = Some((req, slack));
+                for g in 0..2usize {
+                    if max_mask & (1 << g) == 0 {
+                        continue;
+                    }
+                    let (arr, req, slack) = if d == cap as usize {
+                        let capture_extra = if cap_clk.edge_offset(c0) <= cap_clk.edge_offset(g) {
+                            cap_clk.period_ns
+                        } else {
+                            0.0
+                        };
+                        let closing_max = capture_extra + clk_state.arrival_min[edge]
+                            - late_time
+                            - sdc.uncertainty_ns(d, cap as usize, false)
+                            + credit_for(edge, s.crpr_max[pol]);
+                        // OpenSTA latch model: data arriving in the transparent phase borrows time. The required time
+                        // is reported at the opening edge and the slack is what remains before the closing edge.
+                        // The opening edge is the latest opening-polarity arrival before the
+                        // closing edge; edges recur every period, so align by whole periods —
+                        // the first arrival alone sits one period early when the closing edge
+                        // was shifted (inverting clock, parity-1 launch). Both clock modes read
+                        // the same seeded/propagated arrivals here.
+                        // The latch's opening edge is the opposite polarity of the setup check
+                        // edge (`dlxtn`: setup at rise, opens on fall; `dlxtp`: setup at fall,
+                        // opens on rise).
+                        let opening_max = if !check.latch {
+                            0.0 // only read on the latch branch below
+                        } else {
+                            let closing = clk_state.arrival_min[edge] + capture_extra;
+                            let open_pol = 1 - edge;
+                            let periods = ((closing - clk_state.arrival_min[open_pol])
+                                / cap_clk.period_ns)
+                                .floor()
+                                .max(0.0);
+                            clk_state.arrival_min[open_pol] + periods * cap_clk.period_ns
+                                - sdc.uncertainty_ns(d, cap as usize, false)
+                                + credit_for(open_pol, s.crpr_max[pol])
+                        };
+                        let arr_max = s.arrival_max[pol];
+                        let (req, slack) = if !check.latch {
+                            (closing_max, closing_max - arr_max)
+                        } else if arr_max <= opening_max {
+                            // The data waits for the latch to open; the margin is the time until
+                            // the opening edge.
+                            (opening_max, opening_max - arr_max)
+                        } else {
+                            // OpenSTA latch model: arrival inside the transparent window borrows
+                            // time, so the required time equals the arrival (zero slack) until the
+                            // borrow cap — the closing required time of this transition (closing
+                            // edge minus uncertainty and the transition's setup constraint).
+                            let req = arr_max.min(closing_max);
+                            (req, req - arr_max)
+                        };
+                        (arr_max, req, slack)
+                    } else {
+                        // Cross-domain candidate: the min-gap edge pair on the
+                        // launch/capture grids shifts both sides of the check
+                        // (`docs/multi-clock.md` §1.2). A foreign launch never
+                        // shares the capture clock net — no CRPR credit.
+                        let Some(lclk) = sdc.clocks.get(d) else {
+                            continue;
+                        };
+                        let Some((lsh, csh)) = setup_edge_pair(lclk, cap_clk, g, c0)
+                        else {
+                            continue;
+                        };
+                        let arr = s.arrival_max[pol] + lsh;
+                        let req = clk_state.arrival_min[edge] + csh - late_time
+                            - sdc.uncertainty_ns(d, cap as usize, false);
+                        (arr, req, req - arr)
+                    };
+                    if max_pick.is_none_or(|(_, _, sl)| slack < sl) {
+                        max_pick = Some((arr, req, slack));
+                    }
                 }
             }
-            let (req_max, slack_max) = max_pick.unwrap();
+            let (arr_max, req_max, slack_max) = max_pick.unwrap();
             // The hold (early) constraint pairs with the capture clock's early slew; the
             // setup (late) constraint uses the late slew. Under the ideal clock both are
             // the seeded transition and identical.
             let early_time =
                 eval_nldm_constraint(early_table, s.slew_min[pol], clk_state.slew_min[edge])
                     * sdc.derate(false, DERATE_CHECK, false, check_transition(early));
-            let req_min = clk_state.arrival_max[edge] + early_time + sdc.hold_uncertainty_ns
-                - credit_for(edge, s.crpr_min[pol]);
-            // Hold pairs the capture edge with the next launch edge of the same polarity:
-            // the arrival shifts one period when the launch edge parity precedes the
-            // capture pin's first edge of this polarity.
-            // Same parity tie on the early side: the hold arrival shifts one period
-            // per tying launch parity; keep the smallest resulting slack.
+            // Same (domain, parity) candidate shape on the early side. The
+            // same-domain branch holds the measured formula verbatim — the
+            // hold realign on waveform instants, `+P` when the launch
+            // parity's edge precedes the capture pin's first check edge
+            // (`cap_clk.edge_offset(c0) > cap_clk.edge_offset(g)`); a
+            // foreign bit pairs min-gap (`hold_edge_pair`) instead.
             let min_mask = if s.par_min[pol] == 0 {
                 1
             } else {
                 s.par_min[pol]
             };
-            let mut min_pick: Option<(f32, f32)> = None;
-            for g in 0..2usize {
-                if min_mask & (1 << g) == 0 {
+            let min_dom = if s.dom_min[pol] == 0 {
+                dom_bit(cap as usize)
+            } else {
+                s.dom_min[pol]
+            };
+            let mut min_pick: Option<(f32, f32, f32)> = None;
+            for d in 0..8usize {
+                if min_dom & (1 << d) == 0 {
                     continue;
                 }
-                let arr = s.arrival_min[pol] + if c0 > g { sdc.period_ns } else { 0.0 };
-                let slack = arr - req_min;
-                if min_pick.is_none_or(|(_, sl)| slack < sl) {
-                    min_pick = Some((arr, slack));
+                for g in 0..2usize {
+                    if min_mask & (1 << g) == 0 {
+                        continue;
+                    }
+                    let (arr, req) = if d == cap as usize {
+                        let req = clk_state.arrival_max[edge] + early_time
+                            + sdc.uncertainty_ns(d, cap as usize, true)
+                            - credit_for(edge, s.crpr_min[pol]);
+                        (
+                            s.arrival_min[pol]
+                                + if cap_clk.edge_offset(c0) > cap_clk.edge_offset(g) {
+                                    cap_clk.period_ns
+                                } else {
+                                    0.0
+                                },
+                            req,
+                        )
+                    } else {
+                        let Some(lclk) = sdc.clocks.get(d) else {
+                            continue;
+                        };
+                        let Some((lsh, csh)) = hold_edge_pair(lclk, cap_clk, g, c0)
+                        else {
+                            continue;
+                        };
+                        (
+                            s.arrival_min[pol] + lsh,
+                            clk_state.arrival_max[edge] + csh + early_time
+                                + sdc.uncertainty_ns(d, cap as usize, true),
+                        )
+                    };
+                    let slack = arr - req;
+                    if min_pick.is_none_or(|(_, _, sl)| slack < sl) {
+                        min_pick = Some((arr, req, slack));
+                    }
                 }
             }
-            let (arr_min, slack_min) = min_pick.unwrap();
+            let (arr_min, req_min, slack_min) = min_pick.unwrap();
             cands.max[pol] = Some(Worst {
-                arr: s.arrival_max[pol],
+                arr: arr_max,
                 dly: s.dly_max[pol],
                 req: req_max,
                 slack: slack_max,
@@ -4434,16 +5690,49 @@ fn collect_endpoints(
             GateKind::Rising => (RISE, FALL),
             GateKind::Falling => (FALL, RISE),
         };
-        let pe = edge_parity(clk_pin, setup_edge);
+        let pe_s = edge_parity(clk_pin, setup_edge);
+        let pe_h = edge_parity(clk_pin, hold_edge);
         let s = state[enable.0 as usize];
         let c = state[clk_pin.0 as usize];
-        if sdc.propagated_clock && (!c.reached(RISE) || !c.reached(FALL)) {
+        let cap = clock_domain[clk_pin.0 as usize];
+        if cap == u8::MAX
+            || (sdc.clocks[cap as usize].propagated
+                && (!c.reached(RISE) || !c.reached(FALL)))
+        {
             skipped.unreached_endpoints += 1;
             skipped.skipped_endpoints.push(SkippedEndpoint {
                 pin: cx.pin_name(enable),
                 kind: EndpointKind::ClockGate,
                 reason: SkipReason::NoClock,
                 related: Some(cx.pin_name(clk_pin)),
+            });
+            continue;
+        }
+        let cap_clk = &sdc.clocks[cap as usize];
+        // Same rule as the register checks: an enable launched on a domain
+        // other than the gate clock's must pair on both grids. The gate's
+        // hold edge follows the launch edge (opposite-polarity grid,
+        // strictly-after), so the min side always pairs — only an
+        // undeclared launch or a non-converging LCM defers.
+        if let Some(launch) = xdomain_defer(
+            s,
+            sdc,
+            dom_bit(cap as usize),
+            cap_clk,
+            pe_s,
+            pe_h,
+            true,
+            false,
+        ) {
+            skipped.cross_domain_endpoints += 1;
+            skipped.skipped_endpoints.push(SkippedEndpoint {
+                pin: cx.pin_name(enable),
+                kind: EndpointKind::ClockGate,
+                reason: SkipReason::CrossDomain,
+                related: Some(format!(
+                    "launch {launch} -> capture {}",
+                    sdc.clocks[cap as usize].name
+                )),
             });
             continue;
         }
@@ -4455,28 +5744,107 @@ fn collect_endpoints(
             if !s.reached(pol) {
                 continue;
             }
-            // Tying launch parities can shift the setup capture edge and the hold
-            // arrival by a period; evaluate each parity bit and keep the worst.
+            // Tying launch (domain, parity) bits can shift the setup capture edge
+            // and the hold arrival; evaluate each pair and keep the worst.
             // Both clock modes read the clock pin's seeded/propagated arrivals:
             // under the ideal clock the parity walk has already placed each
-            // transition on its clock-edge parity, so `pe` is the real parity.
+            // transition on its clock-edge parity, so `pe_s`/`pe_h` are the
+            // real parities.
             let par_bits = |mask: u8| if mask == 0 { 1 } else { mask & 0b11 };
-            let req_max = (0..2usize)
-                .filter(|g| par_bits(s.par_max[pol]) & (1 << g) != 0)
-                .map(|g| {
-                    c.arrival_min[setup_edge] + if pe <= g { sdc.period_ns } else { 0.0 }
-                        - sdc.setup_uncertainty_ns
-                })
-                .fold(f32::INFINITY, f32::min);
-            let arr_min = (0..2usize)
-                .filter(|g| par_bits(s.par_min[pol]) & (1 << g) != 0)
-                .map(|g| s.arrival_min[pol] + if g < pe { sdc.period_ns } else { 0.0 })
-                .fold(f32::INFINITY, f32::min);
-            let req_min = c.arrival_max[hold_edge] + sdc.hold_uncertainty_ns;
-            let slack_max = req_max - s.arrival_max[pol];
-            let slack_min = arr_min - req_min;
+            let max_dom = if s.dom_max[pol] == 0 {
+                dom_bit(cap as usize)
+            } else {
+                s.dom_max[pol]
+            };
+            let mut max_pick: Option<(f32, f32, f32)> = None;
+            for d in 0..8usize {
+                if max_dom & (1 << d) == 0 {
+                    continue;
+                }
+                for g in 0..2usize {
+                    if par_bits(s.par_max[pol]) & (1 << g) == 0 {
+                        continue;
+                    }
+                    let (arr, req) = if d == cap as usize {
+                        (
+                            s.arrival_max[pol],
+                            c.arrival_min[setup_edge]
+                                + if cap_clk.edge_offset(pe_s) <= cap_clk.edge_offset(g) {
+                                    cap_clk.period_ns
+                                } else {
+                                    0.0
+                                }
+                                - sdc.uncertainty_ns(d, cap as usize, false),
+                        )
+                    } else {
+                        let Some(lclk) = sdc.clocks.get(d) else {
+                            continue;
+                        };
+                        let Some((lsh, csh)) = setup_edge_pair(lclk, cap_clk, g, pe_s)
+                        else {
+                            continue;
+                        };
+                        (
+                            s.arrival_max[pol] + lsh,
+                            c.arrival_min[setup_edge] + csh
+                                - sdc.uncertainty_ns(d, cap as usize, false),
+                        )
+                    };
+                    let slack = req - arr;
+                    if max_pick.is_none_or(|(_, _, sl)| slack < sl) {
+                        max_pick = Some((arr, req, slack));
+                    }
+                }
+            }
+            let (arr_max, req_max, slack_max) = max_pick.unwrap();
+            let min_dom = if s.dom_min[pol] == 0 {
+                dom_bit(cap as usize)
+            } else {
+                s.dom_min[pol]
+            };
+            let mut min_pick: Option<(f32, f32, f32)> = None;
+            for d in 0..8usize {
+                if min_dom & (1 << d) == 0 {
+                    continue;
+                }
+                for g in 0..2usize {
+                    if par_bits(s.par_min[pol]) & (1 << g) == 0 {
+                        continue;
+                    }
+                    let (arr, req) = if d == cap as usize {
+                        (
+                            s.arrival_min[pol]
+                                + if cap_clk.edge_offset(g) < cap_clk.edge_offset(pe_s) {
+                                    cap_clk.period_ns
+                                } else {
+                                    0.0
+                                },
+                            c.arrival_max[hold_edge]
+                                + sdc.uncertainty_ns(d, cap as usize, true),
+                        )
+                    } else {
+                        let Some(lclk) = sdc.clocks.get(d) else {
+                            continue;
+                        };
+                        let Some((lsh, csh)) = setup_edge_pair(lclk, cap_clk, g, pe_h)
+                        else {
+                            continue;
+                        };
+                        (
+                            s.arrival_min[pol] + lsh,
+                            c.arrival_max[hold_edge] + csh
+                                + sdc.uncertainty_ns(d, cap as usize, true),
+                        )
+                    };
+                    let slack = arr - req;
+                    if min_pick.is_none_or(|(_, _, sl)| slack < sl) {
+                        min_pick = Some((arr, req, slack));
+                    }
+                }
+            }
+            let (arr_min, req_min, slack_min) = min_pick.unwrap();
             cands.max[pol] = Some(Worst {
-                arr: s.arrival_max[pol],
+                arr: arr_max,
                 dly: s.dly_max[pol],
                 req: req_max,
                 slack: slack_max,
@@ -4509,12 +5877,37 @@ fn collect_endpoints(
         }
         let s = state[p];
         let port = cx.port_name(pin);
+        // The required-time anchor is the port's own `-clock` row — possibly a
+        // virtual clock, whose period/latency still anchor the check. The
+        // pairing domain is the row's `launch_domain`: a virtual row sharing
+        // a design grid pairs same-domain, a unique one defers every launch.
+        let out_row = sdc.output_clock_row(port);
+        let empty_clk = Clock::default();
+        let out_clk = sdc.clocks.get(out_row).unwrap_or(&empty_clk);
+        let cap_tag = launch_domain(sdc, out_row);
+        // No clock pin anchors a port check; the anchor grid's edge-0 rise
+        // lattice (`c0 = 0`) is the capture phase for pairing.
+        if let Some(launch) = xdomain_defer(
+            s,
+            sdc,
+            dom_bit(cap_tag),
+            out_clk,
+            0,
+            0,
+            false,
+            false,
+        ) {
+            skipped.cross_domain_endpoints += 1;
+            skipped.skipped_endpoints.push(SkippedEndpoint {
+                pin: cx.pin_name(pin),
+                kind: EndpointKind::OutputPort,
+                reason: SkipReason::CrossDomain,
+                related: Some(format!("launch {launch} -> capture {}", out_clk.name)),
+            });
+            continue;
+        }
         let (delay_min, delay_max) = sdc.output_delay_ns(port);
         let latency = sdc.output_clock_latency_ns(port);
-        // OpenSTA applies clock uncertainty to output-port required times too (setup subtracts,
-        // hold adds), the same terms the register checks carry. Port delays are not derated.
-        let req_max = latency + sdc.period_ns - delay_max - sdc.setup_uncertainty_ns;
-        let req_min = latency - delay_min + sdc.hold_uncertainty_ns;
         let mut cands = EndpointPolarities {
             max: [None; 2],
             min: [None; 2],
@@ -4523,17 +5916,110 @@ fn collect_endpoints(
             if !s.reached(pol) {
                 continue;
             }
-            let slack_max = req_max - s.arrival_max[pol];
-            let slack_min = s.arrival_min[pol] - req_min;
+            // OpenSTA applies clock uncertainty to output-port required times too (setup subtracts,
+            // hold adds), the same terms the register checks carry. Port delays are not derated.
+            // Foreign launch bits pair on the anchor's rise-edge grid.
+            let max_dom = if s.dom_max[pol] == 0 {
+                dom_bit(cap_tag)
+            } else {
+                s.dom_max[pol]
+            };
+            let max_par = if s.par_max[pol] == 0 {
+                1
+            } else {
+                s.par_max[pol]
+            };
+            let mut max_pick: Option<(f32, f32, f32)> = None;
+            for d in 0..8usize {
+                if max_dom & (1 << d) == 0 {
+                    continue;
+                }
+                for g in 0..2usize {
+                    if max_par & (1 << g) == 0 {
+                        continue;
+                    }
+                    let (arr, req) = if d == cap_tag {
+                        (
+                            s.arrival_max[pol],
+                            latency + out_clk.edge_offset(0) + out_clk.period_ns - delay_max
+                                - sdc.uncertainty_ns(d, out_row, false),
+                        )
+                    } else {
+                        let Some(lclk) = sdc.clocks.get(d) else {
+                            continue;
+                        };
+                        let Some((lsh, csh)) = setup_edge_pair(lclk, out_clk, g, 0)
+                        else {
+                            continue;
+                        };
+                        (
+                            s.arrival_max[pol] + lsh,
+                            latency + out_clk.edge_offset(0) + csh - delay_max
+                                - sdc.uncertainty_ns(d, out_row, false),
+                        )
+                    };
+                    let slack = req - arr;
+                    if max_pick.is_none_or(|(_, _, sl)| slack < sl) {
+                        max_pick = Some((arr, req, slack));
+                    }
+                }
+            }
+            let (arr_max, req_max, slack_max) = max_pick.unwrap();
+            let min_dom = if s.dom_min[pol] == 0 {
+                dom_bit(cap_tag)
+            } else {
+                s.dom_min[pol]
+            };
+            let min_par = if s.par_min[pol] == 0 {
+                1
+            } else {
+                s.par_min[pol]
+            };
+            let mut min_pick: Option<(f32, f32, f32)> = None;
+            for d in 0..8usize {
+                if min_dom & (1 << d) == 0 {
+                    continue;
+                }
+                for g in 0..2usize {
+                    if min_par & (1 << g) == 0 {
+                        continue;
+                    }
+                    let (arr, req) = if d == cap_tag {
+                        (
+                            s.arrival_min[pol],
+                            latency + out_clk.edge_offset(0) - delay_min
+                                + sdc.uncertainty_ns(d, out_row, true),
+                        )
+                    } else {
+                        let Some(lclk) = sdc.clocks.get(d) else {
+                            continue;
+                        };
+                        let Some((lsh, csh)) = hold_edge_pair(lclk, out_clk, g, 0)
+                        else {
+                            continue;
+                        };
+                        (
+                            s.arrival_min[pol] + lsh,
+                            latency + out_clk.edge_offset(0) + csh - delay_min
+                                + sdc.uncertainty_ns(d, out_row, true),
+                        )
+                    };
+                    let slack = arr - req;
+                    if min_pick.is_none_or(|(_, _, sl)| slack < sl) {
+                        min_pick = Some((arr, req, slack));
+                    }
+                }
+            }
+            let (arr_min, req_min, slack_min) = min_pick.unwrap();
             cands.max[pol] = Some(Worst {
-                arr: s.arrival_max[pol],
+                arr: arr_max,
                 dly: s.dly_max[pol],
                 req: req_max,
                 slack: slack_max,
                 slew: s.slew_max[pol],
             });
             cands.min[pol] = Some(Worst {
-                arr: s.arrival_min[pol],
+                arr: arr_min,
                 dly: s.dly_min[pol],
                 req: req_min,
                 slack: slack_min,
@@ -4557,6 +6043,7 @@ fn collect_endpoints(
         cx,
         graph,
         clock_state,
+        clock_domain,
         state,
         &mut skipped,
         &mut pulse_rows,
@@ -4691,6 +6178,7 @@ fn merge_skip_reports(a: SkipReport, b: SkipReport) -> SkipReport {
         unresolved_arcs: a.unresolved_arcs.max(b.unresolved_arcs),
         incomplete_checks: a.incomplete_checks.max(b.incomplete_checks),
         unreached_endpoints: a.unreached_endpoints.max(b.unreached_endpoints),
+        cross_domain_endpoints: a.cross_domain_endpoints.max(b.cross_domain_endpoints),
         skipped_endpoints,
         cell_driven_clock_nets: a.cell_driven_clock_nets.max(b.cell_driven_clock_nets),
         unresolved_driving_cells: a.unresolved_driving_cells.max(b.unresolved_driving_cells),
@@ -4720,7 +6208,7 @@ mod tests {
     use super::*;
     use crate::interner::StringInterner;
     use crate::readers::{load_liberty, load_tech_db, parse_def};
-    use crate::sta::sdc::load_sdc;
+    use crate::sta::sdc::{load_sdc, parse_sdc};
     use crate::test_support::{design_dir, sky130_hd};
 
     #[test]
@@ -4769,6 +6257,116 @@ mod tests {
         );
         skipped.unresolved_driving_cells = 1;
         assert!(!skipped.is_clean());
+    }
+
+    #[test]
+    fn test_edge_pairing_unit_cases() {
+        // `grid_lcm` resolves the f32 representation noise: 1.4f32 is
+        // 1.39999997… in f64, so the LCM itself carries the residue — the
+        // window bound absorbs it, but compare it loosely, not exactly.
+        let lcm = |a: f32, b: f32, want: f64| {
+            grid_lcm(a, b).is_some_and(|l| (l - want).abs() < 1e-4)
+        };
+        assert!(lcm(2.0, 1.4, 14.0));
+        assert!(lcm(2.0, 1.0, 2.0));
+        let clk = |period: f32, waveform_ns: Option<[f32; 2]>| Clock {
+            period_ns: period,
+            waveform_ns,
+            ..Clock::default()
+        };
+        // `edge_offset` is the declared waveform instant, the `p·P/2`
+        // uniform grid when no `-waveform` was declared.
+        assert_eq!(clk(2.0, None).edge_offset(0), 0.0);
+        assert_eq!(clk(2.0, None).edge_offset(1), 1.0);
+        assert_eq!(clk(2.0, Some([0.0, 0.5])).edge_offset(1), 0.5);
+        assert_eq!(clk(2.0, Some([0.3, 1.7])).edge_offset(0), 0.3);
+        assert_eq!(clk(2.0, Some([0.3, 1.7])).edge_offset(1), 1.7);
+        let pair = |a: f32, b: f32, c: f32, d: f32| {
+            setup_edge_pair(&clk(a, None), &clk(b, None), c as usize, d as usize)
+                .map(|(l, c)| ((l * 1e4).round() / 1e4, (c * 1e4).round() / 1e4))
+        };
+        // A->B on the 2.0/1.4 grids: launch 4.0, capture 4.2 (`t2_frac`).
+        assert_eq!(pair(2.0, 1.4, 0.0, 0.0), Some((4.0, 4.2)));
+        // B->A: launch 9.8, capture 10.0 (`t2_frac`).
+        assert_eq!(pair(1.4, 2.0, 0.0, 0.0), Some((9.8, 10.0)));
+        // Equal-grid integer case keeps the min-gap pair (launch 1.0,
+        // capture 2.0), not the edge-0 fold (`t2_int`).
+        assert_eq!(pair(1.0, 2.0, 0.0, 0.0), Some((1.0, 2.0)));
+        assert_eq!(pair(2.0, 1.0, 0.0, 0.0), Some((0.0, 1.0)));
+        // Same-period grids degenerate to the same-domain pair; the `g=1`
+        // launch parity's first edge is already inside the recorded arrival,
+        // so its additive shift is 0.
+        assert_eq!(pair(2.0, 2.0, 0.0, 0.0), Some((0.0, 2.0)));
+        assert_eq!(pair(2.0, 2.0, 1.0, 0.0), Some((0.0, 2.0)));
+        let hold = |a: f32, b: f32, c: f32, d: f32| {
+            hold_edge_pair(&clk(a, None), &clk(b, None), c as usize, d as usize)
+                .map(|(l, c)| ((l * 1e4).round() / 1e4, (c * 1e4).round() / 1e4))
+        };
+        assert_eq!(hold(2.0, 1.4, 0.0, 0.0), Some((0.0, 0.0)));
+        // Coincidence is the zero gap; the first one on the odd launch
+        // parity is T=7.0.
+        assert_eq!(hold(2.0, 1.4, 1.0, 0.0), Some((6.0, 7.0)));
+        // B->A odd grid never coincides but still pairs: the minimum
+        // non-negative gap is launch 2.1 / capture 2.0 (`t2_wave` measured
+        // a non-coincident hold pair on ckb->cka).
+        assert_eq!(hold(1.4, 2.0, 1.0, 0.0), Some((1.4, 2.0)));
+
+        // Non-uniform grids (measured `t2_wave`): the pair searches run on
+        // the declared waveform instants, not `p·P/2`.
+        let pairw = |a: &Clock, b: &Clock, c: usize, d: usize| {
+            setup_edge_pair(a, b, c, d)
+                .map(|(l, c)| ((l * 1e4).round() / 1e4, (c * 1e4).round() / 1e4))
+        };
+        let holdw = |a: &Clock, b: &Clock, c: usize, d: usize| {
+            hold_edge_pair(a, b, c, d)
+                .map(|(l, c)| ((l * 1e4).round() / 1e4, (c * 1e4).round() / 1e4))
+        };
+        let cka_w = clk(2.0, Some([0.3, 1.7]));
+        let ckb = clk(1.0, None);
+        // Setup cka{0.3,1.7}->ckb: the 0.3 rise launch pairs with the first
+        // ckb edge strictly after (1.0); the 1.7 fall launch with 2.0.
+        assert_eq!(pairw(&cka_w, &ckb, 0, 0), Some((0.0, 1.0)));
+        assert_eq!(pairw(&cka_w, &ckb, 1, 0), Some((0.0, 2.0)));
+        // Hold ckb->cka{0.3,1.7} — the `t2_wave` measurement: ckb's 1.0
+        // launch pairs with cka's 0.3 capture edge, a non-coincident
+        // minimum gap.
+        assert_eq!(holdw(&ckb, &cka_w, 0, 0), Some((1.0, 0.0)));
+        // Hold cka{0.3,1.7}->ckb: the 0.3 launch pairs with the ckb edge 0
+        // at-or-before it — zero shifts even though the instants differ.
+        assert_eq!(holdw(&cka_w, &ckb, 0, 0), Some((0.0, 0.0)));
+        // Identical waveforms degenerate to the same-domain pair.
+        assert_eq!(pairw(&cka_w, &cka_w, 0, 0), Some((0.0, 2.0)));
+        // A waveform restating the uniform grid ([0, P/2]) is the `None`
+        // lattice.
+        let cka_flat = clk(2.0, Some([0.0, 1.0]));
+        assert_eq!(pairw(&cka_flat, &ckb, 0, 0), Some((0.0, 1.0)));
+        assert_eq!(
+            pairw(&cka_flat, &ckb, 1, 0),
+            pairw(&clk(2.0, None), &ckb, 1, 0)
+        );
+    }
+
+    #[test]
+    fn test_pin_segment_arrival() {
+        // A `-from` pin still UNREACHED in the class contributes no segment
+        // (the sentinel delay would fold to ±∞); with no reached pin the
+        // fold is `None` and the caller drops the polarity's candidate.
+        let mut reached = PinTimingState::UNREACHED;
+        reached.dly_max = [0.5, 0.5];
+        reached.dly_min = [0.25, 0.25];
+        let states = [PinTimingState::UNREACHED, reached];
+        let pins: HashSet<u32> = [0, 1].into_iter().collect();
+        assert_eq!(
+            pin_segment_arrival(&pins, &states, 1.0, 0, false),
+            Some(0.5)
+        );
+        assert_eq!(
+            pin_segment_arrival(&pins, &states, 1.0, 0, true),
+            Some(0.75)
+        );
+        let unreached: HashSet<u32> = [0].into_iter().collect();
+        assert_eq!(pin_segment_arrival(&unreached, &states, 1.0, 0, false), None);
+        assert_eq!(pin_segment_arrival(&unreached, &states, 1.0, 0, true), None);
     }
 
     /// Tolerances against OpenSTA. A value passes if |ours - ref| <= max(abs, rel * |ref|).
@@ -7215,7 +8813,7 @@ mod tests {
         // consumer clock pins are seeded from `clk_state` before data propagation.
         // A propagated run requires a non-empty `clock_pins` array: without it this
         // check would be silently disabled, so a missing or empty one is a hard error.
-        if sdc.propagated_clock {
+        if sdc.propagated_clock() {
             let clock_pins = zero_wire
                 .get("clock_pins")
                 .and_then(|c| c.as_array())
@@ -7570,6 +9168,298 @@ mod tests {
         );
     }
 
+    /// `mc-xdomain` edge pairing: the two-clock fixture reports cross-domain
+    /// endpoints on the min-gap (launch, capture) edge pair instead of
+    /// deferring (`docs/multi-clock.md` §1) — `u_fx/D` pairs launch edge 0
+    /// with capture 1.0, `u_fy/D` launch 1.0 with capture 2.0 — while
+    /// same-domain checks keep their capture lattice's period (`u_fa1/D` on
+    /// `cka`'s 2.0 ns, `u_fb1/D` on `ckb`'s 1.0 ns). The whole OpenSTA
+    /// `t2_int` endpoint set is asserted.
+    #[test]
+    fn sta_evaluates_two_clock() {
+        let lib_dir = sky130_hd();
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let dir = design_dir("sta_clocks");
+        let design = parse_def(&dir.join("two_clock.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join("t2_int.sdc")).expect("SDC");
+        assert_eq!(sdc.design_clock_count(), 2);
+        let report = run_sta(&design, &lib, &sdc, None).expect("two-clock sta");
+        let mut pins: Vec<_> = report.endpoints.iter().map(|e| e.pin.as_str()).collect();
+        pins.sort_unstable();
+        assert_eq!(
+            pins,
+            [
+                "u_fa0/D", "u_fa1/D", "u_fb0/D", "u_fb1/D", "u_fx/D", "u_fy/D", "ya", "yb"
+            ]
+        );
+        // Capture-domain periods: cka 2.0 vs ckb 1.0, minus the same setup
+        // arc (measured OpenSTA `t2_int`: 1.885446 / 0.885446).
+        let req = |pin: &str| {
+            report
+                .endpoints
+                .iter()
+                .find(|e| e.pin == pin)
+                .unwrap()
+                .max_req_ns
+        };
+        assert!((req("u_fa1/D") - 1.885446).abs() < 1e-4, "{}", req("u_fa1/D"));
+        assert!((req("u_fb1/D") - 0.885446).abs() < 1e-4, "{}", req("u_fb1/D"));
+        // Cross-domain min-gap pairs (measured `t2_int`): cka→ckb pairs launch
+        // edge 0 with capture 1.0 (`u_fx/D` req = 1.0 − setup); ckb→cka pairs
+        // launch 1.0 with capture 2.0 (`u_fy/D` req = 2.0 − setup), not the
+        // edge-0 fold. `u_fb0/D` launches on `d_in`'s edge-0 arrival.
+        assert!((req("u_fx/D") - 0.885446).abs() < 1e-4, "{}", req("u_fx/D"));
+        assert!((req("u_fy/D") - 1.885446).abs() < 1e-4, "{}", req("u_fy/D"));
+        assert!((req("u_fb0/D") - 0.854762).abs() < 1e-4, "{}", req("u_fb0/D"));
+        // Per-domain output anchors: `ya` -clock cka, `yb` -clock ckb.
+        assert!((req("ya") - 1.3).abs() < 1e-5, "{}", req("ya"));
+        assert!((req("yb") - 0.3).abs() < 1e-5, "{}", req("yb"));
+        assert_eq!(report.skipped.cross_domain_endpoints, 0);
+    }
+
+    /// `mc-xdomain`/`mc-selectors` scenario matrix: `tests/designs/sta_clocks/*.probe.json`
+    /// was emitted by `probe.sh` (OpenSTA in the LibreLane container). In every
+    /// scenario each reported endpoint must equal OpenSTA's row at
+    /// STRICT tolerance, and every golden endpoint we do not report must be a
+    /// named `CrossDomain` skip — nothing folds silently onto the capture
+    /// lattice, nothing is lost. Cross-domain rows evaluate on the min-gap
+    /// edge pair now, so `cross_domain_endpoints` is 0 on this fixture and the
+    /// wns/tns/violations aggregates compare in every scenario. Clock-object
+    /// selectors, `set_clock_groups`, and `-waveform` scenarios are covered
+    /// here since `mc-selectors`.
+    #[test]
+    fn test_sta_clocks_match_opensta() {
+        let lib_dir = sky130_hd();
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let dir = design_dir("sta_clocks");
+        let mut evaluated = 0;
+        for (def_name, probe_name) in [
+            ("two_clock.def", "two_clock.probe.json"),
+            ("two_clock_latch.def", "two_clock_latch.probe.json"),
+        ] {
+            let design = parse_def(&dir.join(def_name), &tech, Some(&lib)).expect("DEF");
+            let reference: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(dir.join(probe_name)).expect("probe file"),
+            )
+            .expect("probe JSON");
+            let scenarios = reference["scenarios"].as_object().expect("scenarios");
+            for (name, golden) in scenarios {
+                let sdc_path = dir.join(format!("{name}.sdc"));
+                let sdc = load_sdc(&sdc_path)
+                    .unwrap_or_else(|e| panic!("{name}: unexpected parse failure: {e}"));
+                let (report, _, polarities) =
+                    run_sta_detail(&design, &lib, &sdc, None, true).expect("STA");
+                let golden_eps = golden["endpoints"].as_array().expect("endpoints");
+                let is_deferred = |pin: &str| {
+                    report
+                        .skipped
+                        .skipped_endpoints
+                        .iter()
+                        .any(|s| s.pin == pin && s.reason == SkipReason::CrossDomain)
+                };
+                const SLACK_TIE_NS: f64 = 0.002;
+                let fields = [
+                    "max_arr_ns",
+                    "max_req_ns",
+                    "max_slack_ns",
+                    "max_slew_ns",
+                    "min_arr_ns",
+                    "min_req_ns",
+                    "min_slack_ns",
+                    "min_slew_ns",
+                ];
+                let tol = Tol::STRICT;
+                let mut failures = Vec::new();
+                for r in golden_eps {
+                    let pin = r["pin"].as_str().unwrap();
+                    let Some(idx) = report.endpoints.iter().position(|e| e.pin == pin) else {
+                        if !is_deferred(pin) {
+                            failures.push(format!("{pin}: missing and not a CrossDomain skip"));
+                        }
+                        continue;
+                    };
+                    let ep = &polarities[idx];
+                    let max = resolve_tied_polarity(
+                        pick_worst_polarity(&ep.max).unwrap(),
+                        &ep.max,
+                        r["max_arr_ns"].as_f64().unwrap(),
+                        r["max_req_ns"].as_f64().unwrap(),
+                        r["max_slew_ns"].as_f64().unwrap(),
+                        SLACK_TIE_NS,
+                    );
+                    let min = resolve_tied_polarity(
+                        pick_worst_polarity(&ep.min).unwrap(),
+                        &ep.min,
+                        r["min_arr_ns"].as_f64().unwrap(),
+                        r["min_req_ns"].as_f64().unwrap(),
+                        r["min_slew_ns"].as_f64().unwrap(),
+                        SLACK_TIE_NS,
+                    );
+                    let values = [
+                        max.arr, max.req, max.slack, max.slew, min.arr, min.req, min.slack,
+                        min.slew,
+                    ];
+                    for (i, field) in fields.iter().enumerate() {
+                        let expected = r[*field].as_f64().unwrap();
+                        let (rel_tol, abs_tol) = if field.ends_with("slew_ns") {
+                            (tol.slew_rel, 0.005)
+                        } else if field.ends_with("slack_ns") {
+                            (tol.arr_rel, tol.slack_abs_ns)
+                        } else {
+                            (tol.arr_rel, tol.arr_abs_ns)
+                        };
+                        if !within_tolerance(values[i], expected, rel_tol, abs_tol).0 {
+                            failures
+                                .push(format!("{pin}.{field}: ours={} ref={expected}", values[i]));
+                        }
+                    }
+                }
+                for e in &report.endpoints {
+                    if !golden_eps.iter().any(|r| r["pin"] == e.pin) {
+                        failures.push(format!("{}: reported but absent from OpenSTA", e.pin));
+                    }
+                }
+                for s in &report.skipped.skipped_endpoints {
+                    if s.reason == SkipReason::CrossDomain
+                        && !golden_eps.iter().any(|r| r["pin"] == s.pin)
+                    {
+                        failures.push(format!("{}: deferred but OpenSTA never timed it", s.pin));
+                    }
+                }
+                // Aggregates only when the endpoint set is complete — OpenSTA's
+                // wns/tns/violation counts span the cross-domain paths that
+                // defer, so a scenario with `CrossDomain` skips cannot compare.
+                // An empty golden table (`t2_selac`/`t2_selunion` cut every
+                // launch) carries `null` aggregates — the endpoint list is
+                // the measurement there.
+                if report.skipped.cross_domain_endpoints == 0 && !golden_eps.is_empty() {
+                    for (ours, key) in [
+                        (report.wns_max_ns, "wns_max_ns"),
+                        (report.tns_max_ns, "tns_max_ns"),
+                        (report.wns_min_ns, "wns_min_ns"),
+                        (report.tns_min_ns, "tns_min_ns"),
+                    ] {
+                        let expected = golden[key].as_f64().unwrap();
+                        let (rel, abs) = if key.starts_with("tns") {
+                            (tol.tns_rel, 0.005)
+                        } else {
+                            (tol.arr_rel, tol.slack_abs_ns)
+                        };
+                        if !within_tolerance(ours, expected, rel, abs).0 {
+                            failures.push(format!("{key}: ours={ours} ref={expected}"));
+                        }
+                    }
+                    for (ours, key) in [
+                        (report.setup_violations, "setup_violations"),
+                        (report.hold_violations, "hold_violations"),
+                    ] {
+                        if let Some(expected) = golden.get(key)
+                            && ours != expected.as_u64().unwrap() as u32
+                        {
+                            failures.push(format!(
+                                "{key}: ours={ours} ref={}",
+                                expected.as_u64().unwrap()
+                            ));
+                        }
+                    }
+                }
+                assert!(
+                    failures.is_empty(),
+                    "{name}: {} mismatches:\n{}",
+                    failures.len(),
+                    failures.join("\n")
+                );
+                if name == "t2_selport" {
+                    // `-from clk1` resolves to the port object — a resolved
+                    // but dead selector, so no diagnostic (OpenSTA warns
+                    // nothing either).
+                    assert_eq!(report.skipped.unresolved_exception_selectors, 0);
+                }
+                evaluated += 1;
+            }
+        }
+        assert_eq!(evaluated, 40, "every scenario must evaluate");
+    }
+
+    /// Undeclared-domain hazard (`docs/multi-clock.md` §2): a single-clock
+    /// SDC on the two-clock DEF must not fold `cb`'s flops onto `cka`'s
+    /// lattice. The `cka` side evaluates; every `cb` endpoint is named in
+    /// `skipped_endpoints` — `NoClock` where the capture clock pin is
+    /// unreached, a no-arrival skip where the launch was dead.
+    #[test]
+    fn one_clock_sdc_on_two_clock_def() {
+        let lib_dir = sky130_hd();
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let dir = design_dir("sta_clocks");
+        let design = parse_def(&dir.join("two_clock.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = parse_sdc(
+            "create_clock -name cka -period 2.0 [get_ports clk1]\n\
+             set_input_delay -min 0.1 -clock cka [get_ports d_in]\n\
+             set_input_delay -max 0.7 -clock cka [get_ports d_in]\n\
+             set_output_delay -min 0.1 -clock cka [get_ports ya]\n\
+             set_output_delay -max 0.7 -clock cka [get_ports ya]\n\
+             set_output_delay -min 0.1 -clock cka [get_ports yb]\n\
+             set_output_delay -max 0.7 -clock cka [get_ports yb]\n\
+             set_input_transition 0.1 [get_ports d_in]\n\
+             set_load 0.05 [get_ports ya]\n\
+             set_load 0.05 [get_ports yb]\n",
+        )
+        .expect("SDC");
+        let report = run_sta(&design, &lib, &sdc, None).expect("sta");
+        let mut pins: Vec<_> = report.endpoints.iter().map(|e| e.pin.as_str()).collect();
+        pins.sort_unstable();
+        assert_eq!(pins, ["u_fa0/D", "u_fa1/D", "ya"]);
+        let reason = |pin: &str| {
+            report
+                .skipped
+                .skipped_endpoints
+                .iter()
+                .find(|s| s.pin == pin)
+                .unwrap_or_else(|| panic!("{pin} not in skipped_endpoints"))
+                .reason
+        };
+        for pin in ["u_fb0/D", "u_fb1/D", "u_fx/D"] {
+            assert_eq!(reason(pin), SkipReason::NoClock, "{pin}");
+        }
+        for pin in ["u_fy/D", "yb"] {
+            assert!(
+                matches!(
+                    reason(pin),
+                    SkipReason::NoPath | SkipReason::UntimedDriver
+                ),
+                "{pin}: {:?}",
+                reason(pin)
+            );
+        }
+    }
+
     /// `set_propagated_clock`: clock arrival is propagated through the buffered tree (buf ->
     /// inverting buffer -> AND clock gate -> latch/FF clock pins) for both transitions. The
     /// fixture also carries an inverting branch (`clkinv`) so `u_ff2/CLK` sees its first rise
@@ -7680,33 +9570,45 @@ mod tests {
 
     /// Equal arrivals from different launch-edge parities must keep both parity bits:
     /// the endpoint required time shifts by a period per parity, so dropping one would
-    /// report the wrong slack (external review S1). The CRPR launch-tag masks follow
-    /// the same replace/union discipline.
+    /// report the wrong slack (external review S1). The CRPR launch-tag and clock-domain
+    /// masks follow the same replace/union discipline.
     #[test]
     fn test_parity_mask_keeps_tied_arrivals() {
         let mut s = PinTimingState::UNREACHED;
-        s.merge(RISE, 1.0, 0.5, 1.0, 0.5, 0.1, 0.1, 0b01, 0b01, 0b010, 0b010);
+        s.merge(
+            RISE, 1.0, 0.5, 1.0, 0.5, 0.1, 0.1, 0b01, 0b01, 0b010, 0b010, 0b001, 0b001,
+        );
         // Same max arrival, opposite parity: both bits survive.
-        s.merge(RISE, 1.0, 0.4, 1.0, 0.4, 0.1, 0.1, 0b10, 0b10, 0b100, 0b100);
+        s.merge(
+            RISE, 1.0, 0.4, 1.0, 0.4, 0.1, 0.1, 0b10, 0b10, 0b100, 0b100, 0b010, 0b010,
+        );
         assert_eq!(s.par_max[RISE], 0b11);
         assert_eq!(s.crpr_max[RISE], 0b110);
+        assert_eq!(s.dom_max[RISE], 0b011);
         // The better min arrival replaces its mask entirely.
         assert_eq!(s.par_min[RISE], 0b10);
         assert_eq!(s.crpr_min[RISE], 0b100);
+        assert_eq!(s.dom_min[RISE], 0b010);
         // A strictly better max replaces the mask; an equal max unions again. The
         // equal min arrival also unions its parity bit.
-        s.merge(RISE, 1.2, 0.4, 1.2, 0.4, 0.1, 0.1, 0b10, 0b01, 0b100, 0b010);
+        s.merge(
+            RISE, 1.2, 0.4, 1.2, 0.4, 0.1, 0.1, 0b10, 0b01, 0b100, 0b010, 0b100, 0b001,
+        );
         assert_eq!(s.par_max[RISE], 0b10);
         assert_eq!(s.par_min[RISE], 0b11);
         assert_eq!(s.crpr_max[RISE], 0b100);
         assert_eq!(s.crpr_min[RISE], 0b110);
+        assert_eq!(s.dom_max[RISE], 0b100);
+        assert_eq!(s.dom_min[RISE], 0b011);
         s.merge(
-            RISE, 1.2, 0.45, 1.2, 0.45, 0.1, 0.1, 0b01, 0b10, 0b010, 0b100,
+            RISE, 1.2, 0.45, 1.2, 0.45, 0.1, 0.1, 0b01, 0b10, 0b010, 0b100, 0b001, 0b010,
         );
         assert_eq!(s.par_max[RISE], 0b11);
         assert_eq!(s.par_min[RISE], 0b11);
         assert_eq!(s.crpr_max[RISE], 0b110);
         assert_eq!(s.crpr_min[RISE], 0b110);
+        assert_eq!(s.dom_max[RISE], 0b101);
+        assert_eq!(s.dom_min[RISE], 0b011);
     }
 
     /// OpenSTA's ideal clock still tracks edge inversion through cell-driven clock
@@ -8369,7 +10271,7 @@ mod tests {
                     continue;
                 }
                 let port_name = cx.port_name(drv);
-                if sdc.clock_port.as_deref() == Some(port_name) {
+                if sdc.is_clock_port(port_name) {
                     continue;
                 }
                 let Some(wire) = cx.wire_delays(net) else {
