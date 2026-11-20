@@ -6,12 +6,26 @@ SDCs — the reference runs OpenSTA on the same inputs.
 
 ## 1. `tests/designs/sta_clocks/t2_mdx.sdc`
 
-Both-sides-covered cross endpoint: `u_fy/D` (ckb→cka) gets a
-`set_max_delay` **and** a `set_min_delay` on the same `-from`/`-to`,
-so the delay-check rewrite fires on both sides of a cross-domain
-endpoint — the literal "covered on both sides should report" case the
-existing `t2_md`/`t2_mdl`/`t2_mdo` files do not exercise (they cover
-one side each, and only `t2_mdl` on a cross endpoint).
+Pin-startpoint `-from` on a cross-domain endpoint: `set_max_delay` and
+`set_min_delay` both `-from [get_pins u_fb0/Q] -to [get_pins u_fy/D]`
+(ckb→cka). The measured semantic (`probe_t2_mdx.txt`) is *not* the
+§1.5 capture-edge-0 anchor — a `get_pins inst/Q` `-from` makes the pin
+itself the path startpoint:
+
+- OpenSTA warns `'u_fb0/Q' is not a valid start point` yet reports the
+  check with the pin as startpoint at arrival 0 (`Startpoint: u_fb0/Q
+  (internal pin)`); `req = N ∓ library constraint` — `max 0.885446 =
+  1.0 − 0.114554`, `min 0.962415 = 1.0 − 0.037585` — with no clock
+  anchor, latency, or uncertainty. Our report carries the same numbers
+  as `arr = ep.dly − pin.dly = 0.0` (the segment is a direct net).
+- The pin's clocked launch is *replaced* by pin-segment paths:
+  `u_fb1/D` — also launched by `u_fb0/Q` but not named by the `-to` —
+  loses both checks and is absent from OpenSTA's endpoint table (the
+  golden asserts ours drops it too, via the "reported but absent from
+  OpenSTA" check). This is the `pin_from_sig_*` kill (`api.md` §5.2).
+- Unrelated endpoints (`u_fx/D`, `u_fb0/D`, …) keep their ordinary
+  paired/anchor semantics — `u_fx/D` still shows the A→B min-gap pair
+  (launch 4.0/capture 4.2).
 
 ```tcl
 create_clock -period 2.0 -name cka [get_ports clk1]
@@ -27,8 +41,7 @@ set_min_delay 1.0 -from [get_pins u_fb0/Q] -to [get_pins u_fy/D]
 ```
 
 Same base as `t2_md` so the uncovered endpoints stay byte-identical in
-expectation; only `u_fy/D` switches to the delay-check rewrite on both
-sides. Cross-domain coverage summary after this ticket:
+expectation. Cross-domain coverage summary after this ticket:
 
 | scenario | cross endpoints | what they pin |
 |---|---|---|
@@ -37,10 +50,11 @@ sides. Cross-domain coverage summary after this ticket:
 | `t2_prop`, `t2_prop1`, `t2_lat` | same set | pairing with propagated / declared network latency |
 | `t2_unc` | same set | capture-row uncertainty on foreign checks |
 | `t2_uncx` | same set | `-from/-to` directional replacement, one direction only |
-| `t2_mcp` | same set | `d_max` on the paired req; `d_min = −nh·Pc` (`−1.037585`) |
+| `t2_mcp`, `t2_mcps` | same set | `d_max` on the paired req; `d_min = −nh·Pc` (`−1.037585`) |
 | `t2_md`, `t2_mdl` | `u_fx/D` (`-to`), `u_fy/D` (`-from` & `-to` in `t2_mdl`) | delay-check anchor at capture edge 0, no pairing needed |
 | `t2_mdo` | none new (output port, same-domain) | unchanged — output delay check stays on the anchor row |
-| `t2_mdx` (new) | `u_fy/D` | both sides delay-covered on a cross endpoint |
+| `t2_mds` | none new (same-domain cell selectors) | unchanged — `get_cells` `-from` stays a launch selector |
+| `t2_mdx` (new) | `u_fy/D` both sides | pin-startpoint `-from`: segment `arr 0.0`, `req 0.885446/0.962415`; `u_fb1/D` clocked-launch kill |
 
 ## 2. `tests/designs/sta_clocks/probe.sh`
 

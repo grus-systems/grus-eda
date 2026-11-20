@@ -31,22 +31,40 @@ skips. This ticket evaluates those pairs per the measured OpenSTA rules
    symmetric. `t2_uncx`: `u_fx/D req 3.785446 = 4.2 − 0.30 − setup`
    while B→A keeps `cka`'s own 0.05. Hold side uses `-hold`.
 4. **Delay-check-covered cross endpoints report** (§1.5 + the `mc-eval`
-   review finding). `set_max_delay`/`set_min_delay` required times
-   already anchor at the capture domain's edge-0 arrival
-   (`run_sta_partitioned` reads `clk_s.arrival_*[anchor]` +
-   `cap_clk.*`) — they need no edge pairing. Once `collect_endpoints`
-   produces candidates for cross-domain endpoints, the existing compose
-   rewrite produces the measured numbers verbatim (`t2_md`/`t2_mdl`:
-   `u_fx/D req 0.935446`, `u_fy/D min_req 1.162415`). Un-skip exactly
-   that: a cross endpoint reports when every reached extreme pairs —
-   delay-covered sides never needed pairing in the first place.
+   review finding). `set_max_delay`/`set_min_delay` needs no edge
+   pairing, in either `-from` form (`api.md` §5):
+   - *Launch selectors* (cells, ports, clock pins): required times
+     anchor at the capture domain's edge-0 arrival
+     (`clk_s.arrival_*[anchor]` + `cap_clk.*`) — `t2_md`/`t2_mdl`
+     `u_fx/D req 0.935446`, `u_fy/D min_req 1.162415`.
+   - *Pin startpoints* (`get_pins inst/Q`, measured `t2_mdx`): the pin
+     itself becomes the path startpoint — the check times the segment
+     (`arr = ep.dly − pin.dly`, `req = N ∓ library constraint`, no
+     clock anchor/latency/uncertainty), and the pin's clocked launch is
+     *replaced*: endpoints no covering `-to` names lose the check on
+     that side (`u_fb1/D` drops out of OpenSTA's table and ours). A
+     `-from` pin unreached in the signature class contributes no
+     segment — it is skipped, and with no reached pin the polarity's
+     candidate drops (named skip, never an infinite arrival).
+   Un-skip exactly the evaluable cases: an endpoint reports when every
+   reached extreme pairs; genuinely unpairable cases stay
+   `CrossDomain`.
 5. **Golden coverage** on `sta_clocks`: `t2_frac`/`t2_int` cross-domain
    endpoints, `t2_unc`/`t2_uncx` direction-specific uncertainty,
-   `t2_md`/`t2_mdl`/`t2_mdo` delay-check endpoints, plus a new `t2_mdx`
-   scenario covering a cross endpoint with **both** sides delay-covered
-   (the literal "covered on both sides" case — `fixture.md`). All
-   compared against the committed probe JSON at `Tol::STRICT`, one
-   fail-proof mutation recorded.
+   `t2_md`/`t2_mdl`/`t2_mdo` delay-check endpoints, `t2_mds`
+   same-domain cell selectors, and `t2_mdx` — the pin-startpoint
+   `-from` form on a cross endpoint (both sides) plus the `u_fb1/D`
+   clocked-launch kill (`fixture.md`). All compared against the
+   committed probe JSON at `Tol::STRICT`, one fail-proof mutation
+   recorded.
+
+> Revision note (2026-11-20 review): the implementation landed at
+> `3f45194`; this revision syncs the design to the pin-startpoint
+> semantic measured during regen (`t2_mdx`) and adds the residual
+> review-mandated work: the unreached-`-from`-pin guard with a test
+> (`api.md` §5.4), routing `eval_sta`'s latch-borrow cap through
+> `unc_worst` like every other uncertainty read (`api.md` §6), and the
+> `sta_evaluates_two_clock_same_domain` rename (`tests.md` §1).
 
 ## Remaining `CrossDomain` deferrals (never fold)
 

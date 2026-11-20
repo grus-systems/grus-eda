@@ -190,7 +190,74 @@ as `setup_edge_pair` (the gate's hold edge *follows* the launch edge —
 not coincident). Unexercised; noted. On `None` from either helper the
 enable defers `CrossDomain`.
 
-## 5. Site table — uncertainty and pairing reads
+## 5. Pin-startpoint `-from` (measured `t2_mdx`)
+
+`set_max_delay`/`set_min_delay -from [get_pins inst/Q]` does not select
+a launch — the pin itself becomes the path startpoint. OpenSTA warns
+`'u_fb0/Q' is not a valid start point` yet times the segment
+(`probe_t2_mdx.txt`): the report's startpoint is the pin at arrival 0.
+
+### 5.1 Resolution — `from_pins`
+
+`resolve_delay_from`/`delay_pin_spec`: a pin spec naming a *launch
+element* (a Q pin — present in `launch_keys`) lands in **both** `out`
+(the signature-coverage keys, so the rule attaches to the launch's
+class) and `pins` (`ResolvedPathDelay.from_pins`). A clock pin keeps
+the `pin_launches` launch-key expansion; any other pin covers nothing.
+`from_pins: Option<HashSet<u32>>` is `None` for every other `-from`
+form — cell/port/clock-pin selectors keep the capture edge-0 anchor
+(`pairing.md` §7) unchanged.
+
+### 5.2 Clocked-launch kill (`pin_from_sig_*`)
+
+A pin-startpoint rule in a class's signature replaces the clocked
+launch of every source in that class — measured: `u_fb1/D` (launched
+by `u_fb0/Q`, not named by the `-to`) loses both checks and is absent
+from OpenSTA's endpoint table and ours. `pin_from_sig_{max,min}` is
+therefore set on signature membership alone — before the rule's `to`
+coverage check — and a side whose class signature holds a pin rule
+whose `-to` does not cover the endpoint drops the whole side:
+`pin_from_sig_max && delay_max_n.is_none()` → `pols.max = [None; 2]`
+(min symmetric). When the `-to` does cover, §5.3's segment rewrite
+runs instead.
+
+### 5.3 Segment rewrite
+
+On a covering rule:
+
+- check pin, max: `arr = max_{fp reached} (w.dly − cs[fp].dly_max[pol])`,
+  `req = N − t_setup`, `slack = req − arr` — no clock anchor, latency,
+  or uncertainty (the required block is `max_delay` + CRPR + library
+  constraint only; golden `u_fy/D` `arr 0.0`, `req 0.885446`).
+- check pin, min: `arr = min_{fp reached} (w.dly − cs[fp].dly_min[pol])`,
+  `req = N + t_hold` (`u_fy/D` `req 0.962415`).
+- output port: `w.arr` becomes the same segment fold; `req` keeps the
+  ordinary port rewrite (`N − out_delay ∓ uncertainty`).
+
+### 5.4 Unreached startpoint pins
+
+A `-from` pin unreached in the signature class on that (polarity,
+side) — `dly_max = NEG_INFINITY` / `dly_min = INFINITY` — contributes
+no constrained path and is **skipped** in the fold. When no pin in the
+set is reached, the polarity's candidate drops (`pols.*[pol] = None`):
+the rule produced no path on that polarity, so the endpoint reports
+the other polarity or lands in the ordinary skip diagnosis
+(`record_endpoint`'s `unreached` → `endpoint_skip_reason`) — a named
+skip, never an infinite segment arrival and never a silent `w.dly`
+fallback (the `-from` already replaced the clocked launch, §5.2). All
+four segment sites share one helper:
+
+```rust
+/// `ep_dly − pin_dly` over the `-from` pins reached in this class on
+/// (pol, side); `None` when none is reached — the caller drops the
+/// polarity's candidate.
+fn pin_segment_arrival(
+    pins: &HashSet<u32>, states: &[PinTimingState],
+    ep_dly: f32, pol: usize, min_side: bool,
+) -> Option<f32>;
+```
+
+## 6. Site table — uncertainty and pairing reads
 
 | site | now | becomes |
 |---|---|---|
@@ -199,14 +266,15 @@ enable defers `CrossDomain`.
 | check hold req | `cap_clk.hold_uncertainty_ns` | `uncertainty_ns(d, cap, true)` |
 | gate req | `cap_clk.{setup,hold}_uncertainty_ns` | per-candidate accessor |
 | output-port req | `out_clk.{setup,hold}_uncertainty_ns` | `uncertainty_ns(d, out_row, side)` |
-| delay-check rewrite (compose) | `cap_clk.{setup,hold}_uncertainty_ns` | worst-over-`dom_*`-bits accessor |
-| latch borrow cap (`eval_sta`) | `en_clk.setup_uncertainty_ns` | unchanged — borrow pairing is parked; only same-domain data reaches the cap in fixtures |
+| delay-check rewrite (compose) | `cap_clk.{setup,hold}_uncertainty_ns` | worst-over-`dom_*`-bits accessor (`unc_worst`) |
+| pin-startpoint `-from` | — | `pin_from_sig_*` side kill (§5.2); segment arrival via `pin_segment_arrival` — unreached pins skipped, none reached → candidate drops (§5.3–§5.4) |
+| latch borrow cap (`eval_sta`) | `en_clk.setup_uncertainty_ns` | `unc_worst(sdc, src.dom_max[src_pol], en_dom, false)` at both reads — the same accessor every other eval site uses; identical on rule-free SDCs (the cap's launch domain is the arriving data's mask, its capture the latch enable's domain row) |
 | check req edge selection | `c0 <= g → +period` | `d == cap`: unchanged; `d != cap`: `setup_edge_pair`/`hold_edge_pair` |
 | `foreign_launch` gate | whole-endpoint defer on any foreign bit | `xdomain_defer` — only unpairable cases defer |
 | compose MCP `d_min` | `((ns−1)−nh)·cap.period` | `−nh·cap.period` when the candidate's `dom_min` mask has a foreign bit (`pairing.md` §6) |
 | compose MCP `d_max` | `(ns−1)·cap.period` | unchanged — applies on the paired req |
 
-## 6. Partitioned skip pass
+## 7. Partitioned skip pass
 
 The `xdomain_skip` closure in `run_sta_partitioned` switches from
 `foreign_launch` to `xdomain_defer` — same arguments, plus `c0` (from
@@ -217,7 +285,7 @@ Endpoints that *did* evaluate are `reported` before the pass runs, so
 the re-diagnosis only sees genuinely unpairable pins — the closure's
 semantics stay "why is this endpoint unreported".
 
-## 7. Signatures touched
+## 8. Signatures touched
 
 - `Sdc::inter_clock_uncertainty` field; `InterClockUnc` type;
   `Sdc::uncertainty_ns`.
@@ -225,16 +293,27 @@ semantics stay "why is this endpoint unreported".
   filter, to consume `-from`/`-to` arguments.
 - `analysis.rs`: `grid_lcm`, `setup_edge_pair`, `hold_edge_pair`,
   `xdomain_defer` (new, `foreign_launch` deleted — its
-  `<undeclared>`/name-join logic moves into `xdomain_defer`).
+  `<undeclared>`/name-join logic moves into `xdomain_defer`),
+  `pin_segment_arrival` (new, §5.4), `unc_worst` (new, §6).
+- `ResolvedPathDelay.from_pins: Option<HashSet<u32>>` plus
+  `resolve_delay_from`/`delay_pin_spec` — pin `-from` specs split
+  launch keys from startpoint pins (§5.1).
 - `collect_endpoints`: candidate loops per §3–§4 — no signature change
   (all inputs already in scope: `clock_domain`, `clock_parity` for `c0`).
+- Compose pass: `pin_from_sig_*` kill (§5.2); the four segment-fold
+  sites call `pin_segment_arrival` and clear the polarity's `Worst` on
+  `None` (the output-port arms restructure to clear `pols.*[pol]`).
+- `eval_sta`: the latch-borrow cap's two uncertainty reads switch to
+  `unc_worst` (§6) — no signature change.
 - `run_sta_partitioned`: `xdomain_skip` closure body; the MCP `d_min`
   site reads `class_states[ci][ep].dom_min[pol]` for the foreign-bit
   test.
+- Tests: `sta_evaluates_two_clock_same_domain` renames to
+  `sta_evaluates_two_clock` (`tests.md` §1).
 - No changes to `PinTimingState`, `StaPrepared`, report types,
   `eval_sta`'s signature, or `main.rs`.
 
-## 8. Remaining `CrossDomain` surface — summary
+## 9. Remaining `CrossDomain` surface — summary
 
 | case | outcome |
 |---|---|

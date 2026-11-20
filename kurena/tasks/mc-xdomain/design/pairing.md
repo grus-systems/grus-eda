@@ -58,18 +58,25 @@ fn hold_edge_pair(pl: f32, pc: f32, g: usize, c0: usize) -> Option<(f32, f32)>;
 
 Implementation notes:
 
-- Launch-edge enumeration: `m` from 0 while `g·pl/2 + m·pl < lcm` (the
-  boundary edge at LCM duplicates edge 0).
-- Capture index: `j = max(0, floor((Tl − phase_c)/pc) + 1)`, then a
-  short `while` loop in both directions so `phase_c + j·pc` is the
-  exact smallest value `> Tl` — robust to `f64` noise at coincident
-  points (a coincident capture edge is never "strictly after").
+- Launch-edge enumeration goes through `launch_window(g, pl, lcm)`:
+  `m` from 0 while `g·pl/2 + m·pl < lcm·(1 − 1e-6)` — the boundary
+  edge at LCM duplicates edge 0, and the margin absorbs the f32-scale
+  noise `grid_lcm` leaves in the bound.
+- `grid_lcm`'s remainder test is relative to the *input* periods
+  (~1e-6 of the smaller): `1.4f32` is `1.399999976…` in f64, so an
+  exact Euclid gcd would sink to the f32 rounding residue and report
+  an absurd LCM — the window accepts the f32-scale gcd instead.
+- Capture index: `j = floor((Tl − phase_c)/pc) + 1` clamped `≥ 0`,
+  then a short `while` walk in both directions so `phase_c + j·pc` is
+  the exact smallest value `> Tl` (with `eps = 1e-9·max(pl, pc)`) —
+  robust to `f64` noise at coincident points (a coincident capture
+  edge is never "strictly after").
 - `hold_edge_pair`: enumerate `m` in the window, test whether
   `(Tl − phase_c)/pc` is integral within ~1e-6 relative; keep the
   smallest `T`. Coincident-pair slack is `T`-invariant (both sides
   shift by `T`), so the smallest `T` is the reported pair.
 - Equal-gap ties on the setup side: keep the first found (smallest
-  launch edge). OpenSTA's tie-break is unmeasured — note it in code.
+  launch edge). OpenSTA's tie-break is unmeasured — noted in code.
 
 ## 3. Worked examples (verified against `two_clock.probe.json`)
 
@@ -159,12 +166,25 @@ extreme is at least partly foreign — noted as conservative).
 
 ## 7. Delay-check interplay
 
-`set_max_delay`/`set_min_delay` endpoints need no pairing — the compose
-rewrite anchors req at the capture domain's edge-0 arrival
-(`clk_s.arrival_*[anchor]`, already per-domain since `mc-eval`).
-Pairing in `collect_endpoints` simply produces the candidates the
-rewrite needs; `w.dly` (the edge-0 delay arrival) is reported
-unchanged — `t2_mdl` `u_fx/D` `arr 0.877469` is the launch edge-0 +
-latency arrival, *not* the paired setup edge. No formula change in the
-rewrite itself; only the per-candidate uncertainty lookup (`api.md`
-§5).
+`set_max_delay`/`set_min_delay` endpoints need no pairing, in either
+`-from` form:
+
+- **Launch selectors** (cells, ports, clock pins): the compose rewrite
+  anchors req at the capture domain's edge-0 arrival
+  (`clk_s.arrival_*[anchor]`, already per-domain since `mc-eval`).
+  Pairing in `collect_endpoints` simply produces the candidates the
+  rewrite needs; `w.dly` (the edge-0 delay arrival) is reported
+  unchanged — `t2_mdl` `u_fx/D` `arr 0.877469` is the launch edge-0 +
+  latency arrival, *not* the paired setup edge. No formula change in
+  the rewrite itself; only the per-candidate uncertainty lookup
+  (`api.md` §6).
+- **Pin startpoints** (`get_pins inst/Q`, measured `t2_mdx`): there is
+  no launch edge to pair at all — the check is `N` against the segment
+  arrival `ep.dly − pin.dly`, `req = N ∓ library constraint` (`api.md`
+  §5.3). A `-from` pin unreached in the signature class is skipped in
+  the fold; no reached pin → the polarity's candidate drops (`api.md`
+  §5.4).
+
+## Files
+
+- `crates/grus-core/src/sta/analysis.rs`
