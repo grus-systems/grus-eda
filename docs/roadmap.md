@@ -88,30 +88,38 @@ The items below close these gaps, in the order proposed at the end.
 - Done when: on a public design with a buffered clock tree, setup and hold WNS/TNS and the
   per-endpoint arrival match OpenSTA within the default tolerance.
 
-### R3. Hold with propagated clocks
+### R3. Hold with propagated clocks — Done
 
-- Ideal-clock hold analysis exists (`arrival_min`, hold and removal constraints, hold
-  uncertainty, `wns_min`/`tns_min`) and is checked on the five benchmark designs. What is
-  left is the propagated-clock case: the min-path launch must use the early clock arrival
-  and slew, not the late ones.
-- Report the hold violation count next to WNS/TNS.
-- Done when: a fixture with a real hold violation (ideal clock and propagated clock) matches
-  OpenSTA on the violation count, worst hold slack and per-endpoint min arrival. This item
-  is part of R2's acceptance and is listed separately because it needs its own fixture.
+- Fixture `sta_edge/hold_violation/` (`hold.def` + `ideal.sdc` + `propagated.sdc`):
+  2 of 4 endpoints hold-violate in both modes, matched at `Tol::STRICT` by
+  `test_sta_edge_hold_violation_{ideal,propagated}` (`analysis.rs` — v0.1.61,
+  `docs/results.md` 2026-11-17 "R3").
+- `StaReport::hold_violations` is printed by `grus-eda sta` next to WNS/TNS
+  (`main.rs`) and serialised in `--json`; `compare_sta_edge` asserts the counts
+  exactly when the golden carries them.
+- Residual note kept verbatim: the propagated source-slew fix seeds the clock
+  port's `set_input_transition` (not `set_clock_transition`) into the propagated
+  network — measured in the same entry.
 
-### R4. Clock gating
+### R4. Clock gating — Done
 
-- R4a, combinational gates: AND/NAND/OR/NOR gates on the clock path, with the setup and
-  hold edges that match each gate's polarity. Today only a positive-unate `and2` is
-  matched, with fixed edge timing.
-- R4b, latch-based integrated clock-gating cells (`sky130_fd_sc_hd__dlclkp`): clock
-  propagation from `CLK` to `GCLK`, and the enable-pin checks. Today a latch cell
-  intercepts the arc and its output is treated as a half-period-delayed latch launch.
-- The `dlxtn` + `and2` gate in `ibex` is already handled for endpoints
-  ([`history/step4/10-latch-and-clock-gating.md`](history/step4/10-latch-and-clock-gating.md)).
-- Done when: for each of R4a and R4b there is a public design or a small fixture where all
-  endpoints (the gating checks and the gated registers) match OpenSTA on max/min arrival,
-  required time, slack and slew within the default tolerance.
+- Fixture `sta_edge/clock_gate/` covers `and2`/`or2`/`nand2`/`nor2` plus the
+  `dlclkp` integrated clock-gating cell, with `dfrtn` flops behind the
+  inverting gates so both edge polarities are exercised — STRICT in ideal and
+  propagated (`test_sta_edge_clock_gate_{ideal,propagated}`, v0.1.66,
+  `docs/results.md` 2026-11-17 "Roadmap R4").
+- The measured rule: gate kind comes from the output pin's Liberty `function`
+  (AND/NAND = rising check, OR/NOR = falling, both edges swapped); muxes and
+  partial functions are rejected by `gate_kind`, locked by
+  `test_gate_kind_classifies_liberty_functions`. `dlclkp`'s GATE check is an
+  ordinary register check and `CLK -> GCLK` uses the combinational arc.
+- Residuals: cells without a Liberty `function` keep the positive-unate AND
+  guess (they cannot be classified); `gating_enables` checks get no CRPR
+  credit under derate (pessimistic, recorded in the R7 entry); the four
+  `CrossDomain` deferrals in `docs/multi-clock.md` §2 are unrelated and stay
+  parked there. Ideal-mode clock-network inversion is no longer open —
+  `ideal_clock_parity` has tracked edge phase through cell-driven clock nets
+  since v0.1.71 (same-day follow-up entry).
 
 ### R5. Latches
 
@@ -130,14 +138,28 @@ The items below close these gaps, in the order proposed at the end.
   `latch_arcs_dropped`/`recognized_check_arcs`. `min_pulse_width` arcs left the
   deferred set when they became evaluated checks in `v0.1.93` (N3).
 
-### R6. Asynchronous arcs
+### R6. Asynchronous arcs — Done (already matching, re-measured)
 
-- Rising recovery and removal checks are already collected. What is missing: propagation
-  through `Clear`/`Preset` arcs (`RESET_B -> Q`, `SET_B -> Q`), and the falling
-  recovery/removal variants where a cell needs them.
-- Done when: a design with asynchronous resets matches OpenSTA on the async check pins and
-  on every downstream endpoint reached through a `Clear`/`Preset` arc, within the default
-  tolerance.
+- Re-measured on `sta_edge/async_arcs` (`docs/results.md` 2026-11-21): OpenSTA
+  3.0.16 does **not** propagate `Clear`/`Preset` arcs into timed paths. The
+  unclocked-`CLK` discriminators `u_ar`/`u_ap`/`u_aq` carry raw arrivals on
+  `Q`/`Q_N` but no clock tag, so `find_timing_paths -to u_d*/D` returns zero
+  paths and disabling `u_ff0`'s `CLK -> Q` arc leaves `u_ff2/D` pathless.
+  `report_checks -unconstrained` names no unclocked endpoints at all; OpenSTA
+  emits no warning for them. Keeping `Clear`/`Preset` in
+  `recognized_check_arcs` is the matching behaviour — propagating would
+  diverge.
+- Check coverage now spans every async check shape in `sky130_fd_sc_hd`:
+  `dfrtp`/`dfstp`/`dfrbp`/`dfbbp`/`dfbbn` flop variants (rising and falling
+  recovery/removal, dual async pins) in this fixture at STRICT
+  (`test_sta_edge_async_arcs_{ideal,propagated}`), `dfrtn` in
+  `async_fall*`/`clock_gate`, `dlrt*`/`dlrb*` latches in `latch_borrow`;
+  `sdf*` scan cells are family-equivalent supersets (`SCD`/`SCE` pins extra).
+- Named residuals: `non_seq_*` arcs on `dfbb*`/`sdfbb*` stay deferred —
+  measured: OpenSTA does not report them either (`report_check_types` has no
+  rows for them), so the deferral is parity, not a gap; the "future OpenSTA
+  version re-measurement" clause from the 2026-11-17 entry stands — a version
+  that propagates async arcs or reports `non_seq_*` would reopen this item.
 
 ### R7. Timing derate (with CRPR)
 

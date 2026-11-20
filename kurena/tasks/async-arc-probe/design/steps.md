@@ -7,8 +7,9 @@ that adds them).
 
 ## Step 0 — Fixture + container run
 
-Create `tests/designs/sta_edge/async_arcs/` per `fixture.md`: DEF (12 cells,
-12 nets, 6 ports), `ideal.sdc`, `propagated.sdc`, `generate_ref.sh` (golden
+Create `tests/designs/sta_edge/async_arcs/` per `fixture.md`: DEF (14 cells,
+13 nets, 6 ports — fixture.md is authoritative), `ideal.sdc`,
+`propagated.sdc`, `generate_ref.sh` (golden
 JSON + `run_probe` per `probe.md`, both modes).
 
 Run `bash tests/designs/sta_edge/async_arcs/generate_ref.sh` (Colima/Docker

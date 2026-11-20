@@ -31,18 +31,24 @@ Replace the `### R4.` body:
   muxes and partial functions are rejected by `gate_kind`, locked by
   `test_gate_kind_classifies_liberty_functions`. `dlclkp`'s GATE check is an
   ordinary register check and `CLK -> GCLK` uses the combinational arc.
-- Residuals to state accurately: the ideal-clock model still cannot see
-  inversion through cell-driven clock nets (documented same-day; also
-  `timing_derate`'s `clkinv`); the four `CrossDomain` deferrals in
-  `docs/multi-clock.md` §2 are unrelated and stay parked there.
+- Residuals to state accurately: the four `CrossDomain` deferrals in
+  `docs/multi-clock.md` §2 are unrelated and stay parked there; cells without
+  a `function` keep the AND guess; `gating_enables` checks get no CRPR credit.
+  (Correction during implementation: the "ideal clock cannot see cell-driven
+  clock-net inversion" residual was already closed by `ideal_clock_parity` in
+  v0.1.71 — `test_sta_edge_clock_gate_ideal` is un-ignored and STRICT — so it
+  is not a live residual.)
 
 ## 3. `docs/roadmap.md` — R6 disposition (two branches)
 
 **Branch A (expected — no propagation):** mark R6 Done with the probe
 evidence: re-measured on `sta_edge/async_arcs` — OpenSTA 3.0.16 yields no
 `Clear`/`Preset` arrival at `Q`/`Q_N` (unclocked-`CLK` discriminators
-`u_ar`/`u_ap`/`u_aq` unreached; `u_d*/D` endpoints appear in OpenSTA's
-`-unconstrained` list exactly as in our `skipped_endpoints`). Check coverage
+`u_ar`/`u_ap`/`u_aq` unreached; `u_d*/D` endpoints expected to appear in
+OpenSTA's `-unconstrained` list exactly as in our `skipped_endpoints`).
+(Correction during implementation: `-unconstrained` lists *no* unclocked
+endpoints in OpenSTA 3.0.16 — the pins simply produce zero paths and no
+warning; the roadmap entry states the measured behaviour.) Check coverage
 now spans every async check shape in `sky130_fd_sc_hd` (`dfrtp`/`dfrtn`,
 `dfstp`, `dfbbp`/`dfbbn` rising+falling, `dlrt*`/`dlrb*` latches). Keep
 `Clear`/`Preset` in `recognized_check_arcs` (propagating would diverge).

@@ -4335,3 +4335,154 @@ and `probe_t2_clkdup.txt` is new.
 
 Version `0.2.8 → 0.2.9` in `[workspace.package]` (`Cargo.lock`
 refreshed by `cargo check`).
+
+## 2026-11-21 — async-arc probe: R6 re-measurement (+R3/R4 roadmap correction)
+
+**Fixture/script**: `tests/designs/sta_edge/async_arcs/` — hand-written
+`async_arcs.def` (14 `sky130_fd_sc_hd` cells, 13 nets, 6 ports) with
+`ideal.sdc`/`propagated.sdc`; `generate_ref.sh` runs four `openroad` sessions
+inside `ghcr.io/librelane/librelane:3.0.16` and emits
+`async_arcs.reference.json` plus `probe_async_{ideal,propagated}.txt`
+(byte-identical on a second run — checked via md5 before commit). Clock-tree
+`clkbuf_2` x3; on `c1`: `u_ff0`/`dfrtp_1`, `u_fp`/`dfstp_1`, `u_fbp`/`dfbbp_1`,
+`u_fbn`/`dfbbn_1` (`CLK_N`), `u_ff2` `dfxtp_1`; on the **unclocked** port `aclk`
+(no `create_clock` in either SDC): `u_ar`/`dfrtp_1`, `u_ap`/`dfstp_1`,
+`u_aq`/`dfrbp_1` — discriminators whose `Q`/`Q_N` can only carry a timed path
+through a `clear`/`preset` arc — feeding `u_ds`/`u_dp`/`u_dq` `dfxtp_1` whose
+`D` pins are reachable only through those outputs.
+
+**Liberty census** (`sky130_fd_sc_hd__tt_025C_1v80.lib`, counted 2026-11-21,
+drive-strength suffixes stripped):
+
+| shape | families |
+|---|---|
+| `recovery_rising` + `removal_rising` (12) | `dfbbp`, `dfrbp`, `dfrtp`, `dfsbp`, `dfstp`, `dlrbn`, `dlrtn`, `sdfbbp`, `sdfrbp`, `sdfrtp`, `sdfsbp`, `sdfstp` |
+| `recovery_falling` + `removal_falling` (6) | `dfbbn`, `dfrtn`, `dlrbp`, `dlrtp`, `sdfbbn`, `sdfrtn` |
+| `clear` arcs (16) | `dfbb[n/p]`, `dfrbp`, `dfrt[n/p]`, `dfsbp`, `dlrb[n/p]`, `dlrt[n/p]`, `sdfbb[n/p]`, `sdfrbp`, `sdfrt[n/p]`, `sdfsbp` |
+| `preset` arcs (12) | `dfbb[n/p]`, `dfrbp`, `dfsbp`, `dfstp`, `dlrb[n/p]`, `sdfbb[n/p]`, `sdfrbp`, `sdfsbp`, `sdfstp` |
+| `non_seq_setup_rising` + `non_seq_hold_rising` (4) | `dfbb[n/p]`, `sdfbb[n/p]` (`SET_B`/`RESET_B` checked against each other) |
+
+Coverage already locked: `dfrtp` rising (`async_reset`), `dfrtn` falling
+(`async_fall`, `async_fall_chain`, `clock_gate`), `dlrtn`/`dlrbn` rising and
+`dlrtp`/`dlrbp` falling latches (`latch_borrow`). This fixture adds `dfstp`
+(set-only), `dfbbp`/`dfbbn` (dual pins + `non_seq_*`), `dfrbp` (single pin,
+both arc types, used as the `Q_N` discriminator). `sdf*` scan cells share the
+same check shapes plus `SCD`/`SCE` pins — family equivalence only, not placed.
+
+**Q0 — command surface** (verbatim, both modes): `sta::*arrival*` lists
+`::sta::report_arrival` (exists as `report_arrival`); `sta::find_vertex` /
+`sta::pin_vertex` do **not** exist (`invalid command name`); no
+`*unconstrained*` commands; `report_check_types` exists.
+
+**Q1 — `-unconstrained` reporting**: `report_checks -unconstrained` prints the
+worst path per path group — `u_fbn` recovery check under
+`Path Group: asynchronous` and the `u_fbn/D` register check under
+`Path Group: core_clk` — and **no list of unclocked endpoints**. `u_a*/D`,
+`u_a*/RESET_B|SET_B` and `u_d*/D` never appear anywhere in OpenSTA's output
+(no warnings at `read_sdc` or analysis time either — OpenSTA narrates them
+as nothing at all).
+
+**Q2 — does `Clear`/`Preset` propagate an arrival to `Q`? No** (identical in
+ideal and propagated):
+
+- `find_timing_paths -from rst_n` → `path count: 1`, end `u_fbn/RESET_B`;
+  `-from set_n` → 1 path, `u_fbn/SET_B` — the worst-slack recovery-check
+  endpoints only (default `endpoint_path_count`/`group_path_count` of 1).
+- `find_timing_paths -to u_ds/D` / `u_dp/D` / `u_dq/D` → `path count: 0` each.
+- `report_arrival` verbatim:
+
+  ```
+  --- u_ar/Q ---
+   r 0.33:0.33 f 0.36:0.36
+  --- u_ap/Q ---
+   r 0.50:0.50 f 0.36:0.36
+  --- u_aq/Q_N ---
+   r 0.47:0.47 f 0.41:0.41
+  --- u_ff0/Q ---
+   (core_clk ^) r 1.03:1.03 f 1.06:1.06        (propagated: r 0.58 f 0.62)
+  ```
+
+  The `u_a*` outputs do carry raw arrivals (≈ the `CLK->Q` delay applied to an
+  unclocked clock-pin arrival) but with **no clock tag** — OpenSTA stores the
+  value yet cannot start a constrained path from it, so the arcs still yield
+  no endpoints.
+- `report_checks -from rst_n -through u_ar/Q -format full` → `No paths found.`;
+  `-from rst_n -through u_ff0/Q` → 0 paths (reconfirms the 2026-11-17 note).
+- Transient discriminator (in-session only): after
+  `set_disable_timing [get_cells u_ff0] -from CLK -to Q`,
+  `find_timing_paths -to u_ff2/D` → `path count after disable: 0`,
+  `No paths found.` — `u_ff2/D` is fed only by `u_ff0/Q`, so it would stay
+  timed iff `RESET_B -> Q` propagated. It does not.
+
+**Q3 — falling recovery/removal** on `u_fbn` (`dfbbn_1`, `CLK_N`): verbatim
+`Endpoint: u_fbn (recovery check against falling-edge clock core_clk)`,
+capture `clock core_clk (fall edge) 2.00` + 0.70 ideal latency at
+`v u_fbn/CLK_N`, `library recovery time` −0.05 (`RESET_B`) / +0.08 (`SET_B`).
+Same anchoring as `dfrtn` (`async_fall`) — the check sits on the external
+falling transition. Both pins are golden endpoints (max path = recovery,
+min path = removal).
+
+**Q4 — `non_seq_*` on `dfbbp`/`dfbbn`**: OpenSTA does not report them as
+endpoints or elsewhere. `report_check_types` prints group-slack rows
+(`asynchronous`/`core_clk`), `max slew`, `max capacitance`, and one
+pulse-width row — no `non_seq` entries; `report_checks -to u_fbp/RESET_B` and
+`-to u_fbp/SET_B` show only the recovery checks. Our `recognized_check_arcs`
+deferral diverges on nothing: the endpoint sets are equal.
+
+**Q5 — preset-side pairing**: `Endpoint: u_fp (recovery check against
+rising-edge clock core_clk)`, `library recovery time` +0.15 → required 4.80
+(ideal) — `SET_B` anchors exactly like `RESET_B` on `dfrtp`.
+
+**Q6 — golden**: 12 endpoints and 16 `pulse_width` rows per mode (every
+clocked `CLK`/`CLK_N` pin, including `u_fbn/CLK_N` high+low on the inverting
+pin — new coverage). No `u_a*/CLK` rows (unclocked → no checks, matching our
+`skipped_endpoints`). `setup_violations`/`hold_violations` 0/0 both modes.
+
+**Our side (same fixture, `grus-eda sta`, zero wire)**:
+
+- Endpoint set **identical**: 12/12 pins both modes; worst field difference
+  `|Δ| = 1e-6 ns` (`u_fbp/SET_B.max_req_ns` 4.699498 vs 4.699499) — STRICT.
+  WNS/TNS and violation counts match exactly; 16/16 pulse rows match.
+- CLI summary (ideal): `endpoints=12, setup wns=1.088468 tns=0.000000
+  viol=0, hold wns=0.207754 tns=0.000000 viol=0`; `skipped: 31/99 arcs
+  (31.31%), 15/43 endpoints (34.88%)`;
+  `recognized_check_arcs[Clear=7, MinPulseWidth=9, NonSeqHoldRising=4,
+  NonSeqSetupRising=4, Preset=7]`, `unreached_endpoints=15`,
+  `cell_driven_clock_nets=1` (ideal only: `c1` is buffer-driven — the
+  documented ideal-mode clock-net limitation; propagated does not count it).
+- `skipped_endpoints` verbatim (15, both modes): `u_ar/D`, `u_ar/RESET_B`,
+  `u_ap/D`, `u_ap/SET_B`, `u_aq/D`, `u_aq/RESET_B` — `check`/`no_clock`
+  (`u_a*/CLK`); `u_ds/D`, `u_dp/D`, `u_dq/D` — `check`/`no_path`
+  (`u_ar/Q`, `u_ap/Q`, `u_aq/Q_N`); `u_a*/CLK` x3 high+low —
+  `min_pulse_width`/`no_clock`. Where OpenSTA is silent, we name every
+  dropped endpoint with its reason — the divergent-by-design accounting.
+- `--strict` exits **1** in both modes (`unreached_endpoints` is not
+  `is_clean`-exempt) — expected: the fixture deliberately places flops on an
+  unclocked port.
+
+**R6 disposition — closed as already matching (Branch A).** OpenSTA 3.0.16
+does not propagate `Clear`/`Preset` arcs into timed paths: endpoints
+reachable only through them produce zero paths, not unconstrained-path
+reports. The "downstream endpoints" clause is vacuous for this OpenSTA
+version; keeping the arcs in `recognized_check_arcs` is the matching
+behaviour. Check coverage now spans every async check shape in
+`sky130_fd_sc_hd`: `dfrtp`/`dfstp`/`dfrbp`/`dfbbp`/`dfbbn` flops rising and
+falling, `dlrt*`/`dlrb*` latches (`latch_borrow`); `sdf*` scan cells are
+family-equivalent supersets (extra `SCD`/`SCE` pins). Residuals kept open:
+`non_seq_*` — OpenSTA does not report them either, so the deferral is parity
+(a future OpenSTA that reports them would reopen this); the
+"future OpenSTA version re-measurement" clause from 2026-11-17 stands.
+
+**R3/R4 doc-only correction** (no probe needed): `docs/roadmap.md` R3/R4
+marked Done — evidence `test_sta_edge_hold_violation_{ideal,propagated}`
+(v0.1.61, entry above) and `test_sta_edge_clock_gate_{ideal,propagated}` +
+`test_gate_kind_classifies_liberty_functions` (v0.1.66); `hold_violations`
+printed in the `sta` summary and serialised in `--json`.
+
+**Checks run**: `bash tests/designs/sta_edge/async_arcs/generate_ref.sh` —
+whole script, three times; artifacts byte-identical. `grus-eda sta` on both
+SDCs (`--json` + `--strict`, verbatim above). New tests
+`test_sta_edge_async_arcs_{ideal,propagated}` at `Tol::STRICT`; fail-proofed
+(E0 rule 7): splitting `RecoveryFalling` out of the check arm turned both
+tests red (10 vs 12 endpoints), restored green. `cargo test --workspace` —
+all pass; `cargo clippy --workspace --all-targets -- -D warnings` — clean.

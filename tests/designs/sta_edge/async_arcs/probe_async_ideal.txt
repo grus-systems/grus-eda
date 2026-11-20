@@ -1,0 +1,406 @@
+warning: `/var/empty/.tclsh-history' is not writable.
+openroad> <y130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+1
+openroad> <f/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef, created 14 layers, 25 vias
+openroad> <0A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+[WARNING ODB-0220] WARNING (LEFPARS-2008): NOWIREEXTENSIONATPIN statement is obsolete in version 5.6 or later.
+The NOWIREEXTENSIONATPIN statement will be ignored. See file /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef at line 2.
+
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef, created 437 library cells
+openroad> read_def /work/tests/designs/sta_edge/async_arcs/async_arcs.def
+[INFO ODB-0127] Reading DEF file: /work/tests/designs/sta_edge/async_arcs/async_arcs.def
+[INFO ODB-0128] Design: async_arcs
+[INFO ODB-0130]     Created 6 pins.
+[INFO ODB-0131]     Created 14 components and 107 component-terminals.
+[INFO ODB-0133]     Created 13 nets and 42 connections.
+[INFO ODB-0134] Finished DEF file: /work/tests/designs/sta_edge/async_arcs/async_arcs.def
+openroad> 
+openroad> puts "=== scenario ideal.sdc ==="
+=== scenario ideal.sdc ===
+openroad> read_sdc /work/tests/designs/sta_edge/async_arcs/ideal.sdc
+openroad> 
+openroad> puts "=== Q0 command surface ==="
+=== Q0 command surface ===
+openroad> puts "sta::*arrival*   : [lsort [info commands sta::*arrival*]]"
+sta::*arrival*   : ::sta::PathEnd_data_arrival_time ::sta::PathEnd_target_clk_arrival ::sta::Path_arrival ::sta::Vertex_arrival ::sta::Vertex_arrivals_clk ::sta::Vertex_arrivals_clk_delays ::sta::arrivals_invalid ::sta::default_arrival_clock ::sta::report_arrival ::sta::report_arrival_entries ::sta::report_tag_arrivals ::sta::report_tag_arrivals_cmd ::sta::set_use_default_arrival_clock ::sta::use_default_arrival_clock ::sta::vertex_worst_arrival_path ::sta::vertex_worst_arrival_path_rf
+openroad> puts "sta::*vertex*    : [lsort [info commands sta::*vertex*]]"
+sta::*vertex*    : ::sta::PathEnd_vertex ::sta::vertex_iterator ::sta::vertex_name_ ::sta::vertex_path_name ::sta::vertex_port_name ::sta::vertex_worst_arrival_path ::sta::vertex_worst_arrival_path_rf ::sta::vertex_worst_slack_path ::sta::worst_slack_vertex
+openroad> puts "sta::*pin_*      : [lsort [info commands sta::*pin_*]]"
+sta::*pin_*      : ::sta::Instance_pin_iterator ::sta::Net_connected_pin_iterator ::sta::Net_pin_capacitance ::sta::Net_pin_iterator ::sta::Pin_connected_pin_iterator ::sta::connect_pin_cmd ::sta::disconnect_pin_cmd ::sta::get_pin_arg ::sta::get_pin_error ::sta::get_pin_warn ::sta::get_port_pin_arg ::sta::get_port_pin_error ::sta::get_port_pin_warn ::sta::make_port_pin_cmd ::sta::network_leaf_pin_count ::sta::network_pin_count ::sta::parse_cell_port_pin_args ::sta::parse_clk_cell_port_pin_args ::sta::parse_clk_inst_pin_arg ::sta::parse_clk_inst_port_pin_arg ::sta::parse_clk_port_pin_arg ::sta::parse_inst_pin_arg ::sta::parse_inst_port_pin_arg ::sta::parse_inst_port_pin_net_arg ::sta::parse_libcell_libport_inst_port_pin_edge_timing_arc_set_arg ::sta::parse_pin_net_args ::sta::parse_port_pin_net_arg ::sta::pin_case_logic_value ::sta::pin_direction ::sta::pin_direction_desc ::sta::pin_is_constrained ::sta::pin_location ::sta::pin_location_str ::sta::pin_logic_value ::sta::pin_property ::sta::pin_sim_logic_value ::sta::port_ext_pin_cap ::sta::report_pin_ ::sta::report_pin_constant ::sta::set_clock_gating_check_pin_cmd ::sta::set_pin_capacitance_limit ::sta::set_port_ext_pin_cap ::sta::set_power_pin_activity ::sta::set_propagated_clock_pin_cmd ::sta::sta_pin_to_port ::sta::unset_power_pin_activity ::sta::unset_propagated_clock_pin_cmd
+openroad> puts "*unconstrained*  : [lsort [info commands *unconstrained*]]"
+*unconstrained*  : 
+openroad> puts "*check_types*    : [lsort [info commands *check_types*]]"
+*check_types*    : report_check_types
+openroad> puts "report_arrival   : [info commands report_arrival]"
+report_arrival   : report_arrival
+openroad> 
+openroad> puts "=== Q1 report_checks -unconstrained ==="
+=== Q1 report_checks -unconstrained ===
+openroad> report_checks -unconstrained
+Startpoint: rst_n (input port clocked by core_clk)
+Endpoint: u_fbn (recovery check against falling-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.50    1.20 ^ input external delay
+   0.00    1.20 ^ rst_n (in)
+   0.15    1.35 ^ u_rst/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.35 ^ u_fbn/RESET_B (sky130_fd_sc_hd__dfbbn_1)
+           1.35   data arrival time
+
+   2.00    2.00   clock core_clk (fall edge)
+   0.70    2.70   clock network delay (ideal)
+  -0.05    2.65   clock uncertainty
+   0.00    2.65   clock reconvergence pessimism
+           2.65 v u_fbn/CLK_N (sky130_fd_sc_hd__dfbbn_1)
+  -0.05    2.60   library recovery time
+           2.60   data required time
+---------------------------------------------------------
+           2.60   data required time
+          -1.35   data arrival time
+---------------------------------------------------------
+           1.25   slack (MET)
+
+
+Startpoint: d_in (input port clocked by core_clk)
+Endpoint: u_fbn (falling edge-triggered flip-flop clocked by core_clk)
+Path Group: core_clk
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.70    1.40 v input external delay
+   0.00    1.40 v d_in (in)
+   0.00    1.40 v u_fbn/D (sky130_fd_sc_hd__dfbbn_1)
+           1.40   data arrival time
+
+   2.00    2.00   clock core_clk (fall edge)
+   0.70    2.70   clock network delay (ideal)
+  -0.05    2.65   clock uncertainty
+   0.00    2.65   clock reconvergence pessimism
+           2.65 v u_fbn/CLK_N (sky130_fd_sc_hd__dfbbn_1)
+  -0.16    2.49   library setup time
+           2.49   data required time
+---------------------------------------------------------
+           2.49   data required time
+          -1.40   data arrival time
+---------------------------------------------------------
+           1.09   slack (MET)
+
+
+openroad> 
+openroad> puts "=== Q2a find_timing_paths -from rst_n ==="
+=== Q2a find_timing_paths -from rst_n ===
+openroad> <find_timing_paths -from [get_ports rst_n]]} err]} {
+...>     puts "error: $err"
+...> } else {
+...>     puts "path count: [llength $pe_list]"
+...>     foreach pe $pe_list { puts "  end: [get_full_name [$pe pin]]" }
+...> }
+path count: 1
+  end: u_fbn/RESET_B
+openroad> puts "=== Q2a find_timing_paths -from set_n ==="
+=== Q2a find_timing_paths -from set_n ===
+openroad> <find_timing_paths -from [get_ports set_n]]} err]} {
+...>     puts "error: $err"
+...> } else {
+...>     puts "path count: [llength $pe_list]"
+...>     foreach pe $pe_list { puts "  end: [get_full_name [$pe pin]]" }
+...> }
+path count: 1
+  end: u_fbn/SET_B
+openroad> 
+openroad> puts "=== Q2b find_timing_paths -to u_d*/D ==="
+=== Q2b find_timing_paths -to u_d*/D ===
+openroad> foreach p {u_ds/D u_dp/D u_dq/D} {
+...> <list [find_timing_paths -to [get_pins $p]]} err]} {
+...>         puts "$p error: $err"
+...>     } else {
+...>         puts "$p path count: [llength $pe_list]"
+...>         foreach pe $pe_list { puts "  end: [get_full_name [$pe pin]]" }
+...>     }
+...> }
+u_ds/D path count: 0
+u_dp/D path count: 0
+u_dq/D path count: 0
+openroad> 
+openroad> puts "=== Q2d raw arrivals at async-driven outputs ==="
+=== Q2d raw arrivals at async-driven outputs ===
+openroad> foreach p {u_ar/Q u_ap/Q u_aq/Q_N u_ff0/Q} {
+...>     puts "--- $p ---"
+...> <get_pins $p]} err]} { puts "report_arrival: $err" }
+...>     foreach cmd {sta::find_vertex sta::pin_vertex} {
+...>         if {[catch {set v [$cmd [get_pins $p] rise max]} err]} {
+...>             puts "$cmd rise/max: $err"
+...> < arrival: [sta::time_sta_ui [$v arrival]]"} err]} {
+...>             puts "$cmd rise/max vertex=$v arrival: $err"
+...>         }
+...>     }
+...> }
+--- u_ar/Q ---
+ r 0.33:0.33 f 0.36:0.36
+sta::find_vertex rise/max: invalid command name "sta::find_vertex"
+sta::pin_vertex rise/max: invalid command name "sta::pin_vertex"
+--- u_ap/Q ---
+ r 0.50:0.50 f 0.36:0.36
+sta::find_vertex rise/max: invalid command name "sta::find_vertex"
+sta::pin_vertex rise/max: invalid command name "sta::pin_vertex"
+--- u_aq/Q_N ---
+ r 0.47:0.47 f 0.41:0.41
+sta::find_vertex rise/max: invalid command name "sta::find_vertex"
+sta::pin_vertex rise/max: invalid command name "sta::pin_vertex"
+--- u_ff0/Q ---
+ (core_clk ^) r 1.03:1.03 f 1.06:1.06
+sta::find_vertex rise/max: invalid command name "sta::find_vertex"
+sta::pin_vertex rise/max: invalid command name "sta::pin_vertex"
+openroad> <hecks -from rst_n -through u_ar/Q -format full ==="
+=== Q2d report_checks -from rst_n -through u_ar/Q -format full ===
+openroad> < u_ar/Q] -format full} err]} { puts "error: $err" }
+No paths found.
+openroad> 
+openroad> puts "=== Q2c clocked control ==="
+=== Q2c clocked control ===
+openroad> <_ports rst_n] -through [get_pins u_ff0/Q]]} err]} {
+...>     puts "find -from rst_n -through u_ff0/Q error: $err"
+...> } else {
+...>     puts "u_ff0/Q through-path count: [llength $pe_list]"
+...> }
+u_ff0/Q through-path count: 0
+openroad> report_checks -to [get_pins u_ff2/D] -format full
+Startpoint: u_ff0 (rising edge-triggered flip-flop clocked by core_clk)
+Endpoint: u_ff2 (rising edge-triggered flip-flop clocked by core_clk)
+Path Group: core_clk
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.00    0.70 ^ u_ff0/CLK (sky130_fd_sc_hd__dfrtp_1)
+   0.36    1.06 v u_ff0/Q (sky130_fd_sc_hd__dfrtp_1)
+   0.00    1.06 v u_ff2/D (sky130_fd_sc_hd__dfxtp_1)
+           1.06   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.70    4.70   clock network delay (ideal)
+  -0.05    4.65   clock uncertainty
+   0.00    4.65   clock reconvergence pessimism
+           4.65 ^ u_ff2/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.09    4.56   library setup time
+           4.56   data required time
+---------------------------------------------------------
+           4.56   data required time
+          -1.06   data arrival time
+---------------------------------------------------------
+           3.49   slack (MET)
+
+
+openroad> 
+openroad> puts "=== Q2e transient set_disable_timing u_ff0 CLK->Q ==="
+=== Q2e transient set_disable_timing u_ff0 CLK->Q ===
+openroad> <e_timing [get_cells u_ff0] -from CLK -to Q} err]} {
+...>     puts "set_disable_timing error: $err"
+...> } else {
+...> <[find_timing_paths -to [get_pins u_ff2/D]]} err]} {
+...>         puts "find -to u_ff2/D error: $err"
+...>     } else {
+...>         puts "u_ff2/D path count after disable: [llength $pe_list]"
+...>     }
+...>     report_checks -to [get_pins u_ff2/D] -format full
+...> }
+u_ff2/D path count after disable: 0
+No paths found.
+openroad> 
+openroad> puts "=== Q3 falling recovery/removal on u_fbn (dfbbn_1, CLK_N) ==="
+=== Q3 falling recovery/removal on u_fbn (dfbbn_1, CLK_N) ===
+openroad> report_checks -to [get_pins u_fbn/RESET_B] -format full
+Startpoint: rst_n (input port clocked by core_clk)
+Endpoint: u_fbn (recovery check against falling-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.50    1.20 ^ input external delay
+   0.00    1.20 ^ rst_n (in)
+   0.15    1.35 ^ u_rst/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.35 ^ u_fbn/RESET_B (sky130_fd_sc_hd__dfbbn_1)
+           1.35   data arrival time
+
+   2.00    2.00   clock core_clk (fall edge)
+   0.70    2.70   clock network delay (ideal)
+  -0.05    2.65   clock uncertainty
+   0.00    2.65   clock reconvergence pessimism
+           2.65 v u_fbn/CLK_N (sky130_fd_sc_hd__dfbbn_1)
+  -0.05    2.60   library recovery time
+           2.60   data required time
+---------------------------------------------------------
+           2.60   data required time
+          -1.35   data arrival time
+---------------------------------------------------------
+           1.25   slack (MET)
+
+
+openroad> report_checks -to [get_pins u_fbn/SET_B] -format full
+Startpoint: set_n (input port clocked by core_clk)
+Endpoint: u_fbn (recovery check against falling-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.50    1.20 ^ input external delay
+   0.00    1.20 ^ set_n (in)
+   0.15    1.35 ^ u_set/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.35 ^ u_fbn/SET_B (sky130_fd_sc_hd__dfbbn_1)
+           1.35   data arrival time
+
+   2.00    2.00   clock core_clk (fall edge)
+   0.70    2.70   clock network delay (ideal)
+  -0.05    2.65   clock uncertainty
+   0.00    2.65   clock reconvergence pessimism
+           2.65 v u_fbn/CLK_N (sky130_fd_sc_hd__dfbbn_1)
+   0.08    2.73   library recovery time
+           2.73   data required time
+---------------------------------------------------------
+           2.73   data required time
+          -1.35   data arrival time
+---------------------------------------------------------
+           1.38   slack (MET)
+
+
+openroad> 
+openroad> puts "=== Q4 non_seq_* on u_fbp/u_fbn (dfbbp_1/dfbbn_1) ==="
+=== Q4 non_seq_* on u_fbp/u_fbn (dfbbp_1/dfbbn_1) ===
+openroad> <ck_types} err]} { puts "report_check_types: $err" }
+Group                                  Slack
+--------------------------------------------
+asynchronous                            0.21
+core_clk                                0.62
+asynchronous                            1.25
+core_clk                                1.09
+
+max slew
+
+Pin                                    Limit    Slew   Slack
+------------------------------------------------------------
+u_ff2/Q                                 1.50    0.47    1.03 (MET)
+
+max capacitance
+
+Pin                                    Limit     Cap   Slack
+------------------------------------------------------------
+u_ff2/Q                                 0.16    0.05    0.11 (MET)
+
+                                     Required  Actual
+Pin                                    Width   Width   Slack
+------------------------------------------------------------
+u_fp/CLK (high)                         0.42    2.00    1.58 (MET)
+
+openroad> report_checks -to [get_pins u_fbp/RESET_B] -format full
+Startpoint: rst_n (input port clocked by core_clk)
+Endpoint: u_fbp (recovery check against rising-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.50    1.20 ^ input external delay
+   0.00    1.20 ^ rst_n (in)
+   0.15    1.35 ^ u_rst/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.35 ^ u_fbp/RESET_B (sky130_fd_sc_hd__dfbbp_1)
+           1.35   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.70    4.70   clock network delay (ideal)
+  -0.05    4.65   clock uncertainty
+   0.00    4.65   clock reconvergence pessimism
+           4.65 ^ u_fbp/CLK (sky130_fd_sc_hd__dfbbp_1)
+  -0.06    4.59   library recovery time
+           4.59   data required time
+---------------------------------------------------------
+           4.59   data required time
+          -1.35   data arrival time
+---------------------------------------------------------
+           3.23   slack (MET)
+
+
+openroad> report_checks -to [get_pins u_fbp/SET_B] -format full
+Startpoint: set_n (input port clocked by core_clk)
+Endpoint: u_fbp (recovery check against rising-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.50    1.20 ^ input external delay
+   0.00    1.20 ^ set_n (in)
+   0.15    1.35 ^ u_set/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.35 ^ u_fbp/SET_B (sky130_fd_sc_hd__dfbbp_1)
+           1.35   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.70    4.70   clock network delay (ideal)
+  -0.05    4.65   clock uncertainty
+   0.00    4.65   clock reconvergence pessimism
+           4.65 ^ u_fbp/CLK (sky130_fd_sc_hd__dfbbp_1)
+   0.05    4.70   library recovery time
+           4.70   data required time
+---------------------------------------------------------
+           4.70   data required time
+          -1.35   data arrival time
+---------------------------------------------------------
+           3.35   slack (MET)
+
+
+openroad> 
+openroad> puts "=== Q5 preset-side check pairing ==="
+=== Q5 preset-side check pairing ===
+openroad> report_checks -to [get_pins u_fp/SET_B] -format full
+Startpoint: set_n (input port clocked by core_clk)
+Endpoint: u_fp (recovery check against rising-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.50    1.20 ^ input external delay
+   0.00    1.20 ^ set_n (in)
+   0.15    1.35 ^ u_set/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.35 ^ u_fp/SET_B (sky130_fd_sc_hd__dfstp_1)
+           1.35   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.70    4.70   clock network delay (ideal)
+  -0.05    4.65   clock uncertainty
+   0.00    4.65   clock reconvergence pessimism
+           4.65 ^ u_fp/CLK (sky130_fd_sc_hd__dfstp_1)
+   0.15    4.80   library recovery time
+           4.80   data required time
+---------------------------------------------------------
+           4.80   data required time
+          -1.35   data arrival time
+---------------------------------------------------------
+           3.45   slack (MET)
+
+
+openroad> exit
+unable to write history to `/var/empty/.tclsh-history'
+

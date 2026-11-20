@@ -57,6 +57,7 @@ This directory contains public benchmark designs used for verification against r
 ### `sta_edge` (hand-written STA edge-case fixtures)
 
 - **Directory**: `tests/designs/sta_edge/` — not a synthesised design; each case is a minimal hand-written DEF (+ SDC, + SPEF for `resistor_loop`) compared against an OpenSTA golden emitted by the case's own `generate_ref.sh` (same LibreLane container route). Covers the three "Not scheduled" items of `docs/e3-sta.md` Section 5: SPEF resistor loops, `set_clock_uncertainty` on non-register endpoints, and non-`dlxtn` latches. All files are small and committed.
+- `async_arcs` — hand-written, `sky130_fd_sc_hd` only: `dfrtp`/`dfstp`/`dfbbp`/`dfbbn`/`dfrbp`/`dfxtp` flops, three of them (`u_ar`/`u_ap`/`u_aq`) on port `aclk` with no `create_clock` — unclocked-`CLK` discriminators whose `Q`/`Q_N` and the `u_d*/D` endpoints behind them are reachable only through `Clear`/`Preset` arcs (the R6 re-measurement, `docs/results.md` 2026-11-21). Golden + `probe_async_*.txt` emitted by the committed `generate_ref.sh`.
 
 ### `sta_clocks` (hand-written multi-clock probe fixture)
 
