@@ -303,12 +303,12 @@ Remaining:
   `docs/multi-clock.md`: OpenSTA's two-clock rules are measured on the
   committed `sta_clocks` probe (2026-11-19) and the implementation is a
   five-ticket sequence (`mc-model` → `mc-eval` → `mc-xdomain` →
-  `mc-selectors` → `mc-golden`). `mc-model` (the clock table, v0.2.0) and
-  `mc-eval` (domain tagging + same-domain pairing, v0.2.1) are done —
-  same-domain paths on every parseable `sta_clocks` scenario match
-  OpenSTA at strict tolerance and cross-domain pairs defer as named
-  `CrossDomain` skips. Remaining: cross-domain edge-pair search
-  (`mc-xdomain`), clock selectors and `set_clock_groups` (`mc-selectors`),
+  `mc-selectors` → `mc-golden`). `mc-model` (the clock table, v0.2.0),
+  `mc-eval` (domain tagging + same-domain pairing, v0.2.1) and
+  `mc-xdomain` (cross-domain min-gap edge pairing + inter-clock
+  uncertainty, v0.2.2) are done — every parseable `sta_clocks` scenario
+  matches OpenSTA at strict tolerance with `cross_domain == 0`.
+  Remaining: clock selectors and `set_clock_groups` (`mc-selectors`),
   golden promotion (`mc-golden`).
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)

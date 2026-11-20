@@ -154,6 +154,20 @@ pub struct TimingException {
     pub hold_n: Option<i32>,
 }
 
+/// One `set_clock_uncertainty -from/-to` rule, in file order. Sides are
+/// resolved clock-row lists; an empty list is the wildcard (flag absent).
+#[derive(Clone, Debug)]
+pub struct InterClockUnc {
+    /// `-from` rows (launch side); empty = all clocks.
+    pub from: Vec<usize>,
+    /// `-to` rows (capture side); empty = all clocks.
+    pub to: Vec<usize>,
+    /// `-setup` value — `None` when the command gave `-hold`.
+    pub setup_ns: Option<f32>,
+    /// `-hold` value — `None` when the command gave `-setup`.
+    pub hold_ns: Option<f32>,
+}
+
 /// Index into `Sdc::clocks`. Private: `DelayRule` is private.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ClockId(usize);
@@ -282,6 +296,8 @@ pub struct Sdc {
     /// Path-delay constraints (`set_max_delay`, `set_min_delay`) in file
     /// order, same symbolic-selector treatment as `exceptions`.
     pub path_delays: Vec<PathDelay>,
+    /// `set_clock_uncertainty -from/-to` rules, in file order.
+    pub inter_clock_uncertainty: Vec<InterClockUnc>,
     /// Options the parser accepts but does not apply, counted by flag or by descriptive key.
     /// `-lib_cell` and `-pin` restrict a delay to one cell or pin; the model has no per-arc
     /// endpoint matching, so the restriction is dropped and the delay applies to every
@@ -388,6 +404,31 @@ impl Sdc {
     /// The design clock's `set_clock_uncertainty -hold` value.
     pub fn hold_uncertainty_ns(&self) -> f32 {
         self.design_clock().map_or(0.0, |c| c.hold_uncertainty_ns)
+    }
+
+    /// Uncertainty effective for a `launch -> capture` check: the last
+    /// `-from`/`-to` rule matching both sides supplies that side's value — a
+    /// **replacement** for the capture row's own field, not additive and not
+    /// symmetric (measured `t2_uncx`: `-setup 0.30 -from cka -to ckb`
+    /// replaces `ckb`'s 0.20 for A→B only). No match → the capture row's
+    /// value. Applies uniformly, same-domain included (`-from cka -to cka`
+    /// fires on `cka`'s own checks).
+    pub fn uncertainty_ns(&self, launch: usize, capture: usize, hold: bool) -> f32 {
+        for r in self.inter_clock_uncertainty.iter().rev() {
+            let side_match = (r.from.is_empty() || r.from.contains(&launch))
+                && (r.to.is_empty() || r.to.contains(&capture));
+            let v = if hold { r.hold_ns } else { r.setup_ns };
+            if side_match && let Some(v) = v {
+                return v;
+            }
+        }
+        self.clocks.get(capture).map_or(0.0, |c| {
+            if hold {
+                c.hold_uncertainty_ns
+            } else {
+                c.setup_uncertainty_ns
+            }
+        })
     }
 
     /// The design clock's `set_clock_latency` (network) value.
@@ -969,15 +1010,21 @@ impl Interp {
         Ok(())
     }
 
-    /// `set_clock_uncertainty [-setup|-hold] <ns> [get_clocks <name>]`. OpenSTA requires the clock
-    /// list; the single-value form is kept for hand-written SDCs and sets both checks. At most one
-    /// of `-setup`/`-hold` is accepted, matching OpenSTA, which treats a second flag as objects.
+    /// `set_clock_uncertainty [-setup|-hold] <ns> [-from <clocks>] [-to <clocks>] [<clocks>]`.
+    /// OpenSTA requires the clock list; the single-value form is kept for hand-written SDCs
+    /// and sets both checks. At most one of `-setup`/`-hold` is accepted, matching OpenSTA,
+    /// which treats a second flag as objects. `-from`/`-to` select clock objects and store
+    /// an inter-clock rule ([`Sdc::inter_clock_uncertainty`]) instead of writing rows; each
+    /// takes clock objects only and may appear once.
     fn set_clock_uncertainty(&mut self, args: &[Value]) -> Result<()> {
         let mut setup = false;
         let mut hold = false;
+        let mut from: Option<Vec<usize>> = None;
+        let mut to: Option<Vec<usize>> = None;
         let mut rest = Vec::with_capacity(args.len());
-        for arg in args {
-            match arg {
+        let mut i = 0;
+        while i < args.len() {
+            match &args[i] {
                 Value::Str(s) if s.as_str() == "-setup" || s.as_str() == "-hold" => {
                     let slot = if s.as_str() == "-setup" {
                         &mut setup
@@ -988,30 +1035,82 @@ impl Interp {
                         bail!("duplicate {s}");
                     }
                     *slot = true;
+                    i += 1;
                 }
-                value => rest.push(value),
+                Value::Str(s) if s.as_str() == "-from" || s.as_str() == "-to" => {
+                    let slot = if s.as_str() == "-from" {
+                        &mut from
+                    } else {
+                        &mut to
+                    };
+                    if slot.is_some() {
+                        bail!("set_clock_uncertainty takes each of -from/-to once");
+                    }
+                    let rows = match args.get(i + 1) {
+                        Some(Value::Clocks(names)) => {
+                            let mut rows = Vec::with_capacity(names.len());
+                            for name in names {
+                                rows.push(self.resolve_clock(name)?.0);
+                            }
+                            rows
+                        }
+                        // `-from cka`: a bare name (write_sdc form), possibly a
+                        // whitespace-separated list.
+                        Some(Value::Str(name)) => name
+                            .split_whitespace()
+                            .map(|n| self.resolve_clock(n).map(|id| id.0))
+                            .collect::<Result<Vec<_>>>()?,
+                        Some(_) => bail!("set_clock_uncertainty -from/-to take clock objects"),
+                        None => bail!("set_clock_uncertainty {s} needs a value"),
+                    };
+                    *slot = Some(rows);
+                    i += 2;
+                }
+                Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => {
+                    bail!("unsupported option `{s}`")
+                }
+                value => {
+                    rest.push(value);
+                    i += 1;
+                }
             }
         }
         if setup && hold {
             bail!("set_clock_uncertainty takes at most one of -setup/-hold");
         }
         let (value, targets) = match rest.as_slice() {
-            [Value::Str(value)] => (value, vec![self.design_clock_id()?]),
-            [Value::Str(value), Value::Clocks(names)] => {
-                let mut ids = Vec::with_capacity(names.len());
-                for name in names {
-                    ids.push(self.resolve_clock(name)?);
-                }
-                (value, ids)
-            }
+            [Value::Str(value)] => (value.as_str(), None),
+            [Value::Str(value), Value::Clocks(names)] => (value.as_str(), Some(names.clone())),
             // `set_clock_uncertainty 0.25 clk`: write_sdc emits the clock as a bare name.
-            [Value::Str(value), Value::Str(name)] => {
-                (value, vec![self.resolve_clock(name)?])
-            }
+            [Value::Str(value), Value::Str(name)] => (value.as_str(), Some(vec![name.clone()])),
             _ => bail!("set_clock_uncertainty takes a value and optional clock names"),
         };
         let value_ns = parse_f32(value)?;
-        for id in targets {
+        if from.is_some() || to.is_some() {
+            if targets.is_some() {
+                // OpenSTA treats the positional list and `-to` as overlapping;
+                // refuse the ambiguous form loudly.
+                bail!("set_clock_uncertainty cannot name clocks with -from/-to");
+            }
+            self.sdc.inter_clock_uncertainty.push(InterClockUnc {
+                from: from.unwrap_or_default(),
+                to: to.unwrap_or_default(),
+                setup_ns: (!hold).then_some(value_ns),
+                hold_ns: (!setup).then_some(value_ns),
+            });
+            return Ok(());
+        }
+        let ids = match targets {
+            None => vec![self.design_clock_id()?],
+            Some(names) => {
+                let mut ids = Vec::with_capacity(names.len());
+                for name in &names {
+                    ids.push(self.resolve_clock(name)?);
+                }
+                ids
+            }
+        };
+        for id in ids {
             let row = &mut self.sdc.clocks[id.0];
             if !hold {
                 row.setup_uncertainty_ns = value_ns;
@@ -3067,10 +3166,6 @@ mod tests {
                 "unsupported option `-early`",
             ),
             (
-                "set_clock_uncertainty -setup 0.30 -from [get_clocks core_clk] -to [get_clocks vclk]",
-                "set_clock_uncertainty takes a value and optional clock names",
-            ),
-            (
                 "create_clock -waveform {0 0.5} -period 2.0 [get_ports other]",
                 "unsupported option `-waveform`",
             ),
@@ -3156,6 +3251,127 @@ mod tests {
         assert_eq!((a.latency_ns, b.latency_ns), (0.5, 0.5));
         assert_eq!((a.setup_uncertainty_ns, a.hold_uncertainty_ns), (0.05, 0.10));
         assert_eq!((b.setup_uncertainty_ns, b.hold_uncertainty_ns), (0.20, 0.0));
+    }
+
+    /// `set_clock_uncertainty -from/-to` (inter-clock) parse forms (`t2_uncx`).
+    #[test]
+    fn set_clock_uncertainty_directional() {
+        // Directed pair: one rule, setup side only.
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            create_clock -name vclk -period 5.0\n\
+            set_clock_uncertainty -setup 0.30 -from [get_clocks cka] -to [get_clocks ckb]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.inter_clock_uncertainty.len(), 1);
+        let r = &sdc.inter_clock_uncertainty[0];
+        assert_eq!(r.from, vec![0]);
+        assert_eq!(r.to, vec![1]);
+        assert_eq!(r.setup_ns, Some(0.30));
+        assert_eq!(r.hold_ns, None);
+
+        // Hold side stores independently; a bare (flag-less) rule sets both.
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_clock_uncertainty -hold 0.15 -from [get_clocks ckb] -to [get_clocks cka]\n\
+            set_clock_uncertainty 0.40 -from [get_clocks cka] -to [get_clocks ckb]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            sdc.inter_clock_uncertainty[0].hold_ns,
+            Some(0.15)
+        );
+        assert_eq!(sdc.inter_clock_uncertainty[0].setup_ns, None);
+        assert_eq!(
+            sdc.inter_clock_uncertainty[1].setup_ns,
+            Some(0.40)
+        );
+        assert_eq!(
+            sdc.inter_clock_uncertainty[1].hold_ns,
+            Some(0.40)
+        );
+
+        // One-sided forms wildcard the other side; a multi-name collection and a
+        // bare `write_sdc` name both expand.
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_clock_uncertainty -setup 0.1 -from [get_clocks cka]\n\
+            set_clock_uncertainty -setup 0.2 -to [get_clocks {{cka ckb}}]\n\
+            set_clock_uncertainty -setup 0.3 -from cka -to ckb\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.inter_clock_uncertainty[0].to, Vec::<usize>::new());
+        assert_eq!(
+            sdc.inter_clock_uncertainty[1].to,
+            vec![0, 1]
+        );
+        assert_eq!(sdc.inter_clock_uncertainty[2].from, vec![0]);
+        assert_eq!(sdc.inter_clock_uncertainty[2].to, vec![1]);
+    }
+
+    #[test]
+    fn set_clock_uncertainty_directional_bails() {
+        for (snippet, want) in [
+            (
+                "set_clock_uncertainty -setup 0.3 -from [get_clocks nope] -to [get_clocks ckb]",
+                "unknown clock",
+            ),
+            (
+                "set_clock_uncertainty -setup 0.3 -from [get_clocks cka] -to [get_clocks ckb] [get_clocks cka]",
+                "cannot name clocks with -from/-to",
+            ),
+            (
+                "set_clock_uncertainty -rise_from [get_clocks cka] 0.3 -to [get_clocks ckb]",
+                "unsupported option `-rise_from`",
+            ),
+            (
+                "set_clock_uncertainty -setup 0.3 -from [get_clocks cka] -from [get_clocks ckb]",
+                "takes each of -from/-to once",
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                parse_sdc(&format!("{TWO_DESIGN}{snippet}\n")).unwrap_err()
+            );
+            assert!(err.contains(want), "{snippet}: {err}");
+        }
+    }
+
+    /// `Sdc::uncertainty_ns`: the last matching `-from`/`-to` rule *replaces* the
+    /// capture row's value for that direction and side only.
+    #[test]
+    fn uncertainty_ns_directional_lookup() {
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_clock_uncertainty -setup 0.05 [get_clocks cka]\n\
+            set_clock_uncertainty -hold 0.10 [get_clocks cka]\n\
+            set_clock_uncertainty -setup 0.20 [get_clocks ckb]\n\
+            set_clock_uncertainty -hold 0.40 [get_clocks ckb]\n\
+            set_clock_uncertainty -setup 0.30 -from [get_clocks cka] -to [get_clocks ckb]\n"
+        ))
+        .unwrap();
+        // The directed rule replaces ckb's 0.20 for cka->ckb setup only: the
+        // reverse direction and both hold sides keep the row values, and the
+        // hold side of the same direction is untouched (not additive either).
+        assert_eq!(sdc.uncertainty_ns(0, 1, false), 0.30);
+        assert_eq!(sdc.uncertainty_ns(1, 0, false), 0.05);
+        assert_eq!(sdc.uncertainty_ns(0, 1, true), 0.40);
+        assert_eq!(sdc.uncertainty_ns(1, 0, true), 0.10);
+        assert_eq!(sdc.uncertainty_ns(0, 0, false), 0.05);
+
+        // File order: the later rule wins for the same directed pair; a
+        // wildcard `-to` matches every capture row.
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_clock_uncertainty -setup 0.30 -from [get_clocks cka] -to [get_clocks ckb]\n\
+            set_clock_uncertainty -setup 0.50 -from [get_clocks cka] -to [get_clocks ckb]\n\
+            set_clock_uncertainty -hold 0.15 -from [get_clocks ckb]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.uncertainty_ns(0, 1, false), 0.50);
+        assert_eq!(sdc.uncertainty_ns(1, 0, true), 0.15);
+        assert_eq!(sdc.uncertainty_ns(1, 1, true), 0.15);
+        assert_eq!(sdc.uncertainty_ns(0, 1, true), 0.0);
     }
 
     #[test]

@@ -1,21 +1,25 @@
 # Multi-clock SDC support — measured rules and ticket sequence
 
 Status: probe complete (2026-11-19), `mc-model` landed (2026-11-20),
-`mc-eval` landed (2026-11-20). `Sdc` keeps a clock table — one row per
+`mc-eval` landed (2026-11-20), `mc-xdomain` landed (2026-11-20). `Sdc`
+keeps a clock table — one row per
 `create_clock`, in file order, holding name/optional port/period/
 network+source latencies/setup+hold uncertainties/transition/propagated —
 and every clock-targeting command resolves its names against the table.
 Eval is domain-aware: each design clock seeds its own net, every data
 arrival carries a launch-domain tag, and same-domain paths evaluate on the
 capture domain's own lattice (period, latency, uncertainty, propagated/
-ideal mode). A launch/capture pair in different domains defers with a
+ideal mode). Cross-domain setup pairs report on the min-gap edge pair
+over the period LCM (§1.2) with per-direction inter-clock uncertainty
+(§1.3); delay-check-covered endpoints anchor at the capture domain's
+edge 0 (§1.5). A pair that still cannot be evaluated defers with a
 `CrossDomain` diagnostic naming both clocks — never a silent fold. This
 document remains the target spec for the remaining tickets.
 
 Evidence: `tests/designs/sta_clocks/` — `two_clock.def` (clock domains `cka`
 2.0 ns on `clk1`, `ckb` 1.4/1.0 ns on `clk2`, same-domain and both-direction
 cross-domain paths), `two_clock_latch.def` (a `dlxtn` on `ckb` feeding a
-`ckb` flop — every endpoint same-domain), fourteen `t2_*.sdc` scenarios on
+`ckb` flop — every endpoint same-domain), fifteen `t2_*.sdc` scenarios on
 `two_clock.def` plus `t2_latch.sdc`, `probe.sh` (runs OpenSTA in
 `ghcr.io/librelane/librelane:3.0.16`), `two_clock.probe.json` +
 `two_clock_latch.probe.json` + `probe_*.txt` (byte-identical on re-run).
@@ -124,9 +128,13 @@ Output-port form (`t2_mdo`, `set_max_delay 0.8 -to yb`):
 - MCP multiplies the **capture** domain's period (`t2_mcp`,
   `set_multicycle_path -setup 2 -from u_fa0 -to u_fx`): capture moved from
   ckb edge 1.0 to **2.0** (req 0.885446→1.885446); `-hold 1` moves it back
-  one ckb period (min req −0.037585→−1.037585).
+  one ckb period (min req −0.037585→−1.037585). On a cross-domain min
+  candidate the shift is `d_min = −nh·Pc` — the same-domain carry term
+  `((ns−1)−nh)·P` does not apply, since the cross hold pair lives on the
+  coincident grid and the shifted setup edge is not the coincident hold
+  edge. A mixed tying mask takes the cross-domain form (conservative).
 
-## 2. Where grus-eda stands (after `mc-eval`, 2026-11-20)
+## 2. Where grus-eda stands (after `mc-xdomain`, 2026-11-20)
 
 `cargo test -p grus-core multi_clock_bails` pins the remaining bail
 messages verbatim; full table with commands in `docs/results.md`.
@@ -140,10 +148,13 @@ Now accepted (the probe's parse breaks are fixed):
   `set_propagated_clock` resolve `[get_clocks {a b ...}]` row-wise —
   multi-name lists apply to every selected row; uncertainty on a virtual
   clock lands on its own row (the probe's silent wrong-target bug).
+  `set_clock_uncertainty -from`/`-to` stores directed inter-clock rules
+  that replace the capture row's value for the matching direction and
+  side only (§1.3; last matching rule wins, empty selector = wildcard).
 - `set_input_delay`/`set_output_delay -clock <name>` and delay exceptions
   resolve any row, not just the design clock.
 
-Now evaluated (same-domain pairing only):
+Now evaluated:
 
 - Every design clock row seeds its own clock net — propagated via
   `propagate_clock`, ideal via the parity walk — and every data arrival
@@ -152,32 +163,42 @@ Now evaluated (same-domain pairing only):
   `set_input_delay -clock` row, mapped through `launch_domain`: a virtual
   row whose period equals a design row's pairs same-domain (coincident
   edge grids), a unique virtual row stays foreign everywhere.
-- Same-domain checks read the capture row's period, latency, uncertainty
-  and propagated/ideal mode: register checks, latch-borrow windows,
+- Checks read the capture row's period, latency, uncertainty and
+  propagated/ideal mode: register checks, latch-borrow windows,
   delay-check anchors, MCP multipliers, min-pulse-width wrap and output
   ports (`-clock` row anchoring) are all per-domain. Verified
   per-endpoint at STRICT tolerance on all parseable `t2_*` scenarios
   (`test_sta_clocks_match_opensta`); `two_clock_latch`'s whole table —
   wns/tns/violations included — matches.
-- A launch/capture pair in different domains counts
+- Cross-domain setup pairs evaluate on the min-gap edge pair over the
+  period LCM (§1.2): launch `arr` shifts by `m·PL`, required by `j·PC`,
+  uncertainty per directed pair (§1.3). Hold stays on coincident edges.
+  Cross-domain endpoints covered by `set_max_delay`/`set_min_delay`
+  report on the capture domain's edge-0 anchor without pairing (§1.5);
+  a `get_pins inst/Q` `-from` is a path startpoint — the clocked launch
+  out of that pin is replaced by pin-segment paths, and endpoints no
+  covering rule's `-to` names lose the check on that side (`t2_mdx`).
+- A pair that still cannot be evaluated counts
   `skipped.cross_domain_endpoints` and lands in `skipped_endpoints` with
   `reason: cross_domain` and `related: "launch <clocks> -> capture
-  <clock>"`. `--strict` fails (`is_clean` counts them). A reached
-  extreme with a zero mask — a launch on a clock net no declared clock
-  seeds — defers as `launch <undeclared>`: the undeclared-domain fold is
-  detected, not folded.
+  <clock>"`. `--strict` fails (`is_clean` counts them). The remaining
+  deferrals: a reached extreme with a zero mask (`launch <undeclared>`),
+  a latch-D check with a foreign launch (borrow pairing parked), a
+  min-side tying parity with no coincident capture edge in the LCM
+  window (hold selection parked), and a non-converging `grid_lcm`
+  (defensive — unreachable for `f32` periods).
 
 Still unsupported / remaining hazard:
 
-- `set_clock_latency -early`/`-late`, `set_clock_uncertainty -from ... -to
-  ...`, `create_clock -waveform`, `set_clock_groups`, unknown `-clock`
-  names, `set_propagated_clock` on a virtual clock, `create_clock` with
-  `period 0` — all loud parse errors.
+- `set_clock_latency -early`/`-late`, `create_clock -waveform`,
+  `set_clock_groups`, unknown `-clock` names, `set_propagated_clock` on a
+  virtual clock, `create_clock` with `period 0` — all loud parse errors.
 - More than 8 clock rows (design + virtual) bail before graph prep: the
   domain mask is `u8` (`sta: N clocks declared; at most 8 domains can be
   tagged`).
-- Cross-domain pairing itself: deferred to `mc-xdomain` (§1.2 edge
-  search, §1.3 inter-clock uncertainty).
+- Cross-domain hold selection beyond the coincident grid: parked (§1.2 —
+  the fixtures hold at edge 0 or a parity-coincident edge; a parity with
+  no coincident capture edge defers `CrossDomain`).
 
 ## 3. Ticket sequence
 
@@ -200,9 +221,11 @@ kurena spec:
    ports excluded from data seeding; same-domain pairing with distinct
    periods; per-domain period in MCP/borrow windows and I/O anchors.
    Cross-domain pairs defer as named `CrossDomain` skips.
-3. **`mc-xdomain`** — cross-domain launch/capture edge-pair search per the
+3. **`mc-xdomain`** — **done 2026-11-20** (`docs/results.md` entry of the
+   same date). Cross-domain launch/capture edge-pair search per the
    measured rule (§1.2: min `capture − launch` over the LCM window);
-   inter-clock `-from`/`-to` uncertainty (§1.3).
+   inter-clock `-from`/`-to` uncertainty (§1.3); delay-check-covered
+   cross endpoints report on the capture edge-0 anchor (§1.5).
 4. **`mc-selectors`** — clock-object selectors in exceptions (`-from
    [get_clocks cka]` etc.), `set_clock_latency` multi-name (already
    row-wise after `mc-model`), `set_clock_groups` (measured: drops all
@@ -211,8 +234,11 @@ kurena spec:
    `test_sta_clocks_match_opensta`, closing `docs/path-delays.md` §5 item 1
    (the literal two-clock `set_min_delay` fixture is `t2_md`/`t2_mdl`).
 
-Open sub-questions parked for the implementation tickets: cross-domain
-hold-pair selection beyond coincident edges (§1.2 — fixture holds at
-edge 0); `-waveform`-defined duty cycles; `-early`/`-late` latency splits;
-generated clocks; `set_clock_latency` on a delay check's *launch* side vs
-the measured capture anchor.
+Open sub-questions parked: cross-domain hold-pair selection beyond
+coincident edges (§1.2 — a tying parity with no coincident capture edge
+defers `CrossDomain`; the equal-gap setup tie keeps the smallest launch
+edge, OpenSTA's tie-break unmeasured); `-waveform`-defined duty cycles;
+`-early`/`-late` latency splits; generated clocks; `set_clock_latency` on
+a delay check's *launch* side vs the measured capture anchor; inter-clock
+uncertainty matching is on folded domain tags — a virtual clock that
+folds onto a design row shares that row's `-from`/`-to` rules.
