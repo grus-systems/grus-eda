@@ -1,214 +1,142 @@
-# mc-selectors — API and data model
+# mc-selectors — API and code deltas (revision)
 
-Line numbers reference `analysis.rs`/`sdc.rs` at the worktree HEAD.
+All changes live in `crates/grus-core/src/sta/analysis.rs` inside
+`ExceptionCtx` / `run_sta_partitioned`; `sdc.rs` is untouched (its
+lookups are already name-only). Line numbers reference `c69cd99`.
 
-## 1. `sdc.rs`: clock selectors in exceptions
+## 1. `clock_row`: name-only + port-namespace resolution
 
-### `ObjSel::Clocks(Vec<usize>)`
-
-New variant carrying resolved `Sdc::clocks` row indices (not names —
-`resolve_clock` has already validated them at parse; `ClockId` is
-private so plain `usize` rows, the convention
-`InterClockUnc::from`/`to` already uses).
-
-`obj_sel` currently takes `&Value` with no parser access, so it cannot
-resolve names. Two options, pick the smaller diff:
-
-- (a) `obj_sel(&Value, &Parser)` — resolve `Value::Clocks(names)` to
-  rows inside; or
-- (b) keep `obj_sel` pure on the value kinds it knows and handle
-  `Value::Clocks` at the two call sites (`timing_exception`,
-  `path_delay`) with a `clock_sel(names)` helper.
-
-Either way: `-from`/`-to [get_clocks <name>...]` and `[all_clocks]`
-produce `Some(ObjSel::Clocks(rows))` and the command is stored — it no
-longer falls through to `ignored_commands`. Unknown names bail
-`unknown clock` (the `resolve_clock` path; match it to what the probe
-measures for an unknown clock inside an exception — `probe.md` §1).
-`Value::Nets`/`Value::Opaque` still return `None` → ignored.
-
-`-through` stays in `*_UNSUPPORTED_FLAGS` — out of scope.
-
-### Parse-time semantics to record
-
-- `[get_clocks {cka ckb}]` (multi-name) → `rows` is the union.
-- `[all_clocks]` → every row.
-- Bare `-from cka` stays `ObjSel::Names` unless the probe measures
-  OpenSTA resolving bare clock names in exceptions; if it does,
-  `Names` resolution gains a clock-name arm *in `ExceptionCtx`*
-  (names resolve at STA time there), recorded in
-  `docs/multi-clock.md`.
-
-## 2. `analysis.rs`: selector resolution
-
-`ExceptionCtx` gains two maps built once in `run_sta_partitioned`
-(where `graph`, `prepared`, `port_seeds`, `output_ports`, `ep_kinds`
-are all already in scope — around the `clk_launch` build, ~L3610):
-
-```text
-key_dom: HashMap<u32, usize>   // launch key -> clock row
-ep_cap:  HashMap<u32, usize>   // endpoint pin -> capture row
-```
-
-- `key_dom`: for `graph.launches`/`latch_opens`, `key_dom[l.q] =
-  clock_domain[l.clk]`; for `port_seeds`, `key_dom[s.pin] =
-  sdc.input_clock_row(port_name)` — the **raw** resolved `-clock` row
-  (a virtual row stays virtual), *not* `launch_domain`-folded: the
-  selector asks "clocked by X", not "on X's grid".
-- `ep_cap`: register checks and gating enables → `clock_domain[clk
-  pin]`; output ports → `sdc.output_clock_row(port)`.
-
-`resolve_from(ObjSel::Clocks(rows))` → `{k ∈ launch_keys : key_dom[k] ∈
-rows}`. `resolve_delay_from` shares it — a clock `-from` is an ordinary
-launch selector (covers the clocked launch), **not** a pin startpoint;
-`from_pins` stays empty. `resolve_to(ObjSel::Clocks(rows))` → `{p ∈
-endpoint_pins : ep_cap[p] ∈ rows}`. `u8::MAX`-domain entries simply
-match nothing.
-
-Coverage measured on `t2_sel*` scenarios:
-`-from [get_clocks cka]` = `{u_fa0/Q, u_fa1/Q, u_fy/Q, d_in}`;
-`-to [get_clocks ckb]` = `{u_fx/D, u_fb0/D, u_fb1/D, yb}` (pend probe
-confirmation of the port side — `probe.md` §1).
-
-## 3. `set_clock_groups`: parse + eval
-
-### `sdc.rs`
+`ExceptionCtx::clock_row` (~L3243) currently resolves a bare name to a
+clock row when it matches `c.name` **or** `c.port`. The port arm is
+unmeasured and wrong under every plausible reading of OpenSTA: it lets
+`-from clk1` cut the `cka` launch domain.
 
 ```rust
-pub enum ClockGroupKind { Asynchronous, LogicallyExclusive, PhysicallyExclusive }
-pub struct ClockGroup {
-    pub kind: ClockGroupKind,
-    /// Each `-group`'s resolved clock rows, in command order.
-    pub groups: Vec<Vec<usize>>,
-    /// Index into the merged rule list where this command sat in the
-    /// file: `sdc.exceptions.len() + sdc.path_delays.len()` at the
-    /// point the command runs. Precedence vs explicit rules.
-    pub order: usize,
-}
-pub clock_groups: Vec<ClockGroup>,   // on `Sdc`, in file order
-```
-
-Parser `set_clock_groups`: walk args; `-asynchronous` /
-`-logically_exclusive` / `-physically_exclusive` are mutually
-exclusive mode flags (missing mode → named bail or the measured
-default — probe); each `-group` consumes the next `Value::Clocks` or
-`Value::Str` (whitespace list) resolved via `resolve_clock`. `-name`
-accepts a string (stored nowhere — OpenSTA uses it for reporting only;
-count nothing). `-allow_paths` and any other dash flag: probe-driven —
-either `bail!("unsupported option")` or accepted-and-counted per what
-OpenSTA does (`probe.md` §2). Fewer than two `-group`s → the command
-excludes nothing; store it anyway (it parses in OpenSTA — verify) or
-bail, per probe.
-
-### `analysis.rs` — desugar to false paths
-
-In `run_sta_partitioned`, after `rules` is built from
-`exceptions` + `path_delays`: for each `ClockGroup`, for each unordered
-pair of its `groups` lists `(A, B)`, synthesize two
-`ResolvedRule::Exception` entries:
-
-```text
-{ kind: FalsePath, from: keys_by_dom(A), to: eps_by_cap(B) }   // A→B cut
-{ kind: FalsePath, from: keys_by_dom(B), to: eps_by_cap(A) }   // B→A cut
-```
-
-inserted at index `group.order` in `rules` (all of a command's pairs
-together, pair order irrelevant). `keys_by_dom(rows)` = `key_dom` ∪
-rows; `eps_by_cap(rows)` = `ep_cap` ∪ rows. This is exactly what the
-exception machinery does with a hand-written
-`set_false_path -from [get_clocks A] -to [get_clocks B]`, so §1–§2 land
-first — groups reuse the selector coverage.
-
-Everything downstream is unmodified: signature partitioning puts the
-excluded-domain keys in their own classes, `drop` kills their
-candidates at covered endpoints, `survived = false` → `fp_endpoints`
-(the same declared-constraint accounting `set_false_path` uses —
-`is_clean`-exempt, shown by `nonzero()`). `run_sta_detail`'s gate
-becomes:
-
-```rust
-if !sdc.exceptions.is_empty() || !sdc.path_delays.is_empty() || !sdc.clock_groups.is_empty() {
-    return run_sta_partitioned(&prepared, emit_warnings);
+fn clock_row(&self, name: &str) -> Option<usize> {
+    self.sdc().clocks.iter().position(|c| c.name == name)
 }
 ```
 
-`xdomain_defer`/`collect_endpoints` need **no** group awareness:
-excluded pairs never leave the compose pass; they evaluate in their
-class run and are dropped like any false-path-covered candidate. For
-`t2_grp` this reproduces the measured 8→5 shrink including the
-`d_in`-anchored input check (`d_in ∈ keys_by_dom(cka)`, `u_fb0/D ∈
-eps_by_cap(ckb)`).
+— the same lookup `Parser::resolve_clock`/`clock_rows` already apply
+(`sdc.rs` ~L2056 records the measured rule). Update its doc comment and
+the `key_dom`/`ep_cap` comments that cite "bare clock names" to say
+*clock `-name`s*.
 
-Precedence vs `set_max_delay`/explicit `set_false_path` is the `order`
-insertion — measured by `probe.md` §2 before finalizing whether the
-synthesized rules insert at `order`, append, or prepend.
+### Bare names resolve against the port namespace
 
-## 4. `create_clock -waveform`: parse + edge lattice
+`ObjSel::Names` resolution order (unchanged where measured):
 
-### `sdc.rs`
+1. `inst/pin` (contains `/`) → `pin_launches`/`pin_endpoints`/
+   `delay_pin_spec`.
+2. Port name → port object.
+3. Cell name → `keys_by_cell`/`eps_by_cell`.
+4. Clock `-name` → `keys_on_clocks`/`eps_on_clocks`.
+5. Nothing → per-name `unresolved += 1`.
 
-```rust
-pub waveform_ns: Option<[f32; 2]>,   // on `Clock`; [rise instant, fall instant]
-```
+Step 2 currently checks `port_seeds` on `-from` and `output_ports` on
+`-to` — seeded/output ports only. `t2_selport`/`t2_selpto` measure
+whether an *unseeded input* port (`clk1`/`clk2`) resolves in OpenSTA
+(`probe.md` §1 decision table). Under the expected silent-dead-rule
+reading, step 2 gains a resolution arm: the name matches **any**
+`design.io_pins` entry → resolved (`hit = true`), contributing keys
+only through the existing seeded/output coverage checks. Direction does
+not gate resolution — an input port is a resolved-but-dead object on
+`-to` the same as on `-from`, matching OpenSTA's object lookup; the
+probe's `t2_selpto` pins it. Iterate `design.io_pins` with
+`cx.port_name`/`pin_dirs` at ctx build into a `port_by_name` map or
+scan inline (a handful of ports — inline scan is fine).
 
-`-waveform` joins `CLOCK_VALUE_FLAGS`; `flag_arg` reads its
-`Value::Str` (`{0.3 1.7}` arrives whitespace-joined). Parse with
-`split_whitespace` + `parse_f32`; require **exactly two** instants
-(probe may widen — `>2`/odd counts get a named bail
-`create_clock -waveform takes two edge instants` until measured
-otherwise). Same field on design and virtual rows. `finish` unchanged
-(period > 0 only).
+If the probe instead shows a warning or a clock resolution, follow the
+`probe.md` §1 table — do not code to the expected row.
 
-### `analysis.rs` — the offset accessor
+### `unresolved` counts object-resolution failures, not empty coverage
 
-```rust
-impl Clock {
-    /// Time within the period of the clock edge with index parity `p`
-    /// (0 = rise, 1 = fall): the waveform instant, or `p · P/2` for the
-    /// default 50% duty cycle.
-    fn edge_offset(&self, p: usize) -> f32;
-}
-```
+OpenSTA's `no valid objects specified for -from` fires when a selector
+resolves **zero objects**; a resolved object that covers nothing
+(`clk1`, `[get_cells u_buf]`, `[get_pins u_fa0/D]`) is a silent dead
+rule. Today the counting conflates the two: `resolve_sides` (~L3710)
+and the delay-rule equivalents (~L3737, ~L3741) bump `unresolved` on an
+empty *coverage* set.
 
-Every site currently assuming `p · P/2` moves to `edge_offset` (a `&Clock`
-is in scope at all of them):
+Change each `resolve_*` to also return whether the selector resolved
+any object, and bump only on `resolved_any == false`:
 
-- `propagate_clock` port seed (~L1910): `lat + half_period` → `lat +
-  clock.edge_offset(1)`; the RISE merge stays `lat` only when
-  `edge_offset(0) == 0` — generalize to `lat + edge_offset(0)` for
-  symmetry (identical when offset is 0).
-- Ideal seeding (~L2595): `ideal_latency + edge_par * half_period` →
-  `ideal_latency + row.edge_offset(edge_par)`.
-- `setup_edge_pair`/`hold_edge_pair` (~L4784, ~L4816): signatures gain
-  the two offset pairs — `launch0 = off_l[g]`, `phase_c = off_c[c0]`
-  instead of `g·PL/2` / `c0·PC/2`. `grid_lcm` and the window logic are
-  period-only — unchanged.
-- Same-domain phase tests in `collect_endpoints`/`gating` (~L5162,
-  ~L5265, ~L5413, ~L5455): `c0 <= g` → `cap_clk.edge_offset(c0) <=
-  lclk_or_cap.edge_offset(g)`; `c0 > g` / `pe_s <= g` / `g < pe_s`
-  likewise. On the uniform grid every comparison is equivalent to the
-  parity one (both instants ordered `0 < P/2`), so existing SDCs are
-  byte-identical.
-- `xdomain_defer`'s `pair_ok` passes the rows' offsets through.
+- `ObjSel::Clocks(rows)` → `resolved_any = !rows.is_empty()`
+  (`t2_selunk`'s all-miss collection — keeps its +1).
+- `ObjSel::Ports(sel)` → `resolved_any = sel` matches ≥1 `io_pins`
+  entry (its actual direction). `[get_ports nope]` keeps the +1;
+  `[get_ports clk1]` resolves dead.
+- `ObjSel::Cells(sel)` → `resolved_any = ≥1` name in `cell_by_name`
+  (per-name misses still counted inside `cell_sel_ids`).
+- `ObjSel::Pins(specs)` → `resolved_any = ≥1` spec in `pin_by_path`
+  (per-spec misses still counted inside `pin_*`).
+- `ObjSel::Names(names)` → `resolved_any = ≥1` name resolved in steps
+  1–4 (per-name misses still counted inside).
 
-### Sites deliberately unchanged
+`resolve_from`/`resolve_to` return `(HashSet<u32>, bool)`;
+`resolve_delay_from` returns `(HashSet<u32>, HashSet<u32>, bool)`.
+`resolve_sides` and the delay-rule resolution bump `unresolved` on
+`!resolved_any` instead of `is_empty()`.
 
-- Latch `open`/`close` comparisons (`close <= open → += P`), borrow
-  windows, `edge0_pol` decode, MCP `(ns−1)·P`/`−nh·Pc` shifts, pulse
-  widths (`width = arr[close] − arr[open]`, wrap by `period`), delay-
-  check edge-0 anchors (`clk_s.arrival_*`), `capture_extra` — all read
-  seeded/propagated arrivals that already carry the instants, or
-  multiply whole periods.
-- Port seeds: `per_pol` arrivals anchor at `latency + in_delay`.
-  Whether the waveform rise instant adds (`+ edge_offset(0)`) is a
-  `probe.md` §3 measurement; if it does, add it where `per_pol` is
-  built (~L2462).
+Arithmetic check against the pinned count: `exc_diag`'s
+`unresolved_exception_selectors == 4` is preserved — each all-miss
+`get_cells` side counts `per-name miss (+1)` + `zero objects (+1)` = 2,
+as before. A *resolved-but-dead* selector loses its old +1 — that is
+the measured correction, and no committed golden compares the count.
 
-## 5. Model-limit documentation
+## 2. `dead_ends`: gate the fanout traversal on delay rules
 
-- Inter-clock `-from`/`-to` uncertainty and group/selector coverage
-  all match on *clock rows*; `launch_domain` folding affects only
-  dom-mask pairing, not row-keyed coverage — state the distinction in
-  `docs/multi-clock.md`.
-- `-waveform` support covers exactly the two-instant alternating
-  rise/fall form; anything else is a named parse bail.
+The traversal (~L4364–4393) builds `dead_ends: HashMap<u32, Vec<u32>>`
+for every launch key unconditionally, but the leaf pass only fires on
+`ResolvedRule::Delay` entries in a class signature. Restructure:
+
+- Extract the DFS body (net-sink + `graph.outgoing` walk, leaf = pin
+  with neither) into `dead_end_leaves(design, graph, PinId) -> Vec<u32>`
+  — the same walk, parameterized on the start key.
+- Inside `for (ci, (sigma, keys)) in classes.iter().enumerate()`
+  (~L4394), compute first:
+
+  ```rust
+  let has_delay_rule =
+      sigma.iter().any(|&ri| matches!(rules[ri as usize], ResolvedRule::Delay(_)));
+  ```
+
+  and skip the leaf block entirely when false. When true, iterate the
+  class's keys, call `dead_end_leaves` per key, and process leaves
+  inline — the `dead_ends` map disappears (each key lives in exactly
+  one class, so nothing is recomputed).
+
+This is behaviour-preserving: a leaf row can only be produced under a
+delay rule, so SDCs without `set_max_delay`/`set_min_delay` (every
+group/false-path-only scenario) never traverse. `t2_selmd`/`t2_mdx`
+keep their `internal path endpoint` rows — gate them in the golden
+comparison as before.
+
+## 3. Stale comments
+
+`hold_edge_pair` is min-gap since `t2_wave`; every comment still
+describing the hold pair as *coincident* is stale:
+
+- ~L5494–5498 (the flagged one): rewrite as the same-domain realign on
+  waveform instants — `+P` when `cap_clk.edge_offset(c0) >
+  cap_clk.edge_offset(g)` — plus the foreign-bit min-gap pairing.
+- ~L4285: "A cross-domain hold pair lives on the coincident grid" →
+  min-gap grid (the `d_min = −nh·Pc` context is unchanged).
+- ~L5099–5101 (`xdomain_defer` doc): "pair coincident edges on the
+  check/anchor grid" → min-gap on the check/anchor grid (the gating
+  `hold_next` exception stays).
+- ~L5336: "min-gap on setup, coincident on hold" → min-gap on both.
+
+Audit the `coincident` hits (~L4961 `launch_domain`, ~L5031 setup
+pairing) — those are correct: same-period grids do pair coincident
+edges, and setup's strictly-after rule excludes coincidence. Do not
+touch them.
+
+## 4. What does not change
+
+- `ObjSel::Clocks` resolution at parse (`clock_rows`, all-miss → empty
+  rows → dead rule + one count under the §1 rule).
+- `key_dom`/`ep_cap` construction and the `set_clock_groups` desugar —
+  raw declared rows, lone-group semantics, `-allow_paths` no-store.
+- `Clock::edge_offset`, `waveform_ns`, and every consumer site.
+- `run_sta_detail`'s partition gate.

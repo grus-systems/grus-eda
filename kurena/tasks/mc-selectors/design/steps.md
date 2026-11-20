@@ -1,83 +1,69 @@
-# mc-selectors — Implementation steps
+# mc-selectors — Revision steps
 
-Ordered so every step keeps the tree green; the version bump and doc
-updates land in the same commit as the functional change (`AGENTS.md`
-§5). One ticket ≈ one commit — this ticket is at the upper end of the
-size budget; the parse/model step and the eval step are the natural
-seams if review demands a split.
+Ordered so every step keeps the tree green. The version bump
+(`0.2.4 → 0.2.5`, patch — correctness fixes) and doc updates land in
+the functional commit (AGENTS.md §5). Two commits is the natural split:
+fixture+probe first, code+tests+docs second.
 
-## Step 0 — Probe (gate, not a code step)
+## Step 0 — Probe + golden re-fold
 
-- Write the new `t2_*.sdc` scenarios (`fixture.md`), extend `probe.sh`
-  `SCENARIOS`, run the container probe, audit `git diff` (additive
-  only), commit the fixture+artifacts on their own.
-- Record the measured answers to `probe.md` §1–§3 in
-  `docs/results.md` and `docs/multi-clock.md` §1.6 **before** writing
-  eval code. Any answer that contradicts this design's hypothesis goes
-  back to the card — do not code to the hypothesis.
+- Add `t2_selport.sdc` / `t2_selpto.sdc` (`fixture.md`); extend
+  `probe.sh` `SCENARIOS` (+10 names), shrink `PROBE_ONLY` to the four
+  bail-pinned forms, and add the `run_sta` empty-table `null` guard
+  (`fixture.md`, needed by `t2_selac`/`t2_selunion`).
+- Run `probe.sh` whole in `ghcr.io/librelane/librelane:3.0.16`; audit
+  `git diff` — additive only (29 existing blocks + every
+  `probe_t2_*.txt` byte-identical).
+- Read `probe_t2_selport.txt`/`probe_t2_selpto.txt` and the new ref
+  blocks; record the measured port-name rule in `docs/results.md` and
+  `docs/multi-clock.md` §1.7. If the answer is not the expected
+  port-object dead rule (`probe.md` §1 table), stop and come back to
+  the card.
+- Commit fixture + artifacts on their own.
 
-## Step 1 — `sdc.rs`: parse + model
+## Step 1 — `analysis.rs`: `clock_row` + `unresolved` + `dead_ends`
 
-- `ObjSel::Clocks(Vec<usize>)`; `Value::Clocks` accepted in
-  `timing_exception`/`path_delay` `-from`/`-to` (resolution per
-  `api.md` §1); `-through` untouched.
-- `Clock::waveform_ns: Option<[f32; 2]>`; `-waveform` in
-  `CLOCK_VALUE_FLAGS`, two-instant parse, named bail otherwise.
-- `ClockGroup`/`ClockGroupKind`/`Sdc::clock_groups`; `set_clock_groups`
-  parser per `api.md` §3 (modes, multi `-group`, `order` stamp);
-  unsupported forms bail or count per the probe.
-- `multi_clock_bails`: remove the `set_clock_groups` and `-waveform`
-  cases; add positive parse tests (`tests.md` §3).
-- Gate: `cargo test -p grus-core sdc` green; all goldens byte-identical
-  (nothing eval-side reads the new fields yet).
+- `clock_row` → `c.name` only (`api.md` §1); fix its comment and the
+  `key_dom`/`ep_cap` wording.
+- `ObjSel::Names` port-namespace arm: bare io-pin names resolve
+  (dead-rule objects) in `resolve_from`/`resolve_delay_from`/
+  `resolve_to` per the measured rule.
+- `resolved_any` counting: `(coverage, resolved_any)` from every
+  `resolve_*`; `resolve_sides` and the delay path bump `unresolved` on
+  zero resolved objects, not empty coverage (`api.md` §1). Verify
+  `test_sta_exception_diagnostics` still sees `== 4`.
+- `dead_ends`: extract `dead_end_leaves`, gate per class on
+  `ResolvedRule::Delay` in `sigma` (`api.md` §2).
+- Stale-comment sweep (`api.md` §3): the four `coincident` hold-pair
+  comments → min-gap/`edge_offset` wording.
+- `Cargo.toml` `0.2.4 → 0.2.5` + `Cargo.lock` in this commit.
+- Gate: `cargo test --workspace` green; all goldens byte-identical.
 
-## Step 2 — `analysis.rs`: selector resolution + group desugar
+## Step 2 — Tests + fail-proof + docs
 
-- `key_dom`/`ep_cap` maps in `run_sta_partitioned` (`api.md` §2);
-  `resolve_from`/`resolve_delay_from`/`resolve_to` `ObjSel::Clocks`
-  arms.
-- Clock-group desugar → synthesized `FalsePath` rules at `order`
-  (`api.md` §3); `run_sta_detail` partition gate widened.
-- Gate: selector + group scenarios match their fresh goldens at
-  STRICT; all existing tests green.
-
-## Step 3 — `analysis.rs`: waveform edge lattice
-
-- `Clock::edge_offset` accessor; the five `parity · P/2` sites moved
-  (`api.md` §4); `setup_edge_pair`/`hold_edge_pair` signatures gain
-  offsets; call sites updated including `xdomain_defer`.
-- Gate: waveform scenarios at STRICT; every single-clock golden
-  byte-identical (`edge_offset` degenerates on the uniform grid).
-
-## Step 4 — Test updates + fail-proof + docs + version
-
-- `test_sta_clocks_match_opensta`: `parse_gated` shrinks (probably to
-  empty or the scenarios that stay bail-gated); update the
-  `evaluated + parse_gated == N` count; `cross_domain == 0` claim
-  re-verified.
-- Fail-proof mutations per `tests.md` §4 (one per feature); red, then
-  restore, record both runs.
-- `docs/multi-clock.md`: tick §3 item 4; §1.6 addendums (selector
-  anchoring rule, group modes, waveform instants); §2 remove
-  `create_clock -waveform`/`set_clock_groups` from the unsupported
-  list, add whatever stays (e.g. `>2`-instant waveforms, group forms
-  the probe rejected).
-- `docs/timing-exceptions.md`: the "Clock-object selectors → v1
-  ignored" line and the out-of-scope bullet updated to implemented +
-  measured rule.
-- `docs/results.md`: dated entry — probe command, per-scenario table,
-  group drop counts, waveform numbers, fail-proof runs, what ran vs.
-  not (bare-name clocks, `-through`, `>2` instants, unexercised fall
-  instant if applicable).
-- `docs/roadmap.md`: `mc-selectors` done, `mc-golden` next.
-- `tests/designs/README.md`: scenario list/count.
-- `Cargo.toml` `0.2.3 → 0.2.4` + `Cargo.lock` in the functional commit.
+- `test_sta_clocks_match_opensta`: `evaluated` assert `30 → 40`
+  (39 `two_clock` scenarios + `t2_latch`).
+- `test_edge_pairing_unit_cases`: add the `edge_offset` table and the
+  non-uniform `setup_edge_pair`/`hold_edge_pair` rows (`tests.md` §2).
+- Fail-proof (AGENTS.md §7 rule 7): restore `c.port` matching in
+  `clock_row` → `t2_selport` must go red (under the port-object
+  reading, ours would drop the cka launch checks OpenSTA keeps);
+  restore and confirm green. Record both runs.
+- `docs/multi-clock.md`: §1.7 addendum — bare port names resolve to
+  port objects (dead rule), clock names match `-name` only; update the
+  §3 item-4 note and any "30 scenarios" counts.
+- `docs/timing-exceptions.md`: the clock-selector bullet — bare names
+  resolve clock `-name`s only; port names resolve as port objects.
+- `docs/results.md`: dated revision entry — the port-name measurement,
+  the re-fold list, `dead_ends` gating note, fail-proof runs, what ran
+  vs not.
+- `docs/roadmap.md` + `tests/designs/README.md`: scenario counts and
+  the `PROBE_ONLY` description.
 - Gate: `cargo test --workspace` + `cargo clippy --workspace
   --all-targets -- -D warnings` green.
 
 ## Files
 
-- `crates/grus-core/src/sta/sdc.rs`
 - `crates/grus-core/src/sta/analysis.rs`
 - `tests/designs/sta_clocks/`
 - `tests/designs/README.md`

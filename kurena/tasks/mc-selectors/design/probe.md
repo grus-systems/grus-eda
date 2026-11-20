@@ -1,91 +1,116 @@
-# mc-selectors — Probes required before coding
+# mc-selectors — Probes for the revision
 
-Every rule below is a *question*; the implementer measures it on OpenSTA
-in `ghcr.io/librelane/librelane:3.0.16` by adding scenarios to
-`tests/designs/sta_clocks/probe.sh` (fixture list in `fixture.md`) and
-records the answers in `docs/results.md` and `docs/multi-clock.md`
-§1.6 **before** writing eval code. Nothing in this file may be assumed.
+One question is left open by the first probe round: what a bare clock
+*source-port* name resolves to inside `-from`/`-to`. Everything else in
+this revision is a golden-coverage change, not a new measurement — the
+moved `PROBE_ONLY` scenarios were already run; folding them into
+`SCENARIOS` emits their `ref_*.json` blocks.
 
-## 1. Clock selectors in `-from`/`-to`
+All runs go through `tests/designs/sta_clocks/probe.sh` in
+`ghcr.io/librelane/librelane:3.0.16`, exactly as committed (AGENTS.md §7
+rule 1). Tcl on stdin: `!` is history expansion — write `[...] == 0`.
 
-For each of `set_false_path`, `set_max_delay`/`set_min_delay`, and
-`set_multicycle_path`, on `two_clock.def` (cka 2.0 ns on `clk1`,
-ckb 1.0 ns on `clk2`):
+## 1. Bare port names in `-from`/`-to` (`t2_selport`, `t2_selpto`)
 
-- `set_false_path -from [get_clocks cka]` — which endpoints leave the
-  table? Hypothesis (to falsify): every launch tagged `cka` — `u_fa0`,
-  `u_fa1`, `u_fy` launches plus the `d_in` port seed (its
-  `set_input_delay -clock` is `cka`) — so `u_fa0/D`, `u_fa1/D`,
-  `u_fx/D`, `u_fy/D`, `ya` lose their checks. Does OpenSTA also drop
-  the *input* check (`d_in`-launched), or only clocked launches?
-- `set_false_path -to [get_clocks ckb]` — hypothesis: every endpoint
-  whose capture is `ckb` (`u_fx/D`, `u_fb0/D`, `u_fb1/D`, `yb`).
-  Confirm whether the output port `yb` (its `set_output_delay -clock`
-  is `ckb`) is covered.
-- `set_false_path -from cka` (bare name, no `get_clocks`) — does
-  OpenSTA resolve a clock name in exception position at all, and does
-  it anchor launch or capture? If it parses, compare its drop set
-  against the `[get_clocks cka]` form.
-- `set_false_path -from [all_clocks]` — drop set.
-- `set_max_delay N -from [get_clocks cka]` and `-to [get_clocks ckb]` —
-  does a clock `-from` keep the ordinary (clocked) launch with the
-  measured edge-0 capture anchor, or become a startpoint form like
-  `get_pins inst/Q`? Does `-to [get_clocks ckb]` cover `yb`?
-- `set_multicycle_path -setup 2 -from [get_clocks cka]`
-  (`-to [get_clocks ckb]` mirror) — does the multiplier scale the
-  capture row's period as measured for pin selectors (`t2_mcp`)?
-- Multi-name `[get_clocks {cka ckb}]` on `-from` — union coverage.
-- Unknown clock `[get_clocks nope]` inside `-from` — OpenSTA error, or
-  warning + dead rule? (Current model bails `unknown clock`; match the
-  measured severity.)
+The review defect: `ExceptionCtx::clock_row` matches `c.port`, so
+`set_false_path -from clk1` — `clk1` is `cka`'s source port, not its
+`-name` — currently cuts every cka launch. OpenSTA was never asked what
+`-from clk1` means.
 
-## 2. `set_clock_groups`
+New scenarios (fixture boilerplate per `fixture.md`):
 
-- `t2_grp` (`-asynchronous`, committed): re-confirm the 8→5 table on
-  regen — `u_fb0/D`, `u_fx/D`, `u_fy/D` gone, I/O-anchored cross checks
-  included, same-domain untouched.
-- Modes: repeat the same command with `-logically_exclusive` and
-  `-physically_exclusive` — same endpoint drop? If yes they share the
-  eval path; if OpenSTA rejects or treats them differently, name the
-  bail.
-- `-asynchronous -allow_paths` — accepted? Semantics?
-- Precedence vs explicit constraints: `-asynchronous` groups **plus**
-  `set_max_delay 1.0 -from [get_clocks cka] -to [get_pins u_fx/D]`
-  (or a covering `-to`): does OpenSTA still report `u_fx/D` under the
-  delay check (explicit wins / groups lose), or is it still dropped
-  (groups win)? And swapped file order if the answer is order-
-  dependent. Also `-asynchronous` **plus** `set_false_path -from
-  [get_clocks cka]` — sanity: same drop.
-- Degenerate forms: one `-group` only, empty `-group`, `-group` with a
-  bare name instead of `[get_clocks ...]`, missing mode flag,
-  `-name` — what does OpenSTA accept?
+- `t2_selport.sdc` — `set_false_path -from clk1`.
+- `t2_selpto.sdc` — `set_false_path -to clk2` (input port on the `-to`
+  side; `resolve_to` shares `clock_row`, so both arms are pinned).
 
-## 3. `create_clock -waveform`
+Questions, in priority order:
 
-- `create_clock -name cka -period 2.0 -waveform {0 0.5}` and
-  `{0.3 1.7}` on `two_clock.def` (other clock unchanged): record
-  per-endpoint arr/req. Hypothesis: same-domain check shifts both
-  launch and capture by the rise instant (arr/req +0.3, slack
-  unchanged); cross-domain pairs re-enumerate on the shifted launch
-  grid. Verify the *fall* instant matters somewhere the fixture can see
-  — the committed checks are all rise-triggered, so the fall edge only
-  shows via pairing if a fall launch/capture exists; otherwise the
-  golden pins the rise instant and the fall instant is covered by the
-  offset machinery's symmetry (state this honestly in `results.md`).
-- Waveform on the input-delay clock (`-clock cka` with `-waveform`):
-  does the `d_in` arrival shift by the waveform rise instant (port
-  seeds currently anchor at `latency + in_delay`)?
-- Error/edge forms: odd instant count, `>2` instants, instants outside
-  `[0, period)`, `{1.7 0.3}` (reversed order) — which does OpenSTA
-  accept, and what do the accepted ones compute?
+1. Does the endpoint table change at all? Expected: `clk1` resolves to
+   the *port* object — a non-empty collection, so no "no valid objects"
+   warning — but it starts no data path (it only feeds the clock
+   buffers), so the rule covers nothing: the full 8-endpoint table,
+   silent.
+2. Or does OpenSTA resolve `clk1` to the `cka` clock (the `t2_selbare`
+   drop set)?
+3. Does `read_sdc` warn — and is the warning the per-name "not found"
+   form (`t2_selunk`'s `clock 'nope' not found` + `no valid objects
+   specified for -from`) or nothing?
+4. Same two questions on the `-to` side for `clk2`.
+
+Record the full report text (`probe_t2_selport.txt`,
+`probe_t2_selpto.txt`) — the `Startpoint:`/`Endpoint:` headers and any
+`STA-` warning — plus the ref JSON blocks, and write the answer in
+`docs/results.md` and `docs/multi-clock.md` §1.7.
+
+Decision table for the eval change (`api.md` §1):
+
+| Measured | `clock_row` | bare `clk1`/`clk2` in `ObjSel::Names` |
+|---|---|---|
+| resolves to port, dead rule, silent | `c.name` only | resolves as port object (no coverage, no count) |
+| resolves to port, dead rule, warns | `c.name` only | unresolved name-miss count stays |
+| resolves to clock | unchanged | `t2_selbare` rule — comes back to the card |
+| parse error | `c.name` only | bare names never resolve to clocks; document |
+
+The expected outcome (name-only + silent port resolution) matches the
+already-measured `resolve_clock` rule: `set_clock_latency 1.0 clk1` on a
+`-name`d clock is `unknown clock` in OpenSTA — port names are not clock
+handles — while exception selectors resolve names against the *object*
+namespaces, where `clk1` is a legitimate port object.
+
+## 2. Golden coverage re-fold
+
+Move from `PROBE_ONLY` to `SCENARIOS` — all four implement and all
+produce complete endpoint tables in OpenSTA (`run_sta` emits ref JSON
+since `read_sdc` only warns):
+
+- `t2_selbare` — `-from cka` = `-from [get_clocks cka]` (measured).
+- `t2_selac` — `-from [all_clocks]` = union over all rows.
+- `t2_selunion` — `-from [get_clocks {cka ckb}]` = union.
+- `t2_selunk` — `-from [get_clocks nope]` warns (`clock 'nope' not
+  found`, `no valid objects`) and drops nothing — a dead rule, still a
+  complete table.
+
+**Empty-table hazard** (measured, `probe_t2_selac.txt`):
+`t2_selac`/`t2_selunion` cut every launch — OpenSTA prints `No paths
+found.` and the endpoint list is empty. `run_sta`'s
+`format "%.6f" [sta::worst_slack -max]` on a path-less design emits a
+non-numeric value (`Inf`), which is invalid JSON and would corrupt
+`two_clock.probe.json`. Guard in `run_sta` before folding: when
+`$endpoints` comes back empty, emit `null` for the four
+`wns/tns` fields and `0` for the violation counts — the endpoint list
+itself is the measurement. The golden test skips the aggregate compare
+on an empty `endpoints` array (`tests.md` §1).
+
+Same discipline for the other implemented forms OpenSTA accepted:
+
+- `t2_grp1` — single `-group cka` cuts vs every other clock (same 8→5).
+- `t2_grpe` — `-group {} -group ckb` — pins the empty-group arm of the
+  desugar.
+- `t2_grpb` — `-group cka -group ckb` bare names = `t2_grp`.
+- `t2_wavebig` — `-waveform {0 2.5}` on 2.0 — instants past the period,
+  wrapped (`rem_euclid`).
+
+`PROBE_ONLY` keeps exactly the error/divergence forms, which emit no
+usable endpoint table:
+
+- `t2_grpn` — missing mode flag, STA-0400 (ours: named bail).
+- `t2_wave3` — odd instant count, STA-0371 (ours: named bail).
+- `t2_wave4` — `>2` instants, **accepted** by OpenSTA; ours named-bails
+  deliberately — the documented divergence.
+- `t2_waverev` — non-increasing instants, STA-0372 (ours: named bail).
+
+The two new port-name scenarios join `SCENARIOS` directly — they
+measure and golden in the same run (whatever the answer is, it lands
+as a table or a recorded error block).
 
 ## Method
 
-- New `t2_*.sdc` files per `fixture.md`; `probe.sh` `SCENARIOS`
-  extended; `run_sta` + `run_report` produce `ref_*.json` (folded into
-  `two_clock.probe.json`) and `probe_*.txt` (the launch/capture clock
-  names and edge times — the anchoring evidence).
-- Tcl on stdin to `openroad`/`sta`: `!` is history expansion — write
-  `[...] == 0` (AGENTS.md §7 rule 3).
-- `git diff` after regen: only the new scenario blocks and new
-  `probe_*.txt` files may appear.
+- `probe.sh` `SCENARIOS` gains the 8 moved names + `t2_selport` +
+  `t2_selpto` (39 scenarios on `two_clock.def`, plus `t2_latch`);
+  `PROBE_ONLY` shrinks to 4. No logic changes to the script.
+- `git diff` audit after regen (AGENTS.md §7 rule 1): the 29 existing
+  scenario blocks in `two_clock.probe.json`, the `t2_latch` block, and
+  every existing `probe_t2_*.txt` **byte-identical**; only new blocks
+  appear. Name the steps run in `docs/results.md` (rule 9).
+- `tests/designs/README.md`: scenario count and the `PROBE_ONLY`
+  description updated in the same commit.
