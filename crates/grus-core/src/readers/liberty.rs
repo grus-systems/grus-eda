@@ -1,7 +1,7 @@
 use crate::interner::{LibPinId, PinDir, SymbolId};
 use crate::lib_db::{
-    LibCell, LibDb, LibPin, LibPinInternalPower, LibTimingArc, NldmTable, TableAxisVar,
-    TimingSense, TimingType,
+    LibCell, LibDb, LibLeakageState, LibPin, LibPinInternalPower, LibTimingArc, NldmTable,
+    TableAxisVar, TimingSense, TimingType,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use xxhash_rust::xxh3::xxh3_64;
 const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
 // Bump when the serialized LibDb layout changes (e.g. new TimingType variants shift
 // discriminant values and old caches would deserialize `Other` arcs as real types).
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 7;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -618,6 +618,7 @@ fn parse_cell_body(
     let mut is_sequential = false;
     let mut is_latch = false;
     let mut cell_leakage_raw: Option<f32> = None;
+    let mut leakage_states = Vec::new();
 
     // Track cell-local pins mapping SymbolId to global LibPinId
     let mut local_pin_names: HashMap<SymbolId, LibPinId> = HashMap::new();
@@ -725,6 +726,11 @@ fn parse_cell_body(
                     cell_leakage_raw = Some(number_value(s, "cell_leakage_power")?);
                 }
             }
+            Token::Ident("leakage_power") => {
+                if let Some(state) = parse_leakage_power_block(lexer, db)? {
+                    leakage_states.push(state);
+                }
+            }
             Token::Ident("pin") => {
                 if matches!(lexer.next_token(), Some(Token::LParen)) {
                     // Drain the header: `pin (A, B)` is not valid Liberty (the `pin`
@@ -771,8 +777,8 @@ fn parse_cell_body(
             Token::LBrace => {
                 lexer.skip_balanced_braces();
             }
-            // `test_cell`, `pg_pin`, `leakage_power` (summarized by `cell_leakage_power`),
-            // `dynamic_current` and any other unknown attribute are skipped whole so
+            // `test_cell`, `pg_pin`, `dynamic_current` and any other unknown
+            // attribute are skipped whole so
             // their values cannot alias keywords (`cell_footprint : latch;` would
             // otherwise set `is_latch`). One arm only: a guard that fails must not
             // fall through to a second skip.
@@ -826,9 +832,72 @@ fn parse_cell_body(
         arc_offset,
         arc_count,
         leakage_power_w: cell_leakage_raw.map(|v| v * db.leakage_power_unit_w),
+        leakage_states,
     });
 
     Ok(())
+}
+
+/// Parses one `leakage_power () { when : "…"; value : … }` group inside a cell
+/// body. The `when` text is stored raw — state evaluation lives in
+/// `power.rs`, which weighs each state by the marginal probability its
+/// expression holds. `None` when the group carries no `value`.
+fn parse_leakage_power_block(lexer: &mut Lexer, db: &mut LibDb) -> Result<Option<LibLeakageState>> {
+    // Consume the `()` header up to the body brace.
+    let mut saw_brace = false;
+    while let Some(tok) = lexer.next_token() {
+        match tok {
+            Token::LBrace => {
+                saw_brace = true;
+                break;
+            }
+            Token::Semi => return Ok(None),
+            _ => {}
+        }
+    }
+    if !saw_brace {
+        return Ok(None);
+    }
+    let mut when = None;
+    let mut value = None;
+    let mut closed = false;
+    while let Some(tok) = lexer.next_token() {
+        match tok {
+            Token::RBrace => {
+                closed = true;
+                break;
+            }
+            Token::Ident("when") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token()
+                {
+                    when = Some(db.strings.intern(s));
+                }
+            }
+            Token::Ident("value") => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Ident(s) | Token::Str(s)) = lexer.next_token()
+                {
+                    value = Some(number_value(s, "leakage_power value")?);
+                }
+            }
+            Token::LBrace => {
+                lexer.skip_balanced_braces();
+            }
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !closed {
+        bail!("unterminated Liberty leakage_power block (missing closing brace)");
+    }
+    Ok(value.map(|v| LibLeakageState {
+        when,
+        power_w: v * db.leakage_power_unit_w,
+    }))
 }
 
 #[allow(clippy::type_complexity)]

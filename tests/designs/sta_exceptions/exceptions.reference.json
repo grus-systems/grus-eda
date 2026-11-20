@@ -1572,6 +1572,260 @@
       {"pin": "y2", "max_arr_ns": 1.015388, "max_req_ns": 1.350000, "max_slack_ns": 0.334612, "max_slew_ns": 0.255704, "min_arr_ns": 0.890682, "min_req_ns": 1.000000, "min_slack_ns": -0.109318, "min_slew_ns": 0.441249}
   ]
 }
+,
+    "pmp_port": {
+  "wns_max_ns": 0.191446,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.205553,
+  "tns_min_ns": -0.340027,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 0.991446, "max_slack_ns": 0.191446, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.234473, "min_slack_ns": -0.134473, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.796505, "max_req_ns": 2.013333, "max_slack_ns": 1.216828, "max_slew_ns": 0.050167, "min_arr_ns": 0.330844, "min_req_ns": 0.248340, "min_slack_ns": 0.082504, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 2.061578, "max_slack_ns": 1.261578, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.305553, "min_slack_ns": -0.205553, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.778018, "max_req_ns": 1.350000, "max_slack_ns": 0.571982, "max_slew_ns": 0.469449, "min_arr_ns": 0.630674, "min_req_ns": 0.100000, "min_slack_ns": 0.530674, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 1.015388, "max_req_ns": 1.350000, "max_slack_ns": 0.334612, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "pmp_minport": {
+  "wns_max_ns": 0.334612,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.634473,
+  "tns_min_ns": -0.840027,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 1.991446, "max_slack_ns": 1.191446, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.734473, "min_slack_ns": -0.634473, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.796505, "max_req_ns": 2.013333, "max_slack_ns": 1.216828, "max_slew_ns": 0.050167, "min_arr_ns": 0.330844, "min_req_ns": 0.248340, "min_slack_ns": 0.082504, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 2.061578, "max_slack_ns": 1.261578, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.305553, "min_slack_ns": -0.205553, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.778018, "max_req_ns": 1.350000, "max_slack_ns": 0.571982, "max_slew_ns": 0.469449, "min_arr_ns": 0.630674, "min_req_ns": 0.100000, "min_slack_ns": 0.530674, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 1.015388, "max_req_ns": 1.350000, "max_slack_ns": 0.334612, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "pmp_port2": {
+  "wns_max_ns": 0.191446,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.205553,
+  "tns_min_ns": -0.340027,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 0.991446, "max_slack_ns": 0.191446, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.234473, "min_slack_ns": -0.134473, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.796505, "max_req_ns": 2.013333, "max_slack_ns": 1.216828, "max_slew_ns": 0.050167, "min_arr_ns": 0.330844, "min_req_ns": 0.248340, "min_slack_ns": 0.082504, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 2.061578, "max_slack_ns": 1.261578, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.305553, "min_slack_ns": -0.205553, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.778018, "max_req_ns": 1.350000, "max_slack_ns": 0.571982, "max_slew_ns": 0.469449, "min_arr_ns": 0.630674, "min_req_ns": 0.100000, "min_slack_ns": 0.530674, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 1.015388, "max_req_ns": 1.350000, "max_slack_ns": 0.334612, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "pmp_alls": {
+  "wns_max_ns": -0.683130,
+  "tns_max_ns": -0.683130,
+  "wns_min_ns": -0.205553,
+  "tns_min_ns": -0.340027,
+  "setup_violations": 1,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 0.991446, "max_slack_ns": 0.191446, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.234473, "min_slack_ns": -0.134473, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.713326, "max_req_ns": 1.013333, "max_slack_ns": 0.300008, "max_slew_ns": 0.050167, "min_arr_ns": 0.330844, "min_req_ns": 0.248340, "min_slack_ns": 0.082504, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 1.061578, "max_slack_ns": 0.261578, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.305553, "min_slack_ns": -0.205553, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.778018, "max_req_ns": 1.350000, "max_slack_ns": 0.571982, "max_slew_ns": 0.469449, "min_arr_ns": 0.630674, "min_req_ns": 0.100000, "min_slack_ns": 0.530674, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 0.933129, "max_req_ns": 0.250000, "max_slack_ns": -0.683130, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "pcr_clk": {
+  "wns_max_ns": 0.304393,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.235773,
+  "tns_min_ns": -0.386000,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 1.975693, "max_slack_ns": 1.175693, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.250227, "min_slack_ns": -0.150227, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.826725, "max_req_ns": 1.997580, "max_slack_ns": 1.170855, "max_slew_ns": 0.050167, "min_arr_ns": 0.330844, "min_req_ns": 0.264094, "min_slack_ns": 0.066750, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 2.031358, "max_slack_ns": 1.231358, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.335773, "min_slack_ns": -0.235773, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.793771, "max_req_ns": 1.350000, "max_slack_ns": 0.556229, "max_slew_ns": 0.469449, "min_arr_ns": 0.614920, "min_req_ns": 0.100000, "min_slack_ns": 0.514920, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 1.045607, "max_req_ns": 1.350000, "max_slack_ns": 0.304393, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "pcr_clkfp": {
+  "wns_max_ns": 0.304393,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.235773,
+  "tns_min_ns": -0.386000,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 1.975693, "max_slack_ns": 1.175693, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.250227, "min_slack_ns": -0.150227, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.758462, "max_req_ns": 2.029087, "max_slack_ns": 1.270625, "max_slew_ns": 0.050167, "min_arr_ns": 0.330844, "min_req_ns": 0.264094, "min_slack_ns": 0.066750, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 2.031358, "max_slack_ns": 1.231358, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.335773, "min_slack_ns": -0.235773, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.793771, "max_req_ns": 1.350000, "max_slack_ns": 0.556229, "max_slew_ns": 0.469449, "min_arr_ns": 0.614920, "min_req_ns": 0.100000, "min_slack_ns": 0.514920, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 1.045607, "max_req_ns": 1.350000, "max_slack_ns": 0.304393, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "pcr_max": {
+  "wns_max_ns": 0.270625,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.235773,
+  "tns_min_ns": -0.386000,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 1.975693, "max_slack_ns": 1.175693, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.250227, "min_slack_ns": -0.150227, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.758462, "max_req_ns": 1.029087, "max_slack_ns": 0.270625, "max_slew_ns": 0.050167, "min_arr_ns": 0.330844, "min_req_ns": 0.264094, "min_slack_ns": 0.066750, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 2.031358, "max_slack_ns": 1.231358, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.335773, "min_slack_ns": -0.235773, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.793771, "max_req_ns": 1.350000, "max_slack_ns": 0.556229, "max_slew_ns": 0.469449, "min_arr_ns": 0.614920, "min_req_ns": 0.100000, "min_slack_ns": 0.514920, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 1.045607, "max_req_ns": 1.350000, "max_slack_ns": 0.304393, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "pcr_min": {
+  "wns_max_ns": 0.304393,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.235773,
+  "tns_min_ns": -0.541849,
+  "setup_violations": 0,
+  "hold_violations": 3,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 1.975693, "max_slack_ns": 1.175693, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.250227, "min_slack_ns": -0.150227, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.826725, "max_req_ns": 1.997580, "max_slack_ns": 1.170855, "max_slew_ns": 0.050167, "min_arr_ns": 0.576738, "min_req_ns": 0.732587, "min_slack_ns": -0.155849, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 2.031358, "max_slack_ns": 1.231358, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.335773, "min_slack_ns": -0.235773, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.793771, "max_req_ns": 1.350000, "max_slack_ns": 0.556229, "max_slew_ns": 0.469449, "min_arr_ns": 0.614920, "min_req_ns": 0.100000, "min_slack_ns": 0.514920, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 1.045607, "max_req_ns": 1.350000, "max_slack_ns": 0.304393, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "pcr_off": {
+  "wns_max_ns": 0.170855,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.235773,
+  "tns_min_ns": -0.386000,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 0.800000, "max_req_ns": 1.975693, "max_slack_ns": 1.175693, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.250227, "min_slack_ns": -0.150227, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 0.826725, "max_req_ns": 0.997580, "max_slack_ns": 0.170855, "max_slew_ns": 0.050167, "min_arr_ns": 0.330844, "min_req_ns": 0.264094, "min_slack_ns": 0.066750, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 0.800000, "max_req_ns": 2.031358, "max_slack_ns": 1.231358, "max_slew_ns": 0.100000, "min_arr_ns": 0.100000, "min_req_ns": 0.335773, "min_slack_ns": -0.235773, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 0.793771, "max_req_ns": 1.350000, "max_slack_ns": 0.556229, "max_slew_ns": 0.469449, "min_arr_ns": 0.614920, "min_req_ns": 0.100000, "min_slack_ns": 0.514920, "min_slew_ns": 0.230199},
+      {"pin": "y2", "max_arr_ns": 1.045607, "max_req_ns": 1.350000, "max_slack_ns": 0.304393, "max_slew_ns": 0.255704, "min_arr_ns": 0.625888, "min_req_ns": 0.100000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "ld_net": {
+  "wns_max_ns": 0.416871,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.064555,
+  "tns_min_ns": -0.129110,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 1.710434, "max_req_ns": 2.364184, "max_slack_ns": 0.653750, "max_slew_ns": 0.474674, "min_arr_ns": 1.535451, "min_req_ns": 0.660690, "min_slack_ns": 0.874761, "min_slew_ns": 0.883711},
+      {"pin": "u_ff2/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 1.323993, "max_req_ns": 1.950000, "max_slack_ns": 0.626007, "max_slew_ns": 0.469099, "min_arr_ns": 1.176338, "min_req_ns": 0.700000, "min_slack_ns": 0.476337, "min_slew_ns": 0.229591},
+      {"pin": "y2", "max_arr_ns": 1.533129, "max_req_ns": 1.950000, "max_slack_ns": 0.416871, "max_slew_ns": 0.255704, "min_arr_ns": 1.225888, "min_req_ns": 0.700000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "ld_pin_sink": {"error": "Error: ld_pin_sink.sdc, 20 STA-0100"}
+,
+    "ld_pin_drv": {"error": "Error: ld_pin_drv.sdc, 20 STA-0100"}
+,
+    "ld_pins": {"error": "Error: ld_pins.sdc, 20 STA-0100"}
+,
+    "ld_nets": {
+  "wns_max_ns": 0.305596,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.064555,
+  "tns_min_ns": -0.129110,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 1.539263, "max_req_ns": 2.457097, "max_slack_ns": 0.917834, "max_slew_ns": 0.262474, "min_arr_ns": 1.235912, "min_req_ns": 0.690688, "min_slack_ns": 0.545224, "min_slew_ns": 0.455563},
+      {"pin": "u_ff2/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 1.644404, "max_req_ns": 1.950000, "max_slack_ns": 0.305596, "max_slew_ns": 0.927300, "min_arr_ns": 1.343694, "min_req_ns": 0.700000, "min_slack_ns": 0.643694, "min_slew_ns": 0.452918},
+      {"pin": "y2", "max_arr_ns": 1.533129, "max_req_ns": 1.950000, "max_slack_ns": 0.416871, "max_slew_ns": 0.255704, "min_arr_ns": 1.225888, "min_req_ns": 0.700000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "ld_portnet": {
+  "wns_max_ns": 0.416871,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.064555,
+  "tns_min_ns": -0.129110,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 1.313326, "max_req_ns": 2.550057, "max_slack_ns": 1.236731, "max_slew_ns": 0.050167, "min_arr_ns": 0.930844, "min_req_ns": 0.778288, "min_slack_ns": 0.152556, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 1.516168, "max_req_ns": 1.950000, "max_slack_ns": 0.433832, "max_slew_ns": 0.743741, "min_arr_ns": 1.276744, "min_req_ns": 0.700000, "min_slack_ns": 0.576744, "min_slew_ns": 0.362986},
+      {"pin": "y2", "max_arr_ns": 1.533129, "max_req_ns": 1.950000, "max_slack_ns": 0.416871, "max_slew_ns": 0.255704, "min_arr_ns": 1.225888, "min_req_ns": 0.700000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "ld_last": {
+  "wns_max_ns": 0.416871,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.064555,
+  "tns_min_ns": -0.129110,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 1.426827, "max_req_ns": 2.510211, "max_slack_ns": 1.083384, "max_slew_ns": 0.141169, "min_arr_ns": 1.056152, "min_req_ns": 0.743899, "min_slack_ns": 0.312253, "min_slew_ns": 0.199427},
+      {"pin": "u_ff2/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 1.323993, "max_req_ns": 1.950000, "max_slack_ns": 0.626007, "max_slew_ns": 0.469099, "min_arr_ns": 1.176338, "min_req_ns": 0.700000, "min_slack_ns": 0.476337, "min_slew_ns": 0.229591},
+      {"pin": "y2", "max_arr_ns": 1.533129, "max_req_ns": 1.950000, "max_slack_ns": 0.416871, "max_slew_ns": 0.255704, "min_arr_ns": 1.225888, "min_req_ns": 0.700000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "ld_badnet": {
+  "wns_max_ns": 0.416871,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.064555,
+  "tns_min_ns": -0.129110,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 1.710434, "max_req_ns": 2.364184, "max_slack_ns": 0.653750, "max_slew_ns": 0.474674, "min_arr_ns": 1.535451, "min_req_ns": 0.660690, "min_slack_ns": 0.874761, "min_slew_ns": 0.883711},
+      {"pin": "u_ff2/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 1.323993, "max_req_ns": 1.950000, "max_slack_ns": 0.626007, "max_slew_ns": 0.469099, "min_arr_ns": 1.176338, "min_req_ns": 0.700000, "min_slack_ns": 0.476337, "min_slew_ns": 0.229591},
+      {"pin": "y2", "max_arr_ns": 1.533129, "max_req_ns": 1.950000, "max_slack_ns": 0.416871, "max_slew_ns": 0.255704, "min_arr_ns": 1.225888, "min_req_ns": 0.700000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "ld_badpin": {"error": "Error: ld_badpin.sdc, 20 STA-0100"}
+,
+    "ld_afo": {"error": "Error: ld_afo.sdc, 20 invalid command name 'all_fanouts'"}
+,
+    "ld_afi": {"error": "Error: ld_afi.sdc, 20 invalid command name 'all_fanins'"}
+,
+    "ld_fo": {
+  "wns_max_ns": 0.416871,
+  "tns_max_ns": 0.000000,
+  "wns_min_ns": -0.064555,
+  "tns_min_ns": -0.129110,
+  "setup_violations": 0,
+  "hold_violations": 2,
+  "endpoints": [
+      {"pin": "u_ff0/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "u_ff1/D", "max_arr_ns": 1.313326, "max_req_ns": 2.550057, "max_slack_ns": 1.236731, "max_slew_ns": 0.050167, "min_arr_ns": 0.930844, "min_req_ns": 0.778288, "min_slack_ns": 0.152556, "min_slew_ns": 0.033895},
+      {"pin": "u_ff2/D", "max_arr_ns": 1.400000, "max_req_ns": 2.528237, "max_slack_ns": 1.128237, "max_slew_ns": 0.100000, "min_arr_ns": 0.700000, "min_req_ns": 0.764555, "min_slack_ns": -0.064555, "min_slew_ns": 0.100000},
+      {"pin": "y", "max_arr_ns": 1.323993, "max_req_ns": 1.950000, "max_slack_ns": 0.626007, "max_slew_ns": 0.469099, "min_arr_ns": 1.176338, "min_req_ns": 0.700000, "min_slack_ns": 0.476337, "min_slew_ns": 0.229591},
+      {"pin": "y2", "max_arr_ns": 1.533129, "max_req_ns": 1.950000, "max_slack_ns": 0.416871, "max_slew_ns": 0.255704, "min_arr_ns": 1.225888, "min_req_ns": 0.700000, "min_slack_ns": 0.525888, "min_slew_ns": 0.441249}
+  ]
+}
+,
+    "ld_cells": {"error": "Error: ld_cells.sdc, 20 STA-0100"}
 
   }
 }

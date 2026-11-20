@@ -214,6 +214,27 @@ impl Default for DerateCorner {
     }
 }
 
+/// Object sets `set_load` can annotate, resolved once the design is known.
+/// Measured on OpenSTA (`docs/results.md` 2026-11-19): a net selection sets the
+/// net's wire capacitance attribute, a domain separate from pin capacitance;
+/// `get_pins`/`get_cells` objects are rejected outright (`STA-0100`), so those
+/// commands are counted in `ignored_commands` instead of stored here.
+#[derive(Clone, Debug)]
+pub enum LoadSel {
+    Ports(PortSel),
+    /// `get_nets` name list; resolved against `DesignDb::net_names` at STA time.
+    Nets(Vec<String>),
+}
+
+/// One `set_load` command, in file order. Net selections are kept symbolic
+/// until the design is known; for the same measured target a later command
+/// replaces the earlier annotation.
+#[derive(Clone, Debug)]
+pub struct LoadRule {
+    pub sel: LoadSel,
+    pub value_pf: f32,
+}
+
 /// The SDC subset the benchmark flow uses. Commands are applied in file order, so a later
 /// command overrides an earlier one on the same port.
 #[derive(Clone, Debug, Default)]
@@ -245,7 +266,7 @@ pub struct Sdc {
     input_delays: Vec<DelayRule>,
     output_delays: Vec<DelayRule>,
     input_transitions: Vec<(PortSel, f32)>,
-    loads: Vec<(PortSel, f32)>,
+    loads: Vec<LoadRule>,
     driving_cells: Vec<(PortSel, DrivingCell)>,
     /// Timing exceptions (`set_false_path`, `set_multicycle_path`) in file
     /// order, with symbolic selectors resolved against the design at STA time.
@@ -386,7 +407,26 @@ impl Sdc {
     }
 
     pub fn output_load_pf(&self, port: &str) -> f32 {
-        last_value(&self.loads, port, false, self.clock_port.as_deref()).unwrap_or(0.0)
+        self.loads
+            .iter()
+            .rev()
+            .find(|r| match &r.sel {
+                LoadSel::Ports(sel) => {
+                    sel.matches(port, false, self.clock_port.as_deref())
+                }
+                LoadSel::Nets(_) => false,
+            })
+            .map(|r| r.value_pf)
+            .unwrap_or(0.0)
+    }
+
+    /// `set_load` rules on `get_nets` collections, in file order. Net names are
+    /// symbolic until resolved against the design's net table.
+    pub fn net_loads(&self) -> impl Iterator<Item = (&Vec<String>, f32)> {
+        self.loads.iter().filter_map(|r| match &r.sel {
+            LoadSel::Nets(names) => Some((names, r.value_pf)),
+            LoadSel::Ports(_) => None,
+        })
     }
 
     /// The `set_driving_cell` rule covering `port`, if any.
@@ -421,6 +461,8 @@ enum Value {
     Cells(CellSel),
     /// `get_pins`: `instance/pin` specs, symbolic until the design is known.
     Pins(Vec<String>),
+    /// `get_nets`: net names, symbolic until the design is known.
+    Nets(Vec<String>),
     /// A selection the model cannot represent (`select_*`, a
     /// malformed selector). Selector combinators propagate it; exception
     /// commands count it as ignored instead of failing the whole SDC.
@@ -649,6 +691,10 @@ impl Interp {
                 Ok(names) => Value::Pins(names),
                 Err(_) => Value::Opaque,
             }),
+            "get_nets" | "get_net" => Ok(match plain_names(args) {
+                Ok(names) => Value::Nets(names),
+                Err(_) => Value::Opaque,
+            }),
             "all_registers" => Ok(match args {
                 [] => Value::Cells(CellSel::AllRegisters),
                 _ => Value::Opaque,
@@ -732,14 +778,29 @@ impl Interp {
                 Ok(empty())
             }
             "set_load" => {
-                let rule = value_and_ports(
-                    args,
-                    &PORT_VALUE_FLAGS,
-                    &IGNORED_VALUE_FLAGS,
-                    &["-pin_load"],
-                    &mut self.sdc.ignored_options,
-                )?;
-                self.sdc.loads.push(rule);
+                match self.load_rule(name, args)? {
+                    Some(rule) => self.sdc.loads.push(rule),
+                    None => {
+                        *self
+                            .sdc
+                            .ignored_commands
+                            .entry(name.to_string())
+                            .or_default() += 1
+                    }
+                }
+                Ok(empty())
+            }
+            // OpenSTA accepts `set_fanout_load` but warns it is not supported
+            // (STA-0461) and applies nothing: accept the value+object shape so a
+            // stock `write_sdc` file parses, and count the command — it cannot
+            // change a reported number, so it joins the `is_clean` exemption.
+            "set_fanout_load" => {
+                self.fanout_load(args)?;
+                *self
+                    .sdc
+                    .ignored_commands
+                    .entry(name.to_string())
+                    .or_default() += 1;
                 Ok(empty())
             }
             // Design rules the timing model does not check, and propagated clocks it cannot
@@ -1218,18 +1279,25 @@ impl Interp {
         {
             return Ok(Value::Opaque);
         }
-        // Pin specs only subtract from other pin specs: mixing namespaces
-        // (`remove_from_collection [get_pins ...] [get_cells ...]`) cannot be
-        // honoured name-wise, so it degrades to opaque like any other
-        // unrepresentable selection.
+        // Pin and net specs only subtract from same-namespace collections:
+        // mixing namespaces (`remove_from_collection [get_pins ...] [get_cells
+        // ...]`) cannot be honoured name-wise, so it degrades to opaque like
+        // any other unrepresentable selection.
         let pins_in_objects = objects.iter().any(|a| matches!(a, Value::Pins(_)));
-        if pins_in_objects && !matches!(collection, Value::Pins(_)) {
-            return Ok(Value::Opaque);
-        }
-        if matches!(collection, Value::Pins(_))
-            && objects
-                .iter()
-                .any(|a| matches!(a, Value::Cells(_) | Value::Ports(_) | Value::Clocks(_)))
+        let nets_in_objects = objects.iter().any(|a| matches!(a, Value::Nets(_)));
+        let foreign_collection = |a: &&Value| {
+            matches!(a, Value::Cells(_) | Value::Ports(_) | Value::Clocks(_))
+        };
+        if (pins_in_objects && !matches!(collection, Value::Pins(_)))
+            || (nets_in_objects && !matches!(collection, Value::Nets(_)))
+            || (matches!(collection, Value::Pins(_))
+                && objects
+                    .iter()
+                    .any(|a| foreign_collection(&a) || matches!(a, Value::Nets(_))))
+            || (matches!(collection, Value::Nets(_))
+                && objects
+                    .iter()
+                    .any(|a| foreign_collection(&a) || matches!(a, Value::Pins(_))))
         {
             return Ok(Value::Opaque);
         }
@@ -1246,6 +1314,7 @@ impl Interp {
                 }
                 Value::Clocks(names) => removed.extend(names.iter().cloned()),
                 Value::Pins(names) => removed.extend(names.iter().cloned()),
+                Value::Nets(names) => removed.extend(names.iter().cloned()),
                 Value::Str(text) => removed.extend(text.split_whitespace().map(str::to_string)),
                 Value::Opaque => unreachable!(),
             }
@@ -1256,6 +1325,13 @@ impl Interp {
             Value::Ports(sel) => Ok(Value::Ports(sel.clone().without(&removed))),
             Value::Cells(sel) => Ok(Value::Cells(sel.clone().without(&removed))),
             Value::Pins(specs) => Ok(Value::Pins(
+                specs
+                    .iter()
+                    .filter(|s| !removed.contains(*s))
+                    .cloned()
+                    .collect(),
+            )),
+            Value::Nets(specs) => Ok(Value::Nets(
                 specs
                     .iter()
                     .filter(|s| !removed.contains(*s))
@@ -1494,6 +1570,79 @@ impl Interp {
         Ok(())
     }
 
+    /// `set_load <pf> <object collection>`. Port and net collections become
+    /// symbolic [`LoadRule`]s; the other object domains OpenSTA rejects
+    /// (`get_pins`, `get_cells` — `STA-0100`) or does not know
+    /// (`all_fanouts` — opaque here) return `None` so the caller counts the
+    /// whole command ignored rather than half-applying it. `-pin_load` is
+    /// consumed for every domain and `-wire_load` for nets: OpenSTA warns
+    /// those are not allowed on net objects but applies the same value
+    /// anyway, so accepting them reproduces the measured outcome. `-wire_load`
+    /// on ports writes the attached net's wire capacitance — a different
+    /// domain than the port pin load — so that command is counted instead.
+    /// Corner/transition/subtractive qualifiers (`-min`, `-max`, `-rise`,
+    /// `-fall`, `-subtract_pin_load`) are accepted-and-counted: applying them
+    /// to both corners would silently diverge.
+    fn load_rule(&mut self, name: &str, args: &[Value]) -> Result<Option<LoadRule>> {
+        if args.iter().any(
+            |a| matches!(a, Value::Str(s) if LOAD_UNSUPPORTED_FLAGS.contains(&s.as_str())),
+        ) {
+            return Ok(None);
+        }
+        let pos = positionals(
+            args,
+            &PORT_VALUE_FLAGS,
+            &IGNORED_VALUE_FLAGS,
+            &LOAD_BOOL_FLAGS,
+            &mut self.sdc.ignored_options,
+        )?;
+        let [Value::Str(value), object] = pos.as_slice() else {
+            bail!("{name} takes a numeric value and an object collection");
+        };
+        let value_pf = parse_f32(value)?;
+        let sel = match object {
+            Value::Ports(sel) => {
+                // `-wire_load` on a port targets the attached net's wire
+                // capacitance, not the port pin load the model applies.
+                if has_flag(args, "-wire_load") {
+                    return Ok(None);
+                }
+                LoadSel::Ports(sel.clone())
+            }
+            Value::Nets(names) => LoadSel::Nets(names.clone()),
+            Value::Pins(_) | Value::Cells(_) | Value::Clocks(_) | Value::Opaque => {
+                return Ok(None)
+            }
+            Value::Str(_) => {
+                bail!("{name} takes a numeric value and an object collection")
+            }
+        };
+        Ok(Some(LoadRule { sel, value_pf }))
+    }
+
+    /// `set_fanout_load <n> <object collection>`: validated like `set_load`
+    /// (same unsupported-qualifier list; the command is inert in OpenSTA, so
+    /// every accepted shape is counted ignored by the caller anyway).
+    fn fanout_load(&mut self, args: &[Value]) -> Result<()> {
+        if args.iter().any(
+            |a| matches!(a, Value::Str(s) if LOAD_UNSUPPORTED_FLAGS.contains(&s.as_str())),
+        ) {
+            return Ok(());
+        }
+        let pos = positionals(
+            args,
+            &PORT_VALUE_FLAGS,
+            &IGNORED_VALUE_FLAGS,
+            &LOAD_BOOL_FLAGS,
+            &mut self.sdc.ignored_options,
+        )?;
+        let [Value::Str(value), _object] = pos.as_slice() else {
+            bail!("set_fanout_load takes a numeric value and an object collection");
+        };
+        parse_f32(value)?;
+        Ok(())
+    }
+
     fn delay_rule(&mut self, args: &[Value]) -> Result<DelayRule> {
         let sense = match (has_flag(args, "-min"), has_flag(args, "-max")) {
             (true, true) => bail!("a delay takes at most one of -min/-max"),
@@ -1655,7 +1804,7 @@ fn obj_sel(v: &Value) -> Option<ObjSel> {
         Value::Str(text) => Some(ObjSel::Names(
             text.split_whitespace().map(str::to_string).collect(),
         )),
-        Value::Clocks(_) | Value::Opaque => None,
+        Value::Clocks(_) | Value::Nets(_) | Value::Opaque => None,
     }
 }
 
@@ -1691,6 +1840,16 @@ const DELAY_VALUE_FLAGS: [&str; 3] = ["-clock", "-lib_cell", "-pin"];
 /// `-add_delay` accumulates. `delay_rule` reads which are present before `positionals` runs.
 const DELAY_BOOL_FLAGS: [&str; 3] = ["-add_delay", "-min", "-max"];
 const PORT_VALUE_FLAGS: [&str; 2] = ["-lib_cell", "-pin"];
+/// Boolean flags `set_load`/`set_fanout_load` consume: `-pin_load` matches the
+/// applied port-pin domain, and `-wire_load` is a no-op on net objects in
+/// OpenSTA (warning, same value applied). `load_rule` re-checks `-wire_load`
+/// for the port domain, where it means something else.
+const LOAD_BOOL_FLAGS: [&str; 2] = ["-pin_load", "-wire_load"];
+/// `set_load` qualifiers the model cannot honour: corner-, transition-, or
+/// subtractively-scoped loads. The whole command is counted in
+/// `ignored_commands` rather than applied to both corners.
+const LOAD_UNSUPPORTED_FLAGS: [&str; 5] =
+    ["-min", "-max", "-rise", "-fall", "-subtract_pin_load"];
 const CLOCK_VALUE_FLAGS: [&str; 2] = ["-name", "-period"];
 
 /// The value after `flag`, or None when the flag is absent. A flag with no value is an error.
@@ -2662,11 +2821,202 @@ mod tests {
     }
 
     #[test]
+    fn set_load_accepts_nets_and_still_last_wins_on_ports() {
+        // `get_nets` produces a symbolic net selection stored as a load rule;
+        // the port domain keeps its existing last-matching behaviour.
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_load 0.10 [get_nets d1]\n\
+             set_load 0.20 [get_net {{d2 d3}}]\n\
+             set load_nets [get_nets d1]\n\
+             set_load 0.30 $load_nets\n\
+             set_load 0.99 [get_ports {{resp_val}}]\n"
+        ))
+        .unwrap();
+        let net_rules: Vec<_> = sdc.net_loads().map(|(n, v)| (n.clone(), v)).collect();
+        assert_eq!(
+            net_rules,
+            vec![
+                (vec!["d1".to_string()], 0.10),
+                (vec!["d2".to_string(), "d3".to_string()], 0.20),
+                (vec!["d1".to_string()], 0.30),
+            ]
+        );
+        assert_eq!(sdc.output_load_pf("resp_val"), 0.99);
+        assert_eq!(sdc.output_load_pf("resp_msg[0]"), 0.05);
+    }
+
+    #[test]
+    fn set_load_counts_unsupported_object_domains() {
+        for snippet in [
+            // OpenSTA rejects these object types (STA-0100) or does not know
+            // the cone selectors at all: counted, not applied.
+            "set_load 0.10 [get_pins u_ff1/D]",
+            "set_load 0.10 [get_cells u_mux]",
+            "set_load 0.10 [all_fanouts -from [get_pins u_ff1/Q]]",
+            "set_load 0.10 [all_fanins -to [get_pins u_ff1/D]]",
+            "set_load 0.10 [all_clocks]",
+            "set_load 0.10 [get_clocks core_clk]",
+            "set_load 0.10 [get_nets -of_objects [get_pins u_ff1/D]]",
+            // Corner/transition-scoped qualifiers are unmodelled.
+            "set_load -min 0.10 [get_nets d1]",
+            "set_load -max 0.10 [get_ports y]",
+            "set_load -rise 0.10 [get_nets d1]",
+            "set_load -fall 0.10 [get_ports y]",
+            "set_load -subtract_pin_load 0.10 [get_nets d1]",
+            // `-wire_load` on a port targets the attached net's wire cap, a
+            // different domain than the port pin load.
+            "set_load -wire_load 0.20 [get_ports y]",
+        ] {
+            let sdc = parse_sdc(&format!("{GCD}{snippet}\n")).unwrap();
+            assert_eq!(
+                sdc.ignored_commands.get("set_load"),
+                Some(&1),
+                "not counted: {snippet}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_load_still_rejects_malformed_forms() {
+        for snippet in [
+            "set_load foo [get_nets d1]",
+            "set_load 0.05 extra [get_nets d1]",
+            "set_load 0.05",
+            "set_load 0.05 [get_nets d1] [get_nets d2]",
+            "set_load -clock core_clk 0.05 [get_nets d1]",
+            "set_load -bogus 0.05 [get_nets d1]",
+        ] {
+            let text = format!("{GCD}{snippet}\n");
+            assert!(parse_sdc(&text).is_err(), "accepted: {snippet}");
+        }
+    }
+
+    #[test]
+    fn set_load_pin_and_wire_load_flags_apply_on_nets() {
+        // Measured: OpenSTA warns these are not allowed on net objects but
+        // applies the same value, so they are accepted as no-ops.
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_load -pin_load 0.10 [get_nets d1]\n\
+             set_load -wire_load 0.20 [get_nets d2]\n"
+        ))
+        .unwrap();
+        assert!(sdc.ignored_commands.is_empty());
+        let rules: Vec<_> = sdc.net_loads().map(|(n, v)| (n.clone(), v)).collect();
+        assert_eq!(
+            rules,
+            vec![
+                (vec!["d1".to_string()], 0.10),
+                (vec!["d2".to_string()], 0.20)
+            ]
+        );
+    }
+
+    #[test]
+    fn set_fanout_load_parses_and_counts() {
+        // OpenSTA accepts the command but warns it is unsupported (STA-0461)
+        // and applies nothing: parsed here, counted ignored.
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_fanout_load 4 [get_ports y]\n\
+             set_fanout_load 8 [get_nets d1]\n\
+             set_fanout_load 2 [all_outputs]\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.ignored_commands["set_fanout_load"], 3);
+        for bad in [
+            "set_fanout_load",
+            "set_fanout_load 4",
+            "set_fanout_load x [get_ports y]",
+            "set_fanout_load 4 [get_ports y] [get_ports y2]",
+            "set_fanout_load -bogus 4 [get_ports y]",
+        ] {
+            assert!(
+                parse_sdc(&format!("{GCD}{bad}\n")).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_from_collection_on_nets() {
+        let sdc = parse_sdc(&format!(
+            "{GCD}\
+             set_load 0.10 [remove_from_collection [get_nets {{d1 d2}}] [get_nets d1]]\n\
+             set_load 0.20 [remove_from_collection [get_nets {{d1 d2}}] [get_pins u1/A]]\n"
+        ))
+        .unwrap();
+        let rules: Vec<_> = sdc.net_loads().map(|(n, v)| (n.clone(), v)).collect();
+        // Same-namespace subtraction filters by name; the mixed-namespace
+        // command degrades to opaque and is counted ignored.
+        assert_eq!(rules, vec![(vec!["d2".to_string()], 0.10)]);
+        assert_eq!(sdc.ignored_commands["set_load"], 1);
+    }
+
+    #[test]
     fn expr_follows_tcl_for_the_ibex_operands() {
         assert_eq!(eval_arith("8.0 * 0.2 "), Some(8.0 * 0.2));
         assert_eq!(eval_arith("(1.0 + 2.0) * 3 "), Some(9.0));
         assert_eq!(eval_arith("1.0 / 4 "), Some(0.25));
         assert_eq!(eval_arith("8 / 2 "), None);
         assert_eq!(eval_arith("1 + "), None);
+    }
+
+    /// The single-clock SDC model refuses multi-clock constructs at parse time; the
+    /// documented break points for the `mc-*` tickets (docs/multi-clock.md). The second
+    /// `create_clock` bail and the virtual-period bail are already covered by
+    /// `rejects_a_second_design_clock` / `rejects_a_virtual_clock_with_another_period`.
+    #[test]
+    fn multi_clock_bails() {
+        let with_vclk = format!("{GCD}create_clock -name vclk -period 5.0\n");
+        let cases = [
+            (
+                "set_clock_latency 0.5 [get_clocks {core_clk vclk}]",
+                "set_clock_latency takes one clock",
+            ),
+            (
+                "set_clock_latency -early 0.5 [get_clocks core_clk]",
+                "unsupported option `-early`",
+            ),
+            (
+                "set_clock_uncertainty -setup 0.30 -from [get_clocks core_clk] -to [get_clocks vclk]",
+                "set_clock_uncertainty takes a value and optional clock names",
+            ),
+            (
+                "create_clock -waveform {0 0.5} -period 2.0 [get_ports other]",
+                "unsupported option `-waveform`",
+            ),
+            (
+                "set_clock_groups -asynchronous -group [get_clocks core_clk] -group [get_clocks vclk]",
+                "unsupported command `set_clock_groups`",
+            ),
+            (
+                "set_input_delay 1.0 -clock other [get_ports d_in]",
+                "unknown clock `other`",
+            ),
+            (
+                "set_propagated_clock [get_clocks other]",
+                "unknown clock `other`",
+            ),
+        ];
+        for (snippet, want) in cases {
+            let err = format!("{:#}", parse_sdc(&format!("{with_vclk}{snippet}\n")).unwrap_err());
+            assert!(err.contains(want), "{snippet}: {err}");
+        }
+    }
+
+    /// Uncertainty has a single pair of fields for the whole design: naming the virtual
+    /// clock still writes the design-clock values (silent wrong target until `mc-model`
+    /// gives every clock its own row).
+    #[test]
+    fn uncertainty_on_virtual_clock_writes_design_fields() {
+        let text = format!(
+            "{GCD}\
+            create_clock -name vclk -period 5.0\n\
+            set_clock_uncertainty -setup 0.20 [get_clocks vclk]\n"
+        );
+        let sdc = parse_sdc(&text).unwrap();
+        assert_eq!(sdc.setup_uncertainty_ns, 0.20);
     }
 }

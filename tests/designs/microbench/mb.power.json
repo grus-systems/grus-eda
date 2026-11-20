@@ -3,20 +3,20 @@
   "voltage_v": 1.8,
   "internal_w": 2.0948931806954855e-6,
   "switching_w": 1.7031002376930134e-7,
-  "leakage_w": 1.3765316143887762e-11,
-  "total_w": 2.265216969780931e-6,
+  "leakage_w": 1.2719841550488595e-11,
+  "total_w": 2.2652159243063376e-6,
   "groups": [
     {
       "name": "Sequential",
       "internal_w": 2.0891791832648264e-6,
       "switching_w": 7.495959617623725e-9,
-      "leakage_w": 8.438634339913431e-12
+      "leakage_w": 8.419361770262148e-12
     },
     {
       "name": "Combinational",
       "internal_w": 5.7139974306593004e-9,
       "switching_w": 1.6281406415167762e-7,
-      "leakage_w": 5.326681803974331e-12
+      "leakage_w": 4.300479780226448e-12
     },
     {
       "name": "Clock",
@@ -27,10 +27,12 @@
   ],
   "diagnostics": {
     "cells_without_lib_cell": 0,
-    "driven_nets_without_vcd": 0,
+    "driven_nets_without_activity": 0,
     "active_nets_without_cell_driver": 2,
     "internal_power_without_slew": 0,
     "unresolved_related_pin": 0,
-    "conditional_power_blocks": 0
+    "conditional_power_blocks": 0,
+    "saif_unmatched_scopes": 0,
+    "saif_unmatched_signals": 0
   }
 }

@@ -1,4 +1,4 @@
-use crate::interner::{LibCellId, LibPinId, PinDir, SymbolId};
+use crate::interner::{LibCellId, LibPinId, PinDir, StringInterner, SymbolId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -29,7 +29,8 @@ pub enum TimingType {
     RemovalFalling,
     RecoveryFalling,
     /// Minimum clock-pulse width at the related pin (`min_pulse_width`): an
-    /// intra-cell check, never a data-propagation arc.
+    /// intra-cell check, never a data-propagation arc. Evaluated as an STA
+    /// endpoint family since v0.1.93 — see `TimingGraph::pulse_width_checks`.
     MinPulseWidth,
     /// Setup/hold checks on non-sequential pins (`non_seq_*`): like the D-pin
     /// checks but without a `CLK -> Q` launch, deferred from the endpoint model.
@@ -48,14 +49,15 @@ pub enum TimingType {
 
 impl TimingType {
     /// Liberty `timing_type` names that are recognised check arcs: they constrain a
-    /// pin (pulse width, non-sequential setup/hold, tristate, preserve, async
-    /// clear/preset) rather than propagate data, so the endpoint model defers them
-    /// into `SkipReport::recognized_check_arcs` instead of dropping them as unknown.
+    /// pin (non-sequential setup/hold, tristate, preserve, async clear/preset)
+    /// rather than propagate data, so the endpoint model defers them into
+    /// `SkipReport::recognized_check_arcs` instead of dropping them as unknown.
+    /// `min_pulse_width` left this list when it became an evaluated endpoint
+    /// family in v0.1.93.
     pub fn is_deferred_check(self) -> bool {
         matches!(
             self,
-            Self::MinPulseWidth
-                | Self::NonSeqSetupRising
+            Self::NonSeqSetupRising
                 | Self::NonSeqSetupFalling
                 | Self::NonSeqHoldRising
                 | Self::NonSeqHoldFalling
@@ -131,6 +133,50 @@ pub struct LibPinInternalPower {
     pub fall: Option<NldmTable>,
 }
 
+/// One literal of a `when` state expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WhenLit {
+    /// Liberty pin name of the same cell.
+    pub pin: SymbolId,
+    /// `!`-negated.
+    pub inverted: bool,
+}
+
+/// Parses `when` text into a conjunction of literals: `lit (& lit)*`,
+/// `lit` = optional `!` + pin name. Returns `None` for any other form
+/// (`|`, `^`, parens, empty terms, unknown pin names) — the caller counts
+/// the block inexpressible.
+pub fn parse_when_expr(expr: &str, strings: &StringInterner) -> Option<Vec<WhenLit>> {
+    let mut lits = Vec::new();
+    for term in expr.split('&') {
+        let term = term.trim();
+        let (inverted, name) = match term.strip_prefix('!') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, term),
+        };
+        if name.is_empty() {
+            return None;
+        }
+        lits.push(WhenLit {
+            pin: strings.get(name)?,
+            inverted,
+        });
+    }
+    if lits.is_empty() {
+        return None;
+    }
+    Some(lits)
+}
+
+/// One `leakage_power () { when : "…"; value : … }` group inside a cell.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibLeakageState {
+    /// `when` state expression; `None` = the unconditional default group.
+    pub when: Option<SymbolId>,
+    /// Leakage in watts while the state holds.
+    pub power_w: f32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LibCell {
     pub name: SymbolId,
@@ -144,6 +190,9 @@ pub struct LibCell {
     /// `cell_leakage_power` in watts: the Liberty-provided average over all
     /// `leakage_power` `when` states. `None` when the cell declares neither.
     pub leakage_power_w: Option<f32>,
+    /// `leakage_power` groups declared inside the cell, in file order.
+    /// Empty when the cell only carries `cell_leakage_power`.
+    pub leakage_states: Vec<LibLeakageState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -208,5 +257,84 @@ impl LibDb {
         let start = cell.arc_offset as usize;
         let end = start + cell.arc_count as usize;
         &self.arcs[start..end]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interner_with(names: &[&str]) -> (StringInterner, Vec<SymbolId>) {
+        let mut s = StringInterner::new();
+        let ids = names.iter().map(|n| s.intern(n)).collect();
+        (s, ids)
+    }
+
+    #[test]
+    fn test_parse_when_expr_literals() {
+        let (s, ids) = interner_with(&["A", "TE_B", "CI"]);
+        let [a, te_b, ci] = ids.try_into().unwrap();
+
+        assert_eq!(
+            parse_when_expr("A", &s),
+            Some(vec![WhenLit {
+                pin: a,
+                inverted: false
+            }])
+        );
+        assert_eq!(
+            parse_when_expr("!A", &s),
+            Some(vec![WhenLit {
+                pin: a,
+                inverted: true
+            }])
+        );
+        assert_eq!(
+            parse_when_expr("A&!TE_B", &s),
+            Some(vec![
+                WhenLit {
+                    pin: a,
+                    inverted: false
+                },
+                WhenLit {
+                    pin: te_b,
+                    inverted: true
+                },
+            ])
+        );
+        // Whitespace around `&` and after `!` is tolerated.
+        assert_eq!(
+            parse_when_expr(" A & ! CI ", &s),
+            Some(vec![
+                WhenLit {
+                    pin: a,
+                    inverted: false
+                },
+                WhenLit {
+                    pin: ci,
+                    inverted: true
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_when_expr_inexpressible() {
+        let (s, _) = interner_with(&["A", "B", "C"]);
+        for expr in [
+            "A|B",
+            "(A&B)|C",
+            "A^B",
+            "",
+            "A&",
+            "&A",
+            "A&&B",
+            "!",
+            "A&!&B",
+            "A&UNKNOWN",
+            "(A)",
+        ] {
+            assert_eq!(parse_when_expr(expr, &s), None, "expr `{expr}`");
+        }
     }
 }

@@ -1,10 +1,11 @@
 # Path delay constraints (`set_max_delay` / `set_min_delay`)
 
 Status: **implemented** (v1 2026-11-18; output-port endpoints 2026-11-19;
-multi-launch port coverage 2026-11-19) —
+multi-launch port coverage 2026-11-19; async-check and latch-D endpoints
+2026-11-19) —
 parser and signature-class
 composition live in `crates/grus-core/src/sta/{sdc,analysis}.rs`; every
-committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*`/`ml_*`/`pml_*`
+committed `md_*`/`pmd_*`/`mhu_*`/`m2_*`/`pm2_*`/`mdo_*`/`pmo_*`/`ml_*`/`pml_*`/`pmp_*`/`pcr_*`
 scenario
 matches OpenSTA
 (`test_sta_exceptions_match_opensta`). This document records the OpenSTA
@@ -65,9 +66,13 @@ one net arrival — the split-clock-buffer fixture (`pm2_both`) separates
 them: `u_ff1/D` reports `req = 1.013333` (anchored at `u_ff1/CLK` on `c1`),
 not the launch-referenced ~1.082 the arrival winner `u_ff2`'s launch on
 `c3` (~69 ps later, behind the extra `u_clkb3` stage) would give. The CRPR
-credit the clock check adds is not applied to delay checks (unexercised:
-the per-class merge does not keep the winning path's clock net, and this
-fixture's clock nets carry zero late/early spread).
+credit **is** applied to delay checks (measured 2026-11-19 on the
+`pcr_*` spread fixture, section 4): `pcr_max`'s `u_ff0 -> u_ff1` check
+reports `req = capture_early - unc - t_setup + N + S` where
+`S = 0.031507` is the early/late spread at the shared clock-net driver
+`u_clkb/X`, and `pcr_min` shows the hold delay check's required time
+moves by `-S`; `pcr_off` (covered launch on `c3`, sharing only the
+`clk` root with `c1`) confirms no credit on a non-shared path.
 
 - Replace semantics proven by `md_loose` (`N = 5.0` >> setup budget): the
   covered `u_ff0` source's req became `capture - unc - t_setup + 5.0` —
@@ -78,9 +83,20 @@ fixture's clock nets carry zero late/early spread).
   by `md_tight`/`md_basic`, where the delay check wins.
 - Input-port sources work identically: `md_port` (`-from [get_ports d_in]`)
   gave `req = 0.528237 + 1.0 - adjustments` on `u_ff0/D`; the port launch
-  reference is the I/O clock edge the input delay is anchored to (exact
-  anchor TBD during implementation — candidate: referenced clock's arrival
-  at the clock port pin; `ClockRef::Virtual` needs a defined fallback).
+  reference is the I/O clock edge the input delay is anchored to. Under
+  `set_propagated_clock` the `pmp_*` scenarios measured the launch anchor
+  at the SDC `-source` latency: `pmp_port`'s `u_ff0/D` reports the
+  ordinary propagated port seed `arr 0.8` (`0.1` source latency + `0.7`
+  input delay), not the `1.4` an ideal-latency anchor (`source + network`)
+  would give nor the ~`0.87` a capture-pin-propagated anchor would; and
+  `pmp_port2` (network latency 0.6 -> 1.1) is byte-identical to
+  `pmp_port`, so the anchor carries no network-latency term. On this
+  fixture that anchor is numerically identical to the propagated arrival
+  at the `clk` port pin — `clk` is the propagation root, so its pin sees
+  source latency plus zero insertion delay; separating the two named
+  candidates needs insertion upstream of a root and is out of scope.
+  The delay check shares the port's ordinary propagated arrival — the
+  same `input_clock_latency_ns` seed `base_prop` reports.
 
 ### `set_min_delay N` (hold side)
 
@@ -143,6 +159,73 @@ universal `-from` coverage measured there. `ml_min`/`pml_min` carry the
 merged min-side check (`pml_min` reports the delay check's hold
 violation, slack -0.109318).
 
+### Asynchronous-check pins (recovery/removal)
+
+Measured 2026-11-19 on `sta_edge/async_reset` (`u_ff0/RESET_B`, `dfrtp`)
+and the latch cells of `sta_edge/latch_borrow` (`delay_*` committed
+scenarios): OpenSTA **applies** the delay check on both sides — the
+recovery arc plays `late_arc`, the removal arc `early_arc`, and the FF
+formulas flow through verbatim:
+
+- max side: `req = capture_clk_arrival_min[edge0] - unc_setup -
+  t_recovery + N` — `delay_max` on `u_ff0/RESET_B` reads
+  `0.7 - 0.05 + 0.250132 + 1.0 = 1.900132`. The anchor is the **first
+  edge reaching the clock pin** (`edge0`), not `check.edge`: on the
+  `dlrbp`'s `u_rbp/RESET_B` the recovery check fires FALL yet the delay
+  req anchors at RISE (`0.912087` under `delay_allregs`), and the two
+  coincide on `dfrtp` where `check.edge` is RISE already.
+- min side: `req = req_removal_base + N` — `delay_min` reads
+  `1.132095 + 0.5 = 1.632095`.
+- `-from` restricts coverage per launch source (`delay_from` covers the
+  `rst_n` port seed identically); `-to [get_cells u_ff0]` covers the
+  cell's check pins (`delay_cell` moves `u_ff0/D` *and*
+  `u_ff0/RESET_B`). Negative controls (ad hoc, not committed):
+  `-from [get_ports d_in]` and `-from [get_pins u_ff0/CLK]` leave the
+  endpoint byte-identical to baseline.
+- Propagated clock moves the anchor with the propagated capture arrival
+  (`delay_prop`: req `1.404679`).
+
+### Latch-D pins (borrow semantics)
+
+Measured 2026-11-19 on `sta_edge/latch_borrow` (`delay_*` committed
+scenarios): OpenSTA **applies** the delay check on both sides, anchored
+at the delay edge (the first clock edge at the latch's enable pin,
+`lat0`) with the latch's own borrow window:
+
+- max side: `req = N + lat0 - unc_setup + actual_borrow` where
+  `actual_borrow = clamp(arr_dly - base, 0, max_borrow)`,
+  `base = N + lat0 - unc_setup`, and `max_borrow = pulse - t_setup` —
+  the transparent window minus the data setup, exactly the borrow cap of
+  the clock check. `report_checks` decomposes it directly (`u_rtn/D`:
+  `max_delay 1.00 + crpr 0.00 + borrow 2.32` where
+  `max borrow 2.32 = pulse 2.50 - setup 0.18`; OpenSTA prints the setup
+  term negated as "library setup time -0.18"). `u_lp/D` reads
+  `req = arr_dly = 3.156276` (borrow interior), `u_ln/D` reads the base
+  `0.90` (`arr_dly` before the window), and `u_ln2`/`u_rbn`/`u_rtn`/
+  `u_xbn` clamp at `base + pulse - t_setup` under `delay_allregs`.
+- min side: `req = N + lat0 + t_hold + unc_hold` — delay-edge anchored,
+  not closing-edge (`delay_min` on `u_lp/D`: `0.5 + 0 - 0.033557 + 0.1 =
+  0.566443`).
+- **Delay-check arrival (`arr_dly`)**: a path launched through a latch's
+  open edge reports its launch at the delay edge — the clock-to-Q delay
+  alone, without the data's open-edge wait. Under `delay_allregs`,
+  `u_f0/D` (driven by `u_ln/Q`) reports `arr 0.361663`, exactly its
+  baseline `2.861663` minus the `u_ln` open-edge arrival `2.5`. Flop and
+  port launches keep their clock edge, so `dly == arr` there. The min
+  side also reports the raw delay arrival — no launch-parity
+  realignment (`u_lp/D` reads `3.156276`, not the hold-aligned
+  `8.156276`). `slack = req - arr_dly` rigidly.
+- **Covered `-to` silences the borrow arc class-wide**: a `set_max_delay`
+  covering a latch's D pin stops the transparent `D -> Q` forward for
+  *every* downstream path of the signature class — covered endpoints
+  included (`delay_from`: `u_f2/D` loses the `p_lp -> u_lp D -> Q`
+  contribution and drops to the uncovered clock-to-Q launch, `arr
+  2.562374 -> 0.244362`). `set_min_delay` coverage does not disable.
+  Slew still propagates (slew is physical, not path-scoped).
+- `all_registers` covers every sequential check pin — FF-D, latch-D and
+  latch `RESET_B` rows together (`delay_allregs`); `delay_prop` shows
+  `lat0` is the propagated first-edge latency at the clock pin.
+
 ### Selectors
 
 Identical machinery to timing exceptions: `-from`/`-to` accept the same object
@@ -200,14 +283,22 @@ arr_reported = the class's ordinary max arrival at the endpoint
                (each covered source's launch already paired with its
                data delay by the per-class propagation)
 req_reported = capture_arrival_min[check.edge] - unc_setup - t_setup + N
+               + crpr_credit
 slack        = req_reported - arr_reported
 ```
 
 with the capture arrival read at the endpoint register's own clock pin —
 it coincides with a launch reference only when launch and capture clocks
-see equal arrivals. No per-pin delay domain is needed: the reported
-arrival is the covered-source **arrival** winner, which the
-signature-class eval run computes directly.
+see equal arrivals. `crpr_credit` is the same shared-net driver spread
+the clock check adds: the pin's `crpr_max` tag mask records which
+launch produced the extreme (bits interned per run as `(clock net,
+clock edge)` pairs, bit 0 a no-credit sentinel for ports/latch
+launches/contested or unresolvable sources), and the covered class's
+filter leaves that mask holding only the covered launch's tag. The min
+side needs no term of its own — `req_hold_base` already carries `-S`
+from the class's hold required time. No per-pin delay domain is
+needed: the reported arrival is the covered-source **arrival** winner,
+which the signature-class eval run computes directly.
 
 An earlier v1 tracked a separate delay domain on `PinTimingState`
 (`delay_max` = max `arrival - launch` per transition, plus
@@ -226,6 +317,28 @@ Slew needs no pairing: slew is a per-pin/per-transition quantity in our model
 (and OpenSTA queries it at the endpoint vertex), identical for clock and
 delay checks.
 
+The latch-D rules need one arrival-like quantity of their own: the
+**delay arrival** `dly` — `PinTimingState.dly_max`/`dly_min`, merged
+independently like slew (it can pick a different source than the `arr`
+winner). For FF and port launches `dly = arr`; a latch open-edge launch
+(`graph.latch_opens`) strips its clock-edge arrival so the path reports
+at the delay edge. Transparent `D -> Q` borrow arcs forward `dly_max`
+through the same borrow `cap()` as `arrival_max`; `dly_min` forwards
+nothing (`INFINITY` — the early side's clock-to-Q-only rule).
+`collect_endpoints` carries `dly` inside `Worst` next to `arr`, and each
+endpoint kind substitutes `arr = dly` when composing its delay check —
+a no-op for everything except through-latch launches.
+
+A `set_max_delay` rule whose `-to` covers a latch D pin also adds its
+`(D, Q)` borrow arc to a per-signature-class `disabled_borrow` set: the
+eval run forwards slew but no arrival through it, reproducing the
+measured class-wide silencing (uncovered endpoints included). Async
+checks need no new branch of their own — `late_arc`/`early_arc` already
+resolve to recovery/removal — except the anchor: the delay req is
+anchored at `edge0_pol(clk)`, the first edge reaching the clock pin
+(decoded from `clock_parity`, falling back to RISE on contested parity),
+not `check.edge`.
+
 ### Signature classes
 
 Delay coverage joins the exception signature: a source's signature is the set
@@ -243,13 +356,20 @@ only re-run delay state — rejected for v1 complexity.)
 Per side independently (max and min compose separately):
 
 1. false_path covering (s, e): drop candidate (existing).
-2. else max_delay covering (s, e): keep the covered candidate's ordinary
-   arrival and slew, replace its required time with
-   `req = capture_clk_arrival_min[check.edge] - unc_setup - t_setup + N`,
-   `slack = req - arr`.
+2. else max_delay covering (s, e): keep the covered candidate's slew,
+   report `arr = w.dly` (identical to `w.arr` unless the path launched
+   through a latch open edge), and replace the required time per
+   endpoint kind: FF-D/async-check
+   `req = capture_clk_arrival_min[anchor] - unc_setup - t_late + N
+   + crpr_credit` (`anchor = check.edge` for FF-D, `edge0_pol` for
+   async; `t_late` = `t_setup` or `t_recovery`), latch-D the clamped
+   borrow window of section 1, `slack = req - arr`.
 3. else multicycle covering (s, e): existing req shift.
-4. min side: min_delay covering (s, e) -> `req = req_hold_base + N` (the
-   pre-MCP hold required); else existing hold/multicycle handling.
+4. min side: min_delay covering (s, e) -> FF-D/async-check `req =
+   req_early_base + N` (the pre-MCP hold or removal required) and
+   latch-D `req = N + lat0 + t_hold + unc_hold`, both reported against
+   `w.dly` with no launch-parity realignment; else existing
+   hold/multicycle handling.
 
 Output-port endpoints compose the same way, with the edge-referenced
 required times of section 1 substituted in steps 2 and 4
@@ -271,9 +391,10 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
   cells, ports, `all_registers`, `all_inputs`, `all_outputs`, `get_pins`,
   bare `inst/pin`, `remove_from_collection` semantics identical to
   exceptions).
-- Endpoint kind `Check { latch: false }` for **flip-flop D-pin setup/hold
-  checks only** — asynchronous recovery/removal checks share that variant
-  and are excluded (counted in `unsupported_path_delay_endpoints`).
+- Endpoint kind `Check { .. }` carrying a check arc — flip-flop D-pin
+  setup/hold, asynchronous recovery/removal, and latch-D checks
+  (`delay_*` committed scenarios on the `async_reset`/`latch_borrow`
+  fixtures).
 - Endpoint kind `OutputPort` — the edge-referenced formulas in section 1
   (`mdo_*`/`pmo_*` committed scenarios).
 - Universal (no `-from`/`-to`) rules.
@@ -293,20 +414,19 @@ is order-independent and measured (`md_mc`, `md_mc_rev`,
   path-membership selectors we cannot resolve.
 - `-clock <name>` (consumes its argument), `-datapath_only` — OpenSTA
   rejects these anyway (`STA-0563`); counted ignored.
-- Delay constraints reaching `ClockGate`, latch-D, or
-  async-recovery/removal endpoints: counted in a new
+- Delay constraints reaching `ClockGate` endpoints: counted in the
   `unsupported_path_delay_endpoints` skip field (same pattern as
   `unsupported_multicycle_endpoints`); the endpoint keeps its clock-check
   values — loudly partial, never silent.
 
 **Explicitly out of scope (documented, not approximated)**
 
-- Latch-D and clock-gate delay checks.
+- Clock-gate-enable delay checks.
 - `-rise`/`-fall` and other edge qualifiers.
 
 ## 4. Validation plan
 
-Golden scenarios in `exceptions.reference.json` (102 entries: 98 evaluated +
+Golden scenarios in `exceptions.reference.json` (111 entries: 107 evaluated +
 4 OpenSTA error records): `md_*` ideal-clock set including order/precedence
 variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 `mhu_*` uncertainty variants, `base_prop` / `pmd_*` propagated-clock set,
@@ -314,8 +434,18 @@ variants (`md_mc_rev`, `md_overlap_rev`, `md_min_mc*`, `md_min_mcp_*`),
 qualifier-diagnostic coverage, the `m2_*`/`pm2_*` two-source set, and the
 `mdo_*`/`pmo_*` output-port set (N sweeps, min-side attribution probes,
 `all_outputs`/`-from` coverage, precedence, and propagated-clock anchors —
-section 1), and the `ml_*`/`pml_*` multi-launch port set (merged two-source
-checks at `y2`, per-source probes, `all_outputs`, min side — section 1).
+section 1), the `ml_*`/`pml_*` multi-launch port set (merged two-source
+checks at `y2`, per-source probes, `all_outputs`, min side — section 1),
+and the `pmp_*` propagated-clock port-launch set (`set_max_delay` /
+`set_min_delay` `-from [get_ports d_in]`, the `-from [all_inputs]` sweep,
+and the network-latency null-diff probe — section 1). The `pcr_*` set
+adds clock-net early/late spread via `set_timing_derate -early 0.80` /
+`-late 1.20` on `-clock -cell_delay` (spread `S = 0.4 * d(u_clkb)` =
+0.031507 ns at the `c1` driver): `pcr_clk` proves the spread by the
+opposite-direction `max_req`-down/`min_req`-up pair, `pcr_clkfp` forces
+the shared-tree `u_ff0` launch to win `u_ff1/D` (per-path credit on the
+ordinary check), `pcr_max`/`pcr_min` measure the credit on the delay
+checks themselves, and `pcr_off` is the non-shared-path control.
 
 Since 2026-11-19 the fixture drives `u_ff1/D` from a `mux2` with two FF
 inputs (`u_ff0`, `u_ff2`) and a constrained input port (`sel`), assigns
@@ -341,9 +471,14 @@ delay/arrival winners split — `pm2_both` reports the arrival winner
 split falsified the earlier delay-winner pairing — `arr = delay_launch +
 delay_max` went red by exactly that gap — and established that OpenSTA
 reports the covered-source arrival winner (a wrong-arrival mutation was
-also checked red, per the fail-proof rule). The delay check's CRPR credit
-remains unexercised (zero late/early spread on this fixture's clock
-nets). On the port side the same rule is now exercised per source: `y2`
+also checked red, per the fail-proof rule). The `pmp_*` set exercises
+the propagated input-port launch anchor:
+`pmp_port`/`pmp_minport` report the ordinary propagated port seed
+(0.8/0.1) on the delay check and `pmp_port2`'s null diff proves the
+anchor carries no network-latency term — with the caveat that the SDC
+`-source` latency and the propagated `clk`-port-pin arrival coincide
+numerically here because `clk` is the propagation root. On the port side
+the same rule is now exercised per source: `y2`
 is driven from two FF launches through `u_mux2`, and `ml_both` /
 `pml_both` merge them in one delay check against the per-source probes
 `ml_max0`/`ml_max2` (see the coverage note in section 1).
@@ -368,9 +503,8 @@ stays):
   (`clk_state.arrival_max[edge]`) for sequential launches; verified against
   `pmd_*`/`md_*` goldens.
 - ~~Port launch reference~~ — `input_clock_latency_ns`, the same I/O clock
-  anchor the port's own input delay uses (`md_port`/`md_minport` match). The
-  propagated-clock port anchor (source latency vs propagated clock-port
-  arrival) is unverified — no golden exercises it.
+  anchor the port's own input delay uses (`md_port`/`md_minport` match;
+  the propagated-clock anchor is measured by `pmp_*`, resolved below).
 - ~~`delay_max` tie-breaking~~ — keep-first implemented, matching the
   arrival merge order; OpenSTA tie-break remains unmeasured.
 - ~~Signature-class split~~ — implemented as chosen: delay coverage joins
@@ -415,11 +549,89 @@ Resolved by the multi-launch port fixture (2026-11-19):
   `u_ff2`; `ml_min`/`pml_min` cover the merged min-side check and
   `ml_all` the `-to [all_outputs]` selector.
 
+Resolved by the propagated port-launch set (`pmp_*`, 2026-11-19):
+
+- ~~propagated-clock input-port launch anchor~~ — the delay check shares
+  the port's ordinary propagated arrival (`pmp_port`: `u_ff0/D` arr 0.8;
+  `pmp_minport`: arr 0.1), i.e. the SDC `-source` latency anchor our
+  `input_clock_latency_ns` already returns — the ideal-latency
+  (arr 1.4) and capture-pin-propagated (arr ~0.87) anchors are
+  falsified, and `pmp_port2` (network latency 0.6 -> 1.1) is
+  byte-identical, so no network term is carried. Caveat recorded in
+  section 1: `-source` latency and the propagated `clk`-port-pin arrival
+  are numerically identical on this fixture (`clk` is the propagation
+  root) — the two named candidates were not separable. `pmp_alls`
+  (`-from [all_inputs]`) additionally covers the port launch at the
+  skewed `u_ff2` capture pin and the `sel` launch at `u_ff1/D` and `y2`
+  (`y2` reports a real −0.683130 delay-check violation); `clk` is inert
+  as a launch source in both engines.
+
+Resolved by the `pcr_*` spread fixture (2026-11-19):
+
+- ~~CRPR credit on delay checks~~ — `set_timing_derate -early 0.80` /
+  `-late 1.20 -clock -cell_delay` puts `S = 0.031507` of spread on the
+  `c1`/`c3` drivers (`pcr_clk` opposite-direction required-time pair).
+  OpenSTA credits delay checks the same shared-net driver spread the
+  clock check adds (`pcr_max` req `+S`, `pcr_min` req `-S`; `pcr_off`
+  non-shared control `+0`) — and it credits **per path**: `pcr_clkfp`
+  shows the winning `u_ff0` launch credited on `u_ff1/D` even though
+  the endpoint's other sources are not shared. Implemented as
+  per-extreme launch-tag masks (`crpr_max`/`crpr_min`, interned
+  `(clock net, clock edge)` bits, sentinel for non-FF/contested
+  sources) replacing the all-source cone consensus; the delay check
+  adds the same credit term. See `docs/results.md`.
+
+Resolved by the async/latch delay probe set (2026-11-19):
+
+- ~~async-reset endpoint probe~~ — OpenSTA **applies** `set_max_delay`/
+  `set_min_delay` on recovery/removal pins: recovery plays `late_arc`,
+  removal `early_arc`, and the required anchors at the first clock edge
+  (`edge0`), not `check.edge`. Committed: `delay_max`, `delay_min`,
+  `delay_from`, `delay_cell`, `delay_prop` on `sta_edge/async_reset`.
+- ~~latch-borrow delay fixture~~ — OpenSTA **applies** both sides with
+  borrow semantics at the delay edge: `req = N + lat0 - unc +
+  clamp(arr_dly - base, 0, pulse - t_setup)` (max) and `req = N + lat0 +
+  t_hold + unc_hold` (min); covered `set_max_delay` `-to` selectors
+  silence the `D -> Q` borrow arc for the whole signature class;
+  through-latch launches re-base their arrival to the delay edge.
+  Committed: `delay_max`, `delay_min`, `delay_ln`, `delay_from`,
+  `delay_allregs`, `delay_prop` on `sta_edge/latch_borrow`.
+
+Known gaps in that resolution (reachable but ungoldened — review
+2026-11-19):
+
+- the `D -> Q` borrow cap clamps `dly_max` through the same
+  absolute-time window as `arrival_max` (`open + k*period + pulse -
+  unc - t_setup`). Exact wherever `dly == arr` — every goldened case,
+  since covered launches are port/flop seeds — but a through-latch
+  launch feeds a launch-edge-relative `dly` into the absolute
+  window; whether OpenSTA re-bases before clamping is unverified.
+  The fixture has no latch-Q -> latch-D chain, so no covered
+  endpoint reports a borrow-capped `dly`.
+- the delay check's CRPR credit reads `crpr_max`/`crpr_min` — the
+  *arrival* winner's launch tag — while the reported `arr` is the
+  independently merged `dly` winner. The winners diverge only via a
+  through-latch launch and the credit is nonzero only under
+  `set_propagated_clock` + `set_timing_derate`; `pcr_*` has no
+  latches and `latch_borrow` no derate, so the divergent case is
+  ungoldened.
+- `set_min_delay` is golden-verified only on `dlxtp` latch-D
+  (`u_lp/D`) and `dfrtp` `RESET_B` (`u_ff0/RESET_B`); the same code
+  serves `dlxtn` latch-D and latch-cell `RESET_B` removal
+  (`u_rbn`/`u_rbp`/`u_rt*`, covered max-side only by
+  `delay_allregs`) unverified.
+
 Still open:
 
-1. A literal two-clock-domain `set_min_delay` anchoring fixture;
-   async-reset endpoint probe; latch-borrow delay fixture — all need
-   DEF/SDC additions.
-2. CRPR credit on delay checks needs a fixture with nonzero clock-net
-   late/early spread.
-3. Propagated-clock input-port launch anchor (see above).
+1. A literal two-clock-domain `set_min_delay` anchoring fixture —
+   still blocked on multi-clock SDC support (our SDC accepts a single
+   `create_clock` domain; the skewed-launch coverage `pm2_min2`
+   exercises is inside one domain). The anchor question itself is now
+   answered by the `sta_clocks` probe (2026-11-19): on a second-domain
+   endpoint OpenSTA anchors the delay-check required time at the
+   **capture domain's** edge-0 arrival — `req = N + capture_latency ∓
+   capture_uncertainty ∓ t_check`, with the launch domain's latency on
+   the arrival side only (`t2_md`/`t2_mdl`, `docs/multi-clock.md` §1.5).
+   The fixture and OpenSTA artifacts are committed as probe evidence;
+   golden coverage lands with the `mc-*` sequence in
+   `docs/multi-clock.md`.

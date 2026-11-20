@@ -219,6 +219,7 @@ mod tests {
             arc_offset: 0,
             arc_count: 1,
             leakage_power_w: None,
+            leakage_states: Vec::new(),
         });
 
         lib.rebuild_cell_by_name();

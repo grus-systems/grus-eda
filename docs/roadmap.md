@@ -125,8 +125,10 @@ The items below close these gaps, in the order proposed at the end.
 - Restriction recorded in `docs/results.md`: latch loops are *not* phase-iterated —
   a `D -> Q` cycle is a combinational cycle and levelisation rejects it as an error,
   matching the tool's honest-failure rule instead of inventing a fixed point.
-- Remaining skip counts: `min_pulse_width` arcs and `Clear`/`Preset` arcs (OpenSTA
-  3.0.16 does not propagate them, R6) are counted in `latch_arcs_dropped`.
+- Remaining skip counts: deferred check arcs (`non_seq_*` etc.) and `Clear`/`Preset`
+  arcs (OpenSTA 3.0.16 does not propagate them, R6) are counted in
+  `latch_arcs_dropped`/`recognized_check_arcs`. `min_pulse_width` arcs left the
+  deferred set when they became evaluated checks in `v0.1.93` (N3).
 
 ### R6. Asynchronous arcs
 
@@ -274,14 +276,34 @@ Done since (path-delay checks, `docs/path-delays.md`):
   async checks) are counted, never silently applied
   (`unsupported_path_delay_endpoints`).
 
+Done since (load selectors, `docs/results.md` 2026-11-19 entry):
+
+- `set_load <pf> [get_nets {...}]` applies the OpenSTA-measured
+  semantics: the annotation replaces the net's *wire* capacitance in the
+  lumped load (last-wins per net, partial apply with one
+  `unresolved_load_selectors` count per missing name). Measured against
+  OpenSTA goldens at STRICT (`ld_net`, `ld_nets`, `ld_portnet`,
+  `ld_last`, `ld_badnet`). Under `--spef` distributed parasitics the
+  annotation is counted unresolved rather than approximated.
+- `set_load` on `get_pins`/`get_cells`/`all_fanouts`/`all_fanins`/
+  `get_clocks` object sets and the `-min`/`-max`/`-rise`/`-fall`/
+  `-subtract_pin_load` qualifiers no longer abort the parse; each is
+  counted in `sdc_ignored_commands["set_load"]` (OpenSTA rejects the
+  pin/cell objects outright — `STA-0100` — and does not know the cone
+  commands at all).
+- `set_fanout_load <n> <objects>` parses and is counted in
+  `sdc_ignored_commands`; OpenSTA accepts it but warns it is unsupported
+  (`STA-0461`) and applies nothing, so the count is `is_clean`-exempt
+  like the `set_max_*` design rules.
+
 Remaining:
 
-- `get_pins`/`get_nets`/`all_fanouts` selections in *other* commands
-  (`set_load`, `set_fanout_load`), and the path-delay follow-ups in
-  `docs/path-delays.md` section 5 (two-clock and latch fixtures). These
-  select pins/nets the port-based delay model
-  cannot honour yet; options are symbolic selections plus counted-skip,
-  or deferring until a stage needs them.
+- The path-delay follow-ups in `docs/path-delays.md` section 5
+  (two-clock and latch fixtures). Multi-clock SDC support is scoped in
+  `docs/multi-clock.md`: OpenSTA's two-clock rules are measured on the
+  committed `sta_clocks` probe (2026-11-19) and the implementation is a
+  five-ticket sequence (`mc-model` → `mc-eval` → `mc-xdomain` →
+  `mc-selectors` → `mc-golden`).
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 
@@ -299,12 +321,24 @@ Remaining:
   an arrival or slack; `unsupported_arcs` and `latch_arcs_dropped` still
   fail strict, and the CLI summary lists deferred arcs even on a clean run
   ("skipped: none affecting reported timing").
-- `ibex` now reports `recognized_check_arcs[Clear=1655, MinPulseWidth=3602,
+- `ibex` then reported `recognized_check_arcs[Clear=1655, MinPulseWidth=3602,
   Preset=9]` with `unsupported_arcs`/`latch_arcs_dropped` empty;
   `sta_edge/non_dlxtn_latch --strict` passes.
-- Deferred: actually evaluating these checks (pulse width between clock
-  edges, `non_seq_*` vs the clock) is future work — until then the counts
-  stay visible in every summary and the JSON report.
+- `min_pulse_width` is evaluated as of `v0.1.93` (see `docs/results.md`
+  2026-11-19 entry): `StaReport::pulse_width_checks` carries one row per
+  (check pin, high/low) with OpenSTA's measured semantics — widths between
+  consecutive opposite clock edges on the propagated network, the
+  early/late pair producing the smaller width, period wrap behind inverting
+  cells, constraint table at the check pin's own slew, and slack that never
+  enters ordinary WNS/TNS. Only arcs on clock-network pins produce rows
+  (`dfrtn`'s RESET_B arc emits none). Verified at strict tolerance against
+  `sta_edge/min_pulse_width` goldens (ideal, propagated+derated, violating);
+  `merge_corner_reports` merges rows by `(pin, edge)` min slack.
+- Still deferred: `non_seq_*`, `three_state_*`, `preserve`, and async
+  `Clear`/`Preset` stay counted in `recognized_check_arcs`. A
+  `min_pulse_width` arc whose pin is not on the clock network (e.g.
+  `dfrtn` `RESET_B`) emits no check row — matching OpenSTA — and counts
+  into `recognized_check_arcs[MinPulseWidth]` instead (ibex: 1664).
 
 ### N4. SPEF write-out — DONE (v0.1.75)
 
@@ -377,11 +411,21 @@ Remaining:
 - VCD/SAIF-driven power estimation checked against OpenROAD
   `report_power` within a stated tolerance. Largest item; only if power
   estimation is in scope for the project.
-- **Status (2026-11-18)**: VCD path implemented and formula-validated
-  against a clocked micro-benchmark (<2% on every metric vs
-  `report_power`). On `gcd` the totals diverge because OpenSTA propagates
-  activity statistically (BDD + `findSeqActivity`) rather than reading
-  per-net VCD counts; our exact per-net counts are reported instead, and
-  the residual is documented in `docs/results.md`. Still open: SAIF input,
-  `when`-conditional power blocks, and matching OpenSTA's activity
-  propagation if a closer `report_power` agreement is ever required.
+- **Status (2026-11-19)**: VCD and SAIF paths implemented and
+  formula-validated against a clocked micro-benchmark. `--saif` reads
+  `TC` aggregates and reconstructs the per-net edge counts (`--vcd`
+  counts minus clk's one fall outside the truncated `[10,1990]` SAIF
+  window), matching OpenROAD `read_saif` + `report_power` within ~0.4%
+  total on the committed golden (`mb.saif.reference.json`); OpenSTA SAIF
+  field semantics were measured in-container (docs/results.md). On `gcd`
+  the totals diverge because OpenSTA propagates activity statistically
+  (BDD + `findSeqActivity`) rather than reading per-net VCD counts; our
+  exact per-net counts are reported instead, and the residual is
+  documented in `docs/results.md`. `when`-conditional `internal_power`
+  and `leakage_power` blocks now evaluate at the measured OpenSTA model
+  — marginal `P(when)` products, related-pin activity apportioning,
+  half-weight x/z edges — verified at ~1e-7% on the `mbw` ebufn fixture
+  in both VCD and SAIF paths (docs/results.md 2026-11-19); only
+  inexpressible `when` forms remain counted. Still open: matching
+  OpenSTA's activity propagation if a closer `report_power` agreement is
+  ever required.

@@ -6,6 +6,18 @@ max_verify_attempts = 3  # verify self-fix loop bound
 max_revises = 2          # reviewer revise loop bound
 max_implement_retries = 1  # implement executor-failure retry bound
 timeout_sec = 1800       # per subprocess invocation
+# Generated picorv32 artifacts (gitignored) must be present in each
+# task worktree or the sta tests panic — seed copies them from the
+# main checkout at worktree creation.
+# Generated artifacts are gitignored — seed copies them from the
+# main checkout into each task worktree (sta tests panic without
+# them). ~255 MB per worktree: every design dir is needed — even
+# non-#[ignore] tests read jpeg artifacts.
+worktree_seed = ["tests/designs/"]
+
+# Host-capability runners (routing tokens, no container exec):
+[runner.eda]
+kind = "host"
 
 # Verify commands run in declaration order inside the task worktree:
 [[verify]]
@@ -15,6 +27,14 @@ cmd = "cargo test --workspace"
 [[verify]]
 name = "clippy"
 cmd = "cargo clippy --workspace --all-targets -- -D warnings"
+
+# Full STA regression (heavy: release build + OpenSTA/OpenROAD via
+# the librelane container). Select it in a spec's ## Verify to run;
+# `runner = "eda"` restricts `push --remote` to hosts advertising it.
+[[verify]]
+name = "sta-regression"
+cmd = "cargo test --release -p grus-core sta"
+runner = "eda"
 
 # Custom agent-CLI drivers:
 # [drivers.mycli]

@@ -58,6 +58,10 @@ This directory contains public benchmark designs used for verification against r
 
 - **Directory**: `tests/designs/sta_edge/` — not a synthesised design; each case is a minimal hand-written DEF (+ SDC, + SPEF for `resistor_loop`) compared against an OpenSTA golden emitted by the case's own `generate_ref.sh` (same LibreLane container route). Covers the three "Not scheduled" items of `docs/e3-sta.md` Section 5: SPEF resistor loops, `set_clock_uncertainty` on non-register endpoints, and non-`dlxtn` latches. All files are small and committed.
 
+### `sta_clocks` (hand-written multi-clock probe fixture)
+
+- **Directory**: `tests/designs/sta_clocks/` — hand-written in this repository, `sky130_fd_sc_hd` cells only. `two_clock.def` has two clock ports (`clk1`, `clk2`), each buffered into its own `dfxtp` group, with cross-domain paths in both directions. The `t2_*.sdc` scenario files measure OpenSTA's two-clock rules (launch/capture pairing, per-clock uncertainty/latency, delay-check anchors, clock groups) via `probe.sh` inside the same LibreLane container; `two_clock.probe.json` and `probe_*.txt` are the committed evidence (< 1 MB). Findings live in `docs/results.md` and `docs/multi-clock.md`. No grus-eda golden yet: the SDC model accepts a single design clock (the probe's first break point), so these artifacts are evidence for the `mc-*` implementation tickets, not a regression target.
+
 ## 2. Reference Artifacts (`tests/designs/gcd/`)
 
 All golden files are strictly under 1 MB and generated from a single canonical run inside `ghcr.io/librelane/librelane:3.0.16`:
