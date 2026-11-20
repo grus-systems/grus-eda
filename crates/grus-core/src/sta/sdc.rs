@@ -362,7 +362,11 @@ pub struct Sdc {
 /// corner keeps the smaller value, the max corner the larger (measured against OpenSTA:
 /// `1.0 -add_delay` then `0.4 -add_delay` gives `(0.4, 1.0)`, and a later plain rule resets
 /// the fold). `-min`/`-max` rules touch one corner only. `None` when no rule matches, so
-/// callers keep their "no constraint" defaults.
+/// callers keep their "no constraint" defaults. `clock` follows the last
+/// matching rule — a `-clock`-less rule clears the anchor, so a port whose
+/// last rule names no clock ends unclocked here (measured `t2_noclk`: a
+/// `-clock`-less delay produces no timed path at all; OpenSTA's per-entry
+/// corner split is collapsed to the single row).
 fn delay_at(
     rules: &[DelayRule],
     port: &str,
@@ -536,9 +540,10 @@ impl Sdc {
         corner.factors[kind][usize::from(!clock_path)][transition]
     }
 
-    /// Index of the first design (port-bearing) clock row — the row an
-    /// absent or `-clock`-less delay rule anchors to. 0 on an empty or
-    /// virtual-only table.
+    /// Index of the first design (port-bearing) clock row — the row the
+    /// bookkeeping fallbacks in [`Sdc::input_clock_row`] /
+    /// [`Sdc::output_clock_row`] resolve to. 0 on an empty or virtual-only
+    /// table.
     fn design_row(&self) -> usize {
         self.clocks
             .iter()
@@ -547,14 +552,21 @@ impl Sdc {
     }
 
     /// Resolved `set_input_delay -clock` row for `port`, as an index into
-    /// `clocks`; absent or `-clock`-less rules resolve to the first design row.
+    /// `clocks`; absent or `-clock`-less rules resolve to the first design
+    /// row. The fallback is bookkeeping only — a port without a declared
+    /// `-clock` never becomes a startpoint (measured `t2_noclk`), so the
+    /// row is reached through [`Sdc::declared_input_clock_row`] for
+    /// semantics that depend on the anchor existing.
     pub fn input_clock_row(&self, port: &str) -> usize {
         delay_at(&self.input_delays, port, true, self)
             .and_then(|(_, _, clock)| clock)
             .map_or_else(|| self.design_row(), |id| id.0)
     }
 
-    /// Same as [`Sdc::input_clock_row`] for `set_output_delay`.
+    /// Same as [`Sdc::input_clock_row`] for `set_output_delay`: the
+    /// `design_row` fallback is bookkeeping — an output port without a
+    /// declared `-clock` produces no check (measured `t2_noclk`); endpoint
+    /// collection gates on [`Sdc::declared_output_clock_row`].
     pub fn output_clock_row(&self, port: &str) -> usize {
         delay_at(&self.output_delays, port, false, self)
             .and_then(|(_, _, clock)| clock)
@@ -878,9 +890,17 @@ impl Interp {
                 Ok(names) => Value::Ports(PortSel::Ports(names)),
                 Err(_) => Value::Opaque,
             }),
-            "get_clocks" => Ok(match plain_names(args) {
-                Ok(names) => Value::Clocks(names),
-                Err(_) => Value::Opaque,
+            // `[get_clocks]` with no argument is the `*` match — every
+            // clock (measured). `[get_clocks {}]` is a valid empty
+            // collection: `set_clock_*` commands apply to zero rows,
+            // silently (`t2_eclk`). Unknown names drop out at use — see
+            // `clock_rows` (OpenSTA's `STA-0351` warn is unmodelled).
+            "get_clocks" => Ok(match args {
+                [] => Value::Clocks(self.all_clock_names()),
+                _ => match clock_names_arg(args) {
+                    Some(names) => Value::Clocks(names),
+                    None => Value::Opaque,
+                },
             }),
             "get_cells" | "get_instance" | "get_inst" => Ok(self.cells_sel(args)),
             "get_pins" => Ok(match plain_names(args) {
@@ -1067,7 +1087,12 @@ impl Interp {
                 }
                 // OpenSTA accepts instants past the period (`t2_wavebig`
                 // `{0 2.5}`) — the waveform repeats per period, so the
-                // instants wrap.
+                // instants wrap. The wrapped pair is kept as-is even when
+                // it reorders or collapses: measured `t2_waverot` `{1.9
+                // 2.1}` on a 2.0 period becomes `{1.9, 0.1}` (an 80%-high
+                // phase-shifted lattice) and `t2_wavez` `{0 2.0}` becomes
+                // `{0, 0}` — edge 1 no later than edge 0 is a legal stored
+                // state, so no post-wrap check applies.
                 Ok([
                     instants[0].rem_euclid(period_ns),
                     instants[1].rem_euclid(period_ns),
@@ -1118,8 +1143,10 @@ impl Interp {
     /// measured `t2_grpn`). `-allow_paths` parses but declares no
     /// exclusion (measured `t2_grpa`: all endpoints stay timed). Group
     /// arguments are `get_clocks`/`all_clocks` collections or bare
-    /// name lists; unknown clock names bail like every other clock
-    /// resolution (`t2_grpb` shows bare names resolve).
+    /// name lists: collections filter like `clock_rows` (an all-miss
+    /// group resolves empty, `t2_eclk` family), while a bare name list
+    /// still bails on an unknown clock (`t2_grpb` shows bare names
+    /// resolve).
     fn set_clock_groups(&mut self, args: &[Value]) -> Result<()> {
         let mut kind = None;
         let mut groups = Vec::new();
@@ -1156,10 +1183,10 @@ impl Interp {
                 }
                 Value::Str(s) if s == "-group" => {
                     let group = match args.get(i + 1) {
-                        Some(Value::Clocks(names)) => names
-                            .iter()
-                            .map(|n| self.resolve_clock(n).map(|id| id.0))
-                            .collect::<Result<Vec<_>>>()?,
+                        // A collection filters like `clock_rows`: unknown
+                        // names drop out, `[get_clocks {}]` is the empty
+                        // group (measured `t2_eclk` family).
+                        Some(Value::Clocks(names)) => self.clock_rows(names),
                         // `-group cka` and `-group {cka ckb}` arrive as
                         // plain/braced words; `-group {}` is the empty
                         // group (measured `t2_grpe`: parses, still cuts).
@@ -1241,13 +1268,10 @@ impl Interp {
                         bail!("set_clock_uncertainty takes each of -from/-to once");
                     }
                     let rows = match args.get(i + 1) {
-                        Some(Value::Clocks(names)) => {
-                            let mut rows = Vec::with_capacity(names.len());
-                            for name in names {
-                                rows.push(self.resolve_clock(name)?.0);
-                            }
-                            rows
-                        }
+                        // A collection filters like `clock_rows` — unknown
+                        // names drop out and an empty list resolves empty
+                        // (measured `t2_eclk` family).
+                        Some(Value::Clocks(names)) => self.clock_rows(names),
                         // `-from cka`: a bare name (write_sdc form), possibly a
                         // whitespace-separated list.
                         Some(Value::Str(name)) => name
@@ -1274,9 +1298,15 @@ impl Interp {
         }
         let (value, targets) = match rest.as_slice() {
             [Value::Str(value)] => (value.as_str(), None),
-            [Value::Str(value), Value::Clocks(names)] => (value.as_str(), Some(names.clone())),
+            // A `get_clocks` collection filters — unknown names drop out and
+            // an empty list applies to zero rows (`clock_rows`, `t2_eclk`).
+            [Value::Str(value), Value::Clocks(names)] => {
+                (value.as_str(), Some(self.clock_rows(names)))
+            }
             // `set_clock_uncertainty 0.25 clk`: write_sdc emits the clock as a bare name.
-            [Value::Str(value), Value::Str(name)] => (value.as_str(), Some(vec![name.clone()])),
+            [Value::Str(value), Value::Str(name)] => {
+                (value.as_str(), Some(vec![self.resolve_clock(name)?.0]))
+            }
             _ => bail!("set_clock_uncertainty takes a value and optional clock names"),
         };
         let value_ns = parse_f32(value)?;
@@ -1285,6 +1315,14 @@ impl Interp {
                 // OpenSTA treats the positional list and `-to` as overlapping;
                 // refuse the ambiguous form loudly.
                 bail!("set_clock_uncertainty cannot name clocks with -from/-to");
+            }
+            // An absent `-from`/`-to` is the wildcard; a flag supplied with
+            // a collection that resolved empty covers no clock pair, so the
+            // rule is a no-op (measured `t2_eclk` family).
+            if from.as_ref().is_some_and(|f| f.is_empty())
+                || to.as_ref().is_some_and(|t| t.is_empty())
+            {
+                return Ok(());
             }
             self.sdc.inter_clock_uncertainty.push(InterClockUnc {
                 from: from.unwrap_or_default(),
@@ -1296,13 +1334,7 @@ impl Interp {
         }
         let ids = match targets {
             None => vec![self.design_clock_id()?],
-            Some(names) => {
-                let mut ids = Vec::with_capacity(names.len());
-                for name in &names {
-                    ids.push(self.resolve_clock(name)?);
-                }
-                ids
-            }
+            Some(rows) => rows.into_iter().map(ClockId).collect(),
         };
         for id in ids {
             let row = &mut self.sdc.clocks[id.0];
@@ -1339,13 +1371,12 @@ impl Interp {
         }
         let (value, targets) = match rest.as_slice() {
             [Value::Str(value)] => (value, vec![self.design_clock_id()?]),
-            [Value::Str(value), Value::Clocks(names)] => {
-                let mut ids = Vec::with_capacity(names.len());
-                for name in names {
-                    ids.push(self.resolve_clock(name)?);
-                }
-                (value, ids)
-            }
+            // A `get_clocks` collection filters — unknown names drop out and
+            // an empty list applies to zero rows (`clock_rows`, `t2_eclk`).
+            [Value::Str(value), Value::Clocks(names)] => (
+                value,
+                self.clock_rows(names).into_iter().map(ClockId).collect(),
+            ),
             // `set_clock_latency 0.5 clk`: write_sdc emits the clock as a bare name.
             [Value::Str(value), Value::Str(name)] => {
                 (value, vec![self.resolve_clock(name)?])
@@ -1367,7 +1398,9 @@ impl Interp {
     /// `set_propagated_clock|unset_propagated_clock <clock objects>`. The flag is set on
     /// every named design-clock row; unsetting a clock that was never propagated is a
     /// no-op. A virtual clock cannot be propagated: naming it in `set` is an error, in
-    /// `unset` it is skipped.
+    /// `unset` it is skipped. Collection arguments (`get_clocks`/`get_ports`
+    /// results) filter — an empty collection applies to zero rows, silently
+    /// (measured `t2_eclk`); literal names still error when unknown.
     fn propagated_clock(&mut self, command: &str, args: &[Value]) -> Result<()> {
         let mut names = Vec::new();
         for arg in args {
@@ -1375,16 +1408,18 @@ impl Interp {
                 Value::Str(s) if s.starts_with('-') => {
                     bail!("{command} takes clock objects, not `{s}`")
                 }
-                Value::Str(s) => names.extend(s.split_whitespace().map(str::to_string)),
-                Value::Clocks(ns) => names.extend(ns.iter().cloned()),
-                Value::Ports(PortSel::Ports(ns)) => names.extend(ns.iter().cloned()),
+                Value::Str(s) => names.extend(s.split_whitespace().map(|n| (n.to_string(), true))),
+                Value::Clocks(ns) => names.extend(ns.iter().map(|n| (n.clone(), false))),
+                Value::Ports(PortSel::Ports(ns)) => {
+                    names.extend(ns.iter().map(|n| (n.clone(), false)))
+                }
                 _ => bail!("{command} takes clock objects"),
             }
         }
-        if names.is_empty() {
+        if args.is_empty() {
             bail!("{command} takes clock objects");
         }
-        for clock in &names {
+        for (clock, literal) in &names {
             // `get_ports {clk}` names the clock's source port; the clock handle is `-name`.
             let id = match self.resolve_clock(clock) {
                 Ok(id) => id,
@@ -1395,6 +1430,9 @@ impl Interp {
                     .position(|c| c.port.as_deref() == Some(clock.as_str()))
                 {
                     Some(i) => ClockId(i),
+                    // A collection name was filtered by its selector
+                    // already — drop it; a literal name errors.
+                    None if !literal => continue,
                     None => return Err(e),
                 },
             };
@@ -1412,16 +1450,17 @@ impl Interp {
     /// `set_clock_transition <ns> [get_clocks <name>...]`. The slew lands on every named
     /// clock's row, virtual rows included.
     fn set_clock_transition(&mut self, args: &[Value]) -> Result<()> {
-        let (value, names) = match args {
-            [Value::Str(v)] => (v, None),
-            [Value::Str(v), Value::Clocks(names)] => (v, Some(names.clone())),
-            [Value::Str(v), Value::Str(name)] => (v, Some(vec![name.clone()])),
+        let (value, ids) = match args {
+            [Value::Str(v)] => (v, self.clock_rows(&self.all_clock_names())),
+            // A `get_clocks` collection filters — unknown names drop out and
+            // an empty list applies to zero rows (`clock_rows`, `t2_eclk`).
+            [Value::Str(v), Value::Clocks(names)] => (v, self.clock_rows(names)),
+            [Value::Str(v), Value::Str(name)] => (v, vec![self.resolve_clock(name)?.0]),
             _ => bail!("set_clock_transition takes a value and optional clock names"),
         };
         let transition = parse_f32(value)?;
-        for name in names.unwrap_or_else(|| self.all_clock_names()) {
-            let id = self.resolve_clock(&name)?;
-            self.sdc.clocks[id.0].transition_ns = transition;
+        for row in ids {
+            self.sdc.clocks[row].transition_ns = transition;
         }
         Ok(())
     }
@@ -2100,6 +2139,25 @@ fn expr(args: &[Value]) -> Result<Value> {
     }
     let value = eval_arith(&text).with_context(|| format!("unsupported expr `{}`", text.trim()))?;
     Ok(Value::Str(value.to_string()))
+}
+
+/// `get_clocks` name arguments: bare words only. Unlike `plain_names`, an
+/// empty name list is a valid empty collection — `[get_clocks {}]` selects
+/// no clocks and `set_clock_*` commands apply to zero rows, silently
+/// (measured `t2_eclk`). `None` on a flag or nested selection keeps the
+/// opaque form.
+fn clock_names_arg(args: &[Value]) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for arg in args {
+        let Value::Str(text) = arg else {
+            return None;
+        };
+        if text.starts_with('-') {
+            return None;
+        }
+        names.extend(text.split_whitespace().map(str::to_string));
+    }
+    Some(names)
 }
 
 /// Names from a selector's arguments. Each word may hold a whitespace-separated list, as `{a b}` does.
@@ -2801,7 +2859,6 @@ mod tests {
             "set_load 0.1 {unterminated",
             "set_load 0.1 \\\n[all_outputs]",
             "set n [expr 8 / 2]",
-            "set_clock_latency 1.0 [get_clocks nope]",
             "set_input_delay 1.0 -clock nope [all_inputs]",
             "if {1} {set_load 0.1 [all_outputs]}",
         ];
@@ -2945,8 +3002,6 @@ mod tests {
         for snippet in [
             // The virtual I/O clock cannot be propagated.
             "set_propagated_clock [get_clocks vclk]",
-            // No design clock named at all.
-            "set_propagated_clock [get_clocks other]",
             "set_clock_latency -early 0.1 [get_clocks core_clk]",
             "set_clock_latency -source",
         ] {
@@ -3161,7 +3216,6 @@ mod tests {
             "set_clock_uncertainty foo 0.1",
             "set_clock_uncertainty 0.1 0.2",
             "set_clock_uncertainty -setup -hold 0.1",
-            "set_clock_uncertainty 0.1 [get_clocks nope]",
         ];
         for snippet in cases {
             let text = format!("{GCD}{snippet}\n");
@@ -3375,15 +3429,7 @@ mod tests {
                 "needs -asynchronous, -logically_exclusive or -physically_exclusive",
             ),
             (
-                "set_clock_groups -asynchronous -group [get_clocks nope] -group [get_clocks vclk]",
-                "unknown clock `nope`",
-            ),
-            (
                 "set_input_delay 1.0 -clock other [get_ports d_in]",
-                "unknown clock `other`",
-            ),
-            (
-                "set_propagated_clock [get_clocks other]",
                 "unknown clock `other`",
             ),
             (
@@ -3517,10 +3563,6 @@ mod tests {
     #[test]
     fn set_clock_uncertainty_directional_bails() {
         for (snippet, want) in [
-            (
-                "set_clock_uncertainty -setup 0.3 -from [get_clocks nope] -to [get_clocks ckb]",
-                "unknown clock",
-            ),
             (
                 "set_clock_uncertainty -setup 0.3 -from [get_clocks cka] -to [get_clocks ckb] [get_clocks cka]",
                 "cannot name clocks with -from/-to",
@@ -3686,5 +3728,56 @@ mod tests {
             let err = format!("{:#}", parse_sdc(&format!("{snippet}\n")).unwrap_err());
             assert!(err.contains("no design clock declared yet"), "{snippet}: {err}");
         }
+    }
+
+    /// `[get_clocks]` with no argument resolves to every clock;
+    /// `[get_clocks {}]` is a valid empty collection — the `set_clock_*`
+    /// commands apply to zero rows and succeed silently (measured
+    /// `t2_eclk`). Unknown names inside a collection filter out like
+    /// `clock_rows` (OpenSTA's `STA-0351` warn is unmodelled).
+    #[test]
+    fn empty_clock_collection_is_a_noop() {
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_clock_latency 0.5 [get_clocks {{}}]\n\
+            set_clock_transition 0.1 [get_clocks {{}}]\n\
+            set_clock_uncertainty -setup 0.2 [get_clocks {{}}]\n\
+            set_clock_uncertainty -setup 0.2 -from [get_clocks {{}}] -to [get_clocks cka]\n\
+            set_clock_uncertainty -setup 0.3 -from [get_clocks nope] -to [get_clocks ckb]\n\
+            set_propagated_clock [get_clocks {{}}]\n\
+            set_propagated_clock [get_clocks no_such]\n\
+            set_clock_latency 0.5 [get_clocks no_such]\n\
+            set_clock_uncertainty 0.1 [get_clocks no_such]\n\
+            set_clock_groups -asynchronous -group [get_clocks no_such] -group [get_clocks cka]\n"
+        ))
+        .unwrap();
+        let cka = sdc.clock("cka").unwrap();
+        assert_eq!(cka.latency_ns, 0.0);
+        assert_eq!(cka.transition_ns, 0.0);
+        assert_eq!(cka.setup_uncertainty_ns, 0.0);
+        assert!(!cka.propagated);
+        assert!(sdc.inter_clock_uncertainty.is_empty());
+        // The all-miss `-group` stores the empty row set like `-group {}`.
+        assert_eq!(sdc.clock_groups[0].groups, vec![vec![], vec![0]]);
+        // No-argument `[get_clocks]` is the `*` match — every clock.
+        let sdc = parse_sdc(&format!("{TWO_DESIGN}set_clock_latency 0.5 [get_clocks]\n")).unwrap();
+        assert_eq!(sdc.clock("cka").unwrap().latency_ns, 0.5);
+        assert_eq!(sdc.clock("ckb").unwrap().latency_ns, 0.5);
+    }
+
+    /// Post-wrap waveform instants keep their wrapped order even when it
+    /// reorders or collapses — measured `t2_waverot`/`t2_wavez`: OpenSTA
+    /// accepts both and stores the pair as given.
+    #[test]
+    fn create_clock_waveform_wrapped_order_kept() {
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            create_clock -name rot -period 2.0 -waveform {{1.9 2.1}}\n\
+            create_clock -name z -period 2.0 -waveform {{0 2.0}}\n"
+        ))
+        .unwrap();
+        let [r0, r1] = sdc.clock("rot").unwrap().waveform_ns.unwrap();
+        assert!((r0 - 1.9).abs() < 1e-6 && (r1 - 0.1).abs() < 1e-6 && r1 < r0);
+        assert_eq!(sdc.clock("z").unwrap().waveform_ns, Some([0.0, 0.0]));
     }
 }

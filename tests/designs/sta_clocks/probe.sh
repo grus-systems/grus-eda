@@ -203,6 +203,19 @@ for name in $PROBE_ONLY; do
     run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
 done
 
+# Measure-only scenarios: pin OpenSTA behaviour for the mc-cleanups items —
+# run_report only, so no ref_*.json is folded into two_clock.reference.json
+# (the golden stays byte-identical by construction). t2_eclk: empty clock
+# collections on set_clock_*; t2_toinv: resolved-but-invalid -to objects;
+# t2_nsfrom/t2_nsto: bare name colliding with an unnamed clock's name;
+# t2_noclk: -clock-less I/O delay under -waveform; t2_waverot/t2_wavez:
+# -waveform instants that reorder or collapse under the rem_euclid wrap.
+MEASURE_ONLY="t2_eclk t2_nsfrom t2_nsto t2_toinv t2_noclk t2_waverot t2_wavez"
+
+for name in $MEASURE_ONLY; do
+    run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
+done
+
 {
     printf '{\n  "design": "sta_clocks",\n  "scenarios": {\n'
     first=1

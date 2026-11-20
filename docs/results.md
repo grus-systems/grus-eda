@@ -3186,6 +3186,26 @@ the literals `"A"`/`"!A"`, all on `Z` with `related_pin` = the enable pin.
 (up to ~8 literals, e.g. `!A&TE_B`, DFF `IQ` state vars) plus the non-pin
 literals `SHORT`/`DIODE`. `timing` `when`: none.
 
+Commands actually run (re-verified 2026-11-20, macOS `awk` — the
+`internal`/`leakage` one-liner reproduces 26/6244 verbatim):
+
+```bash
+LIB=$HOME/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+awk '/^[[:space:]]*internal_power *\(/ {ip=1; lp=0}
+     /^[[:space:]]*leakage_power *\(/ {ip=0; lp=1}
+     ip && /when[[:space:]]*:/ {ipn++}
+     lp && /when[[:space:]]*:/ {lpn++}
+     END {print "internal", ipn, "leakage", lpn}' "$LIB"
+# -> internal 26 leakage 6244
+
+# per-cell attribution of the 26 `internal_power` `when`s:
+awk '/^[[:space:]]*cell *\("/ { sub(/.*cell *\("/, ""); sub(/".*/, ""); cell=$0 }
+     /^[[:space:]]*internal_power *\(/ {ip=1; lp=0}
+     /^[[:space:]]*leakage_power *\(/ {ip=0; lp=1}
+     ip && /when[[:space:]]*:/ {print cell}' "$LIB" | sort | uniq -c | sort -rn
+# -> 2 per cell across the 13 cells listed above
+```
+
 #### Measured OpenSTA activity model (`get_property $pin activity`)
 
 `<rate/s> <P(1)> <source>`: clean 0↔1 edges count 1.0 toggle, x/z-involved
@@ -3623,11 +3643,12 @@ and keeps the worst slack:
 
 #### Cross-domain comparison vs OpenSTA (`test_sta_clocks_match_opensta`)
 
-All 15 parseable `t2_*` scenarios on `two_clock.def` plus `t2_latch` on
+All 14 parseable `t2_*` scenarios on `two_clock.def` plus `t2_latch` on
 `two_clock_latch.def` compare per-endpoint/per-field at `Tol::STRICT`
 (1% rel / 5 ps); `cross_domain_endpoints == 0` on every committed
 scenario, so wns/tns/violation counts compare everywhere. `t2_grp`
-remains parse-gated (`mc-selectors`).
+remains parse-gated (`mc-selectors`) — 15 scenario names total,
+`t2_grp` produced an SDC error and no ref block at this probe.
 
 | scenario | cross-domain rows now evaluated | what it pins |
 |---|---|---|
@@ -3936,3 +3957,168 @@ sequence (`mc-model` → `mc-eval` → `mc-xdomain` → `mc-selectors` →
 - `t2_int` `u_fx/D` `max_req_ns` perturbed +0.1 in the golden: red on
   exactly that field (`u_fx/D.max_req_ns: ours=0.8854457
   ref=0.985446`). `git checkout --` restored, green.
+
+### 2026-11-20 — `mc-cleanups`: measured-behaviour fixes + code/doc nits (v0.2.7)
+
+Cleanup bundle per `kurena/tasks/mc-cleanups/design/` — seven new
+`MEASURE_ONLY` probe scenarios pin OpenSTA's surface for the items
+that needed measurement; everything else is mechanical.
+
+#### Probe run (`probe.sh` whole, `ghcr.io/librelane/librelane:3.0.16`)
+
+`probe.sh` gained a `MEASURE_ONLY` list whose scenarios run
+`run_report` only — no `ref_*.json` block, so the goldens stay
+byte-identical by construction. The whole script re-ran: every
+pre-existing `probe_t2_*.txt` and both `two_clock{,_latch}.reference.json`
+byte-identical; new artifacts are the seven `t2_*.sdc` +
+`probe_t2_*.txt` pairs below.
+
+- **`t2_eclk`** — empty clock collections. `[get_clocks {}]` on
+  `set_clock_latency`/`-uncertainty`/`-transition`/
+  `set_propagated_clock`: clean output, no warning, the full `t2_int`
+  table (no accidental apply-to-all). `[get_clocks no_such]` warns
+  verbatim `[WARNING STA-0351] clock 'no_such' not found.` and
+  continues. `[get_clocks]` with no argument returns every declared
+  clock (ad-hoc stdin check in the same container).
+- **`t2_toinv`** — resolved-but-invalid `-to`. Five warnings, one per
+  command line: `[WARNING STA-1551] ... t2_toinv.sdc line 12, 'clk2'
+  is not a valid endpoint.`, line 13 same text for `[get_ports clk2]`,
+  line 14 `'d_in'`, line 15 `'u_fa0/Q'`, line 16 `'u_clka/A'`
+  (non-endpoint pins warn the same). `[get_pins u_fa1/D]` — a true
+  endpoint — is silent and cut (control); `[get_cells u_clka]` warns
+  nothing even though it owns no endpoint pin. The rule is dead on
+  every warning; timing continues.
+- **`t2_nsfrom` / `t2_nsto`** — bare-name collision (unnamed
+  `create_clock`s, so `clk1`/`clk2` are both clock and port names).
+  The **clock object wins**: `-from clk1` cuts the `clk1` row's
+  launches (the `t2_selfa`-equivalent set — `u_fa0`, `u_fa1`, `d_in`,
+  `ya`, `u_fx` gone; ckb-domain checks stay), no warning. `-to clk2`
+  cuts the `clk2` captures, no `STA-1551` — OpenSTA never looks at
+  the port once the clock name matches.
+- **`t2_noclk`** — `-clock`-less `set_input_delay`/`set_output_delay`
+  (cka on `-waveform {0.3 1.7}`): `d_in` never appears as a startpoint
+  and `ya` never as an endpoint — a delay rule with no `-clock`
+  produces **no timed path at all** (re-checked without `-waveform`
+  in an ad-hoc run: same). Not a design-row fallback, not a `0.0`
+  anchor — the path simply does not exist (endpoint count 12 vs 18).
+- **`t2_waverot` / `t2_wavez`** — post-wrap waveforms. `{1.9 2.1}` on
+  period 2.0 is accepted with clock lines `1.90 clock cka (rise
+  edge)` — instants wrap mod period and the wrapped order is kept
+  (`[1.9, 0.1]`), not sorted; `{0 2.0}` collapses to `[0, 0]`.
+
+#### Rules implemented
+
+- **A2** — `get_clocks` evaluates `{}` to `Value::Clocks([])` and no
+  argument to all clocks; `set_clock_latency`/`-transition`/
+  `-uncertainty`/`set_propagated_clock`/`set_clock_groups` resolve
+  collection arguments through `clock_rows` filtering — unknown names
+  drop (the STA-0351 posture), zero rows is a silent no-op. Bare
+  literal clock names keep their strict `unknown clock` bail.
+  Directional `set_clock_uncertainty` with an empty `-from`/`-to`
+  collection records no rule.
+- **A5** — post-wrap `-waveform` instants stored as wrapped
+  (`rem_euclid`), unsorted — the measured `[1.9, 0.1]`/`[0, 0]` keep;
+  the pre-wrap strictly-increasing check stays. New unit test
+  `create_clock_waveform_wrapped_order_kept` pins both wraps
+  (tolerance-based — `0.1` comes out `2.1f32 rem_euclid 2.0 =
+  0.0999999…`).
+- **A7** — `resolve_to` counts resolved-but-invalid `-to` objects in
+  `unresolved_exception_selectors`: a non-output port and a resolved
+  non-endpoint pin each count once, matching the five `STA-1551`
+  warnings; resolved cells stay silent (measured). Field doc updated.
+- **A8** — the clock namespace wins a bare-name collision in
+  `resolve_from`, `resolve_to` and `resolve_delay_from`
+  (`clock_row(name)` checked before the port/cell scan). A clock's
+  *source-port* name is unaffected — `clock_row` matches `-name` only,
+  so `t2_selport`/`t2_selpto` behaviour is unchanged.
+- **A9** — `-clock`-less I/O delays anchor on nothing: an input port
+  whose rules all lack `-clock` seeds **slew only** (new `slew_seeds`
+  merged into `base_state`; no `PortSeed`, no launch), and
+  `collect_endpoints` admits an output port only when
+  `declared_output_clock_row` resolves. The eval's slew propagation
+  was decoupled from arrival reachability to keep this honest: an
+  unreached-but-slew-driven driver still degrades slew onto its net
+  and loads (`!reached && slew_reached` slew-only legs at the net edge
+  and in the arc eval — the same discipline `propagate_slew` already
+  used). Without the decoupling the unclocked input's downstream
+  slews went UNREACHED and `test_when_power_mbw_matches_opensta`
+  failed (Combinational internal `5.3687864e-8` ours vs `5.006255e-8`
+  golden) — the suite caught it; the decoupling restored it.
+
+#### Code nits (no probe)
+
+- **A1** `grid_lcm`: the mid-loop `y <= tol` guard moved to the loop
+  top — the honest statement (defensive on a degenerate `b`;
+  unreachable afterwards since the remainder was just checked
+  `> tol`). Doc notes non-convergence below `tol` returns `None`.
+- **A3** `delay_{max,min}_pins` and `ResolvedPathDelay::from_pins`:
+  last-wins wholesale folding documented — a later covering rule's
+  `from_pins` (including `None`) replaces the set.
+- **A4** the `PROBE_ONLY` loop asserts each scenario's expected bail
+  substring, not bare `is_err()`.
+- **A6** `sta_evaluates_two_clock_same_domain` audit — no-op: renamed
+  in v0.2.3, `rg same_domain` finds no residual misnomer.
+  Hold-pairing comment restated to the min-gap rule (the
+  non-coincident-pair wording was stale since `t2_wave`);
+  `SkippedEndpoint`'s count list covers `cross_domain_endpoints`.
+- **A10** `saif.rs`: `DURATION`/`TIMESCALE` report integer-required
+  errors (`SAIF DURATION must be an integer`), negative vs fractional
+  values split into separate messages, and the tokenizer accumulates
+  `Vec<u8>` with `String::from_utf8` at atom close — UTF-8 names
+  round-trip instead of mangling byte-wise. New tests: `1990.0` /
+  `abc` / `-5` DURATION battery, negative `T0`, UTF-8 net name.
+
+#### Docs
+
+- **D1** `docs/timing-exceptions.md`: `unresolved_load_selectors`,
+  `unsupported_path_delay_endpoints` and `cross_domain_endpoints`
+  bullets added; the selector bullet now records `STA-1551`-class
+  `-to` counting and the clock-wins namespace rule.
+- **D2** this file: "15 parseable" → "14 parseable + `t2_grp`
+  parse-gated" in the `mc-xdomain` entry; the when-power `awk`
+  invocation recorded verbatim in the v0.1.97 entry — re-run today:
+  `internal 26 leakage 6244`, and the per-cell variant confirms 2
+  `when`s on each of the 13 cells. saif-power checks-run audit —
+  **no-op**: the v0.1.96 entry already records `cargo test
+  --workspace`, clippy, the `--saif` end-to-end and the
+  `generate_saif_ref.sh` re-run.
+- **D3** `tests/designs/README.md`: `sta_exceptions`, `microbench`
+  and `repro_extreme_ceff` entries (verified against the directory
+  contents — `exceptions.def`, `generate_ref.sh`,
+  `generate_saif_ref.sh`/`generate_when_ref.sh`/`vcd2saif.py`,
+  `repro.tcl`/`sweep_reference.txt`).
+- **D4** `power.rs`: `driven_nets_without_activity` doc records that
+  the same unannotated nets also make `when` literals inexpressible
+  (counted in `conditional_power_blocks`) — the meaning change since
+  v0.1.97.
+- **D5** `t2_mdx` description audit — **no-op**: `fixture.md` already
+  reads "pin-startpoint `-from`"; `rg 'rewrite|both sides'` across
+  `kurena/tasks/*/design/` and `docs/` found only correct usages of
+  "delay-check rewrite".
+- **D6** `docs/multi-clock.md`: the scenario count reworded (40
+  golden + `MEASURE_ONLY`), §1.2's hold note points at §1.7's
+  min-gap finding, §1.7 gains the five new measured rules above.
+
+#### Checks run
+
+- `bash tests/designs/sta_clocks/probe.sh` — whole script; `git diff`
+  on `tests/designs/` shows only the seven new `t2_*.sdc` +
+  `probe_t2_*.txt` pairs, every pre-existing artifact byte-identical.
+- `cargo test --workspace` — 314 + 3 pass, 2 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Fail-proof mutations (E0 rule 7; each confirmed red, then reverted):
+  clock-wins priority disabled → `t2_nsfrom` reads the full dead-rule
+  table instead of `["u_fb1/D","u_fy/D","yb"]`; `-clock` gate forced
+  open → `t2_noclk` regains `u_fa0/D`; `t2_wave3`'s expected substring
+  swapped for `t2_waverev`'s → the named-bail assert fires with the
+  actual message; `two_clock.reference.json` slack +0.02 ns →
+  `t2_frac` fails on `u_fa0/D.max_slack_ns` (+1e-6 and +0.01 stay
+  inside the slack tolerance — 1% rel / 5 ps abs — and pass, the
+  honest floor of that check).
+- `mbw` power regression (unplanned): caught by
+  `test_when_power_mbw_matches_opensta` mid-work, root-caused to
+  arrival-gated slew propagation, fixed by the slew decoupling in A9 —
+  re-verified green.
+
+Version `0.2.6 → 0.2.7` in `[workspace.package]` (`Cargo.lock`
+refreshed by `cargo check`).

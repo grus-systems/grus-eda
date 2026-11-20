@@ -1,0 +1,18 @@
+create_clock -name cka -period 2.0 [get_ports clk1]
+create_clock -name ckb -period 1.0 [get_ports clk2]
+set_input_delay -min 0.1 -clock cka [get_ports d_in]
+set_input_delay -max 0.7 -clock cka [get_ports d_in]
+set_output_delay -min 0.1 -clock cka [get_ports ya]
+set_output_delay -max 0.7 -clock cka [get_ports ya]
+set_output_delay -min 0.1 -clock ckb [get_ports yb]
+set_output_delay -max 0.7 -clock ckb [get_ports yb]
+set_input_transition 0.1 [get_ports d_in]
+set_load 0.05 [get_ports ya]
+set_load 0.05 [get_ports yb]
+set_false_path -to clk2
+set_false_path -to [get_ports clk2]
+set_false_path -to d_in
+set_false_path -to [get_pins u_fa0/Q]
+set_false_path -to [get_pins u_clka/A]
+set_false_path -to [get_pins u_fa1/D]
+set_false_path -to [get_cells u_clka]
