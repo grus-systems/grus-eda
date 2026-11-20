@@ -1,100 +1,91 @@
-# mc-cleanups — Implementation steps (revision 2)
+# mc-cleanups — Implementation steps (revision 3)
 
-The A-items landed in `e6bd1a7`; this sequence covers the review-memo
-follow-up (R1–R5). Order matters at one seam: the probe run precedes
-the measured-rule implementation (R1). Keep the diff in one commit; if
-the R1 data-model change grows past ~300 lines, split at the
-probe/code seam.
+Revisions 1–2 landed (`e6bd1a7`, `25f9700`). This sequence covers the
+second review memo: R6 (probe + fold rule) and the optional lows L1/L2.
+One commit; the probe run precedes the measured-rule implementation.
 
-## Step 1 — Probe harness + scenario files
+## Step 1 — Probe scenario + harness
 
-- `probe.sh`: harden `collect_endpoints_json` per probes.md P0 (union
-  `pins` from both passes, `null` for unset corner fields). Update
-  `SCENARIOS` (+`t2_eclk2 t2_clkcor t2_clkcor2 t2_waverot t2_wavez`)
-  and shrink `MEASURE_ONLY` to `t2_eclk t2_nsfrom t2_nsto t2_toinv
-  t2_noclk`; fix the comment block.
-- `t2_eclk.sdc`: append the lines per probes.md P2.
-- New `t2_eclk2.sdc`, `t2_clkcor.sdc`, `t2_clkcor2.sdc` per probes.md —
-  copy `t2_int.sdc` verbatim then edit; verify names against
-  `two_clock.def`.
+- New `tests/designs/sta_clocks/t2_clkdup.sdc` per probes.md P5 —
+  copy `t2_int.sdc` verbatim, replace the `d_in`/`ya`/`yb` delay lines.
+- `probe.sh`: append `t2_clkdup` to `SCENARIOS` (45 names on
+  `two_clock.def`); `MEASURE_ONLY`/`PROBE_ONLY` unchanged. No
+  collector change — the revision-2 union/`null` hardening covers it.
 
 ## Step 2 — Container run
 
 `bash tests/designs/sta_clocks/probe.sh` (Colima/docker per
 `AGENTS.md` §2). Then `git status` / `git diff tests/designs/`:
 
-- Pre-existing `probe_t2_*.txt` and the existing golden entries:
-  byte-identical. If anything drifts, stop and diagnose.
-- `two_clock.reference.json` gains five blocks (`t2_eclk2`,
-  `t2_clkcor`, `t2_clkcor2`, `t2_waverot`, `t2_wavez`) — `t2_clkcor*`
-  may carry `null` corner fields.
-- `probe_t2_eclk.txt` regenerates from the extended file.
-- If a `t2_eclk` line aborts `read_sdc` mid-file, split tail forms
-  into `t2_eclk3.sdc` and re-run.
-- Read the discriminators (probes.md P1–P3 tables) and record the
-  measured rules.
+- Every pre-existing `probe_t2_*.txt` and golden block: byte-identical.
+  Drift means a committed scenario exercises the fold — stop, diagnose.
+- `two_clock.reference.json` gains `ref_t2_clkdup` (may carry `null`
+  min fields on `yb` under H_overlap); `probe_t2_clkdup.txt` is new.
+- Read the discriminator table (probes.md P5): which delay each row
+  reflects; `yb` min `−0.5`-class vs `null` separates H_slot from
+  H_overlap; `yb`/`ya` max req `0.5`- vs `0.7`-delay separates H_acc.
 
-Gate: artifacts committed; `cargo test --workspace` is expected **red**
-at this point — `test_sta_clocks_match_opensta` compares the new
-blocks against the not-yet-fixed implementation. If it is green with
-the old code, the probes disagree with the assumed semantics —
-re-examine before touching code.
+Gate: artifacts in place. `cargo test --workspace` runs next — green
+means the probe confirmed H_acc *and* the numbers were actually read;
+red is expected under H_slot/H_overlap until Step 3 lands. Do not take
+a green suite as evidence without checking the `t2_clkdup` numbers.
 
-## Step 3 — Measured-rule implementation (R1)
+## Step 3 — Measured-rule implementation (R6)
 
-Per `api.md` R1, driven by the measured outcome:
+Per `api.md` R6, driven by the measured outcome:
 
-- `delay_at` per-corner fold + accessor changes (`sdc.rs`).
-- `PortSeed` per-corner `dom`/`per_pol`, `eval_sta` per-corner masks,
-  `key_dom`/`ep_cap` union matching (`analysis.rs`).
-- `collect_endpoints` per-corner output-port handling.
-- `EndpointReport` → `Option<f32>` corner fields; `record_endpoint`
-  emit-on-either-corner; `merge_corner_reports`, `parasitics.rs`
-  asserts, `test_sta_clocks_match_opensta` `null` handling,
-  `evaluated == 45`.
-- `sdc.rs` unit tests for the fold (both orderings, `-add_delay`
-  winner case).
+- **H_acc**: comments only — `delay_at`/`DelayEntry` docs and the
+  fold-asserting test comments cite `t2_clkdup`.
+- **H_slot**: `delay_at` fold gains `DelaySense::without`;
+  `entries.into_iter().filter_map(…)` rebuild per api.md.
+- **H_overlap**: `retain` predicate gains the `covers_overlap` clause.
+- Update the four fold-asserting unit tests per the api.md table;
+  extend `delay_anchor_prune_is_port_wide` with the same-sense cases.
+- `analysis.rs`: `evaluated == 46`.
+- If the observed shape matches none of the three, implement what the
+  data shows — do not force a model.
 
-Gate: `cargo test --workspace`, clippy. Fail-proof: revert the fold to
-port-wide → `t2_clkcor` red on the corner-null cells; revert
-`record_endpoint` to `(Some, Some)` → same cells red (endpoint drops
-instead of emitting partially). Restore each.
+Contingency (container genuinely cannot run): skip Steps 1–2, apply
+`api.md`'s marking path (inferred/unmeasured markers), keep
+`evaluated == 45`, and say so in `docs/results.md`.
 
-## Step 4 — Wording + records (R4, R5, docs)
+Gate: `cargo test --workspace`, clippy `-D warnings`. Fail-proof:
+implement the *other* predicate (`retain` with/without the
+overlap clause), confirm `t2_clkdup` red on the discriminating fields
+(`yb` min-null / `yb` max-req / `d_in`-seeded arr), restore.
 
-- `sdc.rs`: `t2_eclk`/`t2_eclk family` citations now map to real lines
-  (audit each); `(measured)` on the no-arg `get_clocks` cites
-  `t2_eclk2`; `DelayRule::clock`/`delay_at` docs restated.
-- `docs/results.md`: RD1 rewording + RD2 revision entry.
-- `docs/multi-clock.md`: RD3 sync (counts, §1.7 bullets, limitation).
-- `docs/timing-exceptions.md`: RD4 `unreached_endpoints` restatement.
-- `tests/designs/README.md`: RD5 count + coverage note.
+## Step 4 — Docs + version bump
 
-## Step 5 — Version bump + final gate
-
-- `[workspace.package] version` `0.2.7 → 0.2.8` in `Cargo.toml`;
-  `cargo check` refreshes `Cargo.lock`.
+- `docs/results.md`: dated continuation of the 2026-11-20 entry —
+  verbatim probe lines, discriminator read-off, the rule implemented
+  (or the inferred-marking record), test updates, checks run. Amend
+  the earlier "`retain` only same-anchor entries" bullet reference:
+  state what is now measured vs still inferred.
+- `docs/multi-clock.md`: §1.7 anchor bullet — same-anchor same-sense
+  clause per the measured rule (or the inferred marker); the
+  `set_clock_groups` unknown-name bullet (L2); scenario count 45 → 46
+  in the L24 parenthetical.
+- `tests/designs/README.md`: the v0.2.5→current count reattribution +
+  `t2_clkdup` named (L1).
+- `[workspace.package] version` `0.2.8 → 0.2.9`; `cargo check`
+  refreshes `Cargo.lock`.
 
 ```
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-git diff --stat tests/designs/   # golden: append-only blocks + regenerated t2_eclk probe
+git diff --stat tests/designs/   # golden: +1 block, rest byte-identical
 ```
-
-Optional heavy: `cargo test --release -p grus-core sta`.
 
 ## Files
 
-- `crates/grus-core/src/sta/analysis.rs`
 - `crates/grus-core/src/sta/sdc.rs`
-- `crates/grus-core/src/sta/parasitics.rs`
+- `crates/grus-core/src/sta/analysis.rs`
 - `tests/designs/sta_clocks/probe.sh`
-- `tests/designs/sta_clocks/t2_*.sdc`
-- `tests/designs/sta_clocks/probe_t2_*.txt`
+- `tests/designs/sta_clocks/t2_clkdup.sdc` (new)
+- `tests/designs/sta_clocks/probe_t2_clkdup.txt` (new)
 - `tests/designs/sta_clocks/two_clock.reference.json`
 - `docs/results.md`
 - `docs/multi-clock.md`
-- `docs/timing-exceptions.md`
 - `tests/designs/README.md`
 - `Cargo.toml`
 - `Cargo.lock`

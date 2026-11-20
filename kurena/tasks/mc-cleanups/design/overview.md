@@ -1,110 +1,87 @@
-# mc-cleanups — Overview (revision 2)
+# mc-cleanups — Overview (revision 3)
 
 Cleanup bundle for the low-severity findings left over from the
-multi-clock sequence (`mc-model` … `mc-golden`, v0.2.x) plus adjacent
-docs/power nits.
+multi-clock sequence plus the follow-up review memos.
 
-**Status**: the first implementation landed as `e6bd1a7` (v0.2.7) — all
-spec items and the seven `MEASURE_ONLY` probes are in. The human review
-returned a memo with two medium findings and three cheap lows; this
-revision is the follow-up work.
+**Status**: revision 1 landed as `e6bd1a7` (v0.2.7), revision 2 as
+`25f9700` (v0.2.8) — the entry-list `delay_at` fold, the hardened
+endpoint collector, the five promoted scenarios and the doc pass are
+all in (see the 2026-11-20 `docs/results.md` entry and its revision
+subsection). The second human review returned **one medium finding and
+two optional lows**; this revision is the follow-up.
 
-Version: `e6bd1a7` bumped `0.2.6 → 0.2.7`; the revision is another
-functional change on the same branch → `0.2.7 → 0.2.8` in the same
-commit (`[workspace.package]`, `Cargo.lock` refreshed).
+Version: functional change → `0.2.8 → 0.2.9` in the same commit
+(`[workspace.package]`, `Cargo.lock` refreshed).
 
 ## Review-memo inventory (the remaining work)
 
 | # | Item | Kind | Where |
 |---|------|------|-------|
-| R1 | `delay_at` collapses the `-clock` anchor to the last matching rule — `-max -clock cka` then `-min` (no `-clock`) declocks the port for **both** corners | code + probe | `sdc.rs` `delay_at`, `analysis.rs` seed/collect paths |
-| R2 | `[get_clocks]` no-arg all-clocks rule recorded via an **uncommitted** ad-hoc stdin check — commit a probe scenario per E0 rules | probe artifact | `t2_eclk2.sdc` (new), `sdc.rs` comment cite |
-| R3 | `t2_waverot`/`t2_wavez` only ran `run_report` — run them through `run_sta` so the wrapped-order/`[0,0]`-collapse semantics get endpoint-level evidence | probe artifact + test | `probe.sh` `SCENARIOS` |
-| R4 | `t2_eclk` overclaim: results/code cite a "`t2_eclk` family" for forms the file never exercises (empty `-from`/`-to` collections, `-group [get_clocks {}]`, `set_propagated_clock` name drop) | probe + wording | `t2_eclk.sdc` extension, `sdc.rs` comments, `results.md` |
-| R5 | `set_propagated_clock` non-clock-name drop (collection names now drop silently where literal names error — the `literal` flag in `propagated_clock`) is unprobed and unrecorded | probe + record | `t2_eclk.sdc`, `docs/` |
+| M1 | **Same-anchor same-sense retention in `delay_at`** — two `-max -clock cka` rules accumulating into a worst-fold — is *inferred* from the different-clock prune measurement (`t2_clkcor`/`t2_clkcor2` only measured different anchors and `-add_delay`), and unit tests now assert the inferred fold. Per the E0 rules: **probe the same-clock duplicate-rule case in the container and implement the measured result** (`t2_clkdup`, probes.md P5). Contingency, only if the container genuinely cannot run: keep the fold and mark it explicitly *inferred/unmeasured* in the code comment, the asserting test comments, `docs/multi-clock.md` and `docs/results.md`. | probe + code | `t2_clkdup.sdc` (new), `sdc.rs` `delay_at` + tests, `analysis.rs` test count |
+| L1 | `tests/designs/README.md` says "Since `mc-selectors` (v0.2.5) all 45 golden scenarios evaluate" — misattributed: the count was 40 at v0.2.5 and became 45 at v0.2.8; with `t2_clkdup` it becomes **46** at v0.2.9. Reattribute the count to the version that introduced it. | docs | `tests/designs/README.md` |
+| L2 | `set_clock_groups` unknown-name posture is unrecorded in `docs/`: `-group [get_clocks no_such]` filters to an empty group (the `clock_rows`/`t2_selunk` posture), a bare unknown name bails `unknown clock` (the `resolve_clock` posture) — neither measured on this command; say so. | docs | `docs/multi-clock.md` |
 
-## Landed items (e6bd1a7, v0.2.7) — reference only
+## What the medium item is about
 
-A1 `grid_lcm` guard; A2 empty clock collections + `[get_clocks]` forms;
-A3 pin `-from` last-wins docs; A4 PROBE_ONLY expected-substring asserts;
-A5 post-wrap `-waveform` keep; A6 stale names/comments; A7 `-to`
-resolved-but-invalid counting (5× `STA-1551`); A8 clock-wins namespace
-priority; A9 `-clock`-less I/O delays → no timed path; A10 SAIF nits;
-D1–D7 docs pass. All recorded in the 2026-11-20 `docs/results.md`
-entry. R-items below build on that landed state, not on the spec text.
+`sdc.rs:384–397` — `delay_at` folds a port's `DelayRule`s into a
+`Vec<DelayEntry>`: a plain (non-`-add_delay`) rule `retain`s only
+entries with `e.clock == r.clock`, then appends its own. The
+different-anchor half is measured (`t2_clkcor` both-corners loss,
+`t2_clkcor2` single-anchor survival, `yb` merged anchors). The
+**same-anchor** half is not: `retain` keeps same-clock entries
+unconditionally, so two same-clock `-max` rules accumulate and the
+worst check wins. OpenSTA could instead overwrite a per-(clock,
+corner) slot — that hypothesis is equally consistent with every
+committed measurement (`t2_int`'s `-min`/`-max` pair survives under
+both, since different senses never conflict). Only a same-clock
+same-sense duplicate discriminates — that is what `t2_clkdup` measures.
 
 ## Probe plan (one container run)
 
 `tests/designs/sta_clocks/probe.sh`, same container
-(`ghcr.io/librelane/librelane:3.0.16`):
-
-- Extend `t2_eclk.sdc` with the claimed-but-unprobed forms (R4, R5).
-- New scenarios: `t2_eclk2` (`[get_clocks]` no-arg, R2), `t2_clkcor` /
-  `t2_clkcor2` (mixed `-clock` rule sequences, both orderings +
-  `-add_delay` anchor discrimination, R1).
-- `t2_eclk2`, `t2_clkcor`, `t2_clkcor2`, `t2_waverot`, `t2_wavez` join
-  `SCENARIOS` — their `ref_*.json` blocks fold into
-  `two_clock.reference.json` so `test_sta_clocks_match_opensta` covers
-  them per-endpoint at STRICT (append-only: existing entries stay
-  byte-identical).
-- `collect_endpoints_json` in `run_sta` needs hardening first:
-  a mixed-anchor scenario produces corner-only endpoints
-  (`u_fa0/D` timed on max but absent from the min pass) — the current
-  collector reads `pins` from `paths_max` only and dereferences
-  `min_*($name)` unconditionally (unset var → Tcl error / silent
-  min-only loss). Collect the union of both passes and emit `null` for
-  absent corners.
-- `MEASURE_ONLY` shrinks to `t2_eclk t2_nsfrom t2_nsto t2_toinv
-  t2_noclk`; `t2_waverot`/`t2_wavez` move to `SCENARIOS`.
-
-See `probes.md` for scenario contents and discriminators.
+(`ghcr.io/librelane/librelane:3.0.16`): one new scenario `t2_clkdup`
+joins `SCENARIOS` — same-clock same-sense duplicates on `d_in`/`ya`
+plus a `Both`-then-`-max` same-clock sequence on `yb` that separates
+per-corner-slot overwrite from whole-entry overlap removal. The
+collector needs no further changes (union + `null` fields landed in
+the revision-2 hardening). See `probes.md` P5 for contents and the
+discriminator table.
 
 ## Non-goals
 
-- No new SDC commands or selector namespaces.
-- No change to the LCM pairing model or the deferral conditions.
-- `set_input_delay`/`set_output_delay` value folding (`-add_delay`
-  min-widen/max-widen) is unchanged — only the *anchor* fold is in
-  scope.
-- No attempt to model OpenSTA's warning text; counted diagnostics stay
-  in `SkipReport`/`ignored_commands`.
-- Split-anchor × `-from`/`-to` clock-selector interaction is a
-  pin-granular approximation (the cut cannot be corner-granular) —
-  record the limitation, do not probe it.
+- No new SDC commands or selector namespaces; no change to the
+  entry-list model itself — only the same-anchor prune key is pinned.
+- `-add_delay` semantics unchanged (gcd widening already measured).
+- Unanchored (`-clock`-less) duplicates are not probed: unanchored
+  entries produce no check either way, so only diagnostics folds could
+  differ — not endpoint-visible.
+- L1/L2 are optional lows — do them in the same commit if cheap.
 
-## Verification gates (repo rules + `workflow.toml`)
+## Verification gates
 
-1. `cargo test --workspace` — includes the reworked golden compare
-   (`null` corner fields) and `evaluated == 45` (44 `two_clock` +
-   `t2_latch`).
+1. `cargo test --workspace` — `evaluated` becomes 46
+   (45 `two_clock` + `t2_latch`); updated unit asserts.
 2. `cargo clippy --workspace --all-targets -- -D warnings` — clean.
-3. `git diff tests/designs/`: existing `two_clock{,_latch}.reference.json`
-   entries and pre-existing `probe_t2_*.txt` byte-identical; new
-   golden entries append; `probe_t2_eclk.txt` regenerates from the
-   extended `.sdc` (recorded).
-4. Fail-proof: break each new code path (whole-port declock restore,
-   emit-rule revert to `(Some, Some)`), confirm red, restore. Record.
-5. `docs/results.md` dated continuation of the 2026-11-20 entry: probe
-   lines verbatim, discriminators, rules implemented, wordings fixed.
-6. Optional heavy: `cargo test --release -p grus-core sta`.
+3. `git diff tests/designs/`: `two_clock.reference.json` append-only
+   (+1 block); every pre-existing `probe_t2_*.txt` and golden block
+   byte-identical — drift means a committed scenario exercises the
+   changed fold; stop and diagnose.
+4. Fail-proof: swap the prune predicate to the unmeasured alternative,
+   confirm `t2_clkdup` red on the discriminating fields, restore.
+5. `docs/results.md` dated continuation: verbatim probe lines,
+   discriminator read-off, rule implemented (or the inferred-marking
+   record if the contingency ran).
 
 ## Files
 
-- `crates/grus-core/src/sta/analysis.rs`
 - `crates/grus-core/src/sta/sdc.rs`
-- `crates/grus-core/src/sta/parasitics.rs` (test asserts only)
+- `crates/grus-core/src/sta/analysis.rs` (test count only)
 - `tests/designs/sta_clocks/probe.sh`
-- `tests/designs/sta_clocks/t2_eclk.sdc`
-- `tests/designs/sta_clocks/t2_eclk2.sdc` (new)
-- `tests/designs/sta_clocks/t2_clkcor.sdc` (new)
-- `tests/designs/sta_clocks/t2_clkcor2.sdc` (new)
-- `tests/designs/sta_clocks/t2_waverot.sdc`
-- `tests/designs/sta_clocks/t2_wavez.sdc`
+- `tests/designs/sta_clocks/t2_clkdup.sdc` (new)
 - `tests/designs/sta_clocks/two_clock.reference.json`
-- `tests/designs/sta_clocks/probe_t2_*.txt`
+- `tests/designs/sta_clocks/probe_t2_clkdup.txt` (new)
 - `docs/results.md`
 - `docs/multi-clock.md`
-- `docs/timing-exceptions.md`
 - `tests/designs/README.md`
 - `Cargo.toml`
 - `Cargo.lock`
