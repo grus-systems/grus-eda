@@ -9,6 +9,18 @@ follow-up work R1–R5. `analysis.rs` is
 
 ## R1 — per-corner `-clock` anchor in `delay_at` (medium)
 
+> **Outcome (implementation)**: the probe refuted the per-corner
+> hypothesis and confirmed the *merged entries* reading — OpenSTA keeps
+> a port's delay rules as an entry list. Implemented: `delay_at` folds
+> rules into `Vec<DelayEntry>`; a plain rule prunes entries anchored to
+> a different `-clock` **port-wide** then appends, `-add_delay` appends
+> without pruning, and each surviving anchored entry produces its own
+> check (the reported row is the last anchor's, wns/tns/violations see
+> the worst). `t2_clkcor` (`-max @cka` then bare `-min`) declocks the
+> port on both corners; `t2_clkcor2`'s `yb` checks under both `cka`
+> and `ckb`. Evidence and verbatim probe lines are in the
+> 2026-11-20 `docs/results.md` revision entry.
+
 ### The bug
 
 `sdc.rs:370` — `delay_at` folds matching `DelayRule`s into

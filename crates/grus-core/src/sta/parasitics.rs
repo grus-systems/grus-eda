@@ -1113,11 +1113,14 @@ mod tests {
                 (ea.min_slack_ns, eb.min_slack_ns),
                 (ea.min_slew_ns, eb.min_slew_ns),
             ] {
-                assert!(
-                    (x - y).abs() < 1e-6,
-                    "{}: {x} vs {y} after SPEF round-trip",
-                    ea.pin
-                );
+                assert_eq!(x.is_some(), y.is_some(), "{}: corner coverage", ea.pin);
+                if let (Some(x), Some(y)) = (x, y) {
+                    assert!(
+                        (x - y).abs() < 1e-6,
+                        "{}: {x} vs {y} after SPEF round-trip",
+                        ea.pin
+                    );
+                }
             }
         }
     }

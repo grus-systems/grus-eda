@@ -23,6 +23,7 @@ openroad> </work/tests/designs/sta_clocks/t2_eclk.sdc} err]} {
 ...>     exit 0
 ...> }
 [WARNING STA-0351] clock 'no_such' not found.
+[WARNING STA-0351] clock 'no_such' not found.
 openroad> <endpoint_path_count 1 -group_path_count 100000 ==="
 === report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000 ===
 openroad> <ull -endpoint_path_count 1 -group_path_count 100000

@@ -271,6 +271,11 @@ check read the same per-path credit (`docs/path-delays.md`).
   capacitance, which the distributed RC model cannot express, so under
   `NetParasitics` every selected net counts here instead of being
   approximated.
+- `unreached_endpoints`: endpoints with zero candidates on **both**
+  corners (no clock reaches the check pin, or no launch survives). A
+  port whose delay entries time only one corner is still emitted —
+  the missing corner serializes as `null` fields (measured
+  `t2_clkcor2`).
 - `unsupported_path_delay_endpoints`: endpoint candidates a covering
   `set_max_delay`/`set_min_delay` cannot replace (output ports,
   clock-gate enables, latch-D, async recovery/removal) — loudly partial,
