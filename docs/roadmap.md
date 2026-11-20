@@ -304,12 +304,13 @@ Remaining:
   committed `sta_clocks` probe (2026-11-19) and the implementation is a
   five-ticket sequence (`mc-model` → `mc-eval` → `mc-xdomain` →
   `mc-selectors` → `mc-golden`). `mc-model` (the clock table, v0.2.0),
-  `mc-eval` (domain tagging + same-domain pairing, v0.2.1) and
+  `mc-eval` (domain tagging + same-domain pairing, v0.2.1),
   `mc-xdomain` (cross-domain min-gap edge pairing + inter-clock
-  uncertainty, v0.2.2) are done — every parseable `sta_clocks` scenario
-  matches OpenSTA at strict tolerance with `cross_domain == 0`.
-  Remaining: clock selectors and `set_clock_groups` (`mc-selectors`),
-  golden promotion (`mc-golden`).
+  uncertainty, v0.2.2) and `mc-selectors` (clock-object selectors,
+  `set_clock_groups`, `create_clock -waveform`, v0.2.5) are done —
+  all 40 golden `sta_clocks` scenarios match OpenSTA at strict
+  tolerance with `cross_domain == 0`.
+  Remaining: golden promotion (`mc-golden`).
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 
