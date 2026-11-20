@@ -3016,16 +3016,20 @@ fn eval_sta(
                                         false,
                                         check_transition(&lib.arcs[info.setup_arc as usize]),
                                     );
-                            if src.arrival_max[src_pol] <= open - en_clk.setup_uncertainty_ns {
+                            // Same accessor as every other eval-side
+                            // uncertainty read: the arriving data's launch
+                            // mask against the latch enable's domain row —
+                            // identical to the row field on rule-free SDCs.
+                            let unc =
+                                unc_worst(sdc, src.dom_max[src_pol], en_dom as usize, false);
+                            if src.arrival_max[src_pol] <= open - unc {
                                 continue;
                             }
                             let cap = |arr: f32| {
                                 let k =
                                     ((arr - open) / en_clk.period_ns).floor().max(0.0);
                                 arr.min(
-                                    open + k * en_clk.period_ns + pulse
-                                        - en_clk.setup_uncertainty_ns
-                                        - setup,
+                                    open + k * en_clk.period_ns + pulse - unc - setup,
                                 )
                             };
                             (cap(src.arrival_max[src_pol]), cap(src.dly_max[src_pol]))
@@ -3868,16 +3872,23 @@ fn run_sta_partitioned(
                 // Cross-domain launch bits anchor at the capture domain's
                 // edge 0 (delay checks skip pairing); each polarity's tying
                 // launch mask picks the worst matching inter-clock rule.
-                for (pol, w) in pols.max.iter_mut().enumerate() {
-                    let Some(w) = w else { continue };
+                for pol in [RISE, FALL] {
+                    let Some(mut w) = pols.max[pol] else { continue };
                     let unc = unc_worst(sdc, s.dom_max[pol], out_row, false);
-                    w.arr = delay_max_pins.as_ref().map_or(w.dly, |pins| {
-                        pins.iter()
-                            .map(|&fp| w.dly - class_states[ci][fp as usize].dly_max[pol])
-                            .fold(f32::NEG_INFINITY, f32::max)
-                    });
+                    if let Some(pins) = &delay_max_pins {
+                        let Some(arr) =
+                            pin_segment_arrival(pins, &class_states[ci], w.dly, pol, false)
+                        else {
+                            pols.max[pol] = None;
+                            continue;
+                        };
+                        w.arr = arr;
+                    } else {
+                        w.arr = w.dly;
+                    }
                     w.req = n - delay_max - unc;
                     w.slack = w.req - w.arr;
+                    pols.max[pol] = Some(w);
                 }
             }
             if let Some(n) = delay_max_n
@@ -3908,12 +3919,15 @@ fn run_sta_partitioned(
                         // check times the segment from the pin — arrival is
                         // the endpoint's delay minus the pin's own, required
                         // time `N - t_setup` with no clock anchor, latency,
-                        // or uncertainty. Each pin yields its own constrained
-                        // path; the largest segment arrival is worst.
-                        let arr = pins
-                            .iter()
-                            .map(|&fp| w.dly - class_states[ci][fp as usize].dly_max[pol])
-                            .fold(f32::NEG_INFINITY, f32::max);
+                        // or uncertainty. Each reached pin yields its own
+                        // constrained path; the largest segment arrival is
+                        // worst, and with none reached the polarity drops.
+                        let Some(arr) =
+                            pin_segment_arrival(pins, &class_states[ci], w.dly, pol, false)
+                        else {
+                            pols.max[pol] = None;
+                            continue;
+                        };
                         let req = n - t_setup;
                         pols.max[pol] = Some(Worst {
                             arr,
@@ -4013,16 +4027,23 @@ fn run_sta_partitioned(
                 let (delay_min, _) = sdc.output_delay_ns(cx.port_name(PinId(ep)));
                 let out_row = sdc.output_clock_row(cx.port_name(PinId(ep)));
                 let s = class_states[ci][ep as usize];
-                for (pol, w) in pols.min.iter_mut().enumerate() {
-                    let Some(w) = w else { continue };
+                for pol in [RISE, FALL] {
+                    let Some(mut w) = pols.min[pol] else { continue };
                     let unc = unc_worst(sdc, s.dom_min[pol], out_row, true);
-                    w.arr = delay_min_pins.as_ref().map_or(w.dly, |pins| {
-                        pins.iter()
-                            .map(|&fp| w.dly - class_states[ci][fp as usize].dly_min[pol])
-                            .fold(f32::INFINITY, f32::min)
-                    });
+                    if let Some(pins) = &delay_min_pins {
+                        let Some(arr) =
+                            pin_segment_arrival(pins, &class_states[ci], w.dly, pol, true)
+                        else {
+                            pols.min[pol] = None;
+                            continue;
+                        };
+                        w.arr = arr;
+                    } else {
+                        w.arr = w.dly;
+                    }
                     w.req = n - delay_min + unc;
                     w.slack = w.arr - w.req;
+                    pols.min[pol] = Some(w);
                 }
             }
             if let Some(n) = delay_min_n
@@ -4047,10 +4068,12 @@ fn run_sta_partitioned(
                                 * sdc.derate(false, DERATE_CHECK, false, check_transition(
                                     &lib.arcs[hold_arc as usize],
                                 ));
-                        let arr = pins
-                            .iter()
-                            .map(|&fp| w.dly - class_states[ci][fp as usize].dly_min[pol])
-                            .fold(f32::INFINITY, f32::min);
+                        let Some(arr) =
+                            pin_segment_arrival(pins, &class_states[ci], w.dly, pol, true)
+                        else {
+                            pols.min[pol] = None;
+                            continue;
+                        };
                         let req = n + t_hold;
                         pols.min[pol] = Some(Worst {
                             arr,
@@ -4919,6 +4942,35 @@ fn unc_worst(sdc: &Sdc, mask: u8, cap: usize, hold: bool) -> f32 {
         }
     }
     worst
+}
+
+/// `ep_dly − pin_dly` over the `-from` pins reached in this class on
+/// (pol, side): a pin whose own delay arrival is still the sentinel
+/// contributes no constrained path and is skipped. `None` when no pin in
+/// the set is reached — the caller drops the polarity's candidate rather
+/// than report an infinite segment or fall back to the clocked `w.dly`
+/// (the pin `-from` already replaced that launch).
+fn pin_segment_arrival(
+    pins: &HashSet<u32>,
+    states: &[PinTimingState],
+    ep_dly: f32,
+    pol: usize,
+    min_side: bool,
+) -> Option<f32> {
+    let mut seg: Option<f32> = None;
+    for &fp in pins {
+        let pin_dly = if min_side {
+            states[fp as usize].dly_min[pol]
+        } else {
+            states[fp as usize].dly_max[pol]
+        };
+        if !pin_dly.is_finite() {
+            continue;
+        }
+        let v = ep_dly - pin_dly;
+        seg = Some(seg.map_or(v, |a| if min_side { a.min(v) } else { a.max(v) }));
+    }
+    seg
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5879,6 +5931,29 @@ mod tests {
         assert_eq!(hold(2.0, 1.4, 1.0, 0.0), Some((6.0, 7.0)));
         // No coincident capture edge on the B->A odd grid: defer.
         assert_eq!(hold(1.4, 2.0, 1.0, 0.0), None);
+    }
+
+    #[test]
+    fn test_pin_segment_arrival() {
+        // A `-from` pin still UNREACHED in the class contributes no segment
+        // (the sentinel delay would fold to ±∞); with no reached pin the
+        // fold is `None` and the caller drops the polarity's candidate.
+        let mut reached = PinTimingState::UNREACHED;
+        reached.dly_max = [0.5, 0.5];
+        reached.dly_min = [0.25, 0.25];
+        let states = [PinTimingState::UNREACHED, reached];
+        let pins: HashSet<u32> = [0, 1].into_iter().collect();
+        assert_eq!(
+            pin_segment_arrival(&pins, &states, 1.0, 0, false),
+            Some(0.5)
+        );
+        assert_eq!(
+            pin_segment_arrival(&pins, &states, 1.0, 0, true),
+            Some(0.75)
+        );
+        let unreached: HashSet<u32> = [0].into_iter().collect();
+        assert_eq!(pin_segment_arrival(&unreached, &states, 1.0, 0, false), None);
+        assert_eq!(pin_segment_arrival(&unreached, &states, 1.0, 0, true), None);
     }
 
     /// Tolerances against OpenSTA. A value passes if |ours - ref| <= max(abs, rel * |ref|).
@@ -8680,13 +8755,15 @@ mod tests {
         );
     }
 
-    /// `mc-xdomain` edge pairing: the two-clock fixture evaluates each domain
-    /// on its own lattice — `u_fa1/D`'s required time uses `cka`'s 2.0 ns
-    /// period, `u_fb1/D`'s `ckb`'s 1.0 ns — and cross-domain pairs now report
-    /// on the min-gap edge pair instead of deferring (`docs/multi-clock.md`
-    /// §1): the whole OpenSTA `t2_int` endpoint set.
+    /// `mc-xdomain` edge pairing: the two-clock fixture reports cross-domain
+    /// endpoints on the min-gap (launch, capture) edge pair instead of
+    /// deferring (`docs/multi-clock.md` §1) — `u_fx/D` pairs launch edge 0
+    /// with capture 1.0, `u_fy/D` launch 1.0 with capture 2.0 — while
+    /// same-domain checks keep their capture lattice's period (`u_fa1/D` on
+    /// `cka`'s 2.0 ns, `u_fb1/D` on `ckb`'s 1.0 ns). The whole OpenSTA
+    /// `t2_int` endpoint set is asserted.
     #[test]
-    fn sta_evaluates_two_clock_same_domain() {
+    fn sta_evaluates_two_clock() {
         let lib_dir = sky130_hd();
         let lib =
             load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");

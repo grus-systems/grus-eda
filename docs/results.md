@@ -3681,3 +3681,35 @@ violation diffs (12 mismatches). Restored; test green again.
 - `probe_t2_mdx.txt` carries OpenSTA's `u_fb0/Q is not a valid start
   point` warning — yet it reports the pin-startpoint delay check; the
   measured numbers are what the golden asserts.
+
+### 2026-11-20 — `mc-xdomain` review fixes: unreached `-from` pin guard (v0.2.3)
+
+Residual delta from the 2026-11-20 design review of `3f45194`:
+
+- **`pin_segment_arrival`** (`analysis.rs`): all four pin-startpoint
+  segment-fold sites — check-pin max/min and output-port max/min — now
+  skip `-from` pins still `UNREACHED` in the signature class
+  (`dly_max = NEG_INFINITY` / `dly_min = INFINITY`) instead of folding
+  the sentinel into a `±∞` segment arrival. When no `-from` pin is
+  reached the polarity's `Worst` candidate drops — a named skip through
+  the ordinary skip diagnosis, never an infinite arrival and never a
+  silent `w.dly` fallback (the pin `-from` already replaced the clocked
+  launch). No committed fixture has an unreached `-from` pin, so this
+  is a correctness guard with no golden-visible change.
+- **`eval_sta` latch-borrow cap**: both reads of
+  `en_clk.setup_uncertainty_ns` now go through
+  `unc_worst(sdc, src.dom_max[src_pol], en_dom, false)` — the same
+  accessor every other eval-side uncertainty read uses. Identical
+  values on rule-free SDCs (all committed latch fixtures).
+- `sta_evaluates_two_clock_same_domain` renamed
+  `sta_evaluates_two_clock` — the test has asserted the cross-domain
+  min-gap pairs since `3f45194`, so `same_domain` was stale.
+- New unit test `test_pin_segment_arrival`: reached+unreached pin sets
+  fold only the reached segment on both sides; an all-unreached set
+  yields `None`.
+
+Ran: `cargo test --workspace` (306 + 3 tests, all green incl.
+`test_sta_clocks_match_opensta` at STRICT and
+`sta_evaluates_two_clock`), `cargo clippy --workspace --all-targets --
+-D warnings` (clean). Goldens byte-identical — no fixture or probe
+artifact touched.
