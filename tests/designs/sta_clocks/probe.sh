@@ -199,7 +199,7 @@ exit
 EOF
 }
 
-SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05 t2_selbare t2_selac t2_selunion t2_selunk t2_selport t2_selpto t2_grp1 t2_grpe t2_grpb t2_wavebig t2_eclk2 t2_clkcor t2_clkcor2 t2_waverot t2_wavez"
+SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05 t2_selbare t2_selac t2_selunion t2_selunk t2_selport t2_selpto t2_grp1 t2_grpe t2_grpb t2_wavebig t2_eclk2 t2_clkcor t2_clkcor2 t2_waverot t2_wavez t2_clkdup"
 
 for name in $SCENARIOS; do
     run_sta "two_clock.def" "$name.sdc" "ref_$name.json"

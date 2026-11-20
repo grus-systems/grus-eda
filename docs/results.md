@@ -4249,3 +4249,89 @@ regenerated from the extended `.sdc` (three appended lines).
 
 Version `0.2.7 → 0.2.8` in `[workspace.package]` (`Cargo.lock`
 refreshed by `cargo check`).
+
+#### Revision 2 (v0.2.9) — second review memo: same-anchor fold probe
+
+The second human review returned one medium (`delay_at`'s same-anchor
+same-sense retention was inferred, not measured) and two optional lows
+(`tests/designs/README.md` count attribution, `set_clock_groups`
+unknown-name posture). One probe scenario pinned the rule.
+
+##### Probe run (`probe.sh` whole, same container)
+
+`SCENARIOS` gained `t2_clkdup` (same-clock same-sense duplicates on
+`d_in`/`ya`, plus a `Both`-then-`-max` same-clock pair on `yb` that
+separates per-corner-slot overwrite from whole-entry overlap removal).
+Every pre-existing `probe_t2_*.txt` and golden block regenerated
+byte-identical; `two_clock.reference.json` grew append-only (+1 block)
+and `probe_t2_clkdup.txt` is new.
+
+- **`t2_clkdup`** — measured **per-(clock, corner)-slot overwrite**
+  (H_slot), not the inferred worst-fold (H_acc). Discriminators in
+  `ref_t2_clkdup` / `probe_t2_clkdup.txt`: `d_in`'s launch arrivals
+  read the *last* duplicate, not the worst — `u_fa0/D`/`u_fb0/D`
+  `max_arr_ns = 0.400000` (`-max 0.7` then `-max 0.4`; the report shows
+  `0.40 input external delay`) and `min_arr_ns = 0.300000` (`-min 0.1`
+  then `-min 0.3`); `ya` `max_req_ns = 1.600000` (`2.0 − 0.4`) and
+  `min_req_ns = -0.300000` (`0 − 0.3`); `yb` (`0.5 -clock ckb` then
+  `-max 0.3 -clock ckb`) `max_req_ns = 0.700000` (`1.0 − 0.3` — the
+  `-max` rule overwrote the `Both` entry's max half) while
+  `min_req_ns = -0.500000` (`0 − 0.5` — the min half survived,
+  refuting whole-entry overlap removal which would emit `null`).
+  `wns_max_ns = 0.112671`, `wns_min_ns = 0.324670`; `Endpoint: yb`
+  appears once per corner in the full report.
+
+##### Rule implemented
+
+- **`delay_at` same-anchor slots**: a plain rule still prunes
+  different-anchor entries port-wide, and now also strips the covered
+  corner(s) off same-anchor entries via `DelaySense::without` — a
+  `Both` entry degrades to the uncovered corner rather than dropping.
+  `-add_delay` unchanged.
+- **Amendment**: the revision-1 bullet above reads plain rules
+  "`retain` only same-anchor entries then append". The
+  different-anchor half is measured (`t2_clkcor`/`t2_clkcor2`); the
+  same-anchor half was inferred and is now **refuted** — `t2_clkdup`
+  shows last-wins per (clock, corner) slot, not unconditional
+  retention.
+
+##### Test updates
+
+- `delay_anchor_prune_is_port_wide` gained the same-sense cases
+  (`-min` duplicate → `(0, 0.3)`; `Both` under `-max` → min keeps
+  `(1, 0.5)`, max takes `(1, 0.3)`); its earlier asserts stand.
+- `counts_ignored_lib_cell_and_pin_options` `(1.0, 2.0)` → `(2.0,
+  2.0)`; `add_delay_widens_instead_of_summing` second block `(0.4,
+  1.0)` → `(0.8, 0.8)`; `remove_from_collection_subtracts_selections`
+  `(1.0, 2.0)`/`(1.0, 3.0)` → `(2.0, 2.0)`/`(3.0, 3.0)`;
+  `keeps_negative_values_and_the_known_flags` `(-0.5, 1.0)` → `(-0.5,
+  -0.5)` — each comment re-cites `t2_clkdup`.
+- `evaluated` 45 → 46.
+
+##### Lows
+
+- `tests/designs/README.md`: the "all N golden scenarios evaluate"
+  count reattributed — `mc-selectors` (v0.2.5) keeps its feature list;
+  the count (46 = 45 `two_clock` + `t2_latch`) is stated against
+  v0.2.9, with `t2_clkdup` named beside the v0.2.8 additions.
+- `docs/multi-clock.md`: §1.7 anchor bullet gained the same-anchor
+  clause; `set_clock_groups` gained the unknown-name posture bullet
+  (collection `-group` args filter empty on the adopted
+  `clock_rows`/`t2_selunk` posture — unprobed on this command; bare
+  unknown names bail `unknown clock`).
+
+##### Checks run
+
+- `bash tests/designs/sta_clocks/probe.sh` — whole script;
+  `git diff tests/designs/` shows `two_clock.reference.json`
+  append-only (+1 block) plus the new `t2_clkdup.sdc` /
+  `probe_t2_clkdup.txt`; every pre-existing artifact byte-identical.
+- `cargo test --workspace` — 315 + 3 pass, 2 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Fail-proof (E0 rule 7): the slot predicate replaced by unconditional
+  same-anchor retention (the inferred H_acc) → `t2_clkdup` red on the
+  discriminating fields (`u_fa0/D`/`u_fb0/D` `max_arr` 0.7 vs 0.4,
+  `min_arr` 0.1 vs 0.3, `wns_max`/`wns_min` off), restored green.
+
+Version `0.2.8 → 0.2.9` in `[workspace.package]` (`Cargo.lock`
+refreshed by `cargo check`).

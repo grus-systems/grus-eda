@@ -21,8 +21,8 @@ Evidence: `tests/designs/sta_clocks/` — `two_clock.def` (clock domains `cka`
 2.0 ns on `clk1`, `ckb` 1.4/1.0 ns on `clk2`, same-domain and both-direction
 cross-domain paths), `two_clock_latch.def` (a `dlxtn` on `ckb` feeding a
 `ckb` flop — every endpoint same-domain), the `t2_*.sdc` scenario set on
-`two_clock.def` plus `t2_latch.sdc` (45 golden scenarios since the
-`mc-cleanups` revision — 44 on `two_clock` + `t2_latch`; `probe.sh`
+`two_clock.def` plus `t2_latch.sdc` (46 golden scenarios since the
+`mc-cleanups` revision — 45 on `two_clock` + `t2_latch`; `probe.sh`
 also carries `MEASURE_ONLY` evidence scenarios — `t2_eclk`, `t2_nsfrom`,
 `t2_nsto`, `t2_toinv`, `t2_noclk` — that never fold into the golden),
 `probe.sh` (runs OpenSTA in
@@ -193,6 +193,12 @@ Clock selectors anchor on the clocked object, not the clock pin:
   flag errors (STA-0400, `t2_grpn`).
 - A group cut wins over an explicit `set_max_delay` crossing the same
   pair in either file order (`t2_grpd`/`t2_grpd2` both drop `u_fx/D`).
+- Unknown-name posture (adopted, not probed on this command): a
+  `-group [get_clocks no_such]` collection filters to the empty group
+  silently — the `clock_rows`/`t2_selunk` posture, consistent with the
+  measured `-group {}` empty group (`t2_grpe`) — while a
+  bare `-group` name resolving no clock bails `unknown clock`, the
+  `resolve_clock` posture measured on `set_clock_latency`.
 
 `create_clock -waveform` (`t2_wave`, `t2_wave05`, probe-only degenerate
 forms):
@@ -251,13 +257,17 @@ Empty clock collections (`t2_eclk`, `mc-cleanups` probe):
   `unresolved_exception_selectors` — the clock-command no-op posture
   above applies to `set_clock_*` only.
 
-Delay-rule `-clock` anchors (`t2_clkcor`/`t2_clkcor2`, `mc-cleanups`
-revision probe):
+Delay-rule `-clock` anchors (`t2_clkcor`/`t2_clkcor2`/`t2_clkdup`,
+`mc-cleanups` revision probes):
 
 - A port's `set_input_delay`/`set_output_delay` spec is a **list of
   entries**, each `(value, sense, clock)`. A plain (non-`-add_delay`)
   rule prunes the surviving entries anchored to a *different* clock —
-  **port-wide**, both corners — then appends; `-add_delay` appends
+  **port-wide**, both corners — and overwrites the corner(s) it covers
+  on *same-anchor* entries, one (clock, corner) slot per anchor
+  (`t2_clkdup`: `-min 0.1` then `-min 0.3` on `cka` reports the 0.3
+  check; a `Both` entry under a same-clock `-max` rule keeps only its
+  min half) — then appends; `-add_delay` appends
   without pruning. A `-clock`-less plain rule's anchor is "none",
   which differs from every clock, so it prunes every anchored entry
   (that is why `t2_clkcor`'s `d_in`, `-max @cka` then `-min` bare,

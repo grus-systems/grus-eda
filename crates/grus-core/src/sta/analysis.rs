@@ -9734,7 +9734,7 @@ mod tests {
                 "{name}: expected bail `{expected}`, got `{err:#}`"
             );
         }
-        assert_eq!(evaluated, 45, "every scenario must evaluate");
+        assert_eq!(evaluated, 46, "every scenario must evaluate");
     }
 
     /// `mc-cleanups` measure-only scenarios — no golden block; the pinned

@@ -190,6 +190,22 @@ enum DelaySense {
     Max,
 }
 
+impl DelaySense {
+    /// The corners `self` keeps after a rule covering `covered` lands on the
+    /// same anchor — `None` when nothing remains. A `Both` entry under a
+    /// single-corner rule degrades to the uncovered corner rather than
+    /// dropping (measured `t2_clkdup`: `0.5 -clock ckb` then `-max 0.3 -clock
+    /// ckb` keeps the 0.5 min check).
+    fn without(self, covered: DelaySense) -> Option<DelaySense> {
+        match (self, covered) {
+            (DelaySense::Both, DelaySense::Min) => Some(DelaySense::Max),
+            (DelaySense::Both, DelaySense::Max) => Some(DelaySense::Min),
+            (s, c) if s == c || c == DelaySense::Both => None,
+            (s, _) => Some(s),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DelayRule {
     sel: PortSel,
@@ -206,7 +222,9 @@ struct DelayRule {
 /// anchor. An anchored entry is its own check on the anchor clock's grid — a
 /// corner can carry several under different clocks (measured `t2_clkcor2`: a
 /// `-max -clock cka` rule followed by `-max -clock ckb -add_delay` reports
-/// the port once per anchor and the golden keeps the worst slack).
+/// the port once per anchor and the golden keeps the worst slack). Entries
+/// sharing the anchor share per-corner slots: a later plain rule overwrites
+/// the corner(s) it covers (measured `t2_clkdup`).
 #[derive(Clone, Copy, Debug)]
 struct DelayEntry {
     value_ns: f32,
@@ -374,18 +392,29 @@ pub struct Sdc {
 
 /// Folds the rules matching `port` in file order into the surviving entry
 /// list. A rule without `-add_delay` *replaces*: it removes every entry
-/// anchored to a different `-clock` — port-wide, both corners — then appends
-/// its own (measured `t2_clkcor`: a `-clock`-less `-min` after `-max -clock
-/// cka` leaves no anchored entry on either corner, so the port times
-/// nowhere; `t2_clkcor2` in the opposite order leaves only the later
-/// anchored entry). `-add_delay` appends without pruning (measured
-/// `t2_clkcor2`'s `yb`). `-min`/`-max` rules cover one corner; the
-/// unflagged form writes both.
+/// anchored to a different `-clock` — port-wide, both corners (measured
+/// `t2_clkcor`: a `-clock`-less `-min` after `-max -clock cka` leaves no
+/// anchored entry on either corner, so the port times nowhere; `t2_clkcor2`
+/// in the opposite order leaves only the later anchored entry) — and
+/// overwrites the corner(s) it covers on same-anchor entries, one
+/// (clock, corner) slot per anchor (measured `t2_clkdup`: `-max 0.7` then
+/// `-max 0.4` on `cka` reports the 0.4 check; a `Both` entry under a `-max`
+/// rule keeps only its min half). `-add_delay` appends without pruning
+/// (measured `t2_clkcor2`'s `yb`). `-min`/`-max` rules cover one corner;
+/// the unflagged form writes both.
 fn delay_at(rules: &[DelayRule], port: &str, is_input: bool, sdc: &Sdc) -> Vec<DelayEntry> {
     let mut entries = Vec::new();
     for r in rules.iter().filter(|r| r.sel.matches(port, is_input, sdc)) {
         if !r.add {
-            entries.retain(|e: &DelayEntry| e.clock == r.clock);
+            entries = entries
+                .into_iter()
+                .filter_map(|e: DelayEntry| {
+                    if e.clock != r.clock {
+                        return None; // different anchor: pruned port-wide (t2_clkcor)
+                    }
+                    e.sense.without(r.sense).map(|sense| DelayEntry { sense, ..e })
+                })
+                .collect();
         }
         entries.push(DelayEntry {
             value_ns: r.value_ns,
@@ -2851,10 +2880,10 @@ mod tests {
         ))
         .unwrap();
         // The restrictions are dropped, so the delays still apply to every
-        // selected port — as a second entry beside GCD's, folding each
-        // corner's worst check (min 1.0, max 2.0).
+        // selected port — overwriting the same-anchor (clock, corner) slot
+        // GCD's rules hold (measured `t2_clkdup`).
         assert_eq!(sdc.input_delay_ns("req_val"), (1.0, 1.0));
-        assert_eq!(sdc.output_delay_ns("resp_val"), (1.0, 2.0));
+        assert_eq!(sdc.output_delay_ns("resp_val"), (2.0, 2.0));
         assert_eq!(sdc.ignored_options["-lib_cell"], 1);
         assert_eq!(sdc.ignored_options["-pin"], 2);
         assert_eq!(sdc.commands, 7);
@@ -2978,9 +3007,10 @@ mod tests {
         .unwrap();
         assert_eq!(sdc.input_delay_ns("a"), (0.4, 1.0));
 
-        // A later plain rule does not reset the fold: it only prunes entries
-        // anchored to a different `-clock` (measured `t2_int`/`t2_clkcor`), so
-        // same-anchor entries survive and the new value appends beside them.
+        // A later plain rule prunes entries anchored to a different `-clock`
+        // (measured `t2_clkcor`) and overwrites same-anchor slots
+        // (measured `t2_clkdup`), so the accumulated `-add_delay` entries are
+        // gone and only the plain 0.8 survives.
         let sdc = parse_sdc(&format!(
             "{GCD}\
              set_input_delay 1.0 -add_delay -clock core_clk [get_ports {{a}}]\n\
@@ -2988,13 +3018,15 @@ mod tests {
              set_input_delay 0.8 -clock core_clk [get_ports {{a}}]\n"
         ))
         .unwrap();
-        assert_eq!(sdc.input_delay_ns("a"), (0.4, 1.0));
+        assert_eq!(sdc.input_delay_ns("a"), (0.8, 0.8));
     }
 
-    /// The `t2_clkcor*` measured rule: a port's delay spec is an entry list —
-    /// a plain (non-`-add_delay`) rule removes entries anchored to a different
-    /// `-clock`, port-wide, then appends its own; `-add_delay` appends without
-    /// pruning. Each anchored entry is a check on its own clock's grid.
+    /// The `t2_clkcor*`/`t2_clkdup` measured rule: a port's delay spec is an
+    /// entry list — a plain (non-`-add_delay`) rule removes entries anchored
+    /// to a different `-clock`, port-wide, and overwrites the corner(s) it
+    /// covers on same-anchor entries, then appends its own; `-add_delay`
+    /// appends without pruning. Each anchored entry is a check on its own
+    /// clock's grid.
     #[test]
     fn delay_anchor_prune_is_port_wide() {
         // `-clock`d `-max` then a bare `-min`: the bare rule clears the
@@ -3044,6 +3076,34 @@ mod tests {
         assert_eq!(
             sdc.declared_input_clock_rows("a"),
             [vec![(0, 0.1)], vec![(0, 0.7)]]
+        );
+        // Same-clock *same-sense* duplicates overwrite per (clock, corner)
+        // slot — last wins, not worst-fold (measured `t2_clkdup`: `d_in`'s
+        // `-min 0.1` then `-min 0.3` reports the 0.3 check).
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_input_delay -min 0.1 -clock cka [get_ports {{a}}]\n\
+            set_input_delay -min 0.3 -clock cka [get_ports {{a}}]\n\
+            set_input_delay -max 0.7 -clock cka [get_ports {{a}}]\n\
+            set_input_delay -max 0.4 -clock cka [get_ports {{a}}]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            sdc.declared_input_clock_rows("a"),
+            [vec![(0, 0.3)], vec![(0, 0.4)]]
+        );
+        // A `Both` entry under a same-clock `-max` rule degrades to the
+        // uncovered corner rather than dropping (`t2_clkdup`'s `yb` keeps
+        // the 0.5 min check while the max slot takes 0.3).
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_output_delay 0.5 -clock ckb [get_ports {{y}}]\n\
+            set_output_delay -max 0.3 -clock ckb [get_ports {{y}}]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            sdc.declared_output_clock_rows("y"),
+            [vec![(1, 0.5)], vec![(1, 0.3)]]
         );
     }
 
@@ -3283,17 +3343,17 @@ mod tests {
              set_output_delay 3.0 -clock core_clk [remove_from_collection [get_ports {{resp_val resp_msg[0]}}] [get_ports {{resp_msg[0]}}]]\n"
         ))
         .unwrap();
-        // The new rule appends beside GCD's same-clock entry — the
-        // per-corner fold reports the worst check (min 1.0, max 2.0/3.0),
-        // not a last-wins overwrite.
-        assert_eq!(sdc.input_delay_ns("reset"), (1.0, 2.0));
-        assert_eq!(sdc.input_delay_ns("req_msg[0]"), (1.0, 2.0));
+        // The new rule overwrites the same-anchor (clock, corner) slots
+        // GCD's rules hold (measured `t2_clkdup`), so the selected ports
+        // report the new value on both corners.
+        assert_eq!(sdc.input_delay_ns("reset"), (2.0, 2.0));
+        assert_eq!(sdc.input_delay_ns("req_msg[0]"), (2.0, 2.0));
         assert_eq!(
             sdc.input_delay_ns("req_val"),
             (1.0, 1.0),
             "req_val was removed"
         );
-        assert_eq!(sdc.output_delay_ns("resp_val"), (1.0, 3.0));
+        assert_eq!(sdc.output_delay_ns("resp_val"), (3.0, 3.0));
         assert_eq!(
             sdc.output_delay_ns("resp_msg[0]"),
             (1.0, 1.0),
@@ -3339,9 +3399,9 @@ mod tests {
             "{GCD}set_input_delay -0.5 -clock core_clk [all_inputs -no_clocks]\n"
         ))
         .unwrap();
-        // The negative value lands as a second entry beside GCD's 1.0 —
-        // the fold keeps the min corner's worst (earliest) delay.
-        assert_eq!(sdc.input_delay_ns("req_val"), (-0.5, 1.0));
+        // The negative value overwrites the same-anchor slot GCD's 1.0
+        // holds on both corners (measured `t2_clkdup`).
+        assert_eq!(sdc.input_delay_ns("req_val"), (-0.5, -0.5));
         let sdc = parse_sdc(&format!("{GCD}set_clock_uncertainty 0.1\n")).unwrap();
         assert_eq!(sdc.setup_uncertainty_ns(), 0.1);
         assert_eq!(sdc.hold_uncertainty_ns(), 0.1);
