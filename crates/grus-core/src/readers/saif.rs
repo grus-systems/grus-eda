@@ -102,7 +102,10 @@ fn tokenize(text: &str) -> Result<Vec<Sexpr>> {
             b'"' => {
                 // `\` escapes the next byte inside quotes, same convention
                 // as atoms: \" and \\ cannot terminate the string early.
-                let mut s = String::new();
+                // Bytes accumulate verbatim and decode as UTF-8 — a
+                // per-byte `char` cast would mojibake every multibyte
+                // name (the input is `&str`, so decoding cannot fail).
+                let mut s = Vec::new();
                 i += 1;
                 loop {
                     if i == bytes.len() {
@@ -115,18 +118,20 @@ fn tokenize(text: &str) -> Result<Vec<Sexpr>> {
                             if i == bytes.len() {
                                 bail!("SAIF: unterminated quoted string");
                             }
-                            s.push(bytes[i] as char);
+                            s.push(bytes[i]);
                         }
-                        b => s.push(b as char),
+                        b => s.push(b),
                     }
                     i += 1;
                 }
-                stack.last_mut().unwrap().push(Sexpr::Atom(s));
+                stack.last_mut().unwrap().push(Sexpr::Atom(
+                    String::from_utf8(s).context("SAIF: non-UTF-8 string")?,
+                ));
                 i += 1;
             }
             c if c.is_ascii_whitespace() => i += 1,
             _ => {
-                let mut atom = String::new();
+                let mut atom = Vec::new();
                 while i < bytes.len() {
                     let b = bytes[i];
                     if b.is_ascii_whitespace() || b == b'(' || b == b')' {
@@ -137,13 +142,15 @@ fn tokenize(text: &str) -> Result<Vec<Sexpr>> {
                         if i == bytes.len() {
                             break;
                         }
-                        atom.push(bytes[i] as char);
+                        atom.push(bytes[i]);
                     } else {
-                        atom.push(b as char);
+                        atom.push(b);
                     }
                     i += 1;
                 }
-                stack.last_mut().unwrap().push(Sexpr::Atom(atom));
+                stack.last_mut().unwrap().push(Sexpr::Atom(
+                    String::from_utf8(atom).context("SAIF: non-UTF-8 atom")?,
+                ));
             }
         }
     }
@@ -160,7 +167,7 @@ fn head_name(list: &[Sexpr]) -> Option<&str> {
     }
 }
 
-/// `(TIMESCALE <num> <unit>)` — same unit set as the VCD reader.
+/// `(TIMESCALE <int> <unit>)` — same unit set as the VCD reader.
 fn parse_saif_timescale(items: &[Sexpr]) -> Result<f64> {
     let (Some(Sexpr::Atom(num)), Some(Sexpr::Atom(unit))) = (items.get(1), items.get(2)) else {
         bail!("malformed SAIF TIMESCALE");
@@ -174,10 +181,16 @@ fn parse_saif_timescale(items: &[Sexpr]) -> Result<f64> {
         "fs" => 1e-15,
         _ => bail!("unsupported SAIF timescale unit `{unit}`"),
     };
-    let ticks: f64 = num
-        .parse()
-        .with_context(|| format!("bad SAIF timescale `{num}`"))?;
-    Ok(ticks * scale)
+    // The grammar says <int>, same triage as DURATION.
+    let ticks: u64 = match num.parse::<u64>() {
+        Ok(t) => t,
+        Err(_) => match num.parse::<f64>() {
+            Ok(f) if f < 0.0 => bail!("negative SAIF timescale `{num}`"),
+            Ok(_) => bail!("SAIF timescale must be an integer, found `{num}`"),
+            Err(_) => bail!("bad SAIF timescale `{num}`"),
+        },
+    };
+    Ok(ticks as f64 * scale)
 }
 
 /// One signal entry `(<name> (FIELD value) ...)` inside a `NET`/`PORT` group.
@@ -209,8 +222,11 @@ fn parse_signal(items: &[Sexpr]) -> Result<(String, SaifFields)> {
             "TB" => f.tb = number()?,
             "TC" | "IG" => {
                 let v = number()?;
-                if v.fract() != 0.0 || v < 0.0 {
-                    bail!("fractional SAIF {key} value `{val}` for signal `{name}`");
+                if v < 0.0 {
+                    bail!("negative SAIF {key} value `{val}` for signal `{name}`");
+                }
+                if v.fract() != 0.0 {
+                    bail!("non-integral SAIF {key} value `{val}` for signal `{name}`");
                 }
                 if key == "TC" {
                     f.tc = v as u64;
@@ -279,10 +295,16 @@ pub fn parse_saif(text: &str) -> Result<SaifActivity> {
                 };
                 // The grammar says <int> and OpenSTA rejects (DURATION
                 // 1990.0); any float literal or negative is a hard error.
-                duration = Some(
-                    v.parse::<u64>()
-                        .with_context(|| format!("bad SAIF DURATION `{v}`"))?,
-                );
+                // The f64 triage names a numeric-but-non-integer literal
+                // separately from a non-numeric token.
+                duration = Some(match v.parse::<u64>() {
+                    Ok(d) => d,
+                    Err(_) => match v.parse::<f64>() {
+                        Ok(f) if f < 0.0 => bail!("negative SAIF DURATION `{v}`"),
+                        Ok(_) => bail!("SAIF DURATION must be an integer, found `{v}`"),
+                        Err(_) => bail!("bad SAIF DURATION `{v}`"),
+                    },
+                });
             }
             Some("INSTANCE") => roots.push(parse_instance(list)?),
             _ => {}
@@ -581,17 +603,50 @@ mod tests {
         let text = saif(
             "(INSTANCE dut (NET (clk (T0 0) (T1 0) (TC 4.5))))",
         );
-        assert!(parse_saif(&text).is_err());
+        let err = match parse_saif(&text) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("fractional TC accepted"),
+        };
+        assert!(err.contains("non-integral SAIF TC value `4.5`"), "{err}");
+    }
+
+    #[test]
+    fn test_negative_tc_is_error() {
+        let text = saif("(INSTANCE dut (NET (clk (T0 0) (T1 0) (TC -3))))");
+        let err = match parse_saif(&text) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("negative TC accepted"),
+        };
+        assert!(err.contains("negative SAIF TC value `-3`"), "{err}");
     }
 
     #[test]
     fn test_fractional_duration_is_error() {
         // The grammar says (DURATION <int>) and OpenSTA rejects a float
-        // literal — even an integral-valued one.
-        for v in ["1980.5", "1980.0", "-5"] {
+        // literal — even an integral-valued one. Each rejection names the
+        // actual kind: non-integer numeric, negative, non-numeric.
+        for (v, expected) in [
+            ("1980.5", "SAIF DURATION must be an integer, found `1980.5`"),
+            ("1980.0", "SAIF DURATION must be an integer, found `1980.0`"),
+            ("-5", "negative SAIF DURATION `-5`"),
+            ("abc", "bad SAIF DURATION `abc`"),
+        ] {
             let text = format!("(SAIFILE (TIMESCALE 1 ns) (DURATION {v}) (INSTANCE dut))");
-            assert!(parse_saif(&text).is_err(), "DURATION {v} accepted");
+            let err = match parse_saif(&text) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("DURATION {v} accepted"),
+            };
+            assert!(err.contains(expected), "DURATION {v}: {err}");
         }
+    }
+
+    #[test]
+    fn test_utf8_net_name() {
+        // A multibyte name survives verbatim — the tokenizer used to map
+        // each UTF-8 byte to its own char and mojibake the name.
+        let text = saif("(INSTANCE dut (NET (büße (T0 0) (T1 0) (TC 4))))");
+        let act = parse_saif(&text).expect("parse");
+        assert_eq!(act.roots[0].signals[0].0, "büße");
     }
 
     #[test]

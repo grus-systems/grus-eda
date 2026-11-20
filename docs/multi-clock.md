@@ -20,8 +20,12 @@ sequence complete, this document is the measured-rules record.
 Evidence: `tests/designs/sta_clocks/` — `two_clock.def` (clock domains `cka`
 2.0 ns on `clk1`, `ckb` 1.4/1.0 ns on `clk2`, same-domain and both-direction
 cross-domain paths), `two_clock_latch.def` (a `dlxtn` on `ckb` feeding a
-`ckb` flop — every endpoint same-domain), fifteen `t2_*.sdc` scenarios on
-`two_clock.def` plus `t2_latch.sdc`, `probe.sh` (runs OpenSTA in
+`ckb` flop — every endpoint same-domain), the `t2_*.sdc` scenario set on
+`two_clock.def` plus `t2_latch.sdc` (46 golden scenarios since the
+`mc-cleanups` revision — 45 on `two_clock` + `t2_latch`; `probe.sh`
+also carries `MEASURE_ONLY` evidence scenarios — `t2_eclk`, `t2_nsfrom`,
+`t2_nsto`, `t2_toinv`, `t2_noclk` — that never fold into the golden),
+`probe.sh` (runs OpenSTA in
 `ghcr.io/librelane/librelane:3.0.16`), `two_clock.reference.json` +
 `two_clock_latch.reference.json` + `probe_*.txt` (byte-identical on re-run).
 Raw numbers and the grus-eda break table are in `docs/results.md`
@@ -60,8 +64,9 @@ Integer ratio 2.0/1.0 (`t2_int`): B→A reports launch **1.0** → capture 2.0
 (Δ1.0), not edge 0 (Δ2.0) — the min-gap pair wins even with equal grids.
 
 Hold pairs stay on coincident launch/capture edges (edge 0 in every
-scenario here); no cross-domain hold pair selection beyond the coincident
-grid was exercised.
+scenario here); the coincident-grid rule was later refined — under
+`-waveform` phase shifts the hold pair is the *minimum-gap* pair, not
+coincidence-only (§1.7, `t2_wave`).
 
 ### 1.3 Uncertainty is per-clock, capture-side; `-from`/`-to` overrides pairing-wise
 
@@ -188,6 +193,12 @@ Clock selectors anchor on the clocked object, not the clock pin:
   flag errors (STA-0400, `t2_grpn`).
 - A group cut wins over an explicit `set_max_delay` crossing the same
   pair in either file order (`t2_grpd`/`t2_grpd2` both drop `u_fx/D`).
+- Unknown-name posture (adopted, not probed on this command): a
+  `-group [get_clocks no_such]` collection filters to the empty group
+  silently — the `clock_rows`/`t2_selunk` posture, consistent with the
+  measured `-group {}` empty group (`t2_grpe`) — while a
+  bare `-group` name resolving no clock bails `unknown clock`, the
+  `resolve_clock` posture measured on `set_clock_latency`.
 
 `create_clock -waveform` (`t2_wave`, `t2_wave05`, probe-only degenerate
 forms):
@@ -210,6 +221,106 @@ forms):
   instants accepted in OpenSTA (`t2_wave4`; here a named bail — the
   model is the rise/fall pair), instants past the period accepted and
   wrapped (`t2_wavebig` `{0 2.5}` on 2.0).
+- Post-wrap order is kept, not sorted (`t2_waverot`/`t2_wavez`,
+  `mc-cleanups` probe 2026-11-20, golden scenarios since the
+  revision): `{1.9 2.1}` on period 2.0 wraps to `[1.9, 0.1]` and
+  `{0 2.0}` to `[0, 0]` — both accepted, the wrapped second instant
+  staying behind the first.
+
+Empty clock collections (`t2_eclk`, `mc-cleanups` probe):
+
+- `[get_clocks {}]` is a valid empty collection — a silent no-op on
+  `set_clock_latency`/`-uncertainty`/`-transition`/
+  `set_propagated_clock`, no warning, table identical to `t2_int`.
+- `[get_clocks no_such]` warns once `STA-0351 clock 'no_such' not
+  found.` and applies to the remaining rows (here: none — still the
+  full table).
+- `[get_clocks]` with no argument returns every declared clock
+  (`t2_eclk2`, committed golden — every `clock …` line shifts +0.5 of
+  `set_clock_latency`, both domains).
+- `set_clock_uncertainty` needs `-from` and `-to` **together**: a lone
+  side aborts `read_sdc` with `STA-0421 -from/-to must be used
+  together` (`t2_eclk3` lone `-from`, `t2_eclk4` lone `-to` — split
+  out so each error-prone form sits in tail position). A paired empty
+  side (`-from cka -to [get_clocks {}]`, `t2_eclk` line 17) records
+  no rule and warns nothing — the `t2_int` table is unchanged.
+- `set_propagated_clock [get_clocks no_such]` (`t2_eclk` line 18)
+  warns `STA-0351 clock 'no_such' not found.` and drops the name —
+  the same filtered-collection posture as `set_clock_latency`.
+  Collection-sourced names that resolve to neither a clock `-name`
+  nor a source port drop silently in our model; the `STA-0351`
+  warning text itself is unmodelled.
+- `unset_propagated_clock [get_clocks {}]` (`t2_eclk` line 19) is a
+  silent no-op.
+- In **exception** selectors (`set_false_path`/`-to` etc.), an empty
+  clock collection resolves to zero objects and counts in
+  `unresolved_exception_selectors` — the clock-command no-op posture
+  above applies to `set_clock_*` only.
+
+Delay-rule `-clock` anchors (`t2_clkcor`/`t2_clkcor2`/`t2_clkdup`,
+`mc-cleanups` revision probes):
+
+- A port's `set_input_delay`/`set_output_delay` spec is a **list of
+  entries**, each `(value, sense, clock)`. A plain (non-`-add_delay`)
+  rule prunes the surviving entries anchored to a *different* clock —
+  **port-wide**, both corners — and overwrites the corner(s) it covers
+  on *same-anchor* entries, one (clock, corner) slot per anchor
+  (`t2_clkdup`: `-min 0.1` then `-min 0.3` on `cka` reports the 0.3
+  check; a `Both` entry under a same-clock `-max` rule keeps only its
+  min half) — then appends; `-add_delay` appends
+  without pruning. A `-clock`-less plain rule's anchor is "none",
+  which differs from every clock, so it prunes every anchored entry
+  (that is why `t2_clkcor`'s `d_in`, `-max @cka` then `-min` bare,
+  loses **both** corners; the remaining unanchored entry times no
+  path per the `-clock`-less rule above).
+- Each surviving anchored entry is its own check — `t2_clkcor2`'s `yb`
+  (`-max @cka` plain then `-max @ckb -add_delay`) reports max-side
+  required times under **both** `cka` and `ckb`; the reported row is
+  the last anchor's (`ckb`), `wns`/`tns`/violation counts see the
+  worst (`cka`, slack −0.287).
+- A corner whose entries all get pruned produces no check on that
+  corner only: `t2_clkcor`'s `d_in` (`-max @cka` then `-min` bare) is
+  untimed on both corners, while `t2_clkcor2`'s `d_in` (`-min` bare
+  then `-max @cka`) times the max corner and emits `null` on every
+  min-side field.
+- Limitation: a `-from`/`-to` clock selector matching a split-anchor
+  port (one corner on `cka`, the other on `ckb`) cuts at pin
+  granularity — the cut cannot be corner-granular.
+
+Invalid `-to` objects (`t2_toinv`, `mc-cleanups` probe):
+
+- Every resolved-but-invalid `-to` name warns once per command line,
+  `STA-1551 <file> line N, '<name>' is not a valid endpoint.` — bare
+  input port (`clk2`, `d_in`), `[get_ports clk2]`, and non-endpoint
+  cell pins (`u_fa0/Q`, `u_clka/A`) all warn. A true endpoint pin
+  (`u_fa1/D`) is silent (and cut — the control), and a resolved cell
+  (`u_buf`) warns nothing even when it owns no endpoint pin.
+- The rule is still dead on every warning — timing continues.
+
+Namespace priority on a bare-name collision (`t2_nsfrom`/`t2_nsto`,
+`mc-cleanups` probe — unnamed `create_clock`s, so `clk1`/`clk2` are
+both clock names and port names):
+
+- The **clock** object wins: `-from clk1` covers the `clk1` row's
+  launches (the `t2_selfa`-equivalent cut — `u_fa0`, `u_fa1`, `d_in`,
+  `ya`, `u_fx` paths gone, the ckb-domain checks stay), no warning.
+- `-to clk2` likewise covers the `clk2` captures — no `STA-1551` even
+  though the same name is also an input port: OpenSTA never looks at
+  the port object once the clock name matches.
+- Contrast with `t2_selport`/`t2_selpto`: there `clk1`/`clk2` are
+  **not** clock `-name`s (the clocks are `cka`/`ckb`), so the port
+  resolves — dead `-from`, `STA-1551` on `-to`.
+
+`-clock`-less I/O delays (`t2_noclk`, `mc-cleanups` probe — cka on
+`-waveform {0.3 1.7}`, `set_input_delay`/`set_output_delay` written
+without `-clock`):
+
+- The port produces **no timing path at all**: `d_in` never appears as
+  a startpoint and `ya` never as an endpoint — no fall-back to the
+  first design clock, no `0.0`-edge anchor. The clock-less rules are
+  recorded but inert, and an input port carrying only clock-less rules
+  still drives slew physically (`set_input_transition` propagates
+  through its net for `sta_pin_slews`/power).
 
 ## 2. Where grus-eda stands (after `mc-golden`, 2026-11-20)
 

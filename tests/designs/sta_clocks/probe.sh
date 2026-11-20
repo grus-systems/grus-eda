@@ -64,28 +64,34 @@ proc collect_endpoints_json {} {
     array set max_req {}
     array set max_slack {}
     array set max_slew {}
+    array set min_arr {}
+    array set min_req {}
+    array set min_slack {}
+    array set min_slew {}
     set pins {}
 
     set paths_max [find_timing_paths -path_delay max -endpoint_path_count 1 -group_path_count 100000]
     foreach pe \$paths_max {
         set name [get_full_name [\$pe pin]]
         set v [\$pe vertex]
-        lappend pins \$name
+        if {[info exists max_arr(\$name)] == 0} {
+            lappend pins \$name
+        }
         set max_arr(\$name) [format "%.6f" [sta::time_sta_ui [\$pe data_arrival_time]]]
         set max_req(\$name) [format "%.6f" [sta::time_sta_ui [\$pe data_required_time]]]
         set max_slack(\$name) [format "%.6f" [sta::time_sta_ui [\$pe slack]]]
         set max_slew(\$name) [format "%.6f" [sta::time_sta_ui [\$v slew [\$pe end_transition] max]]]
     }
 
-    array set min_arr {}
-    array set min_req {}
-    array set min_slack {}
-    array set min_slew {}
-
+    # A mixed-anchor scenario produces corner-only endpoints: `pins` is the
+    # union of both passes and an absent corner serializes as `null`.
     set paths_min [find_timing_paths -path_delay min -endpoint_path_count 1 -group_path_count 100000]
     foreach pe \$paths_min {
         set name [get_full_name [\$pe pin]]
         set v [\$pe vertex]
+        if {[info exists max_arr(\$name)] == 0 && [info exists min_arr(\$name)] == 0} {
+            lappend pins \$name
+        }
         set min_arr(\$name) [format "%.6f" [sta::time_sta_ui [\$pe data_arrival_time]]]
         set min_req(\$name) [format "%.6f" [sta::time_sta_ui [\$pe data_required_time]]]
         set min_slack(\$name) [format "%.6f" [sta::time_sta_ui [\$pe slack]]]
@@ -95,7 +101,16 @@ proc collect_endpoints_json {} {
     set sorted_pins [lsort -dictionary \$pins]
     set entries {}
     foreach name \$sorted_pins {
-        lappend entries "      {\"pin\": \"\$name\", \"max_arr_ns\": \$max_arr(\$name), \"max_req_ns\": \$max_req(\$name), \"max_slack_ns\": \$max_slack(\$name), \"max_slew_ns\": \$max_slew(\$name), \"min_arr_ns\": \$min_arr(\$name), \"min_req_ns\": \$min_req(\$name), \"min_slack_ns\": \$min_slack(\$name), \"min_slew_ns\": \$min_slew(\$name)}"
+        set fields {}
+        foreach {key tbl} [list max_arr_ns max_arr max_req_ns max_req max_slack_ns max_slack max_slew_ns max_slew min_arr_ns min_arr min_req_ns min_req min_slack_ns min_slack min_slew_ns min_slew] {
+            upvar 0 \$tbl t
+            if {[info exists t(\$name)]} {
+                lappend fields "\"\$key\": \$t(\$name)"
+            } else {
+                lappend fields "\"\$key\": null"
+            }
+        }
+        lappend entries "      {\"pin\": \"\$name\", [join \$fields ", "]}"
     }
     return [join \$entries ",\n"]
 }
@@ -184,7 +199,7 @@ exit
 EOF
 }
 
-SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05 t2_selbare t2_selac t2_selunion t2_selunk t2_selport t2_selpto t2_grp1 t2_grpe t2_grpb t2_wavebig"
+SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05 t2_selbare t2_selac t2_selunion t2_selunk t2_selport t2_selpto t2_grp1 t2_grpe t2_grpb t2_wavebig t2_eclk2 t2_clkcor t2_clkcor2 t2_waverot t2_wavez t2_clkdup"
 
 for name in $SCENARIOS; do
     run_sta "two_clock.def" "$name.sdc" "ref_$name.json"
@@ -195,11 +210,25 @@ done
 # t2_grpn (missing mode flag) / t2_wave3 (odd instant count) / t2_waverev
 # (non-increasing instants) are SDC errors in OpenSTA and named bails in ours;
 # t2_wave4 (>2 instants) is accepted by OpenSTA but a deliberate named bail in
-# ours. `run_report` records the outcome ("SDC error:" or a table) without
+# ours. t2_eclk3/t2_eclk4 pin the `set_clock_uncertainty` `-from`/`-to` pairing
+# rule: OpenSTA aborts with STA-0421 when exactly one side is given.
+# `run_report` records the outcome ("SDC error:" or a table) without
 # folding a ref_*.json block into two_clock.reference.json.
-PROBE_ONLY="t2_grpn t2_wave3 t2_wave4 t2_waverev"
+PROBE_ONLY="t2_grpn t2_wave3 t2_wave4 t2_waverev t2_eclk3 t2_eclk4"
 
 for name in $PROBE_ONLY; do
+    run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
+done
+
+# Measure-only scenarios: pin OpenSTA behaviour for the mc-cleanups items —
+# run_report only, so no ref_*.json is folded into two_clock.reference.json
+# (the golden stays byte-identical by construction). t2_eclk: empty clock
+# collections on set_clock_*; t2_toinv: resolved-but-invalid -to objects;
+# t2_nsfrom/t2_nsto: bare name colliding with an unnamed clock's name;
+# t2_noclk: -clock-less I/O delay under -waveform.
+MEASURE_ONLY="t2_eclk t2_nsfrom t2_nsto t2_toinv t2_noclk"
+
+for name in $MEASURE_ONLY; do
     run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
 done
 

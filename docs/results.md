@@ -3186,6 +3186,26 @@ the literals `"A"`/`"!A"`, all on `Z` with `related_pin` = the enable pin.
 (up to ~8 literals, e.g. `!A&TE_B`, DFF `IQ` state vars) plus the non-pin
 literals `SHORT`/`DIODE`. `timing` `when`: none.
 
+Commands actually run (re-verified 2026-11-20, macOS `awk` — the
+`internal`/`leakage` one-liner reproduces 26/6244 verbatim):
+
+```bash
+LIB=$HOME/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+awk '/^[[:space:]]*internal_power *\(/ {ip=1; lp=0}
+     /^[[:space:]]*leakage_power *\(/ {ip=0; lp=1}
+     ip && /when[[:space:]]*:/ {ipn++}
+     lp && /when[[:space:]]*:/ {lpn++}
+     END {print "internal", ipn, "leakage", lpn}' "$LIB"
+# -> internal 26 leakage 6244
+
+# per-cell attribution of the 26 `internal_power` `when`s:
+awk '/^[[:space:]]*cell *\("/ { sub(/.*cell *\("/, ""); sub(/".*/, ""); cell=$0 }
+     /^[[:space:]]*internal_power *\(/ {ip=1; lp=0}
+     /^[[:space:]]*leakage_power *\(/ {ip=0; lp=1}
+     ip && /when[[:space:]]*:/ {print cell}' "$LIB" | sort | uniq -c | sort -rn
+# -> 2 per cell across the 13 cells listed above
+```
+
 #### Measured OpenSTA activity model (`get_property $pin activity`)
 
 `<rate/s> <P(1)> <source>`: clean 0↔1 edges count 1.0 toggle, x/z-involved
@@ -3623,11 +3643,12 @@ and keeps the worst slack:
 
 #### Cross-domain comparison vs OpenSTA (`test_sta_clocks_match_opensta`)
 
-All 15 parseable `t2_*` scenarios on `two_clock.def` plus `t2_latch` on
+All 14 parseable `t2_*` scenarios on `two_clock.def` plus `t2_latch` on
 `two_clock_latch.def` compare per-endpoint/per-field at `Tol::STRICT`
 (1% rel / 5 ps); `cross_domain_endpoints == 0` on every committed
 scenario, so wns/tns/violation counts compare everywhere. `t2_grp`
-remains parse-gated (`mc-selectors`).
+remains parse-gated (`mc-selectors`) — 15 scenario names total,
+`t2_grp` produced an SDC error and no ref block at this probe.
 
 | scenario | cross-domain rows now evaluated | what it pins |
 |---|---|---|
@@ -3936,3 +3957,381 @@ sequence (`mc-model` → `mc-eval` → `mc-xdomain` → `mc-selectors` →
 - `t2_int` `u_fx/D` `max_req_ns` perturbed +0.1 in the golden: red on
   exactly that field (`u_fx/D.max_req_ns: ours=0.8854457
   ref=0.985446`). `git checkout --` restored, green.
+
+### 2026-11-20 — `mc-cleanups`: measured-behaviour fixes + code/doc nits (v0.2.7)
+
+Cleanup bundle per `kurena/tasks/mc-cleanups/design/` — seven new
+`MEASURE_ONLY` probe scenarios pin OpenSTA's surface for the items
+that needed measurement; everything else is mechanical.
+
+#### Probe run (`probe.sh` whole, `ghcr.io/librelane/librelane:3.0.16`)
+
+`probe.sh` gained a `MEASURE_ONLY` list whose scenarios run
+`run_report` only — no `ref_*.json` block, so the goldens stay
+byte-identical by construction. The whole script re-ran: every
+pre-existing `probe_t2_*.txt` and both `two_clock{,_latch}.reference.json`
+byte-identical; new artifacts are the seven `t2_*.sdc` +
+`probe_t2_*.txt` pairs below.
+
+- **`t2_eclk`** — empty clock collections. `[get_clocks {}]` on
+  `set_clock_latency` (the +0.5 shift is visible on every `clock …`
+  line — applied to zero rows), `set_clock_uncertainty` (the −0.2
+  setup term does not move any req) and `set_clock_transition`
+  (clock-pin slews unchanged): clean output, no warning, the full
+  `t2_int` table. `set_propagated_clock [get_clocks {}]` produces the
+  same clean output — the table proves *no warning* and *no
+  propagated-mode clock lines* appear; whether an apply-to-all would
+  be observable is unmeasured. `[get_clocks no_such]` warns verbatim
+  `[WARNING STA-0351] clock 'no_such' not found.` and continues.
+  `[get_clocks]` with no argument returns every declared clock
+  (committed evidence: `t2_eclk2` below).
+- **`t2_toinv`** — resolved-but-invalid `-to`. Five warnings, one per
+  command line: `[WARNING STA-1551] ... t2_toinv.sdc line 12, 'clk2'
+  is not a valid endpoint.`, line 13 same text for `[get_ports clk2]`,
+  line 14 `'d_in'`, line 15 `'u_fa0/Q'`, line 16 `'u_clka/A'`
+  (non-endpoint pins warn the same). `[get_pins u_fa1/D]` — a true
+  endpoint — is silent and cut (control); `[get_cells u_clka]` warns
+  nothing even though it owns no endpoint pin. The rule is dead on
+  every warning; timing continues.
+- **`t2_nsfrom` / `t2_nsto`** — bare-name collision (unnamed
+  `create_clock`s, so `clk1`/`clk2` are both clock and port names).
+  The **clock object wins**: `-from clk1` cuts the `clk1` row's
+  launches (the `t2_selfa`-equivalent set — `u_fa0`, `u_fa1`, `d_in`,
+  `ya`, `u_fx` gone; ckb-domain checks stay), no warning. `-to clk2`
+  cuts the `clk2` captures, no `STA-1551` — OpenSTA never looks at
+  the port once the clock name matches.
+- **`t2_noclk`** — `-clock`-less `set_input_delay`/`set_output_delay`
+  (cka on `-waveform {0.3 1.7}`): `d_in` never appears as a startpoint
+  and `ya` never as an endpoint — a delay rule with no `-clock`
+  produces **no timed path at all** (re-checked without `-waveform`
+  in an ad-hoc run: same). Not a design-row fallback, not a `0.0`
+  anchor — the path simply does not exist (endpoint count 12 vs 18).
+- **`t2_waverot` / `t2_wavez`** — post-wrap waveforms. `{1.9 2.1}` on
+  period 2.0 is accepted with clock lines `1.90 clock cka (rise
+  edge)` — instants wrap mod period and the wrapped order is kept
+  (`[1.9, 0.1]`), not sorted; `{0 2.0}` collapses to `[0, 0]`.
+
+#### Rules implemented
+
+- **A2** — `get_clocks` evaluates `{}` to `Value::Clocks([])` and no
+  argument to all clocks; `set_clock_latency`/`-transition`/
+  `-uncertainty`/`set_propagated_clock`/`set_clock_groups` resolve
+  collection arguments through `clock_rows` filtering — unknown names
+  drop (the STA-0351 posture), zero rows is a silent no-op. Bare
+  literal clock names keep their strict `unknown clock` bail.
+  Directional `set_clock_uncertainty` with an empty `-from`/`-to`
+  collection records no rule.
+- **A5** — post-wrap `-waveform` instants stored as wrapped
+  (`rem_euclid`), unsorted — the measured `[1.9, 0.1]`/`[0, 0]` keep;
+  the pre-wrap strictly-increasing check stays. New unit test
+  `create_clock_waveform_wrapped_order_kept` pins both wraps
+  (tolerance-based — `0.1` comes out `2.1f32 rem_euclid 2.0 =
+  0.0999999…`).
+- **A7** — `resolve_to` counts resolved-but-invalid `-to` objects in
+  `unresolved_exception_selectors`: a non-output port and a resolved
+  non-endpoint pin each count once, matching the five `STA-1551`
+  warnings; resolved cells stay silent (measured). Field doc updated.
+- **A8** — the clock namespace wins a bare-name collision in
+  `resolve_from`, `resolve_to` and `resolve_delay_from`
+  (`clock_row(name)` checked before the port/cell scan). A clock's
+  *source-port* name is unaffected — `clock_row` matches `-name` only,
+  so `t2_selport`/`t2_selpto` behaviour is unchanged.
+- **A9** — `-clock`-less I/O delays anchor on nothing: an input port
+  whose rules all lack `-clock` seeds **slew only** (new `slew_seeds`
+  merged into `base_state`; no `PortSeed`, no launch), and
+  `collect_endpoints` admits an output port only when
+  `declared_output_clock_row` resolves. The eval's slew propagation
+  was decoupled from arrival reachability to keep this honest: an
+  unreached-but-slew-driven driver still degrades slew onto its net
+  and loads (`!reached && slew_reached` slew-only legs at the net edge
+  and in the arc eval — the same discipline `propagate_slew` already
+  used). Without the decoupling the unclocked input's downstream
+  slews went UNREACHED and `test_when_power_mbw_matches_opensta`
+  failed (Combinational internal `5.3687864e-8` ours vs `5.006255e-8`
+  golden) — the suite caught it; the decoupling restored it.
+
+#### Code nits (no probe)
+
+- **A1** `grid_lcm`: the mid-loop `y <= tol` guard moved to the loop
+  top — the honest statement (defensive on a degenerate `b`;
+  unreachable afterwards since the remainder was just checked
+  `> tol`). Doc notes non-convergence below `tol` returns `None`.
+- **A3** `delay_{max,min}_pins` and `ResolvedPathDelay::from_pins`:
+  last-wins wholesale folding documented — a later covering rule's
+  `from_pins` (including `None`) replaces the set.
+- **A4** the `PROBE_ONLY` loop asserts each scenario's expected bail
+  substring, not bare `is_err()`.
+- **A6** `sta_evaluates_two_clock_same_domain` audit — no-op: renamed
+  in v0.2.3, `rg same_domain` finds no residual misnomer.
+  Hold-pairing comment restated to the min-gap rule (the
+  non-coincident-pair wording was stale since `t2_wave`);
+  `SkippedEndpoint`'s count list covers `cross_domain_endpoints`.
+- **A10** `saif.rs`: `DURATION`/`TIMESCALE` report integer-required
+  errors (`SAIF DURATION must be an integer`), negative vs fractional
+  values split into separate messages, and the tokenizer accumulates
+  `Vec<u8>` with `String::from_utf8` at atom close — UTF-8 names
+  round-trip instead of mangling byte-wise. New tests: `1990.0` /
+  `abc` / `-5` DURATION battery, negative `T0`, UTF-8 net name.
+
+#### Docs
+
+- **D1** `docs/timing-exceptions.md`: `unresolved_load_selectors`,
+  `unsupported_path_delay_endpoints` and `cross_domain_endpoints`
+  bullets added; the selector bullet now records `STA-1551`-class
+  `-to` counting and the clock-wins namespace rule.
+- **D2** this file: "15 parseable" → "14 parseable + `t2_grp`
+  parse-gated" in the `mc-xdomain` entry; the when-power `awk`
+  invocation recorded verbatim in the v0.1.97 entry — re-run today:
+  `internal 26 leakage 6244`, and the per-cell variant confirms 2
+  `when`s on each of the 13 cells. saif-power checks-run audit —
+  **no-op**: the v0.1.96 entry already records `cargo test
+  --workspace`, clippy, the `--saif` end-to-end and the
+  `generate_saif_ref.sh` re-run.
+- **D3** `tests/designs/README.md`: `sta_exceptions`, `microbench`
+  and `repro_extreme_ceff` entries (verified against the directory
+  contents — `exceptions.def`, `generate_ref.sh`,
+  `generate_saif_ref.sh`/`generate_when_ref.sh`/`vcd2saif.py`,
+  `repro.tcl`/`sweep_reference.txt`).
+- **D4** `power.rs`: `driven_nets_without_activity` doc records that
+  the same unannotated nets also make `when` literals inexpressible
+  (counted in `conditional_power_blocks`) — the meaning change since
+  v0.1.97.
+- **D5** `t2_mdx` description audit — **no-op**: `fixture.md` already
+  reads "pin-startpoint `-from`"; `rg 'rewrite|both sides'` across
+  `kurena/tasks/*/design/` and `docs/` found only correct usages of
+  "delay-check rewrite".
+- **D6** `docs/multi-clock.md`: the scenario count reworded (40
+  golden + `MEASURE_ONLY`), §1.2's hold note points at §1.7's
+  min-gap finding, §1.7 gains the five new measured rules above.
+
+#### Checks run
+
+- `bash tests/designs/sta_clocks/probe.sh` — whole script; `git diff`
+  on `tests/designs/` shows only the seven new `t2_*.sdc` +
+  `probe_t2_*.txt` pairs, every pre-existing artifact byte-identical.
+- `cargo test --workspace` — 314 + 3 pass, 2 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Fail-proof mutations (E0 rule 7; each confirmed red, then reverted):
+  clock-wins priority disabled → `t2_nsfrom` reads the full dead-rule
+  table instead of `["u_fb1/D","u_fy/D","yb"]`; `-clock` gate forced
+  open → `t2_noclk` regains `u_fa0/D`; `t2_wave3`'s expected substring
+  swapped for `t2_waverev`'s → the named-bail assert fires with the
+  actual message; `two_clock.reference.json` slack +0.02 ns →
+  `t2_frac` fails on `u_fa0/D.max_slack_ns` (+1e-6 and +0.01 stay
+  inside the slack tolerance — 1% rel / 5 ps abs — and pass, the
+  honest floor of that check).
+- `mbw` power regression (unplanned): caught by
+  `test_when_power_mbw_matches_opensta` mid-work, root-caused to
+  arrival-gated slew propagation, fixed by the slew decoupling in A9 —
+  re-verified green.
+
+Version `0.2.6 → 0.2.7` in `[workspace.package]` (`Cargo.lock`
+refreshed by `cargo check`).
+
+#### Revision (v0.2.8) — review-memo follow-up, same ticket
+
+The human review of `e6bd1a7` returned five items (R1–R5,
+`kurena/tasks/mc-cleanups/design/` revision 2). One probe run inside
+the same container pinned the measured rules; the implementation
+follows the measured entry-list model (the design's per-corner-anchor
+hypothesis was refuted by the `t2_clkcor` data, as `api.md` allowed).
+
+##### Probe run (`probe.sh` whole, same container)
+
+`probe.sh`'s Tcl collector was hardened first (union of both passes,
+`null` for an absent corner — without it a mixed-anchor scenario dies
+on `can't read "min_arr(...)"`). `SCENARIOS` gained `t2_eclk2`,
+`t2_clkcor`, `t2_clkcor2`, `t2_waverot`, `t2_wavez`; `MEASURE_ONLY`
+shrank to `t2_eclk t2_nsfrom t2_nsto t2_toinv t2_noclk`; `PROBE_ONLY`
+gained `t2_eclk3`, `t2_eclk4`. Every pre-existing `probe_t2_*.txt` and
+golden block regenerated byte-identical; `probe_t2_eclk.txt`
+regenerated from the extended `.sdc` (three appended lines).
+
+- **`t2_clkcor` / `t2_clkcor2`** — mixed `-clock` delay rules. The
+  measured rule is an **entry list**, not a per-corner anchor:
+  a port's rules fold to surviving `(value, sense, clock)` entries; a
+  plain rule prunes entries anchored to a different `-clock`
+  **port-wide** and appends, `-add_delay` appends without pruning, and
+  each surviving anchored entry is its own check. Evidence:
+  `t2_clkcor` (`-max -clock cka` then bare `-min` on `d_in`; the
+  mirror on `ya`) reports **12 endpoints — `d_in`/`ya` gone
+  everywhere** (`t2_noclk` shape); `t2_clkcor2` in the reversed order
+  times `d_in` max-only (`min_*` `null`) and `ya` min-only; and
+  `t2_clkcor2`'s `yb` (`-max @cka` plain, `-max @ckb -add_delay`)
+  appears **twice** in the max table — `Endpoint: yb (output port
+  clocked by cka)` and `Endpoint: yb (output port clocked by ckb)` —
+  while its min corner is `null`.
+- **`t2_eclk` extension** — the previously-unprobed forms:
+  `set_clock_uncertainty -setup 0.2 -from cka -to [get_clocks {}]` —
+  silent, table unchanged (the empty side records no rule);
+  `set_propagated_clock [get_clocks no_such]` —
+  `[WARNING STA-0351] clock 'no_such' not found.` + continue;
+  `unset_propagated_clock [get_clocks {}]` — silent.
+  `set_clock_uncertainty -setup 0.2 -from [get_clocks {}]` (lone
+  `-from`, `t2_eclk3`) and the lone `-to` (`t2_eclk4`) both abort
+  `read_sdc` with `[ERROR STA-0421] -from/-to must be used together.`
+- **`t2_eclk2`** — `[get_clocks]` no-arg: every `clock …` line shifts
+  +0.5 (`1.50 clock network delay`, both domains) and every req drops
+  a further 0.15 — the all-clocks rule, now with committed evidence.
+- **`t2_waverot` / `t2_wavez`** — promoted to `SCENARIOS`; OpenSTA
+  produces a normal `t2_int`-shaped table on both (`[0, 0]` collapsed
+  duty is unobservable on this all-rise fixture).
+
+##### Rules implemented (revision)
+
+- **`delay_at` entry-list fold**: plain rules `retain` only
+  same-anchor entries then append; `-add_delay` appends. A
+  `-clock`-less plain rule's anchor is `None` — it prunes every
+  anchored entry (the `t2_clkcor` both-corners loss). Accessors are
+  per-corner entry lists (`declared_input_clock_rows` /
+  `declared_output_clock_rows` → `[Vec<(row, value)>; 2]`);
+  `output_clock_row(port, corner)` keeps the first-anchor
+  approximation where a single row is unavoidable.
+- **Per-corner `EndpointReport`**: all eight `*_*_ns` fields are
+  `Option<f32>` — a corner with no anchored check serializes `null`
+  (`--sta-json` schema change). `record_endpoint` emits when *either*
+  corner has candidates; `unreached` now means zero candidates on
+  both. A multi-anchor output port reports the last anchor's check
+  per corner while `wns`/`tns`/violation folds see the worst
+  (`t2_clkcor2` `yb`: reported row is `ckb`'s +0.013, `wns` is the
+  `cka` check's −0.287 — a serde-skipped worst field carries it).
+  `PortSeed` gained per-corner `dom`/`per_pol`; `key_dom`/`ep_cap`
+  match on row **intersection** (a `-from cka` cut still drops the
+  port's whole launch — pin-granular, recorded as the split-anchor
+  limitation in `docs/multi-clock.md`).
+- **STA-0421**: directional `set_clock_uncertainty` bails when only
+  one of `-from`/`-to` is given (`t2_eclk3`/`t2_eclk4` named-substring
+  asserts).
+- **`set_propagated_clock` name drop**: collection-sourced names
+  resolving to no clock `-name` or source port drop silently; literal
+  names keep the `unknown clock` bail (`t2_eclk` line 18 evidence;
+  the `STA-0351` warning text is unmodelled).
+- **`get_clocks` no-arg**: comment cites `t2_eclk2` (was "(measured)"
+  on an ad-hoc check).
+
+##### Wordings fixed (review nits)
+
+- The `t2_eclk` bullet above no longer lumps `set_propagated_clock`
+  with the table-visible commands, and the ad-hoc parenthetical is
+  replaced by the `t2_eclk2` citation.
+- `sdc.rs` `t2_eclk` citations audited — every cite names a form the
+  extended file now exercises (`-from cka -to [get_clocks {}]` line
+  17, `set_propagated_clock [get_clocks no_such]` line 18,
+  `unset_propagated_clock [get_clocks {}]` line 19).
+- `docs/multi-clock.md`: 40 → 45 golden scenarios, the
+  empty-collections bullet extended (STA-0421, name drop, unmodelled
+  warning), the entry-list `-clock` anchor rule added with the
+  split-anchor limitation.
+- `docs/timing-exceptions.md`: `unreached_endpoints` restated (zero
+  candidates on **both** corners; a single-corner endpoint emits
+  `null` fields).
+- `tests/designs/README.md`: 40 → 45, `null` corner fields, the new
+  `PROBE_ONLY`/`MEASURE_ONLY` lists.
+- `xdomain_defer` doc: the stale "both max and min sides are needed
+  to report" claim replaced with the per-anchor rule.
+
+##### Checks run (revision)
+
+- `bash tests/designs/sta_clocks/probe.sh` — whole script;
+  pre-existing `probe_t2_*.txt` byte-identical, `two_clock.reference.json`
+  grew append-only (+5 blocks, `t2_clkcor*` carrying `null` corners),
+  `probe_t2_eclk.txt` regenerated from the extended `.sdc`.
+- `cargo test --workspace` — 315 + 3 pass, 2 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Fail-proof mutations (E0 rule 7; each confirmed red, then
+  reverted): `delay_at` prune relaxed to keep anchored entries →
+  `t2_clkcor` reports `u_fa0/D`, `u_fb0/D`, `ya` back where OpenSTA
+  has none; `record_endpoint` emit-rule reverted to requiring both
+  corners → `t2_clkcor2` drops `ya`/`yb` (the output ports route
+  through `record_endpoint`; the register checks emit through the
+  partitioned path's own either-corner rule) and `wns_max`/`tns_max`/
+  `setup_violations` read 0.155/0/0 instead of −0.287/−0.287/1.
+
+Version `0.2.7 → 0.2.8` in `[workspace.package]` (`Cargo.lock`
+refreshed by `cargo check`).
+
+#### Revision 2 (v0.2.9) — second review memo: same-anchor fold probe
+
+The second human review returned one medium (`delay_at`'s same-anchor
+same-sense retention was inferred, not measured) and two optional lows
+(`tests/designs/README.md` count attribution, `set_clock_groups`
+unknown-name posture). One probe scenario pinned the rule.
+
+##### Probe run (`probe.sh` whole, same container)
+
+`SCENARIOS` gained `t2_clkdup` (same-clock same-sense duplicates on
+`d_in`/`ya`, plus a `Both`-then-`-max` same-clock pair on `yb` that
+separates per-corner-slot overwrite from whole-entry overlap removal).
+Every pre-existing `probe_t2_*.txt` and golden block regenerated
+byte-identical; `two_clock.reference.json` grew append-only (+1 block)
+and `probe_t2_clkdup.txt` is new.
+
+- **`t2_clkdup`** — measured **per-(clock, corner)-slot overwrite**
+  (H_slot), not the inferred worst-fold (H_acc). Discriminators in
+  `ref_t2_clkdup` / `probe_t2_clkdup.txt`: `d_in`'s launch arrivals
+  read the *last* duplicate, not the worst — `u_fa0/D`/`u_fb0/D`
+  `max_arr_ns = 0.400000` (`-max 0.7` then `-max 0.4`; the report shows
+  `0.40 input external delay`) and `min_arr_ns = 0.300000` (`-min 0.1`
+  then `-min 0.3`); `ya` `max_req_ns = 1.600000` (`2.0 − 0.4`) and
+  `min_req_ns = -0.300000` (`0 − 0.3`); `yb` (`0.5 -clock ckb` then
+  `-max 0.3 -clock ckb`) `max_req_ns = 0.700000` (`1.0 − 0.3` — the
+  `-max` rule overwrote the `Both` entry's max half) while
+  `min_req_ns = -0.500000` (`0 − 0.5` — the min half survived,
+  refuting whole-entry overlap removal which would emit `null`).
+  `wns_max_ns = 0.112671`, `wns_min_ns = 0.324670`; `Endpoint: yb`
+  appears once per corner in the full report.
+
+##### Rule implemented
+
+- **`delay_at` same-anchor slots**: a plain rule still prunes
+  different-anchor entries port-wide, and now also strips the covered
+  corner(s) off same-anchor entries via `DelaySense::without` — a
+  `Both` entry degrades to the uncovered corner rather than dropping.
+  `-add_delay` unchanged.
+- **Amendment**: the revision-1 bullet above reads plain rules
+  "`retain` only same-anchor entries then append". The
+  different-anchor half is measured (`t2_clkcor`/`t2_clkcor2`); the
+  same-anchor half was inferred and is now **refuted** — `t2_clkdup`
+  shows last-wins per (clock, corner) slot, not unconditional
+  retention.
+
+##### Test updates
+
+- `delay_anchor_prune_is_port_wide` gained the same-sense cases
+  (`-min` duplicate → `(0, 0.3)`; `Both` under `-max` → min keeps
+  `(1, 0.5)`, max takes `(1, 0.3)`); its earlier asserts stand.
+- `counts_ignored_lib_cell_and_pin_options` `(1.0, 2.0)` → `(2.0,
+  2.0)`; `add_delay_widens_instead_of_summing` second block `(0.4,
+  1.0)` → `(0.8, 0.8)`; `remove_from_collection_subtracts_selections`
+  `(1.0, 2.0)`/`(1.0, 3.0)` → `(2.0, 2.0)`/`(3.0, 3.0)`;
+  `keeps_negative_values_and_the_known_flags` `(-0.5, 1.0)` → `(-0.5,
+  -0.5)` — each comment re-cites `t2_clkdup`.
+- `evaluated` 45 → 46.
+
+##### Lows
+
+- `tests/designs/README.md`: the "all N golden scenarios evaluate"
+  count reattributed — `mc-selectors` (v0.2.5) keeps its feature list;
+  the count (46 = 45 `two_clock` + `t2_latch`) is stated against
+  v0.2.9, with `t2_clkdup` named beside the v0.2.8 additions.
+- `docs/multi-clock.md`: §1.7 anchor bullet gained the same-anchor
+  clause; `set_clock_groups` gained the unknown-name posture bullet
+  (collection `-group` args filter empty on the adopted
+  `clock_rows`/`t2_selunk` posture — unprobed on this command; bare
+  unknown names bail `unknown clock`).
+
+##### Checks run
+
+- `bash tests/designs/sta_clocks/probe.sh` — whole script;
+  `git diff tests/designs/` shows `two_clock.reference.json`
+  append-only (+1 block) plus the new `t2_clkdup.sdc` /
+  `probe_t2_clkdup.txt`; every pre-existing artifact byte-identical.
+- `cargo test --workspace` — 315 + 3 pass, 2 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Fail-proof (E0 rule 7): the slot predicate replaced by unconditional
+  same-anchor retention (the inferred H_acc) → `t2_clkdup` red on the
+  discriminating fields (`u_fa0/D`/`u_fb0/D` `max_arr` 0.7 vs 0.4,
+  `min_arr` 0.1 vs 0.3, `wns_max`/`wns_min` off), restored green.
+
+Version `0.2.8 → 0.2.9` in `[workspace.package]` (`Cargo.lock`
+refreshed by `cargo check`).

@@ -47,6 +47,9 @@ pub struct PowerDiagnostics {
     /// Instances whose LEF cell has no Liberty counterpart (no leakage/pin data).
     pub cells_without_lib_cell: usize,
     /// Driven nets absent from the activity input (treated as zero activity).
+    /// Such a net's `net_activity`/`net_prob_one` is `None`, so a `when`
+    /// literal on one of its pins is inexpressible — those `when` blocks
+    /// are counted in `conditional_power_blocks` too.
     pub driven_nets_without_activity: usize,
     /// Nets with VCD activity but no cell-output driver (input ports, undriven);
     /// their switching power is not attributed anywhere, as in OpenSTA.

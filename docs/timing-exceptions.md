@@ -231,9 +231,12 @@ check read the same per-path credit (`docs/path-delays.md`).
   `-name`s) in `-from`/`-to`: resolved to `ObjSel::Clocks(rows)` —
   `-from` covers launch keys tagged to the rows, `-to` covers endpoints
   capturing on the rows (`docs/multi-clock.md` §1.7; unknown names give
-  an empty row set — a dead rule, not an error). A bare name matches a
-  clock `-name` only: a clock's source-port name resolves to the port
-  object instead (a resolved-but-dead selector, measured
+  an empty row set — a dead rule, not an error). On a name collision the
+  clock namespace wins (measured `t2_nsfrom`/`t2_nsto`: a bare `-from`/`-to`
+  name shared by a clock `-name` and a port resolves to the clock, no
+  warning). A name that is *not* a clock `-name` still resolves to the
+  port object — a clock's source-port name therefore resolves to the
+  port (a resolved-but-dead `-from`, or a `-to` diagnostic, measured
   `t2_selport`/`t2_selpto`).
 - Unsupported qualifiers (`-through`, `-start`, `-end`, `-rise`, `-fall`,
   `-edge`, `-lib_cell`, `-pin`, `-points`) → whole command to
@@ -253,11 +256,34 @@ check read the same per-path credit (`docs/path-delays.md`).
   `-setup`/`-hold`/`-both` flags on `set_false_path` are accepted as
   no-ops (the path is removed regardless).
 - Selector sides resolving zero objects (typo'd cell, unknown
-  port/pin/clock name) → diagnostic count, matching OpenSTA's
-  warn-not-silent `no valid objects specified` form. A resolved-but-dead
-  selector (`-from clk1` — the port object exists but launches nothing;
-  an input port on `-to`) is a silent dead rule, counted nowhere
-  (`t2_selport`/`t2_selpto`).
+  port/pin/clock name) → `unresolved_exception_selectors` count,
+  matching OpenSTA's warn-not-silent `no valid objects specified` form.
+  A resolved-but-invalid `-to` object (a non-output port, or a resolved
+  pin that owns no endpoint — OpenSTA `STA-1551`, measured
+  `t2_selpto`/`t2_toinv`) counts there too. Resolved cells owning no
+  endpoints stay silent, and a resolved-but-dead `-from` (`-from clk1` —
+  the port object exists but launches nothing) is a silent dead rule,
+  counted nowhere (`t2_selport`).
+- `unresolved_load_selectors`: `set_load` `get_nets` names missing at
+  `prepare_sta` resolution (counted per missing name, matching OpenSTA's
+  per-name warning), plus resolved net annotations the parasitic path
+  cannot honour — a measured net annotation replaces the net's wire
+  capacitance, which the distributed RC model cannot express, so under
+  `NetParasitics` every selected net counts here instead of being
+  approximated.
+- `unreached_endpoints`: endpoints with zero candidates on **both**
+  corners (no clock reaches the check pin, or no launch survives). A
+  port whose delay entries time only one corner is still emitted —
+  the missing corner serializes as `null` fields (measured
+  `t2_clkcor2`).
+- `unsupported_path_delay_endpoints`: endpoint candidates a covering
+  `set_max_delay`/`set_min_delay` cannot replace (output ports,
+  clock-gate enables, latch-D, async recovery/removal) — loudly partial,
+  see `docs/path-delays.md`.
+- `cross_domain_endpoints`: endpoints whose launch domain differs from
+  their capture domain, deferred to mc-xdomain and named in
+  `skipped_endpoints` with reason `CrossDomain` — see
+  `docs/multi-clock.md`.
 
 ## Out of scope for v1 (diagnosed, not approximated)
 
