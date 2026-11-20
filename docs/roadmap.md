@@ -298,19 +298,21 @@ Done since (load selectors, `docs/results.md` 2026-11-19 entry):
 
 Remaining:
 
-- The path-delay follow-ups in `docs/path-delays.md` section 5
-  (two-clock and latch fixtures). Multi-clock SDC support is scoped in
-  `docs/multi-clock.md`: OpenSTA's two-clock rules are measured on the
-  committed `sta_clocks` probe (2026-11-19) and the implementation is a
-  five-ticket sequence (`mc-model` → `mc-eval` → `mc-xdomain` →
-  `mc-selectors` → `mc-golden`). `mc-model` (the clock table, v0.2.0),
-  `mc-eval` (domain tagging + same-domain pairing, v0.2.1),
-  `mc-xdomain` (cross-domain min-gap edge pairing + inter-clock
-  uncertainty, v0.2.2) and `mc-selectors` (clock-object selectors,
-  `set_clock_groups`, `create_clock -waveform`, v0.2.5) are done —
-  all 40 golden `sta_clocks` scenarios match OpenSTA at strict
-  tolerance with `cross_domain == 0`.
-  Remaining: golden promotion (`mc-golden`).
+- Multi-clock SDC (`docs/multi-clock.md`): OpenSTA's two-clock rules are
+  measured on the committed `sta_clocks` fixture (2026-11-19) and the
+  implementation ran as a five-ticket sequence (`mc-model` → `mc-eval` →
+  `mc-xdomain` → `mc-selectors` → `mc-golden`), now complete: `mc-model`
+  (the clock table, v0.2.0), `mc-eval` (domain tagging + same-domain
+  pairing, v0.2.1), `mc-xdomain` (cross-domain min-gap edge pairing +
+  inter-clock uncertainty, v0.2.2), `mc-selectors` (clock-object
+  selectors, `set_clock_groups`, `create_clock -waveform`, v0.2.5) and
+  `mc-golden` (probe promoted to `two_clock.reference.json`, v0.2.6).
+  All 40 golden `sta_clocks` scenarios match OpenSTA at strict
+  tolerance with `cross_domain == 0`, and `docs/path-delays.md`
+  section 5 has no open items left. Still parked: the four
+  `CrossDomain` deferrals in `docs/multi-clock.md` §2 (undeclared-launch
+  zero mask, latch-D foreign-launch borrow pairing, unpairable hold
+  tying parity, defensive `grid_lcm` non-convergence).
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 

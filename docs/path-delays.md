@@ -12,7 +12,7 @@ matches OpenSTA
 semantics measured on the `sta_exceptions` fixture (see
 `tests/designs/sta_exceptions/generate_ref.sh`) and the implementation shape.
 Sections 3's "v1 diagnoses" and "explicitly out of scope" lists still apply;
-the remaining follow-ups in section 5 are open.
+section 5 has no open items left — its known gaps stay recorded as gaps.
 
 ## 1. What OpenSTA does (measured)
 
@@ -624,9 +624,10 @@ Known gaps in that resolution (reachable but ungoldened — review
   (`u_rbn`/`u_rbp`/`u_rt*`, covered max-side only by
   `delay_allregs`) unverified.
 
-Still open:
+Resolved by the multi-clock promotion (`mc-golden`, v0.2.6,
+2026-11-20):
 
-1. A literal two-clock-domain `set_min_delay` anchoring fixture —
+- A literal two-clock-domain `set_min_delay` anchoring fixture —
    answered and covered by `mc-xdomain` (v0.2.2, 2026-11-20): on a
    second-domain endpoint OpenSTA anchors the delay-check required time
    at the **capture domain's** edge-0 arrival — `req = N +
@@ -640,5 +641,6 @@ Still open:
    delay rule covering a dangling launch reports the leaf as
    `u_fy/Q (internal path endpoint)` with `req = N` and no clock terms
    (`t2_selmd`, `docs/multi-clock.md` §1.7). Golden coverage runs at
-   STRICT in `test_sta_clocks_match_opensta`; formal promotion to
-   `two_clock.reference.json` stays with `mc-golden`.
+   STRICT in `test_sta_clocks_match_opensta`, which deserializes
+   `two_clock.reference.json` + `two_clock_latch.reference.json` as
+   emitted by the committed `probe.sh`.
