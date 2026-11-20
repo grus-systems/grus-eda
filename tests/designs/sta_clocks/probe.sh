@@ -7,7 +7,7 @@
 # Each t2_*.sdc scenario runs in its own OpenSTA process because read_sdc
 # accumulates. Two artifacts per scenario: ref_<name>.json (wns/tns/violations
 # + per-endpoint max/min arr/req/slack/slew, same shape as the sta_exceptions
-# goldens) consolidated into two_clock.probe.json, and probe_<name>.txt —
+# goldens) consolidated into two_clock.reference.json, and probe_<name>.txt —
 # full-format report_checks plus the -unconstrained listing, which prints the
 # launch/capture clock name and edge times per path (the pairing evidence the
 # endpoint table alone does not carry). Runs inside
@@ -196,7 +196,7 @@ done
 # (non-increasing instants) are SDC errors in OpenSTA and named bails in ours;
 # t2_wave4 (>2 instants) is accepted by OpenSTA but a deliberate named bail in
 # ours. `run_report` records the outcome ("SDC error:" or a table) without
-# folding a ref_*.json block into two_clock.probe.json.
+# folding a ref_*.json block into two_clock.reference.json.
 PROBE_ONLY="t2_grpn t2_wave3 t2_wave4 t2_waverev"
 
 for name in $PROBE_ONLY; do
@@ -213,7 +213,7 @@ done
         cat "ref_$name.json"
     done
     printf '\n  }\n}\n'
-} > two_clock.probe.json
+} > two_clock.reference.json
 
 # Second-domain latch fixture: every endpoint is same-domain, so the probe
 # covers the borrow window on ckb's own lattice end to end.
@@ -225,7 +225,7 @@ run_report "two_clock_latch.def" "t2_latch.sdc" "probe_t2_latch.txt"
     printf '    "%s": ' "t2_latch"
     cat "ref_t2_latch.json"
     printf '\n  }\n}\n'
-} > two_clock_latch.probe.json
+} > two_clock_latch.reference.json
 
 rm -f ref_*.json
-echo "Wrote two_clock.probe.json and two_clock_latch.probe.json"
+echo "Wrote two_clock.reference.json and two_clock_latch.reference.json"

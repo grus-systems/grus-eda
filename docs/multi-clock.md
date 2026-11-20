@@ -1,7 +1,8 @@
 # Multi-clock SDC support — measured rules and ticket sequence
 
-Status: probe complete (2026-11-19), `mc-model` landed (2026-11-20),
-`mc-eval` landed (2026-11-20), `mc-xdomain` landed (2026-11-20). `Sdc`
+Status: probe complete (2026-11-19), `mc-model`/`mc-eval`/`mc-xdomain`/
+`mc-selectors`/`mc-golden` landed (all 2026-11-20); the five-ticket
+sequence is complete. `Sdc`
 keeps a clock table — one row per
 `create_clock`, in file order, holding name/optional port/period/
 network+source latencies/setup+hold uncertainties/transition/propagated —
@@ -13,16 +14,16 @@ ideal mode). Cross-domain setup pairs report on the min-gap edge pair
 over the period LCM (§1.2) with per-direction inter-clock uncertainty
 (§1.3); delay-check-covered endpoints anchor at the capture domain's
 edge 0 (§1.5). A pair that still cannot be evaluated defers with a
-`CrossDomain` diagnostic naming both clocks — never a silent fold. This
-document remains the target spec for the remaining tickets.
+`CrossDomain` diagnostic naming both clocks — never a silent fold. With the
+sequence complete, this document is the measured-rules record.
 
 Evidence: `tests/designs/sta_clocks/` — `two_clock.def` (clock domains `cka`
 2.0 ns on `clk1`, `ckb` 1.4/1.0 ns on `clk2`, same-domain and both-direction
 cross-domain paths), `two_clock_latch.def` (a `dlxtn` on `ckb` feeding a
 `ckb` flop — every endpoint same-domain), fifteen `t2_*.sdc` scenarios on
 `two_clock.def` plus `t2_latch.sdc`, `probe.sh` (runs OpenSTA in
-`ghcr.io/librelane/librelane:3.0.16`), `two_clock.probe.json` +
-`two_clock_latch.probe.json` + `probe_*.txt` (byte-identical on re-run).
+`ghcr.io/librelane/librelane:3.0.16`), `two_clock.reference.json` +
+`two_clock_latch.reference.json` + `probe_*.txt` (byte-identical on re-run).
 Raw numbers and the grus-eda break table are in `docs/results.md`
 (2026-11-19 and 2026-11-20 entries); scenario→question mapping is in
 `kurena/tasks/multi-clock-probe/design/probe.md`.
@@ -210,7 +211,7 @@ forms):
   model is the rise/fall pair), instants past the period accepted and
   wrapped (`t2_wavebig` `{0 2.5}` on 2.0).
 
-## 2. Where grus-eda stands (after `mc-selectors`, 2026-11-20)
+## 2. Where grus-eda stands (after `mc-golden`, 2026-11-20)
 
 `cargo test -p grus-core multi_clock_bails` pins the remaining bail
 messages verbatim; full table with commands in `docs/results.md`.
@@ -252,8 +253,9 @@ Now evaluated:
   delay-check anchors, MCP multipliers, min-pulse-width wrap and output
   ports (`-clock` row anchoring) are all per-domain. Verified
   per-endpoint at STRICT tolerance on all parseable `t2_*` scenarios
-  (`test_sta_clocks_match_opensta`); `two_clock_latch`'s whole table —
-  wns/tns/violations included — matches.
+  (`test_sta_clocks_match_opensta` against `two_clock.reference.json`);
+  `two_clock_latch`'s whole table — wns/tns/violations included —
+  matches (`two_clock_latch.reference.json`).
 - Cross-domain setup pairs evaluate on the min-gap edge pair over the
   period LCM (§1.2): launch `arr` shifts by `m·PL`, required by `j·PC`,
   uncertainty per directed pair (§1.3). Hold pairs minimise the
@@ -340,9 +342,11 @@ kurena spec:
    diagnostic on zero-resolved-object selectors, and gates the
    internal-path-endpoint fanout traversal on delay-rule classes. 40
    `sta_clocks` scenarios match at STRICT.
-5. **`mc-golden`** — `sta_clocks` promoted to `two_clock.reference.json` +
-   `test_sta_clocks_match_opensta`, closing `docs/path-delays.md` §5 item 1
-   (the literal two-clock `set_min_delay` fixture is `t2_md`/`t2_mdl`).
+5. **`mc-golden`** — **done 2026-11-20** (`docs/results.md` entry of the
+   same date). `two_clock.probe.json`/`two_clock_latch.probe.json`
+   renamed to `*.reference.json` by `probe.sh` as committed,
+   byte-identical regen; `test_sta_clocks_match_opensta` deserializes
+   them. `docs/path-delays.md` §5 item 1 closed.
 
 Open sub-questions parked: the equal-gap setup tie keeps the smallest
 launch edge (OpenSTA's tie-break unmeasured); `-waveform` lists longer

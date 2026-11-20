@@ -3872,3 +3872,67 @@ all-rise fixture.
   are not golden-compared — the `t2_selport`
   `unresolved_exception_selectors == 0` assert in
   `test_sta_clocks_match_opensta` is the pin.
+
+### 2026-11-20 — `mc-golden`: `sta_clocks` promoted to `two_clock.reference.json` (v0.2.6)
+
+Formal promotion only — no eval, parser or tolerance change. The
+`sta_clocks` evidence files take the `*.reference.json` golden name
+(`AGENTS.md` §2) and `test_sta_clocks_match_opensta` deserializes them
+directly; a missing file panics on `expect("golden file")`, no skip
+path exists.
+
+#### Golden rename + regen
+
+`probe.sh` edits are name-only: the two consolidated outputs and three
+comment/`echo` mentions (`two_clock.probe.json` →
+`two_clock.reference.json`, latch likewise); `SCENARIOS`,
+`PROBE_ONLY` and the `ref_*.json` intermediates untouched. The whole
+script re-ran inside `ghcr.io/librelane/librelane:3.0.16` — all 39
+`run_sta` + `run_report` pairs, the 4 `PROBE_ONLY` reports and the
+latch pair — as this ticket's functional change (emitting `probe.sh`
+blob `9aca5ab4`; its commit lands with this change). `diff` of
+`two_clock.reference.json` against the superseded
+`two_clock.probe.json` and `two_clock_latch.reference.json` against
+`two_clock_latch.probe.json`: **byte-identical** both; `git status`
+shows every `probe_t2_*.txt` unchanged, and git records the two
+renames with zero content diff.
+
+#### Test
+
+`test_sta_clocks_match_opensta`: 40 scenarios (39 `two_clock` +
+`t2_latch`) at STRICT — `cross_domain_endpoints == 0` everywhere;
+`t2_selac`/`t2_selunion` empty-table aggregates still skipped by
+construction; `t2_selport` keeps its
+`unresolved_exception_selectors == 0` pin. The four `PROBE_ONLY`
+bail-pinned forms keep their `multi_clock_bails` pins, and a new loop
+in the test asserts the committed `t2_grpn`/`t2_wave3`/`t2_wave4`/
+`t2_waverev` SDCs still fail `load_sdc` — the parse gate now covers
+the fixture files themselves, not only the inline snippets.
+
+Remaining `CrossDomain` deferrals still named (`docs/multi-clock.md`
+§2): undeclared-launch zero mask (`launch <undeclared>`), latch-D
+foreign-launch borrow pairing, unpairable hold tying parity, defensive
+`grid_lcm` non-convergence — none reachable on this fixture.
+
+`docs/path-delays.md` §5 item 1 closed; the five-ticket multi-clock
+sequence (`mc-model` → `mc-eval` → `mc-xdomain` → `mc-selectors` →
+`mc-golden`) is done.
+
+#### Commands run
+
+- `bash tests/designs/sta_clocks/probe.sh` whole, in
+  `ghcr.io/librelane/librelane:3.0.16`.
+- `cargo test -p grus-core sta_clocks` — green (1 test).
+- `cargo test --workspace` — green (309 + 3, 2 ignored).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --release -p grus-core sta` — green (170 tests, 2
+  ignored).
+
+#### Fail-proof mutations (E0 rule 7)
+
+- `two_clock.reference.json` removed: `sta_clocks_match` panics
+  `golden file: NotFound` — loud failure, no silent skip. Restored,
+  green.
+- `t2_int` `u_fx/D` `max_req_ns` perturbed +0.1 in the golden: red on
+  exactly that field (`u_fx/D.max_req_ns: ours=0.8854457
+  ref=0.985446`). `git checkout --` restored, green.

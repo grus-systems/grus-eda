@@ -9226,7 +9226,7 @@ mod tests {
         assert_eq!(report.skipped.cross_domain_endpoints, 0);
     }
 
-    /// `mc-xdomain`/`mc-selectors` scenario matrix: `tests/designs/sta_clocks/*.probe.json`
+    /// `mc-xdomain`/`mc-selectors` scenario matrix: `tests/designs/sta_clocks/*.reference.json`
     /// was emitted by `probe.sh` (OpenSTA in the LibreLane container). In every
     /// scenario each reported endpoint must equal OpenSTA's row at
     /// STRICT tolerance, and every golden endpoint we do not report must be a
@@ -9251,15 +9251,15 @@ mod tests {
         .0;
         let dir = design_dir("sta_clocks");
         let mut evaluated = 0;
-        for (def_name, probe_name) in [
-            ("two_clock.def", "two_clock.probe.json"),
-            ("two_clock_latch.def", "two_clock_latch.probe.json"),
+        for (def_name, golden_name) in [
+            ("two_clock.def", "two_clock.reference.json"),
+            ("two_clock_latch.def", "two_clock_latch.reference.json"),
         ] {
             let design = parse_def(&dir.join(def_name), &tech, Some(&lib)).expect("DEF");
             let reference: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(dir.join(probe_name)).expect("probe file"),
+                &std::fs::read(dir.join(golden_name)).expect("golden file"),
             )
-            .expect("probe JSON");
+            .expect("golden JSON");
             let scenarios = reference["scenarios"].as_object().expect("scenarios");
             for (name, golden) in scenarios {
                 let sdc_path = dir.join(format!("{name}.sdc"));
@@ -9395,6 +9395,12 @@ mod tests {
                 }
                 evaluated += 1;
             }
+        }
+        for name in ["t2_grpn", "t2_wave3", "t2_wave4", "t2_waverev"] {
+            assert!(
+                load_sdc(&dir.join(format!("{name}.sdc"))).is_err(),
+                "{name}: PROBE_ONLY form must stay a named bail"
+            );
         }
         assert_eq!(evaluated, 40, "every scenario must evaluate");
     }
