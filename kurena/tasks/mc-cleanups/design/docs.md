@@ -1,146 +1,95 @@
-# mc-cleanups — Documentation and record fixes
+# mc-cleanups — Documentation and record fixes (revision 2)
 
-All doc work in one pass. Rule: documentation claims must match what the
-code does and what was actually run — audit before editing, record
-no-op findings honestly in the `docs/results.md` entry.
+The D1–D7 doc pass of the original design is **landed** (`e6bd1a7`).
+This file covers the revision's doc work: correcting overclaims the
+review found, recording the new measurements, and keeping counts in
+step with the promoted scenarios. Rule: claims must match what the
+committed artifacts show — audit before editing, record honestly.
 
-## D1 — `docs/timing-exceptions.md`: missing skip counters
+## RD1 — `docs/results.md` `t2_eclk` bullet rewording (R4/R5)
 
-The skip-surface section (~L238–260) lists `sdc_ignored_commands`,
-`sdc_ignored_options`, `unresolved_exception_selectors`,
-`false_path_endpoints`, and `unsupported_multicycle_endpoints`, plus a
-blanket "skipped count includes unreached endpoints". Missing counters
-that now exist in `SkipReport`:
+The 2026-11-20 entry's `t2_eclk` bullet overclaims:
 
-- `unresolved_load_selectors` (load-selectors ticket): `set_load`
-  selectors that resolve nothing, and per-pin/per-net annotations that
-  cannot be carried into the parasitic path. Add a bullet explaining
-  what is counted (name misses at `prepare_sta` resolution;
-  annotations dropped because the parasitic mode cannot apply them).
-- Audit the same section for `unsupported_path_delay_endpoints` and
-  `cross_domain_endpoints` — if absent, add one-line bullets; both are
-  documented in `multi-clock.md`/`path-delays.md` already, so the fix
-  is a pointer plus the count, not a rewrite.
-- If item A7 lands as a count, the `unresolved_exception_selectors`
-  bullet must mention the `-to` resolved-but-invalid form (OpenSTA
-  `STA-1551`) — update it in the same commit as the code change.
+- "`[get_clocks {}]` on `set_clock_latency`/`-uncertainty`/
+  `-transition`/`set_propagated_clock`: clean output, no warning, the
+  full `t2_int` table (no accidental apply-to-all)" — true for
+  `set_clock_latency`/`-uncertainty` (latency +0.5 and setup −0.2 are
+  both visible in the table) and largely for `-transition` (clock-pin
+  slews). For `set_propagated_clock` the table only proves *no warning*
+  and *no propagated-mode clock lines* — the apply-to-all exclusion is
+  weaker; say so per command instead of lumping.
+- "`[get_clocks]` with no argument returns every declared clock
+  (ad-hoc stdin check in the same container)" — replace the
+  parenthetical with the `t2_eclk2` citation once the committed
+  scenario exists (`probe_t2_eclk2.txt` + the golden block).
+- Append a sentence listing the newly-measured forms from the extended
+  file (empty `-from`/`-to` collections, `-group [get_clocks {}]`,
+  `set_propagated_clock`/`unset_propagated_clock` collection forms)
+  with their observed warnings/errors verbatim.
 
-## D2 — `docs/results.md` entries
+## RD2 — `docs/results.md` revision entry (continuation of 2026-11-20)
 
-Three recorded gaps plus this ticket's own entry:
+A dated subsection appended to the same entry (the ticket's record
+stays contiguous):
 
-1. **"15 parseable" count** (~L3626): the `mc-xdomain` entry says "All
-   15 parseable `t2_*` scenarios". `t2_grp` was parse-gated at that
-   probe — the correct count is **14 parseable + `t2_grp` parse-gated**
-   (15 total scenario names, `t2_grp` produced an SDC error and no ref
-   block). Fix the sentence; do not touch the surrounding numbers.
-2. **when-power `awk` command** (~L3182): the entry says "`awk` scans of
-   the pinned lib" but does not record the command. Re-derive the
-   counts the entry claims — `internal_power` `when:` 26 blocks over 13
-   cells (`ebufn_{1,2,4,8}`, `einvn_{0,1,2,4,8}`, `einvp_{1,2,4,8}`);
-   `leakage_power` `when:` 6244 groups — with a literal `awk`
-   invocation against
-   `sky130_fd_sc_hd__tt_025C_1v80.lib`, run it, and paste the exact
-   command into the entry. A candidate shape to start from (verify and
-   adjust — the entry must record what was *actually* run, per repo
-   rule 9):
-   ```bash
-   awk '/^[[:space:]]*internal_power *\(/ {ip=1; lp=0}
-        /^[[:space:]]*leakage_power *\(/ {ip=0; lp=1}
-        ip && /when[[:space:]]*:/ {ipn++}
-        lp && /when[[:space:]]*:/ {lpn++}
-        END {print "internal", ipn, "leakage", lpn}' <lib>
-   ```
-   If the lib's `when` syntax or block layout defeats a one-pass count,
-   use whatever pipeline actually produces the numbers and record that
-   verbatim.
-3. **saif-power `cargo test --workspace` lines**: the v0.1.96 entry
-   (~L3144) already lists `cargo test --workspace (287+3 pass, 2
-   ignored)` in "Checks run". Audit against the sibling-entry
-   convention (`cargo test -p grus-core <area>` focused lines,
-   release-mode lines where entries record them): add a line **only**
-   for a command that was genuinely run and is missing; if the entry
-   is complete, record the audit as a no-op in this ticket's entry.
+- **Probes**: `t2_clkcor`/`t2_clkcor2` tables and discriminators —
+  verbatim `clock …` lines and `Endpoint:`/`unconstrained` evidence;
+  `t2_eclk` extension warnings/errors verbatim; `t2_eclk2` shift;
+  `t2_waverot`/`t2_wavez` `run_sta` numbers.
+- **Rules implemented**: the per-corner anchor (or whichever measured
+  outcome), the `-add_delay` anchor rule, the collector union/`null`
+  fix (a latent crash — `can't read "min_arr(…)"` — independently of
+  R1), the `set_propagated_clock` name-drop record.
+- **Wordings fixed**: the `t2_eclk` overclaim bullets, the removed
+  ad-hoc clause, the `(measured)` comment now citing `t2_eclk2`.
+- **Schema note**: `EndpointReport` corner fields become `Option` —
+  `--sta-json` emits `null` for an absent corner; the golden JSON
+  carries the same convention.
+- **Checks actually run**: probe.sh whole run, `cargo test
+  --workspace` count, clippy, `git diff` audit result, fail-proof
+  mutations.
+- Version bump `0.2.7 → 0.2.8`.
 
-## D3 — `tests/designs/README.md` fixture list
+## RD3 — `docs/multi-clock.md` sync
 
-The `sta_clocks`-era fixture directories missing entries (verify with
-`ls tests/designs` at implementation time — the list is: `microbench/`,
-`sta_exceptions/`, `repro_extreme_ceff/`; `sta_clocks` itself is
-documented at ~L63):
+- ~L23–26: "40 golden scenarios" → 45 (44 `two_clock` + `t2_latch`);
+  the `MEASURE_ONLY` parenthetical names the shrunken list.
+- §1.7 empty-collections bullet: extend with the `t2_eclk` extension
+  evidence (`-from`/`-to` empties, `-group [get_clocks {}]`,
+  `set_propagated_clock [get_clocks no_such]` → the measured warn/drop
+  posture — **record the non-clock-name drop change explicitly**, R5)
+  and cite `t2_eclk2` for the no-arg rule.
+- §1.7 new bullet: per-corner `-clock` anchor rule for
+  `set_input_delay`/`set_output_delay` — each corner keeps the `-clock`
+  of the last rule that wrote it; an unanchored corner produces no
+  timed path on that corner only; `-add_delay` anchor rule as
+  measured; the split-anchor × clock-selector pin-granular
+  approximation recorded as a limitation.
+- §1.7 waveform bullet: `t2_waverot`/`t2_wavez` are now golden
+  scenarios (not just report probes) — adjust the parenthetical.
+- `skipped_endpoints`/`unreached_endpoints` doc mentions (if any in
+  this file): an endpoint with candidates on only one corner is now
+  emitted with `null` on the missing corner — `unreached` means no
+  candidates at all.
 
-- `sta_exceptions/`: hand-written exception-partitioning fixture —
-  describe `base.def`, the `ex_*.sdc`/`pm_*`/`md_*` scenario classes,
-  which script regenerates `sta.reference.json` (`probe.sh` —
-  confirm the filename), and that `compare_sta_edge`-family tests
-  deserialize the golden at STRICT.
-- `microbench/`: VCD/SAIF power fixture — `mb.def`/`mb.lib`-era inputs,
-  `mb.vcd`/`mb.saif`, `power_vcd_check.tcl` + `power_saif` goldens and
-  `generate_saif_ref.sh`/`vcd2saif.py`; reference `docs/results.md` N7
-  entries. Confirm actual filenames by listing the directory.
-- `repro_extreme_ceff/`: one-line description of the regression fixture
-  (extreme-slew `Ceff` reproduction — confirm purpose from its README
-  or the referencing test, then describe only what is verifiable).
+## RD4 — `docs/timing-exceptions.md`
 
-Same style as the existing entries: provenance first (hand-written
-vs flow output), what the golden pins, which script regenerates it.
+- The skip-counter section's `unreached_endpoints` bullet: restate —
+  counts endpoints with zero candidates on **both** corners; a
+  single-corner endpoint is emitted with `null` fields (measured
+  `t2_clkcor`).
 
-## D4 — `power.rs` `driven_nets_without_activity` doc (~L49)
+## RD5 — `tests/designs/README.md`
 
-The field doc says it counts nets that "have a driver and no VCD/SAIF
-annotation". Since when-power (v0.1.97) the meaning changed: an
-unannotated driven net's `net_activity` is `None`, which also makes
-`net_prob_one` fail — so a `when` literal on a pin of that net becomes
-inexpressible and lands in `conditional_power_blocks` instead of
-producing a `P(when)`. Restate the doc: "driven nets with no VCD/SAIF
-annotation — these contribute no switching activity *and* make `when`
-conditions on their pins inexpressible (counted there too)". Also
-record the meaning change in this ticket's `docs/results.md` entry.
-
-## D5 — `t2_mdx` description audit
-
-`kurena/tasks/mc-xdomain/design/fixture.md:57` already reads
-"pin-startpoint `-from`" — the spec's "delay-check rewrite on both
-sides" phrasing is no longer present. Audit `rg 'rewrite|both sides'`
-across `kurena/tasks/*/design/` and `docs/`: `steps.md:47` and
-`api.md:269` use "delay-check rewrite" for the compose/uncertainty
-accessor (correct usage — keep). If no stale `t2_mdx` description is
-found, record the item as a no-op verification in `docs/results.md`.
-
-## D6 — `docs/multi-clock.md` sync
-
-- ~L23: "fifteen `t2_*.sdc` scenarios on `two_clock.def` plus
-  `t2_latch.sdc`" → the current golden set (39 `two_clock` scenarios +
-  `t2_latch`; 40 total) — or reword to "the `t2_*` scenario set" to
-  stop the count going stale.
-- §1.2 (~L62–64): "no cross-domain hold pair selection beyond the
-  coincident grid was exercised" was true at the first probe but is
-  superseded by §1.7's `t2_wave` finding in the same document — add a
-  forward pointer ("see §1.7, `t2_wave`") or amend the sentence.
-- §1.7: append the newly measured rules from `probes.md` (`-to`
-  invalid-object warning, namespace priority on a name collision,
-  `-clock`-less I/O anchor under `-waveform`, empty clock collections,
-  post-wrap `-waveform` handling) in the same bullet style as the
-  v0.2.5 revision.
-
-## D7 — `docs/results.md` entry for this ticket
-
-One dated entry covering:
-
-- every probe scenario run, its file name, the verbatim OpenSTA
-  warning/error lines (with STA codes), and the discriminator read-off;
-- the rule implemented per item (or "no change — current behaviour
-  matches", "no-op — already correct");
-- code nits landed (A1, A3–A6, A10) and the docs edits (D1–D6);
-- verification actually run: `cargo test --workspace` result, clippy,
-  the golden `git diff` audit, fail-proof mutations;
-- version bump note.
+The `sta_clocks` entry: "all 40 golden scenarios evaluate (39
+`two_clock` + `t2_latch`)" → 45 (44 + `t2_latch`); mention the
+mixed-anchor (`t2_clkcor*`), no-arg `get_clocks` (`t2_eclk2`) and
+wrapped-waveform (`t2_waverot`/`t2_wavez`) coverage, and that golden
+endpoint fields may be `null` for a corner the SDC does not time.
 
 ## Files
 
-- `docs/timing-exceptions.md`
 - `docs/results.md`
 - `docs/multi-clock.md`
+- `docs/timing-exceptions.md`
 - `tests/designs/README.md`
-- `crates/grus-core/src/power.rs` (field doc only)
-- `kurena/tasks/mc-xdomain/design/fixture.md` (audit; edit only if stale text is found)

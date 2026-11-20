@@ -1,105 +1,84 @@
-# mc-cleanups — Implementation steps
+# mc-cleanups — Implementation steps (revision 2)
 
-Order matters only at two seams: the probe run must precede the
-measured-behaviour fixes (A2, A5, A7, A8, A9), and the `docs/results.md`
-entry is written last. Everything else is independent. Keep the diff in
-one commit (the ticket is cleanup-scale); if the diff grows past ~150
-lines of non-doc change, split along the probe/no-probe seam.
+The A-items landed in `e6bd1a7`; this sequence covers the review-memo
+follow-up (R1–R5). Order matters at one seam: the probe run precedes
+the measured-rule implementation (R1). Keep the diff in one commit; if
+the R1 data-model change grows past ~300 lines, split at the
+probe/code seam.
 
-## Step 1 — Mechanical code nits (no probe dependency)
+## Step 1 — Probe harness + scenario files
 
-`analysis.rs`:
+- `probe.sh`: harden `collect_endpoints_json` per probes.md P0 (union
+  `pins` from both passes, `null` for unset corner fields). Update
+  `SCENARIOS` (+`t2_eclk2 t2_clkcor t2_clkcor2 t2_waverot t2_wavez`)
+  and shrink `MEASURE_ONLY` to `t2_eclk t2_nsfrom t2_nsto t2_toinv
+  t2_noclk`; fix the comment block.
+- `t2_eclk.sdc`: append the lines per probes.md P2.
+- New `t2_eclk2.sdc`, `t2_clkcor.sdc`, `t2_clkcor2.sdc` per probes.md —
+  copy `t2_int.sdc` verbatim then edit; verify names against
+  `two_clock.def`.
 
-- A1 `grid_lcm` guard restatement (~L5083–5101).
-- A3 `delay_max_pins`/`delay_min_pins` last-wins comment (~L4019) and
-  `ResolvedPathDelay::from_pins` doc (~L3562).
-- A6.2 hold-pairing comment fix (~L4597–4601) + `coincident` grep audit.
-- A6.3 `SkippedEndpoint` doc update (~L353).
-- A6.1 `same_domain`/`sta_evaluates_two_clock_same_domain` audit —
-  record result.
-- A4 PROBE_ONLY per-name expected-substring asserts (~L9399).
+## Step 2 — Container run
 
-`saif.rs`:
+`bash tests/designs/sta_clocks/probe.sh` (Colima/docker per
+`AGENTS.md` §2). Then `git status` / `git diff tests/designs/`:
 
-- A10.1 DURATION/TIMESCALE integer-required error wording.
-- A10.2 negative-vs-fractional message split (~L229).
-- A10.3 `Vec<u8>` atom accumulation + `String::from_utf8`.
-- Unit tests: DURATION `1990.0`/`abc`/`-5`, negative `T0`, UTF-8 name.
+- Pre-existing `probe_t2_*.txt` and the existing golden entries:
+  byte-identical. If anything drifts, stop and diagnose.
+- `two_clock.reference.json` gains five blocks (`t2_eclk2`,
+  `t2_clkcor`, `t2_clkcor2`, `t2_waverot`, `t2_wavez`) — `t2_clkcor*`
+  may carry `null` corner fields.
+- `probe_t2_eclk.txt` regenerates from the extended file.
+- If a `t2_eclk` line aborts `read_sdc` mid-file, split tail forms
+  into `t2_eclk3.sdc` and re-run.
+- Read the discriminators (probes.md P1–P3 tables) and record the
+  measured rules.
 
-Gate: `cargo test -p grus-core`, `cargo clippy --workspace --all-targets
--- -D warnings`. Fail-proof: point a PROBE_ONLY assert at the wrong
-substring and confirm red; revert.
+Gate: artifacts committed; `cargo test --workspace` is expected **red**
+at this point — `test_sta_clocks_match_opensta` compares the new
+blocks against the not-yet-fixed implementation. If it is green with
+the old code, the probes disagree with the assumed semantics —
+re-examine before touching code.
 
-## Step 2 — Probe scenarios + container run
+## Step 3 — Measured-rule implementation (R1)
 
-- Write the seven `t2_*.sdc` scenario files per `probes.md` (copy
-  `t2_int.sdc` verbatim, then edit the listed lines; verify names like
-  `u_fa0/Q` against `two_clock.def`).
-- Add `MEASURE_ONLY` + its loop to `probe.sh`.
-- Run `bash tests/designs/sta_clocks/probe.sh` (Colima/docker per
-  `AGENTS.md` §2). This regenerates all `probe_*.txt` — confirm with
-  `git status`/`git diff` that pre-existing files are byte-identical
-  and only the new `t2_*` artifacts appear. If a regenerated
-  `probe_*.txt` drifts, stop and diagnose before proceeding (the
-  scenario set did not change; drift means environment or a real
-  change).
+Per `api.md` R1, driven by the measured outcome:
 
-Gate: `two_clock.reference.json`, `two_clock_latch.reference.json`,
-all pre-existing `probe_*.txt` byte-identical; `probe_t2_{eclk,nsfrom,
-nsto,toinv,noclk,waverot,wavez}.txt` committed.
+- `delay_at` per-corner fold + accessor changes (`sdc.rs`).
+- `PortSeed` per-corner `dom`/`per_pol`, `eval_sta` per-corner masks,
+  `key_dom`/`ep_cap` union matching (`analysis.rs`).
+- `collect_endpoints` per-corner output-port handling.
+- `EndpointReport` → `Option<f32>` corner fields; `record_endpoint`
+  emit-on-either-corner; `merge_corner_reports`, `parasitics.rs`
+  asserts, `test_sta_clocks_match_opensta` `null` handling,
+  `evaluated == 45`.
+- `sdc.rs` unit tests for the fold (both orderings, `-add_delay`
+  winner case).
 
-## Step 3 — Measured-behaviour fixes
+Gate: `cargo test --workspace`, clippy. Fail-proof: revert the fold to
+port-wide → `t2_clkcor` red on the corner-null cells; revert
+`record_endpoint` to `(Some, Some)` → same cells red (endpoint drops
+instead of emitting partially). Restore each.
 
-Implement per `api.md` decision trees, using the recorded probe
-evidence:
+## Step 4 — Wording + records (R4, R5, docs)
 
-- A2 empty clock list — `plain_names`/`get_clocks` empty-collection
-  handling + `set_clock_*` empty-selection rule.
-- A5 `-waveform` post-wrap validation (or documented keep).
-- A7 `-to` resolved-but-invalid counting in `resolve_to` +
-  `unresolved_exception_selectors` field doc.
-- A8 port-vs-clock priority in `resolve_from`/`resolve_to`/
-  `resolve_delay_from` `ObjSel::Names` arms.
-- A9 `-clock`-less anchor under `-waveform` (possibly a no-change
-  record).
+- `sdc.rs`: `t2_eclk`/`t2_eclk family` citations now map to real lines
+  (audit each); `(measured)` on the no-arg `get_clocks` cites
+  `t2_eclk2`; `DelayRule::clock`/`delay_at` docs restated.
+- `docs/results.md`: RD1 rewording + RD2 revision entry.
+- `docs/multi-clock.md`: RD3 sync (counts, §1.7 bullets, limitation).
+- `docs/timing-exceptions.md`: RD4 `unreached_endpoints` restatement.
+- `tests/designs/README.md`: RD5 count + coverage note.
 
-Each fix that changes a counted diagnostic updates the corresponding
-field doc and `docs/timing-exceptions.md` in the same edit. Any fix
-visible to an endpoint table gets a unit test pinning it (e.g. a new
-`t2_*`-style `load_sdc`+`run_sta` assert or a parser test — match the
-existing test shapes in `analysis.rs`/`sdc.rs`).
+## Step 5 — Version bump + final gate
 
-Gate: `cargo test --workspace`, clippy. Fail-proof each behaviour
-change: break the new code path (e.g. revert the post-wrap check or the
-priority order), confirm the new/changed test goes red, restore.
-
-## Step 4 — Documentation pass
-
-Per `docs.md`:
-
-- D1 `timing-exceptions.md` counters.
-- D2 `results.md`: "15→14+`t2_grp`" fix, literal `awk` command (run it),
-  saif-power entry audit.
-- D3 `tests/designs/README.md` fixture entries (`microbench`,
-  `sta_exceptions`, `repro_extreme_ceff` — verify filenames first).
-- D4 `driven_nets_without_activity` doc.
-- D5 `t2_mdx` description audit (likely no-op).
-- D6 `multi-clock.md` sync: scenario count, §1.2 hold note pointer,
-  §1.7 new measured rules.
-
-## Step 5 — Results entry + version bump
-
-- D7 `docs/results.md` dated entry: probe lines verbatim (with STA
-  codes), implemented rules, no-op items, verification record.
-- Bump `[workspace.package] version` `0.2.6 → 0.2.7` in `Cargo.toml`;
-  `cargo check` (or any cargo command) refreshes `Cargo.lock`.
-
-## Final gate
+- `[workspace.package] version` `0.2.7 → 0.2.8` in `Cargo.toml`;
+  `cargo check` refreshes `Cargo.lock`.
 
 ```
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-git diff --stat tests/designs/    # only new probe artifacts differ
+git diff --stat tests/designs/   # golden: append-only blocks + regenerated t2_eclk probe
 ```
 
 Optional heavy: `cargo test --release -p grus-core sta`.
@@ -108,14 +87,14 @@ Optional heavy: `cargo test --release -p grus-core sta`.
 
 - `crates/grus-core/src/sta/analysis.rs`
 - `crates/grus-core/src/sta/sdc.rs`
-- `crates/grus-core/src/readers/saif.rs`
-- `crates/grus-core/src/power.rs`
+- `crates/grus-core/src/sta/parasitics.rs`
 - `tests/designs/sta_clocks/probe.sh`
-- `tests/designs/sta_clocks/t2_*.sdc` (new)
-- `tests/designs/sta_clocks/probe_t2_*.txt` (new outputs)
-- `docs/timing-exceptions.md`
+- `tests/designs/sta_clocks/t2_*.sdc`
+- `tests/designs/sta_clocks/probe_t2_*.txt`
+- `tests/designs/sta_clocks/two_clock.reference.json`
 - `docs/results.md`
 - `docs/multi-clock.md`
+- `docs/timing-exceptions.md`
 - `tests/designs/README.md`
 - `Cargo.toml`
 - `Cargo.lock`
