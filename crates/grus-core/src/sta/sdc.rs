@@ -107,6 +107,13 @@ pub enum ObjSel {
     /// objects, and only endpoint pins are capture objects — a `Q`/`D` pin
     /// spec resolves but covers nothing.
     Pins(Vec<String>),
+    /// `get_clocks`/`all_clocks` collections, resolved to `Sdc::clocks`
+    /// row indices at parse time (the `InterClockUnc::from`/`to`
+    /// convention). Unknown names drop out at resolution — measured
+    /// OpenSTA semantics (`t2_selunk`): `[get_clocks nope]` warns and
+    /// the selector covers the empty set, so an all-miss list reaches
+    /// the resolver empty and is diagnosed there.
+    Clocks(Vec<usize>),
     /// Bare words (`-from u_ff0`): matched against port and cell names at
     /// resolution time. An empty list came from an empty selector and must
     /// be diagnosed at resolution, not treated as absent.
@@ -268,8 +275,44 @@ pub struct Clock {
     pub hold_uncertainty_ns: f32,
     /// `set_clock_transition`: slew seeded on clock pins; 0 without the command.
     pub transition_ns: f32,
+    /// `create_clock -waveform {rise fall}` — edge instants within the
+    /// period. `None` is the default 50% duty cycle `[0, P/2]`; see
+    /// `Clock::edge_offset`.
+    pub waveform_ns: Option<[f32; 2]>,
     /// `set_propagated_clock` on this domain.
     pub propagated: bool,
+}
+
+impl Clock {
+    /// Time within the period of the edge with index parity `p` (0 =
+    /// rise, 1 = fall): the `-waveform` instant, or `p · P/2` for the
+    /// default 50% duty cycle.
+    pub fn edge_offset(&self, p: usize) -> f32 {
+        self.waveform_ns.map_or(0.5 * self.period_ns * p as f32, |w| w[p])
+    }
+}
+
+/// A `set_clock_groups` exclusivity mode. All three cut the same
+/// launch/capture pairs on the committed probe (`t2_grpl`/`t2_grpp` =
+/// `t2_grp`) — the model keeps the declared mode but shares the eval
+/// path; `docs/multi-clock.md` records the measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockGroupKind {
+    Asynchronous,
+    LogicallyExclusive,
+    PhysicallyExclusive,
+}
+
+/// One `set_clock_groups` command's resolved clock rows, per `-group`
+/// in command order. A clock is cut from every row not in a group with
+/// it — a lone `-group` cuts its members against all other clocks
+/// (measured `t2_grp1`), so group membership, not pairwise group
+/// matching, is what matters.
+#[derive(Clone, Debug)]
+pub struct ClockGroup {
+    pub kind: ClockGroupKind,
+    /// Resolved `Sdc::clocks` rows per `-group` argument.
+    pub groups: Vec<Vec<usize>>,
 }
 
 /// The SDC subset the benchmark flow uses. Commands are applied in file order, so a later
@@ -298,6 +341,10 @@ pub struct Sdc {
     pub path_delays: Vec<PathDelay>,
     /// `set_clock_uncertainty -from/-to` rules, in file order.
     pub inter_clock_uncertainty: Vec<InterClockUnc>,
+    /// `set_clock_groups` declarations, in file order. `-allow_paths`
+    /// commands store nothing — measured no-op (`t2_grpa` kept all
+    /// eight endpoints).
+    pub clock_groups: Vec<ClockGroup>,
     /// Options the parser accepts but does not apply, counted by flag or by descriptive key.
     /// `-lib_cell` and `-pin` restrict a delay to one cell or pin; the model has no per-arc
     /// endpoint matching, so the restriction is dropped and the delay applies to every
@@ -512,6 +559,23 @@ impl Sdc {
         delay_at(&self.output_delays, port, false, self)
             .and_then(|(_, _, clock)| clock)
             .map_or_else(|| self.design_row(), |id| id.0)
+    }
+
+    /// The `-clock` row a port's input delay is declared against, `None`
+    /// when the rule carries no `-clock` (or no rule exists). Clock-object
+    /// selectors and clock groups match only declared anchors — unlike
+    /// [`Sdc::input_clock_row`] there is no `design_row` fallback.
+    pub fn declared_input_clock_row(&self, port: &str) -> Option<usize> {
+        delay_at(&self.input_delays, port, true, self)
+            .and_then(|(_, _, clock)| clock)
+            .map(|id| id.0)
+    }
+
+    /// Same as [`Sdc::declared_input_clock_row`] for `set_output_delay`.
+    pub fn declared_output_clock_row(&self, port: &str) -> Option<usize> {
+        delay_at(&self.output_delays, port, false, self)
+            .and_then(|(_, _, clock)| clock)
+            .map(|id| id.0)
     }
 
     /// `(min, max)` input delay in ns; both equal the plain value when no `-min`/`-max` was given.
@@ -864,6 +928,10 @@ impl Interp {
                 self.create_clock(args)?;
                 Ok(empty())
             }
+            "set_clock_groups" => {
+                self.set_clock_groups(args)?;
+                Ok(empty())
+            }
             "set_clock_latency" => {
                 self.set_clock_latency(args)?;
                 Ok(empty())
@@ -968,12 +1036,44 @@ impl Interp {
         Ok(value.clone())
     }
 
-    /// `create_clock -name N -period P [source]`. A clock with a source port is a design
+    /// `create_clock -name N -period P [-waveform {rise fall}] [source]`. A clock with a source port is a design
     /// clock; one without is a virtual I/O clock that I/O delays can be referenced to.
     /// Every clock — design or virtual — appends a row to `Sdc::clocks`.
     fn create_clock(&mut self, args: &[Value]) -> Result<()> {
         let name = flag_value(args, "-name")?.map(str::to_string);
         let period_ns = parse_f32(flag_value(args, "-period")?.context("missing -period")?)?;
+        let waveform_ns = flag_value(args, "-waveform")?
+            .map(|text| {
+                let instants = text
+                    .split_whitespace()
+                    .map(parse_f32)
+                    .collect::<Result<Vec<f32>>>()?;
+                // Measured OpenSTA bails: an odd instant count (STA-0371)
+                // and non-increasing instants (STA-0372). Lists past two
+                // instants parse there (`t2_wave4`) but the eval model is
+                // built on the rise/fall pair — named bail instead of a
+                // silently wrong lattice (`docs/multi-clock.md`).
+                if instants.len() % 2 == 1 {
+                    bail!("create_clock -waveform takes an even number of edge instants");
+                }
+                if instants.len() > 2 {
+                    bail!("create_clock -waveform with more than two instants is unsupported");
+                }
+                if instants.windows(2).any(|w| w[1] <= w[0]) {
+                    bail!("create_clock -waveform instants must be strictly increasing");
+                }
+                if instants.len() != 2 {
+                    bail!("create_clock -waveform takes two edge instants");
+                }
+                // OpenSTA accepts instants past the period (`t2_wavebig`
+                // `{0 2.5}`) — the waveform repeats per period, so the
+                // instants wrap.
+                Ok([
+                    instants[0].rem_euclid(period_ns),
+                    instants[1].rem_euclid(period_ns),
+                ])
+            })
+            .transpose()?;
         match positionals(
             args,
             &CLOCK_VALUE_FLAGS,
@@ -991,6 +1091,7 @@ impl Interp {
                     name,
                     port: None,
                     period_ns,
+                    waveform_ns,
                     ..Clock::default()
                 });
             }
@@ -1002,12 +1103,105 @@ impl Interp {
                     name: name.unwrap_or_else(|| port.clone()),
                     port: Some(port.clone()),
                     period_ns,
+                    waveform_ns,
                     ..Clock::default()
                 });
             }
             _ => bail!("unsupported create_clock argument"),
         }
         Ok(())
+    }
+
+    /// `set_clock_groups -asynchronous|-logically_exclusive|-physically_exclusive
+    /// [-name n] [-allow_paths] -group <clocks> [-group <clocks>...]`.
+    /// The mode flag is mandatory — OpenSTA aborts without it (`STA-0400`,
+    /// measured `t2_grpn`). `-allow_paths` parses but declares no
+    /// exclusion (measured `t2_grpa`: all endpoints stay timed). Group
+    /// arguments are `get_clocks`/`all_clocks` collections or bare
+    /// name lists; unknown clock names bail like every other clock
+    /// resolution (`t2_grpb` shows bare names resolve).
+    fn set_clock_groups(&mut self, args: &[Value]) -> Result<()> {
+        let mut kind = None;
+        let mut groups = Vec::new();
+        let mut allow_paths = false;
+        let mut i = 0;
+        while i < args.len() {
+            match &args[i] {
+                Value::Str(s)
+                    if matches!(
+                        s.as_str(),
+                        "-asynchronous" | "-logically_exclusive" | "-physically_exclusive"
+                    ) =>
+                {
+                    if kind.is_some() {
+                        bail!("set_clock_groups takes one mode flag");
+                    }
+                    kind = Some(match s.as_str() {
+                        "-asynchronous" => ClockGroupKind::Asynchronous,
+                        "-logically_exclusive" => ClockGroupKind::LogicallyExclusive,
+                        _ => ClockGroupKind::PhysicallyExclusive,
+                    });
+                    i += 1;
+                }
+                Value::Str(s) if s == "-name" => {
+                    if matches!(args.get(i + 1), Some(Value::Str(_))) {
+                        i += 2;
+                    } else {
+                        bail!("set_clock_groups -name needs a value");
+                    }
+                }
+                Value::Str(s) if s == "-allow_paths" => {
+                    allow_paths = true;
+                    i += 1;
+                }
+                Value::Str(s) if s == "-group" => {
+                    let group = match args.get(i + 1) {
+                        Some(Value::Clocks(names)) => names
+                            .iter()
+                            .map(|n| self.resolve_clock(n).map(|id| id.0))
+                            .collect::<Result<Vec<_>>>()?,
+                        // `-group cka` and `-group {cka ckb}` arrive as
+                        // plain/braced words; `-group {}` is the empty
+                        // group (measured `t2_grpe`: parses, still cuts).
+                        Some(Value::Str(text)) => text
+                            .split_whitespace()
+                            .map(|n| self.resolve_clock(n).map(|id| id.0))
+                            .collect::<Result<Vec<_>>>()?,
+                        _ => bail!("set_clock_groups -group takes clock objects"),
+                    };
+                    groups.push(group);
+                    i += 2;
+                }
+                Value::Str(s) if s.starts_with('-') && !is_negative_number(s) => {
+                    bail!("unsupported option `{s}`")
+                }
+                _ => bail!("set_clock_groups takes a mode flag and -group clock lists"),
+            }
+        }
+        if kind.is_none() {
+            bail!(
+                "set_clock_groups needs -asynchronous, -logically_exclusive or -physically_exclusive"
+            );
+        }
+        if !allow_paths {
+            self.sdc.clock_groups.push(ClockGroup {
+                kind: kind.unwrap(),
+                groups,
+            });
+        }
+        Ok(())
+    }
+
+    /// `Sdc::clocks` rows for a `get_clocks`/`all_clocks` name list.
+    /// Unknown names drop out silently — OpenSTA warns and leaves them
+    /// out of the collection, so an all-miss list resolves to the empty
+    /// set (measured `t2_selunk`) and `resolve_clock`'s bail does not
+    /// apply here.
+    fn clock_rows(&self, names: &[String]) -> Vec<usize> {
+        names
+            .iter()
+            .filter_map(|n| self.sdc.clocks.iter().position(|c| c.name == *n))
+            .collect()
     }
 
     /// `set_clock_uncertainty [-setup|-hold] <ns> [-from <clocks>] [-to <clocks>] [<clocks>]`.
@@ -1573,9 +1767,12 @@ impl Interp {
                             v
                             @ (Value::Ports(_) | Value::Cells(_) | Value::Pins(_) | Value::Str(_)),
                         ) => obj_sel(v),
-                        // Clock objects and opaque selections cannot be
-                        // honoured by the exception model: the whole command
-                        // is counted ignored.
+                        // Clock objects resolve to rows now; only opaque
+                        // selections still cannot be honoured and count the
+                        // command ignored.
+                        Some(Value::Clocks(names)) => {
+                            Some(ObjSel::Clocks(self.clock_rows(names)))
+                        }
                         Some(_) => None,
                     };
                     match sel {
@@ -1702,6 +1899,9 @@ impl Interp {
                             v
                             @ (Value::Ports(_) | Value::Cells(_) | Value::Pins(_) | Value::Str(_)),
                         ) => obj_sel(v),
+                        Some(Value::Clocks(names)) => {
+                            Some(ObjSel::Clocks(self.clock_rows(names)))
+                        }
                         Some(_) => None,
                     };
                     match sel {
@@ -1973,8 +2173,9 @@ fn is_object_selector(name: &str) -> bool {
 }
 
 /// A `-from`/`-to` argument as an [`ObjSel`]; `None` for selections the
-/// exception model cannot honour (clock objects, opaque selections) — the
-/// caller counts the command ignored.
+/// exception model cannot honour (opaque selections) — the caller
+/// counts the command ignored. Clock collections take the
+/// [`Parser::clock_rows`] path at the call sites instead.
 fn obj_sel(v: &Value) -> Option<ObjSel> {
     match v {
         Value::Ports(sel) => Some(ObjSel::Ports(sel.clone())),
@@ -2029,7 +2230,7 @@ const LOAD_BOOL_FLAGS: [&str; 2] = ["-pin_load", "-wire_load"];
 /// `ignored_commands` rather than applied to both corners.
 const LOAD_UNSUPPORTED_FLAGS: [&str; 5] =
     ["-min", "-max", "-rise", "-fall", "-subtract_pin_load"];
-const CLOCK_VALUE_FLAGS: [&str; 2] = ["-name", "-period"];
+const CLOCK_VALUE_FLAGS: [&str; 3] = ["-name", "-period", "-waveform"];
 
 /// The value after `flag`, or None when the flag is absent. A flag with no value is an error.
 fn flag_value<'a>(args: &'a [Value], flag: &str) -> Result<Option<&'a str>> {
@@ -2338,19 +2539,14 @@ mod tests {
 
     #[test]
     fn path_delay_unresolvable_selectors_are_ignored_not_fatal() {
-        for snippet in [
-            "set_max_delay 1.0 -from [get_clocks core_clk] -to [get_cells u1]",
-            "set_min_delay 0.5 -to [all_clocks]",
-            "set_max_delay 1.0 -from [select_cells u1]",
-        ] {
-            let sdc = parse_sdc(&format!("{GCD}{snippet}\n")).unwrap();
-            assert!(sdc.path_delays.is_empty(), "stored: {snippet}");
-            assert!(
-                sdc.ignored_commands.contains_key("set_max_delay")
-                    || sdc.ignored_commands.contains_key("set_min_delay"),
-                "not counted: {snippet}"
-            );
-        }
+        let snippet = "set_max_delay 1.0 -from [select_cells u1]";
+        let sdc = parse_sdc(&format!("{GCD}{snippet}\n")).unwrap();
+        assert!(sdc.path_delays.is_empty(), "stored: {snippet}");
+        assert!(
+            sdc.ignored_commands.contains_key("set_max_delay")
+                || sdc.ignored_commands.contains_key("set_min_delay"),
+            "not counted: {snippet}"
+        );
     }
 
     #[test]
@@ -2455,9 +2651,6 @@ mod tests {
     #[test]
     fn exception_unresolvable_selectors_are_ignored_not_fatal() {
         for snippet in [
-            // Clock-object selectors are unsupported in v1.
-            "set_false_path -from [get_clocks core_clk] -to [get_cells u1]",
-            "set_multicycle_path -setup 2 -to [all_clocks]",
             // Nested selectors the model cannot represent stay opaque.
             "set_multicycle_path -setup 2 -from [select_cells u1]",
             // Pin specs cannot subtract from a port collection.
@@ -3166,12 +3359,24 @@ mod tests {
                 "unsupported option `-early`",
             ),
             (
-                "create_clock -waveform {0 0.5} -period 2.0 [get_ports other]",
-                "unsupported option `-waveform`",
+                "create_clock -waveform {0 0.5 1.0} -period 2.0 [get_ports other]",
+                "even number of edge instants",
             ),
             (
-                "set_clock_groups -asynchronous -group [get_clocks core_clk] -group [get_clocks vclk]",
-                "unsupported command `set_clock_groups`",
+                "create_clock -waveform {1.7 0.3} -period 2.0 [get_ports other]",
+                "strictly increasing",
+            ),
+            (
+                "create_clock -waveform {0 0.5 1.0 1.5} -period 2.0 [get_ports other]",
+                "more than two instants is unsupported",
+            ),
+            (
+                "set_clock_groups -group [get_clocks core_clk] -group [get_clocks vclk]",
+                "needs -asynchronous, -logically_exclusive or -physically_exclusive",
+            ),
+            (
+                "set_clock_groups -asynchronous -group [get_clocks nope] -group [get_clocks vclk]",
+                "unknown clock `nope`",
             ),
             (
                 "set_input_delay 1.0 -clock other [get_ports d_in]",
@@ -3406,6 +3611,70 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(sdc.output_clock_latency_ns("yb"), 0.2);
+    }
+
+    /// `get_clocks`/`all_clocks` selectors inside `-from`/`-to` resolve to
+    /// `ObjSel::Clocks` rows instead of counting the command ignored; an
+    /// all-miss collection resolves empty (measured `t2_selunk`: OpenSTA
+    /// warns and the rule covers nothing).
+    #[test]
+    fn clock_selectors_parse_to_rows() {
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_false_path -from [get_clocks cka]\n\
+            set_max_delay 1.0 -to [get_clocks {{cka ckb}}]\n\
+            set_min_delay 0.5 -from [all_clocks]\n\
+            set_multicycle_path -setup 2 -from [get_clocks ckb] -to [get_clocks cka]\n\
+            set_false_path -from [get_clocks nope]\n"
+        ))
+        .unwrap();
+        assert!(matches!(sdc.exceptions[0].from, Some(ObjSel::Clocks(ref r)) if *r == [0]));
+        assert!(matches!(sdc.path_delays[0].to, Some(ObjSel::Clocks(ref r)) if *r == [0, 1]));
+        assert!(matches!(sdc.path_delays[1].from, Some(ObjSel::Clocks(ref r)) if *r == [0, 1]));
+        assert!(matches!(sdc.exceptions[1].from, Some(ObjSel::Clocks(ref r)) if *r == [1]));
+        assert!(matches!(sdc.exceptions[1].to, Some(ObjSel::Clocks(ref r)) if *r == [0]));
+        assert!(matches!(sdc.exceptions[2].from, Some(ObjSel::Clocks(ref r)) if r.is_empty()));
+        assert!(!sdc.ignored_commands.contains_key("set_false_path"));
+    }
+
+    /// `create_clock -waveform` stores the two edge instants on design and
+    /// virtual rows; absence keeps `None` (the 50% duty default).
+    #[test]
+    fn create_clock_waveform_parses() {
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            create_clock -name vw -period 5.0 -waveform {{0.5 4.0}}\n\
+            create_clock -name cw -period 4.0 -waveform {{0.3 1.7}} [get_ports clk3]\n\
+            create_clock -name big -period 2.0 -waveform {{0 2.5}}\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.clock("vw").unwrap().waveform_ns, Some([0.5, 4.0]));
+        assert_eq!(sdc.clock("cw").unwrap().waveform_ns, Some([0.3, 1.7]));
+        // `t2_wavebig`: instants past the period wrap onto it.
+        assert_eq!(sdc.clock("big").unwrap().waveform_ns, Some([0.0, 0.5]));
+        assert_eq!(sdc.clock("cka").unwrap().waveform_ns, None);
+    }
+
+    /// `set_clock_groups` stores the resolved groups per mode; `-name` is
+    /// accepted, `-allow_paths` records no exclusion, `-group` accepts
+    /// bare/braced names and an empty group.
+    #[test]
+    fn set_clock_groups_parses() {
+        let sdc = parse_sdc(&format!(
+            "{TWO_DESIGN}\
+            set_clock_groups -name g -asynchronous -group [get_clocks cka] -group [get_clocks ckb]\n\
+            set_clock_groups -logically_exclusive -group cka -group ckb\n\
+            set_clock_groups -asynchronous -allow_paths -group [get_clocks cka] -group [get_clocks ckb]\n\
+            set_clock_groups -physically_exclusive -group {{}} -group {{cka ckb}}\n"
+        ))
+        .unwrap();
+        assert_eq!(sdc.clock_groups.len(), 3);
+        assert_eq!(sdc.clock_groups[0].kind, ClockGroupKind::Asynchronous);
+        assert_eq!(sdc.clock_groups[0].groups, vec![vec![0], vec![1]]);
+        assert_eq!(sdc.clock_groups[1].kind, ClockGroupKind::LogicallyExclusive);
+        assert_eq!(sdc.clock_groups[1].groups, vec![vec![0], vec![1]]);
+        assert_eq!(sdc.clock_groups[2].kind, ClockGroupKind::PhysicallyExclusive);
+        assert_eq!(sdc.clock_groups[2].groups, vec![vec![], vec![0, 1]]);
     }
 
     /// A `set_clock_*` without a clock target writes the first port-bearing row at apply
