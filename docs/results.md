@@ -5791,3 +5791,93 @@ plan and ticket order are in
 `kurena/tasks/perf-profile/design/plan.md`; the raw log is at
 `/tmp/perf-measure.log` (regenerate with `measure.sh` — it is not
 committed, the driver is).
+
+### 2026-11-22 — perf-par-slew: parallel propagate_slew (v0.3.3)
+
+`propagate_slew`'s level loop now computes each pin in parallel and
+applies collected updates in level order — the same shape
+`sta.eval.walk` uses (`level.len() < 32` serial, else
+`par_iter().filter_map(..).collect()` + ordered apply) — plus a serial
+per-level replay of same-level-earlier sequential arcs. The replay is
+required only for the `include_seq=false` levelization fallback (ibex's
+clock-gate cycle); under `include_seq=true` seq edges are ordering edges
+and the scan never fires. Design: `kurena/tasks/perf-par-slew/design/`.
+
+**Before/after wall** — `median (min–max)` ms, REPS=5, same machine
+(M4 mini) and flags as the baseline entry; before = v0.3.2 baseline
+column, re-measurement not repeated per plan:
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `sta` placement RC — gcd | 50 (50–50) | 40 (40–40) | ×1.25 |
+| `sta` placement RC — picorv32 | 860 (750–870) | 320 (280–380) | ×2.7 |
+| `sta` placement RC — aes | 1480 (1410–1790) | 470 (410–530) | ×3.1 |
+| `sta` placement RC — ibex | 670 (620–690) | 410 (370–410) | ×1.6 |
+| `sta` placement RC — jpeg | 6000 (5990–6060) | 2060 (2010–2110) | **×2.9** |
+| `sta` routed SPEF — gcd | 50 (40–50) | 40 (40–40) | ×1.25 |
+| `sta` routed SPEF — picorv32 | 900 (790–900) | 360 (360–420) | ×2.5 |
+| `sta` routed SPEF — aes | 1460 (1380–1950) | 510 (480–520) | ×2.9 |
+| `sta` routed SPEF — ibex | 730 (680–770) | 490 (430–540) | ×1.5 |
+| `sta` routed SPEF — jpeg | 6230 (6160–6340) | 2370 (2280–2470) | ×2.6 |
+| `sta` rcx SPEF — gcd | 50 (50–50) | 30 (20–50) | ~noise |
+| `sta` rcx SPEF — picorv32 | 1020 (930–1030) | 490 (390–540) | ×2.1 |
+| `power` placement RC — gcd | 50 (50–50) | 40 (30–40) | ×1.25 |
+| `power` placement RC — picorv32 | 870 (810–910) | 350 (310–350) | ×2.5 |
+| `power` placement RC — aes | 1400 (1360–1450) | 490 (440–490) | ×2.9 |
+| `power` placement RC — ibex | 710 (680–820) | 440 (390–440) | ×1.6 |
+| `power` placement RC — jpeg | 6100 (6000–6110) | 2170 (2100–2190) | ×2.8 |
+
+**Phase** (`sta --parasitics placement`, median ms):
+`sta.prepare.clock.slew` jpeg 4840 → **889 (×5.4)** — share of `sta`
+wall 81% → 43%; aes 1149 → 204 (×5.6), picorv32 667 → 133 (×5.0), ibex
+333 → 74 (×4.5), gcd 20.5 → 12.0. Under `power` the nested phase reads
+the same (jpeg `power.slews` envelope 5749 → 1824; nested
+`sta.prepare.clock.slew` 901, `sta.eval.walk` 830 — nested phases are
+counted under both names, same convention as the baseline entry).
+
+**Achieved vs. ceiling**: plan assumed k = 3 (jpeg `sta` 6.0 s → ~2.7
+s); the M4 mini's 10 cores plus the DMP-dominated inner loop give the
+phase itself ×5.4, and wall lands at 2.06 s — ahead of the conservative
+ceiling, behind the k = 10 Amdahl floor (~1.6 s). Residual, named:
+(1) `sta.eval.walk` (855 jpeg) is now the co-dominant phase — untouched
+here; (2) inside `clock.slew`, serial per-level residue (port seeding,
+ordered apply, the fixup scan, <32-pin levels) and level-boundary
+barriers; (3) DMP table evals partially memory-bound (effective k ≈ 5.4
+of 10 cores); (4) ibex pays the `topological_levels` include_seq=true
+retry inside the phase before falling back — its wall gain (×1.6) is
+bounded by a now-dominant `sta.eval.walk` (237 ms) plus SPEF/DEF loads.
+
+**Equivalence**: all committed goldens untouched (`git status` clean
+under `tests/designs/**`); `cargo test --workspace` (336+3, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --release -p grus-core sta` (183, 2 ignored) all green.
+`--json` byte-identity pre/post on 8 cells: picorv32/aes/ibex/jpeg ×
+(placement RC, routed SPEF) — `cmp`-clean. Determinism:
+`RAYON_NUM_THREADS` 1/4/10 `cmp`-clean on jpeg *and* ibex `sta
+--parasitics placement` (ibex takes the `include_seq=false` fallback —
+the mode the seq replay exists for); merge/apply order is level-order
+collect + disjoint writes, no HashMap-iteration or arrival-order
+dependence (`latch_borrow` is `BTreeMap` keyed lookup only).
+`GRUS_PHASE_TIMING=1` still emits `sta.prepare.clock.slew`. Fail-proof:
+apply step broken to write `slew_max` only → 6 tests red
+(`test_propagated_clock_gate_merges_enable_arc_slew`,
+`test_sta_edge_clock_gate_propagated`,
+`test_gcd_propagated_clock_matches_opensta`,
+`test_picorv32_propagated_clock_matches_opensta`,
+`test_sta_edge_latch_borrow_propagated`,
+`test_sta_edge_min_pulse_width_propagated` — golden diffs show
+`slew_*_min_ns: ours=inf`) → restored green. **Fixup coverage probe
+(honest)**: a temporary `eprintln!` on the replay branch fired 0 times
+across all five committed designs including ibex — no committed input
+exercises a same-level-earlier seq edge, so the replay is
+defensive-but-required (it preserves semantics the levelization cannot
+prove absent), not covered-by-golden.
+
+**What was run**: `REPS=5 sh kurena/tasks/perf-profile/measure.sh
+/tmp/perf-par-slew2.log` (full 45-cell matrix on the v0.3.3 release
+binary; raw log not committed, script is). Note: a first run
+(`/tmp/perf-par-slew.log`) overlapped a background `cargo test
+--release` build and showed inflated ibex/`place` reps (e.g. ibex
+`sta.spef` median 1270); the tabled numbers are the second, idle-machine
+run — the interference run kept min-bounds consistent, no regression
+hid.
