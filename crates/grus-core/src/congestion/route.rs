@@ -72,6 +72,7 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
     let edge_cols = nx.saturating_sub(1);
     let edge_rows = ny.saturating_sub(1);
 
+    let t_route = crate::timing::phase("cong.route");
     // Pass 1: Probabilistic Demand (RISA)
     grid.h_demand.fill(0.0);
     grid.v_demand.fill(0.0);
@@ -555,7 +556,10 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         }
     }
 
+    drop(t_route);
+
     // Congestion Report Aggregation
+    let t_report = crate::timing::phase("cong.report");
     let num_edges = grid.h_demand.len() + grid.v_demand.len();
     let mut total_overflow = 0.0f64;
     let mut max_edge_overflow = 0.0f32;
@@ -652,6 +656,7 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         .zip(grid.v_raw_cap.iter())
         .map(|((&d, &c), &raw)| edge_usage_ratio(d, c, raw))
         .collect();
+    drop(t_report);
 
     CongestionReport {
         nx,
@@ -673,8 +678,12 @@ pub fn estimate_congestion(
     layer_adjustments: Option<&[f32]>,
     gcell_tracks_override: Option<i32>,
 ) -> (GCellGrid, CongestionReport) {
+    let t_grid = crate::timing::phase("cong.grid");
     let mut grid = GCellGrid::build(design_db, tech_db, layer_adjustments, gcell_tracks_override);
+    drop(t_grid);
+    let t_decompose = crate::timing::phase("cong.decompose");
     let segments = decompose_design_nets(design_db, tech_db, &grid);
+    drop(t_decompose);
     let report = route_segments(&mut grid, &segments);
     (grid, report)
 }

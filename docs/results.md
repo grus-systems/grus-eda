@@ -5659,3 +5659,135 @@ Totals `4.5505e-4` vs `4.57e-4` (−0.4%); total leakage `1.3004e-9` vs
   `report_activity_annotation` split counts `user` pins under its
   `input N` bucket while ours reports `user N` per net — a
   label-accounting difference, not a resolution one.
+
+### 2026-11-22 — perf-profile baseline: phase timers + measured hotspot ranking (v0.3.2)
+
+Measure-first ticket (kurena `perf-profile`): env-gated phase timers
+(`GRUS_PHASE_TIMING`, `crates/grus-core/src/timing.rs`, off by default,
+stderr-only `phase <name> <ms> x<count>` lines) at whole-pass boundaries
+of `sta`, `power`, `place`, `congestion`, then a release-build
+measurement of the committed matrix. No optimization landed; the
+deliverable is this table plus `kurena/tasks/perf-profile/design/plan.md`.
+
+**Machine context**: Mac mini, Apple M4 (4P+6E), 16 GB; macOS 27.2.1
+(26B131), `rustc 1.100.0 (0ef1bc386 2026-11-09)`, `cargo build
+--release`, binary `target/release/grus-eda` at the ticket commit.
+Rep policy: 5 reps per cell via `REPS=5 sh
+kurena/tasks/perf-profile/measure.sh /tmp/perf-measure.log`, warm
+Liberty cache; rep 1 was never the slowest rep in any cell (largest
+rep-1 divergence was *faster*, 0.50×, on the 10–20 ms gcd cells —
+timer noise, no cold-path inflation to report separately).
+
+**Design sizes** (placed DEF `COMPONENTS`/`NETS`):
+
+| design | cells | nets | routed.spef |
+|---|---|---|---|
+| gcd | 384 | 269 | 164 K |
+| picorv32 | 10 205 | 6 811 | 4.7 MB (+8.4 MB rcx) |
+| aes | 12 839 | 9 039 | 6.1 MB |
+| ibex | 16 644 | 12 137 | 10 MB |
+| jpeg | 61 569 | 46 568 | 35 MB |
+
+**Wall-clock table** — `median (min–max)` ms:
+
+| cell | gcd | picorv32 | aes | ibex | jpeg |
+|---|---|---|---|---|---|
+| `sta` zero-wire | 20 (10–20) | 50 (30–50) | 70 (70–80) | 90 (60–100) | 290 (170–300) |
+| `sta` placement RC | 50 (50–50) | 860 (750–870) | 1480 (1410–1790) | 670 (620–690) | 6000 (5990–6060) |
+| `sta` routed SPEF | 50 (40–50) | 900 (790–900) | 1460 (1380–1950) | 730 (680–770) | 6230 (6160–6340) |
+| `sta` rcx SPEF | 50 (50–50) | 1020 (930–1030) | — | — | — |
+| `power` zero-wire | 20 (20–20) | 80 (80–90) | 100 (100–130) | 130 (120–140) | 390 (280–410) |
+| `power` placement RC | 50 (50–50) | 870 (810–910) | 1400 (1360–1450) | 710 (680–820) | 6100 (6000–6110) |
+| `congestion` | 10 (10–10) | 40 (30–70) | 40 (40–50) | 60 (60–60) | 210 (210–210) |
+| `place` | 20 (10–20) | 700 (650–800) | 650 (580–1330) | 970 (850–1030) | 4190 (4000–4320) |
+| `power --vcd` | 910 (810–950) | — | — | — | — |
+
+(`/usr/bin/time -l` rounds to 10 ms; sub-10 ms cells are noise and were
+not tabled.)
+
+**Phase breakdown** (median ms, share of cell wall; `sta --parasitics
+placement` shown for all designs — other modes differ only in the
+parasitics/spef rows):
+
+| phase | gcd | picorv32 | aes | ibex | jpeg |
+|---|---|---|---|---|---|
+| `sta.prepare.clock.slew` | 20.5 (41%) | 667 (78%) | 1149 (78%) | 333 (50%) | **4840 (81%)** |
+| `sta.eval.walk` | 11.1 (22%) | 125 (15%) | 264 (18%) | 237 (35%) | 850 (14%) |
+| `sta.load.def` | 1.0 | 19 (2%) | 26 (2%) | 33 (5%) | 121 (2%) |
+| `sta.parasitics` | 1.0 | 15 (2%) | 11 | 21 (3%) | 95 (2%) |
+| `sta.prepare.clock.walk` | — | — | 3 | — | 15 |
+| `sta.prepare.launch` | — | 5 | 3 | 7 | 12 |
+| all other `sta.*` | ≤1 each | ≤4 each | ≤7 each | ≤9 each | ≤7 each |
+| phase sum / wall | 45/50 (91%) | 851/860 (99%) | 1473/1480 (99.6%) | 658/670 (98%) | 5971/6000 (99.5%) |
+
+Other commands (jpeg): `power` — `power.slews` 5749 (94%: nests
+`sta.prepare.clock.slew` 4824 + `sta.eval.walk` 803; nested phases are
+counted under both names, so `power` phase sums exceed 100% — read
+`power.slews` as the outer envelope), `power.cells` 63 (1%),
+`power.activity.resolve` 37 (0.6%). `place` — `place.gp.density` 849
+(20%), `place.legal.pass3` 783 (19%), `place.gp.wl` 685 (16%),
+`place.legal.pass2` 619 (15%), `place.gp.step` 422 (10%),
+`place.legal.pass1` 421 (10%), `place.gp.init` 166 (4%),
+`place.legal.abacus` 43 (1%); GP ≈ 51% vs legalize ≈ 44%. `congestion`
+— `cong.load` 119 (57%), `cong.decompose` 52 (25%), `cong.grid` 16
+(8%), `cong.route` 15 (7%). `sta --spef` jpeg adds `sta.spef.read` 297
+(4.8%); picorv32 rcx `sta.spef.read` 167 (16.4%). `power --vcd` gcd —
+`power.activity.load` 860 (94.5%) dominates (18 MB dump scan);
+`power.slews` 33 (3.7%). `sta.partition.*` never appears — no
+committed SDC partitions.
+
+**Ranked hotspots** (absolute median ms on the largest designs):
+
+1. **`sta.prepare.clock.slew`** — serial Kahn-level slew propagation
+   (`propagate_slew`): 4840 jpeg, 1149 aes, 667 picorv32, 333 ibex;
+   41–81% of `sta` wall, and inside `power.slews` ~79% of `power`
+   wall. `eval.walk` does the same levelized walk with `par_iter`;
+   `propagate_slew` does not — two `driver_response` calls per arc-leg,
+   serial.
+2. `sta.eval.walk` — already per-level rayon: 850 jpeg, 237 ibex.
+3. `place.gp.density`/`place.gp.wl`/`place.gp.step` — GP core, already
+   rayon: 1956 combined on jpeg (47%).
+4. `place.legal.pass1/2/3` — serial by construction: 1823 combined on
+   jpeg (44%) — largest non-parser serial block after #1.
+5. `power.slews` outer envelope — inherits #1+#2; slew-only path could
+   remove the eval/endpoint portion (~13% of jpeg `power`).
+6. `sta.spef.read` — serial parse: 297 jpeg, 167 picorv32-rcx.
+7. `cong.load`/`sta.load.def` — serial DEF parse: 119–133 jpeg.
+8. `power.activity.load` — serial VCD scan, 860 (94.5% of its cell).
+
+**Symbol-level confirmation**: `sample <pid> 4` on `sta --parasitics
+placement` jpeg (clean re-run on idle machine;
+`/tmp/grus-eda_2026-11-22_023747_4O7A.sample.txt`). Collapsed
+top-of-stack, main thread: `sta::dmp::rc_crossing` 1354,
+`sta::nldm::eval_2d` 171, `exp` 159, `pi_waveform_slew` 130+60,
+`solve_dmp_with` 108+49, `fit_ramp_duration` 84, `expm1`/`log`/`log1p`
+132 — ≈80% of samples inside `sta::dmp`/`sta::nldm`, reached through
+`prepare_sta` → `propagate_slew` → `Context::driver_responses`.
+Rayon workers sit in `__psynch_cvwait` (23440) — the dominant pass is
+serial. `samply`/`cargo-instruments` are absent on this machine;
+`xctrace` exists but the recorded repo tool is `sample` — used, kept.
+
+**Peak RSS** (`/usr/bin/time -l` `maximum resident set size`, max over
+reps): jpeg `sta --spef` 308 MB, `sta`/`power` placement RC 232/236 MB,
+`sta` zero-wire 211 MB (lib + DEF resident), `congestion` 79 MB,
+`place` 117 MB; picorv32 rcx `sta` 85 MB; all other cells ≤ 100 MB.
+No swap; no rep hit the machine's 16 GB.
+
+**What was run**: `REPS=5 sh kurena/tasks/perf-profile/measure.sh
+/tmp/perf-measure.log` (45 cells × 5 reps = 225 runs; `sta.spef_rcx`
+and `power.vcd` cells gated on committed artifacts — aes/ibex/jpeg have
+no `*.rcx.spef`, only gcd has a committed VCD). Gate proof: ungated
+stderr on gcd `sta` is the pre-change byte stream (`lef: skipped…`,
+`warning:`); `GRUS_PHASE_TIMING=1` adds `phase ` lines to stderr only,
+stdout identical (`elapsed=` varies by run as before). Byte-identity:
+`--json` STA report on aes and `place --out-def` on gcd `cmp`-clean
+between ungated and gated runs. Fail-proof: `enabled()` forced `true`
+→ ungated run emits 19 `phase ` lines → restored. Checks:
+`cargo test --workspace` (336+3, 2 ignored), `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --release -p grus-core sta`
+(183, 2 ignored) — all green at v0.3.2. No golden file touched (`git
+status` clean outside the listed sources + `docs/`). The optimization
+plan and ticket order are in
+`kurena/tasks/perf-profile/design/plan.md`; the raw log is at
+`/tmp/perf-measure.log` (regenerate with `measure.sh` — it is not
+committed, the driver is).

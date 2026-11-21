@@ -2287,8 +2287,10 @@ fn run_sta_detail(
         return run_sta_partitioned(&prepared, emit_warnings);
     }
     let outcome = eval_sta(&prepared, None, &HashSet::new(), prepared.skipped.clone())?;
+    let t_asm = crate::timing::phase("sta.assemble");
     let (report, polarities) =
         assemble_sta_report(outcome.entries, outcome.pulse_rows, outcome.skipped);
+    drop(t_asm);
     if emit_warnings {
         emit_sta_warnings(&report);
     }
@@ -2423,6 +2425,7 @@ fn prepare_sta<'a>(
     // RC model, so resolved nets count as unresolved instead of being
     // approximated (measured restriction, `docs/results.md` 2026-11-19).
     let mut unresolved_load_selectors = 0;
+    let t_loads = crate::timing::phase("sta.prepare.loads");
     if sdc.net_loads().next().is_some() {
         let net_by_name: HashMap<_, u32> = design
             .net_names
@@ -2443,6 +2446,7 @@ fn prepare_sta<'a>(
             cx.net_wire_loads.fill(None);
         }
     }
+    drop(t_loads);
     let build_pi = |n: usize| {
         let net = NetId(n as u32);
         let tree = parasitics?.net(net)?;
@@ -2458,6 +2462,7 @@ fn prepare_sta<'a>(
         Some([pi(RISE), pi(FALL)])
     };
     let n_nets = design.num_nets();
+    let t_pi = crate::timing::phase("sta.prepare.pi_models");
     cx.pi_models = if parasitics.is_none() {
         vec![None; n_nets]
     } else if n_nets < 512 {
@@ -2465,7 +2470,9 @@ fn prepare_sta<'a>(
     } else {
         (0..n_nets).into_par_iter().map(build_pi).collect()
     };
+    drop(t_pi);
 
+    let t_wd = crate::timing::phase("sta.prepare.wire_delays");
     let wire_delays_per_net: Vec<Option<[Vec<f32>; 2]>> = if parasitics.is_some() {
         if n_nets < 512 {
             (0..n_nets)
@@ -2480,13 +2487,18 @@ fn prepare_sta<'a>(
     } else {
         Vec::new()
     };
+    drop(t_wd);
 
     let mut skipped = SkipReport {
         unresolved_load_selectors,
         ..Default::default()
     };
+    let t_graph = crate::timing::phase("sta.prepare.graph");
     let graph = build_graph(&cx, &mut skipped);
+    drop(t_graph);
+    let t_levels = crate::timing::phase("sta.prepare.levels");
     let levelized = topological_levels(&cx, &graph, false)?;
+    drop(t_levels);
     // Primary inputs: ideal drivers. No clock port is a data startpoint —
     // `is_clock_port` covers every design row, so a second domain's source
     // port stays out of the data seeds too. Seeds are stored unfiltered;
@@ -2496,6 +2508,7 @@ fn prepare_sta<'a>(
     let mut port_seeds = Vec::new();
     let mut slew_seeds = Vec::new();
     let mut state_ports = vec![PinTimingState::UNREACHED; design.num_pins()];
+    let t_ports = crate::timing::phase("sta.prepare.ports");
     for &pin in &design.io_pins {
         let p = pin.0 as usize;
         let name = cx.port_name(pin);
@@ -2565,6 +2578,7 @@ fn prepare_sta<'a>(
             slew_seeds.push((p, per_pol));
         }
     }
+    drop(t_ports);
 
     let mut base_state = vec![PinTimingState::UNREACHED; design.num_pins()];
     // Unclocked input ports seed slew only — the same contribution a
@@ -2597,13 +2611,18 @@ fn prepare_sta<'a>(
         // slew its output pin (and downstream clock pins) see. `propagate_clock`
         // uses those slews for delay lookups; the returned states carry arrival,
         // and their slew fields are overwritten with the unified values below.
+        let t_cslew = crate::timing::phase("sta.prepare.clock.slew");
         let unified_slew = propagate_slew(&cx, &graph, &wire_delays_per_net, &state_ports)?;
+        drop(t_cslew);
+        let t_cwalk = crate::timing::phase("sta.prepare.clock.walk");
         let (mut clk_state, clk_parity) =
             propagate_clock(&cx, &levelized, &wire_delays_per_net, &unified_slew);
         for (c, u) in clk_state.iter_mut().zip(unified_slew.iter()) {
             c.slew_max = u.slew_max;
             c.slew_min = u.slew_min;
         }
+        drop(t_cwalk);
+        let t_cseed = crate::timing::phase("sta.prepare.clock.seed");
         if any_propagated {
             // The propagated parity is authoritative only on propagated rows;
             // ideal domains keep the ideal walk's answer so a clock pin on an
@@ -2655,6 +2674,7 @@ fn prepare_sta<'a>(
                 }
             }
         }
+        drop(t_cseed);
         clock_state = Some(clk_state);
     }
     // Ideal-clock seeding: every consumer whose domain row is not propagated
@@ -2674,6 +2694,7 @@ fn prepare_sta<'a>(
         .chain(graph.latch_opens.iter().map(|o| o.enable))
         .chain(graph.gating_enables.iter().map(|g| g.clk_pin))
         .chain(graph.pulse_width_checks.iter().map(|c| c.pin));
+    let t_iseed = crate::timing::phase("sta.prepare.clock.seed");
     for clk in clock_pins {
         let idx = clk.0 as usize;
         let dom = clock_domain[idx];
@@ -2705,6 +2726,7 @@ fn prepare_sta<'a>(
             );
         }
     }
+    drop(t_iseed);
     let clock_parity = Some(clock_parity);
 
     // A launch produces separate late/early arrivals: the clock edge time is not
@@ -2840,6 +2862,7 @@ fn prepare_sta<'a>(
             eval_launch(l.q, zero, l.lib_arc, l.edge, false)
         }
     };
+    let t_launch = crate::timing::phase("sta.prepare.launch");
     let launch_seeds: Vec<LaunchSeed> = if graph.launches.len() < 64 {
         graph
             .launches
@@ -2888,6 +2911,7 @@ fn prepare_sta<'a>(
             ),
         })
         .collect();
+    drop(t_launch);
 
     Ok(StaPrepared {
         cx,
@@ -2926,6 +2950,7 @@ fn eval_sta(
     let graph = &prepared.graph;
     let levelized = &prepared.levelized;
     let wire_delays_per_net = &prepared.wire_delays_per_net;
+    let t_seeds = crate::timing::phase("sta.eval.seeds");
     let mut state = prepared.base_state.clone();
     for seed in &prepared.port_seeds {
         let p = seed.pin.0 as usize;
@@ -3010,7 +3035,9 @@ fn eval_sta(
             }
         }
     }
+    drop(t_seeds);
 
+    let t_walk = crate::timing::phase("sta.eval.walk");
     for lvl in 1..levelized.level_offsets.len() - 1 {
         let level = levelized.level(lvl);
         let eval_pin = |state: &[PinTimingState], pin: PinId| -> Option<(usize, PinTimingState)> {
@@ -3240,7 +3267,9 @@ fn eval_sta(
             }
         }
     }
+    drop(t_walk);
 
+    let t_ep = crate::timing::phase("sta.eval.endpoints");
     let (entries, pulse_rows, skipped) = collect_endpoints(
         cx,
         graph,
@@ -3252,6 +3281,7 @@ fn eval_sta(
         &prepared.crpr_tags,
         skipped_seed,
     )?;
+    drop(t_ep);
     Ok(EvalOutcome {
         entries,
         pulse_rows,
@@ -3919,6 +3949,7 @@ fn run_sta_partitioned(
     let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
     let graph = &prepared.graph;
 
+    let t_ctx = crate::timing::phase("sta.partition.ctx");
     let mut cell_by_name = HashMap::new();
     for c in 0..design.num_cells() {
         cell_by_name.insert(
@@ -4048,7 +4079,9 @@ fn run_sta_partitioned(
         ep_cap,
         unresolved: 0,
     };
+    drop(t_ctx);
 
+    let t_rules = crate::timing::phase("sta.partition.rules");
     let mut rules = Vec::with_capacity(sdc.exceptions.len() + sdc.path_delays.len());
     // A selector side is unresolved only when it resolves zero objects —
     // OpenSTA's `no valid objects specified` form. A resolved object that
@@ -4170,6 +4203,7 @@ fn run_sta_partitioned(
     }
     let mut classes: Vec<(Vec<u32>, HashSet<u32>)> = class_map.into_iter().collect();
     classes.sort_by(|a, b| a.0.cmp(&b.0));
+    drop(t_rules);
 
     let mut class_maps = Vec::with_capacity(classes.len());
     let mut class_states = Vec::with_capacity(classes.len());
@@ -4212,6 +4246,7 @@ fn run_sta_partitioned(
     // constraint replaces the check on its side, a multicycle shifts required
     // times by the measured OpenSTA formulas. The worst slack across
     // surviving (class, polarity) candidates wins.
+    let t_comp = crate::timing::phase("sta.partition.compose");
     let check_by_pin: HashMap<u32, RegisterCheck> = graph.checks.iter().copied().collect();
     // The polarity of the first clock edge reaching a pin (`edge0`): OpenSTA
     // anchors latch and asynchronous-pin delay checks there, not at the check
@@ -5344,20 +5379,27 @@ fn run_sta_partitioned(
         );
     }
 
+    drop(t_comp);
+
     // Pulse checks have no launch-source side, so exceptions cannot
     // partition them: evaluate once on the merged state.
     let mut pulse_rows = Vec::new();
-    eval_pulse_width_checks(
-        cx,
-        graph,
-        prepared.clock_state.as_deref(),
-        &prepared.clock_domain,
-        &merged,
-        &mut skipped,
-        &mut pulse_rows,
-    );
+    {
+        let _pulse = crate::timing::phase("sta.eval.endpoints.pulse");
+        eval_pulse_width_checks(
+            cx,
+            graph,
+            prepared.clock_state.as_deref(),
+            &prepared.clock_domain,
+            &merged,
+            &mut skipped,
+            &mut pulse_rows,
+        );
+    }
 
+    let t_asm = crate::timing::phase("sta.assemble");
     let (report, polarities) = assemble_sta_report(entries, pulse_rows, skipped);
+    drop(t_asm);
     if emit_warnings {
         emit_sta_warnings(&report);
     }
@@ -6729,15 +6771,18 @@ fn collect_endpoints(
     }
 
     let mut pulse_rows = Vec::new();
-    eval_pulse_width_checks(
-        cx,
-        graph,
-        clock_state,
-        clock_domain,
-        state,
-        &mut skipped,
-        &mut pulse_rows,
-    );
+    {
+        let _pulse = crate::timing::phase("sta.eval.endpoints.pulse");
+        eval_pulse_width_checks(
+            cx,
+            graph,
+            clock_state,
+            clock_domain,
+            state,
+            &mut skipped,
+            &mut pulse_rows,
+        );
+    }
 
     Ok((entries, pulse_rows, skipped))
 }
