@@ -1126,6 +1126,12 @@ mod tests {
             if *sess == "s_ports" {
                 partial_nets = resolution.nets;
             } else if *sess == "s_partial" {
+                // Raw `eff_toggles` counts are only comparable because
+                // both fixtures record the same window — `mba_partial.vcd`
+                // and `mba_ports.vcd` both run to #2000, so
+                // `duration_s`/`window_s` is identical. If either
+                // fixture's duration ever changes, compare
+                // `eff_toggles / window_s` instead.
                 assert_eq!(resolution.nets.len(), partial_nets.len());
                 for (n, (a, b)) in
                     resolution.nets.iter().zip(&partial_nets).enumerate()

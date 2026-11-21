@@ -5073,7 +5073,11 @@ model — `P(f)` under independent inputs and
 `d(f) = Σ_i d_i · P(∂f/∂x_i)` via Shannon cofactors. New
 `crates/grus-core/src/bool_expr.rs` is a bounded recursive-descent
 evaluator (constants, `!` `&` `|` `^`, parens, repeated literals;
-`MAX_VARS` bound; malformed forms return `None`, never panic).
+`MAX_VARS`/`MAX_DEPTH`/`MAX_NODES`/`MAX_OPS` bounds — parse-time caps on
+`!`/`(` recursion depth and AST size keep pathological strings from
+overflowing the stack, and the node cap covers every recursive consumer;
+`MAX_OPS` bounds Shannon work only; malformed or over-bound forms return
+`None`, never panic — `test_bound_trips_no_abort` pins each cap).
 `propagate_combinational` (`activity.rs`) parses each candidate driver
 pin's Liberty `function`, maps its variables to the cell's input nets
 via `DesignDb::pin_by_lib_name` (moved out of `power.rs`), and fills in

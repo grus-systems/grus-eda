@@ -322,7 +322,12 @@ fn propagate_combinational(
         .collect();
     while let Some(m) = queue.iter().next().copied() {
         queue.remove(&m);
-        let cand = candidates[m.0 as usize].take().expect("dequeued candidate");
+        let Some(cand) = candidates[m.0 as usize].take() else {
+            // A candidate enqueues once — its `indeg` reaches 0 exactly
+            // once — so the slot is never empty here.
+            debug_assert!(false, "candidate dequeued twice");
+            continue;
+        };
         let mut resolvable = true;
         let mut p_in = Vec::with_capacity(cand.input_nets.len());
         for &dep in &cand.input_nets {
@@ -432,6 +437,13 @@ pub fn resolve_activity(
     for (path, sa) in dump_paths {
         match annotation_net_of(design, &cell_of, &io_pin_of, path) {
             Some((_pin, net)) => {
+                // First path wins: distinct dump paths can collapse onto
+                // the same driver pin (hierarchy deeper than the flat
+                // cell namespace). Sorted iteration makes the choice
+                // deterministic; on consistent dumps the colliding
+                // streams are VCD aliases of one identifier code and
+                // hold identical activity, so the rule only bites on
+                // pathological dumps.
                 annotation.entry(net).or_insert(*sa);
             }
             None => dead_annotation_entries += 1,

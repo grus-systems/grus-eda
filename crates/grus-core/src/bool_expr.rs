@@ -8,9 +8,12 @@
 //! is sky130's literal `xor2` form), and identical to the per-operator
 //! product rules on the once-per-variable forms.
 //!
-//! Everything is total: malformed input parses `None`, and a node-eval
-//! budget plus a variable bound keep pathological strings from blowing
-//! up the recursion. Consumers keep the `Default` fill on `None`.
+//! Everything is total: malformed input parses `None`, and parse-time
+//! recursion-depth (`!`/`(` descent) and AST-node caps plus a variable
+//! bound keep pathological strings from blowing the stack — the node cap
+//! then covers every recursive consumer (`cofactor`, `lowest_var`,
+//! `const_prob`), while `MAX_OPS` bounds Shannon *work*, not stack.
+//! Consumers keep the `Default` fill on `None`.
 
 /// Grammar (`! > & > ^ > |`, left-associative; `+` is OR, `*` is AND,
 /// `'` postfix is NOT — the sky130 `function` alphabet plus the Liberty
@@ -40,15 +43,29 @@ pub enum BoolExpr {
 
 /// Distinct variables a parsed expression may name.
 pub const MAX_VARS: usize = 32;
+/// Parser recursion depth (`!` unary chains and `(` descents). Nodes are
+/// constructed only on the way back out of these calls, so a node count
+/// cannot bound this case — `"!" * 100_000 + "A"` would overflow the
+/// stack before any node exists.
+const MAX_DEPTH: usize = 64;
+/// Total AST nodes built during one `parse`. AST depth ≤ node count, so
+/// this one bound covers both the iterative `'` postfix chain (deep
+/// trees without parser recursion) and every recursive consumer —
+/// `cofactor`, `lowest_var`, `const_prob` all recurse to AST depth.
+const MAX_NODES: usize = 2048;
 /// Total node evaluations allowed across one `prob`/`sensitivity` call —
-/// the Shannon recursion is exponential in the worst case; the bound only
-/// exists so a pathological string cannot hang the caller.
+/// the Shannon recursion is exponential in the worst case (work bound,
+/// not stack: `prob_rec` depth is ≤ `MAX_VARS` since each level fixes
+/// one variable). The bound exists so a pathological string cannot hang
+/// the caller.
 const MAX_OPS: usize = 1_000_000;
 
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
     vars: Vec<String>,
+    depth: usize,
+    nodes: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -80,11 +97,26 @@ impl<'a> Parser<'a> {
         (self.vars.len() - 1) as u16
     }
 
+    /// One `BoolExpr` construction; trips `None` past `MAX_NODES`.
+    fn bump(&mut self) -> Option<()> {
+        self.nodes += 1;
+        (self.nodes <= MAX_NODES).then_some(())
+    }
+
+    /// One recursive-descent call (`!`/`(`); trips `None` past
+    /// `MAX_DEPTH`. Restored on exit.
+    fn descend(&mut self, f: impl FnOnce(&mut Self) -> Option<BoolExpr>) -> Option<BoolExpr> {
+        self.depth += 1;
+        let r = if self.depth <= MAX_DEPTH { f(self) } else { None };
+        self.depth -= 1;
+        r
+    }
+
     fn atom(&mut self) -> Option<BoolExpr> {
         match self.peek()? {
             b'(' => {
                 self.pos += 1;
-                let e = self.expr()?;
+                let e = self.descend(|p| p.expr())?;
                 self.eat(b')').then_some(e)
             }
             b'0' | b'1' => {
@@ -98,6 +130,7 @@ impl<'a> Parser<'a> {
                 {
                     return None;
                 }
+                self.bump()?;
                 Some(BoolExpr::Const(c == b'1'))
             }
             c if c.is_ascii_alphabetic() || c == b'_' => {
@@ -111,6 +144,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                 }
                 let name = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+                self.bump()?;
                 Some(BoolExpr::Var(self.ident_var(name)))
             }
             _ => None,
@@ -119,10 +153,13 @@ impl<'a> Parser<'a> {
 
     fn unary(&mut self) -> Option<BoolExpr> {
         if self.eat(b'!') {
-            return Some(BoolExpr::Not(Box::new(self.unary()?)));
+            let inner = self.descend(|p| p.unary())?;
+            self.bump()?;
+            return Some(BoolExpr::Not(Box::new(inner)));
         }
         let mut e = self.atom()?;
         while self.eat(b'\'') {
+            self.bump()?;
             e = BoolExpr::Not(Box::new(e));
         }
         Some(e)
@@ -132,7 +169,9 @@ impl<'a> Parser<'a> {
         let mut e = self.unary()?;
         while matches!(self.peek(), Some(b'&' | b'*')) {
             self.pos += 1;
-            e = BoolExpr::And(Box::new(e), Box::new(self.unary()?));
+            let rhs = self.unary()?;
+            self.bump()?;
+            e = BoolExpr::And(Box::new(e), Box::new(rhs));
         }
         Some(e)
     }
@@ -140,7 +179,9 @@ impl<'a> Parser<'a> {
     fn xor(&mut self) -> Option<BoolExpr> {
         let mut e = self.and()?;
         while self.eat(b'^') {
-            e = BoolExpr::Xor(Box::new(e), Box::new(self.and()?));
+            let rhs = self.and()?;
+            self.bump()?;
+            e = BoolExpr::Xor(Box::new(e), Box::new(rhs));
         }
         Some(e)
     }
@@ -149,7 +190,9 @@ impl<'a> Parser<'a> {
         let mut e = self.xor()?;
         while matches!(self.peek(), Some(b'|' | b'+')) {
             self.pos += 1;
-            e = BoolExpr::Or(Box::new(e), Box::new(self.xor()?));
+            let rhs = self.xor()?;
+            self.bump()?;
+            e = BoolExpr::Or(Box::new(e), Box::new(rhs));
         }
         Some(e)
     }
@@ -158,12 +201,15 @@ impl<'a> Parser<'a> {
 /// Parses a Liberty `function` string; `vars` names each distinct
 /// identifier in first-use order (each maps to one `Var` index). `None`
 /// on any malformed input — empty, trailing garbage, unbalanced parens,
-/// unknown tokens — and on input over the variable bound.
+/// unknown tokens — and on input over the `MAX_DEPTH`/`MAX_NODES`/
+/// `MAX_VARS` bounds.
 pub fn parse(text: &str) -> Option<(BoolExpr, Vec<String>)> {
     let mut p = Parser {
         bytes: text.as_bytes(),
         pos: 0,
         vars: Vec::new(),
+        depth: 0,
+        nodes: 0,
     };
     let e = p.expr()?;
     if p.peek().is_some() || p.vars.len() > MAX_VARS {
@@ -269,7 +315,12 @@ fn prob_rec(e: &BoolExpr, p: &[f64], ops: &mut usize) -> Option<f64> {
 fn const_prob(e: &BoolExpr) -> f64 {
     match e {
         BoolExpr::Const(c) => *c as u8 as f64,
-        BoolExpr::Var(_) => 0.0, // unreachable under the lowest_var gate
+        BoolExpr::Var(_) => {
+            // `lowest_var` gates every call — a `Var` reaching here is
+            // a bug, not a reachable path.
+            debug_assert!(false, "const_prob reached a Var — lowest_var gate");
+            0.0
+        }
         BoolExpr::Not(f) => 1.0 - const_prob(f),
         BoolExpr::And(a, b) => const_prob(a) * const_prob(b),
         BoolExpr::Or(a, b) => 1.0 - (1.0 - const_prob(a)) * (1.0 - const_prob(b)),
@@ -418,6 +469,24 @@ mod tests {
         // Short `p` slice is a caller bug we answer with `None`.
         let (e, _) = parse_ok("A&B");
         assert_eq!(prob(&e, &[0.5]), None);
+    }
+
+    /// Each parse cap converts a would-be stack overflow into `None` —
+    /// none of these may abort (the spec's "total and bounded" line made
+    /// executable). `descend` bounds `!`/`(` recursion; `bump` bounds
+    /// AST size, which also bounds every recursive consumer.
+    #[test]
+    fn test_bound_trips_no_abort() {
+        // `unary` recursion depth — the trailing `A` keeps the input
+        // well-formed, so only the cap makes this fail.
+        assert!(parse(&format!("{}A", "!".repeat(10_000))).is_none());
+        // `atom` → `expr` recursion depth.
+        assert!(parse(&format!("{}A", "(".repeat(10_000))).is_none());
+        // Node bound: the `'` postfix chain builds a deep tree without
+        // any parser recursion.
+        assert!(parse(&format!("A{}", "'".repeat(10_000))).is_none());
+        // Node bound: a flat `&` chain.
+        assert!(parse(&format!("{}A", "A&".repeat(5_000))).is_none());
     }
 
     /// sky130 `function` coverage: every `LibPin.function` string in
