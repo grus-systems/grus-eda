@@ -4731,3 +4731,236 @@ back byte-stable and the new `t2_*` artifacts were emitted by the
 same run (golden SDCs `t2_u1`/`t2_u2`/`t2_lcm`/`t2_lcm2`/`t2_xlat`/
 `t2_xlat2`; measure-only `t2_u3`/`t2_lcm3`/`t2_lcm4` plus the
 `-digits 5` `t2_xlat2` evidence rerun).
+
+### 2026-11-21 — N7 — activity propagation probe (v0.2.13)
+
+Measure-first ticket for OpenSTA's statistical activity model — the
+recorded root cause of the gcd `report_power` divergence (N7 entries
+2026-11-18). No code change; the measured semantics and the AP1–AP4
+sequenced plan land in `docs/roadmap.md` and
+`kurena/tasks/activity-propagation/design/api.md` §Plan.
+
+**Run record**: committed `tests/designs/microbench/generate_activity_ref.sh`
+inside `ghcr.io/librelane/librelane:3.0.16`, `sky130_fd_sc_hd`
+`tt_025C_1v80`, `mba.def`/`mba.sdc`. All sections ran (P0 command surface,
+P0b label-precedence, all 12 sessions, the python parse) — twice;
+`mba.activity.reference.json` and `mba.none.openroad.txt` regenerated
+byte-identically on the second run. `mba.none.openroad.txt` is the
+`s_none` transcript with `grep -v` on INFO/WARNING/banner/blank lines —
+**filtered, not verbatim**. The fixture is hand-written (`mba.def`:
+and/or/inv/xor cone with reconvergent fanout on `b`, one plain `dfxtp`,
+a toggling flop and a 2-bit counter as sequential feedback, a `conb_1`
+feeding two bufs, an undriven net `n_float`; five probe VCDs).
+
+**Per-pin accessor**: `get_property <pin> activity` exists (first
+recorded 2026-11-19) and returns `<density/s> <P(1)> <source>` — so every
+rate below is a **direct read**, not an inversion from `report_power`
+columns. Sanity: `clk` reads `1.00000e+08 0.500 clock` = 2 toggles per
+20 ns period. `density`/`probability` are not separate properties; pin
+objects interpolate to pointers, so the dump queries all 43 pins by name.
+
+#### P0 — command surface (verbatim)
+
+- `info commands *power*`: `set_max_dynamic_power analyze_power_grid
+  assign_power_net create_power_domain report_power_metric
+  unset_power_activity define_power_switch_cell report_power
+  set_max_leakage_power create_power_switch read_power_activities
+  check_power_grid map_power_switch set_power_activity
+  set_pdnsim_inst_power`.
+- `*activ*`: `unset_power_activity read_power_activities
+  report_activity_annotation set_power_activity`.
+- `*annotation*`: `report_parasitic_annotation report_activity_annotation`.
+- `set_power_analysis`: **`invalid command name` in this build**.
+- `set_power_activity`: bare → STA-0306 `Specify -activity or -density`;
+  `-help` → STA-0562. Measured spellings: `-global`, `-input`,
+  `-input_ports [all_inputs]`, `-pins [get_pins ...]` all parse with
+  `-activity <f>` and/or `-density <f>` plus `-duty <f>`.
+  `-activity` is normalized to the clock (`0.2` → `1e7` = 0.2 × 5e7);
+  `-density` is in library time units (`0.03` → `3e7`/s = 0.03/ns).
+  `read_power_activities` bare → STA-0565 `requires one positional
+  argument` (a filename). `report_activity_annotation -verbose` →
+  STA-0562; `-report_unannotated` prints the pin list.
+- Knob semantics (P0b session): `-input` seeds input ports *and* undriven
+  pins at the given {density, duty} — source label `input`, pins still
+  `unannotated` in the split. `-input_ports` sets explicit pins — label
+  `user`, counted `input N` in the split. `-global` overrides **every**
+  non-clock non-constant pin — measured including VCD-annotated pins
+  (`a` reads `3e6/0.55 vcd`, then `1e7/0.4 global` after `-global`; the
+  split still counts it `vcd`) and `unknown` feedback registers.
+  `unset_power_activity` removed nothing in either sequence (`a` kept
+  `1e7 0.4 global`). Only `vcd`/`saif`/`user` (`-pins`, `-input_ports`)
+  pins count in `report_activity_annotation`; the `-global`/`-input`
+  knobs do not.
+- `read_vcd` prints `Annotated N pin activities.` — N is the count of
+  **pin-name matches**, not nets (P4).
+
+#### P1 — no annotation at all (`s_none`, verbatim)
+
+```
+clk      1.00000e+08 0.500 clock        a,b      5.00000e+06 0.500 input
+u_flt/A  5.00000e+06 0.500 input        n_flt    5.00000e+06 0.500 propagated
+n_and    5.00000e+06 0.250 propagated   n_inv    5.00000e+06 0.500 propagated
+n_or     6.25000e+06 0.625 propagated   y        1.00000e+07 0.500 propagated
+q        5.00000e+06 0.500 propagated
+n_q0,n_q0n,n_q1,n_c1d (the whole u_f0/u_f1 feedback cone, 11 pins):
+         0.00000e+00 0.000 unknown
+n_hi,n_lo,n_bh,n_bl (+ ports yh,yl):    0.00000e+00 0.000 constant
+```
+
+Defaults, solved directly (not implied):
+
+- **Input default = 0.1 × f_clk, duty 0.5** — `5e6/0.5` on input ports
+  *and* undriven nets (`u_flt/A`, source `input`). `s_p40` (period 40)
+  halves it to `2.5e6` along with `clk` `5e7` — the default is
+  clock-normalized, not a fixed rate. `-input -activity a -duty d`
+  replaces it; `-input_ports` sets individual pins instead.
+- **Clock nets = SDC rate**, `2/period`, duty 0.5, source `clock` — on
+  clk's port and all three DFF CLK pins. Unaffected by `-global`,
+  `-input`, or VCD annotation (the SAIF-`TC` finding re-confirmed).
+- **Sequential**: plain `dfxtp` Q inherits D's {P, d} (`q` = a's
+  `5e6/0.5`); sequential feedback resolves to `0/unknown` — P3.
+- **Constants** (`function : "0"/"1"` cones): `{0, "constant"}` on the
+  conb pins, the downstream buf cone, and the output ports — immune to
+  `-global`.
+- **Everything else**: combinational propagation per P2, source
+  `propagated`; nothing is zero except `unknown`/`constant`.
+- `report_power` on the all-default run: Sequential
+  `6.218178e-06 / 4.050000e-07 / 2.453692e-11`, Combinational
+  `2.413420e-07 / 1.341279e-06 / 3.129771e-11`, Total `8.205853e-06`
+  (internal / switching / leakage, watts). `unannotated 43`.
+- `s_global` (`-activity 0.2 -duty 0.4`): every non-clock non-constant
+  pin → `1e7/0.4 global` — including the `unknown` feedback cone;
+  constants and clock pins keep `constant`/`clock`. Total `1.159849e-05`.
+- `s_input` (`-activity 0.2 -duty 0.4`): `a`,`b`,`u_flt/A` →
+  `1e7/0.4 input`; internals propagate from the seeds — `u_and/X`
+  `8e6/0.16` (= 0.4², d = 2×1e7×0.4), `u_or/X` `1.16e7/0.664`.
+- `s_global_density` (`-density 0.03 -duty 0.35`): all → `3e7/0.35
+  global` — `-density` is per library time unit.
+
+#### P2 — combinational propagation: **M1 local marginals**
+
+Seeds `a` = `3e6/0.55`, `b` = `3e6/0.8` (`s_ports`). Every propagated
+value below reproduces to print precision from per-gate independence:
+
+| net | read | M1 formula | joint (M2) |
+|---|---|---|---|
+| `n_and` | `4.05e6` `0.440` | P = p_a·p_b = 0.44; d = d_a·p_b + d_b·p_a = 4.05e6 | — |
+| `n_inv` | `3e6` `0.200` | P = 1−p_b; d = d_b | — |
+| `n_or`  | `4.92e6` `0.552` | P = p+q−p·q = 0.552; d = d_and·(1−p_inv) + d_inv·(1−p_and) = 4.92e6 | P = 0.64 |
+| `y` (xor) | `6e6` `0.470` | P = p_a⊕p_b = 0.47; d = d_a + d_b = 6e6 | — |
+
+The discriminating `n_or` read is `0.552` — the correlated `b` fanout
+through `u_and`/`u_inv` is **not** tracked (M2's joint truth `a|!b` =
+0.64 is rejected). Density follows output-sensitization: an input edge
+propagates iff the other inputs sit in the enabling state
+(AND: `Σ d_i·∏_{j≠i} p_j`; OR: `Σ d_i·∏_{j≠i} (1−p_j)`; XOR: `d_a+d_b` —
+every input edge toggles the output under either state). Inverting
+pins compose `1−P` with the same density (`n_inv`).
+
+`s_full` (all 18 nets dumped with function-consistent waveforms) vs
+`s_ports`: the *activity model* reads identically — flat internal net
+dumps are dead entries (P4). The propagated-vs-exact delta on this cone,
+from the `mba_full` waveforms themselves:
+
+| net | propagated | exact dump | note |
+|---|---|---|---|
+| `n_and` | `4.05e6` / 0.44 | `3e6` / 0.55 | stimulus has a⊆b |
+| `n_or` | `4.92e6` / 0.552 | `3e6` / 0.75 | correlation missed |
+| `y` | `6e6` / 0.47 | `3e6` / 0.25 | a,b edges coincide — invisible to marginals |
+| `n_inv` | `3e6` / 0.20 | `3e6` / 0.20 | exact here |
+
+#### P3 — sequential: **Q inherits D's {P, d}; feedback cones → `unknown`**
+
+- `u_df/Q` copies `a` verbatim: `3e6/0.55` (`s_ports`), `6e6/0.55`
+  (`s_ports_a2x` — density follows the doubled input rate), `3e6/0.40`
+  (`s_xz` — probability follows the x-degraded seed). S1 confirmed; a
+  DFF contributes its D pin's activity, nothing clock-derived.
+- The toggle flop and 2-bit counter — `u_f0`/`u_i0`/`u_f1`/`u_x1`,
+  11 pins — read `0.00000e+00 0.000 unknown` in **every** session,
+  including `s_full` where the nets carry exact dumps (dead entries
+  again). OpenSTA does **not** resolve the sequential feedback loop:
+  no divide-by-2 (`n_q0` exact `5e7`, `n_q1`/`n_c1d` exact `2.5e7` —
+  all reported 0). `-global` is the only knob that overrides `unknown`.
+- Sequential *internal* on clock pins follows the SDC clock
+  (`u_*/CLK` = `1e8/0.5 clock` everywhere; halved to `5e7` in `s_p40`
+  along with Sequential internal `6.218e-6 → 3.109e-6`) — the
+  SAIF-`TC`-sweep finding re-confirmed on this fixture.
+
+#### P4 — partial annotation: **per-pin name match; internals re-derive**
+
+- `read_vcd`/`read_saif` annotate **pins whose name appears in the
+  dump**: flat top-scope names match *port* pins only (`s_full` split
+  `vcd 4` = `a`, `b`, `clk`, `y`; `s_ports`/`s_partial`/`s_xz` `vcd 3` =
+  `a`, `b`, `clk`; `s_partial2` `vcd 1` = `u_and/X`). A `clk` match is
+  annotated but reported `clock` — the clock model wins.
+- **Flat internal net names are dead entries**: `s_partial` dumps
+  `n_and` at a deliberately inconsistent `1e6/0.80`; `u_and/X` still
+  reads `4.05e6/0.44 propagated` and `n_or` is bit-identical to
+  `s_ports`. `s_full` ≡ `s_partial` ≡ `s_ports` in every column —
+  internal dumps change nothing.
+- **Hierarchical pin names do annotate**: `mba_partial2.vcd` scopes
+  `u_and/X` (no port signals): `u_and/X` reads `1e6/0.8 vcd` and
+  downstream `u_or/X` follows to `1.5e6/0.9` (= 0.8+0.5−0.8·0.5 /
+  1e6·0.5 + 5e6·0.2 — annotation propagates; the same read with ports
+  annotated identically also moved `n_or` to `1.4e6/0.84`). Verdict:
+  internal annotation wins over re-derivation — *when it lands on a
+  pin*.
+- **Activity is per-pin, not per-net**: in `s_full`, port `y` holds the
+  exact `3e6/0.25 vcd` while `u_xor/X` on the same net keeps
+  `6e6/0.47 propagated`; Combinational switching is identical to
+  `s_ports`, so net switching consumes the **driver pin's** value —
+  port `y`'s annotation changes nothing downstream (no fanout).
+- Fallback: unannotated input ports → `input` default; unannotated
+  internals → propagated; the only "stay zero" classes are `unknown`
+  (feedback) and `constant`.
+
+#### P5 — x/z, constants, undriven
+
+- `s_xz`: `a` carries `0→x` at 300, `x→1` at 500 (the 200 rise
+  replaced). Reads `3e6/0.40 vcd`: density counts the two half-weight
+  x edges (5 clean + 2×0.5 = 6 → `3e6`, same as the clean-run seed);
+  `P = 800/2000` with x time in the denominator. Propagation runs on
+  the degraded seed normally (`n_and` `3.6e6/0.32`, `n_or` `4.92e6/0.456`,
+  `y` `6e6/0.56`) — no poisoning.
+- Constants: `{0, "constant"}` on `u_c/HI`,`u_c/LO`, both buf cones and
+  ports `yh`/`yl`. The accessor prints `P 0.000` on *both* HI- and
+  LO-side nets — the read cannot distinguish the constant's value;
+  recorded as a probe limitation, not hidden.
+- Undriven `n_float`: **no OpenSTA warning at all**; `u_flt/A` gets the
+  `input` default and `u_flt/X` propagates it (`5e6/0.5`).
+- Constant nets contribute nothing to `report_power` columns by
+  construction (density 0 ⇒ no switching; their leakage states are the
+  only visible trace) — the honest limit of what `report_power` can show.
+
+#### Disposition — Branch P (plan), and why
+
+The model above is small but not one-commit small: it needs a resolved
+per-net activity record (replacing `Option<SignalActivity>`), the
+name-match seed pass, a `LibPin.function` evaluator with the three
+density rules, sequential Q=D + unknown marking, constant propagation,
+and the CLI/diagnostic surface — each mechanism independently
+golden-covered. It lands as **AP1–AP4** (sequenced in
+`kurena/tasks/activity-propagation/design/api.md` §Plan; the
+`mba.activity.reference.json` sessions are their goldens):
+
+- **AP1** — resolved-activity skeleton + measured defaults
+  (annotation/clock/input-default/global seeds; no propagation).
+  Golden: `s_none`, `s_global`, `s_input`, `s_p40`.
+- **AP2** — combinational propagation (function evaluator + levelized
+  fill, M1 rules). Golden: `s_ports`/`s_full`/`s_input` comb columns +
+  per-pin block.
+- **AP3** — sequential rules (Q=D; feedback cones `unknown` → 0).
+  Golden: `s_ports`/`s_ports_a2x`/`s_xz` seq columns.
+- **AP4** — annotation precedence (pin-name match incl. scoped inst
+  pins), constants, x/z seeds, per-origin diagnostics; gcd
+  `report_power` re-comparison recorded here. Golden: `s_partial`,
+  `s_partial2`, `s_xz`, `s_full`.
+
+**Checks run**: `generate_activity_ref.sh` re-run end-to-end on this
+worktree — `mba.activity.reference.json` and `mba.none.openroad.txt`
+byte-identical across runs (`diff` clean); `cargo test --workspace`
+and `cargo clippy --workspace --all-targets -- -D warnings`; `git diff`
+on every existing golden (`mb*`/`mbw*`/`gcd`/all other
+`*.reference.json`) empty — this ticket adds files only. Not run:
+`grus-eda power` on the `mba` fixture as a golden test (no code landed;
+the fixture parses and runs cleanly through the CLI as a smoke check).

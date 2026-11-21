@@ -1,0 +1,19 @@
+$timescale 1ns $end
+$scope module tb $end
+$scope module dut $end
+$scope module u_and $end
+$var wire 1 ! X $end
+$upscope $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+0!
+$end
+#300
+1!
+#1900
+0!
+#2000
+$finish

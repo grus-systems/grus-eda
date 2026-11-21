@@ -479,6 +479,8 @@ Remaining:
   — marginal `P(when)` products, related-pin activity apportioning,
   half-weight x/z edges — verified at ~1e-7% on the `mbw` ebufn fixture
   in both VCD and SAIF paths (docs/results.md 2026-11-19); only
-  inexpressible `when` forms remain counted. Still open: matching
-  OpenSTA's activity propagation if a closer `report_power` agreement is
-  ever required.
+  inexpressible `when` forms remain counted. Still open: statistical
+  activity propagation — semantics measured 2026-11-21 (defaults →
+  combinational → sequential → precedence; sequenced as AP1–AP4, each
+  golden-covered on the `mba` fixture). See `docs/results.md` 2026-11-21
+  and `kurena/tasks/activity-propagation/design/api.md` §Plan.
