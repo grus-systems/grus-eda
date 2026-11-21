@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod congestion;
 pub mod design_db;
 pub mod floorplan;

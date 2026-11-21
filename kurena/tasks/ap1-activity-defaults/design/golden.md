@@ -100,10 +100,13 @@ for `yc`/`qd` ports. No special-casing needed.
 
 - `mb.power.json`: regenerate via the recorded CLI command
   (`grus-eda power --lib … --tlef … --lef … --def mb.def --sdc mb.sdc
-  --vcd mb.vcd --json`). Expected diff: `diagnostics` gains
-  `activity_origin_counts` (`{"annotated": 4}`) and nothing else — the
-  count-representation decision keeps annotated arithmetic bit-identical.
-  Any watt-column move is a bug; `git diff` is the proof, recorded.
+  --vcd mb.vcd --json`). Diff: `diagnostics` gains
+  `activity_origin_counts` (`{"annotated": 3, "clock": 1}` — the clk
+  net's source column reads `clock`, matching `s_full`'s golden), and
+  Sequential internal moves 2.0892e-6 → 2.0789e-6 because the `2/period`
+  clock seed replaces clk's VCD count (the TC precedence: clock beats
+  annotation) — toward OpenSTA's 2.078733e-6. Any other watt-column move
+  is a bug; `git diff` is the proof, recorded.
 - `mb.saif.reference.json`, `mbw.reference.json`, `mbw.power.json`,
   `mba.activity.reference.json`: untouched; `git diff` empty and asserted
   in the results entry (mb/mbw fully annotated ⇒ byte-identical output).

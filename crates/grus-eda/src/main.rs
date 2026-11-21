@@ -293,8 +293,7 @@ struct PowerArgs {
     #[arg(
         long,
         help = "Path to VCD (.vcd) switching-activity dump",
-        conflicts_with = "saif",
-        required_unless_present = "saif"
+        conflicts_with = "saif"
     )]
     vcd: Option<PathBuf>,
 
@@ -812,6 +811,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let t0 = std::time::Instant::now();
             let pin_slews =
                 grus_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?;
+            let annotated = args.vcd.is_some() || args.saif.is_some();
             let (activity, saif_diag) = match (&args.vcd, &args.saif) {
                 (Some(vcd_path), _) => {
                     (grus_core::readers::load_vcd(vcd_path)?, None)
@@ -822,7 +822,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         saif.resolve(&design, args.saif_scope.as_deref())?;
                     (activity, Some(diag))
                 }
-                (None, None) => unreachable!("clap requires --vcd or --saif"),
+                (None, None) => (grus_core::readers::VcdActivity::default(), None),
             };
             let mut report = grus_core::power::estimate_power(
                 &design,
@@ -831,15 +831,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 parasitics.as_ref(),
                 &activity,
                 &pin_slews,
+                &grus_core::activity::ActivityOverrides::default(),
             );
             if let Some(d) = saif_diag {
                 report.diagnostics.saif_unmatched_scopes = d.unmatched_scopes;
                 report.diagnostics.saif_unmatched_signals = d.unmatched_signals;
             }
+            let activity_desc = if annotated {
+                format!("activity window {:.3e} s", report.duration_s)
+            } else {
+                "activity: defaults (no annotation file)".to_string()
+            };
             println!(
-                "Power ({} parasitics, activity window {:.3e} s): internal={:.6e} W, switching={:.6e} W, leakage={:.6e} W, total={:.6e} W ({:.2} ms)",
+                "Power ({} parasitics, {}): internal={:.6e} W, switching={:.6e} W, leakage={:.6e} W, total={:.6e} W ({:.2} ms)",
                 mode,
-                report.duration_s,
+                activity_desc,
                 report.internal_w,
                 report.switching_w,
                 report.leakage_w,
@@ -856,6 +862,31 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     g.internal_w + g.switching_w + g.leakage_w
                 );
             }
+            // The `report_activity_annotation` split analogue: nets per origin
+            // in the measured label order, zero counts skipped.
+            const ORIGIN_ORDER: [&str; 9] = [
+                "annotated",
+                "clock",
+                "global",
+                "input",
+                "propagated",
+                "sequential",
+                "constant",
+                "unknown",
+                "default",
+            ];
+            let split = ORIGIN_ORDER
+                .iter()
+                .filter_map(|l| {
+                    report
+                        .diagnostics
+                        .activity_origin_counts
+                        .get(*l)
+                        .map(|n| format!("{l}={n}"))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("activity: {split}");
             let d = &report.diagnostics;
             if d.cells_without_lib_cell > 0
                 || d.driven_nets_without_activity > 0
@@ -867,7 +898,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 || d.saif_unmatched_signals > 0
             {
                 eprintln!(
-                    "power: {} cells without lib cell, {} driven nets without recorded activity, {} active nets without cell driver, {} internal-power lookups missing slew, {} unresolved related pins, {} conditional power blocks, {} unmatched SAIF scopes, {} unmatched SAIF signals",
+                    "power: {} cells without lib cell, {} driven nets unresolved by activity seeds, {} active nets without cell driver, {} internal-power lookups missing slew, {} unresolved related pins, {} conditional power blocks, {} unmatched SAIF scopes, {} unmatched SAIF signals",
                     d.cells_without_lib_cell,
                     d.driven_nets_without_activity,
                     d.active_nets_without_cell_driver,
@@ -1110,6 +1141,21 @@ mod tests {
                 "0.60"
             ])
             .is_ok()
+        );
+        // `power` runs on defaults alone; --vcd and --saif stay exclusive.
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda", "power", "--lib", "a", "--tlef", "b", "--lef", "c", "--def", "d",
+                "--sdc", "e"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "grus-eda", "power", "--lib", "a", "--tlef", "b", "--lef", "c", "--def", "d",
+                "--sdc", "e", "--vcd", "v", "--saif", "s"
+            ])
+            .is_err()
         );
     }
 

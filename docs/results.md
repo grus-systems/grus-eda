@@ -4964,3 +4964,103 @@ on every existing golden (`mb*`/`mbw*`/`gcd`/all other
 `*.reference.json`) empty — this ticket adds files only. Not run:
 `grus-eda power` on the `mba` fixture as a golden test (no code landed;
 the fixture parses and runs cleanly through the CLI as a smoke check).
+
+### 2026-11-21 — N7 — AP1: resolved activity + measured seed defaults (v0.2.14)
+
+First implementation ticket of the AP1–AP4 sequence measured above.
+`crates/grus-core/src/activity.rs` adds `resolve_activity`, which fills
+every net's `ResolvedActivity { prob_one: Option<f64>, eff_toggles: f64,
+origin: ActivityOrigin }` in the measured precedence — constant cone →
+clock → `-global` → VCD/SAIF → input/undriven → `Default` (the interim
+fill while AP2/AP3 are unlanded). `PowerCx.net_activity` is now
+`Vec<ResolvedActivity>`; `net_activity()`/`net_prob_one()` read through
+it. No combinational propagation (AP2), no sequential rules (AP3), no
+scoped pin matching (AP4).
+
+**Representation choice (api.md §1)**: option (a) — `eff_toggles` stays
+`f64`. Seeded nets store `density_per_s × window_s` so the annotated
+(`SignalActivity`-count) and seeded paths share one arithmetic —
+`switching_w`/`pin_internal_power` are untouched. `window_s` is
+`vcd.duration_s` when a dump is loaded and positive, else `1.0`:
+absolute-density mode where counts equal rates numerically and the
+window cancels in `switching_w` either way. `PowerReport.duration_s`
+reports that window.
+
+**Semantics landed**: `constant_cone` marks `function:"0"/"1"` outputs
+and grows through non-sequential cells whose every input net is already
+constant (constant-through-buffer is this seed, not AP2; mixed-input
+gates stay unresolved); clock nets are port-driven `create_clock`
+sources at `{2/period, 0.5}` — cell-driven downstream clock nets are
+`Default` (named residual, unmeasured); `-global` hits every non-clock
+non-constant net, beating annotation and `unknown` cones; `-input` /
+undriven seed is `{0.5, 0.1·f_clk}` (`f_clk/10.0` keeps `5e7→5e6`
+bit-exact). Origin labels mirror the accessor's `source` column;
+`propagated`/`sequential`/`unknown` are declared but never emitted in
+AP1. `activity_origin_counts` (per net — OpenSTA's split is per pin,
+recorded difference) feeds `PowerDiagnostics`; `driven_nets_without_
+activity` now counts only `Default`/`Unknown` driven nets — genuinely
+unresolved ones (the AP2 work list), so on partial VCDs it can only
+drop vs the old count.
+
+**`group_of` correction**: the old "arc-less → Clock" arm was a
+gcd-era guess never exercised by a lib'd cell (gcd's arc-less cells
+are unmapped fillers counted in `cells_without_lib_cell`). Measured on
+`mba`: `conb_1`'s leakage sits in OpenSTA's **Combinational** group.
+New rule — sequential → Sequential; non-sequential touching a
+`Clock`-origin net → Clock (clock-network cell); else → Combinational.
+Mid-tree clock cells still land in Combinational (their nets are
+`Default`-origin in AP1 — same residual as above).
+
+**Golden — `test_activity_defaults_mba_matches_opensta`**
+(`mba.activity.reference.json`, 43 pins):
+
+- `s_global` / `s_global_density`: all 43 pins `{density, prob, source}`
+  strict (clock `1e8/0.5`, constant `0/0`, global `1e7/0.4` and
+  `3e7/0.35`), plus group columns at tightened bounds — internal
+  0.5% / switching 0.5% / leakage 1% + 1e-14 / total 0.3%. Measured
+  residuals: sequential switching +0.263%, combinational switching
+  +0.156%, combinational internal +0.132% (OpenSTA's switched
+  capacitance appears to carry a small term we do not reproduce —
+  named residual); sequential internal and every leakage column are
+  exact modulo the golden's print precision.
+- `s_none` / `s_input`: the 15 seeded-class pins
+  (`input`/`clock`/`constant`) strict; the 28 pins whose golden source
+  is `propagated` (17) or `unknown` (11) are pinned in
+  `EXPECTED_DIVERGENT` — a *new* divergence or a moved set fails
+  loudly; AP2/AP3 shrink it.
+- `s_none`/`s_input` group columns are print-only for the record
+  (the `Default` fill is not propagation): `s_none` internal +3.5%,
+  switching +24.0%, total +7.8%; `s_input` internal +7.0%, switching
+  +26.8%, total +13.6% vs OpenSTA — the divergence AP2 closes.
+
+**Moved goldens**: `mb.power.json` regenerated via the recorded CLI
+command — `diagnostics` gains `activity_origin_counts`
+(`{"annotated": 3, "clock": 1}`; the `clk` net's source reads `clock`,
+matching `s_full`'s golden), and Sequential internal moves
+`2.0892e-6 → 2.0789e-6` because the `2/period` clock seed replaces
+`clk`'s VCD count on the DFF's CLK-pin internal-power lookup (the TC
+precedence measured in P0b) — moving **toward** OpenSTA's
+`2.078733e-6` (was +0.4% off, now +0.01%). No other column moved.
+`mb.saif.reference.json`, `mbw.reference.json`,
+`mba.activity.reference.json`, and every other `*.reference.json`:
+`git diff` empty — fully-annotated fixtures are byte-identical
+(`mb`/`mbw` tests still pass at the established bounds; the saif
+clk-annotation override shifts Sequential internal inside its 2%
+bound in the same direction).
+
+**CLI**: `grus-eda power` runs with neither `--vcd` nor `--saif`
+(they stay mutually exclusive); the header prints `activity: defaults
+(no annotation file)` and a deterministic per-origin split line
+(`activity: annotated=3 clock=1 …`) follows the groups.
+
+**Fail-proof**: seed pass disabled (every net forced `Default`) →
+`s_none a: source` red (`"default"` vs golden `"input"`); restored.
+One density corrupted inside `mba.activity.reference.json` `s_global`
+→ strict assert red at the density bound; `git checkout` restored,
+test green.
+
+**Checks run**: `cargo test -p grus-core power` (4/4 incl. the new
+golden), `cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --release -p grus-core
+sta`. AP2–AP4 remain open (combinational propagation, sequential
+rules, scoped annotation).
