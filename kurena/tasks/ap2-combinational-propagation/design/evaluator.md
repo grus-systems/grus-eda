@@ -17,8 +17,10 @@ per-operator table on the common forms; it is the same math, once.
 ## Grammar (covers the sky130_fd_sc_hd alphabet)
 
 Measured inventory of `sky130_fd_sc_hd__tt_025C_1v80.lib` `function`
-strings (943 decls): operators `! & | ^ ( )`, `+` (OR, on PG-pin forms
-like `!VPWR + VGND`), `*` (AND, e.g. `(CLK*M0)`), constants `"0"`/`"1"`,
+strings (483 pin `function` decls; `LibDb` keeps 448 — the other 460
+`function :` grep hits are `power_down_function` cell attributes, not pin
+decls): operators `! & | ^ ( )`, `+` (OR, on PG-pin forms like
+`!VPWR + VGND`), `*` (AND, e.g. `(CLK*M0)`), constants `"0"`/`"1"`,
 identifiers `[A-Za-z_][A-Za-z0-9_]*` (`A1`, `B1_N`, `SLEEP_B`, `CIN`,
 `VPWR`, `D_N`). No `'` postfix in this lib; keep it in the grammar anyway
 (Liberty allows `X'` for NOT — one clause).
@@ -66,6 +68,16 @@ pub fn prob(e: &BoolExpr, p: &[f64]) -> Option<f64>;
 /// `P(∂f/∂x_i)` — the probability input `i` is sensitized:
 /// `prob(cofactor(f,i,false) ⊕ cofactor(f,i,true))`.
 pub fn sensitivity(e: &BoolExpr, i: usize, p: &[f64]) -> Option<f64>;
+
+/// 3-valued (Kleene) evaluation: `vals[i]` is var `i`'s constant value,
+/// `None` for non-constant inputs. Returns the output's definite value
+/// or `None` when it depends on an unknown input. Absorbing-element
+/// semantics — `And` is `Some(false)` on any `Some(false)` input,
+/// `Or` is `Some(true)` on any `Some(true)`; `Xor`/`Not` have no
+/// absorbing element. Used by `constant_cone`'s marking (api.md §5):
+/// `or(1,X)=1` and `and(0,X)=0` mark outputs `constant` even with
+/// toggling other inputs — the measured rule.
+pub fn const_eval(e: &BoolExpr, vals: &[Option<bool>]) -> Option<bool>;
 ```
 
 ## Bounds — the "total and bounded" clause
@@ -92,7 +104,15 @@ not stack):
 - `MAX_VARS = 32`, `MAX_OPS = 1_000_000` (op counter inside `prob_rec`)
   as before — `MAX_OPS` bounds Shannon's exponential *work* (a 32-var
   depth-10 expression can still expand toward 2³² leaves); it does not
-  bound stack and is not asked to.
+  bound stack and is not asked to. The budget is a `let mut ops =
+  MAX_OPS` **per `prob` call**, and `sensitivity` calls `prob`
+  internally — so one gate evaluation can spend up to
+  `(1 + n_inputs) × MAX_OPS`. That per-call reset is intended (the bound
+  is per-call work, not a shared per-gate budget) and must carry a
+  comment at the `let mut ops` site saying so.
+
+`const_eval` recurses to AST depth only and allocates nothing — the
+`MAX_NODES` parse cap already bounds it; it needs no counter of its own.
 
 sky130 `function` strings top out at ~10 vars / ~depth 8 / ~60
 characters; both caps leave two orders of magnitude of headroom while
@@ -134,6 +154,11 @@ module stays panic-free in every build mode.
   `p=.55,q=.8`→`0.47`; mux `(A0&!S)|(A1&S)` cross-check vs. hand truth
   table.
 - `sensitivity`: AND `∂/∂a`→`p_b`; XOR→`1.0`; `A&A` `∂/∂a`→`1.0`.
+- `const_eval`: `and(1,X)`→`None`, `and(0,X)`→`Some(false)`,
+  `or(1,X)`→`Some(true)`, `or(0,X)`→`None`, `xor(c,X)`→`None`,
+  `xor(c0,c1)`→`Some(c0^c1)`, `not(Some)`→`Some(!v)`, `not(None)`→`None`;
+  multi-level `(A&B)|C` at `A=0` → `Some(false)` on the left arm does
+  not decide the `Or` (absorption is per-operator, not per-tree).
 - Bounds — each cap must convert a would-be stack overflow into `None`:
   a 40-var expression → `None` (var bound); `"!" * 10_000 + "A"` →
   `None` (`unary` depth); `"(" * 10_000 + "A"` → `None` (`atom`→`expr`
@@ -145,7 +170,8 @@ module stays panic-free in every build mode.
 ## Files
 
 - `crates/grus-core/src/bool_expr.rs` — parser, AST, `prob`,
-  `sensitivity`, unit tests (new file, the whole module)
+  `sensitivity`, `const_eval`, unit tests (new file, the whole module)
 - `crates/grus-core/src/lib.rs` — `pub mod bool_expr;` (one line)
 - `crates/grus-core/src/activity.rs` — sole consumer: driver-pin
-  `function` → `parse` → var→pin map → `prob`/`sensitivity`
+  `function` → `parse` → var→pin map → `prob`/`sensitivity`;
+  `const_eval` serves `constant_cone`'s 3-valued marking (api.md §5)

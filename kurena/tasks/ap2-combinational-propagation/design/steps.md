@@ -1,74 +1,95 @@
 # steps — implementation order and gates
 
-One commit (~500–600 lines incl. tests + docs — bigger than the AP1
-ticket because the pin-namespace match rides along; each step compiles
-green before the next).
+The r2 ticket landed (v0.2.15): `bool_expr.rs` evaluator, `pin_signals`
+on `vcd.rs`/`saif.rs`, `pin_by_lib_name`, Kahn propagation, the mba test
+extension, the results entry. r3 is one follow-up commit (~200 lines
+incl. tests + docs) closing the review items. The `cp.def` probe was run
+during planning (verbatim output recorded below and destined for
+`docs/results.md`) — implementation needs no further container session.
 
-## 1. `crates/grus-core/src/bool_expr.rs` + `lib.rs`
+## 1. `bool_expr.rs` — `const_eval` + the ops-reset comment
 
-- `BoolExpr`, `parse`, `prob`, `sensitivity` per `evaluator.md`,
-  including the parse-time `MAX_DEPTH` (parser recursion) and
-  `MAX_NODES` (AST size) caps — the bound-trip tests
-  (`"!"`/`"(`/`'`/flat chains → `None`, no abort) are part of the unit
-  tests. `const_prob`'s unreachable `Var` arm is `debug_assert` +
-  `0.0` fallback. `pub mod bool_expr;` in `lib.rs`.
+- `pub fn const_eval(e: &BoolExpr, vals: &[Option<bool>]) -> Option<bool>`
+  — Kleene absorbing-element eval per `evaluator.md` (And → `Some(false)`
+  on any `Some(false)`; Or → `Some(true)` on any `Some(true)`; known
+  value iff all inputs known). Recursion bounded by `MAX_NODES` at parse;
+  no own counter.
+- Comment at `prob`'s `let mut ops = MAX_OPS;`: the budget resets per
+  call, `sensitivity` calls `prob` internally → per-gate worst case is
+  `(1 + n_inputs) × MAX_OPS`; the bound is per-call work, intended.
+- Unit tests: the `evaluator.md` `const_eval` table, including
+  `(A&B)|C` at `A=Some(false), B,C=None` → `None` (absorption is
+  per-operator).
 - Gate: `cargo test -p grus-core bool_expr` green; clippy-clean.
 
-## 2. `readers/vcd.rs` — `pin_signals`
+## 2. `activity.rs` — `comb_funcs` table + 3-valued marking
 
-- `SignalDecl.path` (scope chain joined); `VcdActivity.pin_signals`
-  emitted for every decl incl. shadowed-alias entries; vector `path[bit]`
-  expansion mirrors `signals`. `signals` untouched.
-- Gate: existing vcd tests green unchanged; add a small scoped-decl test
-  (`tb/dut/u_t/Z` → key `tb/dut/u_t/Z`).
+- `CombFunc { expr, input_nets }` + `comb_function_table` per api.md §2
+  (driver on `!is_sequential && !is_latch` cell; `function: None` →
+  `None` uncounted; parse/var-miss → `None` +
+  `unresolvable_functions += 1`, counted at build for any origin).
+- `constant_cone(design, &comb_funcs) -> Vec<bool>` — the sweep
+  per api.md §5 (`vals: Vec<Option<bool>>`, `const_eval`, fixed point).
+  The literal `"0"/"1"` check disappears into `Const` exprs; `lib` is no
+  longer needed inside (the table carries parsed exprs).
+- Seed-site comment on the `Constant` arm: the stored marginal is 0.0
+  for both polarities and that is the **measured internal value**
+  (`cp.def` 2026-11-21 — `xor(HI,a)` propagates `a`'s `0.55`, not `¬a`'s
+  `0.45`); only the marking logic uses true polarity.
+- `propagate_combinational(&comb_funcs, ...)`: candidates = `Default` ∧
+  table-`Some`; `pending: Vec<bool>` replaces the `Option::take` dequeue
+  invariant (`debug_assert!(pending[m])` — api.md §2). Eval unchanged.
+- Gate: `cargo test -p grus-core` green — mba test unchanged green
+  (`constant 4` identical; no mixed gate exists there), mb/mbw unchanged.
 
-## 3. `readers/saif.rs` — `pin_signals` emit
+## 3. `tests/designs/microbench/cp.def` + `cp_probe.tcl`
 
-- Top-scope resolved nets: `signals[net]` unchanged; cell-driven nets
-  also emit `pin_signals["{driver_cell}/{driver_pin}"]`. Nested-instance
-  signals emit `pin_signals["{inst}/{leaf}"]` (instances after top-scope;
-  unmatched scope → count, emit nothing).
-- Gate: `test_saif_power_mb_matches_opensta` and the `mbw` test stay
-  green **unchanged** — `activity.signals` shape is preserved, and the
-  new map only feeds `resolve_activity`'s matcher (identical net set on
-  `mb`/`mbw`).
+- `cp.def`: the probed file verbatim (conb + 8 gates + port `a` + port
+  `y` on `n_xorh`; 11 nets incl. `n_bufh`).
+- `cp_probe.tcl`: lib/lef/def reads, `set_power_activity -input_ports
+  [get_ports a] -density 0.003 -duty 0.55`, the `get_property … activity`
+  dump, then the precedence section (`-pins` and `-global` on
+  `u_orh/X`/`u_andh/X`/`u_orl/X`). Header comment records the docker
+  invocation (`generate_activity_ref.sh`'s container stanza).
 
-## 4. `activity.rs` + `design_db.rs` — matcher + propagation
+## 4. `power.rs` — `test_constant_cone_cp_matches_opensta`
 
-- Move `sibling_pin_by_lib_name` → `DesignDb::pin_by_lib_name`
-  (`pub(crate)`; switch the two `power.rs` callsites).
-- `annotation_net_of` + the `HashMap<NetId, SignalActivity>` annotation
-  map; the `vcd.signals.get(name)` arm reads the map. Precedence chain
-  untouched. The `or_insert` site carries the first-path-wins collision
-  comment (`api.md` §1).
-- Comb-candidate DAG + Kahn fill per `api.md` §2; `unresolvable_functions`,
-  `dead_annotation_entries` on `ActivityResolution`. The dequeue
-  `take()` is `let Some(...) else { debug_assert!(...); continue; }`.
-- Gate: `cargo check` green; `cargo test --workspace` — the `mba` test
-  stays green **as written** (`s_none`/`s_input` divergent pins are still
-  divergent — the new `propagated` resolution only changes their origin
-  label, which the current test does not assert… it does assert the
-  divergent *set*, unchanged). `mb`/`mbw` green unchanged = the
-  byte-identical proof for the matcher swap.
+- Loads `cp.def`, `Sdc::default()`, `VcdActivity::default()`, overrides
+  `input: {3e6, 0.55}`; asserts the measured per-net map verbatim
+  (`golden.md` table) + `origin_counts {constant 6, input 1,
+  propagated 4}` + both diagnostics `0`. Comment cites the
+  `docs/results.md` entry as the source of every expected number.
 
-## 5. `power.rs` — test extension
+## 5. Fail-proof (recorded in the entry)
 
-- Sessions table gains VCD paths; `STRICT` gains `propagated` handling
-  under the mapping rules; `PER_PIN_RESIDUAL` = `[("s_full","y")]`;
-  `EXPECTED_DIVERGENT` → the 13-pin set; `s_xz`/`s_partial2` included if
-  verbatim; `origin_counts` pinned for one session; group columns per
-  `golden.md`.
-- Gate: `cargo test -p grus-core power` green; then the two fail-proof
-  breaks (propagation off → red; corrupted propagated golden → red;
-  restored), recorded.
+- `constant_cone` reverted to all-inputs marking → cp test reds on
+  `n_orh`/`n_andl` (`propagated` vs expected `constant`); restore, green.
+- The r2 proofs stand (propagation off → `s_none origin_counts` red;
+  corrupted golden `prob` → strict red; both recorded 2026-11-21).
 
 ## 6. Docs + version
 
-- `results.md` entry (see below), `roadmap.md` N7 line → AP2 done,
-  `Cargo.toml` `0.2.14 → 0.2.15`, `cargo check` for `Cargo.lock`.
-- `mb.power.json` regenerated — expected `git diff` empty; `git diff`
-  empty on every `*.reference.json`.
-- `git status` — only the `## Files` list moved.
+- `docs/results.md` — new `2026-11-21 — N7 — AP2 r3: measured constant
+  semantics (v0.2.16)` entry:
+  - The two probe sessions' verbatim `ACTI` output (table + precedence
+    reads) and the three measured rules (api.md §5).
+  - `conditional_power_blocks` enumeration: no moves possible —
+    `prob_one` on constants unchanged; named residual for `when`
+    literals on absorptive-marked nets (no fixture exercises it).
+  - **SAIF-vs-VCD asymmetry record**: a SAIF top-scope `NET` entry
+    naming an internal net annotates via the emitted driver-pin
+    `pin_signals` key while the same flat name in a VCD dead-ends into
+    `dead_annotation_entries` — a constructed asymmetry; OpenSTA's
+    `read_saif` on such a `NET` entry is unmeasured (named residual).
+  - Moved goldens: none — `git diff` empty on every
+    `*.reference.json`/`mb.power.json` (enumerated).
+  - Fail-proof record; verify-trio output.
+- `docs/roadmap.md` N7 line: extend the AP2 clause — `(v0.2.16 —
+  constant marking is 3-valued absorptive; the stored constant marginal
+  is the measured 0.0 — cp.def probe)`.
+- `Cargo.toml` `0.2.15 → 0.2.16`; `cargo check` refreshes `Cargo.lock`.
+- `mb.power.json` regen — expected `git diff` empty; `git status` shows
+  only the `## Files` list.
 
 ## 7. Final verify (all recorded in the entry)
 
@@ -76,45 +97,26 @@ green before the next).
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --release -p grus-core sta`
 
-## results.md entry contents
-
-- Landed model: evaluator (Shannon, repeated literals), level order
-  choice, taint rule, pin-namespace annotation (+ why the spec's `## Files`
-  list gained `vcd.rs`/`saif.rs`), the 13-pin `EXPECTED_DIVERGENT` note
-  (`qd` shares net `q`'s residual).
-- Per-session group-column residuals (the AP3 set: net `q` + 4 unknown
-  nets) — measured numbers.
-- `driven_nets_without_activity`/`origin_counts` movement per session
-  (e.g. `s_none`: `default 10→5`, `propagated 0→5`; `mb` VCD path:
-  driven-without-activity stays 0).
-- `unresolvable_functions`/`dead_annotation_entries` counts on `mba` and
-  the sky130 `function` coverage measurement.
-- Moved goldens: none (assert `git diff` empty on all); `s_partial2`
-  bonus coverage if it landed.
-- Fail-proof record; verify-trio output.
-
 ## Acceptance cross-check
 
 | acceptance item | where |
 |---|---|
-| evaluator `P(f)`/`d(f)` exact under independence, repeated literals | step 1, evaluator.md |
-| missing/unparseable functions fall back without panic | step 4 (`unresolvable_functions`) |
-| combinational level order; seq outputs never produced | step 4 (Kahn; `!is_sequential && !is_latch` gate) |
-| `Default` input keeps `Default` output (taint) | step 4 |
-| `Propagated` nets match golden `{density,prob}` at strict bound on the six sessions | step 5, golden.md |
-| `EXPECTED_DIVERGENT` verbatim | step 5 (13 pins — `qd` included; see golden.md note) |
-| fail-proof recorded | step 5 |
-| `docs/results.md` entry (residuals, origin-count movement, moved-golden explanation, roadmap N7) | step 6 |
+| evaluator `P(f)`/`d(f)` exact, repeated literals | landed v0.2.15 |
+| missing/unparseable functions fall back without panic | `comb_funcs` build counting (api.md §2) |
+| combinational level order; seq outputs never produced | landed (Kahn + `!is_sequential && !is_latch` in table build) |
+| `Default` input keeps `Default` output (taint) | landed; unchanged |
+| `Propagated` nets match golden at strict bound | landed; unchanged — `prob_one` on constants stays the measured 0.0 |
+| `EXPECTED_DIVERGENT` verbatim (13 pins) | landed; unchanged |
+| fail-proof recorded | step 5 (adds the marking revert) |
+| `docs/results.md` entry + roadmap N7 | step 6 (probe verdict, SAIF/VCD record, residual/golden-move enumeration) |
 | verify trio + version bump same commit | steps 6–7 |
 
 ## Files
 
-- `crates/grus-core/src/bool_expr.rs` + `crates/grus-core/src/lib.rs` — step 1
-- `crates/grus-core/src/readers/vcd.rs` — step 2
-- `crates/grus-core/src/readers/saif.rs` — step 3
-- `crates/grus-core/src/activity.rs` + `crates/grus-core/src/design_db.rs` — step 4
-- `crates/grus-core/src/power.rs` — steps 4–5 (helper callsites, test)
-- `tests/designs/microbench/mb.power.json` — step 6 regeneration (expected
-  byte-identical)
-- `docs/results.md`, `docs/roadmap.md`, `Cargo.toml`, `Cargo.lock` — step 6
+- `crates/grus-core/src/bool_expr.rs` — `const_eval`, ops-reset comment, tests
+- `crates/grus-core/src/activity.rs` — `comb_funcs`, 3-valued
+  `constant_cone`, propagation pass switch to the shared table
+- `crates/grus-core/src/power.rs` — `test_constant_cone_cp_matches_opensta`
+- `tests/designs/microbench/cp.def`, `cp_probe.tcl` — new
+- `docs/results.md`, `docs/roadmap.md`, `Cargo.toml`, `Cargo.lock`
 - `kurena/tasks/ap2-combinational-propagation/design/` — this document set

@@ -53,9 +53,10 @@ stream's final `SignalActivity`.
   name missing from `cell_of` counts and emits nothing — `ghost` still
   exercises the counter).
 - SAIF top-scope `NET` entries whose name is neither a net nor a port
-  stay unmatched-counted as today; a `NET` named like an internal net but
-  carrying no instance coverage now dead-ends the same way VCD flat names
-  do (SAIF-vs-VCD top-scope asymmetry is unmeasured — record in results).
+  stay unmatched-counted as today. Note the landed asymmetry this
+  creates — a `NET` entry naming an internal net annotates through its
+  emitted driver-pin key, while the same flat name in a VCD dead-ends;
+  the record lives in `docs/results.md` (see §5's enumeration).
 
 ### `activity.rs` — the match
 
@@ -113,43 +114,62 @@ precedence is still "seed order, then propagated", matching the measured
 model (constants, clocks, globals, annotation, inputs all win over
 propagation).
 
+### The shared `comb_funcs` table
+
+One parse per `function`, built once in `resolve_activity` before the
+seed pass and consumed by both `constant_cone` (§5) and the propagation
+pass:
+
+```rust
+/// A combinational driver pin's parsed `function` with its
+/// function-referenced input nets in variable order.
+struct CombFunc {
+    expr: bool_expr::BoolExpr,
+    input_nets: Vec<NetId>,
+}
+
+/// Indexed by `NetId`. `Some` for every net whose driver pin sits on a
+/// `!is_sequential && !is_latch` cell and whose `LibPin.function` parsed
+/// and resolved all vars to nets. `function: None` is not a failure —
+/// it produces `None` without counting.
+fn comb_function_table(design: &DesignDb, lib: &LibDb, unresolvable: &mut usize)
+    -> Vec<Option<CombFunc>>;
+```
+
+- A var matching no sibling pin (`DesignDb::pin_by_lib_name` — moved out
+  of `power.rs`), or a pin with no net, or a `parse` `None` (malformed
+  or over `MAX_DEPTH`/`MAX_NODES`/`MAX_VARS` — see `evaluator.md`) →
+  `None`, counted in `unresolvable_functions`. PG forms like
+  `!VPWR+VGND` parse fine but their vars match no design pin and land
+  here.
+- Counting is at table build, for **any** origin — the table is built
+  before seeds, so an annotated net's broken function counts too.
+  Broadens the v0.2.15 semantics slightly (counted only `Default`
+  candidates); identical counts on every committed fixture (all 0).
+
 ### Candidate nets and input resolution
 
-A net is a candidate iff `origin == Default` and its driver pin belongs
-to a cell whose `LibCell` is `!is_sequential && !is_latch`. For the
-driver pin's `LibPin.function`:
+A net is a propagation candidate iff `origin == Default` and
+`comb_funcs[n].is_some()`. Sequential/latch drivers and
+`function: None` never enter the table, so the old `None` gate ("stays
+`Default`, not counted") is unchanged. An eval-side `prob`/`sensitivity`
+`None` (op budget, short `p`) still lands in `unresolvable_functions`
+at the eval site.
 
-- `None` (dff `Q`, PG pins) → stays `Default`, not counted (no function
-  to evaluate).
-- parse → `BoolExpr` + var names; each var maps to the cell's design pin
-  whose `lib.pins[lp].name` equals it — `power.rs`'s private
-  `sibling_pin_by_lib_name` **moves** to `DesignDb::pin_by_lib_name`
-  (`pub(crate)`, same body; `activity.rs` sits upstream of `power.rs` so
-  it cannot call into `power`, and a duplicated copy would drift — the
-  two `power.rs` callsites switch to the method). A var matching no
-  pin, a pin with no net, or a `parse` `None` (malformed or over the
-  `MAX_DEPTH`/`MAX_NODES`/`MAX_VARS` bounds — see `evaluator.md`) →
-  stays `Default`, counted in `unresolvable_functions` (the "sky130 lib
-  count" the acceptance asks to record — measure on `tt_025C_1v80`; PG
-  forms like `!VPWR+VGND` parse fine but their vars match no design pin
-  and land here). An eval-side `prob`/`sensitivity` `None` (op budget,
-  short `p`) lands in the same counter.
 - Only *referenced* inputs gate: `ebufn`'s `(A)` ignores `TE_B`; a
   `Default` on an unreferenced input does not taint.
 
 ### Level order — own Kahn, `topological_levels` untouched
 
-Build the comb-net dependency graph once: for every candidate net `m`
-with driver cell `c`, `deps(m)` = the distinct nets of `c`'s
-function-referenced input pins; `indeg(m)` = number of `deps` that are
-themselves candidates; `dependents(n)` accumulates the reverse edges.
-Queue = candidates with `indeg 0`, popped in `NetId` order (deterministic
-output for tests). A candidate enqueues at most once (its `indeg` reaches
-0 exactly once), so the dequeue `take()` of its slot is never empty —
-encode that invariant as `let Some(cand) = candidates[m].take() else {
-debug_assert!(false, "candidate dequeued twice"); continue; }`, not
-`expect`: an impossible state must not carry a release panic path. On
-visiting `m`:
+Build the candidate dependency graph over `comb_funcs`: for every
+candidate net `m`, `deps(m)` = its `input_nets` deduped; `indeg(m)` =
+number of `deps` that are themselves candidates; `dependents(n)`
+accumulates the reverse edges. Queue = candidates with `indeg 0`, popped
+in `NetId` order (deterministic output for tests). The table is shared
+and immutable now, so a `pending: Vec<bool>` keeps the enqueue-once
+invariant — `debug_assert!(pending[m], "candidate dequeued twice")` then
+`pending[m] = false` — instead of the old `Option::take` slot: an
+impossible state must not carry a release panic path. On visiting `m`:
 
 - Every function var's input net has `origin ∉ {Default, Unknown}` and
   `prob_one.is_some()` → evaluate `P(f)`, `d(f)`; write
@@ -209,15 +229,112 @@ update naming `Propagated` as a derived source. Test changes are in
 Every entry equals the golden read verbatim — the M1 model reproduced by
 the evaluator, not re-measured.
 
+## 5. Constant marking vs. the stored marginal — measured (cp.def, 2026-11-21)
+
+Review delta: the landed `constant_cone` seeds `prob_one = 0.0` (the P5
+display-artifact record) and the propagation pass consumes it as a real
+marginal — the polarity question had to be measured, not inferred.
+Probe fixture: `tests/designs/microbench/cp.def` — a `conb_1` feeding one
+input each of `and2`/`or2`/`xor2` gates whose other input is the port
+`a`, annotated `-input_ports -density 0.003 -duty 0.55` (no clock —
+absolute density). `cp_probe.tcl` is committed; the verbatim output is
+in `docs/results.md`.
+
+Measured reads (LibreLane 3.0.16):
+
+| pin | gate form | OpenSTA read |
+|---|---|---|
+| `u_andh/X` | `and(n_hi, a)` | `0.00000e+00 0.000 propagated` |
+| `u_xorh/X` | `xor(n_hi, a)` | `3.00000e+06 0.550 propagated` |
+| `u_orh/X`  | `or(n_hi, a)`  | `0.00000e+00 0.000 constant` |
+| `u_andl/X` | `and(n_lo, a)` | `0.00000e+00 0.000 constant` |
+| `u_orl/X`  | `or(n_lo, a)`  | `3.00000e+06 0.550 propagated` |
+| `u_xorl/X` | `xor(n_lo, a)` | `3.00000e+06 0.550 propagated` |
+| `u_andhh/X`| `and(n_hi, n_hi)` | `0.00000e+00 0.000 constant` |
+| `u_bufh/X` | `buf(n_hi)` | `0.00000e+00 0.000 constant` |
+
+Three measured rules fall out:
+
+1. **The stored activity record for a constant net is `{d=0, P=0}` on
+   both polarities** — the P5 display artifact is the real internal
+   value. `xor(n_hi, a)` propagating `0.55` (a's marginal, computed with
+   `P(HI)=0`) instead of `0.45` (`¬a`) is the discriminator; `and(n_hi,
+   a)` → `0/0` confirms. `prob_one: Some(0.0)` on `Constant` nets is the
+   correct seed; propagation and `eval_when` keep consuming it. No
+   `conditional_power_blocks` or golden moves are possible from this
+   clause — `prob_one` is unchanged.
+2. **The `constant` label uses true-polarity 3-valued evaluation** —
+   a gate output is `constant` iff its function has a definite value
+   with constant inputs bound to their true value: `or(1,X)=1`,
+   `and(0,X)=0` mark even with a toggling other input (absorption);
+   `and(1,X)`, `or(0,X)`, `xor(c,X)` do not mark. The landed
+   all-inputs-constant rule misses the absorptive cases (`u_orh/X`,
+   `u_andl/X`, `u_andhh/X` all read `constant`).
+3. **Marking is structural** — an absorptive-constant pin stays
+   `constant` under `set_power_activity -pins` and `-global` (measured);
+   a `propagated` pin accepts both. Marking before the seed pass gives
+   exactly this precedence — unchanged code order.
+
+### `constant_cone` rewrite — 3-valued marking
+
+`constant_cone` takes `&comb_funcs` (§2) instead of re-deriving pins.
+Internal state `vals: Vec<Option<bool>>` (the net's constant value);
+the return is still the marked set (`Vec<bool>`, `vals[i].is_some()`).
+Two-phase sweep to a fixed point, same shape as landed:
+
+- Seed: `comb_funcs[n]` with `Const` expr (`function : "0"/"1"` parses
+  to `BoolExpr::Const`) — the literal check folds into the same rule.
+- Sweep: for each unmarked table net, `vals[n] = bool_expr::const_eval(
+  &expr, &input_vals)` where `input_vals[i] = vals[input_nets[i]]` —
+  `None` for unmarked inputs (Kleene semantics: `And`→false on any
+  `Some(false)`, `Or`→true on any `Some(true)`, else the value iff all
+  inputs are known). Monotone in the information ordering — the fixed
+  point is order-independent.
+- Only *function-referenced* inputs gate marking — an unreferenced
+  floating pin (`ebufn`'s `TE_B`) cannot block a mark, the same rule
+  propagation taint uses.
+- Sequential/latch drivers never enter `comb_funcs` → never mark
+  (unchanged boundary).
+
+The stored record for a marked net is **unchanged**
+`{ prob_one: Some(0.0), eff_toggles: 0.0, origin: Constant }` — the
+seed-site comment gains the measurement citation (the stored marginal is
+the real internal value, not a display quirk; only the marking logic
+knows the true polarity).
+
+### Consequences enumerated
+
+- `eval_when` / `conditional_power_blocks`: no moves possible —
+  `prob_one` on constants is unchanged at `Some(0.0)`. A `when` literal
+  on a HI-constant net keeps weight 0 — the same stored record OpenSTA's
+  own machinery reads. On newly-marked absorptive nets a `when` weight
+  would change, but no committed fixture mixes `when` literals with
+  constant-fed pins (`mb`/`mbw`: `a`/`b`/`teb` only; `mba`: none; no gcd
+  power test exists).
+- Golden moves: none expected — `mba`'s cones are all-constant-input
+  (identical marking); `mb`/`mbw` have no `conb`; `git diff` empty is
+  asserted on every `*.reference.json`/`mb.power.json`.
+- `driven_nets_without_activity`/`origin_counts` on `mba`: unchanged
+  (`constant 4` — the absorptive rule marks no new net there).
+- SAIF-vs-VCD asymmetry — record only (docs): a SAIF top-scope `NET`
+  entry naming an internal net resolves by net name and annotates via
+  the emitted driver-pin key (`pin_signals["u_and/X"]`), while the same
+  flat name in a VCD dead-ends into `dead_annotation_entries`. The
+  asymmetry is constructed by the pin-namespace emit — OpenSTA's own
+  `read_saif` on such a `NET` entry is unmeasured (named residual).
+
 ## Files
 
-- `crates/grus-core/src/activity.rs` — annotation map, Kahn order,
-  propagation pass, `unresolvable_functions`/`dead_annotation_entries`
+- `crates/grus-core/src/activity.rs` — `comb_funcs` table, 3-valued
+  `constant_cone`, annotation map, Kahn order, propagation pass,
+  `unresolvable_functions`/`dead_annotation_entries`
 - `crates/grus-core/src/bool_expr.rs` — `BoolExpr`, `parse`, `prob`,
-  `sensitivity` (new)
+  `sensitivity`, `const_eval` (new)
 - `crates/grus-core/src/lib.rs` — `pub mod bool_expr;`
 - `crates/grus-core/src/design_db.rs` — `pin_by_lib_name` (moved helper)
 - `crates/grus-core/src/readers/vcd.rs` — `SignalDecl.path`,
   `VcdActivity.pin_signals`
 - `crates/grus-core/src/readers/saif.rs` — `resolve` `pin_signals` emit
 - `crates/grus-core/src/power.rs` — helper callsites, diagnostics doc line
+- `tests/designs/microbench/cp.def`, `cp_probe.tcl` — constant-polarity
+  probe fixture (new, committed for reproducibility)

@@ -104,6 +104,41 @@ Density compare unchanged (`rel ≤ 1e-9`, `abs ≥ 1.0` floor); `prob`
   the accepted minimum is the recorded delta table (kept `eprintln`
   shape from AP1). Decision and measured numbers go in the entry.
 
+## cp.def — the constant-polarity fixture (r3)
+
+`tests/designs/microbench/cp.def` — a `conb_1` (`n_hi`, `n_lo`) feeding
+one input of `and2`/`or2`/`xor2` gates; the other input is port `a`.
+This is the design `mba` cannot express (mba has no mixed
+constant+toggling gate), committed with `cp_probe.tcl` (the openroad
+reads + `get_property activity` dump + the `-pins`/`-global` precedence
+section) so the measured table in api.md §5 reproduces as written.
+
+New `power.rs` test `test_constant_cone_cp_matches_opensta`: loads
+`cp.def` with `Sdc::default()` (no clock — the probe used `-density`,
+an absolute rate), `VcdActivity::default()`, overrides
+`input: {3e6, 0.55}` (the `-input_ports` analog — input-port nets take
+the input seed in both models). Asserts the resolved map **verbatim**
+against the measured table (`window_s = 1.0` — no dump, so
+`eff_toggles` equals the rate):
+
+| net | origin | `prob_one` | `eff_toggles` |
+|---|---|---|---|
+| `a` | `Input` | `Some(0.55)` | `3e6` |
+| `n_hi`, `n_lo` | `Constant` | `Some(0.0)` | `0` |
+| `n_andh` | `Propagated` | `Some(0.0)` | `0` |
+| `n_andl`, `n_orh`, `n_andhh`, `n_bufh` | `Constant` | `Some(0.0)` | `0` |
+| `n_orl`, `n_xorh`, `n_xorl` | `Propagated` | `Some(0.55)` | `3e6` |
+
+`n_xorh` at `0.55` (a, not `0.45` = ¬a) is the polarity discriminator
+the whole revision hangs on — pin it. `origin_counts` pins
+`{constant 6, input 1, propagated 4}`; `unresolvable_functions == 0`
+(all nine functions resolve — conb literals, `and2`, `or2`, `xor2`,
+`buf`); `dead_annotation_entries == 0`.
+
+The absorptive-constant `n_orh`/`n_andl`/`n_andhh` asserts are what the
+all-inputs-constant `constant_cone` got wrong — they pin the 3-valued
+marking from api.md §5.
+
 ## Moved goldens
 
 - `mb.power.json`: regenerated via the recorded CLI command — expected
@@ -125,18 +160,24 @@ Density compare unchanged (`rel ≤ 1e-9`, `abs ≥ 1.0` floor); `prob`
   `mba.activity.reference.json` → red at the density bound; `git checkout
   --` restore, green.
 - (Already covered by AP1: seed pass off → seeded-class red.)
+- (r3) Revert `constant_cone`'s `const_eval` to the all-inputs rule →
+  `test_constant_cone_cp_matches_opensta` reds on `n_orh`/`n_andl`
+  (`propagated` vs expected `constant`); restore.
 
 ## Files
 
 - `crates/grus-core/src/power.rs` — `test_activity_defaults_mba_matches_opensta`
   extension (VCD session column, `propagated` handling + mapping rules,
   `PER_PIN_RESIDUAL`, 13-pin `EXPECTED_DIVERGENT`, `origin_counts` pin,
-  group bounds for propagation sessions)
+  group bounds for propagation sessions) +
+  `test_constant_cone_cp_matches_opensta` (r3)
 - `tests/designs/microbench/mba.activity.reference.json` — read-only
   golden input (fail-proof corrupts then restores it byte-for-byte)
 - `tests/designs/microbench/mba_*.vcd` — existing session fixtures,
   read-only
+- `tests/designs/microbench/cp.def`, `cp_probe.tcl` — new committed
+  fixture + probe script (r3)
 - `tests/designs/microbench/mb.power.json` — regenerated; asserted
   byte-identical (`git diff` empty)
 - `docs/results.md` — measured residuals, divergent-set note, moved-golden
-  record, fail-proof record
+  record, fail-proof record, r3 probe verdict + SAIF/VCD asymmetry record
