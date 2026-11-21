@@ -5927,15 +5927,18 @@ loads; `power.slews` there was already under the noise floor.
 envelope jpeg 1824 → **808**, aes 405 → 152, picorv32 267 → 98, ibex 331 →
 218 (fallback — see below), gcd 23.5 → 7.3. Moved keys: `sta.slew.seeds` /
 `sta.slew.walk` now nest under `power.slews`; `sta.eval.seeds|walk|
-endpoints` no longer fire under `power`, and `sta.prepare.clock.slew|walk|
-loads` are skipped entirely on these SDCs (no propagated clocks — the
-block only served pulse-width checks). `slew_eval` is also ~10% cheaper
+endpoints*` no longer fire under `power` on the non-fallback designs, and
+`sta.prepare.clock.slew|walk|loads` are skipped entirely on these SDCs
+(no propagated clocks — the block only served pulse-width checks).
+`slew_eval` is also ~10% cheaper
 per leg than the full walk (jpeg `sta.slew.walk` 771 vs before
 `sta.eval.walk` 830: no arrival/required/CRPR arithmetic, no endpoint
 bookkeeping). **Fallback**: ibex's `uncovered_borrow` routes it through
-`eval_state_full` — `sta.eval.walk` (205) still fires inside
-`power.slews`, but `sta.eval.endpoints*` and `sta.prepare.clock.*` do not,
-which still buys the prepare-side skip.
+`eval_state_full` — `sta.eval.seeds|walk|endpoints(.pulse)` still fire
+inside `power.slews` (walk 205 ms, endpoint collection ~1 ms); only the
+report tail (`sta.assemble`, `sta.partition.*`) and the
+`sta.prepare.clock.*` block are skipped, which still buys the
+prepare-side skip.
 
 **Achieved vs. ceiling**: the plan estimated jpeg `power` ~1.3 s on
 `sta.eval.walk` removal alone; the measured 1.03 s lands ahead of that
@@ -5959,9 +5962,11 @@ picorv32, ibex, aes, jpeg; `..._parity_propagated` covers
 propagated-clock SDCs (gcd, picorv32), `..._parity_exceptions` the
 `fp_allregs` exceptions fixture, `..._parity_microbench` the `mb`/`mbw`
 power fixtures, and `..._latch_borrow_fallback` asserts the predicate
-fires on the borrow fixture then compares through the public path. All
-compare `slew_max` **and** `slew_min` on the state side — the min side is
-where the borrow fixture actually diverges under a naive replay.
+fires on the borrow fixture then compares through the public path. Every
+case asserts `slew_max` through the public `PinSlew` and additionally
+compares the internal replay state's `slew_min` against the full eval
+state — the min side is where the borrow fixture actually diverges under
+a naive replay.
 Fail-proof: `merge_slew` fed input slews instead of driver outputs → 4
 parity groups red → restored green; `uncovered_borrow` forced `false` →
 latch-borrow test red → restored. Two further probes showed why the

@@ -3389,11 +3389,13 @@ fn uncovered_borrow(prepared: &StaPrepared) -> bool {
     })
 }
 
-/// The per-pin state `run_sta_detail` produces, without the report: the same
-/// partitioned/single-eval dispatch. `sta_pin_slews` reaches for it only when
-/// the slew replay cannot reproduce an arrival-coupled decision (`latch_borrow`
-/// off a clock net); a partitioned run is required there because the union of
-/// per-class slew maps, not one class's, is today's `PinSlew` output.
+/// The per-pin state `run_sta_detail`'s dispatch produces. Everything up to
+/// the assembled report still runs — `eval_sta` collects endpoints, and the
+/// partitioned branch builds a full report that is then discarded.
+/// `sta_pin_slews` reaches for this only when the slew replay cannot
+/// reproduce an arrival-coupled decision (`latch_borrow` off a clock net);
+/// a partitioned run is required there because the union of per-class slew
+/// maps, not one class's, is today's `PinSlew` output.
 fn eval_state_full(prepared: &StaPrepared) -> Result<Vec<PinTimingState>> {
     let sdc = prepared.cx.sdc;
     if !sdc.exceptions.is_empty() || !sdc.path_delays.is_empty() || !sdc.clock_groups.is_empty() {
@@ -3479,6 +3481,11 @@ fn slew_eval(prepared: &StaPrepared) -> Vec<PinTimingState> {
                     for &(src_pol, dst_pol) in legs {
                         let reached = src.reached(src_pol);
                         if !reached && !slew_reached(&src, src_pol) {
+                            continue;
+                        }
+                        if (arc.timing_type == TimingType::CombinationalRise && dst_pol != RISE)
+                            || (arc.timing_type == TimingType::CombinationalFall && dst_pol != FALL)
+                        {
                             continue;
                         }
                         let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol)
@@ -9977,7 +9984,9 @@ mod tests {
 
     /// perf-slewonly-power parity gate: `sta_pin_slews`'s slew-only path must
     /// return the eval-state slew fields `run_sta_detail` produces, pin by pin.
-    /// Value equality — the contract is power-lookup input equality.
+    /// Value equality — the contract is power-lookup input equality. `PinSlew`
+    /// carries only `slew_max`; the internal replay state is compared on
+    /// `slew_min` too, since the borrow window diverges on the min side first.
     fn assert_pin_slew_parity(
         design: &DesignDb,
         lib: &LibDb,
@@ -9987,11 +9996,23 @@ mod tests {
     ) {
         let (_report, full, _pol) =
             run_sta_detail(design, lib, sdc, parasitics, false).expect("full STA");
+        let prepared = prepare_sta(design, lib, sdc, parasitics, true).expect("prepare");
+        let replay = if uncovered_borrow(&prepared) {
+            eval_state_full(&prepared).expect("full-state fallback")
+        } else {
+            slew_eval(&prepared)
+        };
         let fast = sta_pin_slews(design, lib, sdc, parasitics).expect("slew-only STA");
         assert_eq!(full.len(), fast.len(), "{label}: pin count");
-        for (i, (s, p)) in full.iter().zip(&fast).enumerate() {
+        for (i, ((s, p), r)) in full.iter().zip(&fast).zip(&replay).enumerate() {
             assert_eq!(s.slew_max[RISE], p.rise_ns, "{label} pin {i} rise");
             assert_eq!(s.slew_max[FALL], p.fall_ns, "{label} pin {i} fall");
+            for pol in [RISE, FALL] {
+                assert_eq!(
+                    s.slew_min[pol], r.slew_min[pol],
+                    "{label} pin {i} slew_min[{pol}]"
+                );
+            }
         }
     }
 
@@ -10053,8 +10074,9 @@ mod tests {
 
     /// `assert_pin_slew_parity` on a fixture DEF/SDC at explicit paths
     /// (`sta_edge`, `sta_exceptions`, `microbench` — no `.placed.def` naming).
-    /// Returns the prepared design so a caller can assert which internal path
-    /// ran (e.g. the `latch_borrow` fallback predicate).
+    /// Returns the raw design/lib/SDC triple; the caller runs `prepare_sta`
+    /// itself when it needs to assert which internal path ran (e.g. the
+    /// `latch_borrow` fallback predicate).
     fn slew_parity_fixture(dir: &std::path::Path, def: &str, sdc: &str) -> (DesignDb, LibDb, Sdc) {
         let (lib, tech) = slew_parity_pdk();
         let design = parse_def(&dir.join(def), &tech, Some(&lib)).expect("DEF");

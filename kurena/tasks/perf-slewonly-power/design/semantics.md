@@ -135,9 +135,11 @@ dispatch for exception SDCs, else `eval_sta`) on the same `prepared`
 and reads its `state.slew_*`. The slew-mode prepare is still
 sufficient: the clock block's only slew-visible effect (the
 propagated-consumer `base_state` copy) is already gated on
-`any_propagated` in both modes. No committed design trips the
-predicate; the parity test covers the fallback on the
-`sta_edge/latch_borrow` fixture.
+`any_propagated` in both modes. Design-time we expected no committed
+design to trip the predicate; measured at implementation, ibex does —
+one `_21829_/Q` data-latch borrow onto a data net — so ibex runs the
+fallback while gcd/picorv32/aes/jpeg take `slew_eval`. The parity test
+also covers the fallback on the `sta_edge/latch_borrow` fixture.
 
 (Note for the parity record: a *partitioned* eval unions per-class
 slew maps — a `disabled_borrow` leg merges slew while the enabled

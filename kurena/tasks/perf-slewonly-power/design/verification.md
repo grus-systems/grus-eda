@@ -41,7 +41,7 @@ big designs:
 |---|---|
 | gcd × `Rc::{None, Placement, RoutedSpef}` | smallest; SPEF pi-model path; `power` uses `None`/`Placement` |
 | picorv32 × `Rc::{None, Placement}` | medium; per goal's minimum |
-| ibex × `Rc::{None, Placement}` | clock-gate latch → `latch_borrow` keys all clock-covered → exercises `slew_eval` on a cyclic clock net |
+| ibex × `Rc::{None, Placement}` | one `_21829_/Q` data-latch borrow off the clock net → exercises `uncovered_borrow` → `eval_state_full` fallback on a committed design (its `prim_clock_gating` borrows stay clock-netted as expected) |
 | jpeg `Rc::Placement` | the measured design; largest level structure |
 | aes `Rc::Placement` | fourth committed design family |
 | `gcd.propagated.sdc` (or `picorv32.propagated.sdc`) `Rc::None` | `any_propagated` → slew path *keeps* the clock block; propagated-consumer unified-slew copy must match |

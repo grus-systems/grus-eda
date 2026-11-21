@@ -90,8 +90,10 @@ carries `reached` as a finite `arrival_max` marker on the same
 - **Fallback, not approximation**: a `latch_borrow` edge with a
   non-clock output net sends `sta_pin_slews` through the existing eval
   tail — the borrow window's arrival-dependent `continue`s cannot be
-  replayed without arrivals (semantics §4). No committed design hits
-  it (ibex's gating latch borrows onto a clock net).
+  replayed without arrivals (semantics §4). Design-time we expected no
+  committed design to hit it; measured at implementation, ibex trips it
+  once (a `_21829_/Q` data-latch borrow onto a data net) and takes the
+  fallback — see `docs/results.md` 2026-11-22.
 - **Phase keys honest**: slew work reports under `power.slews`; new
   keys `sta.slew.seeds`/`sta.slew.walk`; `sta.prepare.clock.*` shrinks
   to propagated-clock designs only — moves recorded in

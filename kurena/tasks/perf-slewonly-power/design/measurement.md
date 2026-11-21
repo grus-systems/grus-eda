@@ -73,7 +73,8 @@ or the propagate_clock block for pin slews: `sta_pin_slews` runs the
 shared prepare (clock block re-gated on `any_propagated` — pulse-width
 checks never fed slew), the shared seed state, and a slew+reached-only
 replay of the eval legs; `latch_borrow` edges off clock nets fall back
-to the eval tail (arrival-coupled window; no committed design has one).
+to the eval tail (arrival-coupled window; ibex has one — a
+`_21829_/Q` data-latch borrow — and takes the fallback).
 Design: `kurena/tasks/perf-slewonly-power/design/`.
 
 **Before/after wall** — median (min–max) ms, REPS=5, M4 mini, same
