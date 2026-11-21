@@ -863,7 +863,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
             // The `report_activity_annotation` split analogue: nets per origin
-            // in the measured label order, zero counts skipped.
+            // in the measured label order, zero counts skipped. The dead-override
+            // counters append unconditionally — diagnostics, not origin buckets,
+            // so a nonzero count must never hide behind the zero-skip.
             const ORIGIN_ORDER: [&str; 10] = [
                 "annotated",
                 "clock",
@@ -887,7 +889,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("activity: {split}");
+            println!(
+                "activity: {split} dead_annotation={} dead_user={}",
+                report.diagnostics.dead_annotation_entries,
+                report.diagnostics.dead_user_entries
+            );
             let d = &report.diagnostics;
             if d.cells_without_lib_cell > 0
                 || d.driven_nets_without_activity > 0

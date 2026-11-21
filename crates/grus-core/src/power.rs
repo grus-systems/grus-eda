@@ -71,6 +71,16 @@ pub struct PowerDiagnostics {
     pub internal_power_without_slew: usize,
     /// `internal_power` `related_pin` names that match no sibling pin of the cell.
     pub unresolved_related_pin: usize,
+    /// Dump `pin_signals` entries that named no net driver — a mirror of
+    /// `ActivityResolution::dead_annotation_entries` so the CLI/JSON
+    /// report surfaces it (the counters stay single-sourced on the
+    /// resolution).
+    pub dead_annotation_entries: usize,
+    /// `-pins` overrides whose pin is not a net driver — mirrors
+    /// `ActivityResolution::dead_user_entries`. Always 0 through the CLI
+    /// (no `--pins` flag); surfaced so an API-driven report keeps the
+    /// count visible.
+    pub dead_user_entries: usize,
     /// `internal_power`/`leakage_power` `when` blocks skipped because the
     /// expression is outside the literal-conjunction grammar, names no sibling
     /// pin, or a literal net carries no measured state. Seed probabilities
@@ -405,6 +415,8 @@ pub fn estimate_power(
         duration_s: window_s,
         diagnostics: PowerDiagnostics {
             activity_origin_counts: resolution.origin_counts,
+            dead_annotation_entries: resolution.dead_annotation_entries,
+            dead_user_entries: resolution.dead_user_entries,
             ..Default::default()
         },
     };
@@ -1298,11 +1310,16 @@ mod tests {
                 pins: vec![
                     (pin_obj["a"], setting(1e7, 0.4)),
                     (pin_obj["b"], setting(1e7, 0.4)),
+                    // `u_or/A` is an instance sink pin on `n_and` — not a
+                    // net driver, so a dead `user` entry. It proves the
+                    // counter is live and that a dead override cannot
+                    // perturb resolution (the verbatim compare below).
+                    (pin_obj["u_or/A"], setting(1e7, 0.4)),
                 ],
                 ..Default::default()
             },
         );
-        assert_eq!(via_pins.dead_user_entries, 0, "pins dead entries");
+        assert_eq!(via_pins.dead_user_entries, 1, "dead pins entry counted");
         assert_eq!(via_pins.nets.len(), input_ports_nets.len());
         for (n, (a, b)) in via_pins.nets.iter().zip(&input_ports_nets).enumerate()
         {

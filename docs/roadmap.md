@@ -471,10 +471,14 @@ Remaining:
   window), matching OpenROAD `read_saif` + `report_power` within ~0.4%
   total on the committed golden (`mb.saif.reference.json`); OpenSTA SAIF
   field semantics were measured in-container (docs/results.md). On `gcd`
-  the totals diverge because OpenSTA propagates activity statistically
-  (BDD + `findSeqActivity`) rather than reading per-net VCD counts; our
-  exact per-net counts are reported instead, and the residual is
-  documented in `docs/results.md`. `when`-conditional `internal_power`
+  the earlier "statistical propagation vs exact counts" gap turned out
+  to be mostly VCD-reader corruption (same-named `pin_signals` folding,
+  dropped short `b` writes) — with the reader fixes and the AP1–AP4
+  propagated model, `report_power` lands within ~2% of OpenSTA on every
+  group under the same VCD seeds (`docs/results.md` 2026-11-22); the
+  named residuals are the zero-wire-parasitics switching term and the
+  state-weighted `when` leakage attribution. `when`-conditional
+  `internal_power`
   and `leakage_power` blocks now evaluate at the measured OpenSTA model
   — marginal `P(when)` products, related-pin activity apportioning,
   half-weight x/z edges — verified at ~1e-7% on the `mbw` ebufn fixture
@@ -501,7 +505,12 @@ Remaining:
   `pin_signals` folding and dropped short `b` writes — fixed, and the
   gcd `report_power` gap narrowed to within ~2% on every group).
   Remaining named residuals: the per-pin/per-net annotation gap
-  (`s_full` `y`), the zero-wire parasitics switching residual and the
-  state-weighted `when` leakage residual on gcd. See
+  (`s_full` `y`), the `unknown`-net `prob_one: Some(0.0)` /
+  `when`-literal semantics note (OpenSTA's own `when` weight on
+  `unknown` unmeasured), the unmeasured precedence choices
+  (`user`-vs-dump, `-pins`-vs-`-input_ports`, duplicate `-pins`
+  last-wins), OpenSTA counting `user` under its `input N` split where
+  we report `user N` per net, and the zero-wire parasitics switching
+  plus state-weighted `when` leakage residuals on gcd. See
   `docs/results.md` 2026-11-22 and
   `kurena/tasks/ap4-activity-precedence/design/`.

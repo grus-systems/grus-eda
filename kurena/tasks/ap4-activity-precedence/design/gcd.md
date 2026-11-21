@@ -69,9 +69,14 @@ unverified unless run):
 iverilog -o /tmp/gcd_tb.vvp \
   tests/designs/gcd/power/gcd_tb.v \
   tests/designs/gcd/gcd.synth.v \
+  "$PDK/sky130A/libs.ref/sky130_fd_sc_hd/verilog/primitives.v" \
   "$PDK/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v"
 (cd tests/designs/gcd/power && vvp /tmp/gcd_tb.vvp)   # writes gcd.vcd
 ```
+
+(`primitives.v` added by the implementation run: without it iverilog
+fails with 560 unknown-UDP-primitive errors — the cell models'
+`sky130_fd_sc_hd__udp_*` primitives live there.)
 
 If it is not executed, the entry says the artifact is the
 2026-11-18 generation carried in the worktree — never implied-run.
