@@ -14,11 +14,11 @@
 //!   state expression holds.
 //!
 //! Activity is resolved per net by [`resolve_activity`] in the measured seed
-//! order (constant → clock → global → annotation → input → default;
-//! docs/results.md 2026-11-21 N7): a VCD dump (or resolved SAIF marginals)
-//! annotates matching nets, and every other net takes its class default so
-//! numbers are exact for the simulated window where annotated and statistical
-//! elsewhere — combinational propagation is AP2/AP3. Slews come from
+//! order (constant → clock → global → annotation → input → default, then
+//! combinational propagation over `Default` entries; docs/results.md
+//! 2026-11-21 N7): a dump annotates nets through their driver pins, every
+//! other net takes its class default, and combinational cell outputs derive
+//! the M1 local-marginal fill — sequential rules are AP3. Slews come from
 //! [`sta_pin_slews`]. Edges involving x/z count
 //! half a transition each, and per-direction lookups consume half the effective
 //! count — both measured OpenSTA behaviors (docs/results.md N7). `when` forms
@@ -52,9 +52,10 @@ pub struct PowerDiagnostics {
     /// Instances whose LEF cell has no Liberty counterpart (no leakage/pin data).
     pub cells_without_lib_cell: usize,
     /// Driven nets with no measured, seeded, or derived activity source —
-    /// resolved origin `Default` (the AP1 interim fill) or `Unknown`.
-    /// Such a net's `prob_one` is the seed probability, so `when` literals
-    /// on it evaluate rather than counting inexpressible.
+    /// resolved origin `Default` (the interim fill) or `Unknown`; the AP2
+    /// `Propagated` fill counts as derived and shrinks this counter on
+    /// partial annotation. Such a net's `prob_one` is the seed probability,
+    /// so `when` literals on it evaluate rather than counting inexpressible.
     pub driven_nets_without_activity: usize,
     /// Nets per resolved activity origin — the `report_activity_annotation`
     /// split shape. OpenSTA's split is per pin; ours is per net (recorded
@@ -244,21 +245,6 @@ fn net_load_pf(
         .sum::<f32>()
 }
 
-/// Finds the design pin of `cell` whose Liberty pin name is `sym`, for
-/// `internal_power` `related_pin` resolution.
-fn sibling_pin_by_lib_name(
-    design: &DesignDb,
-    lib: &LibDb,
-    cell: CellId,
-    sym: crate::interner::SymbolId,
-) -> Option<PinId> {
-    design.cell_pins(cell).iter().copied().find(|&p| {
-        design.pin_lib_pins[p.0 as usize]
-            .map(|lp| lib.pins[lp.0 as usize].name == sym)
-            .unwrap_or(false)
-    })
-}
-
 /// Marginal probability a `when` expression holds: the product over literals
 /// of each literal pin's net state probability — OpenSTA's independence model
 /// (no joint distributions exist in its activity model; docs/results.md N7).
@@ -268,7 +254,7 @@ fn eval_when(cx: &PowerCx, cell: CellId, when: crate::interner::SymbolId) -> Opt
     let lits = parse_when_expr(cx.lib.strings.resolve(when), &cx.lib.strings)?;
     let mut p = 1.0f64;
     for lit in lits {
-        let pin = sibling_pin_by_lib_name(cx.design, cx.lib, cell, lit.pin)?;
+        let pin = cx.design.pin_by_lib_name(cx.lib, cell, lit.pin)?;
         let net = cx.design.pin_nets[pin.0 as usize]?;
         let p1 = cx.net_prob_one(net)?;
         p *= if lit.inverted { 1.0 - p1 } else { p1 };
@@ -315,7 +301,7 @@ fn pin_internal_power(
             // No related pin: the block's own pin transition is the trigger
             // (the input-pin self-power form).
             None => Some(pin),
-            Some(sym) => match sibling_pin_by_lib_name(cx.design, cx.lib, cell, sym) {
+            Some(sym) => match cx.design.pin_by_lib_name(cx.lib, cell, sym) {
                 Some(p) => Some(p),
                 None => {
                     cx.diagnostics.unresolved_related_pin += 1;
@@ -868,17 +854,17 @@ mod tests {
         check_groups(&ref_json["power_saif"], &report, "saif");
     }
 
-    /// AP1 activity-defaults golden: `resolve_activity` on `mba` (no
-    /// annotation file) must reproduce OpenSTA's per-pin
-    /// `{density, prob, source}` for every seeded class in the four AP1
-    /// sessions of `mba.activity.reference.json` (emitted by the committed
-    /// `generate_activity_ref.sh` inside LibreLane 3.0.16). `s_global` and
-    /// `s_global_density` contain only `clock`/`constant`/`global` sources,
-    /// so all 43 pins are strict and the group columns sit inside the
-    /// established power bounds. `s_none`/`s_input` are strict on the 15
-    /// seeded-class pins; the 28 pins whose golden source is `propagated`/
-    /// `unknown` are pinned in `EXPECTED_DIVERGENT` — AP2/AP3 shrink the
-    /// table, and any *new* strict mismatch fails here.
+    /// AP2 activity-propagation golden: `resolve_activity` on `mba` must
+    /// reproduce OpenSTA's per-pin `{density, prob, source}` in the ten
+    /// committed sessions of `mba.activity.reference.json` (emitted by the
+    /// committed `generate_activity_ref.sh` inside LibreLane 3.0.16).
+    /// `s_global*` pins all 43 pins strict inside the established power
+    /// bounds; the propagation sessions assert every `Propagated`/`seeded`
+    /// value strictly under the source mapping rules below. The surviving
+    /// divergent set is exactly the AP3 residual (net `q`'s sequential
+    /// Q=D copy plus the `unknown` cone), pinned in `EXPECTED_DIVERGENT`.
+    /// `s_p40` (uncommitted 40 ns SDC) and `s_input_ports` (no override
+    /// surface yet) stay uncovered.
     #[test]
     fn test_activity_defaults_mba_matches_opensta() {
         let hd = sky130_hd();
@@ -903,15 +889,17 @@ mod tests {
                 .expect("parse reference json");
 
         // Golden keys are pins; our model resolves per net. Port pins map by
-        // port name, cell pins by `cell/pin`.
+        // port name, cell pins by `cell/pin`. `pin_obj` keeps the PinId for
+        // the driver check the source mapping rules need.
         let mut pin_net: std::collections::HashMap<String, NetId> =
+            std::collections::HashMap::new();
+        let mut pin_obj: std::collections::HashMap<String, PinId> =
             std::collections::HashMap::new();
         for &p in &design.io_pins {
             if let Some(n) = design.pin_nets[p.0 as usize] {
-                pin_net.insert(
-                    design.strings.resolve(design.pin_names[p.0 as usize]).to_string(),
-                    n,
-                );
+                let name = design.strings.resolve(design.pin_names[p.0 as usize]).to_string();
+                pin_net.insert(name.clone(), n);
+                pin_obj.insert(name, p);
             }
         }
         for c in 0..design.num_cells() {
@@ -920,43 +908,51 @@ mod tests {
             for &p in design.cell_pins(cell) {
                 if let Some(n) = design.pin_nets[p.0 as usize] {
                     let pname = design.strings.resolve(design.pin_names[p.0 as usize]);
-                    pin_net.insert(format!("{cname}/{pname}"), n);
+                    let key = format!("{cname}/{pname}");
+                    pin_net.insert(key.clone(), n);
+                    pin_obj.insert(key, p);
                 }
             }
         }
 
         // Golden sources our model reproduces verbatim; `vcd`/`saif`/`user`
-        // collapse onto the `annotated` label.
-        const STRICT: [&str; 7] =
-            ["clock", "global", "input", "constant", "vcd", "saif", "user"];
+        // collapse onto the `annotated` label — but only when the pin
+        // resolves its net (the pin is the net's driver). A golden
+        // annotated pin that is not its net's driver is a per-pin
+        // annotation residual our per-net model cannot represent.
         fn expected_label(src: &str) -> &str {
             match src {
                 "vcd" | "saif" | "user" => "annotated",
                 other => other,
             }
         }
-        // The pins the interim `Default` fill cannot reproduce yet — the
-        // golden's `propagated` (17) and `unknown` (11) sources, identical
-        // in `s_none` and `s_input`.
+        // The pins the AP2 fill cannot reproduce yet — net `q`'s sequential
+        // Q=D copy (`u_df/Q` and its output-port pin `qd`, which shares the
+        // residual) plus the 11 `unknown`-cone pins. Same set on every
+        // strict session; `s_global*` expects none.
         static EXPECTED_DIVERGENT: &[&str] = &[
-            "y", "yc", "qd", "u_and/A", "u_and/B", "u_and/X", "u_inv/A", "u_inv/Y", "u_or/A",
-            "u_or/B", "u_or/X", "u_xor/A", "u_xor/B", "u_xor/X", "u_df/D", "u_df/Q", "u_flt/X",
-            "q0", "q1", "u_f0/D", "u_f0/Q", "u_i0/A", "u_i0/Y", "u_f1/D", "u_f1/Q", "u_x1/A",
-            "u_x1/B", "u_x1/X",
+            "q0", "q1", "qd", "u_df/Q", "u_f0/D", "u_f0/Q", "u_i0/A", "u_i0/Y", "u_f1/D",
+            "u_f1/Q", "u_x1/A", "u_x1/B", "u_x1/X",
         ];
+        // Golden annotated pins that are not their net's resolving pin —
+        // `s_full`'s output port `y` holds `vcd 3e6/0.25` while net `y`'s
+        // driver `u_xor/X` reads `propagated 6e6/0.47`; the per-pin vs
+        // per-net residual is AP4 scope.
+        static PER_PIN_RESIDUAL: &[(&str, &str)] = &[("s_full", "y")];
 
         let setting = |density_per_s: f64, prob_one: f64| ActivitySetting {
             density_per_s,
             prob_one,
         };
-        let sessions: [(&str, ActivityOverrides); 4] = [
-            ("s_none", ActivityOverrides::default()),
+        let sessions: [(&str, ActivityOverrides, Option<&str>); 10] = [
+            ("s_none", ActivityOverrides::default(), None),
             (
                 "s_input",
                 ActivityOverrides {
                     input: Some(setting(1e7, 0.4)),
                     ..Default::default()
                 },
+                None,
             ),
             (
                 "s_global",
@@ -964,6 +960,7 @@ mod tests {
                     global: Some(setting(1e7, 0.4)),
                     ..Default::default()
                 },
+                None,
             ),
             (
                 "s_global_density",
@@ -971,18 +968,85 @@ mod tests {
                     global: Some(setting(3e7, 0.35)),
                     ..Default::default()
                 },
+                None,
+            ),
+            ("s_ports", ActivityOverrides::default(), Some("mba_ports.vcd")),
+            (
+                "s_ports_a2x",
+                ActivityOverrides::default(),
+                Some("mba_ports_a2x.vcd"),
+            ),
+            (
+                "s_partial",
+                ActivityOverrides::default(),
+                Some("mba_partial.vcd"),
+            ),
+            ("s_full", ActivityOverrides::default(), Some("mba_full.vcd")),
+            ("s_xz", ActivityOverrides::default(), Some("mba_xz.vcd")),
+            (
+                "s_partial2",
+                ActivityOverrides::default(),
+                Some("mba_partial2.vcd"),
             ),
         ];
 
-        for (sess, overrides) in &sessions {
+        let mut residual: std::collections::BTreeSet<(&str, &str)> =
+            std::collections::BTreeSet::new();
+        let mut origin_counts_pinned = false;
+        // `s_partial`'s only difference from `s_ports` is the dead flat
+        // `n_and` entry — the resolved per-net vectors must be identical.
+        let mut partial_nets: Vec<crate::activity::ResolvedActivity> = Vec::new();
+        for (sess, overrides, vcd_file) in &sessions {
+            let vcd = match vcd_file {
+                Some(f) => {
+                    crate::readers::load_vcd(&require(dir.join(f))).expect("vcd")
+                }
+                None => VcdActivity::default(),
+            };
             let golden = &ref_json[sess]["activity"];
             let resolution = crate::activity::resolve_activity(
                 &design,
                 &lib,
                 &sdc,
-                &VcdActivity::default(),
+                &vcd,
                 overrides,
             );
+            // AP2 diagnostics: `s_partial`'s flat `n_and` dump entry names
+            // no driver pin and lands dead (the other pins in that dump
+            // resolve, keeping the session identical to `s_ports`);
+            // `s_full` dumps all 18 pins — the 15 non-driver pins (cell
+            // inputs plus output port `y`) are dead. Every sky130
+            // `function` the bench hits parses and resolves, so
+            // `unresolvable_functions` stays 0.
+            let expected_dead = match *sess {
+                "s_partial" => 1,
+                "s_full" => 15,
+                _ => 0,
+            };
+            assert_eq!(
+                (resolution.dead_annotation_entries, resolution.unresolvable_functions),
+                (expected_dead, 0),
+                "{sess} diagnostics"
+            );
+            if *sess == "s_none" && !origin_counts_pinned {
+                origin_counts_pinned = true;
+                let counts: std::collections::BTreeMap<&str, usize> = resolution
+                    .origin_counts
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), *v))
+                    .collect();
+                assert_eq!(
+                    counts,
+                    std::collections::BTreeMap::from([
+                        ("clock", 1),
+                        ("constant", 4),
+                        ("input", 3),
+                        ("propagated", 5),
+                        ("default", 5),
+                    ]),
+                    "s_none origin_counts"
+                );
+            }
             let mut divergent: std::collections::BTreeSet<&str> =
                 std::collections::BTreeSet::new();
             for (pin, g) in golden.as_object().unwrap() {
@@ -991,7 +1055,7 @@ mod tests {
                 });
                 let r = resolution.nets[net.0 as usize];
                 let src = g["source"].as_str().unwrap();
-                if STRICT.contains(&src) {
+                let strict = |label: &str| {
                     let d_golden = g["density"].as_f64().unwrap();
                     let d_ours = r.eff_toggles / resolution.window_s;
                     assert!(
@@ -1008,17 +1072,43 @@ mod tests {
                         "{sess} {pin}: prob ours {p_ours} vs golden {p_golden} (origin {})",
                         r.origin.label()
                     );
-                    assert_eq!(
-                        r.origin.label(),
-                        expected_label(src),
-                        "{sess} {pin}: source"
-                    );
-                } else {
-                    // Our per-net resolution labels these pins by their net's
-                    // seed (`input` on port-driven nets, `default` on driven
-                    // ones) — the divergence table keys on the *golden*
-                    // source, not on ours.
-                    divergent.insert(pin.as_str());
+                    assert_eq!(r.origin.label(), label, "{sess} {pin}: source");
+                };
+                match src {
+                    // The AP3 sequential Q=D copy and the `unknown` cone —
+                    // ours stays `Default` there (asserted as divergent).
+                    "unknown" => {
+                        divergent.insert(pin.as_str());
+                    }
+                    // Strict {d,P}; the origin label is `propagated` on
+                    // comb-derived nets, `annotated`/`input` where the pin
+                    // sits on a seeded net (OpenSTA re-derives per pin).
+                    "propagated" => {
+                        if matches!(
+                            r.origin,
+                            ActivityOrigin::Default | ActivityOrigin::Unknown
+                        ) {
+                            divergent.insert(pin.as_str());
+                        } else {
+                            let label = r.origin.label();
+                            strict(label);
+                            assert!(
+                                ["propagated", "annotated", "input"].contains(&label),
+                                "{sess} {pin}: source {label} outside the propagated mapping"
+                            );
+                        }
+                    }
+                    "vcd" | "saif" | "user" => {
+                        let p = pin_obj[pin.as_str()];
+                        let resolves_net = design.pin_is_driver[p.0 as usize]
+                            && design.pin_nets[p.0 as usize] == Some(net);
+                        if resolves_net {
+                            strict("annotated");
+                        } else {
+                            residual.insert((sess, pin.as_str()));
+                        }
+                    }
+                    other => strict(expected_label(other)),
                 }
             }
             // `s_global*` covers every non-clock non-constant pin, so its
@@ -1033,13 +1123,29 @@ mod tests {
                 "{sess}: the divergent-source pin set moved"
             );
 
+            if *sess == "s_ports" {
+                partial_nets = resolution.nets;
+            } else if *sess == "s_partial" {
+                assert_eq!(resolution.nets.len(), partial_nets.len());
+                for (n, (a, b)) in
+                    resolution.nets.iter().zip(&partial_nets).enumerate()
+                {
+                    assert!(
+                        a.prob_one == b.prob_one
+                            && a.eff_toggles == b.eff_toggles
+                            && a.origin == b.origin,
+                        "s_partial net {n} differs from s_ports"
+                    );
+                }
+            }
+
             // Group columns share the same fill pass through `estimate_power`.
             let report = estimate_power(
                 &design,
                 &lib,
                 &sdc,
                 None,
-                &VcdActivity::default(),
+                &vcd,
                 &pin_slews,
                 overrides,
             );
@@ -1101,8 +1207,10 @@ mod tests {
                 check("total leakage", report.leakage_w, t["leakage_w"].as_f64().unwrap(), 0.01, 1e-14);
                 check("total", report.total_w, t["total_w"].as_f64().unwrap(), 0.003, 0.0);
             } else {
-                // The `Default` interim fill is not propagation: these columns
-                // are measured for the record only and asserted in AP2.
+                // AP2 residual on propagation sessions: net `q`'s sequential
+                // Q=D copy plus the four `unknown`-cone nets — measured for
+                // the record; bounds tighten when AP3 lands
+                // (docs/results.md).
                 let t = &groups["total"];
                 for (col, ours) in [
                     ("internal_w", report.internal_w),
@@ -1117,5 +1225,10 @@ mod tests {
                 }
             }
         }
+        assert_eq!(
+            residual.iter().copied().collect::<Vec<_>>(),
+            PER_PIN_RESIDUAL.to_vec(),
+            "the per-pin annotation residual moved"
+        );
     }
 }

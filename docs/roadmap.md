@@ -482,7 +482,10 @@ Remaining:
   inexpressible `when` forms remain counted. Statistical activity
   propagation is sequenced AP1–AP4 on the `mba` fixture: **AP1 done**
   (v0.2.14 — `resolve_activity` skeleton + measured seed defaults,
-  `grus-eda power` runs without annotation); AP2 combinational
-  propagation, AP3 sequential rules, and AP4 scoped annotation
-  precedence remain open. See `docs/results.md` 2026-11-21 and
+  `grus-eda power` runs without annotation); **AP2 done** (v0.2.15 —
+  bounded Liberty `function` evaluator, Kahn-ordered combinational
+  propagation with `Default`-taints, pin-namespaced annotation; the
+  golden's surviving divergent set is the 13-pin AP3 residual);
+  AP3 sequential rules and AP4 scoped annotation precedence remain
+  open. See `docs/results.md` 2026-11-21 and
   `kurena/tasks/activity-propagation/design/api.md` §Plan.

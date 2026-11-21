@@ -5064,3 +5064,94 @@ golden), `cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --release -p grus-core
 sta`. AP2–AP4 remain open (combinational propagation, sequential
 rules, scoped annotation).
+
+### 2026-11-21 — N7 — AP2: combinational activity propagation (v0.2.15)
+
+Second ticket of the AP1–AP4 sequence: `Default`-origin nets driven by
+non-sequential non-latch cells are overwritten by the M1 local-marginal
+model — `P(f)` under independent inputs and
+`d(f) = Σ_i d_i · P(∂f/∂x_i)` via Shannon cofactors. New
+`crates/grus-core/src/bool_expr.rs` is a bounded recursive-descent
+evaluator (constants, `!` `&` `|` `^`, parens, repeated literals;
+`MAX_VARS` bound; malformed forms return `None`, never panic).
+`propagate_combinational` (`activity.rs`) parses each candidate driver
+pin's Liberty `function`, maps its variables to the cell's input nets
+via `DesignDb::pin_by_lib_name` (moved out of `power.rs`), and fills in
+Kahn order over the candidate-DAG — a `Default`/`Unknown`/`prob_one:
+None` input taints the output to `Default` (sequential feedback cones
+stay unresolved until AP3); true comb cycles never dequeue. sky130
+coverage: 448 `LibPin.function` decls kept from the lib (483 raw
+`function :` lines), all parse, all vars map to sibling pins —
+`unresolvable_functions = 0` on every `mba` session
+(`bool_expr::tests::test_sky130_function_coverage` pins the counts).
+
+**Annotation moves to the pin namespace**: `VcdActivity` gains
+`pin_signals` — per-declaration scoped paths (`tb/dut/u_t/Z`), aliases
+for reused VCD codes included; `vcd.signals` (flat names) is retained
+for compat but no longer feeds net resolution. `SaifActivity::resolve`
+emits the same map (top scope via the net's driver pin, nested
+`INSTANCE/leaf`). A dump entry annotates a net iff it names the net's
+driver pin (`annotation_net_of`): input ports and instance output pins
+drive; output ports and instance input pins are dead entries, counted
+in `dead_annotation_entries`. On `mba`: `s_partial`'s flat `n_and` dump
+entry is dead (the session's resolved nets are asserted identical to
+`s_ports` — the only difference is the dead entry); `s_full` dumps 18
+pins and 15 non-driver entries are dead.
+
+**Golden — `test_activity_defaults_mba_matches_opensta`**: every
+session's golden now reads strict at the recorded bounds. The
+divergent set shrank from 28 to exactly 13 pins, asserted verbatim in
+`EXPECTED_DIVERGENT`: net `q`'s sequential Q=D copy (`u_df/Q`, `qd`)
+plus the 11 `unknown`-cone pins (`q0`, `q1`, `u_f0/D`, `u_f0/Q`,
+`u_i0/A`, `u_i0/Y`, `u_f1/D`, `u_f1/Q`, `u_x1/A`, `u_x1/B`, `u_x1/X`).
+`s_full`'s output port `y` is the one per-pin residual
+(`PER_PIN_RESIDUAL`): the golden pin is `vcd`-annotated while net `y`'s
+driver `u_xor/X` is `propagated` — our model is per-net; the per-pin
+precedence is AP4 scope. `s_none` `origin_counts` is pinned at
+`{clock 1, constant 4, input 3, propagated 5, default 5}`; AP2
+diagnostics asserted per session (`dead_annotation_entries` 1/15/0 as
+above, `unresolvable_functions` 0 everywhere).
+
+**Group-column residuals** (measured; the surviving AP3 cone —
+`Default`-seeded `q` plus the four `unknown`-cone nets — carries the
+gap; bounds tighten when AP3 lands):
+
+| session | internal | switching | total |
+|---|---|---|---|
+| `s_none` | +4.24% | +52.98% | +14.62% |
+| `s_input` | +8.09% | +54.19% | +23.52% |
+| `s_ports` | +4.93% | +94.97% | +18.68% |
+| `s_ports_a2x` | +3.92% | +47.09% | +13.27% |
+| `s_partial` | +4.93% | +94.97% | +18.68% |
+| `s_full` | +4.93% | +94.97% | +18.68% |
+| `s_xz` | +4.94% | +95.07% | +18.70% |
+| `s_partial2` | +4.29% | +68.49% | +15.52% |
+
+vs AP1's `s_none` +3.5%/+24.0%/+7.8% — the residual *grew* without new
+error: AP1's flat `Default` fill under-counted the comb cone (`y`
+`1e7`, `n_or` `6.25e6` vs the `5e6` seed) while over-counting the
+`unknown`-cone nets (`5e6` vs golden `0`), and the two errors
+cancelled. The propagated fill now lands the comb nets exactly on
+golden, so only the `unknown`-cone overcount shows.
+`driven_nets_without_activity` on `s_none` moves 10 → 5 (the five
+`Propagated` nets count as derived).
+
+**Moved goldens**: `mb.power.json` regenerated via the recorded CLI
+command — `git diff` **empty**: `tb/dut/_d_/Q` and `tb/dut/_i_/Y`
+resolve to their nets' driver pins, keeping `annotated=3` and every
+watt column bit-identical. The flat `q`/`y`/`D`/`CLK`/`A` entries are
+dead annotations now (5 entries) but were never the net's resolving
+source. `mba.activity.reference.json`, `mb.saif.reference.json`,
+`mbw.reference.json`, all other `*.reference.json`: `git status` clean
+— fully annotated fixtures stay byte-identical.
+
+**Fail-proof**: `propagate_combinational` disabled (early `return`) →
+`s_none origin_counts` red (`default 10`, no `propagated`); restored.
+One golden `prob` corrupted inside `s_none` (`u_and/A` 0.5→0.6) →
+strict assert red at `s_none u_and/A: prob ours 0.5 vs golden 0.6`;
+file restored byte-identical, test green.
+
+**Checks run**: `cargo test --workspace` (332+3), `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --release -p
+grus-core sta` (182), the CLI regen above. AP3 sequential rules and AP4
+scoped annotation precedence remain open.

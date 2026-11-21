@@ -5,7 +5,9 @@
 //! scope hierarchy, instead of VCD's per-edge stream. [`SaifActivity::resolve`]
 //! maps a selected scope onto the design's flat net names and produces the same
 //! [`VcdActivity`] `estimate_power` consumes: per-net (rise, fall) edge counts
-//! plus the window duration.
+//! plus the window duration. `resolve` additionally emits `pin_signals`
+//! (`{inst}/{pin}` for nested scopes; the driving pin's name for top-scope
+//! nets) — the pin namespace `resolve_activity` matches against.
 //!
 //! Measured OpenSTA 3.0.16 semantics this file does *not* copy (see
 //! docs/results.md 2026-11-19): OpenSTA resolves `NET`-group names to pins of
@@ -445,10 +447,23 @@ impl SaifActivity {
 
         let mut diag = SaifDiagnostics::default();
         let mut signals: HashMap<String, SignalActivity> = HashMap::new();
+        let mut pin_signals: HashMap<String, SignalActivity> = HashMap::new();
 
         // Top-scope signal names resolve to a design net by name, else to the
         // net of a top-level port. Nested INSTANCE names resolve to design
         // cells whose signal names are pin names on that instance.
+        fn signal_activity(f: &SaifFields, timescale_s: f64) -> SignalActivity {
+            let (rise, fall) = split_tc(f);
+            SignalActivity {
+                rise,
+                fall,
+                xtrans: 0,
+                t0_s: f.t0 * timescale_s,
+                t1_s: f.t1 * timescale_s,
+                other_s: (f.tx + f.tz + f.tb) * timescale_s,
+            }
+        }
+
         fn annotate(
             signals: &mut HashMap<String, SignalActivity>,
             design: &DesignDb,
@@ -460,18 +475,7 @@ impl SaifActivity {
                 .strings
                 .resolve(design.net_names[net.0 as usize])
                 .to_string();
-            let (rise, fall) = split_tc(f);
-            signals.insert(
-                name,
-                SignalActivity {
-                    rise,
-                    fall,
-                    xtrans: 0,
-                    t0_s: f.t0 * timescale_s,
-                    t1_s: f.t1 * timescale_s,
-                    other_s: (f.tx + f.tz + f.tb) * timescale_s,
-                },
-            );
+            signals.insert(name, signal_activity(f, timescale_s));
         }
 
         for (name, f) in &selected.signals {
@@ -480,7 +484,25 @@ impl SaifActivity {
                 .copied()
                 .or_else(|| port_net_of.get(name.as_str()).copied().flatten());
             match net {
-                Some(net) => annotate(&mut signals, design, net, f, self.timescale_s),
+                Some(net) => {
+                    annotate(&mut signals, design, net, f, self.timescale_s);
+                    // A top-scope NET entry annotates the pin driving the
+                    // net: `{port}` for an io-pin driver, `{cell}/{leaf}`
+                    // for a cell-pin driver (an undriven net has no pin to
+                    // key on). Nested-instance emits below win collisions.
+                    if let Some(drv) = design.net_driver(net) {
+                        let pin_name = design.strings.resolve(design.pin_names[drv.0 as usize]);
+                        let key = match design.pin_cells[drv.0 as usize] {
+                            None => pin_name.to_string(),
+                            Some(c) => format!(
+                                "{}/{}",
+                                design.strings.resolve(design.cell_names[c.0 as usize]),
+                                pin_name
+                            ),
+                        };
+                        pin_signals.insert(key, signal_activity(f, self.timescale_s));
+                    }
+                }
                 None => diag.unmatched_signals += 1,
             }
         }
@@ -490,6 +512,7 @@ impl SaifActivity {
             design: &DesignDb,
             cell_of: &HashMap<&str, CellId>,
             signals: &mut HashMap<String, SignalActivity>,
+            pin_signals: &mut HashMap<String, SignalActivity>,
             diag: &mut SaifDiagnostics,
             timescale_s: f64,
         ) {
@@ -503,16 +526,34 @@ impl SaifActivity {
                 .map(|&p| (design.strings.resolve(design.pin_names[p.0 as usize]), p))
                 .collect();
             for (name, f) in &scope.signals {
-                let net = pin_of
-                    .get(name.as_str())
-                    .and_then(|&p| design.pin_nets[p.0 as usize]);
-                match net {
-                    Some(net) => annotate(signals, design, net, f, timescale_s),
+                match pin_of.get(name.as_str()) {
+                    Some(&p) => {
+                        // Emit the pin-namespaced entry sink or driver — the
+                        // matcher drops sinks (a sink pin's dump used to
+                        // overwrite the driver pin's entry on the same net).
+                        pin_signals.insert(
+                            format!("{}/{name}", scope.name),
+                            signal_activity(f, timescale_s),
+                        );
+                        if let Some(net) = design.pin_nets[p.0 as usize] {
+                            annotate(signals, design, net, f, timescale_s);
+                        } else {
+                            diag.unmatched_signals += 1;
+                        }
+                    }
                     None => diag.unmatched_signals += 1,
                 }
             }
             for child in &scope.instances {
-                resolve_instance(child, design, cell_of, signals, diag, timescale_s);
+                resolve_instance(
+                    child,
+                    design,
+                    cell_of,
+                    signals,
+                    pin_signals,
+                    diag,
+                    timescale_s,
+                );
             }
         }
         for inst in &selected.instances {
@@ -521,6 +562,7 @@ impl SaifActivity {
                 design,
                 &cell_of,
                 &mut signals,
+                &mut pin_signals,
                 &mut diag,
                 self.timescale_s,
             );
@@ -529,6 +571,7 @@ impl SaifActivity {
         Ok((
             VcdActivity {
                 signals,
+                pin_signals,
                 duration_s: self.duration_s,
                 timescale_s: self.timescale_s,
             },
@@ -770,6 +813,22 @@ mod tests {
         d.io_pins = vec![PinId(0), PinId(1), PinId(2)];
         d.cell_pin_offsets = vec![0, 3, 5];
         d.cell_pin_ids = vec![PinId(3), PinId(4), PinId(5), PinId(6), PinId(7)];
+        // net_driver needs the net CSR plus driver flags: io clk/a and cell
+        // outputs `_d_/Q`, `_i_/Y` drive; io y and cell inputs are sinks.
+        d.net_pin_offsets = vec![0, 2, 4, 6, 8];
+        d.net_pin_ids = vec![
+            PinId(0),
+            PinId(4),
+            PinId(1),
+            PinId(3),
+            PinId(5),
+            PinId(6),
+            PinId(7),
+            PinId(2),
+        ];
+        for drv in [true, true, false, false, false, true, false, true] {
+            d.pin_is_driver.push(drv);
+        }
         d
     }
 

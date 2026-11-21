@@ -9,9 +9,10 @@
 //! `t0_s`/`t1_s` and x/z/never-defined time lands in `other_s`, so
 //! `t1/(t0+t1+other)` is the time-in-1 probability a `when` weight consumes. Every declared signal
 //! earns a `signals` entry — a constant dumped net is annotated with zero
-//! edges and a measured duty. Scope paths are ignored: DEF net names are
-//! flat leaf names, and directly-connected ports share their driver's
-//! transitions.
+//! edges and a measured duty. `signals` keys stay flat leaf names for
+//! compatibility; `pin_signals` additionally keys every declaration by its
+//! `$scope` path (`tb/dut/u_t/Z`), which is the namespace `resolve_activity`
+//! matches against design pins.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -58,7 +59,15 @@ impl SignalActivity {
 #[derive(Clone, Debug, Default)]
 pub struct VcdActivity {
     /// Keyed by leaf signal name (`clk`, `_000_`) or per-bit vector name (`req_msg[3]`).
+    /// Compat/debug view — `resolve_activity` consumes `pin_signals`.
     pub signals: HashMap<String, SignalActivity>,
+    /// Per-pin annotation candidates, keyed by the declaration's `$scope`
+    /// chain joined with `/` plus the leaf name (`tb/dut/_d_/Q`,
+    /// `tb/dut/n_and`). Every declaration yields an entry; declarations
+    /// sharing an identifier code (Icarus reuses codes in sibling scopes)
+    /// get an alias entry copying the retained shallowest stream's
+    /// activity — the `signals` alias semantics, made visible.
+    pub pin_signals: HashMap<String, SignalActivity>,
     /// Dumped window in seconds, from the first to the last timestamp.
     pub duration_s: f64,
     /// Seconds per timescale tick.
@@ -97,8 +106,12 @@ fn parse_timescale(text: &str) -> Result<f64> {
 }
 
 /// A declared signal: identifier code plus bit layout for vectors.
+#[derive(Clone)]
 struct SignalDecl {
     name: String,
+    /// `$scope` chain at declaration joined with `/` plus the leaf name
+    /// (`tb/dut/_d_/Q`) — the hierarchical key `pin_signals` emits.
+    path: String,
     /// (left, right) index bounds for vectors; `None` for scalars.
     range: Option<(i64, i64)>,
     nbits: usize,
@@ -132,8 +145,13 @@ impl IdActivity {
 /// Header-parse state shared by `$var`/`$scope`/`$upscope` items.
 struct VcdHeaders {
     decls: HashMap<String, SignalDecl>,
+    /// Every declaration in file order, including id-sharing ones shadowed
+    /// out of `decls` — `pin_signals` emits an alias entry for each.
+    decl_list: Vec<(String, SignalDecl)>,
     /// Per-identifier waveform state, one slot per bit.
     activity: HashMap<String, IdActivity>,
+    /// `$scope` name chain — `pin_signals` path prefix.
+    scopes: Vec<String>,
     scope_depth: usize,
 }
 
@@ -142,7 +160,9 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
     let timescale_s = parse_timescale(text)?;
     let mut headers = VcdHeaders {
         decls: HashMap::new(),
+        decl_list: Vec::new(),
         activity: HashMap::new(),
+        scopes: Vec::new(),
         scope_depth: 0,
     };
     let mut signals: HashMap<String, SignalActivity> = HashMap::new();
@@ -244,12 +264,51 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
         }
     }
 
+    // `pin_signals`: one entry per declaration, keyed by its scope path;
+    // id-sharing declarations alias the retained shallowest stream
+    // bit-for-bit (same pos maps the retained decl's own bit expansion).
+    let mut pin_signals: HashMap<String, SignalActivity> = HashMap::new();
+    for (id, decl) in &headers.decl_list {
+        let Some(retained) = headers.decls.get(id) else {
+            continue;
+        };
+        for pos in 0..decl.nbits.min(retained.nbits) {
+            let stream_name = match retained.range {
+                Some((left, right)) => {
+                    let bit_idx = if left >= right {
+                        left - pos as i64
+                    } else {
+                        left + pos as i64
+                    };
+                    format!("{}[{}]", retained.name, bit_idx)
+                }
+                None => retained.name.clone(),
+            };
+            let Some(sa) = signals.get(&stream_name) else {
+                continue;
+            };
+            let pin_name = match decl.range {
+                Some((left, right)) => {
+                    let bit_idx = if left >= right {
+                        left - pos as i64
+                    } else {
+                        left + pos as i64
+                    };
+                    format!("{}[{}]", decl.path, bit_idx)
+                }
+                None => decl.path.clone(),
+            };
+            pin_signals.insert(pin_name, *sa);
+        }
+    }
+
     let duration_s = match first_ts {
         Some(f) => (last_ts.saturating_sub(f)) as f64 * timescale_s,
         None => 0.0,
     };
     Ok(VcdActivity {
         signals,
+        pin_signals,
         duration_s,
         timescale_s,
     })
@@ -260,9 +319,18 @@ fn handle_header_item(item: &str, headers: &mut VcdHeaders) -> Result<()> {
     let item = item.trim();
     if item.starts_with("$scope") {
         headers.scope_depth += 1;
+        // `$scope <type> <name> $end` — the name is the third field.
+        let name = item
+            .trim_start_matches("$scope")
+            .trim_end_matches("$end")
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("");
+        headers.scopes.push(name.to_string());
         Ok(())
     } else if item.starts_with("$upscope") {
         headers.scope_depth = headers.scope_depth.saturating_sub(1);
+        headers.scopes.pop();
         Ok(())
     } else if item.starts_with("$var") {
         parse_var_decl(item, headers)
@@ -320,26 +388,31 @@ fn parse_var_decl(item: &str, headers: &mut VcdHeaders) -> Result<()> {
         None => 1,
     };
     let id_key = id.to_string();
+    let path = if headers.scopes.is_empty() {
+        name.clone()
+    } else {
+        format!("{}/{}", headers.scopes.join("/"), name)
+    };
+    let decl = SignalDecl {
+        name,
+        path,
+        range,
+        nbits,
+        depth: headers.scope_depth,
+    };
     // Icarus reuses identifier codes across sibling scopes; value changes cannot
     // distinguish them, so one stream feeds whichever declaration we keep. The
     // shallowest scope is the design-level net name (`clk`, not a cell's `CLK`).
     match headers.decls.get(&id_key) {
-        Some(existing) if existing.depth <= headers.scope_depth => {}
+        Some(existing) if existing.depth <= decl.depth => {}
         _ => {
-            headers.decls.insert(
-                id_key.clone(),
-                SignalDecl {
-                    name,
-                    range,
-                    nbits,
-                    depth: headers.scope_depth,
-                },
-            );
+            headers.decls.insert(id_key.clone(), decl.clone());
             headers
                 .activity
-                .insert(id_key, IdActivity::with_bits(nbits));
+                .insert(id_key.clone(), IdActivity::with_bits(nbits));
         }
     }
+    headers.decl_list.push((id_key, decl));
     Ok(())
 }
 
@@ -678,6 +751,34 @@ $finish
         let s = act.signals.get("clk").expect("clk");
         assert_eq!((s.rise, s.fall), (1, 1));
         assert!(!act.signals.contains_key("CLK"));
+        // Every declaration earns a `pin_signals` entry keyed by scope path;
+        // the shadowed `CLK` decls alias the retained shallowest stream.
+        for path in ["dut/clk", "_1_/CLK", "_2_/CLK"] {
+            let s = act.pin_signals.get(path).unwrap_or_else(|| panic!("{path}"));
+            assert_eq!((s.rise, s.fall), (1, 1), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_pin_signals_scoped_decl() {
+        // A scoped instance-pin dump (`tb/dut/u_t/Z`) keys `pin_signals` by
+        // the full path while `signals` keeps the flat leaf.
+        let vcd = "$timescale 1ns $end\n\
+                   $scope module tb $end\n\
+                   $scope module dut $end\n\
+                   $var wire 1 ! a $end\n\
+                   $scope module u_t $end\n\
+                   $var wire 1 \" Z $end\n\
+                   $upscope $end\n\
+                   $upscope $end\n\
+                   $upscope $end\n\
+                   $enddefinitions $end\n\
+                   #0\n0!\n1\"\n#10\n1!\n0\"\n#20\n";
+        let act = parse_vcd(vcd).expect("parse");
+        let s = act.pin_signals.get("tb/dut/u_t/Z").expect("scoped pin");
+        assert_eq!((s.rise, s.fall), (0, 1));
+        assert_eq!(act.pin_signals.get("tb/dut/a").expect("port").rise, 1);
+        assert_eq!(act.signals["Z"], act.pin_signals["tb/dut/u_t/Z"]);
     }
 
     #[test]
