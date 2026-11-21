@@ -1,5 +1,11 @@
 # golden — `mba` AP4 test design
 
+> **Status**: the label machinery, `origin_counts` pins, equivalence
+> check, and three fail-proofs below all landed in `22b96d6`. The R1
+> delta is the `dead_user_entries` exercise (§dead_user_entries and
+> the `-pins` coverage section) plus the corrected `mb.power.json`
+> diff expectation.
+
 `test_activity_defaults_mba_matches_opensta` (`power.rs` `#[cfg(test)]`)
 stays a 12-session loop — the session table is unchanged
 (`s_input_ports` and `s_p40` entered in AP3). AP4 changes the *label
@@ -59,43 +65,51 @@ vs `s_none`'s `{clock 1, constant 4, input 3, propagated 6,
 unknown 4}`: `a`/`b` move `input` → `user` (−2/+2); undriven `n_float`
 keeps `input` — the measured `-input_ports` port-only semantics.
 
-## `dead_user_entries` — asserted 0
+## `dead_user_entries` — exercised, not just asserted (R1)
 
-Fold into the existing per-session diagnostics assert (extend the
-tuple): `dead_user_entries == 0` on every session — no session sets
-`pins`, and `input_ports` resolves through its own arm, never through
-`pin_overrides`.
+Landed state: the per-session diagnostics tuple asserts
+`dead_user_entries == 0` on every session (none sets `pins`). The
+review memo asks for the counter to be *exercised* — an `== 0`-only
+assert cannot catch a counter that never increments. The `via_pins`
+check below carries the exercise: a `pins` entry on a non-driver pin
+yields `dead_user_entries == 1` while the resolved nets stay
+identical. The `== 0` session tuple assert stays as is.
 
-## `-pins` coverage — the equivalence check
+## `-pins` coverage — the equivalence check (R1: dead entry added)
 
 `resolve_activity` is deterministic per `(design, sdc, vcd,
 overrides)`; `pins` and `input_ports` naming the same input ports
 must yield identical nets (measured: both are `user` on `a`/`b`,
 `input` elsewhere). After the session loop, resolve `s_input_ports`
-a second way:
+a second way — now with one deliberately dead entry:
 
 ```rust
 let via_pins = resolve_activity(&design, &lib, &sdc, &VcdActivity::default(),
     &ActivityOverrides {
         pins: vec![(pin_obj["a"], setting(1e7, 0.4)),
-                   (pin_obj["b"], setting(1e7, 0.4))],
+                   (pin_obj["b"], setting(1e7, 0.4)),
+                   // `u_or/A` is an instance sink pin on `n_and` —
+                   // not a net driver, so a dead `user` entry.
+                   (pin_obj["u_or/A"], setting(1e7, 0.4))],
         ..Default::default()
     });
+assert_eq!(via_pins.dead_user_entries, 1, "dead pins entry counted");
 ```
 
 and assert `via_pins.nets` equals the `s_input_ports` session's
 `resolution.nets` verbatim (`prob_one`/`eff_toggles`/`origin` per
 net — the `s_partial`≡`s_ports` compare is the template; same-window
-comment applies: both runs share `window_s == 1.0`). This transitively
-pins `-pins` against the measured `user` semantics — a `pins` arm
-that mislabelled, misseeded, or leaked onto non-port nets would
-diverge here.
+comment applies: both runs share `window_s == 1.0`). The dead entry
+makes the check strictly stronger: the counter increments *and* a
+dead override provably cannot perturb resolution — a `pins`
+implementation that seeded `n_and` (or mislabelled it) would diverge
+on the verbatim compare.
 
 Note: `pin_obj` holds `PinId`s already — the call-site name→pin
-resolution is demonstrated in-test (`"a"`/`"b"` → `pin_obj`), which
-is exactly the contract api.md §2 specifies.
+resolution is demonstrated in-test (`"a"`/`"b"`/`"u_or/A"` →
+`pin_obj`), which is exactly the contract api.md §2 specifies.
 
-## Fail-proof (record all three in the results entry)
+## Fail-proof (record in the results entry; the first three landed)
 
 - **`user` arm dropped** (`User` relabeled `Annotated`, or both `user`
   seed arms removed) → `s_input_ports` red: `a`'s strict source
@@ -106,14 +120,20 @@ is exactly the contract api.md §2 specifies.
 - **`s_p40` corrupted** (one density in the golden's `s_p40` block
   e.g. `a` `2.5e6 → 3e6`) → strict red at the density bound; `git
   checkout --` restore byte-identical, green.
+- **R1 — dead counter disabled** (`dead_user_entries` computed as `0`,
+  or the `u_or/A` entry dropped from `via_pins`) → the `dead pins
+  entry counted` assert red. Restore, green. (Cheap to run alongside
+  the others; proves the counter is live, which is what the memo
+  asked.)
 
 ## Moved goldens
 
 - `mba.activity.reference.json` — read-only input; `git diff` empty.
-- `mb.power.json` — regenerated via the recorded CLI command;
-  expected `git diff` **empty** (mb has no `user`/`pins` overrides —
-  CLI passes `ActivityOverrides::default()`; the `User` origin is
-  unreachable there).
+- `mb.power.json` — regenerated via the recorded CLI command. **R1
+  correction**: the expected diff is *named*, not empty — the two new
+  serialized diagnostics keys (`dead_annotation_entries`,
+  `dead_user_entries`) are the whole diff; record the actual values.
+  No watt column may move (the counters are report-only).
 - Every other `*.reference.json` — `git diff` empty, asserted in the
   entry.
 
@@ -121,7 +141,7 @@ is exactly the contract api.md §2 specifies.
 
 - `crates/grus-core/src/power.rs` — `"user"` match arm +
   `expected_label` shrink, `s_input_ports` `origin_counts` pin,
-  `dead_user_entries` assert, `pins` equivalence check, doc comment
+  `pins` equivalence check, doc comment (all landed); R1: `u_or/A`
+  dead entry in `via_pins` + `dead_user_entries == 1` assert
 - `tests/designs/microbench/mba.activity.reference.json` — read-only
-- `tests/designs/microbench/mb.power.json` — regenerated, asserted
-  byte-identical
+- `tests/designs/microbench/mb.power.json` — regenerated, named diff

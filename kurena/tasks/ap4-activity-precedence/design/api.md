@@ -1,5 +1,9 @@
 # api — `User` origin, `pins` override, final seed precedence
 
+> **Status**: §1–§6 describe the base implementation, committed in
+> `22b96d6` (v0.3.0). §7–§8 are the review-memo revision (R1) — the
+> only remaining code work.
+
 AP4 touches `activity.rs` only in the seed chain — `resolve_activity`'s
 signature is unchanged. The propagation pass, constant cone, and
 producer tables are untouched.
@@ -146,13 +150,67 @@ minimal — the literal call sites document the rule).
 `Cargo.toml` `0.2.17 → 0.3.0` — **minor**, not patch: `ActivityOverrides`
 loses `Copy` (public type, breaking under the workspace's 0.x rule —
 "breaking changes bump `minor`"). `Cargo.lock` refreshes via
-`cargo check`.
+`cargo check`. (Landed in `22b96d6`; the revision below bumps patch.)
+
+## 7. R1 — `dead_*` counters reach the report surface
+
+The review memo: `dead_annotation=1286` in the results entry cannot be
+produced by the committed CLI — both dead counters live only on
+`ActivityResolution`, which `estimate_power` drops. The memo's
+preferred fix is taken: serialize them and print them on the activity
+diagnostic line.
+
+`PowerDiagnostics` (`power.rs`, derives `Serialize`) gains:
+
+```rust
+/// Dump `pin_signals` entries that named no net driver — a mirror of
+/// `ActivityResolution::dead_annotation_entries` so the CLI/JSON
+/// report surfaces it (the counters stay single-sourced on the
+/// resolution).
+pub dead_annotation_entries: usize,
+/// `-pins` overrides whose pin is not a net driver — mirrors
+/// `ActivityResolution::dead_user_entries`. Always 0 through the CLI
+/// (no `--pins` flag); surfaced so an API-driven report keeps the
+/// count visible.
+pub dead_user_entries: usize,
+```
+
+`estimate_power` populates them next to `activity_origin_counts` in
+the `PowerCx` init (`power.rs` ~line 406 — `resolution`'s fields are
+moved/copied independently, so the `usize` copies sit fine beside the
+`origin_counts` move).
+
+`main.rs` `activity:` line appends both counters **unconditionally**
+after the origin split:
+
+```
+activity: annotated=268 clock=1 dead_annotation=1286 dead_user=0
+```
+
+Unconditional because they are diagnostics, not origin buckets — the
+zero-skip on `ORIGIN_ORDER` must never hide a nonzero dead count.
+Update the `// report_activity_annotation split analogue` comment to
+note the appended counters.
+
+Serialization falls out for free (`Serialize` derive): `--json`
+reports — including the `mb.power.json` golden — gain the two keys
+under `diagnostics`. Expected `mb.power.json` diff is exactly
+`+"dead_annotation_entries": <n>,` and `+"dead_user_entries": 0,`;
+record the real `<n>` (docs.md §1).
+
+## 8. R1 — version
+
+`Cargo.toml` `0.3.0 → 0.3.1` — **patch**: additive diagnostics fields
+plus a diagnostic-line extension; no behavior change to resolution or
+power math. `Cargo.lock` refreshes via `cargo check`.
 
 ## Files
 
 - `crates/grus-core/src/activity.rs` — `User` variant + label, `pins`
   field, `pin_overrides` map, `dead_user_entries`, two `User` seed
-  arms, doc updates
-- `crates/grus-core/src/power.rs` — header precedence comment
-- `crates/grus-eda/src/main.rs` — `ORIGIN_ORDER` + `"user"`
-- `Cargo.toml`, `Cargo.lock`
+  arms, doc updates (landed; untouched in R1)
+- `crates/grus-core/src/power.rs` — header precedence comment (landed);
+  R1: `PowerDiagnostics` `dead_*` fields + `estimate_power` population
+- `crates/grus-eda/src/main.rs` — `ORIGIN_ORDER` + `"user"` (landed);
+  R1: `activity:` line appends `dead_annotation=`/`dead_user=`
+- `Cargo.toml` (0.3.1), `Cargo.lock`
