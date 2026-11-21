@@ -864,10 +864,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             // The `report_activity_annotation` split analogue: nets per origin
             // in the measured label order, zero counts skipped.
-            const ORIGIN_ORDER: [&str; 9] = [
+            const ORIGIN_ORDER: [&str; 10] = [
                 "annotated",
                 "clock",
                 "global",
+                "user",
                 "input",
                 "propagated",
                 "sequential",

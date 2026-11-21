@@ -3,8 +3,9 @@
 //! `{density, prob}` record per net.
 //!
 //! The fill order is the measured precedence (docs/results.md 2026-11-21 N7):
-//! constant cone → clock → `-global` override → `-input_ports` → annotation →
-//! input/undriven → leftover `Default` — then the unified propagation pass
+//! constant cone → clock → `-global` override → `-pins` → `-input_ports` →
+//! annotation → input/undriven → leftover `Default` — then the unified
+//! propagation pass
 //! (seq Q=D copy plus combinational evaluation in one fixed point) overwrites
 //! `Default` entries it can derive (`Propagated`), and every leftover
 //! `Default` becomes `unknown` `{0, 0}` — the measured semantics for
@@ -45,6 +46,11 @@ pub enum ActivityOrigin {
     Clock,
     /// `-global` override.
     Global,
+    /// `set_power_activity -pins` / `-input_ports` — an explicit user
+    /// set, measured source label `user` (P0b). Sits below
+    /// `global`/`clock`/`constant` and above dump annotation in the
+    /// seed order.
+    User,
     /// Input-port-driven or undriven net.
     Input,
     /// Combinational propagation: gate-function evaluation over resolved
@@ -65,12 +71,13 @@ pub enum ActivityOrigin {
 
 impl ActivityOrigin {
     /// The source column label, as OpenSTA's activity accessor prints it
-    /// (`annotated` stands in for its per-mechanism `vcd`/`saif`/`user`).
+    /// (`annotated` stands in for its per-mechanism `vcd`/`saif`).
     pub fn label(self) -> &'static str {
         match self {
             Self::Annotated => "annotated",
             Self::Clock => "clock",
             Self::Global => "global",
+            Self::User => "user",
             Self::Input => "input",
             Self::Propagated => "propagated",
             Self::Sequential => "sequential",
@@ -91,7 +98,7 @@ pub struct ActivitySetting {
     pub prob_one: f64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ActivityOverrides {
     /// `-global`: hits every non-clock non-constant net — beats annotation,
     /// input, and the leftover fill (measured).
@@ -99,11 +106,21 @@ pub struct ActivityOverrides {
     /// `-input`: replaces the input default; also the leftover fill value.
     pub input: Option<ActivitySetting>,
     /// `-input_ports`: user annotation on input-port-driven nets —
-    /// `{density, P}` absolute. Port drivers only; undriven nets keep
-    /// `input` (measured: `s_input_ports`'s `n_float` reads `input`
-    /// `5e6/0.5`). Beats a dump entry on the same net (unmeasured —
-    /// recorded); loses to `-global` and `clock`.
+    /// `{density, P}` absolute, origin `user`. Port drivers only;
+    /// undriven nets keep `input` (measured: `s_input_ports`'s `n_float`
+    /// reads `input` `5e6/0.5`). Beats a dump entry on the same net
+    /// (unmeasured — recorded); loses to `-global` and `clock`.
     pub input_ports: Option<ActivitySetting>,
+    /// `-pins <list>`: per-pin user overrides, origin `user`. The call
+    /// site resolves pin names to `PinId`s (name resolution is a caller
+    /// concern, same as the `-activity` rate normalization). An entry
+    /// annotates its net iff the pin is the net's driver — identical to
+    /// the dump-annotation rule (`annotation_net_of`): input ports and
+    /// instance output pins drive; sink pins and output ports are dead
+    /// `user` entries, counted in `dead_user_entries`. Last entry wins
+    /// on a duplicate pin. Checked before `input_ports` — the specific
+    /// selector beats the `[all_inputs]` blanket (unmeasured, recorded).
+    pub pins: Vec<(PinId, ActivitySetting)>,
 }
 
 /// One net's resolved activity.
@@ -137,6 +154,13 @@ pub struct ActivityResolution {
     /// Dump entries matching no driver pin — flat internal net names,
     /// sink pins, unknown names. Diagnostic only.
     pub dead_annotation_entries: usize,
+    /// `pins` entries whose pin is not a net driver (a sink pin, an
+    /// output port, or a pin with no net) — dead `user` entries, the
+    /// `dead_annotation_entries` analogue for the `-pins` arm.
+    /// Diagnostic only; a driver entry is never dead even when a
+    /// higher-precedence arm claims its net first — the pin *was*
+    /// resolved (matching `annotation_net_of`'s contract).
+    pub dead_user_entries: usize,
 }
 
 /// A combinational driver pin's parsed `function` with its
@@ -568,6 +592,22 @@ pub fn resolve_activity(
         }
     }
 
+    // `-pins` per-pin user overrides keyed by `PinId` — `collect` keeps
+    // the last entry on a duplicate pin (repeated `set_power_activity`
+    // semantics; unmeasured, recorded). Entries whose pin is not a net
+    // driver are dead `user` entries, counted once up front — the same
+    // rule `annotation_net_of` applies to dump paths.
+    let pin_overrides: HashMap<PinId, ActivitySetting> =
+        overrides.pins.iter().copied().collect();
+    let dead_user_entries = overrides
+        .pins
+        .iter()
+        .filter(|&&(p, _)| {
+            !design.pin_is_driver[p.0 as usize]
+                || design.pin_nets[p.0 as usize].is_none()
+        })
+        .count();
+
     let mut nets = Vec::with_capacity(design.num_nets());
     for (n, &is_constant) in constant.iter().enumerate() {
         let net = NetId(n as u32);
@@ -605,18 +645,27 @@ pub fn resolve_activity(
                     eff_toggles: g.density_per_s * window_s,
                     origin: ActivityOrigin::Global,
                 }
+            } else if let Some(&u) = driver.and_then(|d| pin_overrides.get(&d)) {
+                // `-pins <list>`: the net's driver pin was named —
+                // per-pin user override, checked before the
+                // `-input_ports` blanket (unmeasured order, recorded).
+                ResolvedActivity {
+                    prob_one: Some(u.prob_one),
+                    eff_toggles: u.density_per_s * window_s,
+                    origin: ActivityOrigin::User,
+                }
             } else if let Some(ip) = overrides.input_ports.filter(|_| {
                 driver.is_some_and(|d| design.pin_cells[d.0 as usize].is_none())
             }) {
                 // `-input_ports` annotates only nets driven by an io pin —
                 // undriven nets (`driver.is_none()`) keep the `input`
                 // default below (measured: `s_input_ports`'s `n_float`
-                // reads `input 5e6/0.5`). The `user` golden source maps
-                // to `Annotated` here.
+                // reads `input 5e6/0.5`). Origin `user` — the measured
+                // source label.
                 ResolvedActivity {
                     prob_one: Some(ip.prob_one),
                     eff_toggles: ip.density_per_s * window_s,
-                    origin: ActivityOrigin::Annotated,
+                    origin: ActivityOrigin::User,
                 }
             } else if let Some(sa) = annotation.get(&net) {
                 // Pin-namespace match: the net's driver pin was dumped.
@@ -684,5 +733,6 @@ pub fn resolve_activity(
         origin_counts,
         unresolvable_functions,
         dead_annotation_entries,
+        dead_user_entries,
     }
 }

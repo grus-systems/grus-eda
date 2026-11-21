@@ -493,6 +493,15 @@ Remaining:
   `{P, d}` verbatim (origin `propagated`), resolution iterates to a
   fixed point, leftover `Default` nets become `unknown {0,0}` and
   taint; all 12 `mba` sessions match the golden per-pin and
-  `EXPECTED_DIVERGENT` is empty); AP4 scoped annotation precedence
-  remains open. See `docs/results.md` 2026-11-22 and
-  `kurena/tasks/ap3-sequential-activity/design/`.
+  `EXPECTED_DIVERGENT` is empty); **AP4 done** (v0.3.0 —
+  `ActivityOverrides::pins` per-pin `-pins` overrides and the native
+  `user` origin (also emitted by `-input_ports`), `dead_user_entries`,
+  `pins`≡`input_ports` equivalence pinned on the golden; two VCD
+  reader bugs the pin-namespace comparison exposed — flat-name
+  `pin_signals` folding and dropped short `b` writes — fixed, and the
+  gcd `report_power` gap narrowed to within ~2% on every group).
+  Remaining named residuals: the per-pin/per-net annotation gap
+  (`s_full` `y`), the zero-wire parasitics switching residual and the
+  state-weighted `when` leakage residual on gcd. See
+  `docs/results.md` 2026-11-22 and
+  `kurena/tasks/ap4-activity-precedence/design/`.

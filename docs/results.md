@@ -5404,3 +5404,103 @@ golden density corrupted `3e6 → 4e6` → red at the density bound
 clippy --workspace --all-targets -- -D warnings`, `cargo test
 --release -p grus-core sta` (183, 2 ignored), the `mb.power.json`
 regen above. AP4 scoped annotation precedence remains open.
+
+### 2026-11-22 — N7 — AP4: scoped `set_power_activity` user overrides (v0.3.0)
+
+Closes the AP sequence: `ActivityOverrides` gains `pins:
+Vec<(PinId, ActivitySetting)>` (the `-pins <list>` arm; call site
+resolves names to `PinId`s, last duplicate wins, non-driver pins count
+in the new `dead_user_entries` diagnostic — the
+`dead_annotation_entries` analogue) and `ActivityOrigin::User` with
+label `"user"`. The `-input_ports` arm now resolves to the native
+`user` origin instead of collapsing onto `annotated`. Seed order is
+the measured chain constant → clock → global → `-pins` →
+`-input_ports` → annotation → input/undriven → `Default`; `-pins` vs
+`-input_ports` is unmeasured and recorded (specific selector before
+the `[all_inputs]` blanket). `ActivityOverrides` loses `Copy` (the
+`Vec` field); API surface only — no CLI flag was added, `-activity`
+stays clock-normalized at the call site and `-density` absolute.
+
+**Golden** (`test_activity_defaults_mba_matches_opensta`, all 12
+sessions strict): `s_input_ports`'s `a`/`b` compare at the native
+`user` label `{1e7, 0.4}`; `origin_counts` pins `s_input_ports` at
+`{clock 1, constant 4, input 1, propagated 6, unknown 4, user 2}`
+(`a`/`b` move `input`→`user` −2/+2 while undriven `n_float` keeps
+`input` — the measured port-only semantics) alongside `s_none`. A
+post-loop check resolves `-pins a,b` and asserts the per-net vector is
+identical to `s_input_ports`'s (`propagated` non-driver pins on a
+user-seeded net inherit `user`, so the propagated-mapping assert
+accepts it). `PER_PIN_RESIDUAL` is unchanged at `[("s_full","y")]` —
+per-pin vs per-net annotation stays the one model gap.
+
+**VCD reader fixes** (found by the gcd re-comparison below — the
+pin-namespace annotation exposed them): (1) `pin_signals` read the
+flat `signals` fold, so a same-named declaration (`Y`/`X`/`Q` on every
+dumped cell) summed every like-named stream — `IdActivity` now keeps a
+per-declaration `sa` stream `pin_signals` reads; `signals` stays the
+flat debug view. (2) `apply_vector_change` dropped `b` writes shorter
+than the declared width — `b0`/`bx` (all-x write) and leading-zero
+trims — losing both the edges and the state interval; short values now
+left-extend (x/z extend themselves, 0/1 extend with 0) per VCD
+left-alignment. Unit tests `test_pin_signals_keep_same_leaf_apart` and
+`test_short_vector_writes_left_extend` pin both; the `mba`/micro
+fixtures never exercised either (unique leaf names, full-width
+writes), so existing goldens are unaffected.
+
+**gcd `report_power` re-comparison** (`grus-eda power --vcd
+tests/designs/gcd/power/gcd.vcd`, zero-wire parasitics) vs OpenROAD
+`power_vcd_check.tcl` re-run this session (`Annotated 931 pin
+activities`; `[STA-1453] clock core_clk vcd period 10.000 differs
+from SDC clock period 5.000` — OR seeds the clock from SDC as we do):
+
+| group | ours internal | OR internal | ours switch | OR switch |
+|---|---|---|---|---|
+| Sequential | 2.984e-4 (+0.1%) | 2.98e-4 | 1.024e-5 (−4.3%) | 1.07e-5 |
+| Combinational | 5.873e-5 (−0.1%) | 5.88e-5 | 8.765e-5 (−1.8%) | 8.93e-5 |
+| Total | 3.572e-4 (+0.05%) | 3.57e-4 | 9.789e-5 (−2.1%) | 1.00e-4 |
+
+Totals `4.5505e-4` vs `4.57e-4` (−0.4%); total leakage `1.3004e-9` vs
+`1.30e-9` (+0.03%). Every group moves toward OR vs the 2026-11-18
+run — sequential internal 1.56e-4 → 2.984e-4 (was −48%, now +0.1%),
+combinational internal 1.35e-4 → 5.87e-5 (was +129%, now −0.1%),
+combinational switching 4.17e-5 → 8.77e-5 (was −53%, now −1.8%). The
+earlier entry's "statistical propagation vs exact counts" narrative
+was mostly parser corruption, not a model gap: OpenSTA annotates the
+same per-pin dump streams (`931 pin activities`) and the corrected
+per-net counts land inside ~2% on every column. The annotation model
+propagates little on this fixture — all 269 nets resolve
+`annotated`/`clock` (`activity: annotated=268 clock=1`,
+`dead_annotation=1286` — the dut-level wire paths and non-driver
+pins). Named residuals: sequential switching −4.3% and the remaining
+switching gap is the zero-wire-parasitics model (OR estimates wire RC
+from the placed DEF; SPEF narrows it, recorded 2026-11-18);
+combinational leakage +23% at ~1.9e-10 absolute — the
+state-weighted-vs-flat `when`-leakage residual already named on
+`mbw`; our Clock group reads 0 while OR attributes 1.88e-10 leakage
+there (our leakage lands in seq/comb — total leakage matches). The
+no-annotation baseline (`clock=1 input=35 propagated=1 unknown=232`)
+is unchanged in shape: gcd's sequential cones are scan/mux `sdf*`/
+`edf*` `next_state` expressions (the 37/63 coverage residual) plus
+feedback cycles, so the datapath resolves `unknown {0,0}` and
+combinational switching collapses to ~7.5e-8 — the honest AP-model
+limit on a real design without a dump.
+
+**Moved goldens**: `mb.power.json` regenerated via the recorded CLI —
+`git diff` empty (`annotated=3 clock=1`, every column bit-identical;
+`mb.vcd` uses only full-width vector writes). `mba.activity.reference.json`
+unchanged — `s_input_ports`/`s_p40` records were emitted by the
+committed `generate_activity_ref.sh` ahead of AP4. All other
+`*.reference.json` `git status`-clean.
+
+**Fail-proof**: `User` relabeled `Annotated` → `s_input_ports
+origin_counts` red (`annotated 2` vs `user 2`); the `-pins` arm
+disabled → `pins-vs-input_ports net 1 differs` red; `s_p40` golden
+density corrupted `2.5e6 → 3e6` → `s_p40 a: density ours 2.5e6 vs
+golden 3e6` red. All restored, green.
+
+**Checks run**: `cargo test --workspace` (335+3, 2 ignored), `cargo
+clippy --workspace --all-targets -- -D warnings`, `cargo test
+--release -p grus-core sta` (183, 2 ignored), the `mb.power.json`
+regen and the `power_vcd_check.tcl` re-run above. AP1–AP4 closed; the
+per-pin/per-net annotation residual (`s_full` `y`) and the gcd
+switching/leakage residuals above remain as named gaps.
