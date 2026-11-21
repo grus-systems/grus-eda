@@ -10329,6 +10329,39 @@ mod tests {
         );
     }
 
+    /// Async-arc coverage sweep: `dfrtp`/`dfstp`/`dfbbp`/`dfbbn`/`dfrbp` cell shapes
+    /// (rising and falling recovery/removal, dual async pins, `non_seq_*` pairs).
+    /// `u_ar`/`u_ap`/`u_aq` sit on port `aclk` with no `create_clock` — an
+    /// unclocked-`CLK` discriminator: if OpenSTA propagated `Clear`/`Preset` arcs,
+    /// their `Q`/`Q_N` could launch into `u_d*/D`. It does not (the probe's
+    /// `find_timing_paths -to u_d*/D` return 0 and a `set_disable_timing` on
+    /// `u_ff0 CLK->Q` leaves `u_ff2/D` without a path), so the golden endpoint
+    /// set is the 12 clocked check/data pins and our endpoint model matches it
+    /// exactly — the unclocked flops land in `skipped_endpoints` instead.
+    #[test]
+    fn test_sta_edge_async_arcs_ideal() {
+        compare_sta_edge(
+            "async_arcs",
+            "async_arcs/async_arcs.def",
+            "ideal.sdc",
+            None,
+            "ideal",
+            Tol::STRICT,
+        );
+    }
+
+    #[test]
+    fn test_sta_edge_async_arcs_propagated() {
+        compare_sta_edge(
+            "async_arcs",
+            "async_arcs/async_arcs.def",
+            "propagated.sdc",
+            None,
+            "propagated",
+            Tol::STRICT,
+        );
+    }
+
     /// `dlxtp_1` is a positive latch (`setup_falling`/`hold_falling` on GATE): the R5
     /// latch model handles it through `open_pol` like `dlxtn`, so all 3 OpenSTA
     /// endpoints (`u_ff/D`, `u_lt/D`, `y`) are reached.
