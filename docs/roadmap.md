@@ -156,10 +156,14 @@ The items below close these gaps, in the order proposed at the end.
   `async_fall*`/`clock_gate`, `dlrt*`/`dlrb*` latches in `latch_borrow`;
   `sdf*` scan cells are family-equivalent supersets (`SCD`/`SCE` pins extra).
 - Named residuals: `non_seq_*` arcs on `dfbb*`/`sdfbb*` stay deferred —
-  measured: OpenSTA does not report them either (`report_check_types` has no
-  rows for them), so the deferral is parity, not a gap; the "future OpenSTA
-  version re-measurement" clause from the 2026-11-17 entry stands — a version
-  that propagates async arcs or reports `non_seq_*` would reopen this item.
+  measured on `sta_edge/check_arcs` (`docs/results.md` 2026-11-21): OpenSTA
+  3.0.16 has no data-check report surface at all (`report_check_types
+  -data_setup` → STA-0562 "not a known keyword or flag",
+  `find_timing_paths -path_delay non_seq_setup` → STA-0510), and each
+  `SET_B`/`RESET_B` pin reports exactly one path — the recovery/removal
+  check, not a `non_seq` row. The deferral is parity, not a gap. `preserve`
+  stays unmeasurable (zero arcs in `sky130_fd_sc_hd`), so the re-measurement
+  clause stands for it alone.
 
 ### R7. Timing derate (with CRPR)
 
@@ -365,8 +369,18 @@ Remaining:
   (`dfrtn`'s RESET_B arc emits none). Verified at strict tolerance against
   `sta_edge/min_pulse_width` goldens (ideal, propagated+derated, violating);
   `merge_corner_reports` merges rows by `(pin, edge)` min slack.
-- Still deferred: `non_seq_*`, `three_state_*`, `preserve`, and async
-  `Clear`/`Preset` stay counted in `recognized_check_arcs`. A
+- `three_state_enable`/`three_state_disable` are evaluated as of `v0.2.11`
+  (see `docs/results.md` 2026-11-21): OpenSTA propagates both as delay arcs
+  firing on the sense-declared source edge, both destination transitions —
+  `Z1`/`0Z` merge into dst rise, `Z0`/`1Z` into dst fall — and counts the
+  tristate driver pin's own capacitance on the net load. Verified at strict
+  tolerance against `sta_edge/check_arcs` goldens (ideal, propagated,
+  `te_slow` discriminator).
+- Still deferred: `non_seq_*`, `preserve`, and async
+  `Clear`/`Preset` stay counted in `recognized_check_arcs` — measured:
+  OpenSTA 3.0.16 reports no `non_seq`/`preserve` rows on any surface
+  (`report_check_types` rejects `-data_setup`/`-data_hold`, no per-pin
+  extra rows) and does not propagate `Clear`/`Preset` (R6). A
   `min_pulse_width` arc whose pin is not on the clock network (e.g.
   `dfrtn` `RESET_B`) emits no check row — matching OpenSTA — and counts
   into `recognized_check_arcs[MinPulseWidth]` instead (ibex: 1664).

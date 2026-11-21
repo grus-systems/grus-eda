@@ -173,6 +173,7 @@ mod tests {
             max_cap: None,
             max_transition: Some(1.5),
             function: None,
+            is_tristate: false,
             internal_power: Vec::new(),
         });
         lib.pins.push(LibPin {
@@ -185,6 +186,7 @@ mod tests {
             max_cap: Some(0.2),
             max_transition: Some(1.5),
             function: None,
+            is_tristate: false,
             internal_power: Vec::new(),
         });
 

@@ -16,7 +16,7 @@ use xxhash_rust::xxh3::xxh3_64;
 const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
 // Bump when the serialized LibDb layout changes (e.g. new TimingType variants shift
 // discriminant values and old caches would deserialize `Other` arcs as real types).
-const CACHE_VERSION: u32 = 7;
+const CACHE_VERSION: u32 = 8;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -673,6 +673,7 @@ fn parse_cell_body(
                                 max_cap: None,
                                 max_transition: None,
                                 function: None,
+                                is_tristate: false,
                                 internal_power: Vec::new(),
                             });
                         }
@@ -713,6 +714,7 @@ fn parse_cell_body(
                                 max_cap: None,
                                 max_transition: None,
                                 function: None,
+                                is_tristate: false,
                                 internal_power: Vec::new(),
                             });
                         }
@@ -1057,6 +1059,12 @@ fn parse_pin_body(
         max_cap,
         max_transition,
         function,
+        is_tristate: pin_arcs.iter().any(|a| {
+            matches!(
+                a.2,
+                TimingType::ThreeStateEnable | TimingType::ThreeStateDisable
+            )
+        }),
         internal_power: pin_internal_power,
     };
     // A pin sharing its name with an `ff`/`latch` state variable reuses the placeholder

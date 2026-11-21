@@ -4486,3 +4486,121 @@ SDCs (`--json` + `--strict`, verbatim above). New tests
 (E0 rule 7): splitting `RecoveryFalling` out of the check arm turned both
 tests red (10 vs 12 endpoints), restored green. `cargo test --workspace` —
 all pass; `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+## 2026-11-21 — deferred check arcs: `non_seq_*`/`three_state_*`/`preserve` probe + `three_state_*` promoted (v0.2.11)
+
+Fixture `tests/designs/sta_edge/check_arcs/` (`check_arcs.def` — 14 cells, 16
+nets, 6 ports): `dfbbp_1`/`dfbbn_1` flops carrying the `non_seq_*`
+`SET_B`/`RESET_B` pair plus `clear`/`preset`, and `ebufn_1`/`einvn_1`/`einvp_1`
+tristate drivers (`TE_B`/`TE` enables) feeding `dfxtp_1` capture flops.
+`ideal.sdc`/`propagated.sdc` constrain the same design; `te_slow.sdc` delays
+port `te` by 2.5 ns instead of 0.7 ns so a propagating enable arc shifts the
+`u_cap*/D` arrivals by +1.8 ns — the propagation discriminator. Golden
+`check_arcs.reference.json` + `probe_check_arcs_{ideal,propagated,te_slow}.txt`
+were emitted by the committed `generate_ref.sh`, run as written from the repo
+root inside `ghcr.io/librelane/librelane:3.0.16` (whole script; rerun after
+adding the Q3 edge-model probe block — golden bytes unchanged, transcripts
+regenerated).
+
+### Library census (sky130_fd_sc_hd__tt_025C_1v80, re-counted today)
+
+| arc type | cells | placement |
+|---|---|---|
+| `non_seq_setup_rising` + `non_seq_hold_rising` (12 arcs each type) | `dfbb[n/p]_{1,2}`, `sdfbb[n/p]_1` | timing groups on `RESET_B` *and* `SET_B`, each `related_pin` = the other pin; `rise_constraint` only (`vio_3_3_1`, values *negative*: −0.10 … −0.33) |
+| `three_state_enable` + `three_state_disable` (13 each) | `ebufn_{1,2,4,8}`, `einvn_{0,1,2,4,8}`, `einvp_{1,2,4,8}` | timing groups on output `Z`, `related_pin` = `TE_B` (`ebufn`/`einvn`) or `TE` (`einvp`); real `del_1_7_7` delay tables + scalar-0 transition tables |
+| `preserve` | — | **zero occurrences in the lib** — nothing to fixture or probe; stays counted, this census is its record |
+
+### Per-type verdicts (OpenSTA 3.0.16, verbatim from `probe_check_arcs_ideal.txt`)
+
+- **Q0 surface**: no data-check flags exist. `report_check_types -data_setup`
+  → `[ERROR STA-0562] report_check_types -data_setup is not a known keyword or
+  flag.` (same for `-data_hold`); `find_timing_paths -path_delay data_setup`
+  → `[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise,
+  min_fall, max, max_rise, max_fall or min_max.` (same for `data_hold`,
+  `non_seq_setup`, `non_seq_hold`, `three_state`).
+- **`non_seq_*` — ignored, stays deferred.** Each `SET_B`/`RESET_B` pin finds
+  exactly one path (`u_fbp/RESET_B path count: 1`, same on all four pins) and
+  `report_checks -to` prints only the recovery row ("recovery check against
+  rising-edge clock", Path Group `asynchronous`) — no `non_seq` row on any
+  surface. Deferral = parity.
+- **`three_state_*` — evaluated as delay arcs.** `find -from te path count: 12`
+  (all `u_cap*/D` endpoints); after `set_disable_timing u_ebuf A->Z` the
+  `te → u_ebuf/Z` path still reaches `u_cap1/D` (`path count after disable
+  A->Z: 1`, "Startpoint: te"), and after `set_disable_timing u_evp TE->Z` the
+  `d_in → u_evp/Z` path survives symmetrically. `te_slow` shifts every
+  `u_cap*/D` `max_arr` by +1.8 ns versus `ideal` (e.g. `u_cap1/D` 1.675581 →
+  3.444121).
+- **`Clear`/`Preset` — still count-only** (R6 confirmed): `paths through
+  u_fbp/Q: 0`, `paths through u_fbn/Q_N: 0`.
+- **`preserve`** — unmeasurable (zero arcs); counted if a lib ever carries it.
+
+### `three_state_*` edge + load model (Q3, verbatim)
+
+`report_edges` shows OpenSTA models the arcs as hi-Z transition arcs. Each arc
+fires **one** source edge — the one that toggles the enable — and produces both
+destination transitions:
+
+```
+TE_B -> Z tristate disable        TE_B -> Z tristate enable
+  ^ -> 0Z 0.05:0.05                 v -> Z1 0.09:0.09
+  ^ -> 1Z 0.03:0.03                 v -> Z0 0.09:0.09
+A -> Z combinational                (u_einv/u_evp same shape;
+  ^ -> ^ 0.13:0.13                   u_evp enable fires `^`, disable `v`)
+  v -> v 0.11:0.11
+```
+
+Rule, applied in `arc_legs()`: `positive_unate` fires on the source **rise**,
+`negative_unate` on the source **fall**; `Z1`/`0Z` merge into dst rise,
+`Z0`/`1Z` into dst fall; delay/transition tables are looked up by dst polarity
+as usual.
+
+`report_net z1` proves the tristate driver's own pin capacitance stays on the
+net load — including for the arcs driving it:
+
+```
+Net z1                         Driver pins
+ Pin capacitance: 0.003934        u_ebuf/Z tristate (ebufn_1) 0.002260
+ ...                             Load pins
+                                 u_cap1/D input (dfxtp_1) 0.001674-0.001681
+```
+
+`sink_cap` previously returned 0 for every driver pin, so `A -> Z` came out
+0.095 ns vs OpenSTA's 0.13 ns. `LibPin::is_tristate` (set when the pin is the
+target of a `three_state_*` arc) now keeps the pin's capacitance on the net;
+ordinary drivers still exclude their own pin.
+
+### Our side (same fixture, `grus-eda sta`, zero wire)
+
+`--strict` verdicts: `propagated.sdc` exits **0** ("skipped: none affecting
+reported timing"); `ideal.sdc`/`te_slow.sdc` exit **1** on
+`cell_driven_clock_nets=1` — `c1` is buffer-driven, the documented ideal-mode
+limitation, not a check-arc issue. Skip block, verbatim (all modes):
+
+```
+  recognized_check_arcs[Clear=4, MinPulseWidth=4, NonSeqHoldRising=4, NonSeqSetupRising=4, Preset=4]
+```
+
+(20/68 arcs; `three_state_*` no longer counted — they are graph edges now.)
+
+Endpoint comparison (`--json` vs golden, 11 endpoints × 8 fields, STRICT):
+
+| scenario | worst \|Δ\| (ns) | where |
+|---|---|---|
+| ideal | 1.0e-6 | `u_fbn/SET_B.min_arr_ns` (golden `%.6f` rounding) |
+| propagated | 0.7e-6 | `u_ff/D.max_slack_ns` |
+| te_slow | 1.0e-6 | `u_fbn/SET_B.min_arr_ns` |
+
+`u_cap1/D.max_arr_ns` = 1.675581 in `ideal` (via `A -> Z` fall) and 3.444121 in
+`te_slow` (via `TE_B -> Z` `Z0`) — the discriminator works.
+
+**Tests**: `test_sta_edge_check_arcs_{ideal,propagated,te_slow}` at
+`Tol::STRICT`; `test_check_arcs_deferred_counts` pins the skip map literal
+above. Fail-proofed (E0 rule 7): dropping `ThreeStateDisable` from the graph
+edge arm turned all three golden tests red; restored green. Liberty cache
+`CACHE_VERSION` 7 → 8 for the new `LibPin::is_tristate` field.
+
+**Checks run**: `bash tests/designs/sta_edge/check_arcs/generate_ref.sh` —
+whole script, twice (probe transcripts byte-stable between reruns). `grus-eda
+sta` on all three SDCs (`--json` + `--strict`, verbatim above). `cargo test
+--workspace` — all pass; `cargo clippy --workspace --all-targets -- -D
+warnings` — clean.
