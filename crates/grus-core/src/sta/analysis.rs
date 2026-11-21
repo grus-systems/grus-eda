@@ -2275,16 +2275,27 @@ impl PinSlew {
     }
 }
 
-/// Runs the full STA flow and returns the per-pin worst slews, for consumers that
-/// need operating-point data (e.g. `internal_power` table lookups) rather than the
-/// endpoint report. Costs the same as [`run_sta`].
+/// Per-pin worst slews for consumers that need operating-point data (e.g.
+/// `internal_power` table lookups) rather than the endpoint report. Slew is
+/// exception-invariant — every source merges it unfiltered — so this replays
+/// `eval_sta`'s slew legs without computing arrivals: shared preparation (the
+/// propagated-clock block re-gated on `any_propagated`), the shared seed
+/// state, and a slew+`reached`-only walk. A `latch_borrow` edge whose Q sits
+/// off a clock net cannot be replayed — its borrow window reads real
+/// arrivals — so that case falls back to the full eval tail
+/// ([`eval_state_full`]), keeping the partitioned union semantics.
 pub fn sta_pin_slews(
     design: &DesignDb,
     lib: &LibDb,
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
 ) -> Result<Vec<PinSlew>> {
-    let (_report, state, _parities) = run_sta_detail(design, lib, sdc, parasitics, false)?;
+    let prepared = prepare_sta(design, lib, sdc, parasitics, true)?;
+    let state = if uncovered_borrow(&prepared) {
+        eval_state_full(&prepared)?
+    } else {
+        slew_eval(&prepared)
+    };
     Ok(state
         .iter()
         .map(|s| PinSlew {
@@ -2345,7 +2356,7 @@ fn run_sta_detail(
     parasitics: Option<&NetParasitics>,
     emit_warnings: bool,
 ) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
-    let prepared = prepare_sta(design, lib, sdc, parasitics)?;
+    let prepared = prepare_sta(design, lib, sdc, parasitics, false)?;
     if !sdc.exceptions.is_empty() || !sdc.path_delays.is_empty() || !sdc.clock_groups.is_empty() {
         return run_sta_partitioned(&prepared, emit_warnings);
     }
@@ -2463,6 +2474,7 @@ fn prepare_sta<'a>(
     lib: &'a LibDb,
     sdc: &'a Sdc,
     parasitics: Option<&'a NetParasitics>,
+    for_slew: bool,
 ) -> Result<StaPrepared<'a>> {
     // Domain tags ride in `u8` masks on every arrival extreme; more than 8
     // clock rows (design and virtual) cannot be tagged.
@@ -2666,7 +2678,11 @@ fn prepare_sta<'a>(
     // from them. The walk therefore runs whenever any row is propagated or
     // any pulse-width check exists; it seeds every design row's port, so a
     // mixed-mode design still gets real arrivals on each clock network.
-    if any_propagated || !graph.pulse_width_checks.is_empty() {
+    // Pin-slew consumers (`sta_pin_slews`) never read pulse checks, clock
+    // parity, or propagated-only arrivals, so the slew mode gates the block
+    // on `any_propagated` alone — the propagated-consumer `base_state` copy
+    // it produces is itself `any_propagated`-gated.
+    if any_propagated || (!for_slew && !graph.pulse_width_checks.is_empty()) {
         // `set_clock_latency` without `-source` is ideal network latency and does
         // not apply; `-source` latency and `set_clock_transition` seed the source
         // port. Slew comes from the unified pass: OpenSTA merges clock and data
@@ -2993,27 +3009,11 @@ fn prepare_sta<'a>(
     })
 }
 
-/// One exception-signature eval run: seed `base_state` with the allowed
-/// sources' arrivals (every source still merges slew), propagate data through
-/// the levelized graph, and collect endpoint candidates.
-/// `disabled_borrow` holds `(D, Q)` latch borrow arcs silenced for this class:
-/// a `set_max_delay` covering a latch's D pin stops the transparent `D -> Q`
-/// forward for every downstream path of the class — covered endpoints or not
-/// (measured on `latch_borrow` `delay_from`: `u_f2/D` loses the `p_lp -> u_lp
-/// D -> Q` contribution even though its own launch is uncovered). Slew still
-/// propagates — slew is physical, not path-scoped.
-fn eval_sta(
-    prepared: &StaPrepared,
-    allowed: Option<&HashSet<u32>>,
-    disabled_borrow: &HashSet<(u32, u32)>,
-    skipped_seed: SkipReport,
-) -> Result<EvalOutcome> {
-    let cx = &prepared.cx;
-    let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
-    let graph = &prepared.graph;
-    let levelized = &prepared.levelized;
-    let wire_delays_per_net = &prepared.wire_delays_per_net;
-    let t_seeds = crate::timing::phase("sta.eval.seeds");
+/// `eval_sta`'s seed pass: `base_state` plus the port and launch/latch
+/// contributions. Every source merges slew unconditionally — `allowed` flips
+/// only the arrival half of each merge — so `None` produces the unfiltered
+/// state the slew replay also seeds from.
+fn eval_seed_state(prepared: &StaPrepared, allowed: Option<&HashSet<u32>>) -> Vec<PinTimingState> {
     let mut state = prepared.base_state.clone();
     for seed in &prepared.port_seeds {
         let p = seed.pin.0 as usize;
@@ -3098,6 +3098,31 @@ fn eval_sta(
             }
         }
     }
+    state
+}
+
+/// One exception-signature eval run: seed `base_state` with the allowed
+/// sources' arrivals (every source still merges slew), propagate data through
+/// the levelized graph, and collect endpoint candidates.
+/// `disabled_borrow` holds `(D, Q)` latch borrow arcs silenced for this class:
+/// a `set_max_delay` covering a latch's D pin stops the transparent `D -> Q`
+/// forward for every downstream path of the class — covered endpoints or not
+/// (measured on `latch_borrow` `delay_from`: `u_f2/D` loses the `p_lp -> u_lp
+/// D -> Q` contribution even though its own launch is uncovered). Slew still
+/// propagates — slew is physical, not path-scoped.
+fn eval_sta(
+    prepared: &StaPrepared,
+    allowed: Option<&HashSet<u32>>,
+    disabled_borrow: &HashSet<(u32, u32)>,
+    skipped_seed: SkipReport,
+) -> Result<EvalOutcome> {
+    let cx = &prepared.cx;
+    let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
+    let graph = &prepared.graph;
+    let levelized = &prepared.levelized;
+    let wire_delays_per_net = &prepared.wire_delays_per_net;
+    let t_seeds = crate::timing::phase("sta.eval.seeds");
+    let mut state = eval_seed_state(prepared, allowed);
     drop(t_seeds);
 
     let t_walk = crate::timing::phase("sta.eval.walk");
@@ -3351,6 +3376,157 @@ fn eval_sta(
         state,
         skipped,
     })
+}
+
+/// `sta_pin_slews`'s fallback predicate: a `latch_borrow` edge whose Q pin
+/// drives a non-clock net carries an arrival-coupled slew decision (the borrow
+/// window `eval_sta` computes) that the slew replay cannot reproduce. A Q on a
+/// clock net is safe — the `!clock_net` guard silences the leg in both paths.
+fn uncovered_borrow(prepared: &StaPrepared) -> bool {
+    let design = prepared.cx.design;
+    prepared.graph.latch_borrow.keys().any(|&(_d, q)| {
+        design.pin_nets[q as usize].is_some_and(|n| !prepared.graph.clock_net[n.0 as usize])
+    })
+}
+
+/// The per-pin state `run_sta_detail` produces, without the report: the same
+/// partitioned/single-eval dispatch. `sta_pin_slews` reaches for it only when
+/// the slew replay cannot reproduce an arrival-coupled decision (`latch_borrow`
+/// off a clock net); a partitioned run is required there because the union of
+/// per-class slew maps, not one class's, is today's `PinSlew` output.
+fn eval_state_full(prepared: &StaPrepared) -> Result<Vec<PinTimingState>> {
+    let sdc = prepared.cx.sdc;
+    if !sdc.exceptions.is_empty() || !sdc.path_delays.is_empty() || !sdc.clock_groups.is_empty() {
+        return Ok(run_sta_partitioned(prepared, false)?.1);
+    }
+    Ok(eval_sta(prepared, None, &HashSet::new(), prepared.skipped.clone())?.state)
+}
+
+/// `eval_sta`'s levelized walk restricted to what `slew_max`/`slew_min` read:
+/// the same net-sink and arc legs, the same `driver_response` lookups, but
+/// slew merges only. `arrival_max` carries a `reached` marker instead of a
+/// real arrival — eval's leg gate is `reached || slew_reached` and `reached`
+/// is not implied by `slew_reached` (a propagated clock pin can be
+/// arrival-reached with `slew_max = -inf` and still fire the gate), so the
+/// marker must track which sources eval would count as reached. The replay
+/// never reads `arrival_max` for value. The one arrival-coupled slew decision
+/// — the borrow window on a `latch_borrow` edge — is unreachable here: the
+/// caller routes any borrow edge whose Q sits off a clock net through
+/// [`eval_state_full`] instead.
+fn slew_eval(prepared: &StaPrepared) -> Vec<PinTimingState> {
+    let cx = &prepared.cx;
+    let (design, lib) = (cx.design, cx.lib);
+    let graph = &prepared.graph;
+    let levelized = &prepared.levelized;
+    let wire_delays_per_net = &prepared.wire_delays_per_net;
+    let t_seeds = crate::timing::phase("sta.slew.seeds");
+    let mut state = eval_seed_state(prepared, None);
+    drop(t_seeds);
+
+    let t_walk = crate::timing::phase("sta.slew.walk");
+    for lvl in 1..levelized.level_offsets.len() - 1 {
+        let level = levelized.level(lvl);
+        let eval_pin = |state: &[PinTimingState], pin: PinId| -> Option<(usize, PinTimingState)> {
+            let p = pin.0 as usize;
+            let mut next = state[p];
+            let mut changed = false;
+
+            if !design.pin_is_driver[p]
+                && let Some((net_idx, pin_idx, drv)) = levelized.pin_driver[p]
+                // Same guard as `eval_sta`: a pin on a clock net keeps exactly
+                // its seed slew — no wire slew merges there.
+                && !graph.clock_net[net_idx as usize]
+            {
+                let driver_state = state[drv.0 as usize];
+                let net_wire = || {
+                    wire_delays_per_net
+                        .get(net_idx as usize)
+                        .and_then(|w| w.as_ref())
+                };
+                let is_port = design.pin_cells[drv.0 as usize].is_none();
+                if driver_state.reached(RISE) || driver_state.reached(FALL) {
+                    // Whole-state assignment, as eval's `sink_state_with_wire`:
+                    // the sink inherits the driver's `reached` markers through
+                    // `arrival_max` exactly as the arrival merge would set them.
+                    next = slew_sink(driver_state, net_wire(), pin_idx, is_port);
+                    changed = true;
+                } else if slew_reached(&driver_state, RISE) || slew_reached(&driver_state, FALL) {
+                    let sink = slew_sink(driver_state, net_wire(), pin_idx, is_port);
+                    for pol in [RISE, FALL] {
+                        merge_slew(&mut next, pol, sink.slew_max[pol], sink.slew_min[pol]);
+                    }
+                    changed = true;
+                }
+            }
+
+            let incoming = levelized.incoming_to(PinId(p as u32));
+            if !incoming.is_empty()
+                && let Some(out_net) = design.pin_nets[p]
+                && !graph.clock_net[out_net.0 as usize]
+            {
+                for &(src_pin, lib_arc) in incoming {
+                    let arc = &lib.arcs[lib_arc as usize];
+                    let src = state[src_pin.0 as usize];
+                    // Borrow legs keep eval's same-polarity leg set even though
+                    // the fallback means this lookup never decides a merge —
+                    // the leg set cannot drift from eval's.
+                    let legs: &[(usize, usize)] =
+                        if graph.latch_borrow.contains_key(&(src_pin.0, p as u32)) {
+                            &[(RISE, RISE), (FALL, FALL)]
+                        } else {
+                            arc_legs(arc)
+                        };
+                    for &(src_pol, dst_pol) in legs {
+                        let reached = src.reached(src_pol);
+                        if !reached && !slew_reached(&src, src_pol) {
+                            continue;
+                        }
+                        let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol)
+                        else {
+                            continue;
+                        };
+                        let s_max = src.slew_max[src_pol];
+                        let s_min = src.slew_min[src_pol];
+                        let (_late_delay, late_slew) =
+                            cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_max);
+                        let early_slew = if s_min == s_max {
+                            late_slew
+                        } else {
+                            cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_min)
+                                .1
+                        };
+                        merge_slew(&mut next, dst_pol, late_slew, early_slew);
+                        if reached {
+                            // The replay keeps `reached` only — `arrival_max`
+                            // holds a finite marker, not a real arrival.
+                            next.arrival_max[dst_pol] = next.arrival_max[dst_pol].max(0.0);
+                        }
+                        changed = true;
+                    }
+                }
+            }
+
+            changed.then_some((p, next))
+        };
+
+        if level.len() < 32 {
+            for &pin in level {
+                if let Some((p, next)) = eval_pin(&state, pin) {
+                    state[p] = next;
+                }
+            }
+        } else {
+            let updates: Vec<(usize, PinTimingState)> = level
+                .par_iter()
+                .filter_map(|&pin| eval_pin(&state, pin))
+                .collect();
+            for (p, next) in updates {
+                state[p] = next;
+            }
+        }
+    }
+    drop(t_walk);
+    state
 }
 
 /// Sort endpoint entries by pin name and reduce them to the report plus the
@@ -9483,6 +9659,7 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy)]
     enum Rc {
         None,
         Placement,
@@ -9796,6 +9973,154 @@ mod tests {
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    /// perf-slewonly-power parity gate: `sta_pin_slews`'s slew-only path must
+    /// return the eval-state slew fields `run_sta_detail` produces, pin by pin.
+    /// Value equality — the contract is power-lookup input equality.
+    fn assert_pin_slew_parity(
+        design: &DesignDb,
+        lib: &LibDb,
+        sdc: &Sdc,
+        parasitics: Option<&NetParasitics>,
+        label: &str,
+    ) {
+        let (_report, full, _pol) =
+            run_sta_detail(design, lib, sdc, parasitics, false).expect("full STA");
+        let fast = sta_pin_slews(design, lib, sdc, parasitics).expect("slew-only STA");
+        assert_eq!(full.len(), fast.len(), "{label}: pin count");
+        for (i, (s, p)) in full.iter().zip(&fast).enumerate() {
+            assert_eq!(s.slew_max[RISE], p.rise_ns, "{label} pin {i} rise");
+            assert_eq!(s.slew_max[FALL], p.fall_ns, "{label} pin {i} fall");
+        }
+    }
+
+    fn slew_parity_pdk() -> (LibDb, crate::tech_db::TechDb) {
+        let lib_dir = sky130_hd();
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        (lib, tech)
+    }
+
+    /// `assert_pin_slew_parity` on a committed `<name>.placed.def` design, with
+    /// `compare_design_files`'s parasitics modes.
+    fn slew_parity_design(design_name: &str, sdc_file: &str, rc_mode: Rc) {
+        let (lib, tech) = slew_parity_pdk();
+        let dir = design_dir(design_name);
+        let design = parse_def(
+            &dir.join(format!("{design_name}.placed.def")),
+            &tech,
+            Some(&lib),
+        )
+        .expect("DEF");
+        let sdc = load_sdc(&dir.join(sdc_file)).expect("SDC");
+        let parasitics = match rc_mode {
+            Rc::None => None,
+            Rc::Placement => {
+                let rc = crate::sta::WireRc::from_layer(&tech, "met2").expect("met2 RC");
+                Some(crate::sta::estimate_placement_parasitics(
+                    &design, &tech, rc,
+                ))
+            }
+            Rc::Spef => {
+                let spef =
+                    crate::readers::load_spef(&dir.join(format!("{design_name}.routed.spef")))
+                        .expect("SPEF");
+                Some(crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics"))
+            }
+            Rc::RoutedSpef => {
+                let spef = crate::readers::load_spef(&dir.join(format!("{design_name}.rcx.spef")))
+                    .expect("SPEF");
+                Some(crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics"))
+            }
+        };
+        assert_pin_slew_parity(
+            &design,
+            &lib,
+            &sdc,
+            parasitics.as_ref(),
+            &format!("{design_name}/{sdc_file}"),
+        );
+    }
+
+    /// `assert_pin_slew_parity` on a fixture DEF/SDC at explicit paths
+    /// (`sta_edge`, `sta_exceptions`, `microbench` — no `.placed.def` naming).
+    /// Returns the prepared design so a caller can assert which internal path
+    /// ran (e.g. the `latch_borrow` fallback predicate).
+    fn slew_parity_fixture(dir: &std::path::Path, def: &str, sdc: &str) -> (DesignDb, LibDb, Sdc) {
+        let (lib, tech) = slew_parity_pdk();
+        let design = parse_def(&dir.join(def), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join(sdc)).expect("SDC");
+        (design, lib, sdc)
+    }
+
+    /// The `power` modes (`Rc::{None, Placement}`) plus the SPEF/pi-model path
+    /// on the smallest design — the parity gate the perf plan named.
+    #[test]
+    fn test_sta_pin_slews_parity_committed_designs() {
+        for rc in [Rc::None, Rc::Placement, Rc::RoutedSpef] {
+            slew_parity_design("gcd", "gcd.sdc", rc);
+        }
+        for rc in [Rc::None, Rc::Placement] {
+            slew_parity_design("picorv32", "picorv32.sdc", rc);
+            slew_parity_design("ibex", "ibex.sdc", rc);
+        }
+        slew_parity_design("aes", "aes.sdc", Rc::Placement);
+        slew_parity_design("jpeg", "jpeg.sdc", Rc::Placement);
+    }
+
+    /// A propagated-clock SDC keeps the `prepare_sta` clock block in slew mode
+    /// — the unified-slew consumer copy into `base_state` must match the full
+    /// run exactly.
+    #[test]
+    fn test_sta_pin_slews_parity_propagated() {
+        slew_parity_design("gcd", "gcd.propagated.sdc", Rc::None);
+        slew_parity_design("picorv32", "picorv32.propagated.sdc", Rc::None);
+    }
+
+    /// The microbench fixtures the committed power goldens read.
+    #[test]
+    fn test_sta_pin_slews_parity_microbench() {
+        let dir = design_dir("microbench");
+        let (design, lib, sdc) = slew_parity_fixture(&dir, "mb.def", "mb.sdc");
+        assert_pin_slew_parity(&design, &lib, &sdc, None, "microbench/mb");
+        let (design, lib, sdc) = slew_parity_fixture(&dir, "mbw.def", "mbw.sdc");
+        assert_pin_slew_parity(&design, &lib, &sdc, None, "microbench/mbw");
+    }
+
+    /// Slew is exception-invariant: an exceptions SDC takes the partitioned
+    /// dispatch in `run_sta_detail`, and `sta_pin_slews` must still match
+    /// without running it (the replay merges what the class union would).
+    #[test]
+    fn test_sta_pin_slews_parity_exceptions() {
+        let dir = design_dir("sta_exceptions");
+        let (design, lib, sdc) = slew_parity_fixture(&dir, "exceptions.def", "fp_allregs.sdc");
+        assert!(!sdc.exceptions.is_empty(), "fixture must carry exceptions");
+        assert_pin_slew_parity(&design, &lib, &sdc, None, "sta_exceptions/fp_allregs");
+    }
+
+    /// `sta_edge/latch_borrow` has a data latch whose Q drives a non-clock net:
+    /// `uncovered_borrow` must fire and route `sta_pin_slews` through the full
+    /// eval tail — the borrow window's arrival-dependent drops cannot be
+    /// replayed.
+    #[test]
+    fn test_sta_pin_slews_latch_borrow_fallback() {
+        let dir = design_dir("sta_edge").join("latch_borrow");
+        let (design, lib, sdc) = slew_parity_fixture(&dir, "latch_borrow.def", "latch.sdc");
+        let prepared = prepare_sta(&design, &lib, &sdc, None, true).expect("prepare");
+        assert!(
+            uncovered_borrow(&prepared),
+            "latch_borrow fixture must trip the fallback predicate"
+        );
+        assert_pin_slew_parity(&design, &lib, &sdc, None, "sta_edge/latch_borrow");
     }
 
     /// Phase 3 edge-case fixtures under `tests/designs/sta_edge/`: hand-written DEF/SDC(/SPEF) per
