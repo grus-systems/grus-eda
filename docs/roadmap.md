@@ -116,8 +116,9 @@ The items below close these gaps, in the order proposed at the end.
 - Residuals: cells without a Liberty `function` keep the positive-unate AND
   guess (they cannot be classified); `gating_enables` checks get no CRPR
   credit under derate (pessimistic, recorded in the R7 entry); the four
-  `CrossDomain` deferrals in `docs/multi-clock.md` §2 are unrelated and stay
-  parked there. Ideal-mode clock-network inversion is no longer open —
+  `CrossDomain` deferrals in `docs/multi-clock.md` §2 are unrelated —
+  resolved in v0.2.12 (`xdomain-deferrals`). Ideal-mode clock-network
+  inversion is no longer open —
   `ideal_clock_parity` has tracked edge phase through cell-driven clock nets
   since v0.1.71 (same-day follow-up entry).
 
@@ -333,12 +334,19 @@ Remaining:
   inter-clock uncertainty, v0.2.2), `mc-selectors` (clock-object
   selectors, `set_clock_groups`, `create_clock -waveform`, v0.2.5) and
   `mc-golden` (probe promoted to `two_clock.reference.json`, v0.2.6).
-  All 40 golden `sta_clocks` scenarios match OpenSTA at strict
+  All 52 golden `sta_clocks` scenarios match OpenSTA at strict
   tolerance with `cross_domain == 0`, and `docs/path-delays.md`
-  section 5 has no open items left. Still parked: the four
-  `CrossDomain` deferrals in `docs/multi-clock.md` §2 (undeclared-launch
-  zero mask, latch-D foreign-launch borrow pairing, unpairable hold
-  tying parity, defensive `grid_lcm` non-convergence).
+  section 5 has no open items left. `xdomain-deferrals` (v0.2.12)
+  resolved the four parked `CrossDomain` corners in
+  `docs/multi-clock.md` §2: undeclared-launch zero masks keep an
+  edge-0 clk->Q launch (ordinary checks dropped like OpenSTA's
+  `t2_u1`, named `UndeclaredLaunch` skips; `-to` delay checks
+  evaluate per `t2_u2`), latch-D foreign launches borrow through the
+  latch's own window (`t2_xlat`/`t2_xlat2`), and hold pairing is
+  capture-edge-driven inside the measured `pair_window` bound
+  (`t2_lcm`/`t2_lcm2`). The only surviving deferral is the defensive
+  no-pair-in-window `CrossDomain` — unreachable on the measured
+  grids.
 
 ### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
 
