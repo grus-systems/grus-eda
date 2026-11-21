@@ -340,13 +340,15 @@ pub struct SkipReport {
     /// Arcs that have no model on non-latch cells, by `TimingType` name.
     pub unsupported_arcs: BTreeMap<String, usize>,
     /// Recognised Liberty check-arc types the endpoint model defers: `non_seq_*`,
-    /// `three_state_*`, `preserve` and async `clear`/`preset`. They constrain a
+    /// `preserve` and async `clear`/`preset`. They constrain a
     /// pin rather than propagate data, so they add endpoints outside the modelled set
     /// instead of altering arrivals. Counted here and shown in the summary; like the
     /// design rules they are exempt from `--strict` (see `is_clean`), because dropping a
     /// check arc cannot change the arrival or slack of an endpoint the model does report.
     /// `min_pulse_width` used to count here; it is now an evaluated check family
-    /// reported under `StaReport::pulse_width_checks`.
+    /// reported under `StaReport::pulse_width_checks` — though an arc whose pin is
+    /// off the clock network still lands here. `three_state_*` also left this map
+    /// in v0.2.11: OpenSTA propagates both arcs as delay edges.
     pub recognized_check_arcs: BTreeMap<String, usize>,
     /// Arcs that have no model on latch cells, by `TimingType` name: anything that is
     /// neither a modelled check, the opening edge arc, a `D -> Q` transparent arc nor a
@@ -571,16 +573,21 @@ impl Context<'_> {
     }
 
     /// Capacitance of one pin of a net for one transition. Zero-wire mode has no wire capacitance,
-    /// only sink pins and port loads.
+    /// only sink pins and port loads. A tristate driver pin keeps its capacitance
+    /// on the net — OpenSTA loads it for the arcs driving it too
+    /// (`sta_edge/check_arcs`, ebufn_1 Z on net z1).
     fn sink_cap(&self, pin: PinId, pol: usize) -> f32 {
         let p = pin.0 as usize;
-        if self.design.pin_is_driver[p] {
-            return 0.0;
-        }
         match (self.design.pin_cells[p], self.design.pin_lib_pins[p]) {
-            (None, _) => self.sdc.output_load_pf(self.port_name(pin)),
+            (None, _) if !self.design.pin_is_driver[p] => {
+                self.sdc.output_load_pf(self.port_name(pin))
+            }
+            (None, _) => 0.0,
             (Some(_), Some(lp)) => {
                 let lib_pin = &self.lib.pins[lp.0 as usize];
+                if self.design.pin_is_driver[p] && !lib_pin.is_tristate {
+                    return 0.0;
+                }
                 if pol == RISE {
                     lib_pin.cap_rise
                 } else {
@@ -1230,8 +1237,8 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
                 TimingType::MinPulseWidth => {
                     graph.pulse_width_checks.push(PulseWidthCheck { pin: dst, lib_arc });
                 }
-                // Recognised check arcs (`non_seq_*`, `three_state_*`, `preserve`,
-                // `clear`, `preset`) constrain a pin rather than propagate data.
+                // Recognised check arcs (`non_seq_*`, `preserve`, `clear`,
+                // `preset`) constrain a pin rather than propagate data.
                 // They are deferred to `recognized_check_arcs`, distinct from the unknown
                 // `unsupported_arcs` catch-all, so the summary separates "known check we do
                 // not endpoint-model" from "arc type we do not recognise". The arm sits
@@ -1279,9 +1286,16 @@ fn build_graph(cx: &Context, skipped: &mut SkipReport) -> TimingGraph {
                             .or_default() += 1;
                     }
                 }
+                // `three_state_*` arcs carry delay tables like combinational
+                // arcs, and OpenSTA 3.0.16 propagates both with their declared
+                // `timing_sense` (measured on `sta_edge/check_arcs`: a path
+                // through `TE_B -> Z` survives `set_disable_timing A->Z`, and
+                // delaying the enable port shifts the `Z` arrival).
                 TimingType::Combinational
                 | TimingType::CombinationalRise
-                | TimingType::CombinationalFall => {
+                | TimingType::CombinationalFall
+                | TimingType::ThreeStateEnable
+                | TimingType::ThreeStateDisable => {
                     graph.edges.push(ArcEdge { src, dst, lib_arc });
                 }
                 TimingType::RisingEdge | TimingType::FallingEdge => {
@@ -1832,7 +1846,7 @@ fn propagate_slew(
                     let legs: &[(usize, usize)] = if borrow {
                         &[(RISE, RISE), (FALL, FALL)]
                     } else {
-                        polarities(arc.timing_sense)
+                        arc_legs(arc)
                     };
                     for &(src_pol, dst_pol) in legs {
                         let s_max = src.slew_max[src_pol];
@@ -1966,7 +1980,7 @@ fn propagate_clock(
                     let arc = &cx.lib.arcs[lib_arc as usize];
                     let src = clk[src_pin.0 as usize];
                     let src_par = parity[src_pin.0 as usize];
-                    for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
+                    for &(src_pol, dst_pol) in arc_legs(arc) {
                         if !src.reached(src_pol) {
                             continue;
                         }
@@ -2086,7 +2100,7 @@ fn ideal_clock_parity(
             for &(src_pin, lib_arc) in levelized.incoming_to(pin) {
                 let arc = &cx.lib.arcs[lib_arc as usize];
                 let src_par = par[src_pin.0 as usize];
-                for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
+                for &(src_pol, dst_pol) in arc_legs(arc) {
                     if (arc.timing_type == TimingType::CombinationalRise && dst_pol != RISE)
                         || (arc.timing_type == TimingType::CombinationalFall && dst_pol != FALL)
                     {
@@ -2110,6 +2124,26 @@ fn polarities(sense: TimingSense) -> &'static [(usize, usize)] {
         TimingSense::PositiveUnate => &[(RISE, RISE), (FALL, FALL)],
         TimingSense::NegativeUnate => &[(RISE, FALL), (FALL, RISE)],
         TimingSense::NonUnate => &[(RISE, RISE), (FALL, RISE), (RISE, FALL), (FALL, FALL)],
+    }
+}
+
+/// (src, dst) transition legs of a graph edge. Ordinary arcs apply their
+/// `timing_sense`; `three_state_*` arcs use OpenSTA 3.0.16's measured edge
+/// model (`report_edges` on `sta_edge/check_arcs`): the arc fires only on the
+/// enable-toggling source edge — `positive_unate` fires on the source rise,
+/// `negative_unate` on the source fall — and produces *both* output
+/// transitions (`Z1`/`0Z` merge into dst rise, `Z0`/`1Z` into dst fall). The
+/// delay/transition tables are looked up by dst polarity like any other arc.
+fn arc_legs(arc: &crate::lib_db::LibTimingArc) -> &'static [(usize, usize)] {
+    match arc.timing_type {
+        TimingType::ThreeStateEnable | TimingType::ThreeStateDisable => {
+            match arc.timing_sense {
+                TimingSense::PositiveUnate => &[(RISE, RISE), (RISE, FALL)],
+                TimingSense::NegativeUnate => &[(FALL, RISE), (FALL, FALL)],
+                TimingSense::NonUnate => polarities(TimingSense::NonUnate),
+            }
+        }
+        _ => polarities(arc.timing_sense),
     }
 }
 
@@ -3000,7 +3034,7 @@ fn eval_sta(
                     let legs: &[(usize, usize)] = if borrow.is_some() {
                         &[(RISE, RISE), (FALL, FALL)]
                     } else {
-                        polarities(arc.timing_sense)
+                        arc_legs(arc)
                     };
                     for &(src_pol, dst_pol) in legs {
                         let reached = src.reached(src_pol);
@@ -9938,6 +9972,7 @@ mod tests {
                     } else {
                         None
                     },
+                    is_tristate: false,
                     internal_power: Vec::new(),
                 });
             }
@@ -11337,7 +11372,7 @@ mod tests {
         for &(src_pin, lib_arc) in levelized.incoming_to(x) {
             let arc = &lib.arcs[lib_arc as usize];
             let src = unified[src_pin.0 as usize];
-            for &(src_pol, dst_pol) in polarities(arc.timing_sense) {
+            for &(src_pol, dst_pol) in arc_legs(arc) {
                 if dst_pol != FALL {
                     continue;
                 }
@@ -11760,5 +11795,91 @@ mod tests {
             report.skipped.sdc_ignored_commands.get("set_fanout_load"),
             Some(&1)
         );
+    }
+
+    /// Deferred-check census fixture: `dfbbp_1`/`dfbbn_1` carry the `non_seq_*`
+    /// pair on SET_B/RESET_B plus `clear`/`preset`; `ebufn_1`/`einvn_1`/`einvp_1`
+    /// carry `three_state_enable`/`three_state_disable`. OpenSTA 3.0.16 ignores
+    /// `non_seq_*` (no endpoint rows, no check-type surface), keeps `Clear`/
+    /// `Preset` count-only, and propagates both `three_state_*` arcs as delay
+    /// arcs firing on the sense-declared source edge: `positive_unate` -> RISE,
+    /// `negative_unate` -> FALL; each fires both destination transitions —
+    /// `Z1`/`0Z` land on rise, `Z0`/`1Z` on fall (measured via `report_edges`
+    /// and `report_slews`, recorded in `probe_check_arcs_*.txt`). The tristate
+    /// driver's own pin capacitance stays on the net load. `te_slow.sdc` delays
+    /// the enable port 1.8 ns past `ideal` so the propagated `TE_B`/`TE -> Z`
+    /// arrivals shift `u_cap*/D` — the propagation discriminator.
+    #[test]
+    fn test_sta_edge_check_arcs_ideal() {
+        compare_sta_edge(
+            "check_arcs",
+            "check_arcs/check_arcs.def",
+            "ideal.sdc",
+            None,
+            "ideal",
+            Tol::STRICT,
+        );
+    }
+
+    #[test]
+    fn test_sta_edge_check_arcs_propagated() {
+        compare_sta_edge(
+            "check_arcs",
+            "check_arcs/check_arcs.def",
+            "propagated.sdc",
+            None,
+            "propagated",
+            Tol::STRICT,
+        );
+    }
+
+    #[test]
+    fn test_sta_edge_check_arcs_te_slow() {
+        compare_sta_edge(
+            "check_arcs",
+            "check_arcs/check_arcs.def",
+            "te_slow.sdc",
+            None,
+            "te_slow",
+            Tol::STRICT,
+        );
+    }
+
+    /// The deferred map is the measured set OpenSTA ignores: `non_seq_*`
+    /// (4 arcs each on `dfbbp_1`/`dfbbn_1` SET_B/RESET_B), `clear`/`preset`
+    /// (2 per flop), `min_pulse_width` (1 per clocked cell: 2 flops + 3 caps).
+    /// `three_state_*` left the map in v0.2.11 — OpenSTA propagates them.
+    #[test]
+    fn test_check_arcs_deferred_counts() {
+        let lib_dir = sky130_hd();
+        let case_dir = design_dir("sta_edge").join("check_arcs");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design = parse_def(&case_dir.join("check_arcs.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&case_dir.join("ideal.sdc")).expect("SDC");
+        let (report, _, _) = run_sta_detail(&design, &lib, &sdc, None, false).expect("STA");
+        let expected: BTreeMap<String, usize> = [
+            ("Clear", 4),
+            ("MinPulseWidth", 4),
+            ("NonSeqHoldRising", 4),
+            ("NonSeqSetupRising", 4),
+            ("Preset", 4),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(report.skipped.recognized_check_arcs, expected);
+        // The ideal clock leaves the buffer-driven net c1 in
+        // `cell_driven_clock_nets`; that is the ideal model's count, not a
+        // deferred check.
+        assert_eq!(report.skipped.cell_driven_clock_nets, 1);
     }
 }

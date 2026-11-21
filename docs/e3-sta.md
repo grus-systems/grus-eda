@@ -219,13 +219,20 @@ generic text above disagree, this section wins.
    A `set_load [get_nets e]` annotation replaces the wire-capacitance term of `load(e, pol)`
    (measured override, not sum — `docs/results.md` 2026-11-19, `ld_*` scenarios).
    Check: `_384_/Q` rise load `0.008223 = 0.001689 + 0.001614 + 0.002495 + 0.002425`; fall
-   `0.007406`. Zero-wire mode adds no wire cap, no wire delay, and sink slew = driver slew.
+   `0.007406`. A *tristate* driver pin stays on its net's load — OpenSTA counts the
+   driver's own pin capacitance for the arcs driving it too (`report_net z1` shows
+   `u_ebuf/Z tristate 0.002260` inside the net's 0.003934 pF total; `docs/results.md`
+   2026-11-21 `check_arcs` entry). Zero-wire mode adds no wire cap, no wire delay, and
+   sink slew = driver slew.
 3. **Ideal clock.** The clock net is not propagated. Every register `CLK` pin has
    `arrival = 0.0` (rise edge at t=0) and **`slew = 0.0`** for both max and min, even though
    `set_input_transition 0.15 [all_inputs]` matches `clk`. Only `RisingEdge` arcs are used
    for `dfxtp`; `min_pulse_width` is a separate evaluated check family (`v0.1.93`,
    `StaReport::pulse_width_checks`, measured OpenSTA semantics in `docs/results.md`
-   2026-11-19) and other non-delay arcs are deferred and counted.
+   2026-11-19) and `three_state_*` enable/disable arcs propagate as delay arcs
+   (`v0.2.11`, `docs/results.md` 2026-11-21). The remaining recognised check arcs —
+   `non_seq_*`, `preserve`, async `Clear`/`Preset`, and `min_pulse_width` off the
+   clock network — are deferred and counted.
    `set_propagated_clock` switches to the propagated mode (`v0.1.60`, roadmap R2): a separate
    pass walks clock nets through combinational arcs and computes arrival/slew per transition
    at every consumer clock pin, tracking the clock-edge index parity so inverting paths pick

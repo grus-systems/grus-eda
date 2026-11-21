@@ -39,6 +39,9 @@ pub enum TimingType {
     NonSeqHoldRising,
     NonSeqHoldFalling,
     /// Tristate/bus-hold timing (`three_state_enable`/`three_state_disable`).
+    /// OpenSTA 3.0.16 propagates both as delay arcs with their declared
+    /// `timing_sense` (measured on `sta_edge/check_arcs`), so they are
+    /// combinational graph edges, not deferred checks.
     ThreeStateEnable,
     ThreeStateDisable,
     /// Value-preservation checks (`preserve`).
@@ -49,11 +52,12 @@ pub enum TimingType {
 
 impl TimingType {
     /// Liberty `timing_type` names that are recognised check arcs: they constrain a
-    /// pin (non-sequential setup/hold, tristate, preserve, async clear/preset)
+    /// pin (non-sequential setup/hold, preserve, async clear/preset)
     /// rather than propagate data, so the endpoint model defers them into
     /// `SkipReport::recognized_check_arcs` instead of dropping them as unknown.
     /// `min_pulse_width` left this list when it became an evaluated endpoint
-    /// family in v0.1.93.
+    /// family in v0.1.93; `three_state_*` left it in v0.2.11 after OpenSTA was
+    /// measured propagating both arcs as delay arcs (`sta_edge/check_arcs`).
     pub fn is_deferred_check(self) -> bool {
         matches!(
             self,
@@ -61,8 +65,6 @@ impl TimingType {
                 | Self::NonSeqSetupFalling
                 | Self::NonSeqHoldRising
                 | Self::NonSeqHoldFalling
-                | Self::ThreeStateEnable
-                | Self::ThreeStateDisable
                 | Self::Preserve
                 | Self::Clear
                 | Self::Preset
@@ -117,6 +119,10 @@ pub struct LibPin {
     /// the Liberty file does not declare one; clock-gate classification needs it because
     /// timing arcs alone cannot tell AND from OR.
     pub function: Option<SymbolId>,
+    /// The pin is the target of a `three_state_*` timing arc. A tristate driver
+    /// still loads its net while disabled, so OpenSTA counts the pin's own
+    /// capacitance in the net load for every arc driving it (`sta_edge/check_arcs`).
+    pub is_tristate: bool,
     /// `internal_power` blocks: energy tables evaluated on pin transitions.
     pub internal_power: Vec<LibPinInternalPower>,
 }
