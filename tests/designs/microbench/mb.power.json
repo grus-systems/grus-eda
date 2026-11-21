@@ -35,6 +35,8 @@
     "active_nets_without_cell_driver": 2,
     "internal_power_without_slew": 0,
     "unresolved_related_pin": 0,
+    "dead_annotation_entries": 5,
+    "dead_user_entries": 0,
     "conditional_power_blocks": 0,
     "saif_unmatched_scopes": 0,
     "saif_unmatched_signals": 0

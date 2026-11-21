@@ -5404,3 +5404,258 @@ golden density corrupted `3e6 → 4e6` → red at the density bound
 clippy --workspace --all-targets -- -D warnings`, `cargo test
 --release -p grus-core sta` (183, 2 ignored), the `mb.power.json`
 regen above. AP4 scoped annotation precedence remains open.
+
+### 2026-11-22 — N7 — AP4: scoped `set_power_activity` user overrides (v0.3.0)
+
+Closes the AP sequence: `ActivityOverrides` gains `pins:
+Vec<(PinId, ActivitySetting)>` (the `-pins <list>` arm; call site
+resolves names to `PinId`s, last duplicate wins, non-driver pins count
+in the new `dead_user_entries` diagnostic — the
+`dead_annotation_entries` analogue) and `ActivityOrigin::User` with
+label `"user"`. The `-input_ports` arm now resolves to the native
+`user` origin instead of collapsing onto `annotated`. Seed order is
+the measured chain constant → clock → global → `-pins` →
+`-input_ports` → annotation → input/undriven → `Default`; `-pins` vs
+`-input_ports` is unmeasured and recorded (specific selector before
+the `[all_inputs]` blanket). `ActivityOverrides` loses `Copy` (the
+`Vec` field); API surface only — no CLI flag was added, `-activity`
+stays clock-normalized at the call site and `-density` absolute.
+
+**Golden** (`test_activity_defaults_mba_matches_opensta`, all 12
+sessions strict): `s_input_ports`'s `a`/`b` compare at the native
+`user` label `{1e7, 0.4}`; `origin_counts` pins `s_input_ports` at
+`{clock 1, constant 4, input 1, propagated 6, unknown 4, user 2}`
+(`a`/`b` move `input`→`user` −2/+2 while undriven `n_float` keeps
+`input` — the measured port-only semantics) alongside `s_none`. A
+post-loop check resolves `-pins a,b` and asserts the per-net vector is
+identical to `s_input_ports`'s (`propagated` non-driver pins on a
+user-seeded net inherit `user`, so the propagated-mapping assert
+accepts it). `PER_PIN_RESIDUAL` is unchanged at `[("s_full","y")]` —
+per-pin vs per-net annotation stays the one model gap.
+
+**VCD reader fixes** (found by the gcd re-comparison below — the
+pin-namespace annotation exposed them): (1) `pin_signals` read the
+flat `signals` fold, so a same-named declaration (`Y`/`X`/`Q` on every
+dumped cell) summed every like-named stream — `IdActivity` now keeps a
+per-declaration `sa` stream `pin_signals` reads; `signals` stays the
+flat debug view. (2) `apply_vector_change` dropped `b` writes shorter
+than the declared width — `b0`/`bx` (all-x write) and leading-zero
+trims — losing both the edges and the state interval; short values now
+left-extend (x/z extend themselves, 0/1 extend with 0) per VCD
+left-alignment. Unit tests `test_pin_signals_keep_same_leaf_apart` and
+`test_short_vector_writes_left_extend` pin both; the `mba`/micro
+fixtures never exercised either (unique leaf names, full-width
+writes), so existing goldens are unaffected.
+
+**gcd `report_power` re-comparison** (`grus-eda power --vcd
+tests/designs/gcd/power/gcd.vcd`, zero-wire parasitics) vs OpenROAD
+`power_vcd_check.tcl` re-run this session (`Annotated 931 pin
+activities`; `[STA-1453] clock core_clk vcd period 10.000 differs
+from SDC clock period 5.000` — OR seeds the clock from SDC as we do):
+
+| group | ours internal | OR internal | ours switch | OR switch |
+|---|---|---|---|---|
+| Sequential | 2.984e-4 (+0.1%) | 2.98e-4 | 1.024e-5 (−4.3%) | 1.07e-5 |
+| Combinational | 5.873e-5 (−0.1%) | 5.88e-5 | 8.765e-5 (−1.8%) | 8.93e-5 |
+| Total | 3.572e-4 (+0.05%) | 3.57e-4 | 9.789e-5 (−2.1%) | 1.00e-4 |
+
+Totals `4.5505e-4` vs `4.57e-4` (−0.4%); total leakage `1.3004e-9` vs
+`1.30e-9` (+0.03%). Every group moves toward OR vs the 2026-11-18
+run — sequential internal 1.56e-4 → 2.984e-4 (was −48%, now +0.1%),
+combinational internal 1.35e-4 → 5.87e-5 (was +129%, now −0.1%),
+combinational switching 4.17e-5 → 8.77e-5 (was −53%, now −1.8%). The
+earlier entry's "statistical propagation vs exact counts" narrative
+was mostly parser corruption, not a model gap: OpenSTA annotates the
+same per-pin dump streams (`931 pin activities`) and the corrected
+per-net counts land inside ~2% on every column. The annotation model
+propagates little on this fixture — all 269 nets resolve
+`annotated`/`clock` (`activity: annotated=268 clock=1`,
+`dead_annotation=1286` — the dut-level wire paths and non-driver
+pins). Named residuals: sequential switching −4.3% and the remaining
+switching gap is the zero-wire-parasitics model (OR estimates wire RC
+from the placed DEF; SPEF narrows it, recorded 2026-11-18);
+combinational leakage +23% at ~1.9e-10 absolute — the
+state-weighted-vs-flat `when`-leakage residual already named on
+`mbw`; our Clock group reads 0 while OR attributes 1.88e-10 leakage
+there (our leakage lands in seq/comb — total leakage matches). The
+no-annotation baseline (`clock=1 input=35 propagated=1 unknown=232`)
+is unchanged in shape: gcd's sequential cones are scan/mux `sdf*`/
+`edf*` `next_state` expressions (the 37/63 coverage residual) plus
+feedback cycles, so the datapath resolves `unknown {0,0}` and
+combinational switching collapses to ~7.5e-8 — the honest AP-model
+limit on a real design without a dump.
+
+**Moved goldens**: `mb.power.json` regenerated via the recorded CLI —
+the "git diff empty" claim described the pre-revision surface
+(`annotated=3 clock=1`, every column bit-identical; `mb.vcd` uses only
+full-width vector writes). The v0.3.1 regen shows the named diff the
+revision adds: `+"dead_annotation_entries": 5` and
+`+"dead_user_entries": 0` under `diagnostics` — no watt column moved.
+`mba.activity.reference.json`
+unchanged — `s_input_ports`/`s_p40` records were emitted by the
+committed `generate_activity_ref.sh` ahead of AP4. All other
+`*.reference.json` `git status`-clean.
+
+**Fail-proof**: `User` relabeled `Annotated` → `s_input_ports
+origin_counts` red (`annotated 2` vs `user 2`); the `-pins` arm
+disabled → `pins-vs-input_ports net 1 differs` red; `s_p40` golden
+density corrupted `2.5e6 → 3e6` → `s_p40 a: density ours 2.5e6 vs
+golden 3e6` red. All restored, green. R1 adds: `dead_user_entries`
+computation forced to `0` → `dead pins entry counted` red (the
+`u_or/A` sink-pin entry in `via_pins` expects `== 1`); restored, green.
+
+**Checks run**: `cargo test --workspace` (335+3, 2 ignored), `cargo
+clippy --workspace --all-targets -- -D warnings`, `cargo test
+--release -p grus-core sta` (183, 2 ignored), the `mb.power.json`
+regen and the `power_vcd_check.tcl` re-run above. AP1–AP4 closed; the
+per-pin/per-net annotation residual (`s_full` `y`) and the gcd
+switching/leakage residuals above remain as named gaps. R1 checks
+(v0.3.1): `cargo test --workspace` (335+3, 2 ignored), `cargo clippy
+--workspace --all-targets -- -D warnings` clean, `cargo test --release
+-p grus-core sta` (183, 2 ignored), the release-binary gcd
+`--vcd`/no-annotation runs, the `mb.power.json` regen (named diff
+above), the container `power_vcd_check.tcl` re-run, and the container
+`gcd.vcd` re-simulation — all recorded in the revision block below.
+
+**Revision (v0.3.1) — reproducibility/provenance pass**: the v0.3.0
+numbers stand; this block repairs the record — both dead counters now
+ride `PowerDiagnostics` onto the committed CLI/JSON surface
+(`activity:` prints them unconditionally), `gcd.vcd` gets its
+provenance, and the two card questions get verbatim answers. No
+resolution or power-math change: every watt column must stay
+bit-identical, and does.
+
+**(a) Did `power_vcd_check.tcl` re-run this session?** Yes — executed
+in the cached LibreLane image (Colima daemon):
+
+```sh
+docker run --rm -u "$(id -u):$(id -g)" \
+  -v "$REPO_ROOT:/work" -v "$HOME/.ciel:/pdk" -e PDK_ROOT=/pdk \
+  ghcr.io/librelane/librelane:3.0.16 \
+  openroad -exit /work/tests/designs/gcd/power/power_vcd_check.tcl
+```
+
+Verbatim lines:
+
+```
+[WARNING STA-1453] clock core_clk vcd period 10.000 differs from SDC clock period 5.000
+Annotated 931 pin activities.
+Group                  Internal  Switching    Leakage      Total
+                        Power      Power      Power      Power (Watts)
+Sequential             2.98e-04   1.07e-05   2.99e-10   3.09e-04  67.6%
+Combinational          5.88e-05   8.93e-05   8.14e-10   1.48e-04  32.4%
+Clock                  0.00e+00   0.00e+00   1.88e-10   1.88e-10   0.0%
+Total                  3.57e-04   1.00e-04   1.30e-09   4.57e-04 100.0%
+```
+
+The v0.3.0 entry's re-run claim is confirmed — `Annotated 931 pin
+activities` and the `STA-1453` warning reproduce verbatim.
+
+**(b) Where was `dead_annotation=1286` read from?** Pre-revision the
+counter existed only on `ActivityResolution::dead_annotation_entries`
+— no committed CLI path printed it (the committed tests assert it
+only for the `mba` sessions: `s_partial` 1, `s_full` 15, else 0). The
+gcd figure was read off that struct through a non-CLI surface — a
+temporary print/debug read in the implementation session; the exact
+mechanism was not recorded, which is what this revision fixes. The
+committed CLI now prints it unconditionally on the `activity:` line:
+
+```
+activity: annotated=268 clock=1 dead_annotation=1286 dead_user=0
+```
+
+Independent census cross-check on the count's composition: the VCD
+holds 1509 `$var` declarations — 223 under `dut` + 1286 under the 233
+cell scopes. Cell scopes hold each cell's port signals *and*
+internals (e.g. `not0_out_Y`); under `annotation_net_of` only cell
+*output* pin vars resolve as net drivers, so input pins, internals,
+and io-unmatched dut wires land dead. The printed 1286 is exactly the
+cell-scope census — and on the regenerated dump below the same rule
+prints `dead_annotation=2358`, matching its 2358 cell-scope vars, so
+the counter tracks the dump's composition rather than a fixed design
+property.
+
+**`gcd.vcd` provenance**: gitignored (`*.vcd` outside
+`tests/designs/microbench/`), ~18 MB, carried in the worktree. Header
+verbatim: `$version` `Icarus Verilog`, `$date` `Wed Nov 18 07:36:28
+2026`, `$timescale 1ps`; scope tree `gcd_tb` → `dut` plus 233 cell
+scopes. Testbench `tests/designs/gcd/power/gcd_tb.v` (committed):
+xorshift32 LFSR stimulus, 400 transactions, `$dumpfile("gcd.vcd")` +
+`$dumpvars(0, dut)`. Simulated netlist `gcd.synth.v` (flattened yosys;
+leaf names `\dpath.a_lt_b$in1[9]`, `_180_` … are DEF net names) plus
+the PDK `sky130_fd_sc_hd.v` cell models (their `celldefine` scopes are
+the 233 cell scopes). **Re-simulation ran this session** inside the
+container — with one recipe correction: as recorded (`gcd_tb.v` +
+`gcd.synth.v` + `sky130_fd_sc_hd.v`) iverilog fails with 560
+unknown-UDP-primitive errors; `sky130_fd_sc_hd/verilog/primitives.v`
+must compile first. The executed recipe:
+
+```sh
+iverilog -o /tmp/gcd_tb.vvp gcd_tb.v ../gcd.synth.v \
+  /pdk/sky130A/libs.ref/sky130_fd_sc_hd/verilog/primitives.v \
+  /pdk/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v
+vvp /tmp/gcd_tb.vvp   # writes gcd.vcd; `$finish` at 317435000 (1ps)
+```
+
+The regenerated dump differs from the carried artifact in composition
+only: 2581 `$var` (223 dut + 2358 cell-scope incl. 35 `reg`) vs 1509
+(223 + 1286 all-`wire`) — this nixpkgs `iverilog-s20250103` build
+dumps more cell internals than the build that produced the
+2026-11-18 file. Our power columns and `annotated=268 clock=1` are
+bit-identical on it; the 2026-11-18 artifact was restored as the
+worktree copy so the comparison inputs stay the ones the table was
+measured on.
+
+**Diagnostics movement lines** (verbatim, this session). `--vcd` run:
+
+```
+activity: annotated=268 clock=1 dead_annotation=1286 dead_user=0
+power: 93 cells without lib cell, 0 driven nets unresolved by activity seeds, 36 active nets without cell driver, 0 internal-power lookups missing slew, 0 unresolved related pins, 0 conditional power blocks, 0 unmatched SAIF scopes, 0 unmatched SAIF signals
+```
+
+No-annotation run:
+
+```
+activity: clock=1 input=35 propagated=1 unknown=232 dead_annotation=0 dead_user=0
+power: 93 cells without lib cell, 232 driven nets unresolved by activity seeds, 36 active nets without cell driver, 0 internal-power lookups missing slew, 0 unresolved related pins, 0 conditional power blocks, 0 unmatched SAIF scopes, 0 unmatched SAIF signals
+```
+
+Movement vs 2026-11-18: `dead_annotation_entries` has no recorded
+counterpart — the flat net-name annotation path never counted
+unresolved dump paths at all. The honest movement line is *surface
+added*, not *count changed* (`dead_user_entries` likewise: always 0
+through the CLI — no `--pins` flag — but serialized for API-driven
+reports).
+
+**Re-verified table** — same command this session; report-only
+change, so bit-identical is required and holds:
+
+| group | ours internal | OR internal | ours switch | OR switch |
+|---|---|---|---|---|
+| Sequential | 2.984e-4 (+0.1%) | 2.98e-4 | 1.024e-5 (−4.3%) | 1.07e-5 |
+| Combinational | 5.873e-5 (−0.1%) | 5.88e-5 | 8.765e-5 (−1.8%) | 8.93e-5 |
+| Total | 3.572e-4 (+0.05%) | 3.57e-4 | 9.789e-5 (−2.1%) | 1.00e-4 |
+
+Totals `4.5505e-4` vs `4.57e-4` (−0.4%); total leakage `1.3004e-9` vs
+`1.30e-9` (+0.03%). No watt column moved.
+
+**Residual notes — restated so the entry stands alone**:
+
+- `unknown` nets carry `prob_one: Some(0.0)` — `when` literals on
+  them are expressible at weight 0 rather than counted inexpressible;
+  OpenSTA's own `when` weight on `unknown` is unmeasured (recorded in
+  AP3, restated).
+- `user`-vs-dump precedence is a **chosen** order — no committed
+  session mixes `set_power_activity` with `read_vcd` on the same pin
+  (unmeasured).
+- Duplicate `-pins` last-wins is **unmeasured** (repeated
+  `set_power_activity` semantics assumed).
+- `-pins` vs `-input_ports` order chosen (unmeasured — specific
+  selector before the `[all_inputs]` blanket).
+- Per-pin vs per-net: `s_full` output port `y` holds per-pin
+  `vcd 3e6/0.25` in the golden while net `y` resolves its driver —
+  `PER_PIN_RESIDUAL [("s_full","y")]`, a named model gap; it can only
+  ever affect the pin-level read, not a watt column. OpenSTA's
+  `report_activity_annotation` split counts `user` pins under its
+  `input N` bucket while ours reports `user N` per net — a
+  label-accounting difference, not a resolution one.

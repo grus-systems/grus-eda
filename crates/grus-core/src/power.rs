@@ -14,7 +14,8 @@
 //!   state expression holds.
 //!
 //! Activity is resolved per net by [`resolve_activity`] in the measured seed
-//! order (constant → clock → global → `-input_ports` → annotation → input →
+//! order (constant → clock → global → `user` `-pins`/`-input_ports` →
+//! annotation → input →
 //! default, then sequential Q=D copy and combinational propagation in one
 //! fixed point, leftovers `unknown`; docs/results.md 2026-11-21 N7): a dump
 //! annotates nets through their driver pins, every
@@ -70,6 +71,16 @@ pub struct PowerDiagnostics {
     pub internal_power_without_slew: usize,
     /// `internal_power` `related_pin` names that match no sibling pin of the cell.
     pub unresolved_related_pin: usize,
+    /// Dump `pin_signals` entries that named no net driver — a mirror of
+    /// `ActivityResolution::dead_annotation_entries` so the CLI/JSON
+    /// report surfaces it (the counters stay single-sourced on the
+    /// resolution).
+    pub dead_annotation_entries: usize,
+    /// `-pins` overrides whose pin is not a net driver — mirrors
+    /// `ActivityResolution::dead_user_entries`. Always 0 through the CLI
+    /// (no `--pins` flag); surfaced so an API-driven report keeps the
+    /// count visible.
+    pub dead_user_entries: usize,
     /// `internal_power`/`leakage_power` `when` blocks skipped because the
     /// expression is outside the literal-conjunction grammar, names no sibling
     /// pin, or a literal net carries no measured state. Seed probabilities
@@ -404,6 +415,8 @@ pub fn estimate_power(
         duration_s: window_s,
         diagnostics: PowerDiagnostics {
             activity_origin_counts: resolution.origin_counts,
+            dead_annotation_entries: resolution.dead_annotation_entries,
+            dead_user_entries: resolution.dead_user_entries,
             ..Default::default()
         },
     };
@@ -861,8 +874,10 @@ mod tests {
     /// rules below — `EXPECTED_DIVERGENT` is empty: net `q`'s sequential
     /// Q=D copy (`u_df/Q`, `qd`) lands `propagated` verbatim (tracking
     /// `a`, including `s_ports_a2x`'s 6e6/0.55 density doubling and
-    /// `s_xz`'s x-degraded 0.40), and the 11 `unknown`-cone pins on nets
-    /// `n_q0`/`n_q0n`/`n_q1`/`n_c1d` compare strict at `{0, 0}` `unknown`.
+    /// `s_xz`'s x-degraded 0.40), the 11 `unknown`-cone pins on nets
+    /// `n_q0`/`n_q0n`/`n_q1`/`n_c1d` compare strict at `{0, 0}` `unknown`,
+    /// and `s_input_ports`'s `a`/`b` compare strict at the native `user`
+    /// origin (AP4 — no `annotated` collapse).
     /// `s_full`'s output port `y` stays the one per-pin residual
     /// (`PER_PIN_RESIDUAL` — per-pin vs per-net annotation, AP4 scope).
     #[test]
@@ -921,14 +936,15 @@ mod tests {
             }
         }
 
-        // Golden sources our model reproduces verbatim; `vcd`/`saif`/`user`
+        // Golden sources our model reproduces verbatim; `vcd`/`saif`
         // collapse onto the `annotated` label — but only when the pin
         // resolves its net (the pin is the net's driver). A golden
         // annotated pin that is not its net's driver is a per-pin
         // annotation residual our per-net model cannot represent.
+        // `user` is a native origin since AP4 — no collapse.
         fn expected_label(src: &str) -> &str {
             match src {
-                "vcd" | "saif" | "user" => "annotated",
+                "vcd" | "saif" => "annotated",
                 other => other,
             }
         }
@@ -1021,10 +1037,13 @@ mod tests {
 
         let mut residual: std::collections::BTreeSet<(&str, &str)> =
             std::collections::BTreeSet::new();
-        let mut origin_counts_pinned = false;
         // `s_partial`'s only difference from `s_ports` is the dead flat
         // `n_and` entry — the resolved per-net vectors must be identical.
         let mut partial_nets: Vec<crate::activity::ResolvedActivity> = Vec::new();
+        // `s_input_ports`'s resolved nets feed the post-loop `-pins`
+        // equivalence check.
+        let mut input_ports_nets: Vec<crate::activity::ResolvedActivity> =
+            Vec::new();
         for (sess, overrides, vcd_file, sdc_file) in &sessions {
             let vcd = match vcd_file {
                 Some(f) => {
@@ -1054,28 +1073,42 @@ mod tests {
                 _ => 0,
             };
             assert_eq!(
-                (resolution.dead_annotation_entries, resolution.unresolvable_functions),
-                (expected_dead, 0),
+                (
+                    resolution.dead_annotation_entries,
+                    resolution.unresolvable_functions,
+                    resolution.dead_user_entries,
+                ),
+                (expected_dead, 0, 0),
                 "{sess} diagnostics"
             );
-            if *sess == "s_none" && !origin_counts_pinned {
-                origin_counts_pinned = true;
+            // `s_none` pins the seed-default split; `s_input_ports` pins
+            // the `user` split — `a`/`b` move `input` → `user` (−2/+2)
+            // while undriven `n_float` keeps `input` (the measured
+            // `-input_ports` port-only semantics).
+            if let Some(want) = match *sess {
+                "s_none" => Some(std::collections::BTreeMap::from([
+                    ("clock", 1),
+                    ("constant", 4),
+                    ("input", 3),
+                    ("propagated", 6),
+                    ("unknown", 4),
+                ])),
+                "s_input_ports" => Some(std::collections::BTreeMap::from([
+                    ("clock", 1),
+                    ("constant", 4),
+                    ("input", 1),
+                    ("propagated", 6),
+                    ("unknown", 4),
+                    ("user", 2),
+                ])),
+                _ => None,
+            } {
                 let counts: std::collections::BTreeMap<&str, usize> = resolution
                     .origin_counts
                     .iter()
                     .map(|(k, v)| (k.as_str(), *v))
                     .collect();
-                assert_eq!(
-                    counts,
-                    std::collections::BTreeMap::from([
-                        ("clock", 1),
-                        ("constant", 4),
-                        ("input", 3),
-                        ("propagated", 6),
-                        ("unknown", 4),
-                    ]),
-                    "s_none origin_counts"
-                );
+                assert_eq!(counts, want, "{sess} origin_counts");
             }
             let mut divergent: std::collections::BTreeSet<&str> =
                 std::collections::BTreeSet::new();
@@ -1121,17 +1154,31 @@ mod tests {
                             let label = r.origin.label();
                             strict(label);
                             assert!(
-                                ["propagated", "annotated", "input"].contains(&label),
+                                ["propagated", "annotated", "user", "input"]
+                                    .contains(&label),
                                 "{sess} {pin}: source {label} outside the propagated mapping"
                             );
                         }
                     }
-                    "vcd" | "saif" | "user" => {
+                    "vcd" | "saif" => {
                         let p = pin_obj[pin.as_str()];
                         let resolves_net = design.pin_is_driver[p.0 as usize]
                             && design.pin_nets[p.0 as usize] == Some(net);
                         if resolves_net {
                             strict("annotated");
+                        } else {
+                            residual.insert((sess, pin.as_str()));
+                        }
+                    }
+                    // `set_power_activity` user overrides — a native
+                    // origin since AP4, strict on driver pins (the only
+                    // golden `user` pins, `s_input_ports` `a`/`b`, are).
+                    "user" => {
+                        let p = pin_obj[pin.as_str()];
+                        let resolves_net = design.pin_is_driver[p.0 as usize]
+                            && design.pin_nets[p.0 as usize] == Some(net);
+                        if resolves_net {
+                            strict("user");
                         } else {
                             residual.insert((sess, pin.as_str()));
                         }
@@ -1148,6 +1195,9 @@ mod tests {
                 "{sess}: the divergent-source pin set moved"
             );
 
+            if *sess == "s_input_ports" {
+                input_ports_nets = resolution.nets.clone();
+            }
             if *sess == "s_ports" {
                 partial_nets = resolution.nets;
             } else if *sess == "s_partial" {
@@ -1242,6 +1292,44 @@ mod tests {
             PER_PIN_RESIDUAL.to_vec(),
             "the per-pin annotation residual moved"
         );
+
+        // `-pins <list>` vs `-input_ports`: per-pin overrides naming the
+        // same input ports must resolve identically — `user` on `a`/`b`,
+        // `input` elsewhere (no committed session ran `-pins`, so the
+        // equivalence pins the arm against the measured session
+        // transitively). Same-window compare applies: both runs share
+        // `window_s == 1.0`, verbatim per-net like `s_partial`≡`s_ports`.
+        // `pin_obj` demonstrates the call-site name → `PinId` resolution
+        // the API delegates to callers.
+        let via_pins = resolve_activity(
+            &design,
+            &lib,
+            &sdc,
+            &VcdActivity::default(),
+            &ActivityOverrides {
+                pins: vec![
+                    (pin_obj["a"], setting(1e7, 0.4)),
+                    (pin_obj["b"], setting(1e7, 0.4)),
+                    // `u_or/A` is an instance sink pin on `n_and` — not a
+                    // net driver, so a dead `user` entry. It proves the
+                    // counter is live and that a dead override cannot
+                    // perturb resolution (the verbatim compare below).
+                    (pin_obj["u_or/A"], setting(1e7, 0.4)),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(via_pins.dead_user_entries, 1, "dead pins entry counted");
+        assert_eq!(via_pins.nets.len(), input_ports_nets.len());
+        for (n, (a, b)) in via_pins.nets.iter().zip(&input_ports_nets).enumerate()
+        {
+            assert!(
+                a.prob_one == b.prob_one
+                    && a.eff_toggles == b.eff_toggles
+                    && a.origin == b.origin,
+                "pins-vs-input_ports net {n} differs"
+            );
+        }
     }
 
     /// Constant-polarity golden (`cp.def`): a `conb_1` feeding one input

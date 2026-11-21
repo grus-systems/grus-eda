@@ -63,10 +63,12 @@ pub struct VcdActivity {
     pub signals: HashMap<String, SignalActivity>,
     /// Per-pin annotation candidates, keyed by the declaration's `$scope`
     /// chain joined with `/` plus the leaf name (`tb/dut/_d_/Q`,
-    /// `tb/dut/n_and`). Every declaration yields an entry; declarations
-    /// sharing an identifier code (Icarus reuses codes in sibling scopes)
-    /// get an alias entry copying the retained shallowest stream's
-    /// activity — the `signals` alias semantics, made visible.
+    /// `tb/dut/n_and`). Every declaration yields an entry carrying its
+    /// own stream; declarations sharing an identifier code (Icarus
+    /// reuses codes in sibling scopes) get an alias entry copying the
+    /// retained shallowest stream's activity. Per-declaration, not the
+    /// `signals` flat-name view — same-named declarations (`Y` on every
+    /// dumped cell) must not fold into each other.
     pub pin_signals: HashMap<String, SignalActivity>,
     /// Dumped window in seconds, from the first to the last timestamp.
     pub duration_s: f64,
@@ -121,15 +123,20 @@ struct SignalDecl {
 }
 
 /// Per-identifier waveform state: last value per bit, the timestamp it last
-/// changed, and ticks accumulated per state (0 / 1 / x|z|never-seen). `when`
-/// power weights need time-in-state, which edge counts alone do not carry.
-/// `last` uses 3 for "no value written yet" so a first write counts as
-/// initialization, not a half-weighted x/z edge.
+/// changed, ticks accumulated per state (0 / 1 / x|z|never-seen), and per-bit
+/// edge counts. `when` power weights need time-in-state, which edge counts
+/// alone do not carry. `last` uses 3 for "no value written yet" so a first
+/// write counts as initialization, not a half-weighted x/z edge. `sa` is the
+/// declaration's own stream — `pin_signals` reads it: `signals` folds
+/// same-named declarations into one flat entry, so a pin's count there is
+/// the sum of every like-named declaration (gcd.vcd's per-cell `Y`/`X`/`Q`
+/// scopes), not the pin's.
 #[derive(Default)]
 struct IdActivity {
     last: Vec<u8>,
     since: Vec<u64>,
     dur: Vec<[u64; 3]>,
+    sa: Vec<SignalActivity>,
 }
 
 impl IdActivity {
@@ -138,6 +145,7 @@ impl IdActivity {
             last: vec![3; nbits],
             since: vec![0; nbits],
             dur: vec![[0; 3]; nbits],
+            sa: vec![SignalActivity::default(); nbits],
         }
     }
 }
@@ -238,9 +246,10 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
 
     // Close every declared signal's last open state interval and fold
     // durations into `signals` — including edge-free signals, so a dumped
-    // constant net reads as annotated with a measured duty.
+    // constant net reads as annotated with a measured duty. The same
+    // durations land on the declaration's own `sa` stream.
     for (id, decl) in &headers.decls {
-        let Some(act) = headers.activity.get(id) else {
+        let Some(act) = headers.activity.get_mut(id) else {
             continue;
         };
         for (pos, (&state, &since)) in act.last.iter().zip(&act.since).enumerate() {
@@ -257,6 +266,9 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
                 }
                 None => decl.name.clone(),
             };
+            act.sa[pos].t0_s = dur[0] as f64 * timescale_s;
+            act.sa[pos].t1_s = dur[1] as f64 * timescale_s;
+            act.sa[pos].other_s = dur[2] as f64 * timescale_s;
             let e = signals.entry(name).or_default();
             e.t0_s = dur[0] as f64 * timescale_s;
             e.t1_s = dur[1] as f64 * timescale_s;
@@ -272,21 +284,15 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
         let Some(retained) = headers.decls.get(id) else {
             continue;
         };
-        for pos in 0..decl.nbits.min(retained.nbits) {
-            let stream_name = match retained.range {
-                Some((left, right)) => {
-                    let bit_idx = if left >= right {
-                        left - pos as i64
-                    } else {
-                        left + pos as i64
-                    };
-                    format!("{}[{}]", retained.name, bit_idx)
-                }
-                None => retained.name.clone(),
-            };
-            let Some(sa) = signals.get(&stream_name) else {
-                continue;
-            };
+        let Some(act) = headers.activity.get(id) else {
+            continue;
+        };
+        for (pos, &sa) in act
+            .sa
+            .iter()
+            .enumerate()
+            .take(decl.nbits.min(retained.nbits))
+        {
             let pin_name = match decl.range {
                 Some((left, right)) => {
                     let bit_idx = if left >= right {
@@ -298,7 +304,7 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
                 }
                 None => decl.path.clone(),
             };
-            pin_signals.insert(pin_name, *sa);
+            pin_signals.insert(pin_name, sa);
         }
     }
 
@@ -517,6 +523,22 @@ fn record_edge(name: &str, old: u8, new: u8, signals: &mut HashMap<String, Signa
     }
 }
 
+/// Same transition accounting as `record_edge`, onto the declaration's own
+/// per-bit stream (`IdActivity::sa`) instead of the flat-name `signals` map.
+fn record_id_edge(act: &mut IdActivity, pos: usize, old: u8, new: u8) {
+    if old == new || old == 3 {
+        return;
+    }
+    let e = &mut act.sa[pos];
+    if old == 2 || new == 2 {
+        e.xtrans += 1;
+    } else if old == 0 && new == 1 {
+        e.rise += 1;
+    } else {
+        e.fall += 1;
+    }
+}
+
 fn apply_change(
     v: char,
     id: &str,
@@ -539,6 +561,7 @@ fn apply_change(
     act.dur[0][old.min(2) as usize] += cur_ts.saturating_sub(act.since[0]);
     act.since[0] = cur_ts;
     act.last[0] = bit_state(v as u8);
+    record_id_edge(act, 0, old, act.last[0]);
     record_edge(&decl.name.clone(), old, act.last[0], signals);
 }
 
@@ -556,7 +579,25 @@ fn apply_vector_change(
     let Some((left, right)) = decl.range else {
         return; // vector write to a scalar id is malformed
     };
-    let chars: Vec<u8> = bits.bytes().collect();
+    // A `b` value may print shorter than the declared width: the missing
+    // high bits are the value's sign convention — x/z extend themselves
+    // (`bx` is the all-x write), 0/1 left-extend with 0 (`b0`, and
+    // leading-zero trims like `b100011111011010` on a 16-bit net).
+    // Dropping them silently loses the transition AND stalls the state
+    // (gcd.vcd's `resp_msg` writes `b0`/`bx` on idle).
+    let chars: Vec<u8> = if bits.len() < decl.nbits {
+        let pad = match bits.as_bytes()[0] {
+            b'x' | b'X' => b'x',
+            b'z' | b'Z' => b'z',
+            _ => b'0',
+        };
+        let mut v = Vec::with_capacity(decl.nbits);
+        v.extend(std::iter::repeat_n(pad, decl.nbits - bits.len()));
+        v.extend_from_slice(bits.as_bytes());
+        v
+    } else {
+        bits.bytes().collect()
+    };
     if chars.len() != decl.nbits {
         return;
     }
@@ -579,6 +620,7 @@ fn apply_vector_change(
         act.since[pos] = cur_ts;
         act.last[pos] = new;
         if old != new {
+            record_id_edge(act, pos, old, new);
             record_edge(&format!("{}[{}]", decl.name, bit_idx), old, new, signals);
         }
     }
@@ -779,6 +821,53 @@ $finish
         assert_eq!((s.rise, s.fall), (0, 1));
         assert_eq!(act.pin_signals.get("tb/dut/a").expect("port").rise, 1);
         assert_eq!(act.signals["Z"], act.pin_signals["tb/dut/u_t/Z"]);
+    }
+
+    #[test]
+    fn test_pin_signals_keep_same_leaf_apart() {
+        // Per-cell pin dumps declare the same leaf (`Y`) under different ids
+        // in different scopes — `pin_signals` must read each declaration's own
+        // stream, not the `signals` flat-name fold of every like-named pin
+        // (gcd.vcd, where `signals["Y"]` summed all cell outputs).
+        let vcd = "$timescale 1ns $end\n\
+                   $scope module dut $end\n\
+                   $scope module _1_ $end\n\
+                   $var wire 1 ! Y $end\n\
+                   $upscope $end\n\
+                   $scope module _2_ $end\n\
+                   $var wire 1 \" Y $end\n\
+                   $upscope $end\n\
+                   $upscope $end\n\
+                   $enddefinitions $end\n\
+                   #0\n0!\n0\"\n#10\n1!\n#20\n0!\n1\"\n#30\n";
+        let act = parse_vcd(vcd).expect("parse");
+        let y1 = act.pin_signals.get("dut/_1_/Y").expect("_1_/Y");
+        let y2 = act.pin_signals.get("dut/_2_/Y").expect("_2_/Y");
+        assert_eq!((y1.rise, y1.fall), (1, 1));
+        assert_eq!((y2.rise, y2.fall), (1, 0));
+        // The flat fold carries the sum — debug view only, not an annotation.
+        assert_eq!((act.signals["Y"].rise, act.signals["Y"].fall), (2, 1));
+    }
+
+    #[test]
+    fn test_short_vector_writes_left_extend() {
+        // `b` values narrower than the declared width pad on the left: 0/1
+        // writes extend with 0 (`b0`, `b111` on [3:0]), x/z extend
+        // themselves (`bx` is the all-x write). Dropping them loses the edge
+        // and stalls the state.
+        let vcd = "$timescale 1ns $end\n\
+                   $var wire 4 # data [3:0] $end\n\
+                   $enddefinitions $end\n\
+                   #0\nb0000 #\n#10\nb111 #\n#20\nb0 #\n#30\nbx #\n#40\n";
+        let act = parse_vcd(vcd).expect("parse");
+        for i in 0..3 {
+            let s = act.signals.get(&format!("data[{i}]")).expect("bit");
+            assert_eq!((s.rise, s.fall, s.xtrans), (1, 1, 1), "data[{i}]");
+        }
+        // bit3 never toggles (0 pad on `b111`), then x on `bx`.
+        let b3 = act.signals.get("data[3]").expect("data[3]");
+        assert_eq!((b3.rise, b3.fall, b3.xtrans), (0, 0, 1));
+        assert!((b3.other_s - 10e-9).abs() < 1e-20);
     }
 
     #[test]

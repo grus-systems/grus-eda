@@ -12,6 +12,7 @@ This directory contains public benchmark designs used for verification against r
 - **License**: BSD 3-Clause License (The Regents of the University of California). See `tests/designs/gcd/gcd.v`.
 - **Target PDK**: SkyWater `sky130_fd_sc_hd` (1.8 V nominal corner `tt_025C_1v80`).
 - **Description**: Standard 16-bit synchronous iterative GCD accelerator with valid/ready handshake interface (`req_msg`, `req_val`, `req_rdy`, `resp_msg`, `resp_val`, `resp_rdy`). Used across E0–E3 for golden equivalence checking.
+- **Power artifacts**: `power/` holds `gcd_tb.v` (committed Icarus testbench: deterministic LFSR stimulus, `$dumpvars(0, dut)`), `power_vcd_check.tcl` (committed OpenROAD reference: `read_vcd -scope gcd_tb/dut` + `report_power`), `power_check.tcl` (no-annotation variant). `gcd.vcd` is gitignored (~18 MB): Icarus Verilog output of `gcd_tb.v` + `gcd.synth.v` + the PDK `sky130_fd_sc_hd` cell models (`primitives.v` + `sky130_fd_sc_hd.v`); regenerate with the verified recipe in `docs/results.md` 2026-11-22 (AP4 revision block).
 
 ### `picorv32` (RISC-V RV32I core)
 - **Directory**: `tests/designs/picorv32/`
