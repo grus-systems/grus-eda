@@ -5881,3 +5881,111 @@ binary; raw log not committed, script is). Note: a first run
 `sta.spef` median 1270); the tabled numbers are the second, idle-machine
 run — the interference run kept min-bounds consistent, no regression
 hid.
+
+### 2026-11-22 — perf-slewonly-power: slew-only sta_pin_slews (v0.3.4)
+
+`sta_pin_slews` no longer pays for `run_sta_detail`. `prepare_sta` gains a
+`for_slew` flag that skips the `sta.prepare.clock.*` block when its only
+consumer is pulse-width checks (i.e. no `set_propagated_clock`); source
+seeding is extracted into `eval_seed_state` shared by `eval_sta` and the new
+`slew_eval`, which replays the same levelized walk — same net sinks, same
+arc legs, same `driver_response` lookups — but merges only
+`slew_max`/`slew_min` and a reachability bit (no arrival/required, no CRPR,
+no endpoint collection, no checks). A latch-borrow Q driving a non-clock
+net makes downstream slew depend on the borrow window `eval_sta` computes,
+so `uncovered_borrow` detects that case and falls back to
+`eval_state_full` (the full walk minus the report); ibex trips it (one
+borrow Q onto a data net). Public signature unchanged — no `main.rs`,
+`power.rs`, or `sta/mod.rs` edits. Design:
+`kurena/tasks/perf-slewonly-power/design/`.
+
+**Before/after wall** — `median (min–max)` ms, REPS=5, same machine
+(M4 mini) and flags; before = v0.3.3 (`perf-par-slew` run for the
+placement cells — its `power` path is untouched since — plus a fresh
+v0.3.3 run for the zero-wire/VCD cells it did not cover):
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `power` zero wire — gcd | 10 (10–320) | 10 (10–10) | ~noise — loads dominate |
+| `power` zero wire — picorv32 | 80 (80–90) | 40 (30–40) | ×2.0 |
+| `power` zero wire — aes | 90 (90–100) | 60 (50–60) | ×1.5 |
+| `power` zero wire — ibex | 120 (110–140) | 50 (50–80) | ×2.4 |
+| `power` zero wire — jpeg | 350 (330–370) | 150 (140–170) | ×2.3 |
+| `power` placement RC — gcd | 40 (30–40) | 10 (10–10) | ×4.0 |
+| `power` placement RC — picorv32 | 350 (310–350) | 140 (140–140) | ×2.5 |
+| `power` placement RC — aes | 490 (440–490) | 200 (190–230) | ×2.5 |
+| `power` placement RC — ibex | 440 (390–440) | 290 (290–300) | ×1.5 |
+| `power` placement RC — jpeg | 2170 (2100–2190) | 1030 (990–1050) | **×2.1** |
+| `power --vcd` gcd | 890 (670–990) | 500 (490–510) | see note |
+
+`power --vcd` is dominated by `power.activity.load` (~479 of ~500 ms —
+untouched code, the before run's reps ranged 670–990); the slew share is
+`power.slews` 23.7 → 9.1 ms. Zero-wire gcd stays ~10 ms: it is all file
+loads; `power.slews` there was already under the noise floor.
+
+**Phase** (`power --parasitics placement`, median ms): `power.slews`
+envelope jpeg 1824 → **808**, aes 405 → 152, picorv32 267 → 98, ibex 331 →
+218 (fallback — see below), gcd 23.5 → 7.3. Moved keys: `sta.slew.seeds` /
+`sta.slew.walk` now nest under `power.slews`; `sta.eval.seeds|walk|
+endpoints*` no longer fire under `power` on the non-fallback designs, and
+`sta.prepare.clock.slew|walk|loads` are skipped entirely on these SDCs
+(no propagated clocks — the block only served pulse-width checks).
+`slew_eval` is also ~10% cheaper
+per leg than the full walk (jpeg `sta.slew.walk` 771 vs before
+`sta.eval.walk` 830: no arrival/required/CRPR arithmetic, no endpoint
+bookkeeping). **Fallback**: ibex's `uncovered_borrow` routes it through
+`eval_state_full` — `sta.eval.seeds|walk|endpoints(.pulse)` still fire
+inside `power.slews` (walk 205 ms, endpoint collection ~1 ms); only the
+report tail (`sta.assemble`, `sta.partition.*`) and the
+`sta.prepare.clock.*` block are skipped, which still buys the
+prepare-side skip.
+
+**Achieved vs. ceiling**: the plan estimated jpeg `power` ~1.3 s on
+`sta.eval.walk` removal alone; the measured 1.03 s lands ahead of that
+because the `sta.prepare.clock.*` skip (901 ms on jpeg) also fired — none
+of the committed SDCs use `set_propagated_clock`, so pulse-width-only
+clock propagation is pure waste under `power`. Residual, named: (1)
+`sta.slew.walk` itself — jpeg 771 ms, the same DMP-dominated inner loop
+as `eval.walk`, now ~75% of `power` wall; (2) ibex's borrow fallback
+keeps `sta.eval.walk` (205 of its 290); (3) input loads — `power.load.def`
+61 + `power.parasitics` 82 + `power.cells` 31 now sum to ~17% of jpeg
+wall; (4) `power.activity.resolve` ~19.
+
+**Equivalence**: all committed goldens untouched (`git status` clean
+under `tests/designs/**`); `cargo test --workspace` (341+3, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
+--release -p grus-core sta` (188, 2 ignored) all green. Parity is proven
+by test, not assumed: `test_sta_pin_slews_parity_committed_designs`
+compares full-eval `PinTimingState` slew against `sta_pin_slews` **per
+pin and per transition** on gcd (zero-wire / placement RC / routed SPEF),
+picorv32, ibex, aes, jpeg; `..._parity_propagated` covers
+propagated-clock SDCs (gcd, picorv32), `..._parity_exceptions` the
+`fp_allregs` exceptions fixture, `..._parity_microbench` the `mb`/`mbw`
+power fixtures, and `..._latch_borrow_fallback` asserts the predicate
+fires on the borrow fixture then compares through the public path. Every
+case asserts `slew_max` through the public `PinSlew` and additionally
+compares the internal replay state's `slew_min` against the full eval
+state — the min side is where the borrow fixture actually diverges under
+a naive replay.
+Fail-proof: `merge_slew` fed input slews instead of driver outputs → 4
+parity groups red → restored green; `uncovered_borrow` forced `false` →
+latch-borrow test red → restored. Two further probes showed why the
+fallback is structural, not cosmetic: under a broken predicate the
+borrow fixture diverged in `slew_min` at the latch Q pins, and a
+synthetic uncovered-borrow edit on ibex diverged `slew_max` too (−inf vs
+8.69 ns on pin 32170). Determinism: `RAYON_NUM_THREADS=1` parity suite
+green (updates are still collect-then-ordered-apply).
+
+**What was run**: `REPS=5 sh kurena/tasks/perf-profile/measure.sh
+/tmp/perf-slewonly-power3.log` (full 38-cell matrix on the v0.3.4 release
+binary; raw log not committed, the script is). Before cells:
+`power.placement.*` from `/tmp/perf-par-slew2.log` (v0.3.3 — the `power`
+code path is byte-identical between v0.3.3 and the pre-change worktree);
+`power.zerowire.*` and `power.vcd.gcd` measured on the v0.3.3 binary
+into `/tmp/perf-slewonly-before.log`. Note: a first v0.3.4 matrix
+(`/tmp/perf-slewonly-power.log`) ran while a background build was still
+draining and showed inflated `power.*` reps (picorv32 `sta.slew.walk`
+240–743 ms vs 91 steady-state); a power-only idle re-run
+(`/tmp/perf-slewonly-power2.log`) agreed with the tabled log within ±15%
+(jpeg `power` 880 vs 1030), so the table uses the second full-matrix run
+— min-bounds consistent, no regression hid.
