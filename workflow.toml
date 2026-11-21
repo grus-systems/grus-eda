@@ -15,6 +15,12 @@ timeout_sec = 1800       # per subprocess invocation
 # non-#[ignore] tests read jpeg artifacts.
 worktree_seed = ["tests/designs/"]
 
+# `drive=true` auto-fires every never-pushed spec in kurena/tasks/
+# — enable only when the whole queue is meant to run unattended.
+[auto]
+drive = false
+approve = "on_pass"
+
 # Host-capability runners (routing tokens, no container exec):
 [runner.eda]
 kind = "host"
