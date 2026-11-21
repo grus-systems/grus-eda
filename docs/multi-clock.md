@@ -25,7 +25,9 @@ cross-domain paths), `two_clock_latch.def` (a `dlxtn` on `ckb` feeding a
 since `xdomain-deferrals` — 49 on `two_clock` incl. `t2_u1`/`t2_u2`/
 `t2_lcm`/`t2_lcm2` + `t2_latch`/`t2_xlat`/`t2_xlat2`; `probe.sh`
 also carries `MEASURE_ONLY` evidence scenarios — `t2_eclk`, `t2_nsfrom`,
-`t2_nsto`, `t2_toinv`, `t2_noclk` — that never fold into the golden),
+`t2_nsto`, `t2_toinv`, `t2_noclk`, plus the `xdomain-deferrals` evidence
+runs `t2_u3`/`t2_lcm3`/`t2_lcm4` and the `-digits 5` `t2_xlat2` rerun —
+that never fold into the golden),
 `probe.sh` (runs OpenSTA in
 `ghcr.io/librelane/librelane:3.0.16`), `two_clock.reference.json` +
 `two_clock_latch.reference.json` + `probe_*.txt` (byte-identical on re-run).
@@ -341,13 +343,18 @@ The four parked `CrossDomain` corners, resolved by measurement:
   `req = N − t_setup` (max `arr 0.293 vs req 1.39`) and
   `req = N + t_hold` (min `arr 0.303 vs req 0.46`) — the ordinary
   clock check stays dropped, the delay anchor composes on the same
-  undeclared launch.
+  undeclared launch. The complementary corner also evaluates
+  (`t2_u3`): a `-to` delay check on an *unclocked capture* endpoint
+  (`u_fb0/D`, CLK on the undeclared `cb` net) anchors `req` at the
+  delay value itself — `N ∓ t_constraint`, no clock edge,
+  uncertainty, or CRPR term.
 - **Latch-D foreign launch** (`t2_xlat`/`t2_xlat2` — `d2` launches
   `cka` into a `ckb` latch `u_ln`): OpenSTA borrows against the
   latch's own `ckb` window — `time given to startpoint = open +
   min(arr − open, pulse − unc − setup)`, the arrival clamped to the
-  *first* window's borrow cap (fall event 0.91038 = cap, not the raw
-  0.9-normalized arrival). The borrowed D->Q launch is ckb-domained:
+  *first* window's borrow cap (`probe_t2_xlat2_d5.txt`: fall event
+  0.91038 = cap, not the raw 0.9-normalized arrival). The borrowed
+  D->Q launch is ckb-domained:
   `u_ln -> u_fb0` pairs like any same-domain path.
 - **Pair-search windows** (`t2_lcm` 2.0/1.7320508, `t2_lcm2`
   2.0/1.999999): OpenSTA scans the first ~100 min-period edges for a
@@ -356,7 +363,9 @@ The four parked `CrossDomain` corners, resolved by measurement:
   every endpoint** (bounds the launch scan to the first `N` capture
   periods — directional: 100 when the launch clock is faster, 1000
   when slower); `t2_lcm2` converges at the boundary and reports
-  silently. Hold pairing is capture-edge-driven (smallest launch edge
+  silently. The convergence boundary is bracketed by `probe_t2_lcm3.txt`
+  (2.0/1.98, LCM 198 — silent) and `probe_t2_lcm4.txt` (2.0/1.9801 —
+  warns). Hold pairing is capture-edge-driven (smallest launch edge
   at-or-after each capture edge — `t2_waverot` boundary pair).
 
 ## 2. Where grus-eda stands (after `xdomain-deferrals`)
@@ -437,7 +446,9 @@ Now evaluated:
   dropped exactly as OpenSTA drops them (`t2_u1`: `u_fy/D` vanishes from
   the endpoint table and the `-unconstrained` listing) while `-to` delay
   checks still evaluate (`t2_u2`: `u_fy/D` req = edge-0 capture ±
-  setup/hold + N). The named skip is `UndeclaredLaunch` with
+  setup/hold + N; `t2_u3`: an unclocked *capture* pin anchors
+  `req = N ∓ t_constraint` with the pin's driver-chain slew). The
+  named skip is `UndeclaredLaunch` with
   `related: "launch <undeclared> -> ..."`, counted in
   `skipped.undeclared_endpoints` and exempt from `is_clean` like the
   other evidence-backed defers.

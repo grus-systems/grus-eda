@@ -175,12 +175,15 @@ EOF
 # times per path, plus the unconstrained listing that shows which endpoints
 # left the timed set. The optional 4th argument is a wall-clock bound in
 # seconds (`timeout <s>`; `0` = unbounded) so a non-convergent scenario
-# records the timeout in the artifact instead of stalling the probe.
+# records the timeout in the artifact instead of stalling the probe; the
+# optional 5th is a `-digits` precision for the report_checks calls.
 run_report () {
     local def_file="$1"
     local sdc_file="$2"
     local out_file="$3"
     local limit="${4:-0}"
+    local digits_flag=""
+    [ -n "${5:-}" ] && digits_flag=" -digits $5"
     local rc=0
     timeout "$limit" openroad -no_init -no_splash << EOF > "/work/tests/designs/sta_clocks/$out_file" 2>&1 || rc=$?
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
@@ -194,9 +197,9 @@ if {[catch {read_sdc /work/tests/designs/sta_clocks/$sdc_file} err]} {
     exit 0
 }
 puts "=== report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000 ==="
-report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000
+report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000${digits_flag}
 puts "=== report_checks -path_delay min -format full -endpoint_path_count 1 -group_path_count 100000 ==="
-report_checks -path_delay min -format full -endpoint_path_count 1 -group_path_count 100000
+report_checks -path_delay min -format full -endpoint_path_count 1 -group_path_count 100000${digits_flag}
 puts "=== report_checks -unconstrained ==="
 report_checks -unconstrained
 exit
@@ -239,6 +242,16 @@ for name in $MEASURE_ONLY; do
     run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
 done
 
+# xdomain-deferrals evidence (measure-only): t2_u3 probes a `-to` delay
+# check on an unclocked *capture* endpoint; t2_lcm3/t2_lcm4 bracket the
+# period-resolution boundary where OpenSTA's common-period search
+# converges (2.0/1.98) vs warns (2.0/1.9801). The 300 s bound on the
+# lcm pair is the run_report timeout argument's only current use.
+MEASURE_XD="t2_u3 t2_lcm3 t2_lcm4"
+for name in $MEASURE_XD; do
+    run_report "two_clock.def" "$name.sdc" "probe_$name.txt" 300
+done
+
 {
     printf '{\n  "design": "sta_clocks",\n  "scenarios": {\n'
     first=1
@@ -262,6 +275,10 @@ for name in $XLAT; do
     run_sta "two_clock_latch.def" "$name.sdc" "ref_$name.json"
     run_report "two_clock_latch.def" "$name.sdc" "probe_$name.txt"
 done
+# The digits-5 rerun pins the borrowed launch event: at two digits the
+# first-window cap (0.91038) is indistinguishable from a 0.9-normalized
+# launch.
+run_report "two_clock_latch.def" "t2_xlat2.sdc" "probe_t2_xlat2_d5.txt" 0 5
 
 {
     printf '{\n  "design": "sta_clocks_latch",\n  "scenarios": {\n'

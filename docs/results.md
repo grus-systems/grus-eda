@@ -4637,22 +4637,31 @@ vs 0.293). The seed now comes from `driver_input_slew`: walk the
 driver chain back to the source port (`set_input_transition` or 0),
 fold each cell's `driver_response` output slew forward.
 
+`t2_u3` covers the complementary corner — a `-to` delay check on an
+**unclocked capture** endpoint (`set_max/min_delay -to u_fb0/D`, whose
+CLK pin sits on the undeclared `cb` net): OpenSTA reports `u_fb0/D`
+anyway with `req` anchored at the delay value itself — `1.50
+max_delay − 0.14 setup → 1.36`, `0.50 min_delay − 0.04 hold → 0.46`,
+no clock edge, uncertainty, or CRPR term (`probe_t2_u3.txt`).
+
 Implemented: the zero-mask launch is seeded (edge 0, computed slew,
 empty dom mask); ordinary checks skip with `UndeclaredLaunch`
 (`related` names `<undeclared>`), `skipped.undeclared_endpoints`
 counts them and `is_clean` exempts them (OpenSTA drops the same
 checks); `-to` delay checks on the same endpoints compose from the
 undeclared arrival — `u_fy/D` req = edge-0 `capture ± setup/hold + N`
-as measured.
+as measured, with the unclocked-capture form falling back to the bare
+`N ∓ t_constraint` anchor and the pin's driver-chain slew (`t2_u3`).
 
 ### Item 2 — latch-D foreign launch: evaluated
 
 `t2_xlat`/`t2_xlat2` (`d2` launches `cka` into `u_ln`, a `ckb` `dlxtn`):
 OpenSTA borrows against the **latch's own** window. `t2_xlat2` at
-`-digits 5`: `u_ln/D` fall arrival 1.90 → `time given to startpoint
-0.91038` = `open 0.7 + min(arr − open, pulse 0.5 − unc 0.15 −
-setup)` — the arrival clamped to the *first* window's borrow cap, not
-window-cycle arithmetic. The borrowed `u_ln/Q` launch is `ckb`-domained
+`-digits 5` (`probe_t2_xlat2_d5.txt` — the two-digit report cannot
+separate the cases): `u_ln/D` fall arrival 1.90 → `time given to
+startpoint 0.91038` = `open 0.7 + min(arr − open, pulse 0.5 − unc
+0.15 − setup)` — the arrival clamped to the *first* window's borrow
+cap, not window-cycle arithmetic. The borrowed `u_ln/Q` launch is `ckb`-domained
 (`u_ln -> u_fb0` pairs `ckb->ckb`, req 0.94/0.99 per transition).
 Endpoint checks on `u_ln/D` show `time borrowed from endpoint`
 0.32/0.36 → req 0.87/0.91 (`probe_t2_xlat2.txt`).
@@ -4682,21 +4691,28 @@ every endpoint**: `u_fy/D` slack −0.38, `u_fx/D` −0.39. `t2_lcm2`
 (2.0/1.999999) converges inside the bound and warns nothing. The
 measured window: scan the first ~100 min-period edges for a common
 period; on failure bound the launch scan to the first `N` capture
-periods — directional, `N = 100` when the launch clock is faster,
-`1000` when slower (`2.0`/`1.98` converges at the boundary,
-`2.0`/`1.9801` warns). `pair_window` implements exactly that; the
-no-pair `CrossDomain` deferral survives only as the defensive
-`None` path — unreachable on the measured grids.
+periods — directional, `N = 100` when the launch clock is faster
+(`probe_t2_lcm.txt` pairs at 112/97 inside 200 = 100·2.0), `1000`
+when slower (808/933 inside ~1732 = 1000·1.732). The boundary is
+bracketed by `probe_t2_lcm3.txt` (2.0/1.98, LCM 198 — converges
+silently) and `probe_t2_lcm4.txt` (2.0/1.9801 — warns). `pair_window`
+implements exactly that; the no-pair `CrossDomain` deferral survives
+only as the defensive `None` path — unreachable on the measured
+grids.
 
 ### Our side
 
 `test_sta_clocks_match_opensta` compares all 52 golden scenarios
 (49 `two_clock` + `t2_latch`/`t2_xlat`/`t2_xlat2`) endpoint-by-endpoint
 at STRICT — **zero mismatches**, `cross_domain_endpoints == 0`
-everywhere. `xdomain_deferrals_scenarios` pins the per-item verdicts:
-`t2_u1` `u_fy/D` named `UndeclaredLaunch` (and `yb`), `t2_u2`
-`u_fy/D` arr/req, `t2_lcm*` slack rows, `t2_xlat*` `u_ln/D` borrow
-(req 0.87) plus the re-domained `u_fb0/D` row.
+asserted per scenario (the `is_deferred` exemption can no longer hide
+a re-deferral). `xdomain_deferrals_scenarios` pins the per-item
+verdicts: `t2_u1` `u_fy/D` named `UndeclaredLaunch` (and `yb`),
+`t2_u2` `u_fy/D` arr/req, `t2_lcm*` slack rows, `t2_xlat*` `u_ln/D`
+borrow (req 0.87) plus the re-domained `u_fb0/D` row.
+`sta_clocks_measure_only_scenarios` additionally pins `t2_u3`
+(`u_fb0/D` reported through the unclocked-capture `-to` check,
+req 1.36/0.46) and the `t2_lcm3`/`t2_lcm4` full endpoint sets.
 `one_clock_sdc_on_two_clock_def` now expects `UndeclaredLaunch` on
 `u_fy/D`/`yb` (previously `NoPath | UntimedDriver`).
 
@@ -4709,7 +4725,9 @@ re-opens the `t2_u2`/`t2_xlat2` mismatches.
 
 **Checks run**: `cargo test --workspace` (all pass),
 `cargo clippy --workspace --all-targets -- -D warnings` (clean),
-`cargo test -p grus-core sta::` (174 pass), `probe.sh` run whole in
+`cargo test -p grus-core sta::` (176 pass), `probe.sh` run whole in
 the container as committed — the existing transcripts/goldens came
-back byte-stable and the six new `t2_*` artifacts were emitted by the
-same run.
+back byte-stable and the new `t2_*` artifacts were emitted by the
+same run (golden SDCs `t2_u1`/`t2_u2`/`t2_lcm`/`t2_lcm2`/`t2_xlat`/
+`t2_xlat2`; measure-only `t2_u3`/`t2_lcm3`/`t2_lcm4` plus the
+`-digits 5` `t2_xlat2` evidence rerun).

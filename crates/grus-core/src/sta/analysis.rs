@@ -4794,6 +4794,25 @@ fn run_sta_partitioned(
                     } else {
                         check.edge
                     };
+                    // An unclocked capture pin still composes (measured
+                    // `t2_u3` `u_fb0/D`): the report then anchors `req` at
+                    // the delay value itself — `N - t_setup` — with no
+                    // clock edge, uncertainty, or CRPR term, and the
+                    // constraint table reads the pin's driver-chain slew.
+                    let captured = clk_s.reached(anchor);
+                    let clk_slew = if captured {
+                        clk_s.slew_max[check.edge]
+                    } else {
+                        driver_input_slew(
+                            cx,
+                            &prepared.levelized,
+                            design,
+                            sdc,
+                            clk,
+                            check.edge,
+                            16,
+                        )
+                    };
                     for pol in [RISE, FALL] {
                         if s.arrival_max[pol] <= f32::NEG_INFINITY {
                             continue;
@@ -4802,18 +4821,34 @@ fn run_sta_partitioned(
                             continue;
                         };
                         let t_setup =
-                            eval_nldm_constraint(table, s.slew_max[pol], clk_s.slew_max[check.edge])
-                                * sdc.derate(
-                                    true,
-                                    DERATE_CHECK,
-                                    false,
-                                    check_transition(late),
-                                );
+                            eval_nldm_constraint(table, s.slew_max[pol], clk_slew) * sdc
+                                .derate(true, DERATE_CHECK, false, check_transition(late));
                         let arr = s.dly_max[pol];
-                        let req = clk_s.arrival_min[anchor]
-                            - unc_worst(sdc, s.dom_max[pol], cap_row, false)
-                            - t_setup
-                            + n;
+                        let req = if captured {
+                            // Same anchor the in-loop `-to` rewrite uses,
+                            // including the propagated-clock CRPR credit.
+                            let credit = if sdc.clocks.get(cap_row).is_some_and(|c| c.propagated) {
+                                design.pin_nets[clk.0 as usize].map_or(0.0, |capture_net| {
+                                    crpr_credit(
+                                        design,
+                                        prepared.clock_state.as_deref(),
+                                        &prepared.crpr_tags,
+                                        s.crpr_max[pol],
+                                        capture_net,
+                                        anchor,
+                                    )
+                                })
+                            } else {
+                                0.0
+                            };
+                            clk_s.arrival_min[anchor]
+                                - unc_worst(sdc, s.dom_max[pol], cap_row, false)
+                                - t_setup
+                                + n
+                                + credit
+                        } else {
+                            n - t_setup
+                        };
                         pols.max[pol] = Some(Worst {
                             arr,
                             dly: arr,
@@ -4833,6 +4868,20 @@ fn run_sta_partitioned(
                     } else {
                         check.edge
                     };
+                    let captured = clk_s.reached(anchor);
+                    let clk_slew = if captured {
+                        clk_s.slew_min[check.edge]
+                    } else {
+                        driver_input_slew(
+                            cx,
+                            &prepared.levelized,
+                            design,
+                            sdc,
+                            clk,
+                            check.edge,
+                            16,
+                        )
+                    };
                     for pol in [RISE, FALL] {
                         if s.arrival_min[pol] >= f32::INFINITY {
                             continue;
@@ -4841,18 +4890,17 @@ fn run_sta_partitioned(
                             continue;
                         };
                         let t_hold =
-                            eval_nldm_constraint(table, s.slew_min[pol], clk_s.slew_min[check.edge])
-                                * sdc.derate(
-                                    false,
-                                    DERATE_CHECK,
-                                    false,
-                                    check_transition(early),
-                                );
+                            eval_nldm_constraint(table, s.slew_min[pol], clk_slew) * sdc
+                                .derate(false, DERATE_CHECK, false, check_transition(early));
                         let arr = s.dly_min[pol];
-                        let req = clk_s.arrival_max[anchor]
-                            + unc_worst(sdc, s.dom_min[pol], cap_row, true)
-                            + t_hold
-                            + n;
+                        let req = if captured {
+                            clk_s.arrival_max[anchor]
+                                + unc_worst(sdc, s.dom_min[pol], cap_row, true)
+                                + t_hold
+                                + n
+                        } else {
+                            n + t_hold
+                        };
                         pols.min[pol] = Some(Worst {
                             arr,
                             dly: arr,
@@ -5652,15 +5700,25 @@ fn driver_input_slew(
 /// residue pattern. With no coincidence inside the bound it warns
 /// `STA-1010` but still pairs, bounding the launch scan to the first `N`
 /// capture periods: `N = 100` when the launch clock is the faster one,
-/// `1000` when it is the slower (measured on eight period pairs — the
-/// bound is directional, not symmetric; `2.0`/`1.98` converges at the
-/// 100-edge boundary while `2.0`/`1.9801` warns).
+/// `1000` when it is the slower. The bound is directional, not symmetric —
+/// `probe_t2_lcm.txt` pairs launch 112/capture 97 inside the 200 =
+/// 100·2.0 capture window for the faster-launch direction and launch
+/// 808/capture 933 inside ~1732 = 1000·1.732 for the slower; the
+/// convergence boundary itself is bracketed by `probe_t2_lcm3.txt`
+/// (2.0/1.98, LCM 198 — converges silently) and `probe_t2_lcm4.txt`
+/// (2.0/1.9801 — warns).
 fn pair_window(pl: f64, pc: f64) -> f64 {
     match grid_lcm(pl as f32, pc as f32) {
         Some(lcm) if lcm <= 100.0 * pl.min(pc) => lcm,
         _ => (if pl < pc { 100.0 } else { 1000.0 }) * pc,
     }
 }
+
+/// Trip bound on the launch-edge scan: the window is a multiple of the
+/// *capture* period, so an extreme `PL << PC` ratio would otherwise
+/// iterate orders of magnitude past every measured horizon (~100–1000
+/// edges).
+const MAX_PAIR_EDGES: usize = 1_000_000;
 
 /// Launch edges `launch0 + m·PL` below the pair-search window (`launch0` is
 /// the launch edge's waveform instant). The bound carries f32-scale noise
@@ -5669,6 +5727,7 @@ fn launch_window(launch0: f64, pl: f64, window: f64) -> impl Iterator<Item = (us
     (0usize..)
         .map(move |m| (m, launch0 + m as f64 * pl))
         .take_while(move |&(_, tl)| tl < window * (1.0 - 1e-6))
+        .take(MAX_PAIR_EDGES)
 }
 
 /// Setup pair (measured `docs/multi-clock.md` §1.2): every launch edge
@@ -5726,10 +5785,9 @@ fn hold_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f3
     let mut j = 0i64;
     loop {
         let tc = phase_c + j as f64 * pc;
-        if tc >= window * (1.0 - 1e-6) {
+        if tc >= window * (1.0 - 1e-6) || j as usize >= MAX_PAIR_EDGES {
             break;
         }
-        j += 1;
         // Smallest m >= 0 with `launch0 + m·PL >= tc` — fp noise keeps the
         // ceil a step under/at the coincidence, then the walk settles it.
         let mut m = ((tc - launch0 - eps) / pl).ceil().max(0.0) as i64;
@@ -5739,8 +5797,9 @@ fn hold_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f3
         let tl = launch0 + m as f64 * pl;
         let gap = tl - tc;
         if best.is_none_or(|(g0, _, _)| gap < g0 - 1e-9) {
-            best = Some((gap, m as f64 * pl, (j - 1) as f64 * pc));
+            best = Some((gap, m as f64 * pl, j as f64 * pc));
         }
+        j += 1;
     }
     best.map(|(_, lsh, csh)| (lsh as f32, csh as f32))
 }
@@ -10026,6 +10085,16 @@ mod tests {
                         failures.push(format!("{}: deferred but OpenSTA never timed it", s.pin));
                     }
                 }
+                // Capture-driven hold pairing (item 3) made the pairing
+                // total on this fixture: a regression that re-defers a
+                // golden endpoint (e.g. `t2_waverot.u_fy/D`) must fail
+                // here, not hide behind the `is_deferred` exemption.
+                if report.skipped.cross_domain_endpoints != 0 {
+                    failures.push(format!(
+                        "cross_domain_endpoints={} (must be 0)",
+                        report.skipped.cross_domain_endpoints
+                    ));
+                }
                 // Aggregates only when the endpoint set is complete — OpenSTA's
                 // wns/tns/violation counts span the cross-domain paths that
                 // defer, so a scenario with `CrossDomain` skips cannot compare.
@@ -10178,13 +10247,46 @@ mod tests {
         // leave the endpoint table.
         let report = run("t2_noclk");
         assert_eq!(pins(&report), ["u_fa1/D", "u_fb1/D", "u_fx/D", "u_fy/D", "yb"]);
+        // `t2_u3` (xdomain-deferrals): a `-to` delay check on an
+        // *unclocked* capture endpoint. OpenSTA reports `u_fb0/D` with
+        // `req` anchored at the delay value itself — `N - t_setup` /
+        // `N + t_hold`, no clock edge or uncertainty — arr 0.70/0.10,
+        // req 1.36/0.46.
+        let report = run("t2_u3");
+        assert_eq!(pins(&report), ["u_fa0/D", "u_fa1/D", "u_fb0/D", "ya"]);
+        let ep = |pin: &str| {
+            report
+                .endpoints
+                .iter()
+                .find(|e| e.pin == pin)
+                .unwrap()
+        };
+        assert!((ep("u_fb0/D").max_req_ns.unwrap() - 1.3648895).abs() < 1e-4);
+        assert!((ep("u_fb0/D").min_req_ns.unwrap() - 0.456963).abs() < 1e-4);
+        // `t2_lcm3`/`t2_lcm4` bracket the common-period boundary
+        // (`probe_t2_lcm{3,4}.txt`): 2.0/1.98 converges in OpenSTA's
+        // 100-edge scan while 2.0/1.9801 warns STA-1010 — ours evaluates
+        // every endpoint either way (`grid_lcm` fails on the latter, the
+        // pair window falls back to 1000 capture periods).
+        for name in ["t2_lcm3", "t2_lcm4"] {
+            let report = run(name);
+            assert_eq!(
+                pins(&report),
+                [
+                    "u_fa0/D", "u_fa1/D", "u_fb0/D", "u_fb1/D", "u_fx/D", "u_fy/D", "ya", "yb"
+                ],
+                "{name}"
+            );
+            assert_eq!(report.skipped.cross_domain_endpoints, 0, "{name}");
+        }
     }
 
     /// Undeclared-domain hazard (`docs/multi-clock.md` §2): a single-clock
     /// SDC on the two-clock DEF must not fold `cb`'s flops onto `cka`'s
     /// lattice. The `cka` side evaluates; every `cb` endpoint is named in
     /// `skipped_endpoints` — `NoClock` where the capture clock pin is
-    /// unreached, a no-arrival skip where the launch was dead.
+    /// unreached, `UndeclaredLaunch` where an unclocked register's edge-0
+    /// clk->Q launch reaches a declared-domain endpoint.
     #[test]
     fn one_clock_sdc_on_two_clock_def() {
         let lib_dir = sky130_hd();
