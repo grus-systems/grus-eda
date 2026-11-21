@@ -445,8 +445,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
             let mut interner = grus_core::interner::StringInterner::new();
             let t_load = std::time::Instant::now();
-            let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
-            let design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
+            let (tech_db, design_db) = {
+                let _p = grus_core::timing::phase("cong.load");
+                let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
+                let design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
+                (tech_db, design_db)
+            };
             let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
 
             let layer_adjustments = args.layer_adjust.map(|alpha| {
@@ -491,6 +495,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
             if args.heatmap {
                 print_heatmap(grid.nx, grid.ny, &report.gcell_usage_ratio);
+            }
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
             }
         }
         Commands::Floorplan(args) => {
@@ -658,13 +665,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // Write placed DEF
             println!("Writing placed DEF to {:?}", args.out_def);
             let t_write = std::time::Instant::now();
-            grus_core::readers::write_def(&design_db, &tech_db, &args.def, &args.out_def)?;
+            {
+                let _p = grus_core::timing::phase("place.write");
+                grus_core::readers::write_def(&design_db, &tech_db, &args.def, &args.out_def)?;
+            }
             let elapsed_write = t_write.elapsed().as_secs_f64() * 1000.0;
             println!(
                 "Wrote placed DEF successfully in {:.2}ms (total placement runtime: {:.2}ms)",
                 elapsed_write,
                 elapsed_gp + elapsed_leg
             );
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
+            }
         }
         Commands::Sta(args) => {
             let mode = match (args.parasitics, &args.spef) {
@@ -677,32 +690,55 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     spef
                 ),
             };
-            let lib_db = grus_core::readers::load_liberty(&args.lib)?;
+            let lib_db = {
+                let _p = grus_core::timing::phase("sta.load.liberty");
+                grus_core::readers::load_liberty(&args.lib)?
+            };
             let lib_hold_db = match &args.lib_hold {
-                Some(path) => Some(grus_core::readers::load_liberty(path)?),
+                Some(path) => {
+                    let _p = grus_core::timing::phase("sta.load.liberty");
+                    Some(grus_core::readers::load_liberty(path)?)
+                }
                 None => None,
             };
             let mut interner = grus_core::interner::StringInterner::new();
-            let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
-            let design = grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?;
+            let tech_db = {
+                let _p = grus_core::timing::phase("sta.load.lef");
+                load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
+            };
+            let design = {
+                let _p = grus_core::timing::phase("sta.load.def");
+                grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
+            };
             let design_hold = match &lib_hold_db {
-                Some(lib) => Some(grus_core::readers::parse_def(
-                    &args.def,
-                    &tech_db,
-                    Some(lib),
-                )?),
+                Some(lib) => {
+                    let _p = grus_core::timing::phase("sta.load.def");
+                    Some(grus_core::readers::parse_def(
+                        &args.def,
+                        &tech_db,
+                        Some(lib),
+                    )?)
+                }
                 None => None,
             };
-            let sdc = grus_core::sta::load_sdc(&args.sdc)?;
+            let sdc = {
+                let _p = grus_core::timing::phase("sta.load.sdc");
+                grus_core::sta::load_sdc(&args.sdc)?
+            };
             let t0 = std::time::Instant::now();
             let compute_parasitics = |d: &grus_core::design_db::DesignDb| -> anyhow::Result<Option<grus_core::sta::NetParasitics>> {
                 match (mode, &args.spef) {
                     ("placement RC", _) => {
+                        let _p = grus_core::timing::phase("sta.parasitics");
                         let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
                         Ok(Some(grus_core::sta::estimate_placement_parasitics(d, &tech_db, rc)))
                     }
                     (_, Some(spef_path)) => {
-                        let spef = grus_core::readers::load_spef(spef_path)?;
+                        let spef = {
+                            let _p = grus_core::timing::phase("sta.spef.read");
+                            grus_core::readers::load_spef(spef_path)?
+                        };
+                        let _p = grus_core::timing::phase("sta.parasitics");
                         Ok(Some(grus_core::sta::spef_parasitics(d, &spef)?))
                     }
                     _ => Ok(None),
@@ -727,6 +763,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         "--spef-out needs parasitics: pass --parasitics placement or --spef"
                     );
                 };
+                let _p = grus_core::timing::phase("sta.spef.write");
                 let spef_text = grus_core::sta::write_spef(&design, &lib_db, p)?;
                 std::fs::write(path, spef_text)?;
                 println!("Wrote SPEF to {:?}", path);
@@ -771,12 +808,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             print_skip_summary(&report);
             if let Some(path) = &args.json {
+                let _p = grus_core::timing::phase("sta.report.json");
                 let json = serde_json::to_string_pretty(&report)?;
                 std::fs::write(path, json)?;
                 println!("Wrote STA report JSON to {:?}", path);
             }
             if args.strict && !report.skipped.is_clean() {
                 anyhow::bail!("strict: the run skipped inputs; see the summary above");
+            }
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
             }
         }
         Commands::Power(args) => {
@@ -790,33 +831,54 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     spef
                 ),
             };
-            let lib_db = grus_core::readers::load_liberty(&args.lib)?;
+            let lib_db = {
+                let _p = grus_core::timing::phase("power.load.liberty");
+                grus_core::readers::load_liberty(&args.lib)?
+            };
             let mut interner = grus_core::interner::StringInterner::new();
-            let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
-            let design = grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?;
-            let sdc = grus_core::sta::load_sdc(&args.sdc)?;
+            let tech_db = {
+                let _p = grus_core::timing::phase("power.load.lef");
+                load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
+            };
+            let design = {
+                let _p = grus_core::timing::phase("power.load.def");
+                grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
+            };
+            let sdc = {
+                let _p = grus_core::timing::phase("power.load.sdc");
+                grus_core::sta::load_sdc(&args.sdc)?
+            };
             let parasitics = match (mode, &args.spef) {
                 ("placement RC", _) => {
+                    let _p = grus_core::timing::phase("power.parasitics");
                     let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
                     Some(grus_core::sta::estimate_placement_parasitics(
                         &design, &tech_db, rc,
                     ))
                 }
                 (_, Some(spef_path)) => {
-                    let spef = grus_core::readers::load_spef(spef_path)?;
+                    let spef = {
+                        let _p = grus_core::timing::phase("power.spef.read");
+                        grus_core::readers::load_spef(spef_path)?
+                    };
+                    let _p = grus_core::timing::phase("power.parasitics");
                     Some(grus_core::sta::spef_parasitics(&design, &spef)?)
                 }
                 _ => None,
             };
             let t0 = std::time::Instant::now();
-            let pin_slews =
-                grus_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?;
+            let pin_slews = {
+                let _p = grus_core::timing::phase("power.slews");
+                grus_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?
+            };
             let annotated = args.vcd.is_some() || args.saif.is_some();
             let (activity, saif_diag) = match (&args.vcd, &args.saif) {
                 (Some(vcd_path), _) => {
+                    let _p = grus_core::timing::phase("power.activity.load");
                     (grus_core::readers::load_vcd(vcd_path)?, None)
                 }
                 (None, Some(saif_path)) => {
+                    let _p = grus_core::timing::phase("power.activity.load");
                     let saif = grus_core::readers::load_saif(saif_path)?;
                     let (activity, diag) =
                         saif.resolve(&design, args.saif_scope.as_deref())?;
@@ -920,6 +982,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let json = serde_json::to_string_pretty(&report)?;
                 std::fs::write(path, json)?;
                 println!("Wrote power report JSON to {:?}", path);
+            }
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
             }
         }
     }

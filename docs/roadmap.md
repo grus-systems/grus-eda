@@ -514,3 +514,25 @@ Remaining:
   plus state-weighted `when` leakage residuals on gcd. See
   `docs/results.md` 2026-11-22 and
   `kurena/tasks/ap4-activity-precedence/design/`.
+
+### N8. Performance (measured baseline — 2026-11-22, v0.3.2)
+
+Not a correctness item; a speed track. `GRUS_PHASE_TIMING=1` emits
+stderr phase timers at the whole-pass boundaries of `sta`, `power`,
+`place`, `congestion` (off by default, zero-cost gate). The committed
+matrix (`kurena/tasks/perf-profile/measure.sh`, 5 warm-cache reps on the
+M4 mini) is logged in `docs/results.md` 2026-11-22. Measured, the
+dominant phase is `sta.prepare.clock.slew` — a *serial* Kahn-level slew
+propagation (`propagate_slew`) at 77–81% of `sta` wall on the three
+largest designs and ~94% of `power` wall via `sta_pin_slews`; `sample`
+puts ~80% of main-thread samples inside `sta::dmp`
+(`rc_crossing`/`fit_ramp_duration`/`solve_dmp_with`). Candidate
+follow-on tickets, in measured order (details + Amdahl ceilings in
+`kurena/tasks/perf-profile/design/plan.md` — candidates, not
+commitments): `perf-par-slew` (per-level `par_iter`, ×~2.2 jpeg `sta`),
+`perf-slewonly-power` (slew-only `sta_pin_slews`, parity-gated),
+`perf-legal-passes` (algorithmic; serial ordered-move passes are 44% of
+`place`), then the parser tickets `perf-spef-parse`, `perf-def-parse`,
+`perf-vcd-parse`. Every optimization ticket lands only with a
+bit-identical-or-tolerance-named fast path and a `docs/results.md`
+number, per the usual discipline.

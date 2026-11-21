@@ -404,7 +404,9 @@ pub fn estimate_power(
     pin_slews: &[PinSlew],
     overrides: &ActivityOverrides,
 ) -> PowerReport {
+    let t_resolve = crate::timing::phase("power.activity.resolve");
     let resolution = resolve_activity(design, lib, sdc, vcd, overrides);
+    drop(t_resolve);
     let window_s = resolution.window_s;
     let mut cx = PowerCx {
         design,
@@ -422,6 +424,7 @@ pub fn estimate_power(
     };
     // Per-net load caps; driven nets whose origin is `Unknown` have no
     // measured, seeded, or derived source.
+    let t_loads = crate::timing::phase("power.net_loads");
     for n in 0..design.num_nets() {
         let net = NetId(n as u32);
         if design.net_driver(net).is_some()
@@ -433,6 +436,7 @@ pub fn estimate_power(
             cx.net_load_pf[n][pol] = net_load_pf(design, lib, sdc, parasitics, net, pol);
         }
     }
+    drop(t_loads);
 
     let mut groups: [PowerGroup; 3] = std::array::from_fn(|i| PowerGroup {
         name: GROUP_NAMES[i].to_string(),
@@ -440,6 +444,7 @@ pub fn estimate_power(
     });
 
     // Leakage + internal power, per cell.
+    let t_cells = crate::timing::phase("power.cells");
     for cell_idx in 0..design.num_cells() {
         let cell = CellId(cell_idx as u32);
         let Some(lib_cell_id) = design.cell_lib_ids[cell_idx] else {
@@ -487,8 +492,10 @@ pub fn estimate_power(
             pin_internal_power(&mut cx, cell, pin, lib_pin, g, &mut groups);
         }
     }
+    drop(t_cells);
 
     // Switching power, per cell-driven net, attributed to the driver's group.
+    let t_sw = crate::timing::phase("power.switching");
     for n in 0..design.num_nets() {
         let net = NetId(n as u32);
         let Some(driver) = design.net_driver(net) else {
@@ -513,6 +520,7 @@ pub fn estimate_power(
         );
         groups[g].switching_w += cx.switching_w(net, driver, lib.nominal_voltage_v);
     }
+    drop(t_sw);
 
     let mut internal_w = 0.0;
     let mut switching_w = 0.0;

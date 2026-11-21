@@ -819,6 +819,7 @@ pub fn legalize_placement(
     let site_height = tech_db.site_height_dbu;
     let num_cells = design_db.num_cells();
 
+    let t_abacus = crate::timing::phase("place.legal.abacus");
     // Precompute cell dimensions in DBU
     let mut cell_w_dbu = vec![0i32; num_cells];
     let mut cell_h_dbu = vec![0i32; num_cells];
@@ -1137,10 +1138,15 @@ pub fn legalize_placement(
         }
     }
     let post_abacus_hpwl_dbu = design_db.compute_hpwl_dbu(tech_db);
-    verify_legality(design_db, tech_db).context("verify_legality failed right after Abacus")?;
+    drop(t_abacus);
+    {
+        let _v = crate::timing::phase("place.legal.verify");
+        verify_legality(design_db, tech_db).context("verify_legality failed right after Abacus")?;
+    }
 
     // Step 4: Post-Abacus Local Detailed Placement Refinement (4 Rounds)
     // Precompute sorted unique incident nets per cell for fast deterministic merging.
+    let t_pre = crate::timing::phase("place.legal.pre");
     let mut cell_nets: Vec<Vec<usize>> = vec![Vec::new(); num_cells];
     for (c, nets_entry) in cell_nets.iter_mut().enumerate() {
         let start = design_db.cell_pin_offsets[c] as usize;
@@ -1156,6 +1162,7 @@ pub fn legalize_placement(
 
     let pin_geom = PinGeomCache::new(design_db, tech_db);
     let cell_pin_nets = build_cell_pin_nets(design_db, &pin_geom, num_cells);
+    drop(t_pre);
 
     let mut pass1_eval_fallbacks = 0usize;
     let mut incident_buf: Vec<usize> = Vec::new();
@@ -1164,6 +1171,7 @@ pub fn legalize_placement(
     let mut candidates_buf: Vec<i32> = Vec::new();
     for _round in 0..4 {
         // Pass 1: Equal-width cell swaps
+        let p1 = crate::timing::phase("place.legal.pass1");
         pass1_eval_fallbacks += equal_width_swap_pass_fast(
             design_db,
             tech_db,
@@ -1174,8 +1182,10 @@ pub fn legalize_placement(
             &cell_nets,
             &band_ys,
         );
+        drop(p1);
 
         // Re-synchronize sub_row.cells by bucketing each movable cell into its exact sub_row.
+        let t_resync = crate::timing::phase("place.legal.resync");
         for sr in &mut sub_rows {
             sr.cells.clear();
         }
@@ -1205,8 +1215,10 @@ pub fn legalize_placement(
         for (p, slot) in pin_x.iter_mut().enumerate() {
             *slot = pin_geom.pin_pos(design_db, PinId(p as u32)).0;
         }
+        drop(t_resync);
 
         // Pass 2: Adjacent sub-row cell swaps (single net scan per pair since only x shifts)
+        let t_pass2 = crate::timing::phase("place.legal.pass2");
         for sr in &mut sub_rows {
             let k = sr.cells.len();
             if k < 2 {
@@ -1272,8 +1284,10 @@ pub fn legalize_placement(
                 }
             }
         }
+        drop(t_pass2);
 
         // Pass 3: Single-cell site sliding within sub-row
+        let t_pass3 = crate::timing::phase("place.legal.pass3");
         for sr in &sub_rows {
             let k = sr.cells.len();
             for j in 0..k {
@@ -1377,6 +1391,7 @@ pub fn legalize_placement(
                 }
             }
         }
+        drop(t_pass3);
     }
 
     let final_hpwl_dbu = design_db.compute_hpwl_dbu(tech_db);
@@ -1408,7 +1423,10 @@ pub fn legalize_placement(
     };
 
     // Self-verification
-    verify_legality(design_db, tech_db).context("verify_legality failed on output placement")?;
+    {
+        let _v = crate::timing::phase("place.legal.verify");
+        verify_legality(design_db, tech_db).context("verify_legality failed on output placement")?;
+    }
 
     Ok(LegalizeResult {
         avg_displacement_um,

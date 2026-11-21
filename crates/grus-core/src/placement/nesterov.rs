@@ -242,6 +242,7 @@ pub fn run_nesterov_placement(
     config: &NesterovConfig,
 ) -> NesterovResult {
     let dbu_per_um = design_db.dbu_per_micron.max(1) as f32;
+    let t_init = crate::timing::phase("place.gp.init");
     let wl_precomp = WaWirelengthPrecomp::new(design_db, tech_db);
     let mut density_solver = DensitySolver::new(
         design_db,
@@ -290,6 +291,7 @@ pub fn run_nesterov_placement(
         (core_xl, core_xh, core_yl, core_yh),
         60,
     );
+    drop(t_init);
 
     // Small deterministic perturbation to movable cells
     for c in 0..num_cells {
@@ -317,8 +319,10 @@ pub fn run_nesterov_placement(
     // Initial force and overflow evaluation
     let mut force_x = vec![0.0f32; num_cells];
     let mut force_y = vec![0.0f32; num_cells];
-    let (init_tau, _) =
-        density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y);
+    let (init_tau, _) = {
+        let _d = crate::timing::phase("place.gp.density");
+        density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y)
+    };
 
     let gamma_0 = base_gamma * 10.0f32.powf(2.0 * (init_tau - 0.10));
 
@@ -326,17 +330,20 @@ pub fn run_nesterov_placement(
     let mut dummy_pin_gy = vec![0.0f32; num_pins];
     let mut wl_gx = vec![0.0f32; num_cells];
     let mut wl_gy = vec![0.0f32; num_cells];
-    compute_wa_wirelength_and_grad(
-        design_db,
-        &wl_precomp,
-        &v_x,
-        &v_y,
-        gamma_0,
-        &mut dummy_pin_gx,
-        &mut dummy_pin_gy,
-        &mut wl_gx,
-        &mut wl_gy,
-    );
+    {
+        let _w = crate::timing::phase("place.gp.wl");
+        compute_wa_wirelength_and_grad(
+            design_db,
+            &wl_precomp,
+            &v_x,
+            &v_y,
+            gamma_0,
+            &mut dummy_pin_gx,
+            &mut dummy_pin_gy,
+            &mut wl_gx,
+            &mut wl_gy,
+        );
+    }
 
     let norm_wl = l1_norm_f64(&wl_gx, &wl_gy);
     let norm_force = l1_norm_f64(&force_x, &force_y);
@@ -366,25 +373,30 @@ pub fn run_nesterov_placement(
 
     for k in 0..config.max_iters {
         let tau_k = if k > 0 {
-            let (t, _) =
-                density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y);
+            let (t, _) = {
+                let _d = crate::timing::phase("place.gp.density");
+                density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y)
+            };
             final_overflow = t;
             if t <= config.stop_overflow {
                 converged = true;
                 break;
             }
             let gamma_k = base_gamma * 10.0f32.powf(2.0 * (t - 0.10));
-            compute_wa_wirelength_and_grad(
-                design_db,
-                &wl_precomp,
-                &v_x,
-                &v_y,
-                gamma_k,
-                &mut dummy_pin_gx,
-                &mut dummy_pin_gy,
-                &mut wl_gx,
-                &mut wl_gy,
-            );
+            {
+                let _w = crate::timing::phase("place.gp.wl");
+                compute_wa_wirelength_and_grad(
+                    design_db,
+                    &wl_precomp,
+                    &v_x,
+                    &v_y,
+                    gamma_k,
+                    &mut dummy_pin_gx,
+                    &mut dummy_pin_gy,
+                    &mut wl_gx,
+                    &mut wl_gy,
+                );
+            }
             t
         } else {
             final_overflow = init_tau;
@@ -395,6 +407,7 @@ pub fn run_nesterov_placement(
             init_tau
         };
 
+        let _step = crate::timing::phase("place.gp.step");
         // Compute preconditioned gradient g_k
         let mut g_inf = 1e-6f32;
         for c in 0..num_cells {
@@ -462,8 +475,10 @@ pub fn run_nesterov_placement(
     // The loop exits without a stop check after its last step, so the overflow
     // it last saw belongs to v, not to the returned u.
     if !converged {
-        let (tau_u, _) =
-            density_solver.compute_density_and_forces(&u_x, &u_y, &mut force_x, &mut force_y);
+        let (tau_u, _) = {
+            let _d = crate::timing::phase("place.gp.density");
+            density_solver.compute_density_and_forces(&u_x, &u_y, &mut force_x, &mut force_y)
+        };
         final_overflow = tau_u;
         converged = tau_u <= config.stop_overflow;
     }

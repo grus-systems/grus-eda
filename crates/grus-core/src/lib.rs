@@ -10,6 +10,7 @@ pub mod power;
 pub mod readers;
 pub mod sta;
 pub mod tech_db;
+pub mod timing;
 
 #[cfg(test)]
 mod test_support;
