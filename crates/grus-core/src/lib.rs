@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod bool_expr;
 pub mod congestion;
 pub mod design_db;
 pub mod floorplan;

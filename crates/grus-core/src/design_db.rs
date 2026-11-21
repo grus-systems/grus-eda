@@ -2,6 +2,7 @@ use crate::interner::{
     CellId, LayerId, LibCellId, LibPinId, MacroId, MacroPinId, NetId, PinDir, PinId,
     StringInterner, SymbolId,
 };
+use crate::lib_db::LibDb;
 use crate::tech_db::{RectDbu, TechDb};
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +134,22 @@ impl DesignDb {
         pins.first()
             .copied()
             .filter(|&first_pin| self.pin_is_driver[first_pin.0 as usize])
+    }
+
+    /// Finds the design pin of `cell` whose Liberty pin name is `sym` —
+    /// Liberty names pins by `function`/`related_pin`/`when` text, not by
+    /// the netlist's pin names.
+    pub(crate) fn pin_by_lib_name(
+        &self,
+        lib: &LibDb,
+        cell: CellId,
+        sym: SymbolId,
+    ) -> Option<PinId> {
+        self.cell_pins(cell).iter().copied().find(|&p| {
+            self.pin_lib_pins[p.0 as usize]
+                .map(|lp| lib.pins[lp.0 as usize].name == sym)
+                .unwrap_or(false)
+        })
     }
 
     /// Computes the absolute coordinates (x, y) in DBU for a given pin under its cell's placement and orientation.
