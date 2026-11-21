@@ -18,9 +18,13 @@ per the measured **M1 local-marginal** model.
    expression shape — the per-operator product rules in api.md §3 are the
    same math on the common forms), and
    `d(f) = Σ_i d_i · P(∂f/∂x_i)` with `∂f/∂x_i = f(x_i=0) ⊕ f(x_i=1)`
-   (output sensitization — measured P2). Total and bounded: a missing,
-   constant, unparseable, or over-budget function returns `None`; the net
-   keeps `Default`. See `evaluator.md`.
+   (output sensitization — measured P2). Total and bounded: parse caps
+   recursion depth (`!`/`(`) and AST node count, so a pathological
+   `function` string returns `None` instead of overflowing the stack —
+   the cap then covers every recursive consumer (`cofactor`,
+   `lowest_var`, `const_prob`); `MAX_OPS` bounds Shannon work, not
+   stack. A missing, constant, unparseable, or over-bound function
+   returns `None`; the net keeps `Default`. See `evaluator.md`.
 2. **Levelized fill** inside `activity.rs`. Combinational cells evaluate in
    topological order over the net graph. **Decided: an own Kahn order
    inside `activity.rs`** — `sta::analysis::topological_levels` stays
@@ -110,6 +114,24 @@ needs anyway.
 - Clock-origin nets feeding combinational cells propagate like any seed:
   a cell-driven downstream clock net becomes `Propagated {2/period, 0.5}`
   (unmeasured source label; `mba` has no clock tree — named residual).
+
+## Changes since the rejected r1 design
+
+- `evaluator.md`: added the missing stack bound — `MAX_DEPTH` on parser
+  recursion (`!`/`(` descent) plus `MAX_NODES` on AST construction, which
+  together cap `cofactor`/`lowest_var`/`const_prob`/`prob_rec` depth;
+  `MAX_OPS` now documented as a work bound only. Bound-trip unit tests
+  specified for each cap.
+- `api.md`: documented the first-path-wins collision rule on
+  `annotation.entry(net).or_insert` (sorted dump paths; deterministic,
+  identical on consistent dumps); the dequeue `take()` invariant is a
+  `debug_assert` + `continue`, not `expect`.
+- `evaluator.md`: `const_prob`'s unreachable `Var` arm is a
+  `debug_assert` with a `0.0` fallback — no silent unreachable path, no
+  release panic.
+- `golden.md`: noted the equal-window assumption behind the verbatim
+  `s_partial == s_ports` net-vector compare (`#2000` on both fixtures;
+  raw `eff_toggles` counts are only comparable at equal `window_s`).
 
 ## Files
 

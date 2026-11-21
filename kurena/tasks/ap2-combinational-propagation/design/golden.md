@@ -24,6 +24,17 @@ a per-pin residual table names the annotated non-driver pins.
 Not covered: `s_input_ports` (`-input_ports` per-pin seeds — no override
 surface yet), `s_p40` (uncommitted SDC).
 
+Cross-session assert — `s_partial` vs `s_ports`: the test pins
+`s_partial`'s resolved per-net vectors **verbatim** against `s_ports`'s
+(`prob_one`, `eff_toggles`, `origin` per net — `s_partial`'s only extra
+is the dead flat `n_and` entry). This compares `eff_toggles` as raw
+counts (density × `window_s`), which is valid **only because both
+fixtures record the same window** — `mba_partial.vcd` and
+`mba_ports.vcd` both run to `#2000`, so `duration_s`/`window_s` is
+identical. If either fixture's duration ever changes, the assert must
+switch to `eff_toggles / window_s`; note the assumption in a comment at
+the assert site.
+
 ## Per-net resolution after AP2 (s_none shape)
 
 18 nets: `clk` Clock; `a`,`b` Input/`Annotated`/`Global` per session;

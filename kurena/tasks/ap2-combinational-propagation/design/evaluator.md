@@ -52,14 +52,15 @@ pub enum BoolExpr {
 
 /// Parses `text`; `vars` is the ordered set of identifier names the
 /// caller resolves to pins (each distinct name → one `Var` index, in
-/// first-use order). `None` on any malformed input.
+/// first-use order). `None` on any malformed input and on input over
+/// the depth/node/var bounds below.
 pub fn parse(text: &str) -> Option<(BoolExpr, Vec<String>)>;
 
 /// Exact `P(expr = 1)` under input independence, `p[i]` = `P(var i = 1)`.
 /// Shannon: pick the lowest-indexed free variable `x`, return
 /// `p_x·prob(f|x=1) + (1−p_x)·prob(f|x=0)`; cofactors substitute and
 /// simplify eagerly, so non-degenerate forms collapse early.
-/// `None` when the op bound is exceeded.
+/// `None` when the op bound is exceeded or `p` is short.
 pub fn prob(e: &BoolExpr, p: &[f64]) -> Option<f64>;
 
 /// `P(∂f/∂x_i)` — the probability input `i` is sensitized:
@@ -67,9 +68,35 @@ pub fn prob(e: &BoolExpr, p: &[f64]) -> Option<f64>;
 pub fn sensitivity(e: &BoolExpr, i: usize, p: &[f64]) -> Option<f64>;
 ```
 
-Bounds: variable count ≤ 32 and a total op counter (e.g. 1_000_000 node
-evaluations) — sky130 functions top out at ~10 vars; the bound only
-exists so a hostile/pathological string cannot blow the recursion out.
+## Bounds — the "total and bounded" clause
+
+The evaluator is recursive at two levels, so boundedness needs two
+distinct caps (this is the r1 design's gap: `MAX_OPS` bounded work but
+not stack):
+
+- `MAX_DEPTH = 64` — parser *recursion* depth. `unary` recurses once
+  per `!` and `atom` descends into `expr` once per `(`; a `Parser.depth`
+  counter is incremented before each such recursive call (restored on
+  exit) and trips `None` past the bound. Nodes are constructed only on
+  the way back out of these calls, so a node count alone cannot bound
+  this case — `"!" * 100_000 + "A"` would overflow the stack before any
+  node exists.
+- `MAX_NODES = 2048` — total AST nodes built, bumped at every `BoolExpr`
+  construction. AST depth ≤ node count, so this one bound covers the
+  iterative `'` postfix chain (`"A" + "'" * 100_000` builds deep trees
+  without ever recursing the parser) *and* every recursive consumer:
+  `cofactor`, `lowest_var`, and `const_prob` each recurse to AST depth
+  (≤ 2048); `sensitivity`'s `Xor(f0,f1)` wrap adds at most one level;
+  `prob_rec` recursion depth is additionally ≤ `MAX_VARS` since each
+  level fixes one variable.
+- `MAX_VARS = 32`, `MAX_OPS = 1_000_000` (op counter inside `prob_rec`)
+  as before — `MAX_OPS` bounds Shannon's exponential *work* (a 32-var
+  depth-10 expression can still expand toward 2³² leaves); it does not
+  bound stack and is not asked to.
+
+sky130 `function` strings top out at ~10 vars / ~depth 8 / ~60
+characters; both caps leave two orders of magnitude of headroom while
+keeping worst-case recursion trivially safe for a test-thread stack.
 `Const`/`Var`-free results shortcut to `0.0`/`1.0`.
 
 ## Output activity (the measured M1 model)
@@ -86,6 +113,17 @@ Given resolved inputs `{p_i, d_i}` (densities in transitions/second):
 - An input with `prob_one: None` (never-defined annotated dump) makes the
   output unresolvable — the caller keeps `Default`.
 
+### Internal invariants — no silent unreachable paths
+
+`prob`/`prob_rec` only call `const_prob` (var-free evaluation) after
+`lowest_var` returned `None`, i.e. on trees containing no `Var` node.
+`const_prob`'s `Var` arm is therefore unreachable — encode the invariant
+as `debug_assert!(false, "const_prob reached a Var — lowest_var gate")`
+with a `0.0` fallback, not a silent `0.0` alone and not a panic. Same
+treatment for any internal state that "cannot" happen: `debug_assert`
+the invariant in dev, degrade to `None`/`continue` in release. The
+module stays panic-free in every build mode.
+
 ## Unit tests (in `bool_expr.rs` `#[cfg(test)]`)
 
 - Grammar: each operator, precedence (`!A&B|C` = `((!A)&B)|C`), parens,
@@ -96,7 +134,13 @@ Given resolved inputs `{p_i, d_i}` (densities in transitions/second):
   `p=.55,q=.8`→`0.47`; mux `(A0&!S)|(A1&S)` cross-check vs. hand truth
   table.
 - `sensitivity`: AND `∂/∂a`→`p_b`; XOR→`1.0`; `A&A` `∂/∂a`→`1.0`.
-- Bound: a 40-var expression → `None` (no hang, no panic).
+- Bounds — each cap must convert a would-be stack overflow into `None`:
+  a 40-var expression → `None` (var bound); `"!" * 10_000 + "A"` →
+  `None` (`unary` depth); `"(" * 10_000 + "A"` → `None` (`atom`→`expr`
+  depth); `"A" + "'" * 10_000` → `None` (node bound — no parser
+  recursion is involved here); `"A&" * 5_000 + "A"` → `None` (node
+  bound). None of these may abort — that is the spec's "total and
+  bounded" acceptance line made executable.
 
 ## Files
 

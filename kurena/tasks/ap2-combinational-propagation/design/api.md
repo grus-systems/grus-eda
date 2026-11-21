@@ -85,7 +85,17 @@ fn annotation_net_of(design: &DesignDb, path: &str) -> Option<(PinId, NetId)>;
   through to the `io_pins` name match → `pin_is_driver` → `(pin, net)`
   (a `dut`-scoped leaf is not a cell pin — `tb/dut/a` lands on io `a`;
   `tb/dut/y` lands on io `y`, non-driver → dead).
-- One driver per net ⇒ no contention; entries mapping to nothing
+- Collision rule — **first path wins**: distinct dump paths can resolve
+  to the same driver pin (e.g. `tb/dut/u_and/X` and `tb/other/u_and/X`
+  both match the flat `u_and/X` — hierarchy deeper than the flat cell
+  namespace collapses to the same pin). The `HashMap` insert is
+  `annotation.entry(net).or_insert(*sa)` over `dump_paths` iterated in
+  sorted order, so the lexicographically smallest path wins and the
+  choice is deterministic. On consistent dumps the colliding streams
+  are VCD aliases of the same identifier code and hold identical
+  activity, so the rule only bites on pathological dumps — document it
+  in a comment at the `or_insert` site either way.
+- Entries mapping to nothing
   (non-driver io pins, input instance pins, unknown names) are dead —
   count them into a `dead_annotation_entries: usize` on
   `ActivityResolution` for the results entry (`s_full`: 15 dead of 18 —
@@ -117,11 +127,13 @@ driver pin's `LibPin.function`:
   (`pub(crate)`, same body; `activity.rs` sits upstream of `power.rs` so
   it cannot call into `power`, and a duplicated copy would drift — the
   two `power.rs` callsites switch to the method). A var matching no
-  pin, a pin with no net, or an unparseable/over-bound expression →
+  pin, a pin with no net, or a `parse` `None` (malformed or over the
+  `MAX_DEPTH`/`MAX_NODES`/`MAX_VARS` bounds — see `evaluator.md`) →
   stays `Default`, counted in `unresolvable_functions` (the "sky130 lib
   count" the acceptance asks to record — measure on `tt_025C_1v80`; PG
   forms like `!VPWR+VGND` parse fine but their vars match no design pin
-  and land here).
+  and land here). An eval-side `prob`/`sensitivity` `None` (op budget,
+  short `p`) lands in the same counter.
 - Only *referenced* inputs gate: `ebufn`'s `(A)` ignores `TE_B`; a
   `Default` on an unreferenced input does not taint.
 
@@ -132,7 +144,12 @@ with driver cell `c`, `deps(m)` = the distinct nets of `c`'s
 function-referenced input pins; `indeg(m)` = number of `deps` that are
 themselves candidates; `dependents(n)` accumulates the reverse edges.
 Queue = candidates with `indeg 0`, popped in `NetId` order (deterministic
-output for tests). On visiting `m`:
+output for tests). A candidate enqueues at most once (its `indeg` reaches
+0 exactly once), so the dequeue `take()` of its slot is never empty —
+encode that invariant as `let Some(cand) = candidates[m].take() else {
+debug_assert!(false, "candidate dequeued twice"); continue; }`, not
+`expect`: an impossible state must not carry a release panic path. On
+visiting `m`:
 
 - Every function var's input net has `origin ∉ {Default, Unknown}` and
   `prob_one.is_some()` → evaluate `P(f)`, `d(f)`; write
@@ -156,9 +173,9 @@ seq-driven `Default` seeds, not candidates) → tainted → `Default` ✓.
 
 ```rust
 /// Nets left `Default` because the driver pin's `function` was
-/// unparseable, over the eval bound, or named vars matching no input
-/// pin of the cell (AP2 diagnostic — sky130 coverage recorded in
-/// docs/results.md).
+/// unparseable, over a parse/eval bound, or named vars matching no
+/// input pin of the cell (AP2 diagnostic — sky130 coverage recorded
+/// in docs/results.md).
 pub unresolvable_functions: usize,
 /// Dump entries matching no driver pin (dead annotations — flat
 /// internal names, sink pins, unknown names). Diagnostic only.

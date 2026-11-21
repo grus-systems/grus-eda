@@ -6,8 +6,12 @@ green before the next).
 
 ## 1. `crates/grus-core/src/bool_expr.rs` + `lib.rs`
 
-- `BoolExpr`, `parse`, `prob`, `sensitivity` per `evaluator.md`; unit
-  tests in-module. `pub mod bool_expr;` in `lib.rs`.
+- `BoolExpr`, `parse`, `prob`, `sensitivity` per `evaluator.md`,
+  including the parse-time `MAX_DEPTH` (parser recursion) and
+  `MAX_NODES` (AST size) caps — the bound-trip tests
+  (`"!"`/`"(`/`'`/flat chains → `None`, no abort) are part of the unit
+  tests. `const_prob`'s unreachable `Var` arm is `debug_assert` +
+  `0.0` fallback. `pub mod bool_expr;` in `lib.rs`.
 - Gate: `cargo test -p grus-core bool_expr` green; clippy-clean.
 
 ## 2. `readers/vcd.rs` — `pin_signals`
@@ -35,9 +39,11 @@ green before the next).
   (`pub(crate)`; switch the two `power.rs` callsites).
 - `annotation_net_of` + the `HashMap<NetId, SignalActivity>` annotation
   map; the `vcd.signals.get(name)` arm reads the map. Precedence chain
-  untouched.
+  untouched. The `or_insert` site carries the first-path-wins collision
+  comment (`api.md` §1).
 - Comb-candidate DAG + Kahn fill per `api.md` §2; `unresolvable_functions`,
-  `dead_annotation_entries` on `ActivityResolution`.
+  `dead_annotation_entries` on `ActivityResolution`. The dequeue
+  `take()` is `let Some(...) else { debug_assert!(...); continue; }`.
 - Gate: `cargo check` green; `cargo test --workspace` — the `mba` test
   stays green **as written** (`s_none`/`s_input` divergent pins are still
   divergent — the new `propagated` resolution only changes their origin
