@@ -1032,8 +1032,9 @@ mod tests {
                 }
                 None => VcdActivity::default(),
             };
-            let (sess_sdc, sess_slews) = match sdc_file {
-                Some(_) => (&sdc_p40, &pin_slews_p40),
+            let (sess_sdc, sess_slews) = match *sdc_file {
+                Some("mba_p40.sdc") => (&sdc_p40, &pin_slews_p40),
+                Some(other) => panic!("{sess}: unmapped sdc {other}"),
                 None => (&sdc, &pin_slews),
             };
             let golden = &ref_json[sess]["activity"];

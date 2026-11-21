@@ -5296,8 +5296,14 @@ divide-by-two.
   `Unknown {0,0}` and taints downstream like any other seed.
 - `ActivityOverrides.input_ports`: `set_power_activity -input_ports`
   is now distinct from the `-input` seed (the measured OpenSTA
-  semantics: `-input_ports` seeds only primary input *ports*, `-input`
-  seeds every undriven net).
+  semantics: `-input_ports` seeds only primary input *ports* — nets
+  driven by an io pin — while `-input` seeds every undriven net; the
+  `s_input_ports` golden reads `user` on `a`/`b` and `input` on the
+  undriven `n_float`). Precedence: `clock` > `-global` > `-input_ports`
+  > dump annotation > `-input` — losing to `-global`/`clock` is
+  measured (`s_input_ports`'s `clk` reads `clock`); beating a dump
+  entry on the same port net is a chosen order, unmeasured (no
+  committed session mixes them).
 - `tests/designs/microbench/mba_p40.sdc` (period 40 ns): `s_p40`
   proves the seed densities follow the clock period — `clk` `5e7`,
   inputs `2.5e6`, `u_df/Q` propagated `2.5e6` (halved from the 20 ns
@@ -5315,24 +5321,66 @@ divide-by-two.
 **Measured result**: all 12 sessions match the golden per-pin
 verbatim at the strict bound; the divergent set is empty on every
 session. Group columns (Sequential / Combinational / Clock / total
-rows, all four watt columns) asserted at the recorded bounds —
-internal/switching ≤ 0.5%, leakage ≤ 1%, total ≤ 0.3%. Measured
-residuals: sequential internal and all leakage columns exact to the
-golden's print precision; sequential switching −0.26% on the global
-sessions only; combinational internal +0.11%…+0.32% (worst `s_xz`);
-combinational switching −0.09%…−0.16%; every total column within
-0.14%. `driven_nets_without_activity` is 4 (the unknown feedback
-nets) on unseeded sessions, 0 on the global ones.
+rows, all four watt columns) are asserted at the recorded bounds —
+internal/switching ≤ 0.5%, leakage ≤ 1%, total ≤ 0.3%. Per-session
+measured residuals (`(ours − golden)/golden`, temp-instrumented run
+of the committed test; `Clock` rows are all-zero):
 
-**Sequential coverage residual** (sky130 census,
-`sky130_fd_sc_hd__tt_025C_1v80.lib`): 87 sequential groups (69 `ff`,
-18 `latch`). 56 use the bare data-pin form (`next_state`/`data_in`
-`"D"`) and resolve; 31 carry a complex expression — 19 scan-mux
-`(D&!SCE)|(SCD&SCE)`, 7 data-enable `(D&DE)|(IQ&!DE)`, 5 scan+DE
-`(D&DE&!SCE)|(IQ&!DE&!SCE)|(SCD&SCE)` — and 52 groups also carry
-`preset`/`clear` attributes, none of which the model reads. The
-multi-output inversion arm (QN = `1 − P`) is defined but unexercised:
-`mba`'s `dfxtp` is single-Q.
+| session | Seq int | Seq sw | Seq leak | Comb int | Comb sw | Comb leak | total |
+|---|---|---|---|---|---|---|---|
+| `s_none` | 0 | 0 | 0 | +0.113% | −0.096% | 0 | −0.012% |
+| `s_input` | 0 | 0 | 0 | +0.188% | −0.090% | 0 | −0.015% |
+| `s_input_ports` | 0 | 0 | 0 | +0.206% | −0.090% | 0 | −0.015% |
+| `s_global` | 0 | −0.263% | 0 | −0.132% | −0.156% | 0 | −0.088% |
+| `s_global_density` | 0 | −0.263% | 0 | −0.132% | −0.156% | 0 | −0.136% |
+| `s_p40` | 0 | 0 | 0 | +0.113% | −0.096% | 0 | −0.012% |
+| `s_ports` | 0 | 0 | 0 | +0.123% | −0.100% | 0 | −0.009% |
+| `s_ports_a2x` | 0 | 0 | 0 | +0.132% | −0.090% | 0 | −0.010% |
+| `s_partial` | 0 | 0 | 0 | +0.123% | −0.100% | 0 | −0.009% |
+| `s_full` | 0 | 0 | 0 | +0.123% | −0.100% | 0 | −0.009% |
+| `s_xz` | 0 | 0 | 0 | +0.317% | −0.094% | 0 | −0.004% |
+| `s_partial2` | 0 | 0 | 0 | −0.069% | −0.087% | 0 | −0.012% |
+
+Sequential internal and every leakage column are exact to the
+golden's print precision; sequential switching diverges only on the
+two global sessions (−0.263% — the same switched-capacitance term the
+AP2 entries name); combinational internal tops at +0.317% (`s_xz`),
+combinational switching at −0.156% (`s_global*`); every total column
+within 0.14%. `driven_nets_without_activity` is 4 (the unknown
+feedback nets) on unseeded sessions, 0 on the global ones (moved 5 →
+4 from the AP2 residual — net `q` leaves the count).
+
+**Recorded choices on the new origins**: `Unknown` nets carry
+`prob_one: Some(0.0)`, not `None` — it matches the golden's printed
+`0.000`, and it keeps a `when` literal on an unknown net expressible
+at weight 0 rather than counted inexpressible
+(`conditional_power_blocks`); OpenSTA's own `when` weight on
+`unknown` nets is unmeasured, recorded. A `prob_one: None` data net
+(x-only annotation) taints the Q copy like a combinational input —
+recorded, unmeasured. Post-resolution `Default` is an impossible
+origin: every leftover — feedback cycles, tainted cones,
+expression-form data pins, eval failures — lands `Unknown {0,0}`.
+
+**Sequential coverage residual** (cell-level census of
+`sky130_fd_sc_hd__tt_025C_1v80.lib`, reproduce script in
+`kurena/tasks/ap3-sequential-activity/design/census.md` — **37 of
+63** sequential cells covered): 45 `ff` cells + 18 `latch` cells. 19
+`ff` cells use the bare form `next_state : "D"` and all 18 `latch`
+cells use `data_in : "D"` — those resolve. 26 `ff` cells carry a
+complex `next_state` expression and stay `data_pin: None` — 19
+scan-mux `(D&!SCE)|(SCD&SCE)` (`sdf*`), 2 data-enable
+`(D&DE)|(IQ&!DE)` (`edf*`), 5 scan+enable
+`(D&DE&!SCE)|(IQ&!DE&!SCE)|(SCD&SCE)` (`sedf*`); their output nets
+resolve `Default` → `unknown {0,0}` (OpenSTA's choice for a muxed D
+is unmeasured). 28 of the 45 `ff` cells also carry `clear`/`preset`
+attributes alongside the bare `"D"` — they parse as covered and the
+async pin is ignored by the copy rule (unmeasured, recorded). The 24
+`test_cell`-nested `ff` copies (all `next_state : "D"`) are excluded
+from the census exactly as the parser skips `test_cell` groups
+whole. Every sequential output pin's `function` in the lib is `IQ`
+or `IQ_N`; the multi-output inversion arm (QN = `1 − P`) is defined
+for the covered `*bp` cells but unexercised — `mba`'s `dfxtp` is
+single-Q (measured-adjacent).
 
 **Moved goldens**: `mba.activity.reference.json` byte-identical — it
 already held the AP3 records (all 12 sessions incl. `s_p40`, `u_df/Q`

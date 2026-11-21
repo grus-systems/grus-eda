@@ -129,7 +129,7 @@ pub struct ActivityResolution {
     /// Nets per origin — the `report_activity_annotation` split shape,
     /// per net (OpenSTA's split is per pin; recorded difference).
     pub origin_counts: BTreeMap<String, usize>,
-    /// Nets left `Default` because the driver pin's `function` was
+    /// Nets ending `Unknown` because the driver pin's `function` was
     /// unparseable, over a parse/eval bound, or named variables matching
     /// no input pin of the cell (AP2 diagnostic — counted at
     /// `comb_funcs` build for every origin, plus eval-side failures).
