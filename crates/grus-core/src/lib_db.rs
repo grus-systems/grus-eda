@@ -183,12 +183,34 @@ pub struct LibLeakageState {
     pub power_w: f32,
 }
 
+/// Sequential-cell data-pin reference, present on `ff`/`latch` cells
+/// (the same cells `is_sequential`/`is_latch` flag).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LibSeq {
+    /// `ff (v1, v2)` / `latch (v1, v2)` state variable v1 (`"IQ"`).
+    /// An output pin whose `function` is exactly this name is the
+    /// non-inverted state output.
+    pub state_var: SymbolId,
+    /// State variable v2 (`"IQ_N"`) — the inverted output; absent when
+    /// the block declares one variable.
+    pub state_var_n: Option<SymbolId>,
+    /// The sequential data pin: `ff.next_state` / `latch.data_in` when
+    /// the attribute is a bare pin name (`"D"`). `None` on expression
+    /// forms — scan mux `"(D&!SCE) | (SCD&SCE)"`, data-enable
+    /// `"(D&DE) | (IQ&!DE)"`, scan+enable — a named residual
+    /// (docs/results.md census).
+    pub data_pin: Option<SymbolId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LibCell {
     pub name: SymbolId,
     pub area: f32,
     pub is_sequential: bool, // true if ff() block present
     pub is_latch: bool,      // true if latch() block present
+    /// `ff`/`latch` block data-pin reference; `None` when the cell has no
+    /// sequential block or the block declares no state variables.
+    pub seq: Option<LibSeq>,
     pub pin_offset: u32,
     pub pin_count: u16,
     pub arc_offset: u32,

@@ -14,11 +14,13 @@
 //!   state expression holds.
 //!
 //! Activity is resolved per net by [`resolve_activity`] in the measured seed
-//! order (constant → clock → global → annotation → input → default, then
-//! combinational propagation over `Default` entries; docs/results.md
-//! 2026-11-21 N7): a dump annotates nets through their driver pins, every
-//! other net takes its class default, and combinational cell outputs derive
-//! the M1 local-marginal fill — sequential rules are AP3. Slews come from
+//! order (constant → clock → global → `-input_ports` → annotation → input →
+//! default, then sequential Q=D copy and combinational propagation in one
+//! fixed point, leftovers `unknown`; docs/results.md 2026-11-21 N7): a dump
+//! annotates nets through their driver pins, every
+//! other net takes its class default, combinational cell outputs derive
+//! the M1 local-marginal fill, and a sequential output copies its data
+//! pin's net. Slews come from
 //! [`sta_pin_slews`]. Edges involving x/z count
 //! half a transition each, and per-direction lookups consume half the effective
 //! count — both measured OpenSTA behaviors (docs/results.md N7). `when` forms
@@ -52,10 +54,9 @@ pub struct PowerDiagnostics {
     /// Instances whose LEF cell has no Liberty counterpart (no leakage/pin data).
     pub cells_without_lib_cell: usize,
     /// Driven nets with no measured, seeded, or derived activity source —
-    /// resolved origin `Default` (the interim fill) or `Unknown`; the AP2
-    /// `Propagated` fill counts as derived and shrinks this counter on
-    /// partial annotation. Such a net's `prob_one` is the seed probability,
-    /// so `when` literals on it evaluate rather than counting inexpressible.
+    /// resolved origin `Unknown` (post-resolution `Default` is impossible).
+    /// Such a net's `prob_one` is `Some(0.0)`, so `when` literals on it
+    /// evaluate at weight 0 rather than counting inexpressible.
     pub driven_nets_without_activity: usize,
     /// Nets per resolved activity origin — the `report_activity_annotation`
     /// split shape. OpenSTA's split is per pin; ours is per net (recorded
@@ -126,7 +127,7 @@ struct PowerCx<'a> {
     design: &'a DesignDb,
     lib: &'a LibDb,
     /// Resolved activity per net (`resolve_activity` output); every net has
-    /// an origin — `Default` is the AP1 interim fill for unseeded nets.
+    /// an origin — `Unknown` marks the unresolvable cones.
     net_activity: Vec<ResolvedActivity>,
     /// Total load capacitance per net per output transition, pF: wire cap plus
     /// sink pin caps (and SDC output loads), the same quantity STA's `net_load`
@@ -406,15 +407,12 @@ pub fn estimate_power(
             ..Default::default()
         },
     };
-    // Per-net load caps; driven nets whose origin is the interim `Default`
-    // fill (or `Unknown`) have no measured, seeded, or derived source.
+    // Per-net load caps; driven nets whose origin is `Unknown` have no
+    // measured, seeded, or derived source.
     for n in 0..design.num_nets() {
         let net = NetId(n as u32);
         if design.net_driver(net).is_some()
-            && matches!(
-                cx.net_activity(net).origin,
-                ActivityOrigin::Default | ActivityOrigin::Unknown
-            )
+            && cx.net_activity(net).origin == ActivityOrigin::Unknown
         {
             cx.diagnostics.driven_nets_without_activity += 1;
         }
@@ -536,6 +534,7 @@ mod tests {
             area: 0.0,
             is_sequential: false,
             is_latch: false,
+            seq: None,
             pin_offset: 0,
             pin_count: 0,
             arc_offset: 0,
@@ -854,17 +853,18 @@ mod tests {
         check_groups(&ref_json["power_saif"], &report, "saif");
     }
 
-    /// AP2 activity-propagation golden: `resolve_activity` on `mba` must
-    /// reproduce OpenSTA's per-pin `{density, prob, source}` in the ten
+    /// AP3 activity-propagation golden: `resolve_activity` on `mba` must
+    /// reproduce OpenSTA's per-pin `{density, prob, source}` in all 12
     /// committed sessions of `mba.activity.reference.json` (emitted by the
     /// committed `generate_activity_ref.sh` inside LibreLane 3.0.16).
-    /// `s_global*` pins all 43 pins strict inside the established power
-    /// bounds; the propagation sessions assert every `Propagated`/`seeded`
-    /// value strictly under the source mapping rules below. The surviving
-    /// divergent set is exactly the AP3 residual (net `q`'s sequential
-    /// Q=D copy plus the `unknown` cone), pinned in `EXPECTED_DIVERGENT`.
-    /// `s_p40` (uncommitted 40 ns SDC) and `s_input_ports` (no override
-    /// surface yet) stay uncovered.
+    /// Every session asserts all 43 pins strict under the source mapping
+    /// rules below — `EXPECTED_DIVERGENT` is empty: net `q`'s sequential
+    /// Q=D copy (`u_df/Q`, `qd`) lands `propagated` verbatim (tracking
+    /// `a`, including `s_ports_a2x`'s 6e6/0.55 density doubling and
+    /// `s_xz`'s x-degraded 0.40), and the 11 `unknown`-cone pins on nets
+    /// `n_q0`/`n_q0n`/`n_q1`/`n_c1d` compare strict at `{0, 0}` `unknown`.
+    /// `s_full`'s output port `y` stays the one per-pin residual
+    /// (`PER_PIN_RESIDUAL` — per-pin vs per-net annotation, AP4 scope).
     #[test]
     fn test_activity_defaults_mba_matches_opensta() {
         let hd = sky130_hd();
@@ -883,6 +883,12 @@ mod tests {
         let design = crate::readers::parse_def(&def_path, &tech_db, Some(&lib)).expect("def");
         let sdc = crate::sta::load_sdc(&sdc_path).expect("sdc");
         let pin_slews = crate::sta::sta_pin_slews(&design, &lib, &sdc, None).expect("pin slews");
+        // `s_p40` runs the period-40 SDC the generator writes inline to
+        // `/tmp/mba40.sdc` (committed here verbatim) — f_clk 2.5e7, input
+        // seed 2.5e6, clock 5e7.
+        let sdc_p40 = crate::sta::load_sdc(&require(dir.join("mba_p40.sdc"))).expect("sdc p40");
+        let pin_slews_p40 =
+            crate::sta::sta_pin_slews(&design, &lib, &sdc_p40, None).expect("pin slews p40");
 
         let ref_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&ref_path).expect("reference json"))
@@ -926,14 +932,10 @@ mod tests {
                 other => other,
             }
         }
-        // The pins the AP2 fill cannot reproduce yet — net `q`'s sequential
-        // Q=D copy (`u_df/Q` and its output-port pin `qd`, which shares the
-        // residual) plus the 11 `unknown`-cone pins. Same set on every
-        // strict session; `s_global*` expects none.
-        static EXPECTED_DIVERGENT: &[&str] = &[
-            "q0", "q1", "qd", "u_df/Q", "u_f0/D", "u_f0/Q", "u_i0/A", "u_i0/Y", "u_f1/D",
-            "u_f1/Q", "u_x1/A", "u_x1/B", "u_x1/X",
-        ];
+        // AP3 closed the 13-pin residual: net `q`'s sequential Q=D copy
+        // reads `propagated` and the 11 `unknown`-cone pins compare
+        // strict at `{0, 0}` — a new divergent pin fails loudly.
+        static EXPECTED_DIVERGENT: &[&str] = &[];
         // Golden annotated pins that are not their net's resolving pin —
         // `s_full`'s output port `y` holds `vcd 3e6/0.25` while net `y`'s
         // driver `u_xor/X` reads `propagated 6e6/0.47`; the per-pin vs
@@ -944,14 +946,25 @@ mod tests {
             density_per_s,
             prob_one,
         };
-        let sessions: [(&str, ActivityOverrides, Option<&str>); 10] = [
-            ("s_none", ActivityOverrides::default(), None),
+        // (session, overrides, vcd file, sdc file — `None` ⇒ `mba.sdc`).
+        let sessions: [(&str, ActivityOverrides, Option<&str>, Option<&str>); 12] = [
+            ("s_none", ActivityOverrides::default(), None, None),
             (
                 "s_input",
                 ActivityOverrides {
                     input: Some(setting(1e7, 0.4)),
                     ..Default::default()
                 },
+                None,
+                None,
+            ),
+            (
+                "s_input_ports",
+                ActivityOverrides {
+                    input_ports: Some(setting(1e7, 0.4)),
+                    ..Default::default()
+                },
+                None,
                 None,
             ),
             (
@@ -961,6 +974,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                None,
             ),
             (
                 "s_global_density",
@@ -969,24 +983,39 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                None,
             ),
-            ("s_ports", ActivityOverrides::default(), Some("mba_ports.vcd")),
+            ("s_p40", ActivityOverrides::default(), None, Some("mba_p40.sdc")),
+            (
+                "s_ports",
+                ActivityOverrides::default(),
+                Some("mba_ports.vcd"),
+                None,
+            ),
             (
                 "s_ports_a2x",
                 ActivityOverrides::default(),
                 Some("mba_ports_a2x.vcd"),
+                None,
             ),
             (
                 "s_partial",
                 ActivityOverrides::default(),
                 Some("mba_partial.vcd"),
+                None,
             ),
-            ("s_full", ActivityOverrides::default(), Some("mba_full.vcd")),
-            ("s_xz", ActivityOverrides::default(), Some("mba_xz.vcd")),
+            (
+                "s_full",
+                ActivityOverrides::default(),
+                Some("mba_full.vcd"),
+                None,
+            ),
+            ("s_xz", ActivityOverrides::default(), Some("mba_xz.vcd"), None),
             (
                 "s_partial2",
                 ActivityOverrides::default(),
                 Some("mba_partial2.vcd"),
+                None,
             ),
         ];
 
@@ -996,22 +1025,22 @@ mod tests {
         // `s_partial`'s only difference from `s_ports` is the dead flat
         // `n_and` entry — the resolved per-net vectors must be identical.
         let mut partial_nets: Vec<crate::activity::ResolvedActivity> = Vec::new();
-        for (sess, overrides, vcd_file) in &sessions {
+        for (sess, overrides, vcd_file, sdc_file) in &sessions {
             let vcd = match vcd_file {
                 Some(f) => {
                     crate::readers::load_vcd(&require(dir.join(f))).expect("vcd")
                 }
                 None => VcdActivity::default(),
             };
+            let (sess_sdc, sess_slews) = match sdc_file {
+                Some(_) => (&sdc_p40, &pin_slews_p40),
+                None => (&sdc, &pin_slews),
+            };
             let golden = &ref_json[sess]["activity"];
             let resolution = crate::activity::resolve_activity(
-                &design,
-                &lib,
-                &sdc,
-                &vcd,
-                overrides,
+                &design, &lib, sess_sdc, &vcd, overrides,
             );
-            // AP2 diagnostics: `s_partial`'s flat `n_and` dump entry names
+            // Diagnostics: `s_partial`'s flat `n_and` dump entry names
             // no driver pin and lands dead (the other pins in that dump
             // resolve, keeping the session identical to `s_ports`);
             // `s_full` dumps all 18 pins — the 15 non-driver pins (cell
@@ -1041,8 +1070,8 @@ mod tests {
                         ("clock", 1),
                         ("constant", 4),
                         ("input", 3),
-                        ("propagated", 5),
-                        ("default", 5),
+                        ("propagated", 6),
+                        ("unknown", 4),
                     ]),
                     "s_none origin_counts"
                 );
@@ -1075,11 +1104,9 @@ mod tests {
                     assert_eq!(r.origin.label(), label, "{sess} {pin}: source");
                 };
                 match src {
-                    // The AP3 sequential Q=D copy and the `unknown` cone —
-                    // ours stays `Default` there (asserted as divergent).
-                    "unknown" => {
-                        divergent.insert(pin.as_str());
-                    }
+                    // Strict {0,0} + `unknown` label — the sequential
+                    // feedback-cone leftovers converted post-pass.
+                    "unknown" => strict("unknown"),
                     // Strict {d,P}; the origin label is `propagated` on
                     // comb-derived nets, `annotated`/`input` where the pin
                     // sits on a seeded net (OpenSTA re-derives per pin).
@@ -1111,13 +1138,10 @@ mod tests {
                     other => strict(expected_label(other)),
                 }
             }
-            // `s_global*` covers every non-clock non-constant pin, so its
-            // golden holds no divergent sources at all.
-            let expected: std::collections::BTreeSet<&str> = if sess.starts_with("s_global") {
-                std::collections::BTreeSet::new()
-            } else {
-                EXPECTED_DIVERGENT.iter().copied().collect()
-            };
+            // AP3: the divergent set is empty on every session — a new
+            // one fails loudly.
+            let expected: std::collections::BTreeSet<&str> =
+                EXPECTED_DIVERGENT.iter().copied().collect();
             assert_eq!(
                 divergent, expected,
                 "{sess}: the divergent-source pin set moved"
@@ -1149,87 +1173,68 @@ mod tests {
             let report = estimate_power(
                 &design,
                 &lib,
-                &sdc,
+                sess_sdc,
                 None,
                 &vcd,
-                &pin_slews,
+                sess_slews,
                 overrides,
             );
             let groups = &ref_json[sess]["groups"];
             let delta = |ours: f64, golden: f64| (ours - golden).abs();
-            if sess.starts_with("s_global") {
-                // Measured residuals against OpenSTA (docs/results.md N7):
-                // group internal/switching <= 0.27% — OpenSTA's switched
-                // capacitance appears to carry a small term we do not
-                // reproduce; sequential internal and all leakage columns are
-                // exact modulo the golden's print precision.
-                let check =
-                    |label: &str, ours: f64, reference: f64, rel: f64, abs_floor: f64| {
-                        let bound = (reference.abs() * rel).max(abs_floor);
-                        assert!(
-                            delta(ours, reference) <= bound,
-                            "{sess} {label}: ours {ours:e} vs opensta {reference:e} (|diff| {:.3e} > bound {bound:.3e})",
-                            delta(ours, reference)
-                        );
-                    };
-                for name in ["Sequential", "Combinational", "Clock"] {
-                    let g = report
-                        .groups
-                        .iter()
-                        .find(|g| g.name == name)
-                        .unwrap_or_else(|| panic!("{sess} group {name} missing"));
-                    let r = &groups[name];
-                    check(
-                        &format!("{name} internal"),
-                        g.internal_w,
-                        r["internal_w"].as_f64().unwrap(),
-                        0.005,
-                        0.0,
+            // Every session asserts at the measured bound (docs/results.md
+            // N7): internal/switching <= 0.5% — OpenSTA's switched
+            // capacitance appears to carry a small term we do not
+            // reproduce; sequential internal and all leakage columns are
+            // exact modulo the golden's print precision.
+            let check =
+                |label: &str, ours: f64, reference: f64, rel: f64, abs_floor: f64| {
+                    let bound = (reference.abs() * rel).max(abs_floor);
+                    assert!(
+                        delta(ours, reference) <= bound,
+                        "{sess} {label}: ours {ours:e} vs opensta {reference:e} (|diff| {:.3e} > bound {bound:.3e})",
+                        delta(ours, reference)
                     );
-                    check(
-                        &format!("{name} switching"),
-                        g.switching_w,
-                        r["switching_w"].as_f64().unwrap(),
-                        0.005,
-                        0.0,
-                    );
-                    check(
-                        &format!("{name} leakage"),
-                        g.leakage_w,
-                        r["leakage_w"].as_f64().unwrap(),
-                        0.01,
-                        1e-14,
-                    );
-                }
-                let t = &groups["total"];
-                check("total internal", report.internal_w, t["internal_w"].as_f64().unwrap(), 0.005, 0.0);
+                };
+            for name in ["Sequential", "Combinational", "Clock"] {
+                let g = report
+                    .groups
+                    .iter()
+                    .find(|g| g.name == name)
+                    .unwrap_or_else(|| panic!("{sess} group {name} missing"));
+                let r = &groups[name];
                 check(
-                    "total switching",
-                    report.switching_w,
-                    t["switching_w"].as_f64().unwrap(),
+                    &format!("{name} internal"),
+                    g.internal_w,
+                    r["internal_w"].as_f64().unwrap(),
                     0.005,
                     0.0,
                 );
-                check("total leakage", report.leakage_w, t["leakage_w"].as_f64().unwrap(), 0.01, 1e-14);
-                check("total", report.total_w, t["total_w"].as_f64().unwrap(), 0.003, 0.0);
-            } else {
-                // AP2 residual on propagation sessions: net `q`'s sequential
-                // Q=D copy plus the four `unknown`-cone nets — measured for
-                // the record; bounds tighten when AP3 lands
-                // (docs/results.md).
-                let t = &groups["total"];
-                for (col, ours) in [
-                    ("internal_w", report.internal_w),
-                    ("switching_w", report.switching_w),
-                    ("total_w", report.total_w),
-                ] {
-                    let golden = t[col].as_f64().unwrap();
-                    eprintln!(
-                        "{sess} {col}: ours {ours:.6e} vs opensta {golden:.6e} ({:+.3}%)",
-                        100.0 * (ours - golden) / golden
-                    );
-                }
+                check(
+                    &format!("{name} switching"),
+                    g.switching_w,
+                    r["switching_w"].as_f64().unwrap(),
+                    0.005,
+                    0.0,
+                );
+                check(
+                    &format!("{name} leakage"),
+                    g.leakage_w,
+                    r["leakage_w"].as_f64().unwrap(),
+                    0.01,
+                    1e-14,
+                );
             }
+            let t = &groups["total"];
+            check("total internal", report.internal_w, t["internal_w"].as_f64().unwrap(), 0.005, 0.0);
+            check(
+                "total switching",
+                report.switching_w,
+                t["switching_w"].as_f64().unwrap(),
+                0.005,
+                0.0,
+            );
+            check("total leakage", report.leakage_w, t["leakage_w"].as_f64().unwrap(), 0.01, 1e-14);
+            check("total", report.total_w, t["total_w"].as_f64().unwrap(), 0.003, 0.0);
         }
         assert_eq!(
             residual.iter().copied().collect::<Vec<_>>(),

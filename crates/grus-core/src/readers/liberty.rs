@@ -1,6 +1,6 @@
 use crate::interner::{LibPinId, PinDir, SymbolId};
 use crate::lib_db::{
-    LibCell, LibDb, LibLeakageState, LibPin, LibPinInternalPower, LibTimingArc, NldmTable,
+    LibCell, LibDb, LibLeakageState, LibPin, LibPinInternalPower, LibSeq, LibTimingArc, NldmTable,
     TableAxisVar, TimingSense, TimingType,
 };
 use anyhow::{Context, Result, bail};
@@ -16,7 +16,7 @@ use xxhash_rust::xxh3::xxh3_64;
 const CACHE_MAGIC: [u8; 8] = *b"GRUSLIB2";
 // Bump when the serialized LibDb layout changes (e.g. new TimingType variants shift
 // discriminant values and old caches would deserialize `Other` arcs as real types).
-const CACHE_VERSION: u32 = 8;
+const CACHE_VERSION: u32 = 9;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -617,6 +617,7 @@ fn parse_cell_body(
     let mut area = 0.0f32;
     let mut is_sequential = false;
     let mut is_latch = false;
+    let mut seq = None;
     let mut cell_leakage_raw: Option<f32> = None;
     let mut leakage_states = Vec::new();
 
@@ -640,85 +641,16 @@ fn parse_cell_body(
             }
             Token::Ident("ff") => {
                 is_sequential = true;
-                if let Some(Token::LParen) = lexer.next_token() {
-                    // Extract var1 and var2
-                    let mut vars = Vec::new();
-                    while let Some(arg) = lexer.next_token() {
-                        match arg {
-                            Token::RParen => break,
-                            Token::Ident(s) | Token::Str(s) => vars.push(s.to_string()),
-                            _ => {}
-                        }
-                    }
-                    if let Some(Token::LBrace) = lexer.next_token() {
-                        lexer.skip_balanced_braces();
-                    }
-                    for var in vars {
-                        let sym = db.strings.intern(&var);
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            local_pin_names.entry(sym)
-                        {
-                            let global_id = LibPinId(
-                                u16::try_from(db.pins.len())
-                                    .context("Liberty pin count exceeds u16")?,
-                            );
-                            e.insert(global_id);
-                            db.pins.push(LibPin {
-                                name: sym,
-                                dir: PinDir::Internal,
-                                cap_rise: 0.0,
-                                cap_fall: 0.0,
-                                cap_nom: 0.0,
-                                is_clock: false,
-                                max_cap: None,
-                                max_transition: None,
-                                function: None,
-                                is_tristate: false,
-                                internal_power: Vec::new(),
-                            });
-                        }
-                    }
+                if let Some(parsed) = parse_seq_cell_block(lexer, db, &mut local_pin_names, "next_state")?
+                {
+                    seq = Some(parsed);
                 }
             }
             Token::Ident("latch") => {
                 is_latch = true;
-                if let Some(Token::LParen) = lexer.next_token() {
-                    let mut vars = Vec::new();
-                    while let Some(arg) = lexer.next_token() {
-                        match arg {
-                            Token::RParen => break,
-                            Token::Ident(s) | Token::Str(s) => vars.push(s.to_string()),
-                            _ => {}
-                        }
-                    }
-                    if let Some(Token::LBrace) = lexer.next_token() {
-                        lexer.skip_balanced_braces();
-                    }
-                    for var in vars {
-                        let sym = db.strings.intern(&var);
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            local_pin_names.entry(sym)
-                        {
-                            let global_id = LibPinId(
-                                u16::try_from(db.pins.len())
-                                    .context("Liberty pin count exceeds u16")?,
-                            );
-                            e.insert(global_id);
-                            db.pins.push(LibPin {
-                                name: sym,
-                                dir: PinDir::Internal,
-                                cap_rise: 0.0,
-                                cap_fall: 0.0,
-                                cap_nom: 0.0,
-                                is_clock: false,
-                                max_cap: None,
-                                max_transition: None,
-                                function: None,
-                                is_tristate: false,
-                                internal_power: Vec::new(),
-                            });
-                        }
-                    }
+                if let Some(parsed) = parse_seq_cell_block(lexer, db, &mut local_pin_names, "data_in")?
+                {
+                    seq = Some(parsed);
                 }
             }
             Token::Ident("cell_leakage_power") => {
@@ -829,6 +761,7 @@ fn parse_cell_body(
         area,
         is_sequential,
         is_latch,
+        seq,
         pin_offset,
         pin_count,
         arc_offset,
@@ -838,6 +771,113 @@ fn parse_cell_body(
     });
 
     Ok(())
+}
+
+/// Parses one `ff`/`latch` cell-level group (`ff (v1, v2) { … }`). The
+/// state vars get placeholder internal `LibPin`s (a real pin declared
+/// later under the same name reuses the slot), and the body is scanned
+/// for the data-pin attribute (`next_state`/`data_in`). `None` when the
+/// group is malformed (no paren header) or declares no state variables —
+/// such a cell's outputs stay unclassifiable.
+fn parse_seq_cell_block(
+    lexer: &mut Lexer,
+    db: &mut LibDb,
+    local_pin_names: &mut HashMap<SymbolId, LibPinId>,
+    data_attr: &str,
+) -> Result<Option<LibSeq>> {
+    if !matches!(lexer.next_token(), Some(Token::LParen)) {
+        return Ok(None);
+    }
+    let mut vars = Vec::new();
+    while let Some(arg) = lexer.next_token() {
+        match arg {
+            Token::RParen => break,
+            Token::Ident(s) | Token::Str(s) => vars.push(s.to_string()),
+            _ => {}
+        }
+    }
+    let mut data_pin = None;
+    if let Some(Token::LBrace) = lexer.next_token() {
+        data_pin = parse_seq_block_body(lexer, db, data_attr)?;
+    }
+    let mut var_syms = Vec::with_capacity(vars.len());
+    for var in &vars {
+        let sym = db.strings.intern(var);
+        var_syms.push(sym);
+        if let std::collections::hash_map::Entry::Vacant(e) = local_pin_names.entry(sym) {
+            let global_id = LibPinId(
+                u16::try_from(db.pins.len()).context("Liberty pin count exceeds u16")?,
+            );
+            e.insert(global_id);
+            db.pins.push(LibPin {
+                name: sym,
+                dir: PinDir::Internal,
+                cap_rise: 0.0,
+                cap_fall: 0.0,
+                cap_nom: 0.0,
+                is_clock: false,
+                max_cap: None,
+                max_transition: None,
+                function: None,
+                is_tristate: false,
+                internal_power: Vec::new(),
+            });
+        }
+    }
+    Ok(var_syms.first().map(|&state_var| LibSeq {
+        state_var,
+        state_var_n: var_syms.get(1).copied(),
+        data_pin,
+    }))
+}
+
+/// Scans one `ff`/`latch` block body for the data-pin attribute
+/// (`next_state`/`data_in`). The interned pin name is returned only when
+/// the attribute value is a bare pin name — `bool_expr::parse` defines
+/// "bare" exactly as "a single Boolean variable", so expression forms
+/// (scan mux `"(D&!SCE) | (SCD&SCE)"`, data-enable `"(D&DE) | (IQ&!DE)"`,
+/// scan+enable) classify `None`, the documented residual. Every other
+/// attribute is skipped by statement or group; the body's `RBrace`
+/// (or a skip that consumed it) closes the block.
+fn parse_seq_block_body(
+    lexer: &mut Lexer,
+    db: &mut LibDb,
+    data_attr: &str,
+) -> Result<Option<SymbolId>> {
+    let mut data_pin = None;
+    let mut closed = false;
+    while let Some(tok) = lexer.next_token() {
+        match tok {
+            Token::RBrace => {
+                closed = true;
+                break;
+            }
+            Token::Ident(name) if name == data_attr => {
+                if let Some(Token::Colon) = lexer.next_token()
+                    && let Some(Token::Str(s) | Token::Ident(s)) = lexer.next_token()
+                {
+                    data_pin = match crate::bool_expr::parse(s) {
+                        Some((crate::bool_expr::BoolExpr::Var(_), vars)) => {
+                            Some(db.strings.intern(&vars[0]))
+                        }
+                        _ => None,
+                    };
+                }
+            }
+            Token::Ident(_) if skip_statement_or_group(lexer) => {
+                closed = true;
+                break;
+            }
+            Token::LBrace => {
+                lexer.skip_balanced_braces();
+            }
+            _ => {}
+        }
+    }
+    if !closed {
+        bail!("unterminated Liberty ff/latch body (missing closing brace)");
+    }
+    Ok(data_pin)
 }
 
 /// Parses one `leakage_power () { when : "…"; value : … }` group inside a cell

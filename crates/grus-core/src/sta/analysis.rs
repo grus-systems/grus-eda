@@ -10519,6 +10519,7 @@ mod tests {
                 area: 0.0,
                 is_sequential: false,
                 is_latch: false,
+                seq: None,
                 pin_offset: 0,
                 pin_count: 3,
                 arc_offset: 0,

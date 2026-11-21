@@ -5268,3 +5268,91 @@ Propagated, right Constant`; restored, green. The r2 proofs stand
 grus-core sta` (183), the `cp_probe.tcl` container run quoted above,
 the `mb.power.json` regen. AP3 sequential rules and AP4 scoped
 annotation precedence remain open.
+### 2026-11-22 — N7 — AP3: sequential data-pin propagation (v0.2.17)
+
+AP3 of the activity-propagation sequence: a sequential output copies
+its data input's `{P, d}` verbatim, labelled `propagated` in the
+golden. `mba`'s `u_df` (`D` ← port `a`) resolves; `u_f0`/`u_f1` sit in
+unseeded feedback cones and stay `unknown {0,0}` — no inferred
+divide-by-two.
+
+**What landed**:
+
+- `LibSeq` (`lib_db.rs`): `state_var`, `state_var_n`, `data_pin` —
+  parsed in `liberty.rs` from the `ff`/`latch` group's `next_state` /
+  `data_in` into `LibCell::seq`. Only the bare single-pin form (`"D"`)
+  resolves; complex expressions (scan mux, data-enable, set/reset
+  forms) leave `data_pin` unset — named residual, census below.
+  `CACHE_VERSION` bumped to 9.
+- `activity.rs`: `seq_function_table` (per sequential-driver net, the
+  data net plus the output polarity from the Liberty `function` —
+  `function == state_var` copies `P`; `== state_var_n` or `!state_var`
+  copies `1 - P`; density copied unchanged either way). `propagate`
+  unifies combinational and sequential producers in one Kahn
+  worklist — resolved Q nets re-enable later combinational cones and
+  other sequential D inputs (fixed point in a single ordered pass,
+  since a sequential output is never an input to its own function).
+  After the queue drains, every leftover `Default` net becomes
+  `Unknown {0,0}` and taints downstream like any other seed.
+- `ActivityOverrides.input_ports`: `set_power_activity -input_ports`
+  is now distinct from the `-input` seed (the measured OpenSTA
+  semantics: `-input_ports` seeds only primary input *ports*, `-input`
+  seeds every undriven net).
+- `tests/designs/microbench/mba_p40.sdc` (period 40 ns): `s_p40`
+  proves the seed densities follow the clock period — `clk` `5e7`,
+  inputs `2.5e6`, `u_df/Q` propagated `2.5e6` (halved from the 20 ns
+  values).
+- `power.rs` regression: 12 sessions (`s_none`, `s_input`,
+  `s_input_ports`, `s_global`, `s_global_density`, `s_p40`, `s_ports`,
+  `s_ports_a2x`, `s_partial`, `s_full`, `s_xz`, `s_partial2`), strict
+  per-pin `{density, prob, source}` against the golden, `unknown`
+  handled like every other source label, `EXPECTED_DIVERGENT` now
+  empty. `s_none` origin counts pinned at `{clock 1, constant 4,
+  input 3, propagated 6, unknown 4}`; the four unknown nets are the
+  `u_f0`/`u_f1` feedback cone. `s_ports_a2x` shows the doubling:
+  `u_df/Q` and `qd` copy `a`'s annotated `6e6` density verbatim.
+
+**Measured result**: all 12 sessions match the golden per-pin
+verbatim at the strict bound; the divergent set is empty on every
+session. Group columns (Sequential / Combinational / Clock / total
+rows, all four watt columns) asserted at the recorded bounds —
+internal/switching ≤ 0.5%, leakage ≤ 1%, total ≤ 0.3%. Measured
+residuals: sequential internal and all leakage columns exact to the
+golden's print precision; sequential switching −0.26% on the global
+sessions only; combinational internal +0.11%…+0.32% (worst `s_xz`);
+combinational switching −0.09%…−0.16%; every total column within
+0.14%. `driven_nets_without_activity` is 4 (the unknown feedback
+nets) on unseeded sessions, 0 on the global ones.
+
+**Sequential coverage residual** (sky130 census,
+`sky130_fd_sc_hd__tt_025C_1v80.lib`): 87 sequential groups (69 `ff`,
+18 `latch`). 56 use the bare data-pin form (`next_state`/`data_in`
+`"D"`) and resolve; 31 carry a complex expression — 19 scan-mux
+`(D&!SCE)|(SCD&SCE)`, 7 data-enable `(D&DE)|(IQ&!DE)`, 5 scan+DE
+`(D&DE&!SCE)|(IQ&!DE&!SCE)|(SCD&SCE)` — and 52 groups also carry
+`preset`/`clear` attributes, none of which the model reads. The
+multi-output inversion arm (QN = `1 − P`) is defined but unexercised:
+`mba`'s `dfxtp` is single-Q.
+
+**Moved goldens**: `mba.activity.reference.json` byte-identical — it
+already held the AP3 records (all 12 sessions incl. `s_p40`, `u_df/Q`
+`propagated`) from the golden-generation pass. `mb.power.json`
+regenerated via the recorded CLI command — `git diff` empty
+(`annotated=3 clock=1`, every watt column bit-identical; `mb`'s `q`
+stays annotated through `_d_/Q`). `mba_p40.sdc` is a new fixture. All
+other `*.reference.json` `git status`-clean — fully-annotated
+fixtures stay byte-identical. The per-pin annotation residual is
+unchanged: `s_full` output port `y` is annotated per-pin in the
+golden while the per-net model resolves its driver — `PER_PIN_RESIDUAL`
+`[("s_full","y")]`, AP4 scope.
+
+**Fail-proof**: sequential producers dropped from `propagate`'s
+candidate mask → `s_none origin_counts` red (`propagated 5,
+unknown 5` — net `q` falls back to `unknown`); `s_ports` `u_df/Q`
+golden density corrupted `3e6 → 4e6` → red at the density bound
+(`ours 3e6 vs golden 4e6`). Both restored, green.
+
+**Checks run**: `cargo test --workspace` (333+3, 2 ignored), `cargo
+clippy --workspace --all-targets -- -D warnings`, `cargo test
+--release -p grus-core sta` (183, 2 ignored), the `mb.power.json`
+regen above. AP4 scoped annotation precedence remains open.

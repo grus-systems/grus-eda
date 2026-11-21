@@ -487,7 +487,12 @@ Remaining:
   propagation with `Default`-taints, pin-namespaced annotation; the
   golden's surviving divergent set is the 13-pin AP3 residual)
   (v0.2.16 — constant marking is 3-valued absorptive; the stored
-  constant marginal is the measured 0.0 — cp.def probe);
-  AP3 sequential rules and AP4 scoped annotation precedence remain
-  open. See `docs/results.md` 2026-11-21 and
-  `kurena/tasks/activity-propagation/design/api.md` §Plan.
+  constant marginal is the measured 0.0 — cp.def probe); **AP3 done**
+  (v0.2.17 — sequential data-pin propagation: `ff.next_state` /
+  `latch.data_in` parsed into `LibCell::seq`, Q copies the D net's
+  `{P, d}` verbatim (origin `propagated`), resolution iterates to a
+  fixed point, leftover `Default` nets become `unknown {0,0}` and
+  taint; all 12 `mba` sessions match the golden per-pin and
+  `EXPECTED_DIVERGENT` is empty); AP4 scoped annotation precedence
+  remains open. See `docs/results.md` 2026-11-22 and
+  `kurena/tasks/ap3-sequential-activity/design/`.

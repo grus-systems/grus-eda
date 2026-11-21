@@ -3,11 +3,12 @@
 //! `{density, prob}` record per net.
 //!
 //! The fill order is the measured precedence (docs/results.md 2026-11-21 N7):
-//! constant cone → clock → `-global` override → annotation → input/undriven →
-//! leftover `Default` — then AP2's combinational-propagation pass overwrites
-//! `Default` entries it can derive (`Propagated`). Sequential rules (AP3) are
-//! not landed yet — `Default` remains the interim fill for unresolvable cones
-//! and takes the effective input seed.
+//! constant cone → clock → `-global` override → `-input_ports` → annotation →
+//! input/undriven → leftover `Default` — then the unified propagation pass
+//! (seq Q=D copy plus combinational evaluation in one fixed point) overwrites
+//! `Default` entries it can derive (`Propagated`), and every leftover
+//! `Default` becomes `unknown` `{0, 0}` — the measured semantics for
+//! sequential-cone leftovers.
 //!
 //! Annotation matches in the pin namespace (the dump's `$scope`/`INSTANCE`
 //! paths): a dump entry resolves a design pin, and a pin annotates its net
@@ -33,8 +34,9 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Where a net's resolved activity came from. Labels mirror OpenSTA's
-/// `get_property <pin> activity` source column; `Sequential`/`Unknown`
-/// are declared for AP3 and are never emitted yet.
+/// `get_property <pin> activity` source column; `Sequential` is declared
+/// for a possible measured source and never emitted (OpenSTA prints
+/// `propagated` for the Q=D copy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum ActivityOrigin {
     /// VCD/SAIF dump entry resolving to the net's driver pin.
@@ -48,13 +50,16 @@ pub enum ActivityOrigin {
     /// Combinational propagation: gate-function evaluation over resolved
     /// inputs, level-ordered over the net graph.
     Propagated,
-    /// Sequential rules (AP3).
+    /// Sequential rules (AP3) — declared, never emitted.
     Sequential,
     /// `function : "0"/"1"` cone.
     Constant,
-    /// Unresolvable sequential cone (AP3).
+    /// Unresolvable cone — the post-pass fill for every net the seeds
+    /// and propagation left `Default` (`{0, 0}`, measured).
     Unknown,
-    /// Interim fill for nets the seeds and propagation cannot resolve.
+    /// Interim fill during resolution: converted to `Unknown` after the
+    /// propagation pass, so `Default` never appears in a finished
+    /// `ActivityResolution`.
     Default,
 }
 
@@ -93,6 +98,12 @@ pub struct ActivityOverrides {
     pub global: Option<ActivitySetting>,
     /// `-input`: replaces the input default; also the leftover fill value.
     pub input: Option<ActivitySetting>,
+    /// `-input_ports`: user annotation on input-port-driven nets —
+    /// `{density, P}` absolute. Port drivers only; undriven nets keep
+    /// `input` (measured: `s_input_ports`'s `n_float` reads `input`
+    /// `5e6/0.5`). Beats a dump entry on the same net (unmeasured —
+    /// recorded); loses to `-global` and `clock`.
+    pub input_ports: Option<ActivitySetting>,
 }
 
 /// One net's resolved activity.
@@ -201,6 +212,65 @@ fn comb_function_table(
     table
 }
 
+/// A sequential output pin's copy rule: the net takes the resolved
+/// activity of the cell's data-pin net — verbatim, or `1−P` on the
+/// inverted state output.
+struct SeqCopy {
+    data_net: NetId,
+    /// `true` when the driver pin's `function` names `state_var_n`
+    /// (`"IQ_N"` — `Q_N` outputs on `*bp`/`*bn` cells).
+    inverted: bool,
+}
+
+/// The sequential producer table, parallel to `comb_funcs` and indexed
+/// by `NetId`: `Some` for every net whose driver pin sits on an
+/// `ff`/`latch` cell (the `seq` block), whose `LibCell::seq::data_pin`
+/// is a bare name resolvable to a connected design pin, and whose driver
+/// pin `function` names a state variable (`state_var` → verbatim,
+/// `state_var_n` → `1−P`). Expression-form `next_state`/`data_in`
+/// (`data_pin: None`) is never a candidate — its output nets fall to
+/// `Default` → `Unknown`, the named seq-expression residual
+/// (docs/results.md census); it is *not* counted in
+/// `unresolvable_functions` — that counter is combinational-`function`
+/// failures only. A driver function naming neither var is
+/// unclassifiable (sky130 has none — every seq output pin's function is
+/// `IQ` or `IQ_N`).
+fn seq_function_table(design: &DesignDb, lib: &LibDb) -> Vec<Option<SeqCopy>> {
+    let mut table: Vec<Option<SeqCopy>> = (0..design.num_nets()).map(|_| None).collect();
+    for (n, slot) in table.iter_mut().enumerate() {
+        let Some(drv) = design.net_driver(NetId(n as u32)) else {
+            continue;
+        };
+        let Some(cell) = design.pin_cells[drv.0 as usize] else {
+            continue;
+        };
+        let Some(lib_cell) = design.cell_lib_ids[cell.0 as usize]
+            .map(|lc| &lib.cells[lc.0 as usize])
+        else {
+            continue;
+        };
+        let Some(seq) = &lib_cell.seq else { continue };
+        let Some(data_sym) = seq.data_pin else { continue };
+        let func = design.pin_lib_pins[drv.0 as usize]
+            .and_then(|lp| lib.pins[lp.0 as usize].function);
+        let inverted = if func == Some(seq.state_var) {
+            false
+        } else if seq.state_var_n.is_some() && func == seq.state_var_n {
+            true
+        } else {
+            continue;
+        };
+        let Some(data_net) = design
+            .pin_by_lib_name(lib, cell, data_sym)
+            .and_then(|p| design.pin_nets[p.0 as usize])
+        else {
+            continue;
+        };
+        *slot = Some(SeqCopy { data_net, inverted });
+    }
+    table
+}
+
 /// Marks a net `Constant` when its driver function has a definite value
 /// under 3-valued (Kleene) evaluation over the `comb_funcs` table — the
 /// measured marking rule (docs/results.md 2026-11-21 N7 cp.def probe):
@@ -284,23 +354,31 @@ fn annotation_net_of(
     driver_net(*io_pin_of.get(leaf)?)
 }
 
-/// AP2 combinational propagation: overwrites `Default` seed entries whose
-/// `comb_funcs` slot is `Some`, in Kahn level order over the
-/// candidate-net dependency graph. Consumes only resolvable inputs — any
+/// Unified propagation: overwrites `Default` seed entries that have a
+/// producer (`comb_funcs` or `seq_funcs` slot `Some`), in Kahn order over
+/// the candidate-net dependency graph — seq-copy nodes join as
+/// single-dependency nodes, so a resolved Q unblocks downstream
+/// combinational candidates in the same pass (Q→gate→D→Q chains resolve;
+/// sequential feedback cycles are mutual candidates that never reach
+/// `indeg 0` and stay `Default`, exactly like true combinational
+/// cycles). Consumes only resolvable inputs — any
 /// `Default`/`Unknown`/`prob_one: None` input taints the output to
-/// `Default` (the sequential-feedback cones stay unresolved until AP3).
-/// True combinational cycles never dequeue and stay `Default` (not
-/// function failures — `driven_nets_without_activity` sees them).
-fn propagate_combinational(
+/// `Default` (the measured `unknown`-cone semantics; a `prob_one: None`
+/// data net taints the Q copy like a combinational input).
+fn propagate(
     comb_funcs: &[Option<CombFunc>],
+    seq_funcs: &[Option<SeqCopy>],
     nets: &mut [ResolvedActivity],
     window_s: f64,
     unresolvable_functions: &mut usize,
 ) {
     let num_nets = comb_funcs.len();
-    // Candidates: `Default` nets whose function resolved at table build.
+    // Candidates: `Default` nets with a resolved producer.
     let is_candidate: Vec<bool> = (0..num_nets)
-        .map(|n| nets[n].origin == ActivityOrigin::Default && comb_funcs[n].is_some())
+        .map(|n| {
+            nets[n].origin == ActivityOrigin::Default
+                && (comb_funcs[n].is_some() || seq_funcs[n].is_some())
+        })
         .collect();
 
     // `indeg(m)` counts `deps(m)` that are themselves candidates — the
@@ -308,14 +386,18 @@ fn propagate_combinational(
     // deterministic output.
     let mut indeg = vec![0usize; num_nets];
     let mut dependents: Vec<Vec<NetId>> = (0..num_nets).map(|_| Vec::new()).collect();
-    for (n, cand) in comb_funcs.iter().enumerate() {
+    for n in 0..num_nets {
         if !is_candidate[n] {
             continue;
         }
-        let Some(cand) = cand else { continue };
-        let mut deps = cand.input_nets.clone();
-        deps.sort_unstable();
-        deps.dedup();
+        let deps = if let Some(cand) = &comb_funcs[n] {
+            let mut deps = cand.input_nets.clone();
+            deps.sort_unstable();
+            deps.dedup();
+            deps
+        } else {
+            vec![seq_funcs[n].as_ref().unwrap().data_net]
+        };
         for d in deps {
             if is_candidate[d.0 as usize] {
                 indeg[n] += 1;
@@ -335,56 +417,74 @@ fn propagate_combinational(
         // A candidate enqueues once — its `indeg` reaches 0 exactly once.
         debug_assert!(pending[m.0 as usize], "candidate dequeued twice");
         pending[m.0 as usize] = false;
-        let Some(cand) = &comb_funcs[m.0 as usize] else {
-            debug_assert!(false, "candidate without a resolved function");
-            continue;
-        };
-        let mut resolvable = true;
-        let mut p_in = Vec::with_capacity(cand.input_nets.len());
-        for &dep in &cand.input_nets {
-            let r = nets[dep.0 as usize];
-            match r.prob_one {
-                Some(p)
-                    if !matches!(
-                        r.origin,
-                        ActivityOrigin::Default | ActivityOrigin::Unknown
-                    ) =>
-                {
-                    p_in.push((p, r.eff_toggles / window_s))
-                }
-                _ => {
-                    resolvable = false;
-                    break;
+        if let Some(cand) = &comb_funcs[m.0 as usize] {
+            let mut resolvable = true;
+            let mut p_in = Vec::with_capacity(cand.input_nets.len());
+            for &dep in &cand.input_nets {
+                let r = nets[dep.0 as usize];
+                match r.prob_one {
+                    Some(p)
+                        if !matches!(
+                            r.origin,
+                            ActivityOrigin::Default | ActivityOrigin::Unknown
+                        ) =>
+                    {
+                        p_in.push((p, r.eff_toggles / window_s))
+                    }
+                    _ => {
+                        resolvable = false;
+                        break;
+                    }
                 }
             }
-        }
-        if resolvable {
-            let p: Vec<f64> = p_in.iter().map(|&(p, _)| p).collect();
-            match bool_expr::prob(&cand.expr, &p) {
-                Some(p_out) => {
-                    let mut d_out = 0.0;
-                    let mut eval_ok = true;
-                    for (i, &(_, d_i)) in p_in.iter().enumerate() {
-                        match bool_expr::sensitivity(&cand.expr, i, &p) {
-                            Some(s) => d_out += d_i * s,
-                            None => {
-                                eval_ok = false;
-                                break;
+            if resolvable {
+                let p: Vec<f64> = p_in.iter().map(|&(p, _)| p).collect();
+                match bool_expr::prob(&cand.expr, &p) {
+                    Some(p_out) => {
+                        let mut d_out = 0.0;
+                        let mut eval_ok = true;
+                        for (i, &(_, d_i)) in p_in.iter().enumerate() {
+                            match bool_expr::sensitivity(&cand.expr, i, &p) {
+                                Some(s) => d_out += d_i * s,
+                                None => {
+                                    eval_ok = false;
+                                    break;
+                                }
                             }
                         }
+                        if eval_ok {
+                            nets[m.0 as usize] = ResolvedActivity {
+                                prob_one: Some(p_out),
+                                eff_toggles: d_out * window_s,
+                                origin: ActivityOrigin::Propagated,
+                            };
+                        } else {
+                            *unresolvable_functions += 1;
+                        }
                     }
-                    if eval_ok {
-                        nets[m.0 as usize] = ResolvedActivity {
-                            prob_one: Some(p_out),
-                            eff_toggles: d_out * window_s,
-                            origin: ActivityOrigin::Propagated,
-                        };
-                    } else {
-                        *unresolvable_functions += 1;
-                    }
+                    None => *unresolvable_functions += 1,
                 }
-                None => *unresolvable_functions += 1,
             }
+        } else if let Some(copy) = &seq_funcs[m.0 as usize] {
+            // Q = D: the resolved data-net record copies verbatim
+            // (`eff_toggles` shares `window_s`); `1−P` on the inverted
+            // state output. Origin `Propagated` — the golden's label
+            // (OpenSTA prints no `sequential` source).
+            let data = nets[copy.data_net.0 as usize];
+            if let Some(p) = data.prob_one
+                && !matches!(
+                    data.origin,
+                    ActivityOrigin::Default | ActivityOrigin::Unknown
+                )
+            {
+                nets[m.0 as usize] = ResolvedActivity {
+                    prob_one: Some(if copy.inverted { 1.0 - p } else { p }),
+                    eff_toggles: data.eff_toggles,
+                    origin: ActivityOrigin::Propagated,
+                };
+            }
+        } else {
+            debug_assert!(false, "candidate without a resolved producer");
         }
         // Visit order is scheduling only: a dependent whose input stayed
         // `Default` taints on its own evaluation.
@@ -426,9 +526,11 @@ pub fn resolve_activity(
 
     // One parse per driver `function`, shared by the constant marking
     // and the propagation pass; counted at build for any origin, so an
-    // annotated net's broken function counts too.
+    // annotated net's broken function counts too. `seq_funcs` carries
+    // the sequential producer table (Q=D copy) alongside.
     let mut unresolvable_functions = 0usize;
     let comb_funcs = comb_function_table(design, lib, &mut unresolvable_functions);
+    let seq_funcs = seq_function_table(design, lib);
     let constant = constant_cone(design, &comb_funcs);
 
     // The pin-namespaced annotation map: one `SignalActivity` per net,
@@ -503,6 +605,19 @@ pub fn resolve_activity(
                     eff_toggles: g.density_per_s * window_s,
                     origin: ActivityOrigin::Global,
                 }
+            } else if let Some(ip) = overrides.input_ports.filter(|_| {
+                driver.is_some_and(|d| design.pin_cells[d.0 as usize].is_none())
+            }) {
+                // `-input_ports` annotates only nets driven by an io pin —
+                // undriven nets (`driver.is_none()`) keep the `input`
+                // default below (measured: `s_input_ports`'s `n_float`
+                // reads `input 5e6/0.5`). The `user` golden source maps
+                // to `Annotated` here.
+                ResolvedActivity {
+                    prob_one: Some(ip.prob_one),
+                    eff_toggles: ip.density_per_s * window_s,
+                    origin: ActivityOrigin::Annotated,
+                }
             } else if let Some(sa) = annotation.get(&net) {
                 // Pin-namespace match: the net's driver pin was dumped.
                 ResolvedActivity {
@@ -522,7 +637,8 @@ pub fn resolve_activity(
                 // Interim fill for nets nothing resolved: the effective
                 // input seed (api.md: unannotated nets get the P1-measured
                 // default {P, d} instead of zero). The propagation pass
-                // overwrites entries it can derive; AP3 shrinks the rest.
+                // overwrites entries it can derive; the conversion below
+                // turns the leftovers `unknown`.
                 ResolvedActivity {
                     prob_one: Some(input_seed.prob_one),
                     eff_toggles: input_seed.density_per_s * window_s,
@@ -533,12 +649,30 @@ pub fn resolve_activity(
         nets.push(resolved);
     }
 
-    propagate_combinational(
+    propagate(
         &comb_funcs,
+        &seq_funcs,
         &mut nets,
         window_s,
         &mut unresolvable_functions,
     );
+
+    // Every leftover `Default` — sequential feedback cycles, comb nets
+    // tainted by them, seq outputs whose data pin is an expression form
+    // or unclassifiable, comb eval failures — lands `unknown` {0,0},
+    // the measured P3 semantics. `Some(0.0)` (not `None`) matches the
+    // golden's printed prob and keeps `when` literals on unknown nets
+    // expressible at weight 0 (chosen; unmeasured). Post-resolution
+    // `Default` is an impossible origin.
+    for r in &mut nets {
+        if r.origin == ActivityOrigin::Default {
+            *r = ResolvedActivity {
+                prob_one: Some(0.0),
+                eff_toggles: 0.0,
+                origin: ActivityOrigin::Unknown,
+            };
+        }
+    }
 
     let mut origin_counts: BTreeMap<String, usize> = BTreeMap::new();
     for r in &nets {
