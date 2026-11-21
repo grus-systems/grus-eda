@@ -173,12 +173,19 @@ EOF
 
 # Full-format path reports: prints the launch and capture clock name and edge
 # times per path, plus the unconstrained listing that shows which endpoints
-# left the timed set.
+# left the timed set. The optional 4th argument is a wall-clock bound in
+# seconds (`timeout <s>`; `0` = unbounded) so a non-convergent scenario
+# records the timeout in the artifact instead of stalling the probe; the
+# optional 5th is a `-digits` precision for the report_checks calls.
 run_report () {
     local def_file="$1"
     local sdc_file="$2"
     local out_file="$3"
-    openroad -no_init -no_splash << EOF > "/work/tests/designs/sta_clocks/$out_file" 2>&1
+    local limit="${4:-0}"
+    local digits_flag=""
+    [ -n "${5:-}" ] && digits_flag=" -digits $5"
+    local rc=0
+    timeout "$limit" openroad -no_init -no_splash << EOF > "/work/tests/designs/sta_clocks/$out_file" 2>&1 || rc=$?
 read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
 read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
@@ -190,16 +197,19 @@ if {[catch {read_sdc /work/tests/designs/sta_clocks/$sdc_file} err]} {
     exit 0
 }
 puts "=== report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000 ==="
-report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000
+report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000${digits_flag}
 puts "=== report_checks -path_delay min -format full -endpoint_path_count 1 -group_path_count 100000 ==="
-report_checks -path_delay min -format full -endpoint_path_count 1 -group_path_count 100000
+report_checks -path_delay min -format full -endpoint_path_count 1 -group_path_count 100000${digits_flag}
 puts "=== report_checks -unconstrained ==="
 report_checks -unconstrained
 exit
 EOF
+    if [ "$rc" -ne 0 ]; then
+        printf 'openroad exited with status %s\n' "$rc" >> "/work/tests/designs/sta_clocks/$out_file"
+    fi
 }
 
-SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05 t2_selbare t2_selac t2_selunion t2_selunk t2_selport t2_selpto t2_grp1 t2_grpe t2_grpb t2_wavebig t2_eclk2 t2_clkcor t2_clkcor2 t2_waverot t2_wavez t2_clkdup"
+SCENARIOS="t2_int t2_frac t2_unc t2_uncx t2_lat t2_md t2_mdl t2_mdo t2_prop t2_prop1 t2_grp t2_mcp t2_mcps t2_mds t2_mdx t2_selfa t2_selfb t2_selmd t2_selmdt t2_selmc t2_selmct t2_grpl t2_grpp t2_grpa t2_grpnm t2_grpd t2_grpd2 t2_wave t2_wave05 t2_selbare t2_selac t2_selunion t2_selunk t2_selport t2_selpto t2_grp1 t2_grpe t2_grpb t2_wavebig t2_eclk2 t2_clkcor t2_clkcor2 t2_waverot t2_wavez t2_clkdup t2_u1 t2_u2 t2_lcm t2_lcm2"
 
 for name in $SCENARIOS; do
     run_sta "two_clock.def" "$name.sdc" "ref_$name.json"
@@ -232,6 +242,16 @@ for name in $MEASURE_ONLY; do
     run_report "two_clock.def" "$name.sdc" "probe_$name.txt"
 done
 
+# xdomain-deferrals evidence (measure-only): t2_u3 probes a `-to` delay
+# check on an unclocked *capture* endpoint; t2_lcm3/t2_lcm4 bracket the
+# period-resolution boundary where OpenSTA's common-period search
+# converges (2.0/1.98) vs warns (2.0/1.9801). The 300 s bound on the
+# lcm pair is the run_report timeout argument's only current use.
+MEASURE_XD="t2_u3 t2_lcm3 t2_lcm4"
+for name in $MEASURE_XD; do
+    run_report "two_clock.def" "$name.sdc" "probe_$name.txt" 300
+done
+
 {
     printf '{\n  "design": "sta_clocks",\n  "scenarios": {\n'
     first=1
@@ -248,11 +268,27 @@ done
 # covers the borrow window on ckb's own lattice end to end.
 run_sta "two_clock_latch.def" "t2_latch.sdc" "ref_t2_latch.json"
 run_report "two_clock_latch.def" "t2_latch.sdc" "probe_t2_latch.txt"
+# xdomain-deferrals: latch-D with a foreign (cka) launch — t2_xlat2
+# pushes the arrival deeper into the ckb borrow window.
+XLAT="t2_xlat t2_xlat2"
+for name in $XLAT; do
+    run_sta "two_clock_latch.def" "$name.sdc" "ref_$name.json"
+    run_report "two_clock_latch.def" "$name.sdc" "probe_$name.txt"
+done
+# The digits-5 rerun pins the borrowed launch event: at two digits the
+# first-window cap (0.91038) is indistinguishable from a 0.9-normalized
+# launch.
+run_report "two_clock_latch.def" "t2_xlat2.sdc" "probe_t2_xlat2_d5.txt" 0 5
 
 {
     printf '{\n  "design": "sta_clocks_latch",\n  "scenarios": {\n'
-    printf '    "%s": ' "t2_latch"
-    cat "ref_t2_latch.json"
+    first=1
+    for name in t2_latch $XLAT; do
+        if [ $first -eq 0 ]; then printf ',\n'; fi
+        first=0
+        printf '    "%s": ' "$name"
+        cat "ref_$name.json"
+    done
     printf '\n  }\n}\n'
 } > two_clock_latch.reference.json
 

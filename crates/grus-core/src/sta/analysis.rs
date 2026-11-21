@@ -306,11 +306,16 @@ pub enum SkipReason {
     /// usable NLDM constraint table, so no setup/hold bound could be evaluated.
     NoConstraintTable,
     /// An arrival extreme tying this endpoint was launched on a different
-    /// clock domain than the capture. Cross-domain launch/capture pairing is
-    /// not implemented yet (mc-xdomain owns the edge-pair search), so the
-    /// endpoint is deferred with the launch and capture clocks named in
-    /// `related` instead of being folded onto the capture domain's lattice.
+    /// clock domain than the capture and no edge pair exists in the search
+    /// window — defensive; commensurate grids always pair. `related` names
+    /// the launch and capture clocks.
     CrossDomain,
+    /// An arrival extreme tying this endpoint was launched by a register
+    /// whose clock pin sits on no declared clock net — the edge-0 clk->Q
+    /// launch OpenSTA applies for `-to` delay checks (`t2_u2`) while
+    /// dropping the ordinary clock check entirely (`t2_u1`). `related`
+    /// names the capture clock; the launch side reads `<undeclared>`.
+    UndeclaredLaunch,
 }
 
 /// One endpoint candidate that produced no check, with the pin and the reason.
@@ -360,11 +365,14 @@ pub struct SkipReport {
     pub incomplete_checks: usize,
     /// Checks and outputs that no polarity of a path reached.
     pub unreached_endpoints: usize,
-    /// Endpoints whose launch domain differs from their capture domain:
-    /// cross-domain edge pairing is mc-xdomain's job, so these are deferred
-    /// (named in `skipped_endpoints` with reason `CrossDomain`) rather than
-    /// timed on a wrong lattice.
+    /// Endpoints whose launch domain differs from their capture domain and
+    /// could not be paired — named in `skipped_endpoints` with reason
+    /// `CrossDomain`; defensive (every committed scenario pairs).
     pub cross_domain_endpoints: usize,
+    /// Endpoints reached only by an unclocked register's edge-0 launch —
+    /// OpenSTA produces no ordinary check there (`t2_u1`), so they are
+    /// named with reason `UndeclaredLaunch` rather than reported.
+    pub undeclared_endpoints: usize,
     /// Per-endpoint detail for every `incomplete_checks` +
     /// `unreached_endpoints` + `cross_domain_endpoints` skip: which pin
     /// produced no check and why.
@@ -439,6 +447,7 @@ impl SkipReport {
             ("incomplete_checks", self.incomplete_checks),
             ("unreached_endpoints", self.unreached_endpoints),
             ("cross_domain_endpoints", self.cross_domain_endpoints),
+            ("undeclared_endpoints", self.undeclared_endpoints),
             ("cell_driven_clock_nets", self.cell_driven_clock_nets),
             ("unresolved_driving_cells", self.unresolved_driving_cells),
             (
@@ -476,9 +485,12 @@ impl SkipReport {
     }
 
     /// Endpoint candidates that produced no check: incomplete pairs, unreached
-    /// pins, or cross-domain launch/capture pairs that defer to mc-xdomain.
+    /// pins, undeclared launches, or unpairable cross-domain deferrals.
     pub fn endpoints_skipped(&self) -> usize {
-        self.incomplete_checks + self.unreached_endpoints + self.cross_domain_endpoints
+        self.incomplete_checks
+            + self.unreached_endpoints
+            + self.cross_domain_endpoints
+            + self.undeclared_endpoints
     }
 
     /// True when the run left nothing out. Two kinds of skip are exempt because they cannot
@@ -487,7 +499,9 @@ impl SkipReport {
     /// and applies nothing, so ignoring it reproduces the reference — and
     /// `recognized_check_arcs`, recognised Liberty check arcs deferred from
     /// the endpoint model — they add checks outside the reported endpoint set rather than
-    /// altering an arrival or slack the report does produce. All stay visible in the
+    /// altering an arrival or slack the report does produce — and `undeclared_endpoints`,
+    /// unclocked launches OpenSTA drops from the endpoint table too (`t2_u1`), so the
+    /// named skip changes no compared number. All stay visible in the
     /// summary; `--strict` only fails on skips that can make a reported number wrong.
     pub fn is_clean(&self) -> bool {
         const DESIGN_RULES: [&str; 4] = [
@@ -2807,6 +2821,25 @@ fn prepare_sta<'a>(
     // Launch and latch-open contributions are run-invariant — they read only
     // clock-pin state, which `base_state` already carries — so the pairs are
     // computed once here; `eval_sta` merges them filtered by allowed source.
+    // A register on no declared clock net still launches clk->Q from edge 0 —
+    // OpenSTA drops its ordinary checks (`t2_u1`) but times a `-to` delay
+    // check on it (`t2_u2`), so the launch must exist. The zero dom mask it
+    // carries defers the ordinary checks as `UndeclaredLaunch`.
+    let launch_pairs = |l: &LaunchArc| -> [LaunchPair; 2] {
+        let clk_state = base_state[l.clk.0 as usize];
+        if clk_state.reached(l.edge) || clock_domain[l.clk.0 as usize] != u8::MAX {
+            eval_launch(l.q, clk_state, l.lib_arc, l.edge, false)
+        } else {
+            // OpenSTA launches an unclocked register's clk->Q at edge 0
+            // with the clock pin's real vertex slew — the driver chain's
+            // output slew, not a zero seed (`t2_u2`: u_clkb drives cb,
+            // measured ~0.04 at u_fb0/CLK).
+            let mut zero = PinTimingState::UNREACHED;
+            let s = driver_input_slew(&cx, &levelized, design, sdc, l.clk, l.edge, 16);
+            zero.merge(l.edge, 0.0, 0.0, 0.0, 0.0, s, s, 0, 0, 0, 0, 0, 0);
+            eval_launch(l.q, zero, l.lib_arc, l.edge, false)
+        }
+    };
     let launch_seeds: Vec<LaunchSeed> = if graph.launches.len() < 64 {
         graph
             .launches
@@ -2816,7 +2849,7 @@ fn prepare_sta<'a>(
                 par: launch_parity(l.clk, l.edge),
                 tag: launch_tag(l),
                 dom: clock_domain[l.clk.0 as usize],
-                pairs: eval_launch(l.q, base_state[l.clk.0 as usize], l.lib_arc, l.edge, false),
+                pairs: launch_pairs(l),
             })
             .collect()
     } else {
@@ -2828,7 +2861,7 @@ fn prepare_sta<'a>(
                 par: launch_parity(l.clk, l.edge),
                 tag: launch_tag(l),
                 dom: clock_domain[l.clk.0 as usize],
-                pairs: eval_launch(l.q, base_state[l.clk.0 as usize], l.lib_arc, l.edge, false),
+                pairs: launch_pairs(l),
             })
             .collect()
     };
@@ -3074,7 +3107,9 @@ fn eval_sta(
                         // setup). Data arriving before the latch opens contributes nothing — the
                         // clock-to-Q launch covers it. `dly` goes through the same cap; the early
                         // side contributes nothing (clock-to-Q-only launch rule, as for arrivals).
-                        let (arr_in_max, dly_in_max) = if let Some(&li) = borrow {
+                        let (arr_in_max, dly_in_max, par_m, crpr_m, dom_m) = if let Some(&li) =
+                            borrow
+                        {
                             let info = &graph.latch_info[li as usize];
                             let en = state[info.enable.0 as usize];
                             let close_pol = 1 - info.open_pol;
@@ -3118,16 +3153,43 @@ fn eval_sta(
                             if src.arrival_max[src_pol] <= open - unc {
                                 continue;
                             }
+                            // The borrowed launch is periodic in the enable
+                            // clock: OpenSTA reports the first-window event —
+                            // `open + min(arr - open, pulse - unc - setup)`,
+                            // i.e. the arrival clamped to the borrow cap of the
+                            // window rooted at `open` (measured `t2_xlat2`:
+                            // arrival 1.90 gives 0.91038, not 1.91).
                             let cap = |arr: f32| {
-                                let k =
-                                    ((arr - open) / en_clk.period_ns).floor().max(0.0);
-                                arr.min(
-                                    open + k * en_clk.period_ns + pulse - unc - setup,
-                                )
+                                arr.min(open + pulse - unc - setup)
                             };
-                            (cap(src.arrival_max[src_pol]), cap(src.dly_max[src_pol]))
+                            // A borrowed launch is anchored to the latch's own
+                            // open edge — domain, parity and (sentinel) CRPR
+                            // tag are the enable's, not the data source's, so
+                            // `u_ln -> u_fb0` pairs ckb->ckb even though `d2`
+                            // launched cka (`t2_xlat`).
+                            let open_par = prepared
+                                .clock_parity
+                                .as_deref()
+                                .and_then(|p| {
+                                    p.get(info.enable.0 as usize).map(|e| e[info.open_pol])
+                                })
+                                .filter(|&v| v <= 1)
+                                .unwrap_or(info.open_pol as u8);
+                            (
+                                cap(src.arrival_max[src_pol]),
+                                cap(src.dly_max[src_pol]),
+                                1 << open_par,
+                                1,
+                                dom_bit(en_dom as usize),
+                            )
                         } else {
-                            (src.arrival_max[src_pol], src.dly_max[src_pol])
+                            (
+                                src.arrival_max[src_pol],
+                                src.dly_max[src_pol],
+                                src.par_max[src_pol],
+                                src.crpr_max[src_pol],
+                                src.dom_max[src_pol],
+                            )
                         };
                         next.merge(
                             dst_pol,
@@ -3147,11 +3209,11 @@ fn eval_sta(
                             },
                             late_slew,
                             early_slew,
-                            src.par_max[src_pol],
+                            par_m,
                             src.par_min[src_pol],
-                            src.crpr_max[src_pol],
+                            crpr_m,
                             src.crpr_min[src_pol],
-                            src.dom_max[src_pol],
+                            dom_m,
                             src.dom_min[src_pol],
                         );
                         changed = true;
@@ -4657,6 +4719,245 @@ fn run_sta_partitioned(
         );
     }
 
+    // Deferred endpoints keep their `-to` delay check: an undeclared
+    // launch drops the ordinary check (`t2_u1`) but OpenSTA still reports
+    // the `set_max_delay`/`set_min_delay` row on the reached extremes
+    // (measured `t2_u2` on `u_fy/D`: `req = edge-0 capture - t_setup + N`
+    // max side, `+ t_hold + N` min side). The in-loop delay rewrite only
+    // fires on a surviving class candidate, so endpoints deferred from
+    // every class compose here — the measured FF-D/async and output-port
+    // forms only; pin `-from` startpoints stay deferred (unmeasured).
+    for (&ep, &kind) in &ctx.ep_kinds {
+        if composed.contains_key(&ep) || fp_endpoints.contains(&ep) {
+            continue;
+        }
+        let mut delay_max_n = None;
+        let mut delay_min_n = None;
+        let mut pin_from = false;
+        let mut dropped = false;
+        for rule in &rules {
+            match rule {
+                ResolvedRule::Exception(ex)
+                    if ex.kind == ExceptionKind::FalsePath
+                        && ex.to.as_ref().is_none_or(|t| t.contains(&ep)) =>
+                {
+                    dropped = true;
+                }
+                ResolvedRule::Delay(d)
+                    if d.to.as_ref().is_none_or(|t| t.contains(&ep)) =>
+                {
+                    pin_from |= d.from_pins.is_some();
+                    match d.kind {
+                        PathDelayKind::Max => delay_max_n = Some(d.value_ns),
+                        PathDelayKind::Min => delay_min_n = Some(d.value_ns),
+                    }
+                }
+                _ => {}
+            }
+        }
+        if dropped || pin_from || (delay_max_n.is_none() && delay_min_n.is_none()) {
+            if dropped {
+                fp_endpoints.insert(ep);
+            }
+            continue;
+        }
+        // Union of every class's arrival state — the same merged view the
+        // skip re-diagnosis below reads.
+        let mut s = PinTimingState::UNREACHED;
+        for st in &class_states {
+            s.merge_all(&st[ep as usize]);
+        }
+        let mut pols = EndpointPolarities {
+            max: [None; 2],
+            min: [None; 2],
+        };
+        match kind {
+            ExceptionEndpointKind::Check { latch } => {
+                let Some(&check) = check_by_pin.get(&ep) else {
+                    continue;
+                };
+                let Some(clk) = check.clk else {
+                    continue;
+                };
+                let mut clk_s = PinTimingState::UNREACHED;
+                for st in &class_states {
+                    clk_s.merge_all(&st[clk.0 as usize]);
+                }
+                let cap_row = prepared.clock_domain[clk.0 as usize] as usize;
+                if let Some(n) = delay_max_n
+                    && !latch
+                    && let Some(late_arc) = check.late_arc()
+                {
+                    let late = &lib.arcs[late_arc as usize];
+                    let anchor = if check.recovery_arc.is_some() {
+                        edge0_pol(clk)
+                    } else {
+                        check.edge
+                    };
+                    // An unclocked capture pin still composes (measured
+                    // `t2_u3` `u_fb0/D`): the report then anchors `req` at
+                    // the delay value itself — `N - t_setup` — with no
+                    // clock edge, uncertainty, or CRPR term, and the
+                    // constraint table reads the pin's driver-chain slew.
+                    let captured = clk_s.reached(anchor);
+                    let clk_slew = if captured {
+                        clk_s.slew_max[check.edge]
+                    } else {
+                        driver_input_slew(
+                            cx,
+                            &prepared.levelized,
+                            design,
+                            sdc,
+                            clk,
+                            check.edge,
+                            16,
+                        )
+                    };
+                    for pol in [RISE, FALL] {
+                        if s.arrival_max[pol] <= f32::NEG_INFINITY {
+                            continue;
+                        }
+                        let Some(table) = constraint_table(late, pol) else {
+                            continue;
+                        };
+                        let t_setup =
+                            eval_nldm_constraint(table, s.slew_max[pol], clk_slew) * sdc
+                                .derate(true, DERATE_CHECK, false, check_transition(late));
+                        let arr = s.dly_max[pol];
+                        let req = if captured {
+                            // Same anchor the in-loop `-to` rewrite uses,
+                            // including the propagated-clock CRPR credit.
+                            let credit = if sdc.clocks.get(cap_row).is_some_and(|c| c.propagated) {
+                                design.pin_nets[clk.0 as usize].map_or(0.0, |capture_net| {
+                                    crpr_credit(
+                                        design,
+                                        prepared.clock_state.as_deref(),
+                                        &prepared.crpr_tags,
+                                        s.crpr_max[pol],
+                                        capture_net,
+                                        anchor,
+                                    )
+                                })
+                            } else {
+                                0.0
+                            };
+                            clk_s.arrival_min[anchor]
+                                - unc_worst(sdc, s.dom_max[pol], cap_row, false)
+                                - t_setup
+                                + n
+                                + credit
+                        } else {
+                            n - t_setup
+                        };
+                        pols.max[pol] = Some(Worst {
+                            arr,
+                            dly: arr,
+                            req,
+                            slack: req - arr,
+                            slew: s.slew_max[pol],
+                        });
+                    }
+                }
+                if let Some(n) = delay_min_n
+                    && !latch
+                    && let Some(early_arc) = check.early_arc()
+                {
+                    let early = &lib.arcs[early_arc as usize];
+                    let anchor = if check.removal_arc.is_some() {
+                        edge0_pol(clk)
+                    } else {
+                        check.edge
+                    };
+                    let captured = clk_s.reached(anchor);
+                    let clk_slew = if captured {
+                        clk_s.slew_min[check.edge]
+                    } else {
+                        driver_input_slew(
+                            cx,
+                            &prepared.levelized,
+                            design,
+                            sdc,
+                            clk,
+                            check.edge,
+                            16,
+                        )
+                    };
+                    for pol in [RISE, FALL] {
+                        if s.arrival_min[pol] >= f32::INFINITY {
+                            continue;
+                        }
+                        let Some(table) = constraint_table(early, pol) else {
+                            continue;
+                        };
+                        let t_hold =
+                            eval_nldm_constraint(table, s.slew_min[pol], clk_slew) * sdc
+                                .derate(false, DERATE_CHECK, false, check_transition(early));
+                        let arr = s.dly_min[pol];
+                        let req = if captured {
+                            clk_s.arrival_max[anchor]
+                                + unc_worst(sdc, s.dom_min[pol], cap_row, true)
+                                + t_hold
+                                + n
+                        } else {
+                            n + t_hold
+                        };
+                        pols.min[pol] = Some(Worst {
+                            arr,
+                            dly: arr,
+                            req,
+                            slack: arr - req,
+                            slew: s.slew_min[pol],
+                        });
+                    }
+                }
+            }
+            ExceptionEndpointKind::OutputPort => {
+                let name = cx.port_name(PinId(ep));
+                let (delay_min, delay_max) = sdc.output_delay_ns(name);
+                if let Some(n) = delay_max_n {
+                    let out_row = sdc.output_clock_row(name, 1);
+                    for pol in [RISE, FALL] {
+                        if s.arrival_max[pol] <= f32::NEG_INFINITY {
+                            continue;
+                        }
+                        let unc = unc_worst(sdc, s.dom_max[pol], out_row, false);
+                        let arr = s.dly_max[pol];
+                        let req = n - delay_max - unc;
+                        pols.max[pol] = Some(Worst {
+                            arr,
+                            dly: arr,
+                            req,
+                            slack: req - arr,
+                            slew: s.slew_max[pol],
+                        });
+                    }
+                }
+                if let Some(n) = delay_min_n {
+                    let out_row = sdc.output_clock_row(name, 0);
+                    for pol in [RISE, FALL] {
+                        if s.arrival_min[pol] >= f32::INFINITY {
+                            continue;
+                        }
+                        let unc = unc_worst(sdc, s.dom_min[pol], out_row, true);
+                        let arr = s.dly_min[pol];
+                        let req = n - delay_min + unc;
+                        pols.min[pol] = Some(Worst {
+                            arr,
+                            dly: arr,
+                            req,
+                            slack: arr - req,
+                            slew: s.slew_min[pol],
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        if pols.max.iter().any(Option::is_some) || pols.min.iter().any(Option::is_some) {
+            composed.insert(ep, pols);
+        }
+    }
+
     // Internal path endpoints (measured `t2_selmd`): a delay rule whose
     // `-from` covers a launch key also covers the path that ends at a
     // dead-end pin in its fanout cone — OpenSTA reports it as an
@@ -4791,10 +5092,9 @@ fn run_sta_partitioned(
 
     // Re-diagnosis of an unreported endpoint against the union of every
     // class's arrival state — the same pairability test `collect_endpoints`
-    // applies per run: only a foreign launch domain that cannot pair
-    // (undeclared, latch borrow, a foreign hold candidate with no
-    // non-negative capture edge at-or-before a launch edge, non-converging
-    // LCM) lands here; pairable foreign domains reported already.
+    // applies per run: only an undeclared launch or a foreign launch domain
+    // that cannot pair (non-converging LCM, no in-window capture edge)
+    // lands here; pairable foreign domains reported already.
     // `cap_row` names the capture in the skip line while `cap_tag` is the
     // pairing domain (`launch_domain`-resolved, equal to `cap_row` on
     // checks/gates; distinct for a virtual output-port anchor sharing a
@@ -4817,12 +5117,11 @@ fn run_sta_partitioned(
                         cap_tag: usize,
                         setup_c0: usize,
                         hold_c0: usize,
-                        hold_next: bool,
-                        latch: bool|
+                        hold_next: bool|
      -> bool {
         let empty = Clock::default();
         let cap_clk = sdc.clocks.get(cap_tag).unwrap_or(&empty);
-        let Some(launch) = xdomain_defer(
+        let Some((launch, reason)) = xdomain_defer(
             s,
             sdc,
             dom_bit(cap_tag),
@@ -4830,15 +5129,17 @@ fn run_sta_partitioned(
             setup_c0,
             hold_c0,
             hold_next,
-            latch,
         ) else {
             return false;
         };
-        skipped.cross_domain_endpoints += 1;
+        match reason {
+            SkipReason::UndeclaredLaunch => skipped.undeclared_endpoints += 1,
+            _ => skipped.cross_domain_endpoints += 1,
+        }
         skipped.skipped_endpoints.push(SkippedEndpoint {
             pin: cx.pin_name(pin),
             kind,
-            reason: SkipReason::CrossDomain,
+            reason,
             related: Some(format!(
                 "launch {launch} -> capture {}",
                 sdc.clocks[cap_row].name
@@ -4911,7 +5212,6 @@ fn run_sta_partitioned(
             c0,
             c0,
             false,
-            check.latch,
         ) {
             continue;
         }
@@ -4958,7 +5258,6 @@ fn run_sta_partitioned(
             parity_at(g.clk_pin, setup_edge),
             parity_at(g.clk_pin, hold_edge),
             true,
-            false,
         ) {
             continue;
         }
@@ -4988,7 +5287,7 @@ fn run_sta_partitioned(
         rows.sort_unstable();
         rows.dedup();
         let empty_clk = Clock::default();
-        let mut deferred: Option<String> = None;
+        let mut deferred: Option<(String, SkipReason)> = None;
         let mut all_defer = !rows.is_empty();
         for r in rows {
             let cap_tag = launch_domain(sdc, r);
@@ -5000,11 +5299,13 @@ fn run_sta_partitioned(
                 0,
                 0,
                 false,
-                false,
             ) {
-                Some(launch) => {
+                Some((launch, reason)) => {
                     deferred.get_or_insert_with(|| {
-                        format!("launch {launch} -> capture {}", sdc.clocks[r].name)
+                        (
+                            format!("launch {launch} -> capture {}", sdc.clocks[r].name),
+                            reason,
+                        )
                     });
                 }
                 None => {
@@ -5014,12 +5315,16 @@ fn run_sta_partitioned(
             }
         }
         if all_defer {
-            skipped.cross_domain_endpoints += 1;
+            let (related, reason) = deferred.unwrap();
+            match reason {
+                SkipReason::UndeclaredLaunch => skipped.undeclared_endpoints += 1,
+                _ => skipped.cross_domain_endpoints += 1,
+            }
             skipped.skipped_endpoints.push(SkippedEndpoint {
                 pin: cx.pin_name(PinId(p)),
                 kind: EndpointKind::OutputPort,
-                reason: SkipReason::CrossDomain,
-                related: deferred,
+                reason,
+                related: Some(related),
             });
             continue;
         }
@@ -5336,27 +5641,106 @@ fn grid_lcm(a: f32, b: f32) -> Option<f64> {
     None
 }
 
-/// Launch-edge window bound shared by the pair searches: edges repeat at the
-/// period-LCM boundary, so launch edges `launch0 + m·PL < lcm` enumerate the
-/// full residue pattern (`launch0` is the launch edge's waveform instant).
-/// The bound carries f32-scale noise (`grid_lcm` tolerance), so the margin
-/// is 1e-6-relative, not edge-exact.
-fn launch_window(launch0: f64, pl: f64, lcm: f64) -> impl Iterator<Item = (usize, f64)> {
+/// Vertex slew at a pin whose net is cell- or port-driven — used to seed
+/// an unclocked register's clk->Q launch at the pin's real slew rather
+/// than zero. Walks the driver chain back through cells: a port driver
+/// ends the chain with its `set_input_transition` (zero when unset); a
+/// cell driver evaluates `driver_response` at each incoming arc input's
+/// own recursively computed slew and keeps the worst output slew.
+/// `depth` bounds the walk; loops and driverless nets settle at zero.
+fn driver_input_slew(
+    cx: &Context,
+    levelized: &LevelizedGraph,
+    design: &DesignDb,
+    sdc: &Sdc,
+    pin: PinId,
+    pol: usize,
+    depth: usize,
+) -> f32 {
+    if depth == 0 {
+        return 0.0;
+    }
+    let (Some(net), Some(drv)) = (
+        design.pin_nets[pin.0 as usize],
+        design
+            .pin_nets[pin.0 as usize]
+            .and_then(|n| design.net_driver(n)),
+    ) else {
+        return 0.0;
+    };
+    if drv == pin {
+        return 0.0;
+    }
+    if design.pin_cells[drv.0 as usize].is_none() {
+        return sdc.input_transition_ns(cx.port_name(drv));
+    }
+    let mut slew = 0.0f32;
+    for &(src_pin, lib_arc) in levelized.incoming_to(drv) {
+        let arc = &cx.lib.arcs[lib_arc as usize];
+        for &(src_pol, dst_pol) in arc_legs(arc) {
+            if dst_pol != pol {
+                continue;
+            }
+            let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol) else {
+                continue;
+            };
+            let s_in =
+                driver_input_slew(cx, levelized, design, sdc, src_pin, src_pol, depth - 1);
+            let (_, s_out) = cx.driver_response(net, dst_pol, delay_table, slew_table, s_in);
+            slew = slew.max(s_out);
+        }
+    }
+    slew
+}
+
+/// Edge-pair search window shared by the pair searches (measured
+/// `probe_t2_lcm*`): OpenSTA scans each clock's first ~100 edges for a
+/// common period — a coincidence at f32-scale tolerance yields the period
+/// LCM, and launch edges `launch0 + m·PL < lcm` then enumerate the full
+/// residue pattern. With no coincidence inside the bound it warns
+/// `STA-1010` but still pairs, bounding the launch scan to the first `N`
+/// capture periods: `N = 100` when the launch clock is the faster one,
+/// `1000` when it is the slower. The bound is directional, not symmetric —
+/// `probe_t2_lcm.txt` pairs launch 112/capture 97 inside the 200 =
+/// 100·2.0 capture window for the faster-launch direction and launch
+/// 808/capture 933 inside ~1732 = 1000·1.732 for the slower; the
+/// convergence boundary itself is bracketed by `probe_t2_lcm3.txt`
+/// (2.0/1.98, LCM 198 — converges silently) and `probe_t2_lcm4.txt`
+/// (2.0/1.9801 — warns).
+fn pair_window(pl: f64, pc: f64) -> f64 {
+    match grid_lcm(pl as f32, pc as f32) {
+        Some(lcm) if lcm <= 100.0 * pl.min(pc) => lcm,
+        _ => (if pl < pc { 100.0 } else { 1000.0 }) * pc,
+    }
+}
+
+/// Trip bound on the launch-edge scan: the window is a multiple of the
+/// *capture* period, so an extreme `PL << PC` ratio would otherwise
+/// iterate orders of magnitude past every measured horizon (~100–1000
+/// edges).
+const MAX_PAIR_EDGES: usize = 1_000_000;
+
+/// Launch edges `launch0 + m·PL` below the pair-search window (`launch0` is
+/// the launch edge's waveform instant). The bound carries f32-scale noise
+/// (`grid_lcm` tolerance), so the margin is 1e-6-relative, not edge-exact.
+fn launch_window(launch0: f64, pl: f64, window: f64) -> impl Iterator<Item = (usize, f64)> {
     (0usize..)
         .map(move |m| (m, launch0 + m as f64 * pl))
-        .take_while(move |&(_, tl)| tl < lcm * (1.0 - 1e-6))
+        .take_while(move |&(_, tl)| tl < window * (1.0 - 1e-6))
+        .take(MAX_PAIR_EDGES)
 }
 
 /// Setup pair (measured `docs/multi-clock.md` §1.2): every launch edge
-/// `edge_offset(g) + m·PL` inside the period-LCM window pairs with the
+/// `edge_offset(g) + m·PL` inside the pair-search window pairs with the
 /// smallest capture edge `edge_offset(c0) + j·PC` strictly after it; the
 /// winner minimises `capture − launch`. Returns `(m·PL, j·PC)` — additive
 /// shifts on the recorded arrivals, which are referenced to each parity's
-/// first edge. `None` only when `grid_lcm` fails. Equal gaps keep the
-/// first found (smallest launch edge); OpenSTA's tie-break is unmeasured.
+/// first edge. `None` only on a degenerate empty window. Equal gaps keep
+/// the first found (smallest launch edge); OpenSTA's tie-break is
+/// unmeasured.
 fn setup_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f32, f32)> {
-    let lcm = grid_lcm(lclk.period_ns, cclk.period_ns)?;
     let (pl, pc) = (lclk.period_ns as f64, cclk.period_ns as f64);
+    let window = pair_window(pl, pc);
     let launch0 = lclk.edge_offset(g) as f64;
     let phase_c = cclk.edge_offset(c0) as f64;
     // A capture edge coincident with the launch edge is not strictly after;
@@ -5364,7 +5748,7 @@ fn setup_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f
     // degenerate sub-eps gap is treated as coincidence either way.
     let eps = 1e-9 * pc.max(pl);
     let mut best: Option<(f64, f64, f64)> = None;
-    for (m, tl) in launch_window(launch0, pl, lcm) {
+    for (m, tl) in launch_window(launch0, pl, window) {
         let mut j = ((tl - phase_c) / pc).floor().max(-1.0) as i64 + 1;
         j = j.max(0);
         while j > 0 && phase_c + (j - 1) as f64 * pc > tl + eps {
@@ -5381,50 +5765,57 @@ fn setup_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f
     best.map(|(_, lsh, csh)| (lsh as f32, csh as f32))
 }
 
-/// Hold pair (§1.2): each launch edge `edge_offset(g) + m·PL` pairs with the
-/// largest capture edge `edge_offset(c0) + j·PC` at-or-before it; the winner
-/// minimises `launch − capture`. Measured on `t2_wave` (ckb→cka launch 1.0 /
-/// capture 0.3): a non-coincident minimum-gap pair is real, so the rule is
-/// gap-minimising, not coincidence — the coincident grids of every
-/// pre-waveform scenario still return the same pair (gap 0, earliest
-/// launch). `None` when `grid_lcm` fails or no non-negative capture edge
-/// sits at-or-before any launch edge.
+/// Hold pair (§1.2): capture-edge-driven — each capture edge
+/// `edge_offset(c0) + j·PC` inside the pair-search window pairs with the
+/// smallest launch edge `edge_offset(g) + m·PL` at-or-after it, including
+/// the first edge past the boundary (`t2_waverot` `u_fy/D`: capture 1.9 →
+/// launch 2.0 on the LCM boundary); the winner minimises
+/// `launch − capture`. Measured on `t2_wave` (ckb→cka launch 1.0 /
+/// capture 0.3): a non-coincident minimum-gap pair is real, so the rule
+/// is gap-minimising, not coincidence — the coincident grids of every
+/// pre-waveform scenario still return the same pair (gap 0). `None` only
+/// on a degenerate empty window — the search always pairs otherwise.
 fn hold_edge_pair(lclk: &Clock, cclk: &Clock, g: usize, c0: usize) -> Option<(f32, f32)> {
-    let lcm = grid_lcm(lclk.period_ns, cclk.period_ns)?;
     let (pl, pc) = (lclk.period_ns as f64, cclk.period_ns as f64);
+    let window = pair_window(pl, pc);
     let launch0 = lclk.edge_offset(g) as f64;
     let phase_c = cclk.edge_offset(c0) as f64;
     let eps = 1e-9 * pc.max(pl);
     let mut best: Option<(f64, f64, f64)> = None;
-    for (m, tl) in launch_window(launch0, pl, lcm) {
-        // Largest j >= 0 with `phase_c + j·PC <= tl`.
-        let mut j = ((tl - phase_c) / pc).floor() as i64;
-        while j > 0 && phase_c + j as f64 * pc > tl + eps {
-            j -= 1;
+    let mut j = 0i64;
+    loop {
+        let tc = phase_c + j as f64 * pc;
+        if tc >= window * (1.0 - 1e-6) || j as usize >= MAX_PAIR_EDGES {
+            break;
         }
-        if j < 0 || phase_c + j as f64 * pc > tl + eps {
-            continue;
+        // Smallest m >= 0 with `launch0 + m·PL >= tc` — fp noise keeps the
+        // ceil a step under/at the coincidence, then the walk settles it.
+        let mut m = ((tc - launch0 - eps) / pl).ceil().max(0.0) as i64;
+        while m > 0 && launch0 + (m - 1) as f64 * pl >= tc - eps {
+            m -= 1;
         }
-        let gap = tl - (phase_c + j as f64 * pc);
+        let tl = launch0 + m as f64 * pl;
+        let gap = tl - tc;
         if best.is_none_or(|(g0, _, _)| gap < g0 - 1e-9) {
             best = Some((gap, m as f64 * pl, j as f64 * pc));
         }
+        j += 1;
     }
     best.map(|(_, lsh, csh)| (lsh as f32, csh as f32))
 }
 
-/// Whole-endpoint `CrossDomain` deferral predicate, shared between
-/// `collect_endpoints` and the partitioned skip pass. `Some(launch names)`
-/// when any reached arrival extreme cannot be evaluated against `cap_bit`
-/// — a single-anchor endpoint defers outright; a multi-anchor output port
-/// defers per anchor and skips only when every anchor defers
+/// Whole-endpoint cross-domain deferral predicate, shared between
+/// `collect_endpoints` and the partitioned skip pass. `Some(launch names,
+/// reason)` when any reached arrival extreme cannot be evaluated against
+/// `cap_bit` — a single-anchor endpoint defers outright; a multi-anchor
+/// output port defers per anchor and skips only when every anchor defers
 /// (`t2_clkcor2`):
-///   * reached extreme, empty dom mask      -> `<undeclared>` (the fold
-///     `mc-eval` exists to catch)
-///   * latch-D check, any foreign bit       -> parked borrow pairing
-///   * min-side (d, g) with no capture edge
-///     at-or-before a launch edge           -> parked hold selection
-///   * non-converging `grid_lcm`            -> defensive
+///   * reached extreme, empty dom mask      -> `UndeclaredLaunch` —
+///     an unclocked register's edge-0 clk->Q launch (`t2_u1`): OpenSTA
+///     drops the ordinary check while a `-to` delay check still times it
+///     (`t2_u2`), so the launch is seeded and the deferral names it
+///   * any `(d, g)` grid with no pair in the `pair_window` horizon ->
+///     `CrossDomain`, defensive — commensurate grids always pair
 ///
 /// `None` = every tying (domain, parity) pairs — evaluate.
 ///
@@ -5441,8 +5832,7 @@ fn xdomain_defer(
     setup_c0: usize,
     hold_c0: usize,
     hold_next: bool,
-    latch: bool,
-) -> Option<String> {
+) -> Option<(String, SkipReason)> {
     let mut foreign = 0u8;
     let mut undeclared = false;
     for pol in [RISE, FALL] {
@@ -5471,8 +5861,8 @@ fn xdomain_defer(
         }
         names.push_str("<undeclared>");
     }
-    if undeclared || (latch && foreign != 0) {
-        return Some(names);
+    if undeclared {
+        return Some((names, SkipReason::UndeclaredLaunch));
     }
     // Every foreign (domain, parity) on a reached extreme must pair.
     let pair_ok = |dom: u8, par: u8, c0: usize, min_side: bool| -> bool {
@@ -5504,12 +5894,12 @@ fn xdomain_defer(
         if s.arrival_max[pol] > f32::NEG_INFINITY
             && !pair_ok(s.dom_max[pol], s.par_max[pol], setup_c0, false)
         {
-            return Some(names.clone());
+            return Some((names.clone(), SkipReason::CrossDomain));
         }
         if s.arrival_min[pol] < f32::INFINITY
             && !pair_ok(s.dom_min[pol], s.par_min[pol], hold_c0, true)
         {
-            return Some(names.clone());
+            return Some((names.clone(), SkipReason::CrossDomain));
         }
     }
     None
@@ -5668,21 +6058,17 @@ fn collect_endpoints(
         // extreme's (domain, parity) must pair on the two period grids —
         // min-gap on setup and hold alike. Anything unpairable defers
         // with the domains named — never folds onto the capture lattice.
-        if let Some(launch) = xdomain_defer(
-            s,
-            sdc,
-            dom_bit(cap as usize),
-            cap_clk,
-            c0,
-            c0,
-            false,
-            check.latch,
-        ) {
-            skipped.cross_domain_endpoints += 1;
+        if let Some((launch, reason)) =
+            xdomain_defer(s, sdc, dom_bit(cap as usize), cap_clk, c0, c0, false)
+        {
+            match reason {
+                SkipReason::UndeclaredLaunch => skipped.undeclared_endpoints += 1,
+                _ => skipped.cross_domain_endpoints += 1,
+            }
             skipped.skipped_endpoints.push(SkippedEndpoint {
                 pin: cx.pin_name(data),
                 kind: EndpointKind::Check,
-                reason: SkipReason::CrossDomain,
+                reason,
                 related: Some(format!("launch {launch} -> capture {}", cap_clk.name)),
             });
             continue;
@@ -5808,8 +6194,33 @@ fn collect_endpoints(
                             continue;
                         };
                         let arr = s.arrival_max[pol] + lsh;
-                        let req = clk_state.arrival_min[edge] + csh - late_time
+                        // A foreign launch still borrows through the latch's
+                        // own transparent window (measured `t2_xlat*`): the
+                        // same-domain decomposition applies with the paired
+                        // closing edge — `opening + min(arr - opening,
+                        // pulse - t_setup)` is `min(arr, closing_max)` where
+                        // `closing_max` is the closing required time.
+                        let closing = clk_state.arrival_min[edge] + csh;
+                        let closing_max = closing
+                            - late_time
                             - sdc.uncertainty_ns(d, cap as usize, false);
+                        let req = if !check.latch {
+                            closing_max
+                        } else {
+                            let open_pol = 1 - edge;
+                            let periods = ((closing - clk_state.arrival_min[open_pol])
+                                / cap_clk.period_ns)
+                                .floor()
+                                .max(0.0);
+                            let opening_max = clk_state.arrival_min[open_pol]
+                                + periods * cap_clk.period_ns
+                                - sdc.uncertainty_ns(d, cap as usize, false);
+                            if arr <= opening_max {
+                                opening_max
+                            } else {
+                                arr.min(closing_max)
+                            }
+                        };
                         (arr, req, req - arr)
                     };
                     if max_pick.is_none_or(|(_, _, sl)| slack < sl) {
@@ -5952,21 +6363,17 @@ fn collect_endpoints(
         // hold edge follows the launch edge (opposite-polarity grid,
         // strictly-after), so the min side always pairs — only an
         // undeclared launch or a non-converging LCM defers.
-        if let Some(launch) = xdomain_defer(
-            s,
-            sdc,
-            dom_bit(cap as usize),
-            cap_clk,
-            pe_s,
-            pe_h,
-            true,
-            false,
-        ) {
-            skipped.cross_domain_endpoints += 1;
+        if let Some((launch, reason)) =
+            xdomain_defer(s, sdc, dom_bit(cap as usize), cap_clk, pe_s, pe_h, true)
+        {
+            match reason {
+                SkipReason::UndeclaredLaunch => skipped.undeclared_endpoints += 1,
+                _ => skipped.cross_domain_endpoints += 1,
+            }
             skipped.skipped_endpoints.push(SkippedEndpoint {
                 pin: cx.pin_name(enable),
                 kind: EndpointKind::ClockGate,
-                reason: SkipReason::CrossDomain,
+                reason,
                 related: Some(format!(
                     "launch {launch} -> capture {}",
                     sdc.clocks[cap as usize].name
@@ -6146,7 +6553,7 @@ fn collect_endpoints(
         // nothing, and the port defers as a whole only when every anchored
         // check defers — a partially-deferred port emits its surviving
         // checks uncounted.
-        let mut deferred: Option<String> = None;
+        let mut deferred: Option<(String, SkipReason)> = None;
         for (corner, corner_anchors) in anchors.iter().enumerate() {
             for &(out_row, delay) in corner_anchors {
                 let out_clk = sdc.clocks.get(out_row).unwrap_or(&empty_clk);
@@ -6156,18 +6563,12 @@ fn collect_endpoints(
                 // the anchor grid's edge-0 rise lattice (`c0 = 0`) is the
                 // capture phase.
                 let cap_tag = launch_domain(sdc, out_row);
-                if let Some(launch) = xdomain_defer(
-                    s,
-                    sdc,
-                    dom_bit(cap_tag),
-                    out_clk,
-                    0,
-                    0,
-                    false,
-                    false,
-                ) {
-                    deferred
-                        .get_or_insert_with(|| format!("{launch} -> capture {}", out_clk.name));
+                if let Some((launch, reason)) =
+                    xdomain_defer(s, sdc, dom_bit(cap_tag), out_clk, 0, 0, false)
+                {
+                    deferred.get_or_insert_with(|| {
+                        (format!("{launch} -> capture {}", out_clk.name), reason)
+                    });
                     continue;
                 }
                 let latency = sdc.clock_row_latency_ns(out_row);
@@ -6300,13 +6701,16 @@ fn collect_endpoints(
         }
         if cands.max.iter().all(Option::is_none)
             && cands.min.iter().all(Option::is_none)
-            && let Some(deferred) = deferred
+            && let Some((deferred, reason)) = deferred
         {
-            skipped.cross_domain_endpoints += 1;
+            match reason {
+                SkipReason::UndeclaredLaunch => skipped.undeclared_endpoints += 1,
+                _ => skipped.cross_domain_endpoints += 1,
+            }
             skipped.skipped_endpoints.push(SkippedEndpoint {
                 pin: cx.pin_name(pin),
                 kind: EndpointKind::OutputPort,
-                reason: SkipReason::CrossDomain,
+                reason,
                 related: Some(format!("launch {deferred}")),
             });
             continue;
@@ -6492,6 +6896,7 @@ fn merge_skip_reports(a: SkipReport, b: SkipReport) -> SkipReport {
         incomplete_checks: a.incomplete_checks.max(b.incomplete_checks),
         unreached_endpoints: a.unreached_endpoints.max(b.unreached_endpoints),
         cross_domain_endpoints: a.cross_domain_endpoints.max(b.cross_domain_endpoints),
+        undeclared_endpoints: a.undeclared_endpoints.max(b.undeclared_endpoints),
         skipped_endpoints,
         cell_driven_clock_nets: a.cell_driven_clock_nets.max(b.cell_driven_clock_nets),
         unresolved_driving_cells: a.unresolved_driving_cells.max(b.unresolved_driving_cells),
@@ -9680,6 +10085,16 @@ mod tests {
                         failures.push(format!("{}: deferred but OpenSTA never timed it", s.pin));
                     }
                 }
+                // Capture-driven hold pairing (item 3) made the pairing
+                // total on this fixture: a regression that re-defers a
+                // golden endpoint (e.g. `t2_waverot.u_fy/D`) must fail
+                // here, not hide behind the `is_deferred` exemption.
+                if report.skipped.cross_domain_endpoints != 0 {
+                    failures.push(format!(
+                        "cross_domain_endpoints={} (must be 0)",
+                        report.skipped.cross_domain_endpoints
+                    ));
+                }
                 // Aggregates only when the endpoint set is complete — OpenSTA's
                 // wns/tns/violation counts span the cross-domain paths that
                 // defer, so a scenario with `CrossDomain` skips cannot compare.
@@ -9768,7 +10183,7 @@ mod tests {
                 "{name}: expected bail `{expected}`, got `{err:#}`"
             );
         }
-        assert_eq!(evaluated, 46, "every scenario must evaluate");
+        assert_eq!(evaluated, 52, "every scenario must evaluate");
     }
 
     /// `mc-cleanups` measure-only scenarios — no golden block; the pinned
@@ -9832,13 +10247,46 @@ mod tests {
         // leave the endpoint table.
         let report = run("t2_noclk");
         assert_eq!(pins(&report), ["u_fa1/D", "u_fb1/D", "u_fx/D", "u_fy/D", "yb"]);
+        // `t2_u3` (xdomain-deferrals): a `-to` delay check on an
+        // *unclocked* capture endpoint. OpenSTA reports `u_fb0/D` with
+        // `req` anchored at the delay value itself — `N - t_setup` /
+        // `N + t_hold`, no clock edge or uncertainty — arr 0.70/0.10,
+        // req 1.36/0.46.
+        let report = run("t2_u3");
+        assert_eq!(pins(&report), ["u_fa0/D", "u_fa1/D", "u_fb0/D", "ya"]);
+        let ep = |pin: &str| {
+            report
+                .endpoints
+                .iter()
+                .find(|e| e.pin == pin)
+                .unwrap()
+        };
+        assert!((ep("u_fb0/D").max_req_ns.unwrap() - 1.3648895).abs() < 1e-4);
+        assert!((ep("u_fb0/D").min_req_ns.unwrap() - 0.456963).abs() < 1e-4);
+        // `t2_lcm3`/`t2_lcm4` bracket the common-period boundary
+        // (`probe_t2_lcm{3,4}.txt`): 2.0/1.98 converges in OpenSTA's
+        // 100-edge scan while 2.0/1.9801 warns STA-1010 — ours evaluates
+        // every endpoint either way (`grid_lcm` fails on the latter, the
+        // pair window falls back to 1000 capture periods).
+        for name in ["t2_lcm3", "t2_lcm4"] {
+            let report = run(name);
+            assert_eq!(
+                pins(&report),
+                [
+                    "u_fa0/D", "u_fa1/D", "u_fb0/D", "u_fb1/D", "u_fx/D", "u_fy/D", "ya", "yb"
+                ],
+                "{name}"
+            );
+            assert_eq!(report.skipped.cross_domain_endpoints, 0, "{name}");
+        }
     }
 
     /// Undeclared-domain hazard (`docs/multi-clock.md` §2): a single-clock
     /// SDC on the two-clock DEF must not fold `cb`'s flops onto `cka`'s
     /// lattice. The `cka` side evaluates; every `cb` endpoint is named in
     /// `skipped_endpoints` — `NoClock` where the capture clock pin is
-    /// unreached, a no-arrival skip where the launch was dead.
+    /// unreached, `UndeclaredLaunch` where an unclocked register's edge-0
+    /// clk->Q launch reaches a declared-domain endpoint.
     #[test]
     fn one_clock_sdc_on_two_clock_def() {
         let lib_dir = sky130_hd();
@@ -9883,15 +10331,105 @@ mod tests {
         for pin in ["u_fb0/D", "u_fb1/D", "u_fx/D"] {
             assert_eq!(reason(pin), SkipReason::NoClock, "{pin}");
         }
+        // The unclocked `u_fb0` still launches clk->Q at edge 0 (`t2_u1`
+        // measured OpenSTA dropping the check outright), so `u_fy/D` and
+        // `yb` name their `UndeclaredLaunch` deferral rather than an
+        // unreached-path reason.
         for pin in ["u_fy/D", "yb"] {
+            assert_eq!(reason(pin), SkipReason::UndeclaredLaunch, "{pin}");
+        }
+    }
+
+    /// `xdomain-deferrals` resolutions (docs/multi-clock.md §2). Every
+    /// scenario OpenSTA evaluates must now report with zero foreign
+    /// deferrals; the one OpenSTA also drops (`t2_u1`'s `u_fy/D`) stays a
+    /// named `UndeclaredLaunch` skip. Values here are the probe's
+    /// `report_checks` rows — the strict goldens pin the byte comparison.
+    #[test]
+    fn xdomain_deferrals_scenarios() {
+        let lib_dir = sky130_hd();
+        let lib = load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"))
+            .expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let dir = design_dir("sta_clocks");
+        let design = parse_def(&dir.join("two_clock.def"), &tech, Some(&lib)).expect("DEF");
+        let latch_design =
+            parse_def(&dir.join("two_clock_latch.def"), &tech, Some(&lib)).expect("DEF");
+        let run = |d: &DesignDb, name: &str| {
+            let sdc = load_sdc(&dir.join(format!("{name}.sdc"))).expect("sdc");
+            run_sta(d, &lib, &sdc, None).expect("sta")
+        };
+        let pins = |r: &StaReport| {
+            let mut v: Vec<String> =
+                r.endpoints.iter().map(|e| e.pin.clone()).collect();
+            v.sort_unstable();
+            v
+        };
+        let ep = |r: &StaReport, pin: &str| -> EndpointReport {
+            r.endpoints
+                .iter()
+                .find(|e| e.pin == pin)
+                .cloned()
+                .unwrap_or_else(|| panic!("{pin} not reported"))
+        };
+        let approx = |got: Option<f32>, want: f32| {
             assert!(
-                matches!(
-                    reason(pin),
-                    SkipReason::NoPath | SkipReason::UntimedDriver
-                ),
-                "{pin}: {:?}",
-                reason(pin)
+                got.is_some_and(|g| (g - want).abs() < 0.05),
+                "got {got:?} want {want}"
             );
+        };
+
+        // Item 1: `t2_u1` — OpenSTA drops the unclocked-launch check
+        // entirely; we name the deferral instead of reporting it.
+        let r = run(&design, "t2_u1");
+        assert_eq!(pins(&r), ["u_fa0/D", "u_fa1/D", "ya"]);
+        assert_eq!(r.skipped.undeclared_endpoints, 1); // u_fy/D
+        assert_eq!(r.skipped.cross_domain_endpoints, 0);
+        // `t2_u2` — a covering `-to` delay check still reports the same
+        // endpoint (req = edge-0 capture − t_setup + N / + t_hold + N).
+        let r = run(&design, "t2_u2");
+        let fy = ep(&r, "u_fy/D");
+        approx(fy.max_req_ns, 1.39);
+        approx(fy.max_slack_ns, 1.09);
+        approx(fy.min_req_ns, 0.46);
+        approx(fy.min_slack_ns, -0.16);
+        assert_eq!(r.skipped.undeclared_endpoints, 0);
+
+        // Items 3+4: non-convergent grids warn (STA-1010) but still pair
+        // inside the directional window — no deferrals, measured slacks.
+        let r = run(&design, "t2_lcm");
+        assert_eq!(r.skipped.cross_domain_endpoints, 0);
+        assert_eq!(
+            pins(&r),
+            ["u_fa0/D", "u_fa1/D", "u_fb0/D", "u_fb1/D", "u_fx/D", "u_fy/D", "ya", "yb"]
+        );
+        approx(ep(&r, "u_fy/D").max_slack_ns, -0.38);
+        approx(ep(&r, "u_fx/D").max_slack_ns, -0.39);
+        approx(ep(&r, "u_fy/D").min_slack_ns, 0.32);
+        let r = run(&design, "t2_lcm2");
+        assert_eq!(r.skipped.cross_domain_endpoints, 0);
+        approx(ep(&r, "u_fy/D").max_slack_ns, 1.61);
+        approx(ep(&r, "u_fx/D").max_slack_ns, 1.61);
+
+        // Item 2: foreign-launch latch-D borrows through the latch's own
+        // window (req = closing + borrow = 0.55 + 0.32 = 0.87).
+        for (name, arr, slack) in [("t2_xlat", 1.30, -0.43), ("t2_xlat2", 1.90, -1.03)] {
+            let r = run(&latch_design, name);
+            assert_eq!(r.skipped.cross_domain_endpoints, 0, "{name}");
+            let ln = ep(&r, "u_ln/D");
+            approx(ln.max_arr_ns, arr);
+            approx(ln.max_req_ns, 0.87);
+            approx(ln.max_slack_ns, slack);
+            // The borrowed D->Q launch re-domains to ckb: `u_ln -> u_fb0`
+            // reports as a ckb->ckb same-domain path.
+            assert!(pins(&r).iter().any(|p| p == "u_fb0/D"), "{name}");
         }
     }
 
