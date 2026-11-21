@@ -529,10 +529,14 @@ puts ~80% of main-thread samples inside `sta::dmp`
 (`rc_crossing`/`fit_ramp_duration`/`solve_dmp_with`). Candidate
 follow-on tickets, in measured order (details + Amdahl ceilings in
 `kurena/tasks/perf-profile/design/plan.md` — candidates, not
-commitments): `perf-par-slew` (per-level `par_iter`, ×~2.2 jpeg `sta`),
-`perf-slewonly-power` (slew-only `sta_pin_slews`, parity-gated),
-`perf-legal-passes` (algorithmic; serial ordered-move passes are 44% of
-`place`), then the parser tickets `perf-spef-parse`, `perf-def-parse`,
-`perf-vcd-parse`. Every optimization ticket lands only with a
+commitments): ~~`perf-par-slew`~~ **done** (per-level `par_iter`, jpeg
+`sta` placement RC 6.0 s → 2.06 s, `sta.prepare.clock.slew` phase
+×5.4 — `docs/results.md` 2026-11-22 perf-par-slew entry);
+`perf-slewonly-power` (slew-only `sta_pin_slews`, parity-gated — now a
+larger relative share of `power`), `perf-legal-passes` (algorithmic;
+serial ordered-move passes are 44% of `place`), then the parser tickets
+`perf-spef-parse`, `perf-def-parse`, `perf-vcd-parse` — and
+`sta.eval.walk` is the new co-dominant `sta` phase after
+`perf-par-slew`. Every optimization ticket lands only with a
 bit-identical-or-tolerance-named fast path and a `docs/results.md`
 number, per the usual discipline.

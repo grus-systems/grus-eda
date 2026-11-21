@@ -1827,8 +1827,19 @@ fn propagate_slew(
         Some((out_max, out_min))
     };
 
+    // Position of each pin inside `level_pins`, used by the seq fixup below to
+    // tell "same level, earlier position" from every other source placement.
+    let mut rank = vec![0u32; n];
+    for (i, &p) in levelized.level_pins.iter().enumerate() {
+        rank[p.0 as usize] = i as u32;
+    }
+
     for lvl in 1..levelized.level_offsets.len() - 1 {
-        for &pin in levelized.level(lvl) {
+        let level = levelized.level(lvl);
+        let lo = levelized.level_offsets[lvl] as usize;
+        let eval_pin = |slew: &[PinTimingState],
+                        pin: PinId|
+         -> Option<(usize, PinTimingState)> {
             let p = pin.0 as usize;
             let mut next = slew[p];
             let mut changed = false;
@@ -1900,8 +1911,60 @@ fn propagate_slew(
                 }
             }
 
-            if changed {
+            changed.then_some((p, next))
+        };
+
+        if level.len() < 32 {
+            for &pin in level {
+                if let Some((p, next)) = eval_pin(&slew, pin) {
+                    slew[p] = next;
+                }
+            }
+        } else {
+            let updates: Vec<(usize, PinTimingState)> = level
+                .par_iter()
+                .filter_map(|&pin| eval_pin(&slew, pin))
+                .collect();
+            for (p, next) in updates {
                 slew[p] = next;
+            }
+        }
+
+        // Under the include_seq=false fallback a seq arc's source can sit in the
+        // same level as its destination. The serial loop read such a source's
+        // post-update slew when it stood earlier in `level_pins`; the parallel
+        // body read UNREACHED and merged nothing. Replay exactly those merges
+        // here, in level order, so both modes agree bit-for-bit. Sources at a
+        // later position (or level) read UNREACHED serially too — replaying
+        // them would add slew the serial pass never saw. In include_seq=true
+        // mode seq edges are ordering edges and `lo <= r < i` never fires; on
+        // the serial small-level path the body already merged the applied
+        // source value and re-merging it is a no-op (max/min are idempotent).
+        for (j, &pin) in level.iter().enumerate() {
+            let i = lo + j;
+            let p = pin.0 as usize;
+            let Some(out_net) = design.pin_nets[p] else {
+                continue;
+            };
+            for &(src_pin, lib_arc, src_pol) in &seq_in[p] {
+                let r = rank[src_pin.0 as usize] as usize;
+                if r < lo || r >= i {
+                    continue;
+                }
+                let src = slew[src_pin.0 as usize];
+                let s_max = src.slew_max[src_pol];
+                let s_min = src.slew_min[src_pol];
+                if s_max == f32::NEG_INFINITY {
+                    continue;
+                }
+                let arc = &cx.lib.arcs[lib_arc as usize];
+                for dst_pol in [RISE, FALL] {
+                    if let Some((out_max, out_min)) =
+                        arc_slew(out_net, arc, dst_pol, s_max, s_min)
+                    {
+                        merge_slew(&mut slew[p], dst_pol, out_max, out_min);
+                    }
+                }
             }
         }
     }
