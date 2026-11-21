@@ -38,8 +38,9 @@ code.
    `report_activity_annotation` splits pins by source — our diagnostics get
    the same per-origin counts (`propagated_nets`, `default_nets`,
    `constant_nets`) so nothing is hidden; `driven_nets_without_activity`
-   shrinks to genuinely unresolved nets (undriven, x-only) or retires —
-   decided by the P5 measurement.
+   shrinks to genuinely unresolved nets (`unknown` feedback cones — the
+   only zero-activity class left) or retires. Measured: undriven nets get
+   the `input` default, not zero; x/z seeds are half-weight edges.
 
    Representation note: propagation yields `{P, density}` as rates, while
    `SignalActivity` is integer counts + window durations. Options: (a) carry
@@ -49,26 +50,44 @@ code.
    (a) is honest about precision, (b) keeps `SignalActivity` untouched.
    Record the choice + reason in the implement commit.
 
-2. **Seed order** (precedence measured by P4 / the SAIF `TC` finding):
-   1. explicit annotation — VCD/SAIF per-net entry (partial annotation
-      covers only its nets);
-   2. SDC clock nets — rate from the SDC clock (clock activity follows
-      SDC, not the annotation);
-   3. propagated — combinational levelized fill per the measured M1/M2 rule;
-   4. sequential — `findSeqActivity` rule per the P3 verdict;
-   5. defaults — the measured input/internal/sequential defaults;
-   6. constants — `function : "0"/"1"` pins and their downstream;
-   7. undriven/x — per P5 (likely zero + counted, or a default — measured).
+2. **Seed order** (measured 2026-11-21, per-pin precedence — activity is
+   per-pin, not per-net):
+   1. `constant` — `function : "0"/"1"` output pins and everything
+      reachable through them: `{0, "constant"}`; immune to `-global`;
+   2. `clock` — SDC clock nets: `{2/period, 0.5}`; beats VCD/SAIF
+      annotation on the same pin (the `TC` finding) and `-global`;
+   3. `-global` — overrides *every* non-clock non-constant pin, measured
+      including VCD-annotated pins and `unknown` cones (the annotation
+      split still counts the pin `vcd` — the read value goes `global`);
+      `-activity` is clock-normalized, `-density` is per library time
+      unit;
+   4. annotation — VCD/SAIF/`set_power_activity -pins|-input_ports` on a
+      pin whose name appears in the dump (flat names match port pins;
+      scoped paths match inst pins; flat internal net names are dead
+      entries);
+   5. `input` — input ports and undriven nets: `{0.1·f_clk, 0.5}`,
+      replaced by `set_power_activity -input`;
+   6. `propagated` — combinational levelized fill per the measured M1
+      rule, plus sequential Q=D;
+   7. `unknown` — unresolvable sequential feedback cones: `{0, 0}`.
 
-3. **Combinational fill.** Per gate, from `LibPin.function` + the measured
-   {P,d} rules (M1 local marginals if P2 confirms — the expected verdict,
-   matching OpenSTA's per-pin {probability, density} model that has no joint
-   state). Inverting output pins (`inv`, `nand`, `nor`) compose `1−P`
-   through the same evaluator. x/z seeds per P5.
+3. **Combinational fill** (M1 measured — local marginals, no joint
+   state). Per gate, from `LibPin.function`:
+   `P(f)` = the Boolean expression over per-input `P`s with `f` evaluated
+   once per variable (AND: `∏p`; OR: `1−∏(1−p)`; XOR: `p⊕q`; INV: `1−p`;
+   BUF: identity). `d(f)` = output-sensitization:
+   `Σ_i d_i · P(f toggles on an i-edge)`, i.e. `P(other inputs put f in
+   i-sensitive state)` — AND `Σ d_i·∏_{j≠i}p_j`; OR `Σ d_i·∏_{j≠i}(1−p_j)`;
+   XOR `Σ d_i` (any input edge toggles); INV/BUF `d` passes through.
+   Inverting pins compose `1−P` at the same density. x/z seeds per P5
+   (half-weight edges in density; x/z time stays in the `P` denominator).
 
-4. **Sequential fill.** Per the P3 verdict (S1 D-rate / S2 uniform default /
-   S3 clock-derived); feedback registers follow whatever rule the
-   toggle/counter evidence pins down — not a guessed BDD walk.
+4. **Sequential fill** (measured — S1): a DFF Q pin copies its D pin's
+   `{P, d}` verbatim (no clock-derived activity of its own; CLK pins stay
+   `clock`). Sequential feedback cones that cannot be seeded stay
+   `unknown` → `{0, 0}` — OpenSTA does not resolve the toggle/counter
+   loops (no divide-by-2: the measured `mba` counters report 0 despite
+   exact dumps of `n_q0` `5e7` / `n_q1` `2.5e7` existing in `s_full`).
 
 5. **CLI + diagnostics** (implement branch only). `--vcd`/`--saif` become
    optional (clap `required_unless_present` today): neither ⇒ fully
