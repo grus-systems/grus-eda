@@ -1,14 +1,14 @@
 {
   "duration_s": 1.99e-6,
   "voltage_v": 1.8,
-  "internal_w": 2.0948931806954855e-6,
+  "internal_w": 2.0846630802591193e-6,
   "switching_w": 1.7031002376930134e-7,
   "leakage_w": 1.2719841550488595e-11,
-  "total_w": 2.2652159243063376e-6,
+  "total_w": 2.2549858238699714e-6,
   "groups": [
     {
       "name": "Sequential",
-      "internal_w": 2.0891791832648264e-6,
+      "internal_w": 2.07894908282846e-6,
       "switching_w": 7.495959617623725e-9,
       "leakage_w": 8.419361770262148e-12
     },
@@ -28,6 +28,10 @@
   "diagnostics": {
     "cells_without_lib_cell": 0,
     "driven_nets_without_activity": 0,
+    "activity_origin_counts": {
+      "annotated": 3,
+      "clock": 1
+    },
     "active_nets_without_cell_driver": 2,
     "internal_power_without_slew": 0,
     "unresolved_related_pin": 0,

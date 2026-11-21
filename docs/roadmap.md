@@ -479,8 +479,10 @@ Remaining:
   — marginal `P(when)` products, related-pin activity apportioning,
   half-weight x/z edges — verified at ~1e-7% on the `mbw` ebufn fixture
   in both VCD and SAIF paths (docs/results.md 2026-11-19); only
-  inexpressible `when` forms remain counted. Still open: statistical
-  activity propagation — semantics measured 2026-11-21 (defaults →
-  combinational → sequential → precedence; sequenced as AP1–AP4, each
-  golden-covered on the `mba` fixture). See `docs/results.md` 2026-11-21
-  and `kurena/tasks/activity-propagation/design/api.md` §Plan.
+  inexpressible `when` forms remain counted. Statistical activity
+  propagation is sequenced AP1–AP4 on the `mba` fixture: **AP1 done**
+  (v0.2.14 — `resolve_activity` skeleton + measured seed defaults,
+  `grus-eda power` runs without annotation); AP2 combinational
+  propagation, AP3 sequential rules, and AP4 scoped annotation
+  precedence remain open. See `docs/results.md` 2026-11-21 and
+  `kurena/tasks/activity-propagation/design/api.md` §Plan.
