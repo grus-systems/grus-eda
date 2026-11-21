@@ -1237,4 +1237,94 @@ mod tests {
             "the per-pin annotation residual moved"
         );
     }
+
+    /// Constant-polarity golden (`cp.def`): a `conb_1` feeding one input
+    /// each of `and2`/`or2`/`xor2`/`buf` gates whose other input is the
+    /// annotated port `a`. Every expected value below is the verbatim
+    /// OpenSTA `get_property activity` read measured by the committed
+    /// `cp_probe.tcl` (docs/results.md 2026-11-21 — N7 — AP2 r3). The
+    /// discriminators: `n_xorh` = `xor(HI, a)` propagates `a`'s 0.55 —
+    /// the stored constant marginal is really `P=0` on both polarities —
+    /// while `n_orh`/`n_andl`/`n_andhh`/`n_bufh` mark `constant` through
+    /// the 3-valued absorbing-element rule, not all-inputs-constant.
+    #[test]
+    fn test_constant_cone_cp_matches_opensta() {
+        let hd = sky130_hd();
+        let lib_path = require(hd.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
+        let tlef_path = require(hd.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(hd.join("lef/sky130_fd_sc_hd.lef"));
+        let def_path = require(design_dir("microbench").join("cp.def"));
+
+        let lib = crate::readers::load_liberty(&lib_path).expect("liberty");
+        let mut interner = crate::interner::StringInterner::new();
+        let (tech_db, _report) =
+            crate::readers::load_tech_db(&tlef_path, &lef_path, &mut interner).expect("tech db");
+        let design = crate::readers::parse_def(&def_path, &tech_db, Some(&lib)).expect("def");
+        let sdc = crate::sta::sdc::Sdc::default();
+
+        let resolution = crate::activity::resolve_activity(
+            &design,
+            &lib,
+            &sdc,
+            &VcdActivity::default(),
+            &ActivityOverrides {
+                input: Some(ActivitySetting {
+                    density_per_s: 3e6,
+                    prob_one: 0.55,
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            (resolution.unresolvable_functions, resolution.dead_annotation_entries),
+            (0, 0),
+            "cp diagnostics — all nine functions resolve (conb literals, and2, or2, xor2, buf)"
+        );
+        // `window_s` is 1.0 with no dump, so `eff_toggles` equals the rate.
+        let net = |name: &str| {
+            let n = (0..design.num_nets())
+                .map(|n| crate::interner::NetId(n as u32))
+                .find(|&n| design.strings.resolve(design.net_names[n.0 as usize]) == name)
+                .unwrap_or_else(|| panic!("net {name} missing"));
+            resolution.nets[n.0 as usize]
+        };
+        use crate::activity::ActivityOrigin as O;
+        let check = |name: &str, origin: O, prob: f64, toggles: f64| {
+            let r = net(name);
+            assert_eq!(r.origin, origin, "{name} origin");
+            assert_eq!(r.prob_one, Some(prob), "{name} prob_one");
+            assert_eq!(r.eff_toggles, toggles, "{name} eff_toggles");
+        };
+        check("a", O::Input, 0.55, 3e6);
+        check("n_hi", O::Constant, 0.0, 0.0);
+        check("n_lo", O::Constant, 0.0, 0.0);
+        // and(1,a) — non-absorbing; P(HI)=0 in the stored record forces
+        // the output read to 0/0.
+        check("n_andh", O::Propagated, 0.0, 0.0);
+        // or(1,a) and and(0,a) — absorptive constants; and(hi,hi) and
+        // buf(hi) the same. The all-inputs-constant rule missed these.
+        check("n_orh", O::Constant, 0.0, 0.0);
+        check("n_andl", O::Constant, 0.0, 0.0);
+        check("n_andhh", O::Constant, 0.0, 0.0);
+        check("n_bufh", O::Constant, 0.0, 0.0);
+        // xor(1,a)/or(0,a)/xor(0,a) pass a through — `n_xorh` at 0.55 is
+        // the polarity discriminator the revision hangs on.
+        check("n_xorh", O::Propagated, 0.55, 3e6);
+        check("n_orl", O::Propagated, 0.55, 3e6);
+        check("n_xorl", O::Propagated, 0.55, 3e6);
+        let counts: std::collections::BTreeMap<&str, usize> = resolution
+            .origin_counts
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
+        assert_eq!(
+            counts,
+            std::collections::BTreeMap::from([
+                ("constant", 6),
+                ("input", 1),
+                ("propagated", 4),
+            ]),
+            "cp origin_counts"
+        );
+    }
 }

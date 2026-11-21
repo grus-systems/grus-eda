@@ -335,6 +335,9 @@ fn const_prob(e: &BoolExpr) -> f64 {
 /// A var-free expression reads `0.0`/`1.0` directly. `None` when the op
 /// budget is exceeded or `p` is short.
 pub fn prob(e: &BoolExpr, p: &[f64]) -> Option<f64> {
+    // The budget resets per call — `sensitivity` calls `prob` internally,
+    // so one gate evaluation can spend up to `(1 + n_inputs) * MAX_OPS`.
+    // The bound is per-call work, not a shared per-gate budget; intended.
     let mut ops = MAX_OPS;
     match lowest_var(e) {
         None => Some(const_prob(e)),
@@ -354,6 +357,40 @@ pub fn sensitivity(e: &BoolExpr, i: usize, p: &[f64]) -> Option<f64> {
         (a, b) => BoolExpr::Xor(Box::new(a), Box::new(b)),
     };
     prob(&diff, p)
+}
+
+/// 3-valued (Kleene) evaluation: `vals[i]` is var `i`'s constant value,
+/// `None` for non-constant inputs. Returns the output's definite value
+/// or `None` when it depends on an unknown input — absorbing-element
+/// semantics (`And` is `Some(false)` on any `Some(false)` input, `Or` is
+/// `Some(true)` on any `Some(true)`; `Xor`/`Not` have no absorbing
+/// element). Absorption is per-operator: `(A&B)|C` at `A = Some(false)`
+/// is still `None` while `C` is unknown.
+///
+/// Used by `constant_cone`'s marking: `or(1,X)=1` and `and(0,X)=0` mark
+/// outputs `constant` even with toggling other inputs — the measured
+/// rule (docs/results.md 2026-11-21 N7 cp.def probe). Recursion is
+/// bounded by `MAX_NODES` at parse; no counter of its own.
+pub fn const_eval(e: &BoolExpr, vals: &[Option<bool>]) -> Option<bool> {
+    match e {
+        BoolExpr::Const(c) => Some(*c),
+        BoolExpr::Var(x) => vals.get(*x as usize).copied().flatten(),
+        BoolExpr::Not(f) => const_eval(f, vals).map(|v| !v),
+        BoolExpr::And(a, b) => match (const_eval(a, vals), const_eval(b, vals)) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        },
+        BoolExpr::Or(a, b) => match (const_eval(a, vals), const_eval(b, vals)) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        },
+        BoolExpr::Xor(a, b) => match (const_eval(a, vals), const_eval(b, vals)) {
+            (Some(a), Some(b)) => Some(a != b),
+            _ => None,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +493,53 @@ mod tests {
         // Mux: ∂f/∂s = A0⊕A1 → P = .7+.4-2*.28 = 0.54.
         let (e, _) = parse_ok("(A0&!S)|(A1&S)");
         assert!((sensitivity(&e, 1, &[0.7, 0.6, 0.4]).unwrap() - 0.54).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_const_eval() {
+        // `vals` is indexed by var position in `parse`'s first-use order.
+        let (e, _) = parse_ok("A&B");
+        assert_eq!(const_eval(&e, &[Some(true), None]), None);
+        assert_eq!(const_eval(&e, &[Some(false), None]), Some(false));
+        assert_eq!(const_eval(&e, &[None, Some(false)]), Some(false));
+        assert_eq!(const_eval(&e, &[Some(true), Some(true)]), Some(true));
+        let (e, _) = parse_ok("A|B");
+        assert_eq!(const_eval(&e, &[Some(true), None]), Some(true));
+        assert_eq!(const_eval(&e, &[Some(false), None]), None);
+        assert_eq!(const_eval(&e, &[Some(false), Some(false)]), Some(false));
+        // `Xor`/`Not` have no absorbing element.
+        let (e, _) = parse_ok("A^B");
+        assert_eq!(const_eval(&e, &[Some(true), None]), None);
+        assert_eq!(const_eval(&e, &[Some(false), Some(true)]), Some(true));
+        let (e, _) = parse_ok("!A");
+        assert_eq!(const_eval(&e, &[Some(true)]), Some(false));
+        assert_eq!(const_eval(&e, &[None]), None);
+        // A `Var` index past the slice is an unknown input, not a panic.
+        let (e, _) = parse_ok("A&B");
+        assert_eq!(const_eval(&e, &[Some(true)]), None);
+        // Constants evaluate without inputs.
+        let (e, _) = parse_ok("(1)");
+        assert_eq!(const_eval(&e, &[]), Some(true));
+        let (e, _) = parse_ok("0");
+        assert_eq!(const_eval(&e, &[]), Some(false));
+        // Absorption is per-operator: `(A&B)|C` at A = Some(false) gives
+        // `Some(false)` on the And arm, which is neutral for the Or —
+        // the output stays undecided while C is unknown.
+        let (e, _) = parse_ok("(A&B)|C");
+        assert_eq!(const_eval(&e, &[Some(false), None, None]), None);
+        assert_eq!(const_eval(&e, &[Some(false), None, Some(true)]), Some(true));
+        assert_eq!(
+            const_eval(&e, &[Some(false), Some(true), Some(false)]),
+            Some(false)
+        );
+        // A nested absorbing chain: `(A|B)&C` at A = Some(true) leaves
+        // the And undecided on C.
+        let (e, _) = parse_ok("(A|B)&C");
+        assert_eq!(const_eval(&e, &[Some(true), None, None]), None);
+        assert_eq!(
+            const_eval(&e, &[Some(true), None, Some(false)]),
+            Some(false)
+        );
     }
 
     #[test]

@@ -5159,3 +5159,112 @@ file restored byte-identical, test green.
 --workspace --all-targets -- -D warnings`, `cargo test --release -p
 grus-core sta` (182), the CLI regen above. AP3 sequential rules and AP4
 scoped annotation precedence remain open.
+
+### 2026-11-21 — N7 — AP2 r3: measured constant semantics (v0.2.16)
+
+Review delta on the landed AP2: `constant_cone` seeded `prob_one = 0.0`
+(the recorded accessor display artifact) and the propagation pass
+consumed it as a real marginal — the polarity question had to be
+measured, not inferred. Probe fixture `tests/designs/microbench/cp.def`
+(committed, with `cp_probe.tcl`): a `conb_1` (`n_hi`, `n_lo`) feeding
+one input each of `and2`/`or2`/`xor2`/`buf` gates whose other input is
+port `a`, annotated `set_power_activity -input_ports [get_ports a]
+-density 0.003 -duty 0.55` (absolute density; no clock). Verbatim
+`cp_probe.tcl` output inside LibreLane 3.0.16 (run today against the
+committed files):
+
+```
+ACTI u_andh/X 0.00000e+00 0.000 propagated
+ACTI u_xorh/X 3.00000e+06 0.550 propagated
+ACTI u_orh/X 0.00000e+00 0.000 constant
+ACTI u_andl/X 0.00000e+00 0.000 constant
+ACTI u_orl/X 3.00000e+06 0.550 propagated
+ACTI u_xorl/X 3.00000e+06 0.550 propagated
+ACTI u_andhh/X 0.00000e+00 0.000 constant
+ACTI u_bufh/X 0.00000e+00 0.000 constant
+=== precedence: -pins on absorptive vs propagated ===
+PINS u_orh/X 0.00000e+00 0.000 constant
+PINS u_andh/X 1.00000e+07 0.900 user
+=== precedence: -global on absorptive vs propagated ===
+GLOB u_orh/X 0.00000e+00 0.000 constant
+GLOB u_andl/X 0.00000e+00 0.000 constant
+GLOB u_orl/X 2.00000e+07 0.700 global
+```
+
+Three measured rules fall out:
+
+1. **The stored activity record for a constant net is `{d=0, P=0}` on
+   both polarities** — the P5 display artifact is the real internal
+   value. `xor(n_hi, a)` propagating `0.55` (a's marginal, computed with
+   `P(HI)=0`) instead of `0.45` (`¬a`) is the discriminator;
+   `and(n_hi, a)` → `0/0` confirms. `prob_one: Some(0.0)` on `Constant`
+   nets is correct as seeded; propagation and `eval_when` keep
+   consuming it.
+2. **The `constant` label uses true-polarity 3-valued evaluation** — a
+   gate output is `constant` iff its function has a definite value with
+   constant inputs bound to their true value: `or(1,X)=1`, `and(0,X)=0`
+   mark even with a toggling other input (absorption); `and(1,X)`,
+   `or(0,X)`, `xor(c,X)` do not. The landed all-inputs-constant rule
+   missed the absorptive cases (`u_orh/X`, `u_andl/X`, `u_andhh/X` all
+   read `constant`).
+3. **Marking is structural** — an absorptive-constant pin stays
+   `constant` under `set_power_activity -pins` and `-global` (measured
+   above); a `propagated` pin accepts both. Marking before the seed
+   pass gives exactly this precedence — unchanged code order.
+
+**What landed**: `bool_expr::const_eval` (Kleene absorbing-element
+evaluation; recursion bounded by `MAX_NODES` at parse), the shared
+`comb_funcs` table (`comb_function_table` — one parse per driver
+`function`, built before the seed pass, shared by `constant_cone` and
+`propagate_combinational`; unresolvable functions now counted at build
+for any origin — identical counts on every committed fixture, all 0),
+`constant_cone` rewritten to a 3-valued fixed-point sweep over the
+table (only function-referenced inputs gate marking, matching the
+propagation taint rule), and `propagate_combinational` switched to the
+shared immutable table with a `pending: Vec<bool>` carrying the
+enqueue-once invariant (replacing the `Option::take` slot — the
+impossible state no longer carries a release panic path).
+`test_constant_cone_cp_matches_opensta` asserts the resolved per-net
+map verbatim against the measured table, including the `n_xorh` = 0.55
+polarity discriminator and `origin_counts` `{constant 6, input 1,
+propagated 4}` with both AP2 diagnostics 0.
+
+**`conditional_power_blocks` enumeration**: no moves possible —
+`prob_one` on constants is unchanged at `Some(0.0)`, so a `when`
+literal on a HI-constant net keeps weight 0 (the same stored record
+OpenSTA's own machinery reads). On newly-marked absorptive nets a
+`when` weight would change, but no committed fixture mixes `when`
+literals with constant-fed pins (`mb`/`mbw`: `a`/`b`/`teb` only; `mba`:
+none; no gcd power test exists) — named residual.
+
+**SAIF-vs-VCD asymmetry** (record only): a SAIF top-scope `NET` entry
+naming an internal net resolves by net name and annotates via the
+emitted driver-pin `pin_signals` key, while the same flat name in a VCD
+dead-ends into `dead_annotation_entries` — a constructed asymmetry of
+the pin-namespace emit. OpenSTA's own `read_saif` on such a `NET`
+entry is unmeasured — named residual.
+
+**Moved goldens**: none — `mb.power.json` regenerated via the recorded
+CLI command, `git diff` empty (`annotated=3 clock=1`, every watt column
+bit-identical). `mba.activity.reference.json` is read-only input;
+`mb.saif.reference.json`, `mbw.reference.json`, all other
+`*.reference.json`: `git status` clean — fully-annotated fixtures stay
+byte-identical, asserted by `test_saif_power_mb_matches_opensta`,
+`test_when_power_mbw_matches_opensta`, and the mba test. On `mba`
+itself the marking is unchanged (`constant 4` — its constant cones are
+all-constant-input, identical under either rule);
+`origin_counts`/`driven_nets_without_activity` are unchanged on every
+session.
+
+**Fail-proof**: `constant_cone`'s `const_eval` reverted to the
+all-inputs rule (`input_vals.iter().all(Option::is_some)` gate) →
+`test_constant_cone_cp_matches_opensta` red at `n_orh origin: left
+Propagated, right Constant`; restored, green. The r2 proofs stand
+(propagation off → `s_none origin_counts` red; corrupted golden `prob`
+→ strict red; both recorded above).
+
+**Checks run**: `cargo test --workspace` (333+3), `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --release -p
+grus-core sta` (183), the `cp_probe.tcl` container run quoted above,
+the `mb.power.json` regen. AP3 sequential rules and AP4 scoped
+annotation precedence remain open.

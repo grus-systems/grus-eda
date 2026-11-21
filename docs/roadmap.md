@@ -485,7 +485,9 @@ Remaining:
   `grus-eda power` runs without annotation); **AP2 done** (v0.2.15 —
   bounded Liberty `function` evaluator, Kahn-ordered combinational
   propagation with `Default`-taints, pin-namespaced annotation; the
-  golden's surviving divergent set is the 13-pin AP3 residual);
+  golden's surviving divergent set is the 13-pin AP3 residual)
+  (v0.2.16 — constant marking is 3-valued absorptive; the stored
+  constant marginal is the measured 0.0 — cp.def probe);
   AP3 sequential rules and AP4 scoped annotation precedence remain
   open. See `docs/results.md` 2026-11-21 and
   `kurena/tasks/activity-propagation/design/api.md` §Plan.
