@@ -6,6 +6,8 @@
 //! delay (50%) and slew (20%-80%); `ceff` is then adjusted until the charge that this source
 //! delivers into the pi-model load up to the 50% crossing equals the charge delivered into `ceff`.
 
+use std::cell::RefCell;
+
 /// Driving-point pi model: `c1` at the driver, `rpi` in series, `c2` at the far end.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct PiModel {
@@ -23,10 +25,18 @@ impl PiModel {
     /// `Y(s) = y1 s + y2 s^2 + y3 s^3` (`y2 < 0`).
     pub fn from_moments(y1: f64, y2: f64, y3: f64) -> Self {
         if y2.abs() < 1e-30 || y3.abs() < 1e-30 {
-            return Self { c1: y1, rpi: 0.0, c2: 0.0 };
+            return Self {
+                c1: y1,
+                rpi: 0.0,
+                c2: 0.0,
+            };
         }
         let c2 = y2 * y2 / y3;
-        Self { c1: y1 - c2, rpi: -(y3 * y3) / (y2 * y2 * y2), c2 }
+        Self {
+            c1: y1 - c2,
+            rpi: -(y3 * y3) / (y2 * y2 * y2),
+            c2,
+        }
     }
 }
 
@@ -166,7 +176,8 @@ fn brent_checked(f: &dyn Fn(f64) -> f64, lo: f64, hi: f64, tol: f64) -> Option<f
     if fhi == 0.0 {
         return Some(hi);
     }
-    (flo.is_finite() && fhi.is_finite() && flo * fhi < 0.0).then(|| brent_root(f, lo, hi, flo, fhi, tol))
+    (flo.is_finite() && fhi.is_finite() && flo * fhi < 0.0)
+        .then(|| brent_root(f, lo, hi, flo, fhi, tol))
 }
 
 /// Time (from the ramp start) at which the RC response first reaches `level`.
@@ -247,7 +258,8 @@ pub fn pi_waveform_slew(pi: &PiModel, rd: f64, dt: f64) -> f64 {
             return 1.0 - k1 * (-u / tau1).exp() - k2 * (-u / tau2).exp();
         }
         if u <= dt {
-            return u / dt + (k1 * tau1 * (-u / tau1).exp_m1() + k2 * tau2 * (-u / tau2).exp_m1()) / dt;
+            return u / dt
+                + (k1 * tau1 * (-u / tau1).exp_m1() + k2 * tau2 * (-u / tau2).exp_m1()) / dt;
         }
         let post = |k: f64, tau: f64| -> f64 {
             if dt <= tau {
@@ -300,7 +312,12 @@ struct ModalRatio {
 impl ModalRatio {
     fn new(y: f64) -> Self {
         let inv = 1.0 / (1.0 - y);
-        Self { y, rho: (1.0 + y) * inv, inv, log: 2.0 * y.atanh() }
+        Self {
+            y,
+            rho: (1.0 + y) * inv,
+            inv,
+            log: 2.0 * y.atanh(),
+        }
     }
 
     /// `rho^k - 1`.
@@ -331,7 +348,10 @@ impl ModalRatio {
         let p = self.pm1(n as usize + 1);
         let e0 = p / q - (nf + 1.0);
         let e1 = ((nf + 1.0) * q - p + nf * p * q - 0.5 * nf * (nf + 1.0) * q * q) / (q * q);
-        (0.5 * (nf + 1.0) + e0 / (2.0 * self.y), 0.25 * nf * (nf + 1.0) + e1 / (2.0 * self.y))
+        (
+            0.5 * (nf + 1.0) + e0 / (2.0 * self.y),
+            0.25 * nf * (nf + 1.0) + e1 / (2.0 * self.y),
+        )
     }
 }
 
@@ -392,7 +412,10 @@ fn pi_charge_discrete(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> Optio
     if cond.is_nan() || cond > 1e12 {
         return None;
     }
-    let modes = [ModalRatio::new(0.5 * h * lam_a), ModalRatio::new(0.5 * h * lam_b)];
+    let modes = [
+        ModalRatio::new(0.5 * h * lam_a),
+        ModalRatio::new(0.5 * h * lam_b),
+    ];
     if !modes.iter().all(|m| m.rho.abs() < 1.0) {
         return None;
     }
@@ -430,7 +453,12 @@ fn pi_charge_numeric(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> f64 {
     let (g, gp) = (1.0 / rd, 1.0 / rpi);
     let (a11, a12) = (-(g + gp) / c1, gp / c1);
     let (a21, a22) = (gp / c2, -gp / c2);
-    let (m11, m12, m21, m22) = (1.0 - 0.5 * h * a11, -0.5 * h * a12, -0.5 * h * a21, 1.0 - 0.5 * h * a22);
+    let (m11, m12, m21, m22) = (
+        1.0 - 0.5 * h * a11,
+        -0.5 * h * a12,
+        -0.5 * h * a21,
+        1.0 - 0.5 * h * a22,
+    );
     let det = m11 * m22 - m12 * m21;
     let (mut v1, mut v2, mut q) = (0.0, 0.0, 0.0);
     let mut i_prev = (vs(t0) - v1) * g;
@@ -438,7 +466,10 @@ fn pi_charge_numeric(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> f64 {
         let t = t0 + h * k as f64;
         let rhs1 = v1 + 0.5 * h * (a11 * v1 + a12 * v2) + 0.5 * h * (vs(t - h) + vs(t)) * g / c1;
         let rhs2 = v2 + 0.5 * h * (a21 * v1 + a22 * v2);
-        let (n1, n2) = ((rhs1 * m22 - m12 * rhs2) / det, (m11 * rhs2 - m21 * rhs1) / det);
+        let (n1, n2) = (
+            (rhs1 * m22 - m12 * rhs2) / det,
+            (m11 * rhs2 - m21 * rhs1) / det,
+        );
         v1 = n1;
         v2 = n2;
         let i_now = (vs(t) - v1) * g;
@@ -450,6 +481,27 @@ fn pi_charge_numeric(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> f64 {
 
 /// Table of a driver arc: `table(c)` returns the table `(delay, slew)` at load `c`.
 pub type DriverTable<'a> = &'a dyn Fn(f64) -> (f64, f64);
+
+/// Per-call memo of a [`DriverTable`]. `table` is a pure function of the load, so a hit on the
+/// `c.to_bits()` key returns the stored pair — bitwise identical to re-evaluation. One
+/// `driver_response` evaluates the same `c` several times (`is_lumped_bailout` in both
+/// `solve_dmp` and `driver_waveform_slew`, `residual(hi)`, the `rd_of` slope lookups); a linear
+/// `Vec` scan wins over a hash map at the ~22 distinct keys a call produces.
+pub fn memo_table<'a>(
+    entries: &'a RefCell<Vec<(u64, f64, f64)>>,
+    table: DriverTable<'a>,
+) -> impl Fn(f64) -> (f64, f64) + 'a {
+    move |c| {
+        let bits = c.to_bits();
+        let mut entries = entries.borrow_mut();
+        if let Some(&(_, d, s)) = entries.iter().find(|e| e.0 == bits) {
+            return (d, s);
+        }
+        let (d, s) = table(c);
+        entries.push((bits, d, s));
+        (d, s)
+    }
+}
 
 fn delay_slope(table: DriverTable, c: f64) -> f64 {
     let h = 0.05 * c;
@@ -469,7 +521,11 @@ fn is_lumped_bailout(pi: &PiModel, table: DriverTable) -> bool {
 /// Solves for the effective capacitance. `rd_scale` converts the local delay-vs-capacitance slope of the
 /// table into the driver resistance.
 pub fn solve_dmp(pi: &PiModel, rd_scale: f64, table: DriverTable) -> DmpResult {
-    solve_dmp_with(pi, &|table, c| (rd_scale * delay_slope(table, c)).max(1e-6), table)
+    solve_dmp_with(
+        pi,
+        &|table, c| (rd_scale * delay_slope(table, c)).max(1e-6),
+        table,
+    )
 }
 
 /// [`solve_dmp`] with the driver-resistance rule as a parameter: `rd_of(table, c)` is the resistance
@@ -482,7 +538,11 @@ pub fn solve_dmp_with(
     let total = pi.total();
     let lumped = |c: f64| {
         let (delay, slew) = table(c);
-        DmpResult { ceff: c, delay, slew }
+        DmpResult {
+            ceff: c,
+            delay,
+            slew,
+        }
     };
     if is_lumped_bailout(pi, table) {
         return lumped(total);
@@ -550,6 +610,30 @@ mod tests {
     }
 
     #[test]
+    fn memo_table_hits_are_bitwise_exact() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let raw = |c: f64| {
+            calls.set(calls.get() + 1);
+            (c, c * 2.0 + 0.01)
+        };
+        let entries = RefCell::new(Vec::new());
+        let table = memo_table(&entries, &raw);
+        let a = table(0.5);
+        let b = table(0.5);
+        assert_eq!(a.0.to_bits(), b.0.to_bits());
+        assert_eq!(a.1.to_bits(), b.1.to_bits());
+        assert_eq!(calls.get(), 1);
+        let c = table(0.75);
+        assert_eq!(calls.get(), 2);
+        assert_ne!(c.0.to_bits(), a.0.to_bits());
+        // Signed zeros are distinct keys, matching the pure function's behavior.
+        assert_ne!(table(-0.0).0.to_bits(), a.0.to_bits());
+        assert_ne!(table(-0.0).0.to_bits(), table(0.0).0.to_bits());
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[test]
     fn moments_of_a_single_rc_give_that_rc() {
         let (r, c) = (0.3, 0.02);
         let pi = PiModel::from_moments(c, -r * c * c, r * r * c * c * c);
@@ -558,14 +642,22 @@ mod tests {
 
     #[test]
     fn no_resistance_means_no_shielding() {
-        let pi = PiModel { c1: 0.01, rpi: 0.0, c2: 0.02 };
+        let pi = PiModel {
+            c1: 0.01,
+            rpi: 0.0,
+            c2: 0.02,
+        };
         let r = solve_dmp(&pi, 1.0 / std::f64::consts::LN_2, &linear_table(2.0));
         assert!((r.ceff - 0.03).abs() < 1e-12);
     }
 
     #[test]
     fn resistive_shielding_lowers_ceff_between_c1_and_total() {
-        let pi = PiModel { c1: 0.01, rpi: 5.0, c2: 0.04 };
+        let pi = PiModel {
+            c1: 0.01,
+            rpi: 5.0,
+            c2: 0.04,
+        };
         let r = solve_dmp(&pi, 1.0 / std::f64::consts::LN_2, &linear_table(1.0));
         assert!(r.ceff > 0.01 && r.ceff < 0.05, "ceff = {}", r.ceff);
         // A stronger driver makes the same load look more shielded.
@@ -582,14 +674,36 @@ mod tests {
         let tables: [(&str, &TableFn); 3] = [
             ("lin1", &|c| (0.7 * c + 0.05, 2.2 * c + 0.02)),
             ("lin2", &|c| (1.4 * c + 0.05, 4.4 * c + 0.02)),
-            ("nl", &|c| (0.05 + 0.9 * c.powf(0.8), 0.02 + 1.4 * c.powf(0.9))),
+            ("nl", &|c| {
+                (0.05 + 0.9 * c.powf(0.8), 0.02 + 1.4 * c.powf(0.9))
+            }),
         ];
         let pis = [
-            PiModel { c1: 0.01, rpi: 5.0, c2: 0.04 },
-            PiModel { c1: 0.001, rpi: 2.0, c2: 0.2 },
-            PiModel { c1: 0.005, rpi: 0.05, c2: 0.03 },
-            PiModel { c1: 0.02, rpi: 50.0, c2: 0.01 },
-            PiModel { c1: 0.002, rpi: 0.5, c2: 0.002 },
+            PiModel {
+                c1: 0.01,
+                rpi: 5.0,
+                c2: 0.04,
+            },
+            PiModel {
+                c1: 0.001,
+                rpi: 2.0,
+                c2: 0.2,
+            },
+            PiModel {
+                c1: 0.005,
+                rpi: 0.05,
+                c2: 0.03,
+            },
+            PiModel {
+                c1: 0.02,
+                rpi: 50.0,
+                c2: 0.01,
+            },
+            PiModel {
+                c1: 0.002,
+                rpi: 0.5,
+                c2: 0.002,
+            },
         ];
         #[rustfmt::skip]
         let golden: [(&str, usize, f64, f64, f64); 15] = [
@@ -615,7 +729,9 @@ mod tests {
             let table = tables.iter().find(|t| t.0 == name).expect("golden table").1;
             let r = solve_dmp(&pis[pi_index], 1.0 / std::f64::consts::LN_2, table);
             if !(rel_ok(r.ceff, ceff) && rel_ok(r.delay, delay) && rel_ok(r.slew, slew)) {
-                failures.push(format!("{name} pi{pi_index}: got {r:?}, want ({ceff}, {delay}, {slew})"));
+                failures.push(format!(
+                    "{name} pi{pi_index}: got {r:?}, want ({ceff}, {delay}, {slew})"
+                ));
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -624,12 +740,36 @@ mod tests {
     /// Ramp-charge grid: the pi models of the golden set plus a stiff, strongly shielded one.
     fn charge_grid_models() -> Vec<PiModel> {
         vec![
-            PiModel { c1: 0.01, rpi: 5.0, c2: 0.04 },
-            PiModel { c1: 0.001, rpi: 2.0, c2: 0.2 },
-            PiModel { c1: 0.005, rpi: 0.05, c2: 0.03 },
-            PiModel { c1: 0.02, rpi: 50.0, c2: 0.01 },
-            PiModel { c1: 0.002, rpi: 0.5, c2: 0.002 },
-            PiModel { c1: 0.001, rpi: 1e-3, c2: 0.2 },
+            PiModel {
+                c1: 0.01,
+                rpi: 5.0,
+                c2: 0.04,
+            },
+            PiModel {
+                c1: 0.001,
+                rpi: 2.0,
+                c2: 0.2,
+            },
+            PiModel {
+                c1: 0.005,
+                rpi: 0.05,
+                c2: 0.03,
+            },
+            PiModel {
+                c1: 0.02,
+                rpi: 50.0,
+                c2: 0.01,
+            },
+            PiModel {
+                c1: 0.002,
+                rpi: 0.5,
+                c2: 0.002,
+            },
+            PiModel {
+                c1: 0.001,
+                rpi: 1e-3,
+                c2: 0.2,
+            },
         ]
     }
 
@@ -675,7 +815,10 @@ mod tests {
                 assert_eq!(pi_charge_discrete(&pi, rd, t0, dt, t0), Some(0.0));
                 let before = pi_charge_discrete(&pi, rd, t0, dt, t0 + dt - 1e-9).unwrap();
                 let after = pi_charge_discrete(&pi, rd, t0, dt, t0 + dt + 1e-9).unwrap();
-                assert!((before - after).abs() <= 1e-6 * after.abs(), "{before} vs {after}");
+                assert!(
+                    (before - after).abs() <= 1e-6 * after.abs(),
+                    "{before} vs {after}"
+                );
             }
         }
     }
@@ -751,18 +894,37 @@ mod tests {
     #[test]
     fn pi_waveform_slew_matches_limits_and_ode_simulation() {
         // Zero rpi reduces to the single-pole lumped rc_slew.
-        let pi_lumped = PiModel { c1: 0.2, rpi: 0.0, c2: 0.8 };
+        let pi_lumped = PiModel {
+            c1: 0.2,
+            rpi: 0.0,
+            c2: 0.8,
+        };
         for (rd, dt) in [(0.5, 0.0), (0.5, 0.3), (2.0, 1.5)] {
             let got = pi_waveform_slew(&pi_lumped, rd, dt);
             let want = rc_slew(dt, rd * 1.0);
-            assert!((got - want).abs() <= 1e-6, "lumped rd {rd} dt {dt}: got {got} want {want}");
+            assert!(
+                (got - want).abs() <= 1e-6,
+                "lumped rd {rd} dt {dt}: got {got} want {want}"
+            );
         }
 
         // General pi model matches a fine-step backward-Euler/trapezoid ODE trajectory of V1(t).
         for pi in [
-            PiModel { c1: 0.114533, rpi: 0.497066, c2: 2.118645 },
-            PiModel { c1: 0.01, rpi: 5.0, c2: 0.04 },
-            PiModel { c1: 0.2152, rpi: 0.5469, c2: 1.8 },
+            PiModel {
+                c1: 0.114533,
+                rpi: 0.497066,
+                c2: 2.118645,
+            },
+            PiModel {
+                c1: 0.01,
+                rpi: 5.0,
+                c2: 0.04,
+            },
+            PiModel {
+                c1: 0.2152,
+                rpi: 0.5469,
+                c2: 1.8,
+            },
         ] {
             for (rd, dt) in [(1.5, 0.0), (1.3, 3.6), (0.8, 0.05), (9.9, 0.0)] {
                 let got = pi_waveform_slew(&pi, rd, dt);
@@ -775,15 +937,28 @@ mod tests {
                 let t_end = dt + 10.0 * (rd * total + rpi * c2);
                 let steps = 100_000usize;
                 let h = t_end / steps as f64;
-                let vs = |t: f64| if dt <= 1e-12 { 1.0 } else { (t / dt).clamp(0.0, 1.0) };
-                let (m11, m12, m21, m22) = (1.0 - 0.5 * h * a11, -0.5 * h * a12, -0.5 * h * a21, 1.0 - 0.5 * h * a22);
+                let vs = |t: f64| {
+                    if dt <= 1e-12 {
+                        1.0
+                    } else {
+                        (t / dt).clamp(0.0, 1.0)
+                    }
+                };
+                let (m11, m12, m21, m22) = (
+                    1.0 - 0.5 * h * a11,
+                    -0.5 * h * a12,
+                    -0.5 * h * a21,
+                    1.0 - 0.5 * h * a22,
+                );
                 let det = m11 * m22 - m12 * m21;
                 let (mut v1, mut v2) = (0.0, 0.0);
                 let (mut t20, mut t80) = (None, None);
                 for k in 1..=steps {
                     let t_prev = h * (k - 1) as f64;
                     let t = h * k as f64;
-                    let rhs1 = v1 + 0.5 * h * (a11 * v1 + a12 * v2) + 0.5 * h * (vs(t_prev) + vs(t)) * g / c1;
+                    let rhs1 = v1
+                        + 0.5 * h * (a11 * v1 + a12 * v2)
+                        + 0.5 * h * (vs(t_prev) + vs(t)) * g / c1;
                     let rhs2 = v2 + 0.5 * h * (a21 * v1 + a22 * v2);
                     let n1 = (rhs1 * m22 - m12 * rhs2) / det;
                     let n2 = (m11 * rhs2 - m21 * rhs1) / det;

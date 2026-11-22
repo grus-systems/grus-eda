@@ -59,6 +59,13 @@ Instructions for AI coding agents working in this repository.
 - Versioning: Once the Cargo workspace exists, bump `[workspace.package] version` in the root `Cargo.toml` in the same commit as any functional change. While in `0.x`, features and bug fixes bump `patch`; breaking changes bump `minor`.
 - Append your agent trailer to every commit message and PR description (e.g., `Co-Authored-By: <Agent Name> <email>`).
 
+## 6. Kurena Workflow
+
+- Implementation tasks may be driven through kurena (`kurena` on PATH): write `kurena/tasks/<slug>/spec/{goal.md,acceptance.md}` — goal lists intent plus a `## Files` section of expected paths (exact paths, `dir/` prefixes, or gitignore-style globs like `*.sdc`), acceptance is a checklist — then `kurena push <slug> --detach` starts the run detached. Keep tickets small: one ticket ≈ one commit (~50–150 lines, named files); bigger work is a sequence of gated tickets, not one mega-diff.
+- Watch the run with `kurena wait <slug> --stall-after 900`: it prints stage transitions and exits 0 on a pending card or final outcome, 2 on stall (recover with `kurena resume <slug>`). `kurena status --json` / `kurena show <slug>` give machine-readable state.
+- `workflow.toml` configures the drivers (devin ACP) and verify commands (`cargo test --workspace`, clippy `-D warnings`). Do not hand-edit `.kurena/`; spec and design docs under `kurena/tasks/` are pipeline artifacts and stay committed.
+- Cards are human-gated: present `kurena show <slug>` output and let the user run `approve` / `reject <memo>` / `edit` / `abort`. Never run these yourself.
+
 ## 7. Lessons from the E0 Review (2026-11-09)
 
 An outside review of E0 found that the stage did pass, but parts of the record could not be

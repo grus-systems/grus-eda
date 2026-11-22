@@ -22,7 +22,7 @@ pub struct MacroPinId(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CellId(pub u32);
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NetId(pub u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -173,6 +173,8 @@ mod tests {
             max_cap: None,
             max_transition: Some(1.5),
             function: None,
+            is_tristate: false,
+            internal_power: Vec::new(),
         });
         lib.pins.push(LibPin {
             name: p_out,
@@ -184,6 +186,8 @@ mod tests {
             max_cap: Some(0.2),
             max_transition: Some(1.5),
             function: None,
+            is_tristate: false,
+            internal_power: Vec::new(),
         });
 
         let table = NldmTable {
@@ -212,10 +216,13 @@ mod tests {
             area: 1.08,
             is_sequential: false,
             is_latch: false,
+            seq: None,
             pin_offset: 0,
             pin_count: 2,
             arc_offset: 0,
             arc_count: 1,
+            leakage_power_w: None,
+            leakage_states: Vec::new(),
         });
 
         lib.rebuild_cell_by_name();
@@ -229,8 +236,8 @@ mod tests {
         let config = bincode::config::standard();
         let encoded =
             bincode::serde::encode_to_vec(&lib, config).expect("LibDb bincode encode failed");
-        let (mut decoded, _): (LibDb, usize) =
-            bincode::serde::decode_from_slice(&encoded, config).expect("LibDb bincode decode failed");
+        let (mut decoded, _): (LibDb, usize) = bincode::serde::decode_from_slice(&encoded, config)
+            .expect("LibDb bincode decode failed");
 
         decoded.strings.rebuild_map();
         decoded.rebuild_cell_by_name();

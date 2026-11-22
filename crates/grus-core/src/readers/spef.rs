@@ -1,6 +1,10 @@
 use anyhow::{Context, Result, bail};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
+use xxhash_rust::xxh3::Xxh3DefaultBuilder;
+
+type FastMap<K, V> = HashMap<K, V, Xxh3DefaultBuilder>;
 
 /// One `*D_NET`: ground capacitors per node and resistors between nodes, in pF and kohm.
 /// A coupling capacitor (`*CAP` line with two nodes) is grounded on its first node with the full
@@ -22,11 +26,22 @@ pub struct Spef {
 
 /// Drops the backslash escapes SPEF puts before bus brackets and the hierarchy delimiter.
 pub fn unescape_spef_name(name: &str) -> String {
-    name.replace('\\', "")
+    unescape_spef_name_cow(name).into_owned()
+}
+
+/// Borrowed when the name has no `\` to strip — the common case on real SPEF.
+fn unescape_spef_name_cow(name: &str) -> Cow<'_, str> {
+    if name.contains('\\') {
+        Cow::Owned(name.replace('\\', ""))
+    } else {
+        Cow::Borrowed(name)
+    }
 }
 
 fn unit_scale(value: &str, unit: &str, base: &[(&str, f32)]) -> Result<f32> {
-    let v: f32 = value.parse().with_context(|| format!("bad SPEF unit value `{value}`"))?;
+    let v: f32 = value
+        .parse()
+        .with_context(|| format!("bad SPEF unit value `{value}`"))?;
     let u = unit.to_ascii_uppercase();
     base.iter()
         .find(|(name, _)| *name == u)
@@ -34,14 +49,34 @@ fn unit_scale(value: &str, unit: &str, base: &[(&str, f32)]) -> Result<f32> {
         .with_context(|| format!("unsupported SPEF unit `{unit}`"))
 }
 
+/// `*12` or `*12:3` refer to the NAME_MAP; everything else is a literal name.
+fn resolve<'a>(token: &'a str, map: &'a FastMap<&'a str, String>) -> Cow<'a, str> {
+    if let Some(rest) = token.strip_prefix('*') {
+        let (index_end, suffix) = match rest.find(':') {
+            Some(i) => (i, Some(&rest[i + 1..])),
+            None => (rest.len(), None),
+        };
+        if let Some(name) = map.get(&token[..1 + index_end]) {
+            return match suffix {
+                Some(s) => Cow::Owned(format!("{name}:{s}")),
+                None => Cow::Borrowed(name.as_str()),
+            };
+        }
+    }
+    unescape_spef_name_cow(token)
+}
+
 /// `*12` in a NAME_MAP section or reference. Anything else starting with `*` is a section header
 /// (`*PORTS`) or a `*CONN` pin reference (`*I`), so it cannot be read as a NAME_MAP entry.
 fn is_name_map_index(token: &str) -> bool {
-    token.strip_prefix('*').is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    token
+        .strip_prefix('*')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub fn load_spef(path: &Path) -> Result<Spef> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("Failed to read SPEF {:?}", path))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read SPEF {:?}", path))?;
     parse_spef(&text)
 }
 
@@ -57,46 +92,56 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
     }
     let mut c_scale = 1.0f32;
     let mut r_scale = 1.0f32;
-    let mut name_map: HashMap<String, String> = HashMap::new();
+    // `*<digits>` keys, slices of the input text — identical lookup semantics to
+    // the old `HashMap<String, String>` keyed by the same token, without the
+    // `format!("*{index}")` probe allocation.
+    let mut name_map: FastMap<&str, String> = FastMap::default();
     let mut in_name_map = false;
     // Finished nets in file order, with the (second node, value) of each coupling cap they list.
     let mut ended: Vec<NetParse> = Vec::new();
     let mut current: Option<NetParse> = None;
     let mut section = Section::None;
 
-    let resolve = |token: &str, map: &HashMap<String, String>| -> String {
-        // `*12` or `*12:3` refer to the NAME_MAP; everything else is a literal name.
-        if let Some(rest) = token.strip_prefix('*') {
-            let (index, suffix) = rest.split_once(':').map_or((rest, None), |(a, b)| (a, Some(b)));
-            if let Some(name) = map.get(&format!("*{index}")) {
-                return match suffix {
-                    Some(s) => format!("{name}:{s}"),
-                    None => name.clone(),
-                };
-            }
-        }
-        unescape_spef_name(token)
-    };
-
     for (line_no, line) in text.lines().enumerate() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let Some(&first) = tokens.first() else { continue };
+        // At most 4 fields are ever consumed; the fifth slot keeps `len()`
+        // able to tell a 4-field line from an over-long one (a reject).
+        let mut buf = [""; 5];
+        let mut n = 0usize;
+        for tok in line.split_ascii_whitespace() {
+            if n < buf.len() {
+                buf[n] = tok;
+            }
+            n += 1;
+        }
+        let tokens = &buf[..n.min(buf.len())];
+        let Some(&first) = tokens.first() else {
+            continue;
+        };
         let at = || format!("SPEF line {}", line_no + 1);
         match first {
             "*C_UNIT" | "*R_UNIT" | "*T_UNIT" if tokens.len() < 3 => {
                 bail!("{}: `{first}` needs a value and a unit", at());
             }
             "*C_UNIT" => {
-                c_scale = unit_scale(tokens[1], tokens[2], &[("PF", 1.0), ("FF", 1e-3), ("NF", 1e3)])
-                    .with_context(at)?;
+                c_scale = unit_scale(
+                    tokens[1],
+                    tokens[2],
+                    &[("PF", 1.0), ("FF", 1e-3), ("NF", 1e3)],
+                )
+                .with_context(at)?;
             }
             "*R_UNIT" => {
-                r_scale = unit_scale(tokens[1], tokens[2], &[("KOHM", 1.0), ("OHM", 1e-3), ("MOHM", 1e3)])
-                    .with_context(at)?;
+                r_scale = unit_scale(
+                    tokens[1],
+                    tokens[2],
+                    &[("KOHM", 1.0), ("OHM", 1e-3), ("MOHM", 1e3)],
+                )
+                .with_context(at)?;
             }
             "*T_UNIT" => {
                 // R [kohm] * C [pF] is in ns, so only a ns time unit is consistent with the model.
-                let scale = unit_scale(tokens[1], tokens[2], &[("NS", 1.0), ("PS", 1e-3)]).with_context(at)?;
+                let scale = unit_scale(tokens[1], tokens[2], &[("NS", 1.0), ("PS", 1e-3)])
+                    .with_context(at)?;
                 if (scale - 1.0).abs() > 1e-6 {
                     bail!("{}: only `1 NS` is supported as *T_UNIT", at());
                 }
@@ -108,10 +153,10 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
                     bail!("{}: malformed *D_NET", at());
                 }
                 let net = SpefNet {
-                    total_cap_pf: tokens[2].parse::<f32>().with_context(at)? * c_scale,
+                    total_cap_pf: fast_float2::parse::<f32, _>(tokens[2]).with_context(at)? * c_scale,
                     ..Default::default()
                 };
-                current = Some((resolve(tokens[1], &name_map), net, Vec::new()));
+                current = Some((resolve(tokens[1], &name_map).into_owned(), net, Vec::new()));
                 section = Section::None;
             }
             "*CONN" => section = Section::Conn,
@@ -127,26 +172,31 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
                 if tokens.len() < 2 {
                     bail!("{}: NAME_MAP entry `{first}` has no name", at());
                 }
-                name_map.insert(first.to_string(), unescape_spef_name(tokens[1]));
+                name_map.insert(first, unescape_spef_name(tokens[1]));
             }
             _ if in_name_map && first.starts_with('*') => in_name_map = false,
             _ => {
-                let Some((_, net, couplings)) = current.as_mut() else { continue };
+                let Some((_, net, couplings)) = current.as_mut() else {
+                    continue;
+                };
                 match section {
                     Section::Cap if tokens.len() == 3 => {
-                        net.caps.push((resolve(tokens[1], &name_map), tokens[2].parse::<f32>().with_context(at)? * c_scale));
+                        net.caps.push((
+                            resolve(tokens[1], &name_map).into_owned(),
+                            fast_float2::parse::<f32, _>(tokens[2]).with_context(at)? * c_scale,
+                        ));
                     }
                     Section::Cap if tokens.len() == 4 => {
-                        let value = tokens[3].parse::<f32>().with_context(at)? * c_scale;
-                        net.caps.push((resolve(tokens[1], &name_map), value));
-                        couplings.push((resolve(tokens[2], &name_map), value));
+                        let value = fast_float2::parse::<f32, _>(tokens[3]).with_context(at)? * c_scale;
+                        net.caps.push((resolve(tokens[1], &name_map).into_owned(), value));
+                        couplings.push((resolve(tokens[2], &name_map).into_owned(), value));
                     }
                     Section::Cap => bail!("{}: *CAP entry must have 3 or 4 fields", at()),
                     Section::Res if tokens.len() == 4 => {
                         net.resistors.push((
-                            resolve(tokens[1], &name_map),
-                            resolve(tokens[2], &name_map),
-                            tokens[3].parse::<f32>().with_context(at)? * r_scale,
+                            resolve(tokens[1], &name_map).into_owned(),
+                            resolve(tokens[2], &name_map).into_owned(),
+                            fast_float2::parse::<f32, _>(tokens[3]).with_context(at)? * r_scale,
                         ));
                     }
                     Section::Res => bail!("{}: *RES entry must have 4 fields", at()),
@@ -162,7 +212,7 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
     }
 
     // Node owners: resistor endpoints first, then cap first-nodes; the first net in file order wins.
-    let mut owner: HashMap<&str, usize> = HashMap::new();
+    let mut owner: FastMap<&str, usize> = FastMap::default();
     for (i, (_, net, _)) in ended.iter().enumerate() {
         for (a, b, _) in &net.resistors {
             owner.entry(a.as_str()).or_insert(i);
@@ -177,7 +227,11 @@ pub fn parse_spef(text: &str) -> Result<Spef> {
     let halves: Vec<(usize, String, f32)> = ended
         .iter()
         .flat_map(|(_, _, couplings)| couplings)
-        .filter_map(|(second, value)| owner.get(second.as_str()).map(|&i| (i, second.clone(), value / 2.0)))
+        .filter_map(|(second, value)| {
+            owner
+                .get(second.as_str())
+                .map(|&i| (i, second.clone(), value / 2.0))
+        })
         .collect();
     for (i, node, half) in halves {
         ended[i].1.caps.push((node, half));
@@ -288,11 +342,18 @@ mod tests {
         let path = require(design_dir("gcd").join("gcd.rcx.spef"));
         let spef = load_spef(&path).expect("gcd.rcx.spef must parse");
         assert_eq!(spef.nets.len(), 269);
-        assert!(spef.nets.contains_key("clk"), "NAME_MAP entry *3 must resolve to clk");
+        assert!(
+            spef.nets.contains_key("clk"),
+            "NAME_MAP entry *3 must resolve to clk"
+        );
     }
 
     fn cap_at(net: &SpefNet, node: &str) -> f32 {
-        net.caps.iter().filter(|(n, _)| n == node).map(|(_, v)| v).sum()
+        net.caps
+            .iter()
+            .filter(|(n, _)| n == node)
+            .map(|(_, v)| v)
+            .sum()
     }
 
     /// Net A lists couplings to B:1 (owned by B's resistor), to Z:9 (owned by nobody), and to A:2
@@ -305,12 +366,24 @@ mod tests {
         let spef = parse_spef(text).unwrap();
         let (a, b) = (&spef.nets["A"], &spef.nets["B"]);
         assert!((a.total_cap_pf - 0.003).abs() < 1e-6);
-        assert!((cap_at(a, "A:1") - 0.013).abs() < 1e-6, "full coupling values stay on the first node");
-        assert!((cap_at(a, "A:2") - 0.002).abs() < 1e-6, "own-net owner gets half of A:2's coupling");
-        assert!((cap_at(b, "B:1") - 0.001).abs() < 1e-6, "B owns B:1 and gets half of A's coupling to it");
+        assert!(
+            (cap_at(a, "A:1") - 0.013).abs() < 1e-6,
+            "full coupling values stay on the first node"
+        );
+        assert!(
+            (cap_at(a, "A:2") - 0.002).abs() < 1e-6,
+            "own-net owner gets half of A:2's coupling"
+        );
+        assert!(
+            (cap_at(b, "B:1") - 0.001).abs() < 1e-6,
+            "B owns B:1 and gets half of A's coupling to it"
+        );
         assert!((cap_at(b, "B:2") - 0.001).abs() < 1e-6);
         assert_eq!(b.caps.len(), 2);
-        assert!(spef.nets.values().all(|n| cap_at(n, "Z:9") == 0.0), "unowned node gets nothing");
+        assert!(
+            spef.nets.values().all(|n| cap_at(n, "Z:9") == 0.0),
+            "unowned node gets nothing"
+        );
     }
 
     /// Every truncation from the first `*D_NET` through its `*END` must be rejected, and no

@@ -1,0 +1,7 @@
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+read_vcd -scope gcd_tb/dut /work/tests/designs/gcd/power/gcd.vcd
+report_power

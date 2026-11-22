@@ -1,8 +1,34 @@
 use crate::interner::{LayerId, MacroId, PinDir, StringInterner};
 use crate::tech_db::{LayerDir, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer, TechDb};
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
+
+/// Top-level LEF statements the reader skipped, counted by uppercased keyword.
+/// `skipped` is empty when nothing was skipped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LefSkipReport {
+    pub skipped: BTreeMap<String, usize>,
+}
+
+impl LefSkipReport {
+    /// Adds `other`'s counts into `self` (used to merge .tlef + .lef reports).
+    pub fn merge(&mut self, other: &LefSkipReport) {
+        for (k, v) in &other.skipped {
+            *self.skipped.entry(k.clone()).or_default() += v;
+        }
+    }
+
+    /// Sum of all per-keyword counts.
+    pub fn total(&self) -> usize {
+        self.skipped.values().sum()
+    }
+}
+
+fn count_skip(report: &mut LefSkipReport, keyword: &str) {
+    *report.skipped.entry(keyword.to_uppercase()).or_default() += 1;
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum Token<'a> {
@@ -19,7 +45,11 @@ pub(crate) struct LefLexer<'a> {
 
 impl<'a> LefLexer<'a> {
     pub fn new(input: &'a str) -> Self {
-        Self { input, pos: 0, line: 1 }
+        Self {
+            input,
+            pos: 0,
+            line: 1,
+        }
     }
 
     /// One-based line of the read position, for error messages. Counted incrementally:
@@ -111,20 +141,31 @@ impl<'a> LefLexer<'a> {
 fn required_word<'a>(lexer: &mut LefLexer<'a>, construct: &str) -> Result<&'a str> {
     match lexer.next_token() {
         Some(Token::Word(w) | Token::Str(w)) => Ok(w),
-        other => bail!("LEF line {}: {construct} is missing its value (found {other:?})", lexer.line()),
+        other => bail!(
+            "LEF line {}: {construct} is missing its value (found {other:?})",
+            lexer.line()
+        ),
     }
 }
 
 fn required_f32(lexer: &mut LefLexer, construct: &str) -> Result<f32> {
     let w = required_word(lexer, construct)?;
-    w.parse::<f32>()
-        .with_context(|| format!("LEF line {}: {construct} value `{w}` is not a number", lexer.line()))
+    w.parse::<f32>().with_context(|| {
+        format!(
+            "LEF line {}: {construct} value `{w}` is not a number",
+            lexer.line()
+        )
+    })
 }
 
 fn required_i32(lexer: &mut LefLexer, construct: &str) -> Result<i32> {
     let w = required_word(lexer, construct)?;
-    w.parse::<i32>()
-        .with_context(|| format!("LEF line {}: {construct} value `{w}` is not an integer", lexer.line()))
+    w.parse::<i32>().with_context(|| {
+        format!(
+            "LEF line {}: {construct} value `{w}` is not an integer",
+            lexer.line()
+        )
+    })
 }
 
 /// `w BY h` after a `SIZE` keyword; both numbers are required by the LEF grammar.
@@ -132,7 +173,10 @@ fn parse_size(lexer: &mut LefLexer, construct: &str) -> Result<(f32, f32)> {
     let w = required_f32(lexer, &format!("{construct} SIZE width"))?;
     let by = required_word(lexer, &format!("{construct} SIZE"))?;
     if !by.eq_ignore_ascii_case("BY") {
-        bail!("LEF line {}: {construct} SIZE expects BY, found `{by}`", lexer.line());
+        bail!(
+            "LEF line {}: {construct} SIZE expects BY, found `{by}`",
+            lexer.line()
+        );
     }
     let h = required_f32(lexer, &format!("{construct} SIZE height"))?;
     Ok((w, h))
@@ -144,7 +188,10 @@ fn end_block(lexer: &mut LefLexer, block: &str, name: Option<&str>) -> Result<()
     if let Some(exp) = name {
         match lexer.next_token() {
             Some(Token::Word(w)) if w.eq_ignore_ascii_case(exp) => {}
-            other => bail!("LEF line {}: expected `END {exp}` closing {block}, found {other:?}", lexer.line()),
+            other => bail!(
+                "LEF line {}: expected `END {exp}` closing {block}, found {other:?}",
+                lexer.line()
+            ),
         }
     }
     if let Some(Token::Semi) = lexer.peek_token() {
@@ -158,24 +205,26 @@ fn skip_block(lexer: &mut LefLexer, block_name: &str) -> Result<()> {
     while let Some(tok) = lexer.next_token() {
         if let Token::Word(w) = tok
             && w.eq_ignore_ascii_case("END")
-                && let Some(Token::Word(end_name)) = lexer.peek_token()
-                    && end_name.eq_ignore_ascii_case(block_name) {
-                        let _ = lexer.next_token();
-                        if let Some(Token::Semi) = lexer.peek_token() {
-                            let _ = lexer.next_token();
-                        }
-                        return Ok(());
-                    }
+            && let Some(Token::Word(end_name)) = lexer.peek_token()
+            && end_name.eq_ignore_ascii_case(block_name)
+        {
+            let _ = lexer.next_token();
+            if let Some(Token::Semi) = lexer.peek_token() {
+                let _ = lexer.next_token();
+            }
+            return Ok(());
+        }
     }
     bail!("LEF: {block_name} block is not terminated by END {block_name} (truncated file?)")
 }
 
-/// Parses a Technology LEF (.tlef) or Macro LEF (.lef) file bytes into `TechDb`.
+/// Parses a Technology LEF (.tlef) or Macro LEF (.lef) file bytes into `TechDb`,
+/// reporting the top-level statements it skipped.
 pub fn parse_lef_bytes(
     bytes: &[u8],
     tech_db: &mut TechDb,
     interner: &mut StringInterner,
-) -> Result<()> {
+) -> Result<LefSkipReport> {
     if tech_db.dbu_per_micron == 0 {
         tech_db.dbu_per_micron = 1000;
     }
@@ -186,6 +235,7 @@ pub fn parse_lef_bytes(
     // Top-level statements we do not model (VERSION, BUSBITCHARS, DIVIDERCHAR, MANUFACTURINGGRID,
     // NAMESCASESENSITIVE, ...) fall through to the `skip_to_semi` at the end of the chain. The
     // top-level keyword set is open-ended in LEF, so unknown ones are skipped, not rejected.
+    let mut report = LefSkipReport::default();
     while let Some(tok) = lexer.next_token() {
         let word = match tok {
             Token::Word(w) => w,
@@ -202,25 +252,29 @@ pub fn parse_lef_bytes(
             parse_macro(&mut lexer, tech_db, interner)?;
         } else if word.eq_ignore_ascii_case("PROPERTYDEFINITIONS") {
             skip_block(&mut lexer, "PROPERTYDEFINITIONS")?;
+            count_skip(&mut report, word);
         } else if word.eq_ignore_ascii_case("VIA")
             || word.eq_ignore_ascii_case("VIARULE")
             || word.eq_ignore_ascii_case("NONDEFAULTRULE")
         {
+            count_skip(&mut report, word);
             let name = required_word(&mut lexer, word)?.to_string();
             skip_block(&mut lexer, &name)?;
         } else if word.eq_ignore_ascii_case("SPACING") {
             skip_block(&mut lexer, "SPACING")?;
+            count_skip(&mut report, word);
         } else if word.eq_ignore_ascii_case("END") {
             let _ = lexer.next_word();
             if let Some(Token::Semi) = lexer.peek_token() {
                 let _ = lexer.next_token();
             }
-        } else if tok != Token::Semi {
+        } else {
+            count_skip(&mut report, word);
             lexer.skip_to_semi();
         }
     }
 
-    Ok(())
+    Ok(report)
 }
 
 fn parse_units(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
@@ -256,9 +310,10 @@ fn parse_site(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
                 break;
             } else if w.eq_ignore_ascii_case("CLASS") {
                 if let Some(c) = lexer.next_word()
-                    && c.eq_ignore_ascii_case("CORE") {
-                        is_core = true;
-                    }
+                    && c.eq_ignore_ascii_case("CORE")
+                {
+                    is_core = true;
+                }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("SIZE") {
                 size_um = Some(parse_size(lexer, &format!("SITE {site_id}"))?);
@@ -311,9 +366,10 @@ fn parse_layer(
                 break;
             } else if w.eq_ignore_ascii_case("TYPE") {
                 if let Some(t) = lexer.next_word()
-                    && t.eq_ignore_ascii_case("ROUTING") {
-                        is_routing = true;
-                    }
+                    && t.eq_ignore_ascii_case("ROUTING")
+                {
+                    is_routing = true;
+                }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("DIRECTION") {
                 if let Some(d) = lexer.next_word() {
@@ -328,34 +384,38 @@ fn parse_layer(
                 pitch_x_um = Some(required_f32(lexer, "LAYER PITCH")?);
                 // The second value (y pitch) is optional.
                 if let Some(Token::Word(p2_str)) = lexer.peek_token()
-                    && let Ok(p2) = p2_str.parse::<f32>() {
-                        let _ = lexer.next_token();
-                        pitch_y_um = Some(p2);
-                    }
+                    && let Ok(p2) = p2_str.parse::<f32>()
+                {
+                    let _ = lexer.next_token();
+                    pitch_y_um = Some(p2);
+                }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("OFFSET") {
                 offset_x_um = Some(required_f32(lexer, "LAYER OFFSET")?);
                 // The second value (y offset) is optional.
                 if let Some(Token::Word(o2_str)) = lexer.peek_token()
-                    && let Ok(o2) = o2_str.parse::<f32>() {
-                        let _ = lexer.next_token();
-                        offset_y_um = Some(o2);
-                    }
+                    && let Ok(o2) = o2_str.parse::<f32>()
+                {
+                    let _ = lexer.next_token();
+                    offset_y_um = Some(o2);
+                }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("WIDTH") {
                 width_um = Some(required_f32(lexer, "LAYER WIDTH")?);
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("RESISTANCE") {
                 if let Some(r_kw) = lexer.next_word()
-                    && r_kw.eq_ignore_ascii_case("RPERSQ") {
-                        res_per_sq = required_f32(lexer, "LAYER RESISTANCE RPERSQ")?;
-                    }
+                    && r_kw.eq_ignore_ascii_case("RPERSQ")
+                {
+                    res_per_sq = required_f32(lexer, "LAYER RESISTANCE RPERSQ")?;
+                }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("CAPACITANCE") {
                 if let Some(c_kw) = lexer.next_word()
-                    && c_kw.eq_ignore_ascii_case("CPERSQDIST") {
-                        cap_per_sq_um = required_f32(lexer, "LAYER CAPACITANCE CPERSQDIST")?;
-                    }
+                    && c_kw.eq_ignore_ascii_case("CPERSQDIST")
+                {
+                    cap_per_sq_um = required_f32(lexer, "LAYER CAPACITANCE CPERSQDIST")?;
+                }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("EDGECAPACITANCE") {
                 edge_cap_per_um = required_f32(lexer, "LAYER EDGECAPACITANCE")?;
@@ -371,8 +431,8 @@ fn parse_layer(
 
     if is_routing {
         let dbu = tech_db.dbu_per_micron as f32;
-        let width_um = width_um
-            .with_context(|| format!("LEF: routing layer {layer_name} has no WIDTH"))?;
+        let width_um =
+            width_um.with_context(|| format!("LEF: routing layer {layer_name} has no WIDTH"))?;
         let pitch_um = match dir {
             LayerDir::Vertical => pitch_x_um.or(pitch_y_um),
             LayerDir::Horizontal => pitch_y_um.or(pitch_x_um),
@@ -452,10 +512,7 @@ fn parse_macro(
             } else if w.eq_ignore_ascii_case("SIZE") {
                 let (w_um, h_um) = parse_size(lexer, &format!("MACRO {macro_name}"))?;
                 lexer.skip_to_semi();
-                size_dbu = Some((
-                    (w_um * dbu).round() as i32,
-                    (h_um * dbu).round() as i32,
-                ));
+                size_dbu = Some(((w_um * dbu).round() as i32, (h_um * dbu).round() as i32));
             } else if w.eq_ignore_ascii_case("PIN") {
                 parse_pin(lexer, tech_db, interner, &mut pin_obs_rects)?;
             } else if w.eq_ignore_ascii_case("OBS") {
@@ -551,7 +608,10 @@ fn mean_center(sum_twice: i64, count: i64) -> (i32, bool) {
         return (0, false);
     }
     let den = 2 * count;
-    (sum_twice.div_euclid(den) as i32, sum_twice.rem_euclid(den) != 0)
+    (
+        sum_twice.div_euclid(den) as i32,
+        sum_twice.rem_euclid(den) != 0,
+    )
 }
 
 fn parse_pin(
@@ -596,9 +656,10 @@ fn parse_pin(
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("USE") {
                 if let Some(u) = lexer.next_word()
-                    && (u.eq_ignore_ascii_case("POWER") || u.eq_ignore_ascii_case("GROUND")) {
-                        is_power = true;
-                    }
+                    && (u.eq_ignore_ascii_case("POWER") || u.eq_ignore_ascii_case("GROUND"))
+                {
+                    is_power = true;
+                }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("PORT") {
                 let mut current_port_layer = None;
@@ -734,33 +795,36 @@ fn parse_obs(
     Ok(())
 }
 
-/// Parses a single LEF file into an existing `TechDb`.
+/// Parses a single LEF file into an existing `TechDb`, reporting the top-level
+/// statements it skipped.
 pub fn parse_lef(
     path: &Path,
     tech_db: &mut TechDb,
     interner: &mut StringInterner,
-) -> Result<()> {
-    let file = File::open(path).with_context(|| format!("Failed to open LEF file at {:?}", path))?;
+) -> Result<LefSkipReport> {
+    let file =
+        File::open(path).with_context(|| format!("Failed to open LEF file at {:?}", path))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    parse_lef_bytes(&mmap, tech_db, interner)
+    let report = parse_lef_bytes(&mmap, tech_db, interner)
         .with_context(|| format!("Failed to parse LEF file at {:?}", path))?;
     tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
-    Ok(())
+    Ok(report)
 }
 
-/// Convenience function to parse both Technology LEF (.tlef) and Macro LEF (.lef) into a new `TechDb`.
+/// Convenience function to parse both Technology LEF (.tlef) and Macro LEF (.lef) into a
+/// new `TechDb`, with the merged skip report of both files.
 pub fn load_tech_db(
     tlef_path: &Path,
     lef_path: &Path,
     interner: &mut StringInterner,
-) -> Result<TechDb> {
+) -> Result<(TechDb, LefSkipReport)> {
     let mut tech_db = TechDb::new();
-    parse_lef(tlef_path, &mut tech_db, interner)?;
-    parse_lef(lef_path, &mut tech_db, interner)?;
+    let mut report = parse_lef(tlef_path, &mut tech_db, interner)?;
+    report.merge(&parse_lef(lef_path, &mut tech_db, interner)?);
     tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
-    Ok(tech_db)
+    Ok((tech_db, report))
 }
 
 #[cfg(test)]
@@ -924,7 +988,8 @@ END inv_sample
         let mut interner = StringInterner::new();
         let t0 = std::time::Instant::now();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load sky130 TechDb");
+            .expect("Failed to load sky130 TechDb")
+            .0;
         let elapsed = t0.elapsed();
 
         println!("sky130 LEF load elapsed: {:?}", elapsed);
@@ -935,13 +1000,31 @@ END inv_sample
         let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)
             .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
-        assert_eq!(tech_db.dbu_per_micron, ref_json["tech_dbu_per_micron"].as_i64().unwrap() as i32);
+        assert_eq!(
+            tech_db.dbu_per_micron,
+            ref_json["tech_dbu_per_micron"].as_i64().unwrap() as i32
+        );
         assert_eq!(tech_db.site_name, "unithd");
-        assert_eq!(tech_db.site_width_dbu, ref_json["site_width_dbu"].as_i64().unwrap() as i32);
-        assert_eq!(tech_db.site_height_dbu, ref_json["site_height_dbu"].as_i64().unwrap() as i32);
-        assert_eq!(tech_db.routing_layers.len(), ref_json["tech_routing_layers"].as_u64().unwrap() as usize);
-        assert_eq!(tech_db.macros.len(), ref_json["tech_macros"].as_u64().unwrap() as usize);
-        assert_eq!(tech_db.macro_pins.len(), ref_json["tech_macro_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            tech_db.site_width_dbu,
+            ref_json["site_width_dbu"].as_i64().unwrap() as i32
+        );
+        assert_eq!(
+            tech_db.site_height_dbu,
+            ref_json["site_height_dbu"].as_i64().unwrap() as i32
+        );
+        assert_eq!(
+            tech_db.routing_layers.len(),
+            ref_json["tech_routing_layers"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            tech_db.macros.len(),
+            ref_json["tech_macros"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            tech_db.macro_pins.len(),
+            ref_json["tech_macro_pins"].as_u64().unwrap() as usize
+        );
 
         // Spot-check met1
         let met1_sym = interner.get("met1").expect("met1 not interned");
@@ -966,7 +1049,9 @@ END inv_sample
         assert!((met2.res_per_sq - 0.125).abs() < 1e-4);
 
         // Spot-check inv_1 macro
-        let inv_sym = interner.get("sky130_fd_sc_hd__inv_1").expect("inv_1 symbol");
+        let inv_sym = interner
+            .get("sky130_fd_sc_hd__inv_1")
+            .expect("inv_1 symbol");
         let inv_id = tech_db.macro_by_name.get(&inv_sym).expect("inv_1 macro id");
         let inv = &tech_db.macros[inv_id.0 as usize];
         assert_eq!(inv.width_dbu, 1380);
@@ -976,49 +1061,84 @@ END inv_sample
         assert_eq!(inv.obs_rects.len(), 2);
 
         let inv_pins = tech_db.macro_pins(inv);
-        let a_pin = inv_pins.iter().find(|p| interner.resolve(p.name) == "A").expect("A pin");
+        let a_pin = inv_pins
+            .iter()
+            .find(|p| interner.resolve(p.name) == "A")
+            .expect("A pin");
         assert_eq!(a_pin.dir, PinDir::Input);
         assert!(!a_pin.is_power);
         assert_eq!(a_pin.offset_x_dbu, 485);
         assert_eq!(a_pin.offset_y_dbu, 1195);
 
-        let y_pin = inv_pins.iter().find(|p| interner.resolve(p.name) == "Y").expect("Y pin");
+        let y_pin = inv_pins
+            .iter()
+            .find(|p| interner.resolve(p.name) == "Y")
+            .expect("Y pin");
         assert_eq!(y_pin.dir, PinDir::Output);
         assert!(!y_pin.is_power);
         assert_eq!(y_pin.offset_x_dbu, 901);
         assert_eq!(y_pin.offset_y_dbu, 1243);
 
         // Spot-check multi-rect internal jumper merging on met1
-        let met1_id = tech_db.layer_by_name.get(&met1_sym).copied().expect("met1 layer id");
-        let dfxtp2_sym = interner.get("sky130_fd_sc_hd__dfxtp_2").expect("dfxtp_2 symbol");
+        let met1_id = tech_db
+            .layer_by_name
+            .get(&met1_sym)
+            .copied()
+            .expect("met1 layer id");
+        let dfxtp2_sym = interner
+            .get("sky130_fd_sc_hd__dfxtp_2")
+            .expect("dfxtp_2 symbol");
         let dfxtp2 = &tech_db.macros[tech_db.macro_by_name[&dfxtp2_sym].0 as usize];
-        let dfxtp2_met1_obs = dfxtp2.obs_rects.iter().filter(|(l, _)| *l == met1_id).count();
-        assert_eq!(dfxtp2_met1_obs, 2, "dfxtp_2 met1 OBS: 14 rects merged into 2 jumpers");
+        let dfxtp2_met1_obs = dfxtp2
+            .obs_rects
+            .iter()
+            .filter(|(l, _)| *l == met1_id)
+            .count();
+        assert_eq!(
+            dfxtp2_met1_obs, 2,
+            "dfxtp_2 met1 OBS: 14 rects merged into 2 jumpers"
+        );
 
-        let xnor2_sym = interner.get("sky130_fd_sc_hd__xnor2_2").expect("xnor2_2 symbol");
+        let xnor2_sym = interner
+            .get("sky130_fd_sc_hd__xnor2_2")
+            .expect("xnor2_2 symbol");
         let xnor2 = &tech_db.macros[tech_db.macro_by_name[&xnor2_sym].0 as usize];
-        let xnor2_met1_obs = xnor2.obs_rects.iter().filter(|(l, _)| *l == met1_id).count();
-        assert_eq!(xnor2_met1_obs, 1, "xnor2_2 met1 OBS: 5 rects merged into 1 jumper");
+        let xnor2_met1_obs = xnor2
+            .obs_rects
+            .iter()
+            .filter(|(l, _)| *l == met1_id)
+            .count();
+        assert_eq!(
+            xnor2_met1_obs, 1,
+            "xnor2_2 met1 OBS: 5 rects merged into 1 jumper"
+        );
 
-        let xor2_sym = interner.get("sky130_fd_sc_hd__xor2_2").expect("xor2_2 symbol");
+        let xor2_sym = interner
+            .get("sky130_fd_sc_hd__xor2_2")
+            .expect("xor2_2 symbol");
         let xor2 = &tech_db.macros[tech_db.macro_by_name[&xor2_sym].0 as usize];
         let xor2_met1_obs = xor2.obs_rects.iter().filter(|(l, _)| *l == met1_id).count();
-        assert_eq!(xor2_met1_obs, 1, "xor2_2 met1 OBS: 5 rects merged into 1 jumper");
+        assert_eq!(
+            xor2_met1_obs, 1,
+            "xor2_2 met1 OBS: 5 rects merged into 1 jumper"
+        );
     }
-
 
     fn lef_error(text: &str) -> String {
         let mut interner = StringInterner::new();
         let mut db = TechDb::new();
         match parse_lef_bytes(text.as_bytes(), &mut db, &mut interner) {
             Err(e) => format!("{e:#}"),
-            Ok(()) => panic!("malformed LEF was accepted:\n{text}"),
+            Ok(_) => panic!("malformed LEF was accepted:\n{text}"),
         }
     }
 
     /// Asserts the fixture still contains `needle`, so a test cannot pass by editing nothing.
     fn edit_fixture(base: &str, needle: &str, replacement: &str) -> String {
-        assert!(base.contains(needle), "fixture no longer contains `{needle}`");
+        assert!(
+            base.contains(needle),
+            "fixture no longer contains `{needle}`"
+        );
         base.replacen(needle, replacement, 1)
     }
 
@@ -1033,7 +1153,10 @@ END inv_sample
     fn test_layer_width_without_value_is_an_error() {
         let text = edit_fixture(SAMPLE_TLEF, "WIDTH 0.14 ;", "WIDTH ;");
         let msg = lef_error(&text);
-        assert!(msg.contains("LAYER WIDTH") && msg.contains("missing"), "{msg}");
+        assert!(
+            msg.contains("LAYER WIDTH") && msg.contains("missing"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -1045,7 +1168,11 @@ END inv_sample
 
     #[test]
     fn test_truncated_rect_is_an_error() {
-        let text = edit_fixture(SAMPLE_LEF, "RECT 0.320 1.075 0.650 1.315 ;", "RECT 0.320 1.075 0.650 ;");
+        let text = edit_fixture(
+            SAMPLE_LEF,
+            "RECT 0.320 1.075 0.650 1.315 ;",
+            "RECT 0.320 1.075 0.650 ;",
+        );
         let msg = lef_error(&text);
         assert!(msg.contains("PIN PORT RECT y2"), "{msg}");
     }
@@ -1054,14 +1181,20 @@ END inv_sample
     fn test_macro_without_size_is_an_error() {
         let text = edit_fixture(SAMPLE_LEF, "  SIZE 1.380 BY 2.720 ;\n", "");
         let msg = lef_error(&text);
-        assert!(msg.contains("inv_sample") && msg.contains("no SIZE"), "{msg}");
+        assert!(
+            msg.contains("inv_sample") && msg.contains("no SIZE"),
+            "{msg}"
+        );
     }
 
     #[test]
     fn test_unterminated_macro_is_an_error() {
         let text = edit_fixture(SAMPLE_LEF, "END inv_sample", "");
         let msg = lef_error(&text);
-        assert!(msg.contains("MACRO inv_sample") && msg.contains("not terminated"), "{msg}");
+        assert!(
+            msg.contains("MACRO inv_sample") && msg.contains("not terminated"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -1075,14 +1208,19 @@ END inv_sample
     /// and a truncation inside the `met1` layer block must be an error.
     #[test]
     fn test_every_truncation_of_sample_tlef_is_rejected_or_parsed_without_panic() {
-        let layer_start = SAMPLE_TLEF.find("LAYER met1").expect("fixture has met1") + "LAYER met1".len();
-        let layer_end = SAMPLE_TLEF.find("END met1").expect("fixture has END met1") + "END met1".len();
+        let layer_start =
+            SAMPLE_TLEF.find("LAYER met1").expect("fixture has met1") + "LAYER met1".len();
+        let layer_end =
+            SAMPLE_TLEF.find("END met1").expect("fixture has END met1") + "END met1".len();
         for n in 0..=SAMPLE_TLEF.len() {
             let mut interner = StringInterner::new();
             let mut db = TechDb::new();
             let result = parse_lef_bytes(&SAMPLE_TLEF.as_bytes()[..n], &mut db, &mut interner);
             if n >= layer_start && n < layer_end {
-                assert!(result.is_err(), "truncation at {n} bytes inside met1 was accepted");
+                assert!(
+                    result.is_err(),
+                    "truncation at {n} bytes inside met1 was accepted"
+                );
             }
         }
     }
@@ -1094,5 +1232,90 @@ END inv_sample
             let mut db = TechDb::new();
             let _ = parse_lef_bytes(&SAMPLE_LEF.as_bytes()[..n], &mut db, &mut interner);
         }
+    }
+
+    const SKIP_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+
+FOO 42 ;
+VERSION 5.7 ;
+
+VIA via_a
+END via_a
+
+via via_b
+END via_b
+
+VIARULE rule1
+END rule1
+
+NONDEFAULTRULE ndr1
+END ndr1
+
+PROPERTYDEFINITIONS
+END PROPERTYDEFINITIONS
+
+SPACING
+END SPACING
+
+MACRO m1
+  CLASS CORE ;
+  SIZE 1.0 BY 1.0 ;
+END m1
+END
+"#;
+
+    #[test]
+    fn test_skip_report_counts_skips() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        let report = parse_lef_bytes(SKIP_LEF.as_bytes(), &mut db, &mut interner).unwrap();
+
+        assert_eq!(db.macros.len(), 1);
+        assert_eq!(report.skipped["FOO"], 1);
+        assert_eq!(report.skipped["VERSION"], 1);
+        // Lowercase `via` still counts under the uppercased keyword.
+        assert_eq!(report.skipped["VIA"], 2);
+        assert_eq!(report.skipped["VIARULE"], 1);
+        assert_eq!(report.skipped["NONDEFAULTRULE"], 1);
+        assert_eq!(report.skipped["PROPERTYDEFINITIONS"], 1);
+        assert_eq!(report.skipped["SPACING"], 1);
+        assert_eq!(report.total(), 8);
+    }
+
+    const KNOWN_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+
+LAYER li1
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.17 ;
+END li1
+
+MACRO m1
+  CLASS CORE ;
+  SIZE 1.0 BY 1.0 ;
+END m1
+END
+"#;
+
+    #[test]
+    fn test_skip_report_empty_when_nothing_skipped() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        let report = parse_lef_bytes(KNOWN_LEF.as_bytes(), &mut db, &mut interner).unwrap();
+
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.total(), 0);
     }
 }

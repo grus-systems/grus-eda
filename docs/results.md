@@ -1904,3 +1904,4396 @@ this fixture's golden is propagated-mode only).
 
 This complements the committed `sta_edge/clock_gate` ideal golden (strict
 PASS), which covers inversion but not the clock-gate + latch combination.
+
+### 2026-11-18 — N7 — VCD-driven power estimation vs OpenROAD `report_power`
+
+Adds `grus-eda power` (`--vcd` required): Liberty `internal_power` tables,
+`cell_leakage_power`, and `0.5·C·V²·rate` switching, grouped
+Sequential/Combinational/Clock like `report_power`. Activity is the exact
+per-net VCD rise/fall edge counts over the dump window — not OpenSTA's
+statistical propagation. Slews come from `sta_pin_slews` on the same
+Lib/SDC/parasitic context.
+
+**Reference**: OpenROAD `read_vcd -scope gcd_tb/dut` + `report_power`,
+`tests/designs/gcd/power/power_vcd_check.tcl` (LibreLane 3.0.16,
+sky130_fd_sc_hd tt_025C_1v80, `gcd.placed.def`, `gcd.sdc`, `gcd.vcd`).
+
+#### Micro-benchmark formula check (`tests/designs/microbench/`)
+
+A two-cell clocked design (`dfxtp_1` + `inv_1`) with a hand-written VCD of
+known activity (clk 100 cycles/2 µs, `a` two 400 ns pulses) isolates the
+formula where propagated activity ≈ exact counts. `mb.vcd` was regenerated
+with proper `$dumpvars` initials after discovering that missing initials
+left every signal undefined and dropped each net's first 0->1 edge.
+
+| quantity | grus-eda | OpenROAD | diff |
+|---|---|---|---|
+| Sequential internal | 2.089e-6 | 2.08e-6 | +0.4% |
+| Sequential switching | 7.496e-9 | 7.74e-9 | -3% |
+| Combinational internal | 5.714e-9 | 5.61e-9 | +1.8% |
+| Combinational switching | 1.628e-7 | 1.62e-7 | +0.5% |
+| leakage (all groups) | — | — | <1% |
+
+The internal-power formula is confirmed: table values are **joules per
+transition** (pJ at parse), counted by the power-owning pin's **own net**
+transitions — a DFF's `Q` `power_outputs` block is indexed by the related
+CLK pin's slew but multiplied by Q's activity, not CLK's. This was the
+decisive fix; using the related pin's count over-counted sequential internal
+power ~50x on the micro-bench.
+
+#### gcd comparison (zero-wire parasitics)
+
+| group | grus internal | OR internal | grus switch | OR switch |
+|---|---|---|---|---|
+| Sequential | 1.56e-4 | 2.98e-4 | 1.02e-5 | 1.07e-5 |
+| Combinational | 1.35e-4 | 5.88e-5 | 4.17e-5 | 8.93e-5 |
+| Clock | 0 | 0 | 0 | 0 |
+| **Total** | **2.91e-4** | **3.57e-4** | **5.20e-5** | **1.00e-4** |
+
+Leakage matches to <2% in every group (cell_leakage_power sum is exact).
+
+**Divergences, with root causes:**
+
+- **Internal power does not match on gcd** although the formula is proven on
+  the micro-bench. OpenSTA does not read per-net VCD counts directly; it
+  seeds boundary activities from the dump and **propagates activity
+  statistically** through the design (BDD-based), with sequential cells
+  getting `findSeqActivity` register-propagated values. On `mb2.vcd` (added
+  clock-edge-aligned glitches to `a`) OpenROAD's combinational internal
+  collapsed to 0 while ours stayed exact — direct evidence the two activity
+  models differ. Our per-net counts are the true simulated toggles; where
+  they diverge from OpenSTA's estimate (sequential Q activity is propagated
+  higher than actual toggles, deep combinational logic is attenuated) the
+  totals diverge correspondingly. This is a modeling difference, not a
+  formula defect — matching it would require reimplementing OpenSTA's
+  activity propagation.
+- **Switching under-counts on zero-wire** because OpenROAD estimates wire
+  parasitics from the placed DEF even without SPEF. With `--spef
+  gcd.rcx.spef` our switching total rises 5.20e-5 -> 6.93e-5 (OR 1.00e-4);
+  with `--parasitics placement` (Prim-Dijkstra) -> 6.09e-5. The residual is
+  the wire-RC model difference, secondary to the activity issue.
+
+**Honest scope**: `when`-qualified `internal_power` blocks (ebu*/einv*) are
+skipped and counted (`conditional_power_blocks`); cells without a Liberty
+counterpart (filler/tap, 93 on gcd) contribute nothing; undriven/active nets
+and missing slews are reported in `diagnostics`, not silently approximated.
+SAIF input is not yet implemented (VCD only).
+
+### 2026-11-18 — N2 — `set_false_path` / `set_multicycle_path` (partitioned re-analysis)
+
+Implements the B2 design in `docs/timing-exceptions.md` (reviewed by
+Hydrogen + SWE-2 Flash; measured OpenSTA semantics in
+`tests/designs/sta_exceptions/`). `run_sta_detail` splits into
+`prepare_sta` (graph, slews, clock — once) and `eval_sta` (per exception
+signature class); excluded launch sources merge slew-only so downstream
+delay tables are untouched. `run_sta_partitioned` resolves `get_cells` /
+`all_registers` / `get_ports` / `all_inputs` / `all_outputs` / bare names
+after design load, drops false-pathed classes per endpoint, and shifts
+required times by the measured formulas (`setup: max_req += (N-1)·T`,
+`hold: min_req += ((N-1)-H)·T`, per-field last-command-wins).
+
+**Reference**: `exceptions.reference.json` — OpenSTA `report_timing` inside
+the pinned LibreLane image via committed `generate_ref.sh`, 19 scenarios on
+a 3-FF fixture (period 2.0 ns).
+
+**Comparison** (`cargo test -p grus-core test_sta_exception`, endpoint-level:
+8 fields + WNS/TNS + setup/hold violation counts per endpoint):
+
+- 17/17 OpenSTA-parseable scenarios match within STRICT-class tolerances
+  (rel 1%, abs 5 ps) — including false-path endpoint removal
+  (`fp_uf0_uf1`, `fp_allregs`, `fp_from_din`, `fp_to_y`, `fp_mc_same`) and
+  every multicycle variant (`mc_setup2`, `mc_hold0/1/-1`, `mc_overlap`,
+  `mc_to_y`, `mc_allregs`, `mc_bare2`, `mc_setup2_pos`, `mc_setup2_nofrom`,
+  `mc_s2_h1_split`).
+- `mc_setup2_hold1` (combined `-setup 2 -hold 1`): valid SDC our parser
+  accepts with split-command-identical results; OpenSTA rejects the syntax
+  (`path_multiplier`), so no numeric reference exists — verified
+  self-consistently against `mc_s2_h1_split`.
+- `mc_both`: `-both` is counted in `sdc_ignored_commands` (OpenSTA
+  `STA-0563`; semantics unverifiable), never applied.
+
+**Pin selectors (follow-up, same fixture)**: `get_pins` and bare
+`instance/pin` specs in `-from`/`-to` — 17 more scenarios regenerated via
+the committed `generate_ref.sh`. Measured OpenSTA semantics: the launch
+object is the sequential cell's **clock pin** (`-from [get_pins u_ff0/CLK]`
+cuts the path; `u_ff0/Q`, `u_ff0/D` cover nothing), the capture object is
+the endpoint pin (`-to [get_pins u_ff1/D]` matches). `get_pins` on a bare
+instance or a port name resolves empty. All 34 OpenSTA-parseable
+scenarios now match endpoint-by-endpoint.
+
+**Diagnostics**: `false_path_endpoints` counts removed endpoints (exempt
+from `is_clean` — a declared exception, not a modelling gap);
+`unresolved_exception_selectors` counts unknown names and selectors
+resolving empty; `unsupported_multicycle_endpoints` counts latch-D /
+clock-gate-enable endpoints a multicycle could not rigidly shift.
+Unsupported qualifiers (`-through`, `-rise`, clock selectors, …) still
+route the whole command to `ignored_commands`.
+
+**Regression**: 247 lib tests + 3 integration tests pass; ordinary SDCs
+take the unpartitioned path unchanged (`sdc.exceptions.is_empty()`).
+
+### 2026-11-18 — N2 — `set_max_delay` / `set_min_delay` (delay checks)
+
+Implements `docs/path-delays.md` (v2, reviewed): `PinTimingState` gains a
+per-transition delay domain — `delay_max` (`arrival` minus launch-clock
+arrival, propagated over the same late arc and wire delays, seeded at the
+launch arc's `t_cq`) plus `delay_launch_max` (the winning path's raw launch
+arrival: the late clock-pin arrival for sequential launches, the I/O clock
+reference `input_clock_latency_ns` for input-port launches). Delay coverage
+joins the exception signature, so each signature class's eval run keeps the
+covered sources' delay state separate; `run_sta_partitioned` composes per
+endpoint with measured precedence false_path > delay > multicycle, per side
+independently. Latch `D -> Q` borrow arcs clamp the reconstructed absolute
+arrival (`launch + delay`) and re-derive the delay — no latch fixture covers
+this yet (path-delays.md section 5).
+
+**Reference**: `exceptions.reference.json` — OpenSTA `report_timing` inside
+the pinned LibreLane image via the committed `generate_ref.sh`; 28
+`md_*`/`mhu_*`/`pmd_*` scenarios on the 3-FF fixture.
+
+**Comparison** (`cargo test -p grus-core test_sta_exceptions_match_opensta`,
+endpoint-level: 8 fields + WNS/TNS + violation counts per endpoint):
+
+- All 61 OpenSTA-parseable scenarios match within STRICT-class tolerances
+  (rel 1%, abs 5 ps), including every delay variant: replace semantics at
+  `N = 0.3/0.5/1.0/2.0/5.0` (`md_tight`…`md_loose`), file-order last-wins
+  (`md_overlap`/`md_overlap_rev`, both directions), order-independent delay
+  over multicycle (`md_mc`, `md_mc_rev`), min-side pre-MCP required
+  (`md_min_mcp_h1`, `md_min_mcp_s2`), port-source launches (`md_port`,
+  `md_minport`), pin selectors (`md_pin`), universal `-from` (`md_nofrom`),
+  propagated clock (`pmd_basic`, `pmd_min`, `pmd_multi`) and hold-uncertainty
+  0.5 (`mhu_*`).
+- `md_early`/`md_datapath` are OpenSTA rejection records (our parser counts
+  them in `ignored_commands`); `md_through` exercises the qualifier-diagnostic
+  path — `-through` is unsupported, the whole command is counted ignored.
+- Fail-proof check: flipping the delay formulas (`req - N` on the max side,
+  `req - N` on the min side) turns the test red on `md_basic`; restored.
+
+**Honest coverage note** (carried from the design doc): every fixture
+endpoint has a single launch source, so the delay-winner vs arrival-winner
+divergence that `delay_launch_max` exists for is covered by construction and
+by `test_delay_merge_tracks_the_delay_winner_launch`, not by golden data —
+a two-driver fixture is listed as follow-up.
+
+**Diagnostics**: `unsupported_path_delay_endpoints` counts delay rules
+covering output ports, clock-gate enables, latch-D and async recovery/removal
+endpoints, which keep their clock-check values. The 17-qualifier
+`PATH_DELAY_UNSUPPORTED_FLAGS` list routes the whole command to
+`ignored_commands` (never half-applied).
+
+**Regression**: full `cargo test -p grus-core` passes (255 lib tests);
+ordinary SDCs take the unpartitioned path unchanged when
+`sdc.path_delays.is_empty()`.
+
+### 2026-11-19 — N3 — two-source delay-merge fixture (`m2_*`/`pm2_*`)
+
+Extends the `sta_exceptions` fixture so `u_ff1/D` is reachable from two
+sequential launch sources with skewed launch clocks: `u_ff0/Q -> u_mux/A0`
+and `u_ff2/Q -> u_mux/A1` (`sky130_fd_sc_hd__mux2_1` at `u_mux`), a
+constrained `sel` port driving `u_mux/S` (`-min 0.1` / `-max 0.3` input
+delays — live but losing: its hold slack stays positive so the min-side
+delay probes still win, its setup slack loses to every `set_max_delay`
+check), and a second `clkbuf` `u_clkb2` so `u_ff2/CLK` rides `c2` while
+`u_ff0`/`u_ff1` stay on `c1`.
+
+- **Reference command**: `bash tests/designs/sta_exceptions/generate_ref.sh`
+  (re-invokes itself inside `ghcr.io/librelane/librelane:3.0.16`; all 72
+  scenarios regenerated, every value emitted by that run — no hand-edited
+  numbers).
+- **Our command**: `cargo test -p grus-core test_sta_exceptions_match_opensta`
+  (STRICT: rel 1%, abs 5 ps; per-endpoint 8 fields + WNS/TNS + violation
+  counts).
+
+**Real divergence found and fixed.** With the split clock nets the new
+`pm2_both` scenario (single `-from {u_ff0 u_ff2}` command → merged delay
+domain) exposed that the max-side delay-check required time was anchored
+to the *launch* source's clock arrival: ours 1.0048 vs OpenSTA 1.013333 on
+`u_ff1/D`, an 8.5 ps miss equal to the `c1`/`c2` clock skew. OpenSTA
+anchors `req` at the endpoint register's own clock pin (early capture
+arrival, like the setup clock check, minus the period the clock check
+adds) — invisible while every FF shared one clock net. Fixed in
+`run_sta_partitioned`: `req = capture_arrival_min[check.edge] - unc -
+t_setup + N`, `arr = delay_launch + delay_max`, `slack = req - arr`. The
+two-command propagated scenario `pmd_multi` exercises the same anchoring
+per class. The clock check's CRPR credit is not applied to delay checks
+(the delay domain tracks the winner's launch time, not its clock net);
+unexercised here — zero late/early spread on this fixture's clock nets.
+
+**Comparison after the fix**: all 68 evaluated scenarios match STRICT
+tolerances including the new `m2_max0`/`m2_max2`/`m2_both`/`m2_min2`/
+`pm2_prop`/`pm2_min2`/`pm2_both`; the 4 OpenSTA-rejection records are
+unchanged. Regenerated values legitimately shifted: `u_ff1/D` arrivals
+gain the mux delay and the `sel`/`u_ff2` candidates everywhere; `fp_uf0_uf1`
+now reports `u_ff1/D` (survives via `u_ff2`/`sel`); `exc_diag`'s report
+winner is the unshifted `u_ff2`/`sel` clock check (req 2.550057) — the
+`-setup 2` shift still applies to the `u_ff0` class candidate but loses
+the min-slack pick (diagnostics test updated accordingly). One fixture
+intent did not hold: `sel`'s `-max 0.3` was meant to keep `base`'s
+`u_ff1/D` max report on an FF path, but the port launch (arr 1.313326)
+beats both FF arrivals (`u_ff2` 1.277188) and wins that report —
+harmless, since every delay probe still wins its own scenario, but the
+`base` `u_ff1/D` max row now measures a port-launched path.
+
+**Winner-pairing outcome**: the delay winner (`u_ff2`, ~10 ps larger path
+delay via `A1`) is also the arrival winner — its ~8.5 ps earlier launch on
+`c2` does not overcome the delay gap — so the delay-winner vs
+arrival-winner split did not materialize on golden data. Fail-proof check:
+pairing `delay_max` with the max launch instead of the winner's launch
+turns `pm2_both u_ff1/D.max_arr_ns` red (0.72798 vs 0.719321); restored.
+A fixture separating the two winners (larger `c1` load) is listed as
+follow-up in `docs/path-delays.md` section 5.
+
+**Regression**: `cargo test -p grus-core` passes including the updated
+`test_sta_exception_diagnostics` (partial false-path coverage asserted on
+`fp_uf0_uf1`, full removal on `fp_to_y`, winner required time on
+`exc_diag`).
+
+### 2026-11-19 — N3 follow-up — diverging delay/arrival winners, delay domain retired
+
+Makes the merged `set_max_delay` check's delay winner and arrival winner
+diverge on golden data, as `docs/path-delays.md` section 5 item 3 asked.
+Two fixture changes in `tests/designs/sta_exceptions/exceptions.def`:
+
+- mux data-pin swap (the goal's change): `u_ff0/Q -> u_mux/A1`,
+  `u_ff2/Q -> u_mux/A0`, so `u_ff0` drives the higher-capacitance input
+  and owns the larger pure path delay. Regenerated as stage A first:
+  predicted correctly, it did **not** split the winners — `u_ff0` won
+  both the delay domain and the arrival (`pm2_prop` = `pm2_both` =
+  `base_prop` = 0.731424), because the later-launching source also
+  gained the delay. Measured `g = d_A1 - d_A0 = 1.277188 - 1.263656 =
+  13.532 ps`, `launch_c1 - launch_c2 = 12.103 ps`.
+- extra clock buffer (stage B): `u_clkb3` (`clkbuf_2`) inserted on
+  `u_ff2`'s clock (`c2 -> u_clkb3 -> c3`, `COMPONENTS 7`, `NETS 10`),
+  adding ~81 ps of launch delay so `u_ff2`'s launch lands ~69 ps after
+  `u_ff0`'s — comfortably past `g`.
+
+- **Reference command**: `bash tests/designs/sta_exceptions/generate_ref.sh`
+  run in full inside `ghcr.io/librelane/librelane:3.0.16` (run once per
+  stage; the committed file is the stage-B output). All 72 scenarios
+  regenerated by the script — no hand-edited numbers.
+- **Our command**: `cargo test -p grus-core test_sta_exceptions_match_opensta`
+  (STRICT: rel 1%, abs 5 ps).
+
+**Winner-pairing outcome — the split materialised and falsified the v1
+pairing.** Delay winner `u_ff0` (`m2_both` = `m2_max0` = 1.277188 >
+`m2_max2` = 1.263656 under a shared ideal launch); arrival winner `u_ff2`
+(`base_prop` = 0.786764 = `u_ff2`'s launch on `c3` + `d_A0`; `pm2_prop`,
+the `u_ff0`-only check, stays 0.731424 — a 55.34 ps split). OpenSTA's
+merged `pm2_both` reports **0.786764** — the covered-source arrival
+winner, not the delay winner's `launch + delay` (0.731424). Our v1
+composition (`arr = delay_launch_max + delay_max`) went red by exactly
+that gap on `pm2_both u_ff1/D.max_arr_ns` (ours 0.7314235 vs ref
+0.786764), so the delay domain was retired: `PinTimingState.delay_max` /
+`delay_launch_max`, their merge/seed terms, and the latch-borrow delay
+reconstruction were removed, and the delay check now keeps the covered
+candidate's ordinary arrival (`run_sta_partitioned` ~line 3193) with the
+same capture-anchored required time. `pm2_min2`/`pmd_multi` confirm the
+min side and per-class anchoring are unchanged in form.
+
+**Comparison after the fix**: all 68 evaluated scenarios match STRICT
+tolerances; the 4 OpenSTA-rejection records (`mc_both`,
+`mc_setup2_hold1`, `md_early`, `md_datapath`) unchanged. 31 of 72
+scenarios moved vs the previous golden: all 4 propagated-clock runs
+(`base_prop`, `pmd_basic`, `pmd_min`, `pmd_multi`), all `pm2_*`,
+`m2_max0`/`m2_max2`/`m2_min2`, `mhu_min1`/`mhu_max1`, 6 `mc_*`
+(`mc_setup2`, `mc_setup2_pos`, `mc_bare2`, `mc_holdneg`, `mc_overlap`,
+`mc_pin_clk`) and 13 `md_*` (`md_basic`, `md_tight`, `md_min`,
+`md_min1`, `md_overlap`, `md_overlap_rev`, `md_both`, `md_mc`,
+`md_mc_rev`, `md_min_mc`, `md_min_mc_rev`, `md_min_mcp_h1`,
+`md_min_mcp_s2`) — every scenario whose report contains a `u_ff0`- or
+`u_ff2`-sourced row. 41 are byte-identical: `base`, all 20 `fp_*`,
+`mhu_base`, the source-agnostic `mc_*` (`mc_hold0`, `mc_hold1`,
+`mc_to_y`, `mc_allregs`, `mc_pin`, `mc_s2_h1_split`,
+`mc_setup2_nofrom`) and `md_*` (`md_nofrom`, `md_loose`, `md_port`,
+`md_min0`, `md_minport`, `md_fp`, `md_through`) winners, the 4 error
+records, and `m2_both` — which keeps 1.277188, the same winning value
+now sourced from `u_ff0` instead of `u_ff2`. `sel`'s port-launched candidate did not steal the arrival
+report (u_ff2's 0.786764 > sel's reach). Fail-proof: composing the
+reported arrival from `arrival_min` instead of the covered candidate's
+arrival turns `pm2_both` red, and the retired pairing's red run above is
+itself the divergence proof; restored and green.
+
+**Regression**: `cargo test --workspace` and
+`cargo clippy --workspace --all-targets -- -D warnings` pass. The stale
+`4.562147` literal in the `test_sta_exception_diagnostics` comment was
+corrected to `4.550057` (winner req 2.550057 + one period; the req is
+data-net independent and unchanged in the new golden).
+
+### 2026-11-19 — output-port `-to` delay checks (`mdo_*`/`pmo_*`)
+
+Implements `set_max_delay`/`set_min_delay` checks whose `-to` selects an
+output port — `docs/path-delays.md` section 5 item 2, on the existing
+signature-class machinery. 23 new scenarios probe `-to [get_ports y]` /
+`-to [all_outputs]`, `-from` subsets, propagated clocks, and precedence;
+`generate_ref.sh`'s `SCENARIOS` grew from 72 to 95 names.
+
+- **Reference command**: `bash tests/designs/sta_exceptions/generate_ref.sh`
+  run in full inside `ghcr.io/librelane/librelane:3.0.16`. The existing 72
+  entries came back byte-identical (`git diff` shows only the 23 new keys).
+- **Our command**: `cargo test -p grus-core test_sta_exceptions_match_opensta`
+  (STRICT: rel 1%, abs 5 ps).
+
+**Measured formulas** (fixture preamble: `output_delay` 0.1/0.7,
+`setup_unc` 0.05, `hold_unc` 0.1, output latency 0.7 ideal / 0.1
+propagated):
+
+- max side: `req = N - output_delay_max - setup_unc` — `mdo_max05`/`1`/`2`/`3`
+  read `-0.25`/`0.25`/`1.25`/`2.25` (`N - 0.75` at every point). `mdo_max3`
+  is the loose-replace probe: the delay req (2.25) is looser than the
+  ordinary output req (1.95) and OpenSTA still reports it — replace
+  semantics, same as FF endpoints.
+- min side: `req = N - output_delay_min + hold_unc`. `mdo_min0`/`05`/`1`
+  read `0.0`/`0.5`/`1.0` — ambiguous alone because the preamble's
+  delay_min = hold_unc = 0.1 cancels, so `mdo_mindl` (delay_min raised to
+  0.4 -> req `-0.3`) and `mdo_minhu` (hold_unc raised to 0.35 -> req
+  `+0.25`) isolate each term; the value matches only the
+  `N - delay_min + hold_unc` decomposition of the decision table.
+- propagated clock (`pmo_*`): required times identical to the ideal-clock
+  `mdo_*` values — no latency term, the anchor stays at the delay edge
+  (edge reference 0) in both clock modes.
+- `-from` coverage: `mdo_from1` (`-from u_ff1`, `y`'s only launch) and
+  `mdo_from2` (`-from {u_ff0 u_ff1}`, mixed objects) report the delay req
+  0.25; `mdo_from0` (`-from u_ff0`, whose fanout terminates at `u_ff1/D`)
+  leaves `y` byte-identical to `base` — the launch-source coverage model
+  holds at ports. `mdo_all` (`-to [all_outputs]`) resolves.
+- precedence: `mdo_fp` removes `y` entirely (false_path > delay);
+  `mdo_mc`/`mdo_mc_rev` keep the delay req 0.25 order-independently while
+  the uncovered min side takes the MCP shift (2.7); `mdo_min_mch`/
+  `mdo_min_mcs` keep the min delay req 0.5 off the MCP shifts;
+  `mdo_both` composes per side (0.25/0.5).
+- coverage limit: `y` has exactly one launch (`u_ff1/Q`), so the
+  covered-candidate winner rule is exercised per transition only — a
+  multi-driver port fixture remains open (docs/path-delays.md section 5).
+
+**Implementation**: `run_sta_partitioned`'s `delay_supported` gate admits
+`ExceptionEndpointKind::OutputPort`; the `delay_max_n`/`delay_min_n`
+blocks branch on the endpoint kind — `Check` keeps the capture-anchored
+formula, `OutputPort` replaces `req`/`slack` per the formulas above and
+keeps the candidate's `arr`/`slew`. `unsupported_path_delay_endpoints`
+now counts only clock gates, latch-D and arc-less checks. MCP/false-path
+handling needed no change (the MCP shift was already per-side gated on
+`delay_*_n.is_none()`).
+
+**Result**: all 91 non-error scenarios pass STRICT tolerances; the 4
+OpenSTA-rejection records unchanged. Fail-proof: keeping `latency +
+period` in the max req and `req += n` on the min side turns the `mdo_*`
+set red (`mdo_all` first); restored and green.
+
+**Regression**: `cargo test --workspace` (252 + 3 tests) and
+`cargo clippy --workspace --all-targets -- -D warnings` pass.
+
+### 2026-11-19 — multi-launch output port (`ml_*`/`pml_*`)
+
+Closes the coverage gap the `output-port-delays` run left: `y` has
+exactly one launch (`u_ff1/Q`), so the worst-covered-candidate merge at
+an output port was exercised per transition only. A second
+`sky130_fd_sc_hd__mux2_1` (`u_mux2` at 11500/5440) now drives a new
+output port `y2` (left edge at 0/6800) from `u_ff0/Q -> A1` and
+`u_ff2/Q -> A0` — deliberately mirroring `u_mux`'s post-swap orientation
+so `u_ff0` keeps the larger pure delay through the higher-capacitance
+`A1` input. `u_mux2/S` shares `sel` (one more port-launched, uncovered
+competitor at `y2`). `d0`/`d2`/`sel` each gain exactly one sink.
+
+- **Preamble**: every `.sdc` file (97 existing + 7 new) gained
+  `set_output_delay -min 0.1`/`-max 0.7` for `y2` (real checked
+  endpoint, same values as `y`) plus `set_load 0.05` — a deliberate
+  symmetry extra so `y2`'s reported slew carries the same external-load
+  term `y` has instead of a zero-capacitance port slew. All values
+  still come from the regen.
+- **Scenarios** (`generate_ref.sh` `SCENARIOS` 95 -> 102): `ml_both`
+  (single `-from {u_ff0 u_ff2}` — the signature-class form that merges
+  both launches in one eval run), `ml_max0`/`ml_max2` (per-source
+  probes to decompose the merged report), `ml_all`
+  (`-to [all_outputs]`), `ml_min`, `pml_both`/`pml_min`
+  (`set_propagated_clock` variants).
+- **Reference command**: `bash tests/designs/sta_exceptions/generate_ref.sh`
+  run in full inside `ghcr.io/librelane/librelane:3.0.16` — all 102
+  scenarios regenerated by the committed script; no hand-edited numbers.
+- **Our command**: `cargo test -p grus-core test_sta_exceptions_match_opensta`
+  (STRICT: rel 1%, abs 5 ps).
+
+**Winner outcomes** (all from the regenerated golden):
+
+- `ml_both.y2` reports max_arr `1.508460` / req `0.25` / slack
+  `-1.258460` — identical to `ml_max0` (`u_ff0`'s isolated check) and
+  16.2 ps above `ml_max2` (`1.492272`): the merged rule reports the
+  worst covered candidate, decomposable per source. Predicted ~13.5 ps
+  from the `u_mux` measurement; the same `A1`-vs-`A0` asymmetry at
+  `u_mux2` measured 16.2 ps — above the 5 ps tolerance either way.
+- `pml_both.y2.max_arr` = `1.015388` = `base_prop.y2.max_arr`: under
+  `set_propagated_clock` the winner flips to `u_ff2` (the arrival
+  winner) — the port-side analog of the `pm2_both` falsification.
+- `ml_all.y` = `mdo_max1.y` (`1.323993`/`0.25`/`-1.073993`) — free
+  cross-check on `y`. `ml_all.y2` reports `1.533129`, **not**
+  `ml_both`'s `1.508460`: the universal `-from` also covers the `sel`
+  launch at `y2`, whose larger ordinary arrival (1.533129) is the worst
+  covered candidate. The design note expected equality; the golden
+  shows `sel` coverage under `all_outputs`, which is the correct
+  OpenSTA behaviour and richer coverage than planned.
+- Min side: `ml_min`'s reported `y2` min candidate is the delay check
+  (req `1.0` = `N`, slack `+0.428366`), not `sel`'s ordinary check
+  (req 0.7) — the merge is exercised even though the predicted negative
+  slack did not materialise: the covered min arrival at `y2` is
+  `1.428366` (the FF min paths are slower than the design estimate
+  assumed), so `set_min_delay 1.0` needed no adjustment. `pml_min`
+  reports the propagated-clock merged min check as a real hold
+  violation: `0.890682`/`1.0`/`-0.109318`.
+- `sel` did not take over any delay scenario's max-side report
+  (`ml_both`/`ml_max0`/`ml_max2` all show req `0.25`).
+
+**Expected shifts on the existing golden**: endpoint-level rows moved
+only at ps scale (< 50 ps) from the new `u_mux2` pin loads on
+`d0`/`d2`/`sel`. Two structural moves: `wns_max` changed in 64
+scenarios (new `y2` endpoint's ordinary max slack `0.416871` beats the
+old `y`-anchored `0.626007` — and `1.128237` in `mc_to_y`/`fp_to_y`),
+and `mdo_all`'s `tns_max` moved `-1.074` -> `-2.3571` (the new violating
+`y2` delay check adds its slack). No error records appeared or
+disappeared.
+
+**Result**: all 98 non-error scenarios pass STRICT tolerances — no
+composition change was needed; `test_sta_exception_diagnostics` passes
+unchanged (the `exc_diag` winner-req literal `2.550057` did not drift
+beyond 5 ps). Fail-proof: making the (class, endpoint, transition)
+pick keep the first candidate for `OutputPort` endpoints instead of the
+worst slack turns `ml_both` red (`y2.max_arr_ns`: ours `1.5331295` —
+the uncovered `sel` candidate — vs ref `1.50846`); restored and green.
+
+**Regression**: `cargo test --workspace` and
+`cargo clippy --workspace --all-targets -- -D warnings` pass.
+### 2026-11-19 — propagated-clock port launch anchor (`pmp_*`)
+
+Closes the last open path-delays question: under `set_propagated_clock`,
+what does OpenSTA anchor the input-port launch of a delay check to? The
+ideal-clock `md_port`/`md_minport` scenarios only proved the anchor our
+`Sdc::latency_ns` returns for an unpropagated I/O clock
+(`source + network` latency); the propagated arm (`-source` latency
+alone) was unverified because no delay-check golden exercised it.
+
+- **Scenarios** (`generate_ref.sh` `SCENARIOS` 102 -> 106): `pmp_port`
+  (`set_max_delay 1.0 -from [get_ports d_in] -to [get_cells u_ff0]`),
+  `pmp_minport` (same pair, `set_min_delay 0.5`), `pmp_port2`
+  (`pmp_port` with network `set_clock_latency` 0.6 -> 1.1 — a
+  null-diff probe), `pmp_alls` (`set_max_delay 1.0 -from [all_inputs]`).
+  All four are `base_prop.sdc` + one command.
+- **Reference command**: `bash tests/designs/sta_exceptions/generate_ref.sh`
+  run in full inside `ghcr.io/librelane/librelane:3.0.16` — all 106
+  scenarios regenerated by the committed script; the diff on the 102
+  existing keys is empty (additive only).
+- **Our command**: `cargo test -p grus-core test_sta_exceptions_match_opensta`
+  (STRICT: rel 1%, abs 5 ps).
+
+**Hypotheses** (predicted `d_in` launch arrivals, max/min): H-src SDC
+`-source` latency = our `input_clock_latency_ns` arm -> 0.8/0.1; H-prop
+propagated arrival at the `clk` port pin -> 0.8/0.1 (numerically
+identical on this fixture: `clk` is the propagation root, insertion at
+its pin is zero); H-ideal `source + network` -> 1.4/0.7; H-cap
+propagated arrival at the capture FF clock pin -> ~0.87/~0.17.
+
+**Measured** (regenerated golden):
+
+- `pmp_port.u_ff0/D`: `0.8 / 0.991446 / +0.191446` — the delay check
+  reports the ordinary propagated port seed (`base_prop` shows the same
+  0.8/0.1 arrivals), so the anchor is H-src/H-prop; H-ideal (1.4) and
+  H-cap (~0.87) are falsified by > 500 ps each. req `0.991446` =
+  `u_ff0/CLK` early `0.169918` `- 0.05 - t_setup + 1.0` — the
+  capture-anchored delay-check formula holds for a port launch.
+- `pmp_port2` is **byte-identical** to `pmp_port` in every row: the
+  ideal network latency (0.6 -> 1.1) does not move the delay-check
+  anchor — re-proving at delay checks what `base_prop` showed for
+  ordinary checks (no network term under propagation). Any
+  network-inclusive anchor would have read `u_ff0/D.max_arr` 1.9.
+- `pmp_minport.u_ff0/D`: `0.1 / 0.734473 / -0.634473` (`req_hold_base`
+  `0.234473` + `N 0.5`) — same anchor on the hold side, and a real
+  hold-violating delay check; `hold_violations` 2 with `tns_min`
+  `-0.840027` as predicted.
+- `pmp_alls` (`-from [all_inputs]`): `u_ff0/D` and `u_ff2/D` carry the
+  `d_in` delay check (`u_ff2/D` req `1.061578` anchored at the skewed
+  `c3` clock pin, ~2 buffers deep); `u_ff1/D` is covered by `sel` alone
+  (`0.713326 / 1.013333 / +0.300008` vs the ordinary +1.216828); `y2`
+  is covered by `sel` and reports a real setup violation
+  (`0.933129 / 0.25 / -0.683130`, `setup_violations` 1). `clk` matched
+  the `all_inputs` selector but is inert as a launch source in both
+  engines — no oddity observed; `[all_inputs -no_clocks]` fallback not
+  needed.
+
+**Reconciliation**: no production-code change. The delay check shares
+the covered candidate's ordinary arrival, which for a port source is the
+`input_clock_latency_ns` seed — the propagated arm already returns the
+`-source` latency that OpenSTA anchors to. Honest caveat: H-src and
+H-prop are the same anchor under two names on this fixture (a
+propagated clock's arrival at its own root pin is source latency + zero
+insertion); separating them needs a generated-clock / multi-root
+topology and remains unmeasured — recorded in `docs/path-delays.md`
+section 1 and the section-5 resolution.
+
+**Fail-proof**: mutating `Sdc::latency_ns`'s
+`ClockRef::Design if self.propagated_clock` arm to return
+`source + network` latency turns `base_prop` red first
+(`u_ff0/D.max_arr_ns`: ours 1.4000001 vs ref 0.8 — the `pmp_*`
+scenarios share that seed); restored and green.
+
+**Regression**: `cargo test --workspace` and
+`cargo clippy --workspace --all-targets -- -D warnings` pass.
+
+### 2026-11-19 — CRPR credit on delay checks (`pcr_*`)
+
+Closes `docs/path-delays.md` section 5 item 2: does OpenSTA apply a CRPR
+credit to `set_max_delay`/`set_min_delay` checks? All prior scenarios
+carried zero clock-net late/early spread, so the gap was invisible; and
+`u_ff1/D`'s mixed-source cone made the old all-source consensus
+(`crpr_sink_net` -> `CRPR_BAD`) unable to credit the ordinary check
+there regardless of spread.
+
+- **Knob** (committed `pcr_*.sdc`, all `base_prop.sdc` + two lines):
+  `set_timing_derate -early 0.80 -clock -cell_delay` and
+  `set_timing_derate -late 1.20 -clock -cell_delay`. Only clock-network
+  cell delays move (`u_clkb` on `c1`, `u_clkb2`+`u_clkb3` on `c3`);
+  data-path cells, cell checks and net delays (no parasitics in this
+  flow) are untouched. Spread `S = 0.4 * d(u_clkb)` measured
+  **0.031507 ns** at the `c1` driver.
+- **Scenarios** (`SCENARIOS` 106 -> 111): `pcr_clk` (derates only),
+  `pcr_clkfp` (+ false path on `u_ff2 -> u_ff1`, forcing the `u_ff0`
+  shared-tree launch to win the `u_ff1/D` max report), `pcr_max`/
+  `pcr_min` (`set_max_delay 1.0` / `set_min_delay 0.5` on
+  `u_ff0 -> u_ff1`), `pcr_off` (control: `set_max_delay` on the
+  non-shared `u_ff2 -> u_ff1` path).
+- **Reference command**: `bash tests/designs/sta_exceptions/generate_ref.sh`
+  run in full inside `ghcr.io/librelane/librelane:3.0.16` — all 111
+  scenarios regenerated by the committed script; the diff on the 106
+  existing keys is empty (additive only).
+- **Our command**: `cargo test -p grus-core test_sta_exceptions_match_opensta`
+  (STRICT: rel 1%, abs 5 ps).
+
+**Measured** (regenerated golden):
+
+- Spread exists: `pcr_clk` vs `base_prop` shifts required times in
+  **opposite** directions — `u_ff0/D`/`u_ff1/D` (`c1`) `max_req`
+  `-0.015753`, `min_req` `+0.015754`; `u_ff2/D` (`c3`, two derated
+  buffers) `+-0.030220`. A single-corner derate would move both the
+  same way.
+- Ordinary check, per-path credit: `pcr_clkfp.u_ff1/D.max_req` is
+  `pcr_clk`'s `1.997580` **plus S = 0.031507** — the winning `u_ff0`
+  path is credited the shared-net spread even though the same
+  endpoint's `sel`/`u_ff2` sources are not shared. Our consensus rule
+  went red by exactly `S` (`ours 1.9975798`).
+- Delay checks **are** credited: `pcr_max.u_ff1/D.max_req` is
+  `0.997580 + S = 1.029087` (`slack 0.270625`); `pcr_min.u_ff1/D.min_req`
+  is `0.264094 - S + 0.5 = 0.732587` (`slack -0.155849`). Same rule
+  both sides.
+- Control: `pcr_off.u_ff1/D.max_req` is `0.997580` — the covered
+  `c3`-launched path shares only the `clk` root port with `c1`
+  (spread 0 there), so no credit appears.
+
+**Reconciliation — production change (v0.1.92)**: the merged
+`PinTimingState` did not record which launch produced each extreme, so
+the all-source cone consensus was replaced by per-extreme **launch
+tags** mirroring the `par_*` parity masks: `crpr_max`/`crpr_min` bit
+masks interned per run in `StaPrepared::crpr_tags` (bit 0 = no-credit
+sentinel for ports, latch clock-to-Q launches and unresolvable or
+>7-tag cones; bits 1.. = a launch's `(clock net, clock edge)`),
+propagated with identical winner-replace/tie-union semantics. The
+ordinary check credits `S` when the winning extreme's single tag
+matches `(capture net, check edge)`; the max-side delay check adds the
+same `crpr_credit` term read off the covered class's data-pin mask,
+and the min side inherits it through the class's hold required time.
+`crpr_sink_net`/`crpr_driver_net`/`crpr_memo` deleted — no parallel
+mechanisms.
+
+**Fail-proof**: forcing every launch's tag to the sentinel bit turns
+`pcr_clkfp` red by exactly `S` (`u_ff1/D.max_req_ns`: ours 1.9975798
+vs ref 2.029087); restored and green.
+
+**Regression**: `cargo test --workspace` (252 tests incl. the
+gcd/picorv32/aes/ibex/jpeg STA goldens — single-clock designs see the
+same credit the consensus gave) and
+`cargo clippy --workspace --all-targets -- -D warnings` pass.
+
+## 2026-11-19 — N3 follow-up: `min_pulse_width` OpenSTA surface probe
+
+Probe for the deferred `min_pulse_width` check arcs (roadmap N3). Fixture:
+`tests/designs/sta_edge/min_pulse_width/` — `mpw.def` (buf `u_dbuf`,
+clkbuf `u_clkb` on `c1`, clkinv `u_clkinv` on `c2`, clkbuf `u_clkb2` on
+`c3`; FFs `u_ff0/1/2` `dfxtp_1`, `u_dfr` `dfrtn_1`, latch `u_lt` `dlxtn_1`)
+plus `ideal.sdc` (P=5.0, ideal clock), `propagated.sdc` (+ propagated
+clock, `-clock -cell_delay` derates 0.80/1.20, `-cell_check` 0.90/1.10),
+`viol.sdc` (P=0.6, transition 0.3). All commands run inside
+`ghcr.io/librelane/librelane:3.0.16` via `openroad -no_init -no_splash`
+heredocs (not yet via a committed `generate_ref.sh` — the probe only).
+
+### Command surface (Q1/Q2)
+
+- `report_pulse_width_checks -digits 6` emits **one row per
+  (clock pin, pulse)** — fields: pin name with a `(high)`/`(low)` suffix,
+  `Required Width`, `Actual Width`, `Slack`, `(MET)`/`(VIOLATED)`; sorted
+  by slack ascending. `report_... > file` redirection works, so a
+  generator can capture and parse the rows in-process.
+- `report_check_types -min_pulse_width` prints only the **worst row**;
+  with `-violators` it prints every violating row (same table format).
+- `find_timing_paths -path_delay min_pulse_width` and
+  `report_checks -path_delay min_pulse_width` both error `STA-0510`
+  (accepted: `min`, `min_rise`, `min_fall`, `max`, `max_rise`,
+  `max_fall`, `min_max`) — pulse checks are **not** a path-delay kind.
+- Programmatic surface exists (`sta::min_pulse_width_checks <corner>` →
+  `MinPulseWidthCheckSeq`, `sta::min_pulse_width_check_slack <corner>`,
+  `sta::min_pulse_width_check_pins <pins> <corner>`,
+  `sta::min_pulse_width_violations <corner>`,
+  `sta::set_min_pulse_width*`) but the seq/iterator types have no Tcl
+  constructor — the usable golden surface is the report text.
+
+### Measured rules (ideal + propagated goldens)
+
+- **Row granularity**: one row per (pin, pulse) for which the Liberty
+  `min_pulse_width` arc carries the constraint table. `dlxtn_1` has only
+  `fall_constraint` → only a `(low)` row (9 rows total for 5 check pins).
+- **Constraint mapping (Q3)**: `rise_constraint` → `high` pulse,
+  `fall_constraint` → `low` pulse (values + the `dlxtn` row shape both
+  confirm).
+- **Actual width corner rule (Q4)**: `actual = min(early_pair,
+  late_pair)`, each pair `arr_<corner>[close] − arr_<corner>[open]` —
+  NOT a single corner: `u_ff0/CLK (high)` used the early pair
+  (2.505748481 → reported 2.505749), `u_ff2/CLK (high)` behind `u_clkinv`
+  used the late pair (2.496332675 → 2.496333). Mixed-corner combos
+  (`min[close] − max[open]` etc.) are ruled out numerically.
+- **Edge pairing / wrap (Q8)**: `width = arrive(close) − arrive(open)`,
+  wrapped `+period` once when `<= 0`. `u_ff2/CLK` first-occurrence
+  arrivals are `fall 0.36 / rise 2.86`; the high pulse is
+  `(fall + P) − rise` — the *next* opposite edge, not `|diff|`.
+- **Arrival source**: the check reads the *propagated* clock-network
+  arrivals even under the ideal clock (`report_arrival` on clock pins
+  shows source-latency + cell-delay values — e.g. `u_ff0/CLK` rise
+  0.36 / fall 2.87 under `ideal.sdc`; and `viol.sdc`, an ideal-clock
+  scenario, reports skewed propagated widths like 0.289639).
+- **Required width slew arg (Q5)**: the constraint table evaluated at
+  the check pin's own slew of the constraint-named transition — under
+  the ideal clock that is `set_clock_transition` (0.1 → e.g. `dfxtp`
+  rise_constraint 0.290764; 0.3 under `viol.sdc` → 0.562049), under a
+  propagated clock the propagated pin slew (0.0734743 → 0.254784).
+  `slew_min`/`slew_max` coincide at every fixture pin so the corner is
+  not discriminable; implementation takes `slew_max` (conservative).
+- **Derate/uncertainty on required (Q6)**: none — `-cell_check`
+  0.90/1.10 and `set_clock_uncertainty 0.1` are both present in
+  `propagated.sdc`, yet `Required Width` equals the raw table lookup.
+- **WNS/TNS inclusion (Q7)**: pulse slacks do **not** enter
+  `find_timing_paths` endpoints, `worst_slack`, or
+  `total_negative_slack` — `viol.sdc` reports all 9 rows `VIOLATED`
+  while `total_negative_slack -min` is 0.0 and the min/max endpoint
+  lists stay at the 7 ordinary checks/ports. They are a separate
+  report family (`sta::min_pulse_width_violations <corner>` returns
+  the violating check seq). Report shape: a separate
+  `pulse_width_checks` list, excluded from `endpoints`/WNS/TNS and
+  the setup/hold violation counts.
+- **Deferred-type census (Q9)**: the sky130 hd lib carries
+  `non_seq_setup_rising`/`non_seq_hold_rising` on `dfbb*`/`sdfbb*` cells
+  (12 arcs each) and `three_state_enable`/`disable` on `ebuf*`/`einv*`
+  (13 arcs each); `preserve` has zero arcs. None of those cells are
+  instantiated in our designs (`ibex` skip map is
+  `Clear=1655 MinPulseWidth=3602 Preset=9`) — they stay deferred and
+  counted in `recognized_check_arcs`.
+
+### `viol.sdc` excerpt (`report_pulse_width_checks -digits 6`)
+
+```
+                                        Required      Actual
+Pin                                        Width       Width       Slack
+------------------------------------------------------------------------
+u_ff1/CLK (low)                         0.578190    0.289639   -0.288551 (VIOLATED)
+u_ff0/CLK (low)                         0.578190    0.292814   -0.285376 (VIOLATED)
+u_dfr/CLK_N (low)                       0.568326    0.292814   -0.275512 (VIOLATED)
+u_ff2/CLK (low)                         0.578190    0.303056   -0.275134 (VIOLATED)
+u_dfr/CLK_N (high)                      0.577742    0.307186   -0.270556 (VIOLATED)
+u_ff2/CLK (high)                        0.562049    0.296944   -0.265105 (VIOLATED)
+u_lt/GATE_N (low)                       0.549943    0.289639   -0.260303 (VIOLATED)
+u_ff0/CLK (high)                        0.562049    0.307186   -0.254863 (VIOLATED)
+u_ff1/CLK (high)                        0.562049    0.310361   -0.251688 (VIOLATED)
+```
+
+All 9 rows violated by ~0.25–0.29 ns — margin comfortable (fixture.md §2
+contingency not needed). Note the probe used `sta::worst_slack` wrapped
+in `time_sta_ui` once by mistake (double unit conversion); raw
+`sta::worst_slack -max` for this scenario is −0.683834 ns (`y`'s slack),
+`total_negative_slack -min` 0.0 as stated above.
+
+## 2026-11-19 — `min_pulse_width` promoted to an evaluated check family (v0.1.93)
+
+Fixture `tests/designs/sta_edge/min_pulse_width/` (`mpw.def` + `ideal.sdc` /
+`propagated.sdc` / `viol.sdc`); golden `min_pulse_width.reference.json` was
+emitted by the committed `generate_ref.sh`, run as written from the repo
+root inside `ghcr.io/librelane/librelane:3.0.16`:
+
+```bash
+bash tests/designs/sta_edge/min_pulse_width/generate_ref.sh
+```
+
+The generator re-execs into the container, runs `openroad -no_init
+-no_splash` once per scenario, reads the design, then collects ordinary
+endpoints via `find_timing_paths` and pulse rows by parsing
+`report_pulse_width_checks -digits 6` output (redirected to a file inside
+the same Tcl session — OpenSTA's `MinPulseWidthCheckSeq` iterator is not
+Tcl-constructible, see the probe entry above). Rows are sorted by pin then
+edge; two generator bugs found and fixed before the committed golden was
+produced: a backtick inside an unquoted heredoc comment tripped shell
+command substitution, and the row sort used an index path instead of a
+composite key.
+
+### Implementation notes
+
+- `TimingType::MinPulseWidth` left `is_deferred_check()`; `build_graph`
+  collects `PulseWidthCheck{pin, lib_arc}` before the latch arm.
+- **Check existence**: only arcs whose pin sits on a `clock_net` produce
+  rows. `dfrtn` carries a second `min_pulse_width` arc on `RESET_B`
+  (`fall_constraint` only) and OpenSTA emits no row for it — measured: 9
+  rows golden, not 10. An earlier iteration instead seeded/marked
+  pulse-check pins as clock consumers wholesale; that marked the `d1`
+  data net a clock net, blocked data arrivals on it (5 `*_check` skips
+  `no_path`) and seeded `RESET_B` with a phantom clock arrival that
+  produced a bogus recovery endpoint (`max_arr 1.2`). Fixed by keeping
+  pulse pins in the useful-consumer set only (a clock branch ending at a
+  bare pulse check is not pruned) and filtering checks to clock-network
+  pins after pruning.
+- `eval_pulse_width_checks` applies the measured rules from the probe
+  entry: `rise_constraint`→high/`fall_constraint`→low, actual =
+  `min(early_pair, late_pair)` of propagated arrivals wrapped `+period`
+  when `<= 0`, required = raw table lookup at the check pin's
+  `slew_max[open]`, slack = actual − required. Under the ideal clock the
+  propagated `clock_state` is computed additionally so widths use the
+  same network arrivals OpenSTA measures (`viol.sdc` is an ideal-clock
+  scenario and reports skewed propagated widths).
+- Report shape: `StaReport::pulse_width_checks` (separate from
+  `endpoints`, out of WNS/TNS and violation counts, matching the measured
+  `total_negative_slack -min = 0.0` under 9 violations), sorted pin
+  then `High`/`Low`; `EndpointKind::MinPulseWidth` for unreached rows;
+  `merge_corner_reports` merges rows on `(pin, edge)` keeping the smaller
+  slack; CLI prints `pulse-width checks: n (v violating)`.
+- `total_endpoints` counts every emitted pulse row; the in-test recount
+  reproduces it from the graph's retained checks plus the deferred count
+  for dropped arcs.
+- **Non-clock-pin arcs stay deferred**: a `min_pulse_width` arc whose pin
+  net is not a clock net produces no row and instead counts into
+  `recognized_check_arcs["MinPulseWidth"]`, so `arcs_skipped()` still
+  covers every instantiated arc. ibex instantiates 3602 arcs: 1938 on
+  clock-network pins emit the 3875 report rows, the remaining 1664 on
+  async set/reset pins (`sdf*`/`dfr*` `RESET_B|SET_B`) count as deferred
+  (`recognized_check_arcs[Clear=1655, MinPulseWidth=1664, Preset=9]`);
+  the fixture's `u_dfr/RESET_B` arc shows up as `MinPulseWidth: 1` next
+  to `Clear: 1`.
+- **ibex seq-edge cycle in `propagate_slew`**: the first run of
+  `test_skip_report_counts_latch_arcs` on the newly generated
+  `ibex.placed.def` failed with `combinational loop: 41913 of 107242 pins
+  could not be levelized` while the same file passed on the unchanged
+  checkout. Root cause: the ideal-mode pulse evaluation newly calls
+  `propagate_slew`, which levelizes with clk→Q ordering edges
+  (`include_seq=true`). On ibex a clock-gate latch's Q fans into the
+  gated clock net, and every downstream launch's ordering edge closes a
+  giant strongly-connected component — a latent limitation that also
+  affects `set_propagated_clock` runs, exposed here for the first time.
+  Fix: on that levelization error `propagate_slew` retries with the
+  data-edge order (`include_seq=false`); the seq edges only order a slew
+  dependency, and every clock pin's slew — all the consumers need — is
+  exact either way. The retry only fires where the precise order already
+  fails, so all existing goldens are unchanged (the full suite re-passed).
+- **Runtime cost (measured 2026-11-19, debug build, `sta` elapsed on
+  `--def`+`--sdc` runs)**: the extra `propagate_slew` + `propagate_clock`
+  under the ideal clock roughly doubles eval time — ibex 62.0 → 114.6 ms,
+  picorv32 31.7 → 64.2 ms (median of 3, same binary `target/debug/grus-eda`
+  on unchanged vs this checkout; reported timing identical on both). The
+  slew pass covers all pins because `propagate_clock` needs input slews on
+  every clock-net driver; pruning to the clock subgraph is possible future
+  work if this cost ever matters — absolute times stay in the tens of ms.
+
+### Comparison vs golden (committed `compare_sta_edge`, `Tol::STRICT`)
+
+`test_sta_edge_min_pulse_width_{ideal,propagated,viol}` — every pin/edge
+row, `required_ns`/`actual_ns`/`slack_ns`, plus the ordinary endpoints,
+WNS/TNS and the integer violation counts:
+
+- `ideal`: 9/9 rows, all met; e.g. `u_ff0/CLK (high)` required 0.290764 /
+  actual 2.507186 / slack 2.216422.
+- `propagated`: 9/9 rows, all met; asymmetric widths across the three
+  clock branches (u_ff0 2.505749 vs u_ff2 2.496333 actual), inverted
+  branch wrapped correctly.
+- `viol`: 9/9 rows violated (slacks −0.25…−0.29), ordinary endpoints
+  still 7, `setup_violations=7`, `wns_max −0.683834`.
+
+Fail-proof: swapping the `rise_constraint`/`fall_constraint` mapping sent
+all three tests red — `required_ns`/`slack_ns` mismatches on every row
+plus `u_lt/GATE_N (low): missing` (the dlxtn arc is fall-only, so a
+swapped row lands on the wrong edge). Restored; green again.
+
+`cargo test --workspace`: first run failed 58 tests on
+`test_support::require` panics for gitignored generated artifacts
+(`*.placed.def`, `*.routed.spef`, `*.sta.reference.json` for
+aes/ibex/jpeg/picorv32) absent in this worktree — environmental, not
+the change. After copying the gitignored artifacts from the main
+checkout (bit-identical inputs the committed `generate_ref.sh` flows
+produce), the full suite passes: 259 run, 0 failed, 2 `#[ignore]`d.
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+## 2026-11-19 — N2: `set_load` net selectors and `set_fanout_load` (load-selectors)
+
+### Before failure mode
+
+`target/release/grus-eda sta --lib $PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef .../sky130_fd_sc_hd__nom.tlef --lef .../sky130_fd_sc_hd.lef --def tests/designs/sta_exceptions/exceptions.def --sdc <scenario>`:
+
+- `set_load 0.10 [get_nets d1]` → whole-SDC parse abort:
+  `SDC line 20: set_load: expected a numeric value and a port selector`.
+  Same abort for `[get_pins u_ff1/D]` and `[all_fanouts ...]` (the latter
+  degrades to `Value::Opaque` inside `value_and_ports`).
+- `set_fanout_load 4 [get_ports y]` → `unsupported command set_fanout_load`.
+
+### Probe (OpenSTA inside `ghcr.io/librelane/librelane:3.0.16`)
+
+Heredoc-free probe scripts under `~/tmp_loadprobe/*.tcl` run with
+`openroad -no_init -no_splash` on `exceptions.def`, one process per SDC
+(read_sdc state accumulates). Baseline: `u_mux/X` drives `d1` with
+Cap `0.001681` (only the `u_ff1/D` pin cap).
+
+- **Q1 `set_load v [get_nets n]`**: accepted; sets the net's *wire
+  capacitance* attribute (a separate domain from pin capacitance).
+  `set_load 0.10 [get_nets d1]` → `report_net d1` wire cap `0.10`,
+  driver-stage Cap `0.101681` = wire `0.10` + pin `0.001681`; `u_ff1/D`
+  max arrival moves `1.313326 → 1.710434` ns (well past STRICT).
+- **Assignment, last-wins**: `0.10` then `0.02` on `d1` leaves wire cap
+  `0.02` (Cap `0.021681`). Duplicate names in one collection
+  (`{d1 d1}`) set once (wire cap `0.10`).
+- **Missing net in a collection**: `WARNING STA-0361 net 'no_such_net'
+  not found` — warning only; the resolvable members still apply
+  (partial apply, warn per missing name).
+- **Net annotation vs port load**: additive domains.
+  `set_load 0.03 [get_nets y]` on top of `set_load 0.05 [get_ports y]`
+  gives Cap `0.08` (pin `0.05` + wire `0.03`).
+- **Q2 `get_pins` objects**: OpenSTA *rejects*
+  `set_load <v> [get_pins u_ff1/D]` — `[ERROR STA-0100] unsupported
+  object type Pin` (sink, driver, or multi-pin collections alike).
+  `get_cells` is rejected too (`STA-0100` ... `Instance`). The reference
+  semantics for pin/cell load objects do not exist in this OpenSTA —
+  our parser accepts and counts the whole command instead of guessing.
+- **Q4 `all_fanouts`/`all_fanins`**: not commands at all in this build —
+  `invalid command name "all_fanouts"` / `"all_fanins"` (both singular
+  spellings too). `read_sdc` fails on the command substitution; golden
+  records `{"error": ...}`. Our side: `Value::Opaque` → counted
+  `set_load` skip.
+- **Q5 `set_fanout_load`**: accepted but inert —
+  `[WARNING STA-0461] set_fanout_load not supported.` Timing identical
+  to `base` (every arrival byte-equal). OpenSTA applies nothing, so the
+  command cannot change a compared number; counted in
+  `sdc_ignored_commands["set_fanout_load"]` and exempt from `is_clean`
+  like the `set_max_*` design rules.
+- **Q6 qualifiers**: `-pin_load` / `-wire_load` / `-rise` / `-fall` on
+  *net* objects warn (`STA-0464/0465/0466` "not allowed for net objects")
+  but still apply the full value as wire cap. `-min`/`-max` select a
+  corner (`wire cap 0.10-0.00` / `0.00-0.10`) — unmodelled, counted
+  skip. `-subtract_pin_load` subtracts pin caps from the annotated value
+  (Cap `0.100000`) — unmodelled, counted skip. On *port* objects
+  `-wire_load` writes the attached net's wire cap (a different domain
+  than the port pin load) and `-min`/`-rise` select corner/transition —
+  all counted skips rather than applied to both transitions.
+- **Q7 parasitic interaction**: on a `d1` net annotated with 0.05 pF
+  wire cap via a hand-written SPEF (`~/tmp_loadprobe/exc.spef`), a
+  `set_load 0.10` replaced the SPEF wire cap entirely
+  (`report_net` wire `0.10`, arrival identical to the zero-wire run).
+  How the annotation maps onto a distributed RC pi model was not
+  measured beyond the lumped override; our parasitic mode therefore does
+  not apply net annotations — it counts each selected net in
+  `unresolved_load_selectors` instead of approximating.
+
+### Scenarios (ld_*)
+
+Applied: `ld_net`, `ld_nets`, `ld_portnet`, `ld_last`,
+`ld_badnet` (partial apply + 1 unresolved name).
+OpenSTA-error goldens (`{"error": ...}`, compared for diagnostics only):
+`ld_pin_sink`, `ld_pin_drv`, `ld_pins`, `ld_cells`, `ld_afo`, `ld_afi`.
+Counted no-op: `ld_fo` (`set_fanout_load` inert in OpenSTA; baseline
+timing, `sdc_ignored_commands["set_fanout_load"]=1`, `is_clean`-exempt).
+`ld_badpin` errors in OpenSTA (STA-0100, pins rejected before the
+missing-name warning matters); our side counts `set_load` ignored.
+
+### Implementation notes
+
+- `sdc.rs`: `get_nets`/`get_net` parse to a new `Value::Nets(Vec<String>)`;
+  `set_load` stores `(LoadSel, value)` load rules — `LoadSel::Ports` keeps
+  the existing last-match port mechanism, `LoadSel::Nets` lists raw net
+  names in command order (last-wins per net at resolution). `get_pins`,
+  `get_cells`, `all_fanouts`/`all_fanins` (unknown commands in this
+  OpenSTA), `all_clocks`/`get_clocks`, opaque collections, and the
+  `-min`/`-max`/`-rise`/`-fall`/`-subtract_pin_load` qualifiers are
+  accepted and counted in `sdc_ignored_commands["set_load"]` (one count
+  per command). `-pin_load`/`-wire_load` on net objects apply the value
+  (OpenSTA warns but applies). `set_fanout_load` parses
+  `<float> <collection>` and is counted once per command.
+- `analysis.rs`: `Context::net_wire_loads` carries resolved `get_nets`
+  annotations; `net_load` lets the annotation *replace* the wire
+  capacitance term (measured override semantics), summed with sink pin
+  caps. Under `NetParasitics` the distributed RC path is left untouched
+  and each annotated net counts once in the new
+  `SkipReport::unresolved_load_selectors` (missing names count one per
+  name; merged across corners via `merge_skip_reports` max).
+- `is_clean` exempts `set_fanout_load` (measured inert, like the
+  `set_max_*` design rules) but not `unresolved_load_selectors` or
+  `set_load` ignores — those can change a reported number.
+- Golden: `generate_ref.sh` SCENARIOS extended with the 13 `ld_*`
+  files, `exceptions.reference.json` regenerated inside the pinned
+  container by the committed script unchanged (per-scenario `ref_ld_*`
+  files merged as before); 6 scenarios compared numerically at STRICT,
+  7 carry `error` records and exercise diagnostics only.
+- Fail-proof: zeroing `net_wire_loads` in `net_load` (`None.unwrap_or_else`)
+  fails `test_sta_exceptions_match_opensta` on `ld_badnet u_ff1/D.max_arr_ns`
+  (ours `1.3133256` vs ref `1.710434`, rel 2.3e-1) — the applied path is
+  what the golden measures.
+
+## 2026-11-19 — path delays on async-check and latch-D endpoints (v0.1.95)
+
+Probe of `docs/path-delays.md` §5 item 1's measurable half: does OpenSTA
+honour `set_max_delay`/`set_min_delay` on the two endpoint kinds counted
+in `unsupported_path_delay_endpoints`? Reference command = the committed
+`tests/designs/sta_edge/{async_reset,latch_borrow}/generate_ref.sh`, run
+as written inside `ghcr.io/librelane/librelane:3.0.16` (`openroad
+-no_init -no_splash`). Baselines `ideal`/`propagated`/`prop` regenerated
+byte-identical; all new values are the `delay_*` sections of
+`async_reset.reference.json` / `latch_borrow.reference.json`.
+
+### Verdict table (kind, side)
+
+| endpoint kind | max | min |
+|---|---|---|
+| async-check (`u_ff0/RESET_B`, dfrtp) | **applied** | **applied** |
+| latch-D (`u_lp/D` dlxtp, `u_ln/D` dlxtn) | **applied** | **applied** |
+| clock-gate enable | not probed — stays counted | not probed |
+
+No (kind, side) came back ignored or errored — both halves resolve to
+implementation, not kept skips.
+
+### Async-check — applied, FF formula with edge0 anchor
+
+`u_ff0/RESET_B` (`delay_max`, `-to [get_pins u_ff0/RESET_B]`):
+`req 4.900132 -> 1.900132 = 0.7 (capture_min[RISE]) - 0.05 (unc) -
+(-0.250132) (t_recovery) + 1.0 (N)` — the recovery arc plays `late_arc`.
+`delay_min`: `req 1.132095 -> 1.632095 = removal_base + 0.5` — the
+removal arc plays `early_arc`. `delay_from` (`-from [get_ports rst_n]`)
+is byte-identical to `delay_max` on that pin — the port seed covers the
+launch. `delay_cell` (`-to [get_cells u_ff0]`) moves both `u_ff0/D`
+(req `1.524392`) and `u_ff0/RESET_B`. `delay_prop` anchors on the
+propagated capture arrival (`req 1.404679`).
+
+Anchor correction vs the pre-commit record: the delay req anchors at
+the **first edge reaching the clock pin** (`edge0`), not `check.edge`.
+On `u_rbp/RESET_B` (dlrbp, recovery fires FALL) `delay_allregs` reports
+req `0.912087` — RISE-anchored — where `check.edge`-anchored would give
+3.412; on `dfrtp` both are RISE and coincide.
+
+### Latch-D — applied, delay-edge borrow window
+
+`u_lp/D` (`delay_max`, N=1.0): `req = arr_dly = 3.156276`, slack
+exactly 0 — the check lets the latch borrow up to its own cap, so
+`req = N + lat0 - unc_setup + actual_borrow`,
+`actual_borrow = clamp(arr_dly - base, 0, pulse - t_setup)`,
+`base = 1.0 + 0 - 0.1 = 0.9`, `max_borrow = 2.5 - 0.0412 = 2.4588`
+(dlxtp). `u_ln/D` (`delay_ln`, N=1.5): `req 1.400000` — `arr_dly
+0.656302 < base 1.4`, borrow clamps at 0. `delay_allregs` clamps
+`u_ln2/D` at `base + pulse - t_setup = 0.9 + 2.5 - 0.164489 = 3.235511`
+(dlxtn — pulse is the clock's low half-period on the ideal `ck`) and
+`u_rtn/D` at `0.9 + 2.5 - 0.175455 = 3.224545` (dlrtn — the
+sign on `t_setup` was verified against `report_checks`, which prints
+"library setup time -0.18" for this arc; the bound is `pulse -
+t_setup`). `delay_min` on `u_lp/D`: `req 0.566443 = 0.5 (N) + 0 (lat0)
+- 0.033557 (t_hold) + 0.1 (unc_hold)` — delay-edge anchored, no
+launch-parity realignment (`arr_dly 3.156276`, not the hold-aligned
+`8.156276`).
+
+Arrival re-basing (`arr_dly`): under `delay_allregs`, `u_f0/D` (fed by
+`u_ln/Q`) reports `arr 0.361663` = baseline `2.861663` minus the `u_ln`
+open-edge arrival `2.5` — through-latch launches report at the delay
+edge. FF/port launches keep `dly = arr` (`u_f2/D` unchanged shape).
+Class-wide borrow silencing: `delay_from` (`-from p_lp -to u_lp/D`) and
+`delay_max` drop `u_f2/D`'s `arr` from `2.562374` to `0.244362` — the
+covered `-to` selector disables `u_lp`'s `D -> Q` transparent arc for
+the whole signature class, so the uncovered endpoint keeps only the
+clock-to-Q launch. `delay_min` coverage does not silence it (u_f2/D
+stays `2.562374`). `delay_prop` anchors `lat0` at the propagated
+first-edge latency.
+
+`all_registers` covers FF-D, latch-D and latch `RESET_B` rows in one
+rule (`delay_allregs`: `u_rbn/RESET_B` req `0.943786`,
+`u_rbp/RESET_B` `0.912087`, `u_rtn/RESET_B` `0.956716` — all
+edge0-anchored).
+
+### Negative controls (ad hoc, not committed)
+
+Same container session, `async_reset` + `delay_max`-shaped rules (the
+`delay_max` scenario SDC with only the `-from` selector swapped). Both
+verdicts: **ignored** — the endpoint stays at the unconstrained
+`ideal` value.
+
+`set_max_delay 1.0 -from [get_ports d_in] -to [get_pins u_ff0/RESET_B]`:
+
+```
+endpoint u_ff0/RESET_B max: arr 1.313763 req 4.900132 slack 3.586369
+endpoint u_ff0/RESET_B min: arr 1.313763 req 1.132095 slack 0.181668
+Startpoint: rst_n (input port clocked by core_clk)
+Endpoint: u_ff0 (recovery check against rising-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.70    0.70   clock network delay (ideal)
+   0.50    1.20 ^ input external delay
+   0.00    1.20 ^ rst_n (in)
+   0.11    1.31 ^ u_rst/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.31 ^ u_ff0/RESET_B (sky130_fd_sc_hd__dfrtp_1)
+           1.31   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.70    4.70   clock network delay (ideal)
+  -0.05    4.65   clock uncertainty
+   0.00    4.65   clock reconvergence pessimism
+           4.65 ^ u_ff0/CLK (sky130_fd_sc_hd__dfrtp_1)
+   0.25    4.90   library recovery time
+           4.90   data required time
+---------------------------------------------------------
+           4.90   data required time
+          -1.31   data arrival time
+---------------------------------------------------------
+           3.59   slack (MET)
+```
+
+`set_max_delay 1.0 -from [get_pins u_ff0/CLK] -to [get_pins
+u_ff0/RESET_B]` printed the identical endpoint lines and `report_checks`
+table — `arr 1.313763`, `req 4.900132` (max) / `1.132095` (min) — the
+clock pin does not launch the async pin either. Both outputs are
+field-for-field the `ideal` baseline (max `req 4.900132`, min `req
+1.132095`), i.e. per-source replace semantics: a `-from` that matches
+no launch leaves the check untouched rather than masking it.
+
+OpenSTA warnings during generation: none delay-specific — only the
+pre-existing `[WARNING ODB-0220]` LEF noise and the fixture's baseline
+`STA-0441` SDC note.
+
+### Ours vs. golden
+
+11 new `compare_sta_edge` calls at `Tol::STRICT` (`analysis.rs`
+`test_sta_edge_async_reset_delay_{max,min,from,cell,prop}` and
+`test_sta_edge_latch_borrow_delay_{max,min,ln,from,allregs,prop}`) —
+`cargo test -p grus-core sta_edge`: 32 passed, 0 failed. Every field of
+every endpoint row matches, including the re-based `arr` values and the
+silenced `u_f2/D`. `unsupported_path_delay_endpoints` now counts
+`ClockGate` only.
+
+`cargo test --workspace`: passed in this worktree after copying the
+gitignored generated artifacts (`*.placed.def`, `*.routed.spef`,
+`*.sta.reference.json` for aes/ibex/jpeg/picorv32) from the main
+checkout — they are build products, not tracked inputs; 273 `grus-core`
++ 3 `grus-eda` tests, 0 failures, 2 `#[ignore]`d. `cargo clippy
+--workspace --all-targets -- -D warnings` clean.
+
+### Fail-proof
+
+(a) Reverting `delay_supported` to FF-D/output only → all 11 new tests
+go red on the async/latch rows (e.g. `delay_max` `u_ff0/RESET_B` req
+stays `4.900132`). (b) Substituting `w.arr` for `w.dly` in the delay
+compose → `delay_allregs` goes red on 17 rows (`u_f0/D` reports
+`2.861663` instead of `0.361663`) and `delay_min` on `u_lp/D` (`arr`
+`8.156276` vs `3.156276`). Restored after each; suite green again.
+
+### Not run
+
+- Negative-parity clock pins under delay coverage: `edge0_pol`'s
+  fallback (RISE on contested parity) is unexercised — `async_fall`'s
+  `dfrtn` carries no delay scenario.
+- Literal two-clock-domain `set_min_delay` anchoring — still blocked on
+  multi-clock SDC support (`docs/path-delays.md` §5).
+- Clock-gate enable endpoints — remain counted in
+  `unsupported_path_delay_endpoints`.
+- Borrow-capped `dly` on through-latch launches (relative value
+  against the absolute clamp window; no latch-Q -> latch-D path in
+  the fixture — docs/path-delays.md §5 known gaps).
+- Delay-check CRPR tag under divergent `arr`/`dly` winners (tag
+  follows the arrival winner; needs through-latch launch under
+  propagated clock + derate — ungoldened).
+- `set_min_delay` on `dlxtn` latch-D and latch-cell `RESET_B`
+  (golden-verified on `dlxtp`/`dfrtp` only).
+
+### 2026-11-19 — N7 — SAIF-driven power estimation vs OpenROAD `read_saif` + `report_power` (v0.1.96)
+
+Adds `grus-eda power --saif <file> [--saif-scope <a/b>]` next to `--vcd`
+(exactly one required). `readers/saif.rs` parses the SAIF S-expression
+tree (header `TIMESCALE`/`DURATION`, `INSTANCE`/`VIRTUAL INSTANCE`
+scopes, `NET`/`PORT` signal groups with `T0 T1 TX TZ TB TC IG`), resolves
+the selected scope's nets against `DesignDb`, and converts `TC` into the
+same per-net rise/fall `VcdActivity` the estimator already consumes —
+power math unchanged.
+
+**Reference**: committed `tests/designs/microbench/generate_saif_ref.sh`
+inside `ghcr.io/librelane/librelane:3.0.16`. It converts `mb.vcd` to
+`mb.saif` (`vcd2saif.py --window-end 1990`, window `[10, 1990]` =
+`DURATION 1980` at `TIMESCALE 1 ns` — truncating clk's final `#2000`
+fall makes its `TC` odd so the golden exercises the odd-TC rise/fall
+split), runs `read_vcd -scope tb/dut` + `read_saif -scope tb/dut` in two
+`openroad -exit` sessions on identical lib/LEF/DEF/SDC, cross-checks the
+VCD table against committed `mb.openroad.txt` ("session-A table agrees
+… (print rounding)"), and writes `mb.saif.openroad.txt` +
+`mb.saif.reference.json` from the tool output. Re-run end-to-end on this
+change (sections 1–5, twice; second run byte-identical); the committed
+files were regenerated by the script, not hand-edited.
+`mb.saif.openroad.txt` is `grep -v`-**filtered** stdout (INFO/WARNING/
+banner/blank lines dropped), not verbatim.
+
+#### Measured SAIF semantics (probe variants in `generate_saif_ref.sh` §5)
+
+Each probe mutates fields via a regex anchored on the named signal's
+line — the same field values appear on the net and pin views of clk/q/y,
+so positional replaces hit the wrong line.
+
+- **`TC` drives activity.** All `TC` x10: switching exactly x10
+  (Sequential `7.821818e-09`→`7.821818e-08`, Combinational
+  `1.636363e-07`→`1.636364e-06`), Combinational internal x10
+  (`5.668707e-09`→`5.668707e-08`). Sequential internal only rose
+  `2.079167e-06`→`2.469561e-06` (~1.19x): the `dfxtp` clock-pin internal
+  energy follows the SDC clock frequency, not the `clk` net's `TC` — on
+  clock nets OpenSTA's own clock activity wins over SAIF.
+- **`T0`/`T1` unused by `report_power`.** Swapping duty on `a`
+  (`T0 1180/T1 800` ↔ `800/1180`) and on `y` (`800/1180` ↔ `1180/800`)
+  left every column identical. `clk`'s duty is degenerate under the
+  truncated window (`T0 == T1 == 990`), so a swap there would be a
+  no-op and is not probed.
+- **`TX`/`IG` ignored.** `TX 0`→`40` + `IG 0`→`40` on `y`'s line:
+  identical report.
+- **`TZ`/`TB`** carry no measured effect either; the fixture keeps them 0.
+- **Ports vs pins.** Rewriting the two `INSTANCE` `NET` blocks as `PORT`
+  groups dropped annotation to `saif 3 / unannotated 5` yet the report
+  was identical — OpenSTA annotates *pins*, and unannotated pins fall
+  back to propagated/default activity rather than zero.
+- **Unmatched scopes are silently dropped** by `read_saif`: the fixture's
+  `(INSTANCE ghost …)` under `dut` produced no warning and `saif 8 /
+  unannotated 0` either way. Our resolver instead counts it:
+  `saif_unmatched_scopes = 1`.
+- **`TIMESCALE`/`DURATION`** set the window; `DURATION 1980` ns here.
+  `TC` is a count over the window, so rate = `TC / DURATION`.
+
+#### Ours vs golden (`power::tests::test_saif_power_mb_matches_opensta`)
+
+| quantity | grus-eda | OpenROAD SAIF | diff |
+|---|---|---|---|
+| Sequential internal | 2.088214e-6 | 2.079167e-6 | +0.4% |
+| Sequential switching | 7.533818e-9 | 7.821818e-9 | -3.7% |
+| Sequential leakage | 8.438634e-12 | 8.420709e-12 | +0.2% |
+| Combinational internal | 5.742856e-9 | 5.668707e-9 | +1.3% |
+| Combinational switching | 1.636364e-7 | 1.636363e-7 | +0.00006% |
+| Combinational leakage | 5.326682e-12 | 4.341941e-12 | +23% (~1.0e-12) |
+| Total internal | 2.093957e-6 | 2.084836e-6 | +0.4% |
+| Total switching | 1.711702e-7 | 1.714582e-7 | -0.17% |
+| Total leakage | 1.376532e-11 | 1.276265e-11 | +8% (~1.0e-12) |
+| **Total** | **2.265141e-6** | **2.256307e-6** | **+0.4%** |
+
+Test bounds: internal 2%, switching 5%, total 1%, leakage 25% with a
+1.5e-12 absolute floor (pW-class terms where relative error is large but
+the absolute gap is ~1e-12 W). Residuals are the same ones the VCD run
+showed — the sequential switching undercount and the seq-internal
+overcount trace to OpenSTA's per-pin activity/slew handling (driver-pin
+cap), and the combinational-leakage gap is state-dependent-vs-flat —
+not SAIF decoding defects; the estimator and its divergences are
+unchanged.
+
+**SAIF-vs-VCD agreement, windows differ by one clk fall**: the SAIF
+window `[10,1990]` is 10 ns shorter than the VCD annotation window
+`[10,2000]` — the `#2000` fall is outside it, so `clk` resolves to
+`(100,99)` (`TC 199` odd, `T0 == T1` duty tie → the tie→rise rule gives
+the in-window truth) while every other net reconstructs its exact VCD
+counts (asserted per-net in the test). OpenROAD reports VCD
+`2.254101e-6` vs SAIF `2.256307e-6` (~0.1%) — the delta now includes the
+truncation on top of the `read_vcd`/`read_saif` annotation-path
+difference and supersedes the ~0.05% figure from the `[10,2000]`
+fixture. Ours: SAIF `2.265141e-6` vs VCD `2.265217e-6`, a 0.003% total
+delta from the single dropped fall over the shorter window (test bound
+1%). OpenSTA also drops the `q` NET entry (top-scope names resolve to
+ports only) and propagates it instead; our resolver annotates `q`'s net
+exactly — propagated ≈ exact on mb, a recorded residual class shared
+with the VCD path.
+
+**Hierarchy resolution**: `--saif-scope tb/dut` mirrors `read_saif
+-scope`; with no flag the resolver auto-selects when exactly one
+top-level scope chain exists (errors on ambiguity). `INSTANCE` names
+resolve against DEF cells, `NET`/`PORT` names against their pins/nets;
+anything unmatched is counted (`saif_unmatched_scopes`,
+`saif_unmatched_signals`), never silently dropped — one stricter
+behaviour than OpenROAD. `read_saif -scope tb/dut` prints `Annotated 8
+pin activities.` on the committed fixture.
+
+**Fail-proof**: rewriting both `(TC 199)` occurrences (`clk` net line
+and `_d_`/`CLK` pin line — last write wins on the shared net, so
+corrupting only one is a no-op, verified) to `(TC 398)` turns the test
+red (`Sequential internal: ours 4.136e-6 vs opensta 2.079167e-6`);
+restored via `vcd2saif.py`, suite green.
+
+**Second-pass tightenings** (review fix, no semantic change): two latent
+`vcd2saif.py` bugs fixed — `name.rstrip("$end")` treated `"$end"` as a
+character set (a name ending in `e`/`n`/`d`/`$` would lose its tail);
+now a literal `removesuffix`. The emitted `(TIMESCALE 1 ns)` was
+hardcoded; now the parsed `$timescale` `(num, unit)` pair is emitted
+verbatim, with `die()` on an unknown unit. Container `python3 --version`
+= 3.13.9. `generate_saif_ref.sh` re-run end-to-end: `mb.saif`,
+`mb.saif.reference.json` and `mb.saif.openroad.txt` regenerated
+byte-identical (both fixes are no-ops on this input — no signal name
+ends in the `rstrip` set, and mb.vcd's `$timescale 1ns` emits the same
+line). Two reader tightenings in `saif.rs`: `DURATION` parses as `u64`
+— float literals (`1980.5`, `1980.0`) and negatives are hard errors,
+matching the `<int>` grammar and OpenSTA's rejection of `(DURATION
+1990.0)`; and `\` now escapes the next byte inside quoted strings (`\"`,
+`\\`), the same convention as atoms.
+
+**Checks run**: `cargo test --workspace` (287+3 pass, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`grus-eda power --saif tests/designs/microbench/mb.saif` end-to-end
+(stderr reports `1 unmatched SAIF scopes` from the ghost);
+`generate_saif_ref.sh` re-run end-to-end, artifacts byte-identical.
+### 2026-11-19 — N7 — `when`-qualified `internal_power`/`leakage_power` evaluation (v0.1.97)
+
+`power.rs` no longer skips every `when`-carrying `internal_power` block:
+supported `when` forms (conjunctions of pin literals) now evaluate at the
+measured OpenSTA marginal probability, and `leakage_power` `when` states are
+state-weighted. `conditional_power_blocks` narrows to inexpressible forms
+(outside the literal-conjunction grammar, no matching sibling pin, or a
+literal net with no measured state). `LibDb` gained
+`LibCell::leakage_states` (Liberty cache version 6→7); `SignalActivity`
+gained `xtrans` (half-weight x/z edges) and `other_s` (x/z/never-defined
+time) so `P(net=1) = t1/(t0+t1+other)` exists for every annotated net.
+
+**Reference**: committed `tests/designs/microbench/generate_when_ref.sh`
+inside `ghcr.io/librelane/librelane:3.0.16` — same lib/LEF/DEF/SDC reads,
+`read_vcd -scope tb/dut mbw.vcd` and `read_saif -scope tb/dut mbw.saif`
+(the SAIF emitted by committed `vcd2saif.py`, no flags) +
+`report_power -digits 6`, tables parsed into `mbw.reference.json`
+(`power_vcd` + `power_saif`); filtered stdout committed as
+`mbw.openroad.txt`. Re-run end-to-end on this change: regenerated files
+byte-identical. The probe section (§5) also ran; tables below are its
+console output.
+
+**Fixture**: `mbw` = one `sky130_fd_sc_hd__ebufn_1` (`Z = A` while `TE_B`
+low, hi-Z while high). `Z` carries an unconditional `related_pin:"A"`
+`internal_power` block plus `related_pin:"TE_B"` blocks gated
+`when:"A"`/`when:"!A"` — the library's only `internal_power` `when`
+shape. `mbw.sdc` needs a real port-backed clock for our SDC subset, so a
+dedicated `clk` input port carries `create_clock -period 20` and drives no
+cell. `mbw.vcd`/`mbw.saif` exercise both `when` branches (P(A)=0.55) and
+z-excursions on `z` in both A states (TE_B pulses).
+
+#### P0 — `when` inventory on `sky130_fd_sc_hd__tt_025C_1v80.lib`
+
+`awk` scans of the pinned lib: `internal_power` `when` = 26 blocks / 13
+cells (`ebufn_{1,2,4,8}`, `einvn_{0,1,2,4,8}`, `einvp_{1,2,4,8}`), only
+the literals `"A"`/`"!A"`, all on `Z` with `related_pin` = the enable pin.
+`leakage_power` `when` = 6244 groups library-wide — literal conjunctions
+(up to ~8 literals, e.g. `!A&TE_B`, DFF `IQ` state vars) plus the non-pin
+literals `SHORT`/`DIODE`. `timing` `when`: none.
+
+Commands actually run (re-verified 2026-11-20, macOS `awk` — the
+`internal`/`leakage` one-liner reproduces 26/6244 verbatim):
+
+```bash
+LIB=$HOME/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+awk '/^[[:space:]]*internal_power *\(/ {ip=1; lp=0}
+     /^[[:space:]]*leakage_power *\(/ {ip=0; lp=1}
+     ip && /when[[:space:]]*:/ {ipn++}
+     lp && /when[[:space:]]*:/ {lpn++}
+     END {print "internal", ipn, "leakage", lpn}' "$LIB"
+# -> internal 26 leakage 6244
+
+# per-cell attribution of the 26 `internal_power` `when`s:
+awk '/^[[:space:]]*cell *\("/ { sub(/.*cell *\("/, ""); sub(/".*/, ""); cell=$0 }
+     /^[[:space:]]*internal_power *\(/ {ip=1; lp=0}
+     /^[[:space:]]*leakage_power *\(/ {ip=0; lp=1}
+     ip && /when[[:space:]]*:/ {print cell}' "$LIB" | sort | uniq -c | sort -rn
+# -> 2 per cell across the 13 cells listed above
+```
+
+#### Measured OpenSTA activity model (`get_property $pin activity`)
+
+`<rate/s> <P(1)> <source>`: clean 0↔1 edges count 1.0 toggle, x/z-involved
+edges **0.5** (mbw `z`: 6 clean + 4 z-edges → rate 8/2000ns = 4e6/s);
+`P(1)` = time-in-1 over the whole annotated window (x/z time excluded
+from the numerator but present in the denominator — mbw `z` reads 0.475
+= 950/2000, not 950/1650).
+
+#### P1 — count net, apportioning, z edges
+
+`mbw_a0` (A≡0, TE_B 8 edges → `z` gets 0→z→0 excursions): Combinational
+internal **−6.979485e-08**. `mbw_a0te16` (16 edges):
+**−1.395897e-07** ≈ 2×. `mbw_a1` (A≡1, same TE_B edges → 1→z→1
+excursions): **+9.872135e-08**. Verdicts:
+
+- The owning pin's net (`z`) drives the count (z excursions = the TE_B
+  event); the `when` branch selects by `P(A)` — `!A` table (negative
+  energy) fires under a0, `A` table under a1, each ~100%.
+- Blocks are eligible only while their `related_pin` carries activity —
+  `qe`-style probes with TE_B idle + `a` active give zero contribution
+  from the `when` blocks; both related pins active → `z`'s rate splits
+  by related-pin rate share (a 6:4 A:TE_B probe gives the 0.6/0.4
+  weighted sum, ~3.44e-08).
+- Each direction consumes half the net's effective toggles
+  (`(E_rise + E_fall)·density/2`), and the table's
+  `total_output_net_capacitance` axis — like switching's `C_load` —
+  includes the **driver pin's own `capacitance`**: `set_load 0.05` + Z
+  cap 0.00226 = 0.05226 reproduces every block's table readout to ~0.01%.
+- z excursions count for switching too: `a0` switching 1.693224e-07
+  (eff 4 toggles × 0.05226 pF), `a0te16` exactly 2×.
+
+#### P2/P3 — marginal, not joint
+
+`mbw_duty55` vs `mbw_duty80` (same `a`/`z` edges, P(A) 0.55 vs 0.80,
+TE_B idle): internal **identical** at 3.502020e-08 — not because `when`
+is ignored (TE_B-inactive blocks contribute nothing either way), but the
+discriminating evidence is the golden itself: mbw's `TE_B`-related
+blocks fire at `P(A)=0.55`/`P(!A)=0.45` marginal weights (verified by
+recomputation of all probe tables to ~0.004%). SAIF `mbw.saif` (T0/T1
+marginals only) reproduces the same per-state leakage and the same model
+— VCD internal 5.006255e-08 vs SAIF 4.221585e-08 differ **only** because
+the SAIF encodes clean `TC` counts without the z-edge half-toggles (6 vs
+8) and a `TZ`-inclusive duty; OpenSTA applies the same marginal model to
+both. Verdict: `P(when)` = product of literal pin marginals —
+independence, no joint correlation.
+
+#### P4 — `leakage_power` `when` states are weighted
+
+Static-state probes (`mbw_s00`..`s11`, zero edges): the Combinational
+leakage column reads the lib's state values directly — 2.7640e-12
+(`!A&!TE_B`), 2.5423e-12 (`!A&TE_B`), 2.8469e-12 (`A&!TE_B`), 4.2767e-12
+(`A&TE_B`) — vs flat `cell_leakage_power` 3.107474e-12 (−12%/+38%).
+mbw's annotated states give Σ P(state)·value = 2.929754e-12; `duty80`
+gives 2.830320e-12 — marginal weighting, implemented.
+
+#### Implemented model
+
+Per `internal_power` block on a pin: energy =
+table(trigger-pin's per-direction slew, own-net load incl. driver pin
+cap) × (own net effective toggles / 2) × (related pin's activity share
+of all distinct related pins) × `P(when)` — where `P(when)` = product of
+literal pin marginals from `t1/(t0+t1+other)`. Unsupported forms
+(`|`, `^`, parens, unresolved pins, unmeasured state — includes
+`SHORT`/`DIODE`/`IQ` literals with no net) stay counted. Leakage:
+Σ P(state)·value, uncovered mass at `cell_leakage_power`.
+
+#### Ours vs golden (`power::tests::test_when_power_mbw_matches_opensta`)
+
+STRICT bounds: internal/switching/total 0.1%, leakage 1% + 1.5e-12 W
+floor.
+
+| quantity | grus-eda | OpenROAD | diff |
+|---|---|---|---|
+| VCD internal | 5.006255e-08 | 5.006255e-08 | ~1e-7% |
+| VCD switching | 3.386448e-07 | 3.386448e-07 | ~1e-7% |
+| VCD leakage | 2.929754e-12 | 2.929754e-12 | ~1e-7% |
+| VCD total | 3.887103e-07 | 3.887103e-07 | ~1e-7% |
+| SAIF internal | 4.221584e-08 | 4.221585e-08 | ~1e-7% |
+| SAIF switching | 2.539836e-07 | 2.539836e-07 | ~1e-7% |
+| SAIF leakage | 2.929754e-12 | 2.929754e-12 | ~1e-7% |
+| SAIF total | 2.962024e-07 | 2.962024e-07 | ~1e-7% |
+
+`conditional_power_blocks == 0` on both paths; `grus-eda power --vcd
+mbw.vcd` end-to-end clean. `mb` VCD rerun under the new model: leakage
+improves to 4.30e-12 vs golden 4.34e-12 (the old state-vs-flat residual
+closes); switching unchanged — sky130 output pins declare no
+`capacitance` except tristate `Z` pins, so `q`/`y` driver caps are 0 and
+the documented −3.7% sequential-switching residual remains (not the
+driver-pin-cap previously guessed — Q declares none; cause still open).
+
+**Fail-proof**: `weight = 1.0` in the `when` path →
+`vcd Combinational internal: ours 5.489250e-08 vs opensta 5.006255e-08`
+red; corrupting `power_vcd` Combinational internal in the golden → red;
+both restored, suite green.
+
+**Checks run**: `cargo test --workspace` (291+3 pass, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`generate_when_ref.sh` re-run end-to-end, `mbw.*` artifacts
+byte-identical.
+### 2026-11-19 — multi-clock SDC probe (`sta_clocks` fixture; scope ticket, no implementation)
+
+Probe-only ticket for the `docs/path-delays.md` §5 blocker (literal
+two-clock-domain `set_min_delay` fixture) and the real gap on any multi-clock
+design. New hand-written fixture `tests/designs/sta_clocks/`:
+`two_clock.def` (domains `cka` on `clk1`, `ckb` on `clk2`, same-domain plus
+both-direction cross paths), twelve `t2_*.sdc` scenarios, `probe.sh` inside
+`ghcr.io/librelane/librelane:3.0.16` (OpenSTA via `openroad -no_init`),
+artifacts `two_clock.probe.json` + `probe_<name>.txt`. Measured rules and the
+implementation sequence are in `docs/multi-clock.md`; this entry records the
+commands and raw findings.
+
+#### Commands run
+
+- Our-side break probe (release binary, exit code 1):
+  `grus-eda sta --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef .../sky130_fd_sc_hd__nom.tlef --lef .../sky130_fd_sc_hd.lef --def tests/designs/sta_clocks/two_clock.def --sdc tests/designs/sta_clocks/t2_int.sdc`
+  stderr, verbatim:
+
+  ```
+  Error: SDC line 2: `create_clock`
+
+  Caused by:
+      a second design clock is not supported
+  ```
+
+- Parse-level rows via a temporary `--nocapture` probe (output below), then
+  pinned as the committed test `sdc.rs::tests::multi_clock_bails`.
+- Single-clock SDC on the two-clock DEF (clk1 clock only): parses, completes,
+  all 8 endpoints timed.
+- Scratch experiment: the `create_clock` guard commented out, same command —
+  second clock silently overwrites `clock_port`/`clock_name`/`period_ns`
+  (the whole design then times against `ckb`). **Reverted, never committed.**
+- OpenSTA: `bash tests/designs/sta_clocks/probe.sh` (12 scenarios, one
+  OpenSTA process each); re-run after artifact write —
+  `diff -r` of `two_clock.probe.json` + `probe_*.txt` **byte-identical**.
+
+#### Break-point table (grus-eda, HEAD)
+
+| SDC construct | behaviour | verbatim message |
+|---|---|---|
+| `create_clock ... [get_ports clk2]` (2nd design clock) | parse bail | `a second design clock is not supported` |
+| `set_clock_latency 0.5 [get_clocks {a b}]` | parse bail | `set_clock_latency takes one clock` |
+| `set_clock_latency -early ...` | parse bail | ``unsupported option `-early` `` |
+| `set_clock_uncertainty -from ... -to ...` | parse bail | `set_clock_uncertainty takes a value and optional clock names` |
+| `set_clock_uncertainty 0.20 [get_clocks vclk]` | **silent wrong target** — parses and writes the design-clock `setup/hold_uncertainty_ns` fields regardless of the named clock (no per-clock store) |
+| `create_clock -name v2 -period 3.0` (virtual, period != design) | parse bail | `virtual clock `vclk2` has period 3, not the design period 5` |
+| `create_clock -waveform {0 0.5} ...` | parse bail | ``unsupported option `-waveform` `` |
+| `set_clock_groups -asynchronous ...` | parse bail | `unsupported command `set_clock_groups`` |
+| `set_input_delay -clock other` / `set_propagated_clock [get_clocks other]` | parse bail | `unknown clock `other`` |
+| `set_clock_transition 0.1 [get_clocks {design virtual}]` | partial apply — design side set, virtual side counted in `ignored_options` (`set_clock_transition (virtual clock)`: 1); `--strict` exits 1 |
+| single `create_clock` + two-clock DEF | **silent mis-timing** — parses and completes; the unseeded domain's clock pins fold onto the one lattice (`base_state` merge at `ideal_latency`, `analysis.rs`) and all 8 endpoints report against `clk1`'s clock |
+
+So: the failure mode on a real two-clock SDC is a parse error (loud) — but
+only when the SDC actually declares a second clock. The dangerous modes are
+the silent ones: a single-clock SDC on a multi-clock netlist produces a
+full, wrong report with no warning.
+
+#### Measured OpenSTA rules (container runs; per-endpoint numbers in `two_clock.probe.json`)
+
+Q1 — cross-domain paths are timed by default, both directions. `probe_t2_int.txt`
+full-format reports name launch clock at the startpoint and the endpoint's
+clock at capture (`u_fa0` clocked by `cka` → `u_fx` clocked by `ckb`;
+`u_fb0` by `ckb` → `u_fy` by `cka`).
+
+Q2 — setup pairing picks the **most restrictive edge pair**, not
+launch-edge-0: for each launch edge, the smallest capture-domain edge
+strictly after it; the reported path minimises `capture − launch` over the
+common period (H-window won; H-first falsified). `cka` 2.0 / `ckb` 1.4
+(`t2_frac`, LCM 14 ns):
+
+| path | launch edge | capture edge | arr | req |
+|---|---|---|---|---|
+| `u_fa0`→`u_fx/D` (A→B) | cka 4.0 | ckb 4.2 | 4.277469 | 4.085446 |
+| `u_fb0`→`u_fy/D` (B→A) | ckb 9.8 | cka 10.0 | 10.07747 | 9.885446 |
+| `d_in`→`u_fb0/D` (in, cka→ckb) | 4.0 + 0.7 | ckb 4.2 | 4.7 | 4.054762 |
+
+`t2_int` (2.0/1.0) B→A reports launch **1.0**→capture 2.0 (Δ1.0) rather than
+edge 0 (Δ2.0) — min-gap pair wins on equal grids too. Hold pairs stay on
+coincident edges (edge 0 everywhere here).
+
+Q3 — uncertainty is per-clock, applied on the **capture** side
+(`t2_unc`: `u_fx/D req = 4.2 − 0.20 − setup` = ckb's; `u_fy/D req = 10.0 −
+0.05 − setup` = cka's; output checks take their `-clock`'s value).
+`-from cka -to ckb -setup 0.30` (`t2_uncx`) **replaces** the capture value
+for that direction only: `u_fx/D req 3.785446 = 4.2 − 0.30 − setup`, `u_fy/D`
+and same-domain checks unchanged. Hold uses the capture clock's `-hold`.
+
+Q4 — latency is per-clock: `t2_lat` arrivals carry the launch domain's
+latency (`u_fx/D arr 4.977469 = 4.0 + 0.6+0.1 + 0.277469`), required times
+the capture domain's (`req 4.285446 = 4.2 + 0.2 − setup`). `-source` sums
+with network latency in ideal mode (cka total 0.7).
+
+Q5 — `set_max_delay`/`set_min_delay` on a second-domain endpoint anchors at
+the **capture domain's** edge-0 arrival (H-capture-domain won):
+`req = N + capture_latency ∓ capture_uncertainty ∓ t_check`. `t2_mdl`
+(distinct latencies/uncertainties per domain):
+
+- `u_fx/D` (capture ckb, `set_max_delay 1.0`): `req 0.935446 = 1.0 + 0.2 −
+  0.15 − 0.114554`
+- `u_fy/D` (capture cka, `set_min_delay 0.5`): `req 1.162415 = 0.5 + 0.6 +
+  0.10 − 0.037585`
+- report text (`probe_t2_mdl.txt`) shows `max_delay`/`min_delay` followed
+  by the capture domain's own `clock network delay`/`clock uncertainty`
+  lines, no capture-edge line; the arrival side keeps the covered source's
+  ordinary arrival including the launch domain's latency (`u_fx/D arr
+  0.877469 = 0.6 + 0.277469`).
+- port form (`t2_mdo`): `yb req 0.1 = 0.8 − out_delay 0.7`.
+
+Q6 — `set_clock_groups -asynchronous` drops **all** cross checks incl.
+I/O-anchored (`t2_grp` endpoint table 8→5: `u_fb0/D`, `u_fx/D`, `u_fy/D`
+gone, same-domain untouched). `set_propagated_clock` is per-domain
+(`t2_prop1`: cka propagated `u_fa1/D arr 0.379373`, ckb ideal `u_fb1/D arr
+0.277469`, in the same run). MCP multiplies the **capture** domain's period
+(`t2_mcp`: `-setup 2` moves capture ckb 1.0→2.0, req 0.885446→1.885446;
+`-hold 1` moves it back one ckb period, min req −0.037585→−1.037585).
+
+Not run / not discriminated: cross-domain hold-pair selection beyond
+coincident edges; `-waveform` duty cycles; `-early`/`-late` latency splits;
+generated clocks. `t2_mdl` was added during the probe (the `t2_md` anchor
+question is degenerate when both domains' edge-0 arrivals are 0); scenario
+list updated in `fixture.md` and `probe.sh` accordingly.
+
+**Checks run**: `cargo test --workspace` (293+3 pass, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`probe.sh` re-run produced byte-identical `two_clock.probe.json` +
+`probe_*.txt` (`diff -r` against the first run). No existing goldens
+touched (fixture is probe-only, no regression target yet).
+
+### 2026-11-20 — `mc-model`: SDC clock table + single-domain STA gate (v0.2.0)
+
+First ticket of the `docs/multi-clock.md` sequence. `Sdc`'s single clock
+slot is replaced by `clocks: Vec<Clock>` — one row per `create_clock` in
+file order (name, optional port, period, network+source latency,
+setup+hold uncertainty, transition, propagated flag). Internal clock
+references are row indices (`ClockId`); `Sdc::design_clock()` returns the
+first port-bearing row for the single-domain evaluator. All clock-targeting
+commands resolve `[get_clocks {...}]` against the table row-wise.
+
+#### Commands run
+
+- `grus-eda sta --lib ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib --tlef .../sky130_fd_sc_hd__nom.tlef --lef .../sky130_fd_sc_hd.lef --def tests/designs/sta_clocks/two_clock.def --sdc tests/designs/sta_clocks/t2_int.sdc` (release binary, exit code 1) — stderr, verbatim:
+
+  ```
+  Error: sta: 2 design clocks declared (cka, ckb); multi-clock analysis is not implemented yet
+  ```
+
+  The gate sits in `run_sta_detail`, so `run_sta`, `run_sta_quiet` and
+  `sta_pin_slews` share it; pinned by
+  `sta::analysis::tests::sta_bails_on_a_two_clock_sdc`.
+- Fail-proof: the gate temporarily disabled (`if false && ...`) —
+  `sta_bails_on_a_two_clock_sdc` goes red and `run_sta` returns a full
+  report with all 8 endpoints timed against `cka`'s lattice (the silent
+  fold this gate exists to prevent). Gate restored, test green again.
+
+#### Post-change break table (grus-eda, HEAD)
+
+| SDC construct | behaviour |
+|---|---|
+| 2nd+ `create_clock` on a port / virtual clock with any period | accepted — appends a table row |
+| `set_clock_latency`/`-transition`/`set_clock_uncertainty` on `[get_clocks {a b}]` | applied to every named row |
+| `set_clock_uncertainty 0.20 [get_clocks vclk]` | lands on `vclk`'s row only (probe's silent wrong-target bug fixed; `uncertainty_lands_on_the_named_row`) |
+| `set_input_delay`/`-output_delay -clock <name>` | resolves any row (`delay_clock_references_a_domain_row`) |
+| `set_propagated_clock [get_clocks {<subset>}]` | per-row flag (`propagated_clock_is_per_domain`) |
+| `set_clock_latency -early`/`-late` | parse bail: ``unsupported option `-early` `` |
+| `set_clock_uncertainty -from ... -to ...` | parse bail: `set_clock_uncertainty takes a value and optional clock names` |
+| `create_clock -waveform` | parse bail: ``unsupported option `-waveform` `` |
+| `set_clock_groups` | parse bail: ``unsupported command `set_clock_groups` `` |
+| unknown `-clock` name / `set_propagated_clock` on a virtual clock / `create_clock -period 0` | parse bail (`multi_clock_bails` pins each message) |
+| `sta` on a >1-design-clock SDC | eval bail before graph prep (message above) — no silent fold |
+| no-target `set_clock_latency`/`set_clock_uncertainty` before the first `create_clock` | parse bail: `no design clock declared yet` (was: silently wrote the single-clock fields; `clock_commands_before_create_clock_bail`) |
+
+New parse/model tests in `sdc.rs::tests`: `second_design_clock_appends_a_row`,
+`virtual_clock_keeps_its_own_period`, `uncertainty_lands_on_the_named_row`,
+`multi_name_clock_lists_apply_to_every_row`,
+`clock_commands_target_second_domain_rows`, `propagated_clock_is_per_domain`,
+`delay_clock_references_a_domain_row`, `clock_commands_before_create_clock_bail`;
+`multi_clock_bails` updated to pin only the still-unsupported forms.
+
+**Checks run**: `cargo test --workspace` (299+3 pass, 2 ignored — includes
+all existing goldens, unchanged inputs and expected outputs),
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+`git status` shows no modifications under `tests/` or `kurena/`.
+Version 0.1.98 → 0.2.0 (`Sdc`'s public clock fields were replaced by the
+table + accessors — breaking for direct field users).
+
+### 2026-11-20 — `mc-eval`: domain-tagged same-domain multi-clock STA (v0.2.1)
+
+Second ticket of the `docs/multi-clock.md` sequence. The
+`design_clock_count() > 1` eval gate is gone: every design clock row seeds
+its own clock net (propagated via `propagate_clock`, ideal via the parity
+walk), every data arrival carries a `u8` launch-domain mask alongside the
+parity/CRPR masks (winner-replace/tie-union), and a check evaluates only
+when every reached extreme's mask is exactly the capture domain's bit.
+Capture-side period, latency, uncertainty, propagated/ideal mode and
+MCP/borrow/delay-check anchors all read the capture row. A virtual
+`-clock` I/O row whose period equals a design row pairs same-domain
+(ibex's `vclk` case — coincident edge grids); a unique virtual row stays
+foreign everywhere.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` as committed — the whole script in
+  `ghcr.io/librelane/librelane:3.0.16`; `git diff` on `two_clock.probe.json`
+  is additive only (new `t2_mcps`/`t2_mds` blocks after `t2_mcp`; the 12
+  existing scenario blocks and every existing `probe_t2_*.txt` are
+  byte-identical). New artifacts: `t2_mcps.sdc`, `t2_mds.sdc`,
+  `probe_t2_mcps.txt`, `probe_t2_mds.txt`, `two_clock_latch.def`,
+  `t2_latch.sdc`, `two_clock_latch.probe.json`, `probe_t2_latch.txt`.
+- `grus-eda sta --lib ... --tlef ... --lef ... --def tests/designs/sta_clocks/two_clock.def --sdc tests/designs/sta_clocks/t2_int.sdc --json /tmp/t2_int.json --strict` (debug binary, exit code 1) — verbatim:
+
+  ```
+  warning: STA skipped cross_domain_endpoints=3; the report does not model these
+  warning: STA skipped cell_driven_clock_nets=2; the report does not model these
+  STA (zero wire): endpoints=5, setup wns=-0.287329 tns=-0.287329 viol=1, hold wns=0.148797 tns=0.000000 viol=0, elapsed=0.44ms
+  pulse-width checks: 12 (0 violating)
+  skipped: 0/26 arcs (0.00%), 3/20 endpoints (15.00%)
+    cross_domain_endpoints=3
+    cell_driven_clock_nets=2
+      endpoint u_fx/D Check: CrossDomain (launch cka -> capture ckb)
+      endpoint u_fy/D Check: CrossDomain (launch ckb -> capture cka)
+      endpoint u_fb0/D Check: CrossDomain (launch cka -> capture ckb)
+  Wrote STA report JSON to "/tmp/t2_int.json"
+  Error: strict: the run skipped inputs; see the summary above
+  ```
+
+  `--strict` fails loudly on the deferrals (`cross_domain_endpoints`
+  enters `is_clean`), as intended — `mc-xdomain` owns the pairing.
+- Parse bails, verbatim (`grus-eda sta ... --sdc t2_<x>.sdc`):
+  - `t2_grp`: `unsupported command `set_clock_groups`` (`mc-selectors`)
+  - `t2_uncx`: `set_clock_uncertainty takes a value and optional clock names` (`mc-xdomain` inter-clock uncertainty)
+
+#### Same-domain comparison vs OpenSTA (`test_sta_clocks_match_opensta`)
+
+Per-endpoint fields (`arr`/`req`/`slack`/`slew`, max and min) at
+`Tol::STRICT` (1% rel / 5 ps abs); every reported pin present in the
+golden, every unreported golden pin a named `CrossDomain` skip. wns/tns
+and violation counts compare only where the endpoint set is complete.
+
+| scenario | evaluated | cross-domain deferred | what it pins |
+|---|---|---|---|
+| `t2_int` | 5 endpoints | 3 (`u_fb0/D`, `u_fx/D`, `u_fy/D`) | both lattices: `u_fb1/D` req 0.885446 vs `u_fa1/D` 1.885446 |
+| `t2_frac` | 5 | 3 | non-integer `ckb` 1.4 ns lattice |
+| `t2_prop` | 5 | 3 | both domains propagated |
+| `t2_prop1` | 5 | 3 | mixed `cka` propagated / `ckb` ideal |
+| `t2_lat` | 5 | 3 | per-domain network+source latency in arrivals |
+| `t2_unc` | 5 | 3 | capture-row uncertainty (`ckb` 0.20 vs `cka` 0.05) |
+| `t2_mcp` | 5 | 3 | cross MCP covered endpoint still defers |
+| `t2_mcps` | 5 | 3 | **same-domain MCP**: `u_fb1/D` req 1.885446 = 0.885446 + (2−1)·1.0 — capture-row period |
+| `t2_md` | 5 | 3 | delay-check-covered cross endpoints still defer (uncovered side can't pair) |
+| `t2_mdl` | 5 | 3 | per-domain latency+uncertainty delay anchors read |
+| `t2_mdo` | 5 | 3 | `yb` through the output-port `-to` delay-check branch on `ckb` |
+| `t2_mds` | 5 | 3 | same-domain delay checks: `u_fb1/D` req 0.935446 = 1.0 + 0.2 − 0.15 − 0.114554 |
+| `t2_latch` (`two_clock_latch.def`) | 4 + wns/tns/violations | 0 | second-domain `dlxtn` borrow window on `ckb`'s lattice; full-table match |
+
+#### Fail-proof mutation (E0 rule 7)
+
+`collect_endpoints`'s capture row forced to domain 0
+(`let cap_clk = sdc.design_clock().unwrap();`): `t2_frac` went red —
+`u_fb1/D.max_req_ns: ours=1.8854457 ref=1.285446` (the `cka` 2.0 ns read
+replacing `ckb`'s 1.4 ns) plus the matching slack shift. Restored, test
+green again.
+
+#### Golden-identity invariants — the two intended non-golden-visible changes
+
+- A clock pin no declared domain reaches stays unseeded → `NoClock`
+  skip instead of folding onto domain 0's lattice. Pinned by
+  `one_clock_sdc_on_two_clock_def` (single-clock SDC on `two_clock.def`:
+  `u_fa0/D`, `u_fa1/D`, `ya` evaluate; `u_fb*/D`, `u_fx/D` skip
+  `NoClock`; `u_fy/D`, `yb` skip `NoPath` — their launches are dead).
+- `sta` on a >1-design-clock SDC produces a report instead of the
+  `multi-clock analysis is not implemented yet` error.
+  `sta_bails_on_a_two_clock_sdc` was replaced by
+  `sta_evaluates_two_clock_same_domain`.
+
+Existing single-clock goldens are byte-identical: on one design row
+every tag is 0, every mask is `{0}`, every `cap` read is the design row.
+More than 8 clock rows bail before graph prep (`u8` masks):
+`sta: N clocks declared; at most 8 domains can be tagged`.
+
+New tests: `test_sta_clocks_match_opensta` (13 evaluated scenarios across
+both probe JSONs), `sta_evaluates_two_clock_same_domain`,
+`one_clock_sdc_on_two_clock_def`; `test_parity_mask_keeps_tied_arrivals`
+extended to the domain masks.
+
+**Checks run**: `cargo test --workspace` (301 passed, 0 failed, 2 ignored in grus-core; 3 passed in grus-eda),
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+Version 0.2.0 → 0.2.1 (additive feature, no API break).
+
+### 2026-11-20 — `mc-xdomain`: cross-domain edge pairing + inter-clock uncertainty (v0.2.2)
+
+Third ticket of the `docs/multi-clock.md` sequence. `foreign_launch`'s
+whole-endpoint defer is now `xdomain_defer`: a reached endpoint defers
+`CrossDomain` only when a side genuinely cannot pair — undeclared launch
+(`<undeclared>`), a latch-D check with a foreign launch (borrow pairing
+parked), a min-side tying parity with no coincident capture edge in the
+LCM window (hold selection parked), or a non-converging `grid_lcm`
+(defensive). Everything else evaluates per `(domain, parity)` candidate
+and keeps the worst slack:
+
+- **Setup** (`setup_edge_pair`): each launch edge `g·PL/2 + m·PL` in the
+  period-LCM window pairs with the smallest capture `check.edge` edge
+  strictly after it; the winner minimises `capture − launch`. `arr`
+  shifts `+ m·PL`, `req` shifts `+ j·PC` — no CRPR credit on a foreign
+  branch (the launch never shares the capture clock net).
+- **Hold** (`hold_edge_pair`): coincident edges only, as measured;
+  a non-coincident tying parity defers (parked).
+- **Uncertainty**: `set_clock_uncertainty -from/-to` stores directed
+  inter-clock rules (`Sdc::inter_clock_uncertainty`); every eval-side
+  read goes through `Sdc::uncertainty_ns(launch, cap, side)` — the last
+  matching rule *replaces* the capture row's value for that direction
+  and side only. Delay-check rewrites and mixed tying masks use the
+  worst-over-bits form. `-rise_from` etc. bail `unsupported option`;
+  positional clocks with `-from`/`-to` bail `cannot name clocks with
+  -from/-to`.
+- **Delay checks**: covered cross-domain endpoints report on the
+  capture domain's edge-0 anchor — no pairing needed. A `-from
+  [get_pins inst/Q]` is a path *startpoint* (measured on `t2_mdx`):
+  the pin's clocked launch is replaced by pin-segment paths —
+  `arr = w.dly − pin.dly`, `req = N ∓ constraint`, no clock anchor,
+  no uncertainty — and endpoints no covering rule's `-to` names lose
+  the check on that side entirely.
+- **MCP on a foreign min candidate**: `d_min = −nh·Pc` (measured
+  `t2_mcp` −1.037585), not the same-domain `((ns−1)−nh)·Pc`; mixed
+  masks take the cross form. `d_max` unchanged.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` as committed in
+  `ghcr.io/librelane/librelane:3.0.16` (all 16 scenarios re-run).
+  `git diff`: `two_clock.probe.json` gained only the `t2_mdx` block;
+  every other scenario block and every existing `probe_t2_*.txt` is
+  byte-identical. New artifacts: `t2_mdx.sdc`, `probe_t2_mdx.txt`.
+- `cargo test --workspace`: 305 passed, 0 failed, 2 ignored
+  (grus-core) + 3 passed (grus-eda).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+
+#### Cross-domain comparison vs OpenSTA (`test_sta_clocks_match_opensta`)
+
+All 14 parseable `t2_*` scenarios on `two_clock.def` plus `t2_latch` on
+`two_clock_latch.def` compare per-endpoint/per-field at `Tol::STRICT`
+(1% rel / 5 ps); `cross_domain_endpoints == 0` on every committed
+scenario, so wns/tns/violation counts compare everywhere. `t2_grp`
+remains parse-gated (`mc-selectors`) — 15 scenario names total,
+`t2_grp` produced an SDC error and no ref block at this probe.
+
+| scenario | cross-domain rows now evaluated | what it pins |
+|---|---|---|
+| `t2_int` | `u_fx/D`, `u_fy/D`, `u_fb0/D` | equal-grid min-gap: B→A launch 1.0→capture 2.0, not edge 0 |
+| `t2_frac` | same set | LCM-14 pairing: launch 4.0/capture 4.2 (A→B), 9.8→10.0 (B→A) |
+| `t2_prop`, `t2_prop1`, `t2_lat` | same set | pairing independent of propagated/declared latency (source grids) |
+| `t2_unc` | same set | capture-row uncertainty on foreign checks |
+| `t2_uncx` | same set | `-setup 0.30 -from cka -to ckb` → `u_fx/D` req 3.785446; B→A keeps cka's 0.05, hold sides keep row values (replacement, not additive, not symmetric) |
+| `t2_mcp` | same set | `d_max` on the paired req; `d_min = −nh·Pc` → `u_fx/D` min req −1.037585 |
+| `t2_md`, `t2_mdl` | covered cross endpoints | capture edge-0 anchor reads per-domain latency+uncertainty |
+| `t2_mdo` | — | same-domain output delay check (unchanged) |
+| `t2_mds` | — | same-domain delay checks (unchanged) |
+| `t2_mdx` (new) | `u_fy/D` both sides | pin-startpoint `-from`: `arr 0.0` from the pin, `req 0.885446/0.962415`; `u_fb1/D` loses both checks (unconstrained — absent from OpenSTA's table and ours) |
+| `t2_latch` | 0 | full-table match incl. wns/tns/violations (unchanged) |
+
+New unit tests: `test_edge_pairing_unit_cases` (the `pairing.md` table,
+incl. `setup_edge_pair(2.0, 2.0, 1, 0) -> (0.0, 2.0)` — additive shifts,
+the parity-1 first edge is already inside the recorded arrival),
+`set_clock_uncertainty_directional{,_bails}`,
+`uncertainty_ns_directional_lookup`.
+
+#### Fail-proof mutation (E0 rule 7)
+
+`setup_edge_pair` forced to keep the *first* enumerated pair instead of
+the min-gap pair (`best.is_none_or(...)` → `best.is_none()`):
+`test_sta_clocks_match_opensta` went red — `t2_frac` `u_fx/D`
+`max_arr_ns: ours=0.277469 ref=4.27747`, `u_fy/D` `0.277469` vs
+`10.07747`, `u_fb0/D` `0.7` vs `4.7`, plus matching req/slack/wns/tns/
+violation diffs (12 mismatches). Restored; test green again.
+
+#### Coverage notes (what ran vs not)
+
+- Single-clock goldens byte-identical by construction: the per-domain
+  candidate loops take the same-domain branch verbatim when every tying
+  bit is the capture bit; `uncertainty_ns` falls back to the capture row
+  with an empty rule table; `unc_worst` equals the row read when the
+  mask is the capture bit alone. `cargo test --workspace` above covers
+  every committed single-clock golden.
+- Cross-domain **gating-enable** and **output-port** pairing share the
+  same candidate-loop code but no committed fixture exercises them (all
+  `sta_clocks` output ports anchor same-domain) — noted as spec'd-but-
+  unmeasured, matching the design's own admission.
+- `dom_*`/`par_*` masks union independently; the candidate loop is the
+  cross product — every committed fixture ties single-bit masks, where
+  the product is exact. A multi-bit tie could enumerate a phantom
+  (domain, parity) pair (conservative worst-slack; recorded in
+  `api.md` §3).
+- Inter-clock matching is on folded domain tags: a virtual row folded
+  onto a design row by `launch_domain` shares that row's `-from`/`-to`
+  rules (`overview.md` out-of-scope list).
+- `probe_t2_mdx.txt` carries OpenSTA's `u_fb0/Q is not a valid start
+  point` warning — yet it reports the pin-startpoint delay check; the
+  measured numbers are what the golden asserts.
+
+### 2026-11-20 — `mc-xdomain` review fixes: unreached `-from` pin guard (v0.2.3)
+
+Residual delta from the 2026-11-20 design review of `3f45194`:
+
+- **`pin_segment_arrival`** (`analysis.rs`): all four pin-startpoint
+  segment-fold sites — check-pin max/min and output-port max/min — now
+  skip `-from` pins still `UNREACHED` in the signature class
+  (`dly_max = NEG_INFINITY` / `dly_min = INFINITY`) instead of folding
+  the sentinel into a `±∞` segment arrival. When no `-from` pin is
+  reached the polarity's `Worst` candidate drops — a named skip through
+  the ordinary skip diagnosis, never an infinite arrival and never a
+  silent `w.dly` fallback (the pin `-from` already replaced the clocked
+  launch). No committed fixture has an unreached `-from` pin, so this
+  is a correctness guard with no golden-visible change.
+- **`eval_sta` latch-borrow cap**: both reads of
+  `en_clk.setup_uncertainty_ns` now go through
+  `unc_worst(sdc, src.dom_max[src_pol], en_dom, false)` — the same
+  accessor every other eval-side uncertainty read uses. Identical
+  values on rule-free SDCs (all committed latch fixtures).
+- `sta_evaluates_two_clock_same_domain` renamed
+  `sta_evaluates_two_clock` — the test has asserted the cross-domain
+  min-gap pairs since `3f45194`, so `same_domain` was stale.
+- New unit test `test_pin_segment_arrival`: reached+unreached pin sets
+  fold only the reached segment on both sides; an all-unreached set
+  yields `None`.
+
+Ran: `cargo test --workspace` (306 + 3 tests, all green incl.
+`test_sta_clocks_match_opensta` at STRICT and
+`sta_evaluates_two_clock`), `cargo clippy --workspace --all-targets --
+-D warnings` (clean). Goldens byte-identical — no fixture or probe
+artifact touched.
+
+### 2026-11-20 — `mc-selectors`: clock selectors, `set_clock_groups`, `-waveform` (v0.2.4)
+
+Fourth multi-clock ticket (`docs/multi-clock.md` §3 item 4, §1.7 for the
+measured rules). Probe first, then eval:
+
+#### New probe scenarios (OpenSTA measured, `probe.sh` as committed)
+
+`SCENARIOS` gained 14 names folded into `two_clock.probe.json`;
+`PROBE_ONLY` carries 12 degenerate/error forms (report text only, no
+golden block). `git diff` after regen: every pre-existing scenario
+block and `probe_t2_*.txt` byte-identical; only new blocks/files
+appear.
+
+- Selectors: `-from [get_clocks cka]` drops the 5 checks launched on
+  the cka row including the `d_in` port check at `u_fb0/D` (`t2_selfa`;
+  `u_fy/D` survives — launched by ckb). `-to [get_clocks ckb]` drops
+  all 4 ckb captures including output `yb` (`t2_selfb`). Bare `cka` =
+  `[get_clocks cka]` (`t2_selbare`); `[all_clocks]`/`{cka ckb}` = union
+  (`t2_selac`/`t2_selunion`); `[get_clocks nope]` = warn + dead rule
+  (`t2_selunk`), matched by an empty-row `ObjSel::Clocks`. Delay checks
+  keep the clocked launch (`t2_selmd`/`t2_selmdt`); a covered dangling
+  launch reports its leaf as `internal path endpoint` `u_fy/Q`. MCP
+  forms `t2_selmc`/`t2_selmct` scale the capture period; a cross-domain
+  hold with no explicit `-hold` keeps `(ns−1)·Pc` (vs `−nh·Pc` when
+  given — `t2_mcp`/`t2_selmc`).
+- Groups: `t2_grp` re-confirmed 8→5. `-logically_exclusive`/
+  `-physically_exclusive` = identical table (`t2_grpl`/`t2_grpp` — one
+  shared exclusion path). A single `-group` cuts members vs **all**
+  other clocks (`t2_grp1`). `-allow_paths` = no cut (`t2_grpa`).
+  `-name`/bare names/empty `-group {}` parse (`t2_grpnm`/`t2_grpb`/
+  `t2_grpe`); missing mode flag errors STA-0400 (`t2_grpn`). Groups
+  beat an explicit `set_max_delay` in either file order
+  (`t2_grpd`/`t2_grpd2` both drop `u_fx/D`).
+- Waveform: `{0.3 1.7}` on cka (`t2_wave`) shifts every cka-anchored
+  time +0.3 (`u_fa0/D arr 0.7→1.0`, `ya req 1.3→1.6`); ckb captures
+  untouched. The fall instant shows in ckb→cka hold pairing — a
+  non-coincident min-gap pair (launch 1.0 / capture 0.3), so
+  `hold_edge_pair` is gap-minimising, not coincidence-only (uniform
+  grids unchanged). `{0 0.5}` (`t2_wave05`) is identical to `t2_int` on
+  this all-rise fixture. Degenerate: odd count → STA-0371
+  (`t2_wave3`), non-increasing → STA-0372 (`t2_waverev`), >2 instants
+  accepted in OpenSTA (`t2_wave4`) — here a named bail; instants past
+  the period accepted (`t2_wavebig` `{0 2.5}` → wrapped mod period).
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` as committed in
+  `ghcr.io/librelane/librelane:3.0.16` — the whole script, all 42
+  scenario/report runs.
+- `cargo test --workspace`: 309 passed, 0 failed, 2 ignored
+  (grus-core) + 3 passed (grus-eda) — incl.
+  `test_sta_clocks_match_opensta` at STRICT on all 30 golden
+  `two_clock` scenarios + `t2_latch`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `two_clock_latch.probe.json` and every pre-existing probe artifact:
+  byte-identical (`git diff` shows only additive blocks).
+
+#### Fail-proof mutations (E0 rule 7)
+
+- Group desugar no-op'd (`for grp in &cg.groups` → `.iter().take(0)`):
+  red — `t2_grp` reports `u_fb0/D`, `u_fx/D`, `u_fy/D` back. Restored,
+  green.
+- `resolve_from(ObjSel::Clocks)` forced to `HashSet::new()`: red —
+  `t2_selfa` drop set collapses (6 mismatches incl. `u_fb0/D`, `ya`,
+  `wns_min`). Restored, green.
+- `Clock::edge_offset` forced to `p·P/2`: red — `t2_wave` arr/req
+  mismatches on every cka-anchored endpoint. Restored, green.
+
+Not pinned / out of scope: `-through` and other unsupported
+qualifiers still count ignored; `[get_clocks]` on qualifiers other
+than `-from`/`-to`; >2-instant waveforms (named bail); group
+precedence vs `set_false_path` ordering below the measured surface;
+the fall instant is exercised only through cross-domain hold pairing
+on this fixture.
+
+### 2026-11-20 — `mc-selectors` revision: port-name selectors, golden re-fold (v0.2.5)
+
+Same-day review fix-up of the v0.2.4 entry. One new measurement, one
+golden re-fold, three code corrections; no feature change.
+
+#### New measurement: bare port names in `-from`/`-to`
+
+`ExceptionCtx::clock_row` accepted `c.port` as well as `c.name`, so
+`set_false_path -from clk1` — `clk1` is `cka`'s *source port*, not its
+`-name` — cut every cka launch. Probed (`t2_selport`/`t2_selpto`, new
+scenarios run through `probe.sh` as committed):
+
+- `-from clk1` resolves to the **port object** — a resolved-but-dead
+  selector: the full 8-endpoint table, no warning. An input port starts
+  no data path.
+- `-to clk2` resolves the same way; OpenSTA warns `STA-1551 'clk2' is
+  not a valid endpoint` and applies nothing — still the full table, and
+  *not* `STA-0471 no valid objects` (the object resolved).
+- `clock_row` now matches `c.name` only — the same lookup
+  `resolve_clock`/`clock_rows` already apply. `ObjSel::Names` resolves a
+  bare io-pin name to the port object on either side (direction does not
+  gate resolution).
+
+`unresolved_exception_selectors` now counts **zero-resolved-object**
+selector sides, not empty coverage: a resolved-but-dead selector
+(`clk1`, `[get_pins u_fa0/D]`, `[get_cells u_buf]`) is a silent dead
+rule, matching OpenSTA's `no valid objects specified`. `exc_diag`'s
+pinned `== 4` is preserved (each all-miss `get_cells` side still counts
+per-name miss + zero-objects = 2).
+
+#### Golden re-fold (`probe.sh` as committed, whole script re-run)
+
+`SCENARIOS` 29 → 39: promoted `t2_selbare`, `t2_selac`, `t2_selunion`,
+`t2_selunk`, `t2_grp1`, `t2_grpe`, `t2_grpb`, `t2_wavebig` from
+`PROBE_ONLY`, plus new `t2_selport`/`t2_selpto`. `PROBE_ONLY` keeps only
+the four bail-pinned forms (`t2_grpn`, `t2_wave3`, `t2_wave4`,
+`t2_waverev`). `run_sta` gained an empty-table guard: `t2_selac`/
+`t2_selunion` cut every launch (`No paths found.`), where `worst_slack`
+returns `Inf` — the ref block emits `null` wns/tns and `0` violations;
+the endpoint list is the measurement. `git diff` audit: the 29
+pre-existing `two_clock.probe.json` blocks, `two_clock_latch.probe.json`
+and every pre-existing `probe_t2_*.txt` byte-identical; only new blocks
+and the two new report files appear. `test_sta_clocks_match_opensta`
+now evaluates 40 scenarios (39 + `t2_latch`) and skips aggregate
+comparison on an empty golden table.
+
+Notable measured rows in the new blocks: `t2_grpe` (`-group {}` +
+`-group ckb`) confirms the empty-group arm contributes nothing — the
+same 5-endpoint table as `t2_grp`; `t2_wavebig` (`-waveform {0 2.5}` on
+2.0) wraps to `{0 0.5}` and reproduces `t2_int` exactly on this
+all-rise fixture.
+
+#### Code corrections
+
+- `clock_row` name-only (above).
+- The `dead_ends` fanout traversal is gated per signature class on a
+  `ResolvedRule::Delay` in the signature — the leaf pass only ever
+  produced a row under a delay rule, so group/false-path-only scenarios
+  no longer walk every launch cone (`dead_end_leaves` extracted;
+  behaviour-preserving).
+- Stale comments fixed: `hold_edge_pair` is min-gap since `t2_wave`;
+  four spots still describing the hold pair as *coincident* now say
+  min-gap/`edge_offset`. `test_edge_pairing_unit_cases` gained the
+  `edge_offset` table and the non-uniform `setup_edge_pair`/
+  `hold_edge_pair` rows the first pass promised.
+
+#### Commands run
+
+- `tests/designs/sta_clocks/probe.sh` whole, in
+  `ghcr.io/librelane/librelane:3.0.16` (all 39 + 4 + latch runs).
+- `cargo test -p grus-core sta_clocks_match`,
+  `cargo test -p grus-core edge_pairing`,
+  `cargo test -p grus-core exception_diagnostics` — green.
+
+#### Fail-proof mutations (E0 rule 7)
+
+- `clock_row` with `|| c.port == name` restored: red — `t2_selport`
+  drops the cka-anchored checks OpenSTA keeps (`u_fa0/D`, `u_fa1/D`,
+  `u_fb0/D`, `u_fx/D`, `ya` missing). Restored, green.
+- The `resolved_any` recount has no golden-visible mutation: skip counts
+  are not golden-compared — the `t2_selport`
+  `unresolved_exception_selectors == 0` assert in
+  `test_sta_clocks_match_opensta` is the pin.
+
+### 2026-11-20 — `mc-golden`: `sta_clocks` promoted to `two_clock.reference.json` (v0.2.6)
+
+Formal promotion only — no eval, parser or tolerance change. The
+`sta_clocks` evidence files take the `*.reference.json` golden name
+(`AGENTS.md` §2) and `test_sta_clocks_match_opensta` deserializes them
+directly; a missing file panics on `expect("golden file")`, no skip
+path exists.
+
+#### Golden rename + regen
+
+`probe.sh` edits are name-only: the two consolidated outputs and three
+comment/`echo` mentions (`two_clock.probe.json` →
+`two_clock.reference.json`, latch likewise); `SCENARIOS`,
+`PROBE_ONLY` and the `ref_*.json` intermediates untouched. The whole
+script re-ran inside `ghcr.io/librelane/librelane:3.0.16` — all 39
+`run_sta` + `run_report` pairs, the 4 `PROBE_ONLY` reports and the
+latch pair — as this ticket's functional change (emitting `probe.sh`
+blob `9aca5ab4`; its commit lands with this change). `diff` of
+`two_clock.reference.json` against the superseded
+`two_clock.probe.json` and `two_clock_latch.reference.json` against
+`two_clock_latch.probe.json`: **byte-identical** both; `git status`
+shows every `probe_t2_*.txt` unchanged, and git records the two
+renames with zero content diff.
+
+#### Test
+
+`test_sta_clocks_match_opensta`: 40 scenarios (39 `two_clock` +
+`t2_latch`) at STRICT — `cross_domain_endpoints == 0` everywhere;
+`t2_selac`/`t2_selunion` empty-table aggregates still skipped by
+construction; `t2_selport` keeps its
+`unresolved_exception_selectors == 0` pin. The four `PROBE_ONLY`
+bail-pinned forms keep their `multi_clock_bails` pins, and a new loop
+in the test asserts the committed `t2_grpn`/`t2_wave3`/`t2_wave4`/
+`t2_waverev` SDCs still fail `load_sdc` — the parse gate now covers
+the fixture files themselves, not only the inline snippets.
+
+Remaining `CrossDomain` deferrals still named (`docs/multi-clock.md`
+§2): undeclared-launch zero mask (`launch <undeclared>`), latch-D
+foreign-launch borrow pairing, unpairable hold tying parity, defensive
+`grid_lcm` non-convergence — none reachable on this fixture.
+
+`docs/path-delays.md` §5 item 1 closed; the five-ticket multi-clock
+sequence (`mc-model` → `mc-eval` → `mc-xdomain` → `mc-selectors` →
+`mc-golden`) is done.
+
+#### Commands run
+
+- `bash tests/designs/sta_clocks/probe.sh` whole, in
+  `ghcr.io/librelane/librelane:3.0.16`.
+- `cargo test -p grus-core sta_clocks` — green (1 test).
+- `cargo test --workspace` — green (309 + 3, 2 ignored).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --release -p grus-core sta` — green (170 tests, 2
+  ignored).
+
+#### Fail-proof mutations (E0 rule 7)
+
+- `two_clock.reference.json` removed: `sta_clocks_match` panics
+  `golden file: NotFound` — loud failure, no silent skip. Restored,
+  green.
+- `t2_int` `u_fx/D` `max_req_ns` perturbed +0.1 in the golden: red on
+  exactly that field (`u_fx/D.max_req_ns: ours=0.8854457
+  ref=0.985446`). `git checkout --` restored, green.
+
+### 2026-11-20 — `mc-cleanups`: measured-behaviour fixes + code/doc nits (v0.2.7)
+
+Cleanup bundle per `kurena/tasks/mc-cleanups/design/` — seven new
+`MEASURE_ONLY` probe scenarios pin OpenSTA's surface for the items
+that needed measurement; everything else is mechanical.
+
+#### Probe run (`probe.sh` whole, `ghcr.io/librelane/librelane:3.0.16`)
+
+`probe.sh` gained a `MEASURE_ONLY` list whose scenarios run
+`run_report` only — no `ref_*.json` block, so the goldens stay
+byte-identical by construction. The whole script re-ran: every
+pre-existing `probe_t2_*.txt` and both `two_clock{,_latch}.reference.json`
+byte-identical; new artifacts are the seven `t2_*.sdc` +
+`probe_t2_*.txt` pairs below.
+
+- **`t2_eclk`** — empty clock collections. `[get_clocks {}]` on
+  `set_clock_latency` (the +0.5 shift is visible on every `clock …`
+  line — applied to zero rows), `set_clock_uncertainty` (the −0.2
+  setup term does not move any req) and `set_clock_transition`
+  (clock-pin slews unchanged): clean output, no warning, the full
+  `t2_int` table. `set_propagated_clock [get_clocks {}]` produces the
+  same clean output — the table proves *no warning* and *no
+  propagated-mode clock lines* appear; whether an apply-to-all would
+  be observable is unmeasured. `[get_clocks no_such]` warns verbatim
+  `[WARNING STA-0351] clock 'no_such' not found.` and continues.
+  `[get_clocks]` with no argument returns every declared clock
+  (committed evidence: `t2_eclk2` below).
+- **`t2_toinv`** — resolved-but-invalid `-to`. Five warnings, one per
+  command line: `[WARNING STA-1551] ... t2_toinv.sdc line 12, 'clk2'
+  is not a valid endpoint.`, line 13 same text for `[get_ports clk2]`,
+  line 14 `'d_in'`, line 15 `'u_fa0/Q'`, line 16 `'u_clka/A'`
+  (non-endpoint pins warn the same). `[get_pins u_fa1/D]` — a true
+  endpoint — is silent and cut (control); `[get_cells u_clka]` warns
+  nothing even though it owns no endpoint pin. The rule is dead on
+  every warning; timing continues.
+- **`t2_nsfrom` / `t2_nsto`** — bare-name collision (unnamed
+  `create_clock`s, so `clk1`/`clk2` are both clock and port names).
+  The **clock object wins**: `-from clk1` cuts the `clk1` row's
+  launches (the `t2_selfa`-equivalent set — `u_fa0`, `u_fa1`, `d_in`,
+  `ya`, `u_fx` gone; ckb-domain checks stay), no warning. `-to clk2`
+  cuts the `clk2` captures, no `STA-1551` — OpenSTA never looks at
+  the port once the clock name matches.
+- **`t2_noclk`** — `-clock`-less `set_input_delay`/`set_output_delay`
+  (cka on `-waveform {0.3 1.7}`): `d_in` never appears as a startpoint
+  and `ya` never as an endpoint — a delay rule with no `-clock`
+  produces **no timed path at all** (re-checked without `-waveform`
+  in an ad-hoc run: same). Not a design-row fallback, not a `0.0`
+  anchor — the path simply does not exist (endpoint count 12 vs 18).
+- **`t2_waverot` / `t2_wavez`** — post-wrap waveforms. `{1.9 2.1}` on
+  period 2.0 is accepted with clock lines `1.90 clock cka (rise
+  edge)` — instants wrap mod period and the wrapped order is kept
+  (`[1.9, 0.1]`), not sorted; `{0 2.0}` collapses to `[0, 0]`.
+
+#### Rules implemented
+
+- **A2** — `get_clocks` evaluates `{}` to `Value::Clocks([])` and no
+  argument to all clocks; `set_clock_latency`/`-transition`/
+  `-uncertainty`/`set_propagated_clock`/`set_clock_groups` resolve
+  collection arguments through `clock_rows` filtering — unknown names
+  drop (the STA-0351 posture), zero rows is a silent no-op. Bare
+  literal clock names keep their strict `unknown clock` bail.
+  Directional `set_clock_uncertainty` with an empty `-from`/`-to`
+  collection records no rule.
+- **A5** — post-wrap `-waveform` instants stored as wrapped
+  (`rem_euclid`), unsorted — the measured `[1.9, 0.1]`/`[0, 0]` keep;
+  the pre-wrap strictly-increasing check stays. New unit test
+  `create_clock_waveform_wrapped_order_kept` pins both wraps
+  (tolerance-based — `0.1` comes out `2.1f32 rem_euclid 2.0 =
+  0.0999999…`).
+- **A7** — `resolve_to` counts resolved-but-invalid `-to` objects in
+  `unresolved_exception_selectors`: a non-output port and a resolved
+  non-endpoint pin each count once, matching the five `STA-1551`
+  warnings; resolved cells stay silent (measured). Field doc updated.
+- **A8** — the clock namespace wins a bare-name collision in
+  `resolve_from`, `resolve_to` and `resolve_delay_from`
+  (`clock_row(name)` checked before the port/cell scan). A clock's
+  *source-port* name is unaffected — `clock_row` matches `-name` only,
+  so `t2_selport`/`t2_selpto` behaviour is unchanged.
+- **A9** — `-clock`-less I/O delays anchor on nothing: an input port
+  whose rules all lack `-clock` seeds **slew only** (new `slew_seeds`
+  merged into `base_state`; no `PortSeed`, no launch), and
+  `collect_endpoints` admits an output port only when
+  `declared_output_clock_row` resolves. The eval's slew propagation
+  was decoupled from arrival reachability to keep this honest: an
+  unreached-but-slew-driven driver still degrades slew onto its net
+  and loads (`!reached && slew_reached` slew-only legs at the net edge
+  and in the arc eval — the same discipline `propagate_slew` already
+  used). Without the decoupling the unclocked input's downstream
+  slews went UNREACHED and `test_when_power_mbw_matches_opensta`
+  failed (Combinational internal `5.3687864e-8` ours vs `5.006255e-8`
+  golden) — the suite caught it; the decoupling restored it.
+
+#### Code nits (no probe)
+
+- **A1** `grid_lcm`: the mid-loop `y <= tol` guard moved to the loop
+  top — the honest statement (defensive on a degenerate `b`;
+  unreachable afterwards since the remainder was just checked
+  `> tol`). Doc notes non-convergence below `tol` returns `None`.
+- **A3** `delay_{max,min}_pins` and `ResolvedPathDelay::from_pins`:
+  last-wins wholesale folding documented — a later covering rule's
+  `from_pins` (including `None`) replaces the set.
+- **A4** the `PROBE_ONLY` loop asserts each scenario's expected bail
+  substring, not bare `is_err()`.
+- **A6** `sta_evaluates_two_clock_same_domain` audit — no-op: renamed
+  in v0.2.3, `rg same_domain` finds no residual misnomer.
+  Hold-pairing comment restated to the min-gap rule (the
+  non-coincident-pair wording was stale since `t2_wave`);
+  `SkippedEndpoint`'s count list covers `cross_domain_endpoints`.
+- **A10** `saif.rs`: `DURATION`/`TIMESCALE` report integer-required
+  errors (`SAIF DURATION must be an integer`), negative vs fractional
+  values split into separate messages, and the tokenizer accumulates
+  `Vec<u8>` with `String::from_utf8` at atom close — UTF-8 names
+  round-trip instead of mangling byte-wise. New tests: `1990.0` /
+  `abc` / `-5` DURATION battery, negative `T0`, UTF-8 net name.
+
+#### Docs
+
+- **D1** `docs/timing-exceptions.md`: `unresolved_load_selectors`,
+  `unsupported_path_delay_endpoints` and `cross_domain_endpoints`
+  bullets added; the selector bullet now records `STA-1551`-class
+  `-to` counting and the clock-wins namespace rule.
+- **D2** this file: "15 parseable" → "14 parseable + `t2_grp`
+  parse-gated" in the `mc-xdomain` entry; the when-power `awk`
+  invocation recorded verbatim in the v0.1.97 entry — re-run today:
+  `internal 26 leakage 6244`, and the per-cell variant confirms 2
+  `when`s on each of the 13 cells. saif-power checks-run audit —
+  **no-op**: the v0.1.96 entry already records `cargo test
+  --workspace`, clippy, the `--saif` end-to-end and the
+  `generate_saif_ref.sh` re-run.
+- **D3** `tests/designs/README.md`: `sta_exceptions`, `microbench`
+  and `repro_extreme_ceff` entries (verified against the directory
+  contents — `exceptions.def`, `generate_ref.sh`,
+  `generate_saif_ref.sh`/`generate_when_ref.sh`/`vcd2saif.py`,
+  `repro.tcl`/`sweep_reference.txt`).
+- **D4** `power.rs`: `driven_nets_without_activity` doc records that
+  the same unannotated nets also make `when` literals inexpressible
+  (counted in `conditional_power_blocks`) — the meaning change since
+  v0.1.97.
+- **D5** `t2_mdx` description audit — **no-op**: `fixture.md` already
+  reads "pin-startpoint `-from`"; `rg 'rewrite|both sides'` across
+  `kurena/tasks/*/design/` and `docs/` found only correct usages of
+  "delay-check rewrite".
+- **D6** `docs/multi-clock.md`: the scenario count reworded (40
+  golden + `MEASURE_ONLY`), §1.2's hold note points at §1.7's
+  min-gap finding, §1.7 gains the five new measured rules above.
+
+#### Checks run
+
+- `bash tests/designs/sta_clocks/probe.sh` — whole script; `git diff`
+  on `tests/designs/` shows only the seven new `t2_*.sdc` +
+  `probe_t2_*.txt` pairs, every pre-existing artifact byte-identical.
+- `cargo test --workspace` — 314 + 3 pass, 2 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Fail-proof mutations (E0 rule 7; each confirmed red, then reverted):
+  clock-wins priority disabled → `t2_nsfrom` reads the full dead-rule
+  table instead of `["u_fb1/D","u_fy/D","yb"]`; `-clock` gate forced
+  open → `t2_noclk` regains `u_fa0/D`; `t2_wave3`'s expected substring
+  swapped for `t2_waverev`'s → the named-bail assert fires with the
+  actual message; `two_clock.reference.json` slack +0.02 ns →
+  `t2_frac` fails on `u_fa0/D.max_slack_ns` (+1e-6 and +0.01 stay
+  inside the slack tolerance — 1% rel / 5 ps abs — and pass, the
+  honest floor of that check).
+- `mbw` power regression (unplanned): caught by
+  `test_when_power_mbw_matches_opensta` mid-work, root-caused to
+  arrival-gated slew propagation, fixed by the slew decoupling in A9 —
+  re-verified green.
+
+Version `0.2.6 → 0.2.7` in `[workspace.package]` (`Cargo.lock`
+refreshed by `cargo check`).
+
+#### Revision (v0.2.8) — review-memo follow-up, same ticket
+
+The human review of `e6bd1a7` returned five items (R1–R5,
+`kurena/tasks/mc-cleanups/design/` revision 2). One probe run inside
+the same container pinned the measured rules; the implementation
+follows the measured entry-list model (the design's per-corner-anchor
+hypothesis was refuted by the `t2_clkcor` data, as `api.md` allowed).
+
+##### Probe run (`probe.sh` whole, same container)
+
+`probe.sh`'s Tcl collector was hardened first (union of both passes,
+`null` for an absent corner — without it a mixed-anchor scenario dies
+on `can't read "min_arr(...)"`). `SCENARIOS` gained `t2_eclk2`,
+`t2_clkcor`, `t2_clkcor2`, `t2_waverot`, `t2_wavez`; `MEASURE_ONLY`
+shrank to `t2_eclk t2_nsfrom t2_nsto t2_toinv t2_noclk`; `PROBE_ONLY`
+gained `t2_eclk3`, `t2_eclk4`. Every pre-existing `probe_t2_*.txt` and
+golden block regenerated byte-identical; `probe_t2_eclk.txt`
+regenerated from the extended `.sdc` (three appended lines).
+
+- **`t2_clkcor` / `t2_clkcor2`** — mixed `-clock` delay rules. The
+  measured rule is an **entry list**, not a per-corner anchor:
+  a port's rules fold to surviving `(value, sense, clock)` entries; a
+  plain rule prunes entries anchored to a different `-clock`
+  **port-wide** and appends, `-add_delay` appends without pruning, and
+  each surviving anchored entry is its own check. Evidence:
+  `t2_clkcor` (`-max -clock cka` then bare `-min` on `d_in`; the
+  mirror on `ya`) reports **12 endpoints — `d_in`/`ya` gone
+  everywhere** (`t2_noclk` shape); `t2_clkcor2` in the reversed order
+  times `d_in` max-only (`min_*` `null`) and `ya` min-only; and
+  `t2_clkcor2`'s `yb` (`-max @cka` plain, `-max @ckb -add_delay`)
+  appears **twice** in the max table — `Endpoint: yb (output port
+  clocked by cka)` and `Endpoint: yb (output port clocked by ckb)` —
+  while its min corner is `null`.
+- **`t2_eclk` extension** — the previously-unprobed forms:
+  `set_clock_uncertainty -setup 0.2 -from cka -to [get_clocks {}]` —
+  silent, table unchanged (the empty side records no rule);
+  `set_propagated_clock [get_clocks no_such]` —
+  `[WARNING STA-0351] clock 'no_such' not found.` + continue;
+  `unset_propagated_clock [get_clocks {}]` — silent.
+  `set_clock_uncertainty -setup 0.2 -from [get_clocks {}]` (lone
+  `-from`, `t2_eclk3`) and the lone `-to` (`t2_eclk4`) both abort
+  `read_sdc` with `[ERROR STA-0421] -from/-to must be used together.`
+- **`t2_eclk2`** — `[get_clocks]` no-arg: every `clock …` line shifts
+  +0.5 (`1.50 clock network delay`, both domains) and every req drops
+  a further 0.15 — the all-clocks rule, now with committed evidence.
+- **`t2_waverot` / `t2_wavez`** — promoted to `SCENARIOS`; OpenSTA
+  produces a normal `t2_int`-shaped table on both (`[0, 0]` collapsed
+  duty is unobservable on this all-rise fixture).
+
+##### Rules implemented (revision)
+
+- **`delay_at` entry-list fold**: plain rules `retain` only
+  same-anchor entries then append; `-add_delay` appends. A
+  `-clock`-less plain rule's anchor is `None` — it prunes every
+  anchored entry (the `t2_clkcor` both-corners loss). Accessors are
+  per-corner entry lists (`declared_input_clock_rows` /
+  `declared_output_clock_rows` → `[Vec<(row, value)>; 2]`);
+  `output_clock_row(port, corner)` keeps the first-anchor
+  approximation where a single row is unavoidable.
+- **Per-corner `EndpointReport`**: all eight `*_*_ns` fields are
+  `Option<f32>` — a corner with no anchored check serializes `null`
+  (`--sta-json` schema change). `record_endpoint` emits when *either*
+  corner has candidates; `unreached` now means zero candidates on
+  both. A multi-anchor output port reports the last anchor's check
+  per corner while `wns`/`tns`/violation folds see the worst
+  (`t2_clkcor2` `yb`: reported row is `ckb`'s +0.013, `wns` is the
+  `cka` check's −0.287 — a serde-skipped worst field carries it).
+  `PortSeed` gained per-corner `dom`/`per_pol`; `key_dom`/`ep_cap`
+  match on row **intersection** (a `-from cka` cut still drops the
+  port's whole launch — pin-granular, recorded as the split-anchor
+  limitation in `docs/multi-clock.md`).
+- **STA-0421**: directional `set_clock_uncertainty` bails when only
+  one of `-from`/`-to` is given (`t2_eclk3`/`t2_eclk4` named-substring
+  asserts).
+- **`set_propagated_clock` name drop**: collection-sourced names
+  resolving to no clock `-name` or source port drop silently; literal
+  names keep the `unknown clock` bail (`t2_eclk` line 18 evidence;
+  the `STA-0351` warning text is unmodelled).
+- **`get_clocks` no-arg**: comment cites `t2_eclk2` (was "(measured)"
+  on an ad-hoc check).
+
+##### Wordings fixed (review nits)
+
+- The `t2_eclk` bullet above no longer lumps `set_propagated_clock`
+  with the table-visible commands, and the ad-hoc parenthetical is
+  replaced by the `t2_eclk2` citation.
+- `sdc.rs` `t2_eclk` citations audited — every cite names a form the
+  extended file now exercises (`-from cka -to [get_clocks {}]` line
+  17, `set_propagated_clock [get_clocks no_such]` line 18,
+  `unset_propagated_clock [get_clocks {}]` line 19).
+- `docs/multi-clock.md`: 40 → 45 golden scenarios, the
+  empty-collections bullet extended (STA-0421, name drop, unmodelled
+  warning), the entry-list `-clock` anchor rule added with the
+  split-anchor limitation.
+- `docs/timing-exceptions.md`: `unreached_endpoints` restated (zero
+  candidates on **both** corners; a single-corner endpoint emits
+  `null` fields).
+- `tests/designs/README.md`: 40 → 45, `null` corner fields, the new
+  `PROBE_ONLY`/`MEASURE_ONLY` lists.
+- `xdomain_defer` doc: the stale "both max and min sides are needed
+  to report" claim replaced with the per-anchor rule.
+
+##### Checks run (revision)
+
+- `bash tests/designs/sta_clocks/probe.sh` — whole script;
+  pre-existing `probe_t2_*.txt` byte-identical, `two_clock.reference.json`
+  grew append-only (+5 blocks, `t2_clkcor*` carrying `null` corners),
+  `probe_t2_eclk.txt` regenerated from the extended `.sdc`.
+- `cargo test --workspace` — 315 + 3 pass, 2 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Fail-proof mutations (E0 rule 7; each confirmed red, then
+  reverted): `delay_at` prune relaxed to keep anchored entries →
+  `t2_clkcor` reports `u_fa0/D`, `u_fb0/D`, `ya` back where OpenSTA
+  has none; `record_endpoint` emit-rule reverted to requiring both
+  corners → `t2_clkcor2` drops `ya`/`yb` (the output ports route
+  through `record_endpoint`; the register checks emit through the
+  partitioned path's own either-corner rule) and `wns_max`/`tns_max`/
+  `setup_violations` read 0.155/0/0 instead of −0.287/−0.287/1.
+
+Version `0.2.7 → 0.2.8` in `[workspace.package]` (`Cargo.lock`
+refreshed by `cargo check`).
+
+#### Revision 2 (v0.2.9) — second review memo: same-anchor fold probe
+
+The second human review returned one medium (`delay_at`'s same-anchor
+same-sense retention was inferred, not measured) and two optional lows
+(`tests/designs/README.md` count attribution, `set_clock_groups`
+unknown-name posture). One probe scenario pinned the rule.
+
+##### Probe run (`probe.sh` whole, same container)
+
+`SCENARIOS` gained `t2_clkdup` (same-clock same-sense duplicates on
+`d_in`/`ya`, plus a `Both`-then-`-max` same-clock pair on `yb` that
+separates per-corner-slot overwrite from whole-entry overlap removal).
+Every pre-existing `probe_t2_*.txt` and golden block regenerated
+byte-identical; `two_clock.reference.json` grew append-only (+1 block)
+and `probe_t2_clkdup.txt` is new.
+
+- **`t2_clkdup`** — measured **per-(clock, corner)-slot overwrite**
+  (H_slot), not the inferred worst-fold (H_acc). Discriminators in
+  `ref_t2_clkdup` / `probe_t2_clkdup.txt`: `d_in`'s launch arrivals
+  read the *last* duplicate, not the worst — `u_fa0/D`/`u_fb0/D`
+  `max_arr_ns = 0.400000` (`-max 0.7` then `-max 0.4`; the report shows
+  `0.40 input external delay`) and `min_arr_ns = 0.300000` (`-min 0.1`
+  then `-min 0.3`); `ya` `max_req_ns = 1.600000` (`2.0 − 0.4`) and
+  `min_req_ns = -0.300000` (`0 − 0.3`); `yb` (`0.5 -clock ckb` then
+  `-max 0.3 -clock ckb`) `max_req_ns = 0.700000` (`1.0 − 0.3` — the
+  `-max` rule overwrote the `Both` entry's max half) while
+  `min_req_ns = -0.500000` (`0 − 0.5` — the min half survived,
+  refuting whole-entry overlap removal which would emit `null`).
+  `wns_max_ns = 0.112671`, `wns_min_ns = 0.324670`; `Endpoint: yb`
+  appears once per corner in the full report.
+
+##### Rule implemented
+
+- **`delay_at` same-anchor slots**: a plain rule still prunes
+  different-anchor entries port-wide, and now also strips the covered
+  corner(s) off same-anchor entries via `DelaySense::without` — a
+  `Both` entry degrades to the uncovered corner rather than dropping.
+  `-add_delay` unchanged.
+- **Amendment**: the revision-1 bullet above reads plain rules
+  "`retain` only same-anchor entries then append". The
+  different-anchor half is measured (`t2_clkcor`/`t2_clkcor2`); the
+  same-anchor half was inferred and is now **refuted** — `t2_clkdup`
+  shows last-wins per (clock, corner) slot, not unconditional
+  retention.
+
+##### Test updates
+
+- `delay_anchor_prune_is_port_wide` gained the same-sense cases
+  (`-min` duplicate → `(0, 0.3)`; `Both` under `-max` → min keeps
+  `(1, 0.5)`, max takes `(1, 0.3)`); its earlier asserts stand.
+- `counts_ignored_lib_cell_and_pin_options` `(1.0, 2.0)` → `(2.0,
+  2.0)`; `add_delay_widens_instead_of_summing` second block `(0.4,
+  1.0)` → `(0.8, 0.8)`; `remove_from_collection_subtracts_selections`
+  `(1.0, 2.0)`/`(1.0, 3.0)` → `(2.0, 2.0)`/`(3.0, 3.0)`;
+  `keeps_negative_values_and_the_known_flags` `(-0.5, 1.0)` → `(-0.5,
+  -0.5)` — each comment re-cites `t2_clkdup`.
+- `evaluated` 45 → 46.
+
+##### Lows
+
+- `tests/designs/README.md`: the "all N golden scenarios evaluate"
+  count reattributed — `mc-selectors` (v0.2.5) keeps its feature list;
+  the count (46 = 45 `two_clock` + `t2_latch`) is stated against
+  v0.2.9, with `t2_clkdup` named beside the v0.2.8 additions.
+- `docs/multi-clock.md`: §1.7 anchor bullet gained the same-anchor
+  clause; `set_clock_groups` gained the unknown-name posture bullet
+  (collection `-group` args filter empty on the adopted
+  `clock_rows`/`t2_selunk` posture — unprobed on this command; bare
+  unknown names bail `unknown clock`).
+
+##### Checks run
+
+- `bash tests/designs/sta_clocks/probe.sh` — whole script;
+  `git diff tests/designs/` shows `two_clock.reference.json`
+  append-only (+1 block) plus the new `t2_clkdup.sdc` /
+  `probe_t2_clkdup.txt`; every pre-existing artifact byte-identical.
+- `cargo test --workspace` — 315 + 3 pass, 2 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- Fail-proof (E0 rule 7): the slot predicate replaced by unconditional
+  same-anchor retention (the inferred H_acc) → `t2_clkdup` red on the
+  discriminating fields (`u_fa0/D`/`u_fb0/D` `max_arr` 0.7 vs 0.4,
+  `min_arr` 0.1 vs 0.3, `wns_max`/`wns_min` off), restored green.
+
+Version `0.2.8 → 0.2.9` in `[workspace.package]` (`Cargo.lock`
+refreshed by `cargo check`).
+
+## 2026-11-21 — async-arc probe: R6 re-measurement (+R3/R4 roadmap correction)
+
+**Fixture/script**: `tests/designs/sta_edge/async_arcs/` — hand-written
+`async_arcs.def` (14 `sky130_fd_sc_hd` cells, 13 nets, 6 ports) with
+`ideal.sdc`/`propagated.sdc`; `generate_ref.sh` runs four `openroad` sessions
+inside `ghcr.io/librelane/librelane:3.0.16` and emits
+`async_arcs.reference.json` plus `probe_async_{ideal,propagated}.txt`
+(byte-identical on a second run — checked via md5 before commit). Clock-tree
+`clkbuf_2` x3; on `c1`: `u_ff0`/`dfrtp_1`, `u_fp`/`dfstp_1`, `u_fbp`/`dfbbp_1`,
+`u_fbn`/`dfbbn_1` (`CLK_N`), `u_ff2` `dfxtp_1`; on the **unclocked** port `aclk`
+(no `create_clock` in either SDC): `u_ar`/`dfrtp_1`, `u_ap`/`dfstp_1`,
+`u_aq`/`dfrbp_1` — discriminators whose `Q`/`Q_N` can only carry a timed path
+through a `clear`/`preset` arc — feeding `u_ds`/`u_dp`/`u_dq` `dfxtp_1` whose
+`D` pins are reachable only through those outputs.
+
+**Liberty census** (`sky130_fd_sc_hd__tt_025C_1v80.lib`, counted 2026-11-21,
+drive-strength suffixes stripped):
+
+| shape | families |
+|---|---|
+| `recovery_rising` + `removal_rising` (12) | `dfbbp`, `dfrbp`, `dfrtp`, `dfsbp`, `dfstp`, `dlrbn`, `dlrtn`, `sdfbbp`, `sdfrbp`, `sdfrtp`, `sdfsbp`, `sdfstp` |
+| `recovery_falling` + `removal_falling` (6) | `dfbbn`, `dfrtn`, `dlrbp`, `dlrtp`, `sdfbbn`, `sdfrtn` |
+| `clear` arcs (16) | `dfbb[n/p]`, `dfrbp`, `dfrt[n/p]`, `dfsbp`, `dlrb[n/p]`, `dlrt[n/p]`, `sdfbb[n/p]`, `sdfrbp`, `sdfrt[n/p]`, `sdfsbp` |
+| `preset` arcs (12) | `dfbb[n/p]`, `dfrbp`, `dfsbp`, `dfstp`, `dlrb[n/p]`, `sdfbb[n/p]`, `sdfrbp`, `sdfsbp`, `sdfstp` |
+| `non_seq_setup_rising` + `non_seq_hold_rising` (4) | `dfbb[n/p]`, `sdfbb[n/p]` (`SET_B`/`RESET_B` checked against each other) |
+
+Coverage already locked: `dfrtp` rising (`async_reset`), `dfrtn` falling
+(`async_fall`, `async_fall_chain`, `clock_gate`), `dlrtn`/`dlrbn` rising and
+`dlrtp`/`dlrbp` falling latches (`latch_borrow`). This fixture adds `dfstp`
+(set-only), `dfbbp`/`dfbbn` (dual pins + `non_seq_*`), `dfrbp` (single pin,
+both arc types, used as the `Q_N` discriminator). `sdf*` scan cells share the
+same check shapes plus `SCD`/`SCE` pins — family equivalence only, not placed.
+
+**Q0 — command surface** (verbatim, both modes): `sta::*arrival*` lists
+`::sta::report_arrival` (exists as `report_arrival`); `sta::find_vertex` /
+`sta::pin_vertex` do **not** exist (`invalid command name`); no
+`*unconstrained*` commands; `report_check_types` exists.
+
+**Q1 — `-unconstrained` reporting**: `report_checks -unconstrained` prints the
+worst path per path group — `u_fbn` recovery check under
+`Path Group: asynchronous` and the `u_fbn/D` register check under
+`Path Group: core_clk` — and **no list of unclocked endpoints**. `u_a*/D`,
+`u_a*/RESET_B|SET_B` and `u_d*/D` never appear anywhere in OpenSTA's output
+(no warnings at `read_sdc` or analysis time either — OpenSTA narrates them
+as nothing at all).
+
+**Q2 — does `Clear`/`Preset` propagate an arrival to `Q`? No** (identical in
+ideal and propagated):
+
+- `find_timing_paths -from rst_n` → `path count: 1`, end `u_fbn/RESET_B`;
+  `-from set_n` → 1 path, `u_fbn/SET_B` — the worst-slack recovery-check
+  endpoints only (default `endpoint_path_count`/`group_path_count` of 1).
+- `find_timing_paths -to u_ds/D` / `u_dp/D` / `u_dq/D` → `path count: 0` each.
+- `report_arrival` verbatim:
+
+  ```
+  --- u_ar/Q ---
+   r 0.33:0.33 f 0.36:0.36
+  --- u_ap/Q ---
+   r 0.50:0.50 f 0.36:0.36
+  --- u_aq/Q_N ---
+   r 0.47:0.47 f 0.41:0.41
+  --- u_ff0/Q ---
+   (core_clk ^) r 1.03:1.03 f 1.06:1.06        (propagated: r 0.58 f 0.62)
+  ```
+
+  The `u_a*` outputs do carry raw arrivals (≈ the `CLK->Q` delay applied to an
+  unclocked clock-pin arrival) but with **no clock tag** — OpenSTA stores the
+  value yet cannot start a constrained path from it, so the arcs still yield
+  no endpoints.
+- `report_checks -from rst_n -through u_ar/Q -format full` → `No paths found.`;
+  `-from rst_n -through u_ff0/Q` → 0 paths (reconfirms the 2026-11-17 note).
+- Transient discriminator (in-session only): after
+  `set_disable_timing [get_cells u_ff0] -from CLK -to Q`,
+  `find_timing_paths -to u_ff2/D` → `path count after disable: 0`,
+  `No paths found.` — `u_ff2/D` is fed only by `u_ff0/Q`, so it would stay
+  timed iff `RESET_B -> Q` propagated. It does not.
+
+**Q3 — falling recovery/removal** on `u_fbn` (`dfbbn_1`, `CLK_N`): verbatim
+`Endpoint: u_fbn (recovery check against falling-edge clock core_clk)`,
+capture `clock core_clk (fall edge) 2.00` + 0.70 ideal latency at
+`v u_fbn/CLK_N`, `library recovery time` −0.05 (`RESET_B`) / +0.08 (`SET_B`).
+Same anchoring as `dfrtn` (`async_fall`) — the check sits on the external
+falling transition. Both pins are golden endpoints (max path = recovery,
+min path = removal).
+
+**Q4 — `non_seq_*` on `dfbbp`/`dfbbn`**: OpenSTA does not report them as
+endpoints or elsewhere. `report_check_types` prints group-slack rows
+(`asynchronous`/`core_clk`), `max slew`, `max capacitance`, and one
+pulse-width row — no `non_seq` entries; `report_checks -to u_fbp/RESET_B` and
+`-to u_fbp/SET_B` show only the recovery checks. Our `recognized_check_arcs`
+deferral diverges on nothing: the endpoint sets are equal.
+
+**Q5 — preset-side pairing**: `Endpoint: u_fp (recovery check against
+rising-edge clock core_clk)`, `library recovery time` +0.15 → required 4.80
+(ideal) — `SET_B` anchors exactly like `RESET_B` on `dfrtp`.
+
+**Q6 — golden**: 12 endpoints and 16 `pulse_width` rows per mode (every
+clocked `CLK`/`CLK_N` pin, including `u_fbn/CLK_N` high+low on the inverting
+pin — new coverage). No `u_a*/CLK` rows (unclocked → no checks, matching our
+`skipped_endpoints`). `setup_violations`/`hold_violations` 0/0 both modes.
+
+**Our side (same fixture, `grus-eda sta`, zero wire)**:
+
+- Endpoint set **identical**: 12/12 pins both modes; worst field difference
+  `|Δ| = 1e-6 ns` (`u_fbp/SET_B.max_req_ns` 4.699498 vs 4.699499) — STRICT.
+  WNS/TNS and violation counts match exactly; 16/16 pulse rows match.
+- CLI summary (ideal): `endpoints=12, setup wns=1.088468 tns=0.000000
+  viol=0, hold wns=0.207754 tns=0.000000 viol=0`; `skipped: 31/99 arcs
+  (31.31%), 15/43 endpoints (34.88%)`;
+  `recognized_check_arcs[Clear=7, MinPulseWidth=9, NonSeqHoldRising=4,
+  NonSeqSetupRising=4, Preset=7]`, `unreached_endpoints=15`,
+  `cell_driven_clock_nets=1` (ideal only: `c1` is buffer-driven — the
+  documented ideal-mode clock-net limitation; propagated does not count it).
+- `skipped_endpoints` verbatim (15, both modes): `u_ar/D`, `u_ar/RESET_B`,
+  `u_ap/D`, `u_ap/SET_B`, `u_aq/D`, `u_aq/RESET_B` — `check`/`no_clock`
+  (`u_a*/CLK`); `u_ds/D`, `u_dp/D`, `u_dq/D` — `check`/`no_path`
+  (`u_ar/Q`, `u_ap/Q`, `u_aq/Q_N`); `u_a*/CLK` x3 high+low —
+  `min_pulse_width`/`no_clock`. Where OpenSTA is silent, we name every
+  dropped endpoint with its reason — the divergent-by-design accounting.
+- `--strict` exits **1** in both modes (`unreached_endpoints` is not
+  `is_clean`-exempt) — expected: the fixture deliberately places flops on an
+  unclocked port.
+
+**R6 disposition — closed as already matching (Branch A).** OpenSTA 3.0.16
+does not propagate `Clear`/`Preset` arcs into timed paths: endpoints
+reachable only through them produce zero paths, not unconstrained-path
+reports. The "downstream endpoints" clause is vacuous for this OpenSTA
+version; keeping the arcs in `recognized_check_arcs` is the matching
+behaviour. Check coverage now spans every async check shape in
+`sky130_fd_sc_hd`: `dfrtp`/`dfstp`/`dfrbp`/`dfbbp`/`dfbbn` flops rising and
+falling, `dlrt*`/`dlrb*` latches (`latch_borrow`); `sdf*` scan cells are
+family-equivalent supersets (extra `SCD`/`SCE` pins). Residuals kept open:
+`non_seq_*` — OpenSTA does not report them either, so the deferral is parity
+(a future OpenSTA that reports them would reopen this); the
+"future OpenSTA version re-measurement" clause from 2026-11-17 stands.
+
+**R3/R4 doc-only correction** (no probe needed): `docs/roadmap.md` R3/R4
+marked Done — evidence `test_sta_edge_hold_violation_{ideal,propagated}`
+(v0.1.61, entry above) and `test_sta_edge_clock_gate_{ideal,propagated}` +
+`test_gate_kind_classifies_liberty_functions` (v0.1.66); `hold_violations`
+printed in the `sta` summary and serialised in `--json`.
+
+**Checks run**: `bash tests/designs/sta_edge/async_arcs/generate_ref.sh` —
+whole script, three times; artifacts byte-identical. `grus-eda sta` on both
+SDCs (`--json` + `--strict`, verbatim above). New tests
+`test_sta_edge_async_arcs_{ideal,propagated}` at `Tol::STRICT`; fail-proofed
+(E0 rule 7): splitting `RecoveryFalling` out of the check arm turned both
+tests red (10 vs 12 endpoints), restored green. `cargo test --workspace` —
+all pass; `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+## 2026-11-21 — deferred check arcs: `non_seq_*`/`three_state_*`/`preserve` probe + `three_state_*` promoted (v0.2.11)
+
+Fixture `tests/designs/sta_edge/check_arcs/` (`check_arcs.def` — 14 cells, 16
+nets, 6 ports): `dfbbp_1`/`dfbbn_1` flops carrying the `non_seq_*`
+`SET_B`/`RESET_B` pair plus `clear`/`preset`, and `ebufn_1`/`einvn_1`/`einvp_1`
+tristate drivers (`TE_B`/`TE` enables) feeding `dfxtp_1` capture flops.
+`ideal.sdc`/`propagated.sdc` constrain the same design; `te_slow.sdc` delays
+port `te` by 2.5 ns instead of 0.7 ns so a propagating enable arc shifts the
+`u_cap*/D` arrivals by +1.8 ns — the propagation discriminator. Golden
+`check_arcs.reference.json` + `probe_check_arcs_{ideal,propagated,te_slow}.txt`
+were emitted by the committed `generate_ref.sh`, run as written from the repo
+root inside `ghcr.io/librelane/librelane:3.0.16` (whole script; rerun after
+adding the Q3 edge-model probe block — golden bytes unchanged, transcripts
+regenerated).
+
+### Library census (sky130_fd_sc_hd__tt_025C_1v80, re-counted today)
+
+| arc type | cells | placement |
+|---|---|---|
+| `non_seq_setup_rising` + `non_seq_hold_rising` (12 arcs each type) | `dfbb[n/p]_{1,2}`, `sdfbb[n/p]_1` | timing groups on `RESET_B` *and* `SET_B`, each `related_pin` = the other pin; `rise_constraint` only (`vio_3_3_1`, values *negative*: −0.10 … −0.33) |
+| `three_state_enable` + `three_state_disable` (13 each) | `ebufn_{1,2,4,8}`, `einvn_{0,1,2,4,8}`, `einvp_{1,2,4,8}` | timing groups on output `Z`, `related_pin` = `TE_B` (`ebufn`/`einvn`) or `TE` (`einvp`); real `del_1_7_7` delay tables + scalar-0 transition tables |
+| `preserve` | — | **zero occurrences in the lib** — nothing to fixture or probe; stays counted, this census is its record |
+
+### Per-type verdicts (OpenSTA 3.0.16, verbatim from `probe_check_arcs_ideal.txt`)
+
+- **Q0 surface**: no data-check flags exist. `report_check_types -data_setup`
+  → `[ERROR STA-0562] report_check_types -data_setup is not a known keyword or
+  flag.` (same for `-data_hold`); `find_timing_paths -path_delay data_setup`
+  → `[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise,
+  min_fall, max, max_rise, max_fall or min_max.` (same for `data_hold`,
+  `non_seq_setup`, `non_seq_hold`, `three_state`).
+- **`non_seq_*` — ignored, stays deferred.** Each `SET_B`/`RESET_B` pin finds
+  exactly one path (`u_fbp/RESET_B path count: 1`, same on all four pins) and
+  `report_checks -to` prints only the recovery row ("recovery check against
+  rising-edge clock", Path Group `asynchronous`) — no `non_seq` row on any
+  surface. Deferral = parity.
+- **`three_state_*` — evaluated as delay arcs.** `find -from te path count: 12`
+  (all `u_cap*/D` endpoints); after `set_disable_timing u_ebuf A->Z` the
+  `te → u_ebuf/Z` path still reaches `u_cap1/D` (`path count after disable
+  A->Z: 1`, "Startpoint: te"), and after `set_disable_timing u_evp TE->Z` the
+  `d_in → u_evp/Z` path survives symmetrically. `te_slow` shifts every
+  `u_cap*/D` `max_arr` by +1.8 ns versus `ideal` (e.g. `u_cap1/D` 1.675581 →
+  3.444121).
+- **`Clear`/`Preset` — still count-only** (R6 confirmed): `paths through
+  u_fbp/Q: 0`, `paths through u_fbn/Q_N: 0`.
+- **`preserve`** — unmeasurable (zero arcs); counted if a lib ever carries it.
+
+### `three_state_*` edge + load model (Q3, verbatim)
+
+`report_edges` shows OpenSTA models the arcs as hi-Z transition arcs. Each arc
+fires **one** source edge — the one that toggles the enable — and produces both
+destination transitions:
+
+```
+TE_B -> Z tristate disable        TE_B -> Z tristate enable
+  ^ -> 0Z 0.05:0.05                 v -> Z1 0.09:0.09
+  ^ -> 1Z 0.03:0.03                 v -> Z0 0.09:0.09
+A -> Z combinational                (u_einv/u_evp same shape;
+  ^ -> ^ 0.13:0.13                   u_evp enable fires `^`, disable `v`)
+  v -> v 0.11:0.11
+```
+
+Rule, applied in `arc_legs()`: `positive_unate` fires on the source **rise**,
+`negative_unate` on the source **fall**; `Z1`/`0Z` merge into dst rise,
+`Z0`/`1Z` into dst fall; delay/transition tables are looked up by dst polarity
+as usual.
+
+`report_net z1` proves the tristate driver's own pin capacitance stays on the
+net load — including for the arcs driving it:
+
+```
+Net z1                         Driver pins
+ Pin capacitance: 0.003934        u_ebuf/Z tristate (ebufn_1) 0.002260
+ ...                             Load pins
+                                 u_cap1/D input (dfxtp_1) 0.001674-0.001681
+```
+
+`sink_cap` previously returned 0 for every driver pin, so `A -> Z` came out
+0.095 ns vs OpenSTA's 0.13 ns. `LibPin::is_tristate` (set when the pin is the
+target of a `three_state_*` arc) now keeps the pin's capacitance on the net;
+ordinary drivers still exclude their own pin.
+
+### Our side (same fixture, `grus-eda sta`, zero wire)
+
+`--strict` verdicts: `propagated.sdc` exits **0** ("skipped: none affecting
+reported timing"); `ideal.sdc`/`te_slow.sdc` exit **1** on
+`cell_driven_clock_nets=1` — `c1` is buffer-driven, the documented ideal-mode
+limitation, not a check-arc issue. Skip block, verbatim (all modes):
+
+```
+  recognized_check_arcs[Clear=4, MinPulseWidth=4, NonSeqHoldRising=4, NonSeqSetupRising=4, Preset=4]
+```
+
+(20/68 arcs; `three_state_*` no longer counted — they are graph edges now.)
+
+Endpoint comparison (`--json` vs golden, 11 endpoints × 8 fields, STRICT):
+
+| scenario | worst \|Δ\| (ns) | where |
+|---|---|---|
+| ideal | 1.0e-6 | `u_fbn/SET_B.min_arr_ns` (golden `%.6f` rounding) |
+| propagated | 0.7e-6 | `u_ff/D.max_slack_ns` |
+| te_slow | 1.0e-6 | `u_fbn/SET_B.min_arr_ns` |
+
+`u_cap1/D.max_arr_ns` = 1.675581 in `ideal` (via `A -> Z` fall) and 3.444121 in
+`te_slow` (via `TE_B -> Z` `Z0`) — the discriminator works.
+
+**Tests**: `test_sta_edge_check_arcs_{ideal,propagated,te_slow}` at
+`Tol::STRICT`; `test_check_arcs_deferred_counts` pins the skip map literal
+above. Fail-proofed (E0 rule 7): dropping `ThreeStateDisable` from the graph
+edge arm turned all three golden tests red; restored green. Liberty cache
+`CACHE_VERSION` 7 → 8 for the new `LibPin::is_tristate` field.
+
+**Checks run**: `bash tests/designs/sta_edge/check_arcs/generate_ref.sh` —
+whole script, twice (probe transcripts byte-stable between reruns). `grus-eda
+sta` on all three SDCs (`--json` + `--strict`, verbatim above). `cargo test
+--workspace` — all pass; `cargo clippy --workspace --all-targets -- -D
+warnings` — clean.
+
+## 2026-11-21 — `xdomain-deferrals`: the four parked `CrossDomain` corners resolved (v0.2.12)
+
+`docs/multi-clock.md` §2 parked four defensive deferrals; this entry
+records, per corner, what OpenSTA actually does (committed
+`tests/designs/sta_clocks/probe_t2_*.txt`) and what now runs.
+
+**Probe run**: `bash tests/designs/sta_clocks/probe.sh` inside
+`ghcr.io/librelane/librelane:3.0.16` — whole script (all `SCENARIOS`
++ `PROBE_ONLY` + `MEASURE_ONLY` + the latch block), in this worktree.
+`two_clock.reference.json`/`two_clock_latch.reference.json` regenerated
+by the script and committed; probe transcripts are the verbatim evidence.
+
+### Item 1 — undeclared-launch zero mask: evaluated (named `UndeclaredLaunch`)
+
+`t2_u1` (one-clock SDC on `two_clock.def`): OpenSTA keeps `u_fb0`'s
+clk->Q launch at edge 0 (`t2_u2` shows it —
+`Startpoint: u_fb0 (rising edge-triggered flip-flop)`, no `clocked by`,
+`0.00 ^ u_fb0/CLK`) but drops every ordinary check on the arrivals:
+`u_fy/D` yields no endpoint row and no `-unconstrained` entry.
+`t2_u2` adds `set_max_delay 1.5`/`set_min_delay 0.5 -to u_fy/D` and the
+endpoint **does** report: `req = N − t_setup` (`arr 0.293 / req 1.39`
+max), `req = N + t_hold` (`arr 0.303 / req 0.46` min).
+
+The launch's clk->Q delay is evaluated at the clock pin's **real vertex
+slew** — `report_slew` shows `u_fb0/CLK` ≈ 0.04/0.03 (the `u_clkb`
+buffer output on `cb`), not the ideal-clock edge slew. `u_fa0`'s
+clocked path uses the clock-edge slew (~0) instead, which is why a
+zero-slew seed matched `u_fa0` but underestimated `u_fb0` (arr 0.277
+vs 0.293). The seed now comes from `driver_input_slew`: walk the
+driver chain back to the source port (`set_input_transition` or 0),
+fold each cell's `driver_response` output slew forward.
+
+`t2_u3` covers the complementary corner — a `-to` delay check on an
+**unclocked capture** endpoint (`set_max/min_delay -to u_fb0/D`, whose
+CLK pin sits on the undeclared `cb` net): OpenSTA reports `u_fb0/D`
+anyway with `req` anchored at the delay value itself — `1.50
+max_delay − 0.14 setup → 1.36`, `0.50 min_delay − 0.04 hold → 0.46`,
+no clock edge, uncertainty, or CRPR term (`probe_t2_u3.txt`).
+
+Implemented: the zero-mask launch is seeded (edge 0, computed slew,
+empty dom mask); ordinary checks skip with `UndeclaredLaunch`
+(`related` names `<undeclared>`), `skipped.undeclared_endpoints`
+counts them and `is_clean` exempts them (OpenSTA drops the same
+checks); `-to` delay checks on the same endpoints compose from the
+undeclared arrival — `u_fy/D` req = edge-0 `capture ± setup/hold + N`
+as measured, with the unclocked-capture form falling back to the bare
+`N ∓ t_constraint` anchor and the pin's driver-chain slew (`t2_u3`).
+
+### Item 2 — latch-D foreign launch: evaluated
+
+`t2_xlat`/`t2_xlat2` (`d2` launches `cka` into `u_ln`, a `ckb` `dlxtn`):
+OpenSTA borrows against the **latch's own** window. `t2_xlat2` at
+`-digits 5` (`probe_t2_xlat2_d5.txt` — the two-digit report cannot
+separate the cases): `u_ln/D` fall arrival 1.90 → `time given to
+startpoint 0.91038` = `open 0.7 + min(arr − open, pulse 0.5 − unc
+0.15 − setup)` — the arrival clamped to the *first* window's borrow
+cap, not window-cycle arithmetic. The borrowed `u_ln/Q` launch is `ckb`-domained
+(`u_ln -> u_fb0` pairs `ckb->ckb`, req 0.94/0.99 per transition).
+Endpoint checks on `u_ln/D` show `time borrowed from endpoint`
+0.32/0.36 → req 0.87/0.91 (`probe_t2_xlat2.txt`).
+
+Implemented: the borrow merge re-domains arrivals to the enable's
+domain row (period/uncertainty/setup read off `sdc.clocks[en_dom]`),
+open-edge parity, sentinel CRPR tag; the cap is the single-window
+clamp above. Same-domain `t2_latch` behaviour is unchanged (the cap
+degenerates to the prior formula inside the first window).
+
+### Item 3 — unpairable hold tying: capture-edge-driven pairing
+
+The hold pair search is now **capture-edge-driven** — each capture edge
+inside the window pairs with the smallest launch edge at-or-after it,
+including the first edge past the boundary (measured `t2_waverot`
+`u_fy/D`: capture 1.9 → launch 2.0 on the LCM boundary; `t2_wave`
+non-coincident min-gap). The old launch-driven formulation is what
+left some parities with no pairing; the new rule pairs every measured
+grid — the `None` return is now unreachable-but-kept (see item 4).
+
+### Item 4 — `grid_lcm` non-convergence: OpenSTA evaluates anyway
+
+`t2_lcm` (cka 2.0 / ckb 1.7320508 ≈ √3): OpenSTA warns
+`[WARNING STA-1010] No common period was found between clocks cka and
+ckb` — three times (once per report block) — **and still evaluates
+every endpoint**: `u_fy/D` slack −0.38, `u_fx/D` −0.39. `t2_lcm2`
+(2.0/1.999999) converges inside the bound and warns nothing. The
+measured window: scan the first ~100 min-period edges for a common
+period; on failure bound the launch scan to the first `N` capture
+periods — directional, `N = 100` when the launch clock is faster
+(`probe_t2_lcm.txt` pairs at 112/97 inside 200 = 100·2.0), `1000`
+when slower (808/933 inside ~1732 = 1000·1.732). The boundary is
+bracketed by `probe_t2_lcm3.txt` (2.0/1.98, LCM 198 — converges
+silently) and `probe_t2_lcm4.txt` (2.0/1.9801 — warns). `pair_window`
+implements exactly that; the no-pair `CrossDomain` deferral survives
+only as the defensive `None` path — unreachable on the measured
+grids.
+
+### Our side
+
+`test_sta_clocks_match_opensta` compares all 52 golden scenarios
+(49 `two_clock` + `t2_latch`/`t2_xlat`/`t2_xlat2`) endpoint-by-endpoint
+at STRICT — **zero mismatches**, `cross_domain_endpoints == 0`
+asserted per scenario (the `is_deferred` exemption can no longer hide
+a re-deferral). `xdomain_deferrals_scenarios` pins the per-item
+verdicts: `t2_u1` `u_fy/D` named `UndeclaredLaunch` (and `yb`),
+`t2_u2` `u_fy/D` arr/req, `t2_lcm*` slack rows, `t2_xlat*` `u_ln/D`
+borrow (req 0.87) plus the re-domained `u_fb0/D` row.
+`sta_clocks_measure_only_scenarios` additionally pins `t2_u3`
+(`u_fb0/D` reported through the unclocked-capture `-to` check,
+req 1.36/0.46) and the `t2_lcm3`/`t2_lcm4` full endpoint sets.
+`one_clock_sdc_on_two_clock_def` now expects `UndeclaredLaunch` on
+`u_fy/D`/`yb` (previously `NoPath | UntimedDriver`).
+
+During the bring-up the strict test caught two real divergences, both
+fixed by measurement rather than tuning: the zero-slew launch seed
+(→ `driver_input_slew`) and a `k·P` window-cycle normalization in the
+borrow cap that paired a cycle-2 launch with a cycle-1 capture
+(→ single-window clamp). Fail-proof (E0 rule 7): reverting either
+re-opens the `t2_u2`/`t2_xlat2` mismatches.
+
+**Checks run**: `cargo test --workspace` (all pass),
+`cargo clippy --workspace --all-targets -- -D warnings` (clean),
+`cargo test -p grus-core sta::` (176 pass), `probe.sh` run whole in
+the container as committed — the existing transcripts/goldens came
+back byte-stable and the new `t2_*` artifacts were emitted by the
+same run (golden SDCs `t2_u1`/`t2_u2`/`t2_lcm`/`t2_lcm2`/`t2_xlat`/
+`t2_xlat2`; measure-only `t2_u3`/`t2_lcm3`/`t2_lcm4` plus the
+`-digits 5` `t2_xlat2` evidence rerun).
+
+### 2026-11-21 — N7 — activity propagation probe (v0.2.13)
+
+Measure-first ticket for OpenSTA's statistical activity model — the
+recorded root cause of the gcd `report_power` divergence (N7 entries
+2026-11-18). No code change; the measured semantics and the AP1–AP4
+sequenced plan land in `docs/roadmap.md` and
+`kurena/tasks/activity-propagation/design/api.md` §Plan.
+
+**Run record**: committed `tests/designs/microbench/generate_activity_ref.sh`
+inside `ghcr.io/librelane/librelane:3.0.16`, `sky130_fd_sc_hd`
+`tt_025C_1v80`, `mba.def`/`mba.sdc`. All sections ran (P0 command surface,
+P0b label-precedence, all 12 sessions, the python parse) — twice;
+`mba.activity.reference.json` and `mba.none.openroad.txt` regenerated
+byte-identically on the second run. `mba.none.openroad.txt` is the
+`s_none` transcript with `grep -v` on INFO/WARNING/banner/blank lines —
+**filtered, not verbatim**. The fixture is hand-written (`mba.def`:
+and/or/inv/xor cone with reconvergent fanout on `b`, one plain `dfxtp`,
+a toggling flop and a 2-bit counter as sequential feedback, a `conb_1`
+feeding two bufs, an undriven net `n_float`; five probe VCDs).
+
+**Per-pin accessor**: `get_property <pin> activity` exists (first
+recorded 2026-11-19) and returns `<density/s> <P(1)> <source>` — so every
+rate below is a **direct read**, not an inversion from `report_power`
+columns. Sanity: `clk` reads `1.00000e+08 0.500 clock` = 2 toggles per
+20 ns period. `density`/`probability` are not separate properties; pin
+objects interpolate to pointers, so the dump queries all 43 pins by name.
+
+#### P0 — command surface (verbatim)
+
+- `info commands *power*`: `set_max_dynamic_power analyze_power_grid
+  assign_power_net create_power_domain report_power_metric
+  unset_power_activity define_power_switch_cell report_power
+  set_max_leakage_power create_power_switch read_power_activities
+  check_power_grid map_power_switch set_power_activity
+  set_pdnsim_inst_power`.
+- `*activ*`: `unset_power_activity read_power_activities
+  report_activity_annotation set_power_activity`.
+- `*annotation*`: `report_parasitic_annotation report_activity_annotation`.
+- `set_power_analysis`: **`invalid command name` in this build**.
+- `set_power_activity`: bare → STA-0306 `Specify -activity or -density`;
+  `-help` → STA-0562. Measured spellings: `-global`, `-input`,
+  `-input_ports [all_inputs]`, `-pins [get_pins ...]` all parse with
+  `-activity <f>` and/or `-density <f>` plus `-duty <f>`.
+  `-activity` is normalized to the clock (`0.2` → `1e7` = 0.2 × 5e7);
+  `-density` is in library time units (`0.03` → `3e7`/s = 0.03/ns).
+  `read_power_activities` bare → STA-0565 `requires one positional
+  argument` (a filename). `report_activity_annotation -verbose` →
+  STA-0562; `-report_unannotated` prints the pin list.
+- Knob semantics (P0b session): `-input` seeds input ports *and* undriven
+  pins at the given {density, duty} — source label `input`, pins still
+  `unannotated` in the split. `-input_ports` sets explicit pins — label
+  `user`, counted `input N` in the split. `-global` overrides **every**
+  non-clock non-constant pin — measured including VCD-annotated pins
+  (`a` reads `3e6/0.55 vcd`, then `1e7/0.4 global` after `-global`; the
+  split still counts it `vcd`) and `unknown` feedback registers.
+  `unset_power_activity` removed nothing in either sequence (`a` kept
+  `1e7 0.4 global`). Only `vcd`/`saif`/`user` (`-pins`, `-input_ports`)
+  pins count in `report_activity_annotation`; the `-global`/`-input`
+  knobs do not.
+- `read_vcd` prints `Annotated N pin activities.` — N is the count of
+  **pin-name matches**, not nets (P4).
+
+#### P1 — no annotation at all (`s_none`, verbatim)
+
+```
+clk      1.00000e+08 0.500 clock        a,b      5.00000e+06 0.500 input
+u_flt/A  5.00000e+06 0.500 input        n_flt    5.00000e+06 0.500 propagated
+n_and    5.00000e+06 0.250 propagated   n_inv    5.00000e+06 0.500 propagated
+n_or     6.25000e+06 0.625 propagated   y        1.00000e+07 0.500 propagated
+q        5.00000e+06 0.500 propagated
+n_q0,n_q0n,n_q1,n_c1d (the whole u_f0/u_f1 feedback cone, 11 pins):
+         0.00000e+00 0.000 unknown
+n_hi,n_lo,n_bh,n_bl (+ ports yh,yl):    0.00000e+00 0.000 constant
+```
+
+Defaults, solved directly (not implied):
+
+- **Input default = 0.1 × f_clk, duty 0.5** — `5e6/0.5` on input ports
+  *and* undriven nets (`u_flt/A`, source `input`). `s_p40` (period 40)
+  halves it to `2.5e6` along with `clk` `5e7` — the default is
+  clock-normalized, not a fixed rate. `-input -activity a -duty d`
+  replaces it; `-input_ports` sets individual pins instead.
+- **Clock nets = SDC rate**, `2/period`, duty 0.5, source `clock` — on
+  clk's port and all three DFF CLK pins. Unaffected by `-global`,
+  `-input`, or VCD annotation (the SAIF-`TC` finding re-confirmed).
+- **Sequential**: plain `dfxtp` Q inherits D's {P, d} (`q` = a's
+  `5e6/0.5`); sequential feedback resolves to `0/unknown` — P3.
+- **Constants** (`function : "0"/"1"` cones): `{0, "constant"}` on the
+  conb pins, the downstream buf cone, and the output ports — immune to
+  `-global`.
+- **Everything else**: combinational propagation per P2, source
+  `propagated`; nothing is zero except `unknown`/`constant`.
+- `report_power` on the all-default run: Sequential
+  `6.218178e-06 / 4.050000e-07 / 2.453692e-11`, Combinational
+  `2.413420e-07 / 1.341279e-06 / 3.129771e-11`, Total `8.205853e-06`
+  (internal / switching / leakage, watts). `unannotated 43`.
+- `s_global` (`-activity 0.2 -duty 0.4`): every non-clock non-constant
+  pin → `1e7/0.4 global` — including the `unknown` feedback cone;
+  constants and clock pins keep `constant`/`clock`. Total `1.159849e-05`.
+- `s_input` (`-activity 0.2 -duty 0.4`): `a`,`b`,`u_flt/A` →
+  `1e7/0.4 input`; internals propagate from the seeds — `u_and/X`
+  `8e6/0.16` (= 0.4², d = 2×1e7×0.4), `u_or/X` `1.16e7/0.664`.
+- `s_global_density` (`-density 0.03 -duty 0.35`): all → `3e7/0.35
+  global` — `-density` is per library time unit.
+
+#### P2 — combinational propagation: **M1 local marginals**
+
+Seeds `a` = `3e6/0.55`, `b` = `3e6/0.8` (`s_ports`). Every propagated
+value below reproduces to print precision from per-gate independence:
+
+| net | read | M1 formula | joint (M2) |
+|---|---|---|---|
+| `n_and` | `4.05e6` `0.440` | P = p_a·p_b = 0.44; d = d_a·p_b + d_b·p_a = 4.05e6 | — |
+| `n_inv` | `3e6` `0.200` | P = 1−p_b; d = d_b | — |
+| `n_or`  | `4.92e6` `0.552` | P = p+q−p·q = 0.552; d = d_and·(1−p_inv) + d_inv·(1−p_and) = 4.92e6 | P = 0.64 |
+| `y` (xor) | `6e6` `0.470` | P = p_a⊕p_b = 0.47; d = d_a + d_b = 6e6 | — |
+
+The discriminating `n_or` read is `0.552` — the correlated `b` fanout
+through `u_and`/`u_inv` is **not** tracked (M2's joint truth `a|!b` =
+0.64 is rejected). Density follows output-sensitization: an input edge
+propagates iff the other inputs sit in the enabling state
+(AND: `Σ d_i·∏_{j≠i} p_j`; OR: `Σ d_i·∏_{j≠i} (1−p_j)`; XOR: `d_a+d_b` —
+every input edge toggles the output under either state). Inverting
+pins compose `1−P` with the same density (`n_inv`).
+
+`s_full` (all 18 nets dumped with function-consistent waveforms) vs
+`s_ports`: the *activity model* reads identically — flat internal net
+dumps are dead entries (P4). The propagated-vs-exact delta on this cone,
+from the `mba_full` waveforms themselves:
+
+| net | propagated | exact dump | note |
+|---|---|---|---|
+| `n_and` | `4.05e6` / 0.44 | `3e6` / 0.55 | stimulus has a⊆b |
+| `n_or` | `4.92e6` / 0.552 | `3e6` / 0.75 | correlation missed |
+| `y` | `6e6` / 0.47 | `3e6` / 0.25 | a,b edges coincide — invisible to marginals |
+| `n_inv` | `3e6` / 0.20 | `3e6` / 0.20 | exact here |
+
+#### P3 — sequential: **Q inherits D's {P, d}; feedback cones → `unknown`**
+
+- `u_df/Q` copies `a` verbatim: `3e6/0.55` (`s_ports`), `6e6/0.55`
+  (`s_ports_a2x` — density follows the doubled input rate), `3e6/0.40`
+  (`s_xz` — probability follows the x-degraded seed). S1 confirmed; a
+  DFF contributes its D pin's activity, nothing clock-derived.
+- The toggle flop and 2-bit counter — `u_f0`/`u_i0`/`u_f1`/`u_x1`,
+  11 pins — read `0.00000e+00 0.000 unknown` in **every** session,
+  including `s_full` where the nets carry exact dumps (dead entries
+  again). OpenSTA does **not** resolve the sequential feedback loop:
+  no divide-by-2 (`n_q0` exact `5e7`, `n_q1`/`n_c1d` exact `2.5e7` —
+  all reported 0). `-global` is the only knob that overrides `unknown`.
+- Sequential *internal* on clock pins follows the SDC clock
+  (`u_*/CLK` = `1e8/0.5 clock` everywhere; halved to `5e7` in `s_p40`
+  along with Sequential internal `6.218e-6 → 3.109e-6`) — the
+  SAIF-`TC`-sweep finding re-confirmed on this fixture.
+
+#### P4 — partial annotation: **per-pin name match; internals re-derive**
+
+- `read_vcd`/`read_saif` annotate **pins whose name appears in the
+  dump**: flat top-scope names match *port* pins only (`s_full` split
+  `vcd 4` = `a`, `b`, `clk`, `y`; `s_ports`/`s_partial`/`s_xz` `vcd 3` =
+  `a`, `b`, `clk`; `s_partial2` `vcd 1` = `u_and/X`). A `clk` match is
+  annotated but reported `clock` — the clock model wins.
+- **Flat internal net names are dead entries**: `s_partial` dumps
+  `n_and` at a deliberately inconsistent `1e6/0.80`; `u_and/X` still
+  reads `4.05e6/0.44 propagated` and `n_or` is bit-identical to
+  `s_ports`. `s_full` ≡ `s_partial` ≡ `s_ports` in every column —
+  internal dumps change nothing.
+- **Hierarchical pin names do annotate**: `mba_partial2.vcd` scopes
+  `u_and/X` (no port signals): `u_and/X` reads `1e6/0.8 vcd` and
+  downstream `u_or/X` follows to `1.5e6/0.9` (= 0.8+0.5−0.8·0.5 /
+  1e6·0.5 + 5e6·0.2 — annotation propagates; the same read with ports
+  annotated identically also moved `n_or` to `1.4e6/0.84`). Verdict:
+  internal annotation wins over re-derivation — *when it lands on a
+  pin*.
+- **Activity is per-pin, not per-net**: in `s_full`, port `y` holds the
+  exact `3e6/0.25 vcd` while `u_xor/X` on the same net keeps
+  `6e6/0.47 propagated`; Combinational switching is identical to
+  `s_ports`, so net switching consumes the **driver pin's** value —
+  port `y`'s annotation changes nothing downstream (no fanout).
+- Fallback: unannotated input ports → `input` default; unannotated
+  internals → propagated; the only "stay zero" classes are `unknown`
+  (feedback) and `constant`.
+
+#### P5 — x/z, constants, undriven
+
+- `s_xz`: `a` carries `0→x` at 300, `x→1` at 500 (the 200 rise
+  replaced). Reads `3e6/0.40 vcd`: density counts the two half-weight
+  x edges (5 clean + 2×0.5 = 6 → `3e6`, same as the clean-run seed);
+  `P = 800/2000` with x time in the denominator. Propagation runs on
+  the degraded seed normally (`n_and` `3.6e6/0.32`, `n_or` `4.92e6/0.456`,
+  `y` `6e6/0.56`) — no poisoning.
+- Constants: `{0, "constant"}` on `u_c/HI`,`u_c/LO`, both buf cones and
+  ports `yh`/`yl`. The accessor prints `P 0.000` on *both* HI- and
+  LO-side nets — the read cannot distinguish the constant's value;
+  recorded as a probe limitation, not hidden.
+- Undriven `n_float`: **no OpenSTA warning at all**; `u_flt/A` gets the
+  `input` default and `u_flt/X` propagates it (`5e6/0.5`).
+- Constant nets contribute nothing to `report_power` columns by
+  construction (density 0 ⇒ no switching; their leakage states are the
+  only visible trace) — the honest limit of what `report_power` can show.
+
+#### Disposition — Branch P (plan), and why
+
+The model above is small but not one-commit small: it needs a resolved
+per-net activity record (replacing `Option<SignalActivity>`), the
+name-match seed pass, a `LibPin.function` evaluator with the three
+density rules, sequential Q=D + unknown marking, constant propagation,
+and the CLI/diagnostic surface — each mechanism independently
+golden-covered. It lands as **AP1–AP4** (sequenced in
+`kurena/tasks/activity-propagation/design/api.md` §Plan; the
+`mba.activity.reference.json` sessions are their goldens):
+
+- **AP1** — resolved-activity skeleton + measured defaults
+  (annotation/clock/input-default/global seeds; no propagation).
+  Golden: `s_none`, `s_global`, `s_input`, `s_p40`.
+- **AP2** — combinational propagation (function evaluator + levelized
+  fill, M1 rules). Golden: `s_ports`/`s_full`/`s_input` comb columns +
+  per-pin block.
+- **AP3** — sequential rules (Q=D; feedback cones `unknown` → 0).
+  Golden: `s_ports`/`s_ports_a2x`/`s_xz` seq columns.
+- **AP4** — annotation precedence (pin-name match incl. scoped inst
+  pins), constants, x/z seeds, per-origin diagnostics; gcd
+  `report_power` re-comparison recorded here. Golden: `s_partial`,
+  `s_partial2`, `s_xz`, `s_full`.
+
+**Checks run**: `generate_activity_ref.sh` re-run end-to-end on this
+worktree — `mba.activity.reference.json` and `mba.none.openroad.txt`
+byte-identical across runs (`diff` clean); `cargo test --workspace`
+and `cargo clippy --workspace --all-targets -- -D warnings`; `git diff`
+on every existing golden (`mb*`/`mbw*`/`gcd`/all other
+`*.reference.json`) empty — this ticket adds files only. Not run:
+`grus-eda power` on the `mba` fixture as a golden test (no code landed;
+the fixture parses and runs cleanly through the CLI as a smoke check).
+
+### 2026-11-21 — N7 — AP1: resolved activity + measured seed defaults (v0.2.14)
+
+First implementation ticket of the AP1–AP4 sequence measured above.
+`crates/grus-core/src/activity.rs` adds `resolve_activity`, which fills
+every net's `ResolvedActivity { prob_one: Option<f64>, eff_toggles: f64,
+origin: ActivityOrigin }` in the measured precedence — constant cone →
+clock → `-global` → VCD/SAIF → input/undriven → `Default` (the interim
+fill while AP2/AP3 are unlanded). `PowerCx.net_activity` is now
+`Vec<ResolvedActivity>`; `net_activity()`/`net_prob_one()` read through
+it. No combinational propagation (AP2), no sequential rules (AP3), no
+scoped pin matching (AP4).
+
+**Representation choice (api.md §1)**: option (a) — `eff_toggles` stays
+`f64`. Seeded nets store `density_per_s × window_s` so the annotated
+(`SignalActivity`-count) and seeded paths share one arithmetic —
+`switching_w`/`pin_internal_power` are untouched. `window_s` is
+`vcd.duration_s` when a dump is loaded and positive, else `1.0`:
+absolute-density mode where counts equal rates numerically and the
+window cancels in `switching_w` either way. `PowerReport.duration_s`
+reports that window.
+
+**Semantics landed**: `constant_cone` marks `function:"0"/"1"` outputs
+and grows through non-sequential cells whose every input net is already
+constant (constant-through-buffer is this seed, not AP2; mixed-input
+gates stay unresolved); clock nets are port-driven `create_clock`
+sources at `{2/period, 0.5}` — cell-driven downstream clock nets are
+`Default` (named residual, unmeasured); `-global` hits every non-clock
+non-constant net, beating annotation and `unknown` cones; `-input` /
+undriven seed is `{0.5, 0.1·f_clk}` (`f_clk/10.0` keeps `5e7→5e6`
+bit-exact). Origin labels mirror the accessor's `source` column;
+`propagated`/`sequential`/`unknown` are declared but never emitted in
+AP1. `activity_origin_counts` (per net — OpenSTA's split is per pin,
+recorded difference) feeds `PowerDiagnostics`; `driven_nets_without_
+activity` now counts only `Default`/`Unknown` driven nets — genuinely
+unresolved ones (the AP2 work list), so on partial VCDs it can only
+drop vs the old count.
+
+**`group_of` correction**: the old "arc-less → Clock" arm was a
+gcd-era guess never exercised by a lib'd cell (gcd's arc-less cells
+are unmapped fillers counted in `cells_without_lib_cell`). Measured on
+`mba`: `conb_1`'s leakage sits in OpenSTA's **Combinational** group.
+New rule — sequential → Sequential; non-sequential touching a
+`Clock`-origin net → Clock (clock-network cell); else → Combinational.
+Mid-tree clock cells still land in Combinational (their nets are
+`Default`-origin in AP1 — same residual as above).
+
+**Golden — `test_activity_defaults_mba_matches_opensta`**
+(`mba.activity.reference.json`, 43 pins):
+
+- `s_global` / `s_global_density`: all 43 pins `{density, prob, source}`
+  strict (clock `1e8/0.5`, constant `0/0`, global `1e7/0.4` and
+  `3e7/0.35`), plus group columns at tightened bounds — internal
+  0.5% / switching 0.5% / leakage 1% + 1e-14 / total 0.3%. Measured
+  residuals: sequential switching +0.263%, combinational switching
+  +0.156%, combinational internal +0.132% (OpenSTA's switched
+  capacitance appears to carry a small term we do not reproduce —
+  named residual); sequential internal and every leakage column are
+  exact modulo the golden's print precision.
+- `s_none` / `s_input`: the 15 seeded-class pins
+  (`input`/`clock`/`constant`) strict; the 28 pins whose golden source
+  is `propagated` (17) or `unknown` (11) are pinned in
+  `EXPECTED_DIVERGENT` — a *new* divergence or a moved set fails
+  loudly; AP2/AP3 shrink it.
+- `s_none`/`s_input` group columns are print-only for the record
+  (the `Default` fill is not propagation): `s_none` internal +3.5%,
+  switching +24.0%, total +7.8%; `s_input` internal +7.0%, switching
+  +26.8%, total +13.6% vs OpenSTA — the divergence AP2 closes.
+
+**Moved goldens**: `mb.power.json` regenerated via the recorded CLI
+command — `diagnostics` gains `activity_origin_counts`
+(`{"annotated": 3, "clock": 1}`; the `clk` net's source reads `clock`,
+matching `s_full`'s golden), and Sequential internal moves
+`2.0892e-6 → 2.0789e-6` because the `2/period` clock seed replaces
+`clk`'s VCD count on the DFF's CLK-pin internal-power lookup (the TC
+precedence measured in P0b) — moving **toward** OpenSTA's
+`2.078733e-6` (was +0.4% off, now +0.01%). No other column moved.
+`mb.saif.reference.json`, `mbw.reference.json`,
+`mba.activity.reference.json`, and every other `*.reference.json`:
+`git diff` empty — fully-annotated fixtures are byte-identical
+(`mb`/`mbw` tests still pass at the established bounds; the saif
+clk-annotation override shifts Sequential internal inside its 2%
+bound in the same direction).
+
+**CLI**: `grus-eda power` runs with neither `--vcd` nor `--saif`
+(they stay mutually exclusive); the header prints `activity: defaults
+(no annotation file)` and a deterministic per-origin split line
+(`activity: annotated=3 clock=1 …`) follows the groups.
+
+**Fail-proof**: seed pass disabled (every net forced `Default`) →
+`s_none a: source` red (`"default"` vs golden `"input"`); restored.
+One density corrupted inside `mba.activity.reference.json` `s_global`
+→ strict assert red at the density bound; `git checkout` restored,
+test green.
+
+**Checks run**: `cargo test -p grus-core power` (4/4 incl. the new
+golden), `cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --release -p grus-core
+sta`. AP2–AP4 remain open (combinational propagation, sequential
+rules, scoped annotation).
+
+### 2026-11-21 — N7 — AP2: combinational activity propagation (v0.2.15)
+
+Second ticket of the AP1–AP4 sequence: `Default`-origin nets driven by
+non-sequential non-latch cells are overwritten by the M1 local-marginal
+model — `P(f)` under independent inputs and
+`d(f) = Σ_i d_i · P(∂f/∂x_i)` via Shannon cofactors. New
+`crates/grus-core/src/bool_expr.rs` is a bounded recursive-descent
+evaluator (constants, `!` `&` `|` `^`, parens, repeated literals;
+`MAX_VARS`/`MAX_DEPTH`/`MAX_NODES`/`MAX_OPS` bounds — parse-time caps on
+`!`/`(` recursion depth and AST size keep pathological strings from
+overflowing the stack, and the node cap covers every recursive consumer;
+`MAX_OPS` bounds Shannon work only; malformed or over-bound forms return
+`None`, never panic — `test_bound_trips_no_abort` pins each cap).
+`propagate_combinational` (`activity.rs`) parses each candidate driver
+pin's Liberty `function`, maps its variables to the cell's input nets
+via `DesignDb::pin_by_lib_name` (moved out of `power.rs`), and fills in
+Kahn order over the candidate-DAG — a `Default`/`Unknown`/`prob_one:
+None` input taints the output to `Default` (sequential feedback cones
+stay unresolved until AP3); true comb cycles never dequeue. sky130
+coverage: 448 `LibPin.function` decls kept from the lib (483 raw
+`function :` lines), all parse, all vars map to sibling pins —
+`unresolvable_functions = 0` on every `mba` session
+(`bool_expr::tests::test_sky130_function_coverage` pins the counts).
+
+**Annotation moves to the pin namespace**: `VcdActivity` gains
+`pin_signals` — per-declaration scoped paths (`tb/dut/u_t/Z`), aliases
+for reused VCD codes included; `vcd.signals` (flat names) is retained
+for compat but no longer feeds net resolution. `SaifActivity::resolve`
+emits the same map (top scope via the net's driver pin, nested
+`INSTANCE/leaf`). A dump entry annotates a net iff it names the net's
+driver pin (`annotation_net_of`): input ports and instance output pins
+drive; output ports and instance input pins are dead entries, counted
+in `dead_annotation_entries`. On `mba`: `s_partial`'s flat `n_and` dump
+entry is dead (the session's resolved nets are asserted identical to
+`s_ports` — the only difference is the dead entry); `s_full` dumps 18
+pins and 15 non-driver entries are dead.
+
+**Golden — `test_activity_defaults_mba_matches_opensta`**: every
+session's golden now reads strict at the recorded bounds. The
+divergent set shrank from 28 to exactly 13 pins, asserted verbatim in
+`EXPECTED_DIVERGENT`: net `q`'s sequential Q=D copy (`u_df/Q`, `qd`)
+plus the 11 `unknown`-cone pins (`q0`, `q1`, `u_f0/D`, `u_f0/Q`,
+`u_i0/A`, `u_i0/Y`, `u_f1/D`, `u_f1/Q`, `u_x1/A`, `u_x1/B`, `u_x1/X`).
+`s_full`'s output port `y` is the one per-pin residual
+(`PER_PIN_RESIDUAL`): the golden pin is `vcd`-annotated while net `y`'s
+driver `u_xor/X` is `propagated` — our model is per-net; the per-pin
+precedence is AP4 scope. `s_none` `origin_counts` is pinned at
+`{clock 1, constant 4, input 3, propagated 5, default 5}`; AP2
+diagnostics asserted per session (`dead_annotation_entries` 1/15/0 as
+above, `unresolvable_functions` 0 everywhere).
+
+**Group-column residuals** (measured; the surviving AP3 cone —
+`Default`-seeded `q` plus the four `unknown`-cone nets — carries the
+gap; bounds tighten when AP3 lands):
+
+| session | internal | switching | total |
+|---|---|---|---|
+| `s_none` | +4.24% | +52.98% | +14.62% |
+| `s_input` | +8.09% | +54.19% | +23.52% |
+| `s_ports` | +4.93% | +94.97% | +18.68% |
+| `s_ports_a2x` | +3.92% | +47.09% | +13.27% |
+| `s_partial` | +4.93% | +94.97% | +18.68% |
+| `s_full` | +4.93% | +94.97% | +18.68% |
+| `s_xz` | +4.94% | +95.07% | +18.70% |
+| `s_partial2` | +4.29% | +68.49% | +15.52% |
+
+vs AP1's `s_none` +3.5%/+24.0%/+7.8% — the residual *grew* without new
+error: AP1's flat `Default` fill under-counted the comb cone (`y`
+`1e7`, `n_or` `6.25e6` vs the `5e6` seed) while over-counting the
+`unknown`-cone nets (`5e6` vs golden `0`), and the two errors
+cancelled. The propagated fill now lands the comb nets exactly on
+golden, so only the `unknown`-cone overcount shows.
+`driven_nets_without_activity` on `s_none` moves 10 → 5 (the five
+`Propagated` nets count as derived).
+
+**Moved goldens**: `mb.power.json` regenerated via the recorded CLI
+command — `git diff` **empty**: `tb/dut/_d_/Q` and `tb/dut/_i_/Y`
+resolve to their nets' driver pins, keeping `annotated=3` and every
+watt column bit-identical. The flat `q`/`y`/`D`/`CLK`/`A` entries are
+dead annotations now (5 entries) but were never the net's resolving
+source. `mba.activity.reference.json`, `mb.saif.reference.json`,
+`mbw.reference.json`, all other `*.reference.json`: `git status` clean
+— fully annotated fixtures stay byte-identical.
+
+**Fail-proof**: `propagate_combinational` disabled (early `return`) →
+`s_none origin_counts` red (`default 10`, no `propagated`); restored.
+One golden `prob` corrupted inside `s_none` (`u_and/A` 0.5→0.6) →
+strict assert red at `s_none u_and/A: prob ours 0.5 vs golden 0.6`;
+file restored byte-identical, test green.
+
+**Checks run**: `cargo test --workspace` (332+3), `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --release -p
+grus-core sta` (182), the CLI regen above. AP3 sequential rules and AP4
+scoped annotation precedence remain open.
+
+### 2026-11-21 — N7 — AP2 r3: measured constant semantics (v0.2.16)
+
+Review delta on the landed AP2: `constant_cone` seeded `prob_one = 0.0`
+(the recorded accessor display artifact) and the propagation pass
+consumed it as a real marginal — the polarity question had to be
+measured, not inferred. Probe fixture `tests/designs/microbench/cp.def`
+(committed, with `cp_probe.tcl`): a `conb_1` (`n_hi`, `n_lo`) feeding
+one input each of `and2`/`or2`/`xor2`/`buf` gates whose other input is
+port `a`, annotated `set_power_activity -input_ports [get_ports a]
+-density 0.003 -duty 0.55` (absolute density; no clock). Verbatim
+`cp_probe.tcl` output inside LibreLane 3.0.16 (run today against the
+committed files):
+
+```
+ACTI u_andh/X 0.00000e+00 0.000 propagated
+ACTI u_xorh/X 3.00000e+06 0.550 propagated
+ACTI u_orh/X 0.00000e+00 0.000 constant
+ACTI u_andl/X 0.00000e+00 0.000 constant
+ACTI u_orl/X 3.00000e+06 0.550 propagated
+ACTI u_xorl/X 3.00000e+06 0.550 propagated
+ACTI u_andhh/X 0.00000e+00 0.000 constant
+ACTI u_bufh/X 0.00000e+00 0.000 constant
+=== precedence: -pins on absorptive vs propagated ===
+PINS u_orh/X 0.00000e+00 0.000 constant
+PINS u_andh/X 1.00000e+07 0.900 user
+=== precedence: -global on absorptive vs propagated ===
+GLOB u_orh/X 0.00000e+00 0.000 constant
+GLOB u_andl/X 0.00000e+00 0.000 constant
+GLOB u_orl/X 2.00000e+07 0.700 global
+```
+
+Three measured rules fall out:
+
+1. **The stored activity record for a constant net is `{d=0, P=0}` on
+   both polarities** — the P5 display artifact is the real internal
+   value. `xor(n_hi, a)` propagating `0.55` (a's marginal, computed with
+   `P(HI)=0`) instead of `0.45` (`¬a`) is the discriminator;
+   `and(n_hi, a)` → `0/0` confirms. `prob_one: Some(0.0)` on `Constant`
+   nets is correct as seeded; propagation and `eval_when` keep
+   consuming it.
+2. **The `constant` label uses true-polarity 3-valued evaluation** — a
+   gate output is `constant` iff its function has a definite value with
+   constant inputs bound to their true value: `or(1,X)=1`, `and(0,X)=0`
+   mark even with a toggling other input (absorption); `and(1,X)`,
+   `or(0,X)`, `xor(c,X)` do not. The landed all-inputs-constant rule
+   missed the absorptive cases (`u_orh/X`, `u_andl/X`, `u_andhh/X` all
+   read `constant`).
+3. **Marking is structural** — an absorptive-constant pin stays
+   `constant` under `set_power_activity -pins` and `-global` (measured
+   above); a `propagated` pin accepts both. Marking before the seed
+   pass gives exactly this precedence — unchanged code order.
+
+**What landed**: `bool_expr::const_eval` (Kleene absorbing-element
+evaluation; recursion bounded by `MAX_NODES` at parse), the shared
+`comb_funcs` table (`comb_function_table` — one parse per driver
+`function`, built before the seed pass, shared by `constant_cone` and
+`propagate_combinational`; unresolvable functions now counted at build
+for any origin — identical counts on every committed fixture, all 0),
+`constant_cone` rewritten to a 3-valued fixed-point sweep over the
+table (only function-referenced inputs gate marking, matching the
+propagation taint rule), and `propagate_combinational` switched to the
+shared immutable table with a `pending: Vec<bool>` carrying the
+enqueue-once invariant (replacing the `Option::take` slot — the
+impossible state no longer carries a release panic path).
+`test_constant_cone_cp_matches_opensta` asserts the resolved per-net
+map verbatim against the measured table, including the `n_xorh` = 0.55
+polarity discriminator and `origin_counts` `{constant 6, input 1,
+propagated 4}` with both AP2 diagnostics 0.
+
+**`conditional_power_blocks` enumeration**: no moves possible —
+`prob_one` on constants is unchanged at `Some(0.0)`, so a `when`
+literal on a HI-constant net keeps weight 0 (the same stored record
+OpenSTA's own machinery reads). On newly-marked absorptive nets a
+`when` weight would change, but no committed fixture mixes `when`
+literals with constant-fed pins (`mb`/`mbw`: `a`/`b`/`teb` only; `mba`:
+none; no gcd power test exists) — named residual.
+
+**SAIF-vs-VCD asymmetry** (record only): a SAIF top-scope `NET` entry
+naming an internal net resolves by net name and annotates via the
+emitted driver-pin `pin_signals` key, while the same flat name in a VCD
+dead-ends into `dead_annotation_entries` — a constructed asymmetry of
+the pin-namespace emit. OpenSTA's own `read_saif` on such a `NET`
+entry is unmeasured — named residual.
+
+**Moved goldens**: none — `mb.power.json` regenerated via the recorded
+CLI command, `git diff` empty (`annotated=3 clock=1`, every watt column
+bit-identical). `mba.activity.reference.json` is read-only input;
+`mb.saif.reference.json`, `mbw.reference.json`, all other
+`*.reference.json`: `git status` clean — fully-annotated fixtures stay
+byte-identical, asserted by `test_saif_power_mb_matches_opensta`,
+`test_when_power_mbw_matches_opensta`, and the mba test. On `mba`
+itself the marking is unchanged (`constant 4` — its constant cones are
+all-constant-input, identical under either rule);
+`origin_counts`/`driven_nets_without_activity` are unchanged on every
+session.
+
+**Fail-proof**: `constant_cone`'s `const_eval` reverted to the
+all-inputs rule (`input_vals.iter().all(Option::is_some)` gate) →
+`test_constant_cone_cp_matches_opensta` red at `n_orh origin: left
+Propagated, right Constant`; restored, green. The r2 proofs stand
+(propagation off → `s_none origin_counts` red; corrupted golden `prob`
+→ strict red; both recorded above).
+
+**Checks run**: `cargo test --workspace` (333+3), `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --release -p
+grus-core sta` (183), the `cp_probe.tcl` container run quoted above,
+the `mb.power.json` regen. AP3 sequential rules and AP4 scoped
+annotation precedence remain open.
+### 2026-11-22 — N7 — AP3: sequential data-pin propagation (v0.2.17)
+
+AP3 of the activity-propagation sequence: a sequential output copies
+its data input's `{P, d}` verbatim, labelled `propagated` in the
+golden. `mba`'s `u_df` (`D` ← port `a`) resolves; `u_f0`/`u_f1` sit in
+unseeded feedback cones and stay `unknown {0,0}` — no inferred
+divide-by-two.
+
+**What landed**:
+
+- `LibSeq` (`lib_db.rs`): `state_var`, `state_var_n`, `data_pin` —
+  parsed in `liberty.rs` from the `ff`/`latch` group's `next_state` /
+  `data_in` into `LibCell::seq`. Only the bare single-pin form (`"D"`)
+  resolves; complex expressions (scan mux, data-enable, set/reset
+  forms) leave `data_pin` unset — named residual, census below.
+  `CACHE_VERSION` bumped to 9.
+- `activity.rs`: `seq_function_table` (per sequential-driver net, the
+  data net plus the output polarity from the Liberty `function` —
+  `function == state_var` copies `P`; `== state_var_n` or `!state_var`
+  copies `1 - P`; density copied unchanged either way). `propagate`
+  unifies combinational and sequential producers in one Kahn
+  worklist — resolved Q nets re-enable later combinational cones and
+  other sequential D inputs (fixed point in a single ordered pass,
+  since a sequential output is never an input to its own function).
+  After the queue drains, every leftover `Default` net becomes
+  `Unknown {0,0}` and taints downstream like any other seed.
+- `ActivityOverrides.input_ports`: `set_power_activity -input_ports`
+  is now distinct from the `-input` seed (the measured OpenSTA
+  semantics: `-input_ports` seeds only primary input *ports* — nets
+  driven by an io pin — while `-input` seeds every undriven net; the
+  `s_input_ports` golden reads `user` on `a`/`b` and `input` on the
+  undriven `n_float`). Precedence: `clock` > `-global` > `-input_ports`
+  > dump annotation > `-input` — losing to `-global`/`clock` is
+  measured (`s_input_ports`'s `clk` reads `clock`); beating a dump
+  entry on the same port net is a chosen order, unmeasured (no
+  committed session mixes them).
+- `tests/designs/microbench/mba_p40.sdc` (period 40 ns): `s_p40`
+  proves the seed densities follow the clock period — `clk` `5e7`,
+  inputs `2.5e6`, `u_df/Q` propagated `2.5e6` (halved from the 20 ns
+  values).
+- `power.rs` regression: 12 sessions (`s_none`, `s_input`,
+  `s_input_ports`, `s_global`, `s_global_density`, `s_p40`, `s_ports`,
+  `s_ports_a2x`, `s_partial`, `s_full`, `s_xz`, `s_partial2`), strict
+  per-pin `{density, prob, source}` against the golden, `unknown`
+  handled like every other source label, `EXPECTED_DIVERGENT` now
+  empty. `s_none` origin counts pinned at `{clock 1, constant 4,
+  input 3, propagated 6, unknown 4}`; the four unknown nets are the
+  `u_f0`/`u_f1` feedback cone. `s_ports_a2x` shows the doubling:
+  `u_df/Q` and `qd` copy `a`'s annotated `6e6` density verbatim.
+
+**Measured result**: all 12 sessions match the golden per-pin
+verbatim at the strict bound; the divergent set is empty on every
+session. Group columns (Sequential / Combinational / Clock / total
+rows, all four watt columns) are asserted at the recorded bounds —
+internal/switching ≤ 0.5%, leakage ≤ 1%, total ≤ 0.3%. Per-session
+measured residuals (`(ours − golden)/golden`, temp-instrumented run
+of the committed test; `Clock` rows are all-zero):
+
+| session | Seq int | Seq sw | Seq leak | Comb int | Comb sw | Comb leak | total |
+|---|---|---|---|---|---|---|---|
+| `s_none` | 0 | 0 | 0 | +0.113% | −0.096% | 0 | −0.012% |
+| `s_input` | 0 | 0 | 0 | +0.188% | −0.090% | 0 | −0.015% |
+| `s_input_ports` | 0 | 0 | 0 | +0.206% | −0.090% | 0 | −0.015% |
+| `s_global` | 0 | −0.263% | 0 | −0.132% | −0.156% | 0 | −0.088% |
+| `s_global_density` | 0 | −0.263% | 0 | −0.132% | −0.156% | 0 | −0.136% |
+| `s_p40` | 0 | 0 | 0 | +0.113% | −0.096% | 0 | −0.012% |
+| `s_ports` | 0 | 0 | 0 | +0.123% | −0.100% | 0 | −0.009% |
+| `s_ports_a2x` | 0 | 0 | 0 | +0.132% | −0.090% | 0 | −0.010% |
+| `s_partial` | 0 | 0 | 0 | +0.123% | −0.100% | 0 | −0.009% |
+| `s_full` | 0 | 0 | 0 | +0.123% | −0.100% | 0 | −0.009% |
+| `s_xz` | 0 | 0 | 0 | +0.317% | −0.094% | 0 | −0.004% |
+| `s_partial2` | 0 | 0 | 0 | −0.069% | −0.087% | 0 | −0.012% |
+
+Sequential internal and every leakage column are exact to the
+golden's print precision; sequential switching diverges only on the
+two global sessions (−0.263% — the same switched-capacitance term the
+AP2 entries name); combinational internal tops at +0.317% (`s_xz`),
+combinational switching at −0.156% (`s_global*`); every total column
+within 0.14%. `driven_nets_without_activity` is 4 (the unknown
+feedback nets) on unseeded sessions, 0 on the global ones (moved 5 →
+4 from the AP2 residual — net `q` leaves the count).
+
+**Recorded choices on the new origins**: `Unknown` nets carry
+`prob_one: Some(0.0)`, not `None` — it matches the golden's printed
+`0.000`, and it keeps a `when` literal on an unknown net expressible
+at weight 0 rather than counted inexpressible
+(`conditional_power_blocks`); OpenSTA's own `when` weight on
+`unknown` nets is unmeasured, recorded. A `prob_one: None` data net
+(x-only annotation) taints the Q copy like a combinational input —
+recorded, unmeasured. Post-resolution `Default` is an impossible
+origin: every leftover — feedback cycles, tainted cones,
+expression-form data pins, eval failures — lands `Unknown {0,0}`.
+
+**Sequential coverage residual** (cell-level census of
+`sky130_fd_sc_hd__tt_025C_1v80.lib`, reproduce script in
+`kurena/tasks/ap3-sequential-activity/design/census.md` — **37 of
+63** sequential cells covered): 45 `ff` cells + 18 `latch` cells. 19
+`ff` cells use the bare form `next_state : "D"` and all 18 `latch`
+cells use `data_in : "D"` — those resolve. 26 `ff` cells carry a
+complex `next_state` expression and stay `data_pin: None` — 19
+scan-mux `(D&!SCE)|(SCD&SCE)` (`sdf*`), 2 data-enable
+`(D&DE)|(IQ&!DE)` (`edf*`), 5 scan+enable
+`(D&DE&!SCE)|(IQ&!DE&!SCE)|(SCD&SCE)` (`sedf*`); their output nets
+resolve `Default` → `unknown {0,0}` (OpenSTA's choice for a muxed D
+is unmeasured). 28 of the 45 `ff` cells also carry `clear`/`preset`
+attributes alongside the bare `"D"` — they parse as covered and the
+async pin is ignored by the copy rule (unmeasured, recorded). The 24
+`test_cell`-nested `ff` copies (all `next_state : "D"`) are excluded
+from the census exactly as the parser skips `test_cell` groups
+whole. Every sequential output pin's `function` in the lib is `IQ`
+or `IQ_N`; the multi-output inversion arm (QN = `1 − P`) is defined
+for the covered `*bp` cells but unexercised — `mba`'s `dfxtp` is
+single-Q (measured-adjacent).
+
+**Moved goldens**: `mba.activity.reference.json` byte-identical — it
+already held the AP3 records (all 12 sessions incl. `s_p40`, `u_df/Q`
+`propagated`) from the golden-generation pass. `mb.power.json`
+regenerated via the recorded CLI command — `git diff` empty
+(`annotated=3 clock=1`, every watt column bit-identical; `mb`'s `q`
+stays annotated through `_d_/Q`). `mba_p40.sdc` is a new fixture. All
+other `*.reference.json` `git status`-clean — fully-annotated
+fixtures stay byte-identical. The per-pin annotation residual is
+unchanged: `s_full` output port `y` is annotated per-pin in the
+golden while the per-net model resolves its driver — `PER_PIN_RESIDUAL`
+`[("s_full","y")]`, AP4 scope.
+
+**Fail-proof**: sequential producers dropped from `propagate`'s
+candidate mask → `s_none origin_counts` red (`propagated 5,
+unknown 5` — net `q` falls back to `unknown`); `s_ports` `u_df/Q`
+golden density corrupted `3e6 → 4e6` → red at the density bound
+(`ours 3e6 vs golden 4e6`). Both restored, green.
+
+**Checks run**: `cargo test --workspace` (333+3, 2 ignored), `cargo
+clippy --workspace --all-targets -- -D warnings`, `cargo test
+--release -p grus-core sta` (183, 2 ignored), the `mb.power.json`
+regen above. AP4 scoped annotation precedence remains open.
+
+### 2026-11-22 — N7 — AP4: scoped `set_power_activity` user overrides (v0.3.0)
+
+Closes the AP sequence: `ActivityOverrides` gains `pins:
+Vec<(PinId, ActivitySetting)>` (the `-pins <list>` arm; call site
+resolves names to `PinId`s, last duplicate wins, non-driver pins count
+in the new `dead_user_entries` diagnostic — the
+`dead_annotation_entries` analogue) and `ActivityOrigin::User` with
+label `"user"`. The `-input_ports` arm now resolves to the native
+`user` origin instead of collapsing onto `annotated`. Seed order is
+the measured chain constant → clock → global → `-pins` →
+`-input_ports` → annotation → input/undriven → `Default`; `-pins` vs
+`-input_ports` is unmeasured and recorded (specific selector before
+the `[all_inputs]` blanket). `ActivityOverrides` loses `Copy` (the
+`Vec` field); API surface only — no CLI flag was added, `-activity`
+stays clock-normalized at the call site and `-density` absolute.
+
+**Golden** (`test_activity_defaults_mba_matches_opensta`, all 12
+sessions strict): `s_input_ports`'s `a`/`b` compare at the native
+`user` label `{1e7, 0.4}`; `origin_counts` pins `s_input_ports` at
+`{clock 1, constant 4, input 1, propagated 6, unknown 4, user 2}`
+(`a`/`b` move `input`→`user` −2/+2 while undriven `n_float` keeps
+`input` — the measured port-only semantics) alongside `s_none`. A
+post-loop check resolves `-pins a,b` and asserts the per-net vector is
+identical to `s_input_ports`'s (`propagated` non-driver pins on a
+user-seeded net inherit `user`, so the propagated-mapping assert
+accepts it). `PER_PIN_RESIDUAL` is unchanged at `[("s_full","y")]` —
+per-pin vs per-net annotation stays the one model gap.
+
+**VCD reader fixes** (found by the gcd re-comparison below — the
+pin-namespace annotation exposed them): (1) `pin_signals` read the
+flat `signals` fold, so a same-named declaration (`Y`/`X`/`Q` on every
+dumped cell) summed every like-named stream — `IdActivity` now keeps a
+per-declaration `sa` stream `pin_signals` reads; `signals` stays the
+flat debug view. (2) `apply_vector_change` dropped `b` writes shorter
+than the declared width — `b0`/`bx` (all-x write) and leading-zero
+trims — losing both the edges and the state interval; short values now
+left-extend (x/z extend themselves, 0/1 extend with 0) per VCD
+left-alignment. Unit tests `test_pin_signals_keep_same_leaf_apart` and
+`test_short_vector_writes_left_extend` pin both; the `mba`/micro
+fixtures never exercised either (unique leaf names, full-width
+writes), so existing goldens are unaffected.
+
+**gcd `report_power` re-comparison** (`grus-eda power --vcd
+tests/designs/gcd/power/gcd.vcd`, zero-wire parasitics) vs OpenROAD
+`power_vcd_check.tcl` re-run this session (`Annotated 931 pin
+activities`; `[STA-1453] clock core_clk vcd period 10.000 differs
+from SDC clock period 5.000` — OR seeds the clock from SDC as we do):
+
+| group | ours internal | OR internal | ours switch | OR switch |
+|---|---|---|---|---|
+| Sequential | 2.984e-4 (+0.1%) | 2.98e-4 | 1.024e-5 (−4.3%) | 1.07e-5 |
+| Combinational | 5.873e-5 (−0.1%) | 5.88e-5 | 8.765e-5 (−1.8%) | 8.93e-5 |
+| Total | 3.572e-4 (+0.05%) | 3.57e-4 | 9.789e-5 (−2.1%) | 1.00e-4 |
+
+Totals `4.5505e-4` vs `4.57e-4` (−0.4%); total leakage `1.3004e-9` vs
+`1.30e-9` (+0.03%). Every group moves toward OR vs the 2026-11-18
+run — sequential internal 1.56e-4 → 2.984e-4 (was −48%, now +0.1%),
+combinational internal 1.35e-4 → 5.87e-5 (was +129%, now −0.1%),
+combinational switching 4.17e-5 → 8.77e-5 (was −53%, now −1.8%). The
+earlier entry's "statistical propagation vs exact counts" narrative
+was mostly parser corruption, not a model gap: OpenSTA annotates the
+same per-pin dump streams (`931 pin activities`) and the corrected
+per-net counts land inside ~2% on every column. The annotation model
+propagates little on this fixture — all 269 nets resolve
+`annotated`/`clock` (`activity: annotated=268 clock=1`,
+`dead_annotation=1286` — the dut-level wire paths and non-driver
+pins). Named residuals: sequential switching −4.3% and the remaining
+switching gap is the zero-wire-parasitics model (OR estimates wire RC
+from the placed DEF; SPEF narrows it, recorded 2026-11-18);
+combinational leakage +23% at ~1.9e-10 absolute — the
+state-weighted-vs-flat `when`-leakage residual already named on
+`mbw`; our Clock group reads 0 while OR attributes 1.88e-10 leakage
+there (our leakage lands in seq/comb — total leakage matches). The
+no-annotation baseline (`clock=1 input=35 propagated=1 unknown=232`)
+is unchanged in shape: gcd's sequential cones are scan/mux `sdf*`/
+`edf*` `next_state` expressions (the 37/63 coverage residual) plus
+feedback cycles, so the datapath resolves `unknown {0,0}` and
+combinational switching collapses to ~7.5e-8 — the honest AP-model
+limit on a real design without a dump.
+
+**Moved goldens**: `mb.power.json` regenerated via the recorded CLI —
+the "git diff empty" claim described the pre-revision surface
+(`annotated=3 clock=1`, every column bit-identical; `mb.vcd` uses only
+full-width vector writes). The v0.3.1 regen shows the named diff the
+revision adds: `+"dead_annotation_entries": 5` and
+`+"dead_user_entries": 0` under `diagnostics` — no watt column moved.
+`mba.activity.reference.json`
+unchanged — `s_input_ports`/`s_p40` records were emitted by the
+committed `generate_activity_ref.sh` ahead of AP4. All other
+`*.reference.json` `git status`-clean.
+
+**Fail-proof**: `User` relabeled `Annotated` → `s_input_ports
+origin_counts` red (`annotated 2` vs `user 2`); the `-pins` arm
+disabled → `pins-vs-input_ports net 1 differs` red; `s_p40` golden
+density corrupted `2.5e6 → 3e6` → `s_p40 a: density ours 2.5e6 vs
+golden 3e6` red. All restored, green. R1 adds: `dead_user_entries`
+computation forced to `0` → `dead pins entry counted` red (the
+`u_or/A` sink-pin entry in `via_pins` expects `== 1`); restored, green.
+
+**Checks run**: `cargo test --workspace` (335+3, 2 ignored), `cargo
+clippy --workspace --all-targets -- -D warnings`, `cargo test
+--release -p grus-core sta` (183, 2 ignored), the `mb.power.json`
+regen and the `power_vcd_check.tcl` re-run above. AP1–AP4 closed; the
+per-pin/per-net annotation residual (`s_full` `y`) and the gcd
+switching/leakage residuals above remain as named gaps. R1 checks
+(v0.3.1): `cargo test --workspace` (335+3, 2 ignored), `cargo clippy
+--workspace --all-targets -- -D warnings` clean, `cargo test --release
+-p grus-core sta` (183, 2 ignored), the release-binary gcd
+`--vcd`/no-annotation runs, the `mb.power.json` regen (named diff
+above), the container `power_vcd_check.tcl` re-run, and the container
+`gcd.vcd` re-simulation — all recorded in the revision block below.
+
+**Revision (v0.3.1) — reproducibility/provenance pass**: the v0.3.0
+numbers stand; this block repairs the record — both dead counters now
+ride `PowerDiagnostics` onto the committed CLI/JSON surface
+(`activity:` prints them unconditionally), `gcd.vcd` gets its
+provenance, and the two card questions get verbatim answers. No
+resolution or power-math change: every watt column must stay
+bit-identical, and does.
+
+**(a) Did `power_vcd_check.tcl` re-run this session?** Yes — executed
+in the cached LibreLane image (Colima daemon):
+
+```sh
+docker run --rm -u "$(id -u):$(id -g)" \
+  -v "$REPO_ROOT:/work" -v "$HOME/.ciel:/pdk" -e PDK_ROOT=/pdk \
+  ghcr.io/librelane/librelane:3.0.16 \
+  openroad -exit /work/tests/designs/gcd/power/power_vcd_check.tcl
+```
+
+Verbatim lines:
+
+```
+[WARNING STA-1453] clock core_clk vcd period 10.000 differs from SDC clock period 5.000
+Annotated 931 pin activities.
+Group                  Internal  Switching    Leakage      Total
+                        Power      Power      Power      Power (Watts)
+Sequential             2.98e-04   1.07e-05   2.99e-10   3.09e-04  67.6%
+Combinational          5.88e-05   8.93e-05   8.14e-10   1.48e-04  32.4%
+Clock                  0.00e+00   0.00e+00   1.88e-10   1.88e-10   0.0%
+Total                  3.57e-04   1.00e-04   1.30e-09   4.57e-04 100.0%
+```
+
+The v0.3.0 entry's re-run claim is confirmed — `Annotated 931 pin
+activities` and the `STA-1453` warning reproduce verbatim.
+
+**(b) Where was `dead_annotation=1286` read from?** Pre-revision the
+counter existed only on `ActivityResolution::dead_annotation_entries`
+— no committed CLI path printed it (the committed tests assert it
+only for the `mba` sessions: `s_partial` 1, `s_full` 15, else 0). The
+gcd figure was read off that struct through a non-CLI surface — a
+temporary print/debug read in the implementation session; the exact
+mechanism was not recorded, which is what this revision fixes. The
+committed CLI now prints it unconditionally on the `activity:` line:
+
+```
+activity: annotated=268 clock=1 dead_annotation=1286 dead_user=0
+```
+
+Independent census cross-check on the count's composition: the VCD
+holds 1509 `$var` declarations — 223 under `dut` + 1286 under the 233
+cell scopes. Cell scopes hold each cell's port signals *and*
+internals (e.g. `not0_out_Y`); under `annotation_net_of` only cell
+*output* pin vars resolve as net drivers, so input pins, internals,
+and io-unmatched dut wires land dead. The printed 1286 is exactly the
+cell-scope census — and on the regenerated dump below the same rule
+prints `dead_annotation=2358`, matching its 2358 cell-scope vars, so
+the counter tracks the dump's composition rather than a fixed design
+property.
+
+**`gcd.vcd` provenance**: gitignored (`*.vcd` outside
+`tests/designs/microbench/`), ~18 MB, carried in the worktree. Header
+verbatim: `$version` `Icarus Verilog`, `$date` `Wed Nov 18 07:36:28
+2026`, `$timescale 1ps`; scope tree `gcd_tb` → `dut` plus 233 cell
+scopes. Testbench `tests/designs/gcd/power/gcd_tb.v` (committed):
+xorshift32 LFSR stimulus, 400 transactions, `$dumpfile("gcd.vcd")` +
+`$dumpvars(0, dut)`. Simulated netlist `gcd.synth.v` (flattened yosys;
+leaf names `\dpath.a_lt_b$in1[9]`, `_180_` … are DEF net names) plus
+the PDK `sky130_fd_sc_hd.v` cell models (their `celldefine` scopes are
+the 233 cell scopes). **Re-simulation ran this session** inside the
+container — with one recipe correction: as recorded (`gcd_tb.v` +
+`gcd.synth.v` + `sky130_fd_sc_hd.v`) iverilog fails with 560
+unknown-UDP-primitive errors; `sky130_fd_sc_hd/verilog/primitives.v`
+must compile first. The executed recipe:
+
+```sh
+iverilog -o /tmp/gcd_tb.vvp gcd_tb.v ../gcd.synth.v \
+  /pdk/sky130A/libs.ref/sky130_fd_sc_hd/verilog/primitives.v \
+  /pdk/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v
+vvp /tmp/gcd_tb.vvp   # writes gcd.vcd; `$finish` at 317435000 (1ps)
+```
+
+The regenerated dump differs from the carried artifact in composition
+only: 2581 `$var` (223 dut + 2358 cell-scope incl. 35 `reg`) vs 1509
+(223 + 1286 all-`wire`) — this nixpkgs `iverilog-s20250103` build
+dumps more cell internals than the build that produced the
+2026-11-18 file. Our power columns and `annotated=268 clock=1` are
+bit-identical on it; the 2026-11-18 artifact was restored as the
+worktree copy so the comparison inputs stay the ones the table was
+measured on.
+
+**Diagnostics movement lines** (verbatim, this session). `--vcd` run:
+
+```
+activity: annotated=268 clock=1 dead_annotation=1286 dead_user=0
+power: 93 cells without lib cell, 0 driven nets unresolved by activity seeds, 36 active nets without cell driver, 0 internal-power lookups missing slew, 0 unresolved related pins, 0 conditional power blocks, 0 unmatched SAIF scopes, 0 unmatched SAIF signals
+```
+
+No-annotation run:
+
+```
+activity: clock=1 input=35 propagated=1 unknown=232 dead_annotation=0 dead_user=0
+power: 93 cells without lib cell, 232 driven nets unresolved by activity seeds, 36 active nets without cell driver, 0 internal-power lookups missing slew, 0 unresolved related pins, 0 conditional power blocks, 0 unmatched SAIF scopes, 0 unmatched SAIF signals
+```
+
+Movement vs 2026-11-18: `dead_annotation_entries` has no recorded
+counterpart — the flat net-name annotation path never counted
+unresolved dump paths at all. The honest movement line is *surface
+added*, not *count changed* (`dead_user_entries` likewise: always 0
+through the CLI — no `--pins` flag — but serialized for API-driven
+reports).
+
+**Re-verified table** — same command this session; report-only
+change, so bit-identical is required and holds:
+
+| group | ours internal | OR internal | ours switch | OR switch |
+|---|---|---|---|---|
+| Sequential | 2.984e-4 (+0.1%) | 2.98e-4 | 1.024e-5 (−4.3%) | 1.07e-5 |
+| Combinational | 5.873e-5 (−0.1%) | 5.88e-5 | 8.765e-5 (−1.8%) | 8.93e-5 |
+| Total | 3.572e-4 (+0.05%) | 3.57e-4 | 9.789e-5 (−2.1%) | 1.00e-4 |
+
+Totals `4.5505e-4` vs `4.57e-4` (−0.4%); total leakage `1.3004e-9` vs
+`1.30e-9` (+0.03%). No watt column moved.
+
+**Residual notes — restated so the entry stands alone**:
+
+- `unknown` nets carry `prob_one: Some(0.0)` — `when` literals on
+  them are expressible at weight 0 rather than counted inexpressible;
+  OpenSTA's own `when` weight on `unknown` is unmeasured (recorded in
+  AP3, restated).
+- `user`-vs-dump precedence is a **chosen** order — no committed
+  session mixes `set_power_activity` with `read_vcd` on the same pin
+  (unmeasured).
+- Duplicate `-pins` last-wins is **unmeasured** (repeated
+  `set_power_activity` semantics assumed).
+- `-pins` vs `-input_ports` order chosen (unmeasured — specific
+  selector before the `[all_inputs]` blanket).
+- Per-pin vs per-net: `s_full` output port `y` holds per-pin
+  `vcd 3e6/0.25` in the golden while net `y` resolves its driver —
+  `PER_PIN_RESIDUAL [("s_full","y")]`, a named model gap; it can only
+  ever affect the pin-level read, not a watt column. OpenSTA's
+  `report_activity_annotation` split counts `user` pins under its
+  `input N` bucket while ours reports `user N` per net — a
+  label-accounting difference, not a resolution one.
+
+### 2026-11-22 — perf-profile baseline: phase timers + measured hotspot ranking (v0.3.2)
+
+Measure-first ticket (kurena `perf-profile`): env-gated phase timers
+(`GRUS_PHASE_TIMING`, `crates/grus-core/src/timing.rs`, off by default,
+stderr-only `phase <name> <ms> x<count>` lines) at whole-pass boundaries
+of `sta`, `power`, `place`, `congestion`, then a release-build
+measurement of the committed matrix. No optimization landed; the
+deliverable is this table plus `kurena/tasks/perf-profile/design/plan.md`.
+
+**Machine context**: Mac mini, Apple M4 (4P+6E), 16 GB; macOS 27.2.1
+(26B131), `rustc 1.100.0 (0ef1bc386 2026-11-09)`, `cargo build
+--release`, binary `target/release/grus-eda` at the ticket commit.
+Rep policy: 5 reps per cell via `REPS=5 sh
+kurena/tasks/perf-profile/measure.sh /tmp/perf-measure.log`, warm
+Liberty cache; rep 1 was never the slowest rep in any cell (largest
+rep-1 divergence was *faster*, 0.50×, on the 10–20 ms gcd cells —
+timer noise, no cold-path inflation to report separately).
+
+**Design sizes** (placed DEF `COMPONENTS`/`NETS`):
+
+| design | cells | nets | routed.spef |
+|---|---|---|---|
+| gcd | 384 | 269 | 164 K |
+| picorv32 | 10 205 | 6 811 | 4.7 MB (+8.4 MB rcx) |
+| aes | 12 839 | 9 039 | 6.1 MB |
+| ibex | 16 644 | 12 137 | 10 MB |
+| jpeg | 61 569 | 46 568 | 35 MB |
+
+**Wall-clock table** — `median (min–max)` ms:
+
+| cell | gcd | picorv32 | aes | ibex | jpeg |
+|---|---|---|---|---|---|
+| `sta` zero-wire | 20 (10–20) | 50 (30–50) | 70 (70–80) | 90 (60–100) | 290 (170–300) |
+| `sta` placement RC | 50 (50–50) | 860 (750–870) | 1480 (1410–1790) | 670 (620–690) | 6000 (5990–6060) |
+| `sta` routed SPEF | 50 (40–50) | 900 (790–900) | 1460 (1380–1950) | 730 (680–770) | 6230 (6160–6340) |
+| `sta` rcx SPEF | 50 (50–50) | 1020 (930–1030) | — | — | — |
+| `power` zero-wire | 20 (20–20) | 80 (80–90) | 100 (100–130) | 130 (120–140) | 390 (280–410) |
+| `power` placement RC | 50 (50–50) | 870 (810–910) | 1400 (1360–1450) | 710 (680–820) | 6100 (6000–6110) |
+| `congestion` | 10 (10–10) | 40 (30–70) | 40 (40–50) | 60 (60–60) | 210 (210–210) |
+| `place` | 20 (10–20) | 700 (650–800) | 650 (580–1330) | 970 (850–1030) | 4190 (4000–4320) |
+| `power --vcd` | 910 (810–950) | — | — | — | — |
+
+(`/usr/bin/time -l` rounds to 10 ms; sub-10 ms cells are noise and were
+not tabled.)
+
+**Phase breakdown** (median ms, share of cell wall; `sta --parasitics
+placement` shown for all designs — other modes differ only in the
+parasitics/spef rows):
+
+| phase | gcd | picorv32 | aes | ibex | jpeg |
+|---|---|---|---|---|---|
+| `sta.prepare.clock.slew` | 20.5 (41%) | 667 (78%) | 1149 (78%) | 333 (50%) | **4840 (81%)** |
+| `sta.eval.walk` | 11.1 (22%) | 125 (15%) | 264 (18%) | 237 (35%) | 850 (14%) |
+| `sta.load.def` | 1.0 | 19 (2%) | 26 (2%) | 33 (5%) | 121 (2%) |
+| `sta.parasitics` | 1.0 | 15 (2%) | 11 | 21 (3%) | 95 (2%) |
+| `sta.prepare.clock.walk` | — | — | 3 | — | 15 |
+| `sta.prepare.launch` | — | 5 | 3 | 7 | 12 |
+| all other `sta.*` | ≤1 each | ≤4 each | ≤7 each | ≤9 each | ≤7 each |
+| phase sum / wall | 45/50 (91%) | 851/860 (99%) | 1473/1480 (99.6%) | 658/670 (98%) | 5971/6000 (99.5%) |
+
+Other commands (jpeg): `power` — `power.slews` 5749 (94%: nests
+`sta.prepare.clock.slew` 4824 + `sta.eval.walk` 803; nested phases are
+counted under both names, so `power` phase sums exceed 100% — read
+`power.slews` as the outer envelope), `power.cells` 63 (1%),
+`power.activity.resolve` 37 (0.6%). `place` — `place.gp.density` 849
+(20%), `place.legal.pass3` 783 (19%), `place.gp.wl` 685 (16%),
+`place.legal.pass2` 619 (15%), `place.gp.step` 422 (10%),
+`place.legal.pass1` 421 (10%), `place.gp.init` 166 (4%),
+`place.legal.abacus` 43 (1%); GP ≈ 51% vs legalize ≈ 44%. `congestion`
+— `cong.load` 119 (57%), `cong.decompose` 52 (25%), `cong.grid` 16
+(8%), `cong.route` 15 (7%). `sta --spef` jpeg adds `sta.spef.read` 297
+(4.8%); picorv32 rcx `sta.spef.read` 167 (16.4%). `power --vcd` gcd —
+`power.activity.load` 860 (94.5%) dominates (18 MB dump scan);
+`power.slews` 33 (3.7%). `sta.partition.*` never appears — no
+committed SDC partitions.
+
+**Ranked hotspots** (absolute median ms on the largest designs):
+
+1. **`sta.prepare.clock.slew`** — serial Kahn-level slew propagation
+   (`propagate_slew`): 4840 jpeg, 1149 aes, 667 picorv32, 333 ibex;
+   41–81% of `sta` wall, and inside `power.slews` ~79% of `power`
+   wall. `eval.walk` does the same levelized walk with `par_iter`;
+   `propagate_slew` does not — two `driver_response` calls per arc-leg,
+   serial.
+2. `sta.eval.walk` — already per-level rayon: 850 jpeg, 237 ibex.
+3. `place.gp.density`/`place.gp.wl`/`place.gp.step` — GP core, already
+   rayon: 1956 combined on jpeg (47%).
+4. `place.legal.pass1/2/3` — serial by construction: 1823 combined on
+   jpeg (44%) — largest non-parser serial block after #1.
+5. `power.slews` outer envelope — inherits #1+#2; slew-only path could
+   remove the eval/endpoint portion (~13% of jpeg `power`).
+6. `sta.spef.read` — serial parse: 297 jpeg, 167 picorv32-rcx.
+7. `cong.load`/`sta.load.def` — serial DEF parse: 119–133 jpeg.
+8. `power.activity.load` — serial VCD scan, 860 (94.5% of its cell).
+
+**Symbol-level confirmation**: `sample <pid> 4` on `sta --parasitics
+placement` jpeg (clean re-run on idle machine;
+`/tmp/grus-eda_2026-11-22_023747_4O7A.sample.txt`). Collapsed
+top-of-stack, main thread: `sta::dmp::rc_crossing` 1354,
+`sta::nldm::eval_2d` 171, `exp` 159, `pi_waveform_slew` 130+60,
+`solve_dmp_with` 108+49, `fit_ramp_duration` 84, `expm1`/`log`/`log1p`
+132 — ≈80% of samples inside `sta::dmp`/`sta::nldm`, reached through
+`prepare_sta` → `propagate_slew` → `Context::driver_responses`.
+Rayon workers sit in `__psynch_cvwait` (23440) — the dominant pass is
+serial. `samply`/`cargo-instruments` are absent on this machine;
+`xctrace` exists but the recorded repo tool is `sample` — used, kept.
+
+**Peak RSS** (`/usr/bin/time -l` `maximum resident set size`, max over
+reps): jpeg `sta --spef` 308 MB, `sta`/`power` placement RC 232/236 MB,
+`sta` zero-wire 211 MB (lib + DEF resident), `congestion` 79 MB,
+`place` 117 MB; picorv32 rcx `sta` 85 MB; all other cells ≤ 100 MB.
+No swap; no rep hit the machine's 16 GB.
+
+**What was run**: `REPS=5 sh kurena/tasks/perf-profile/measure.sh
+/tmp/perf-measure.log` (45 cells × 5 reps = 225 runs; `sta.spef_rcx`
+and `power.vcd` cells gated on committed artifacts — aes/ibex/jpeg have
+no `*.rcx.spef`, only gcd has a committed VCD). Gate proof: ungated
+stderr on gcd `sta` is the pre-change byte stream (`lef: skipped…`,
+`warning:`); `GRUS_PHASE_TIMING=1` adds `phase ` lines to stderr only,
+stdout identical (`elapsed=` varies by run as before). Byte-identity:
+`--json` STA report on aes and `place --out-def` on gcd `cmp`-clean
+between ungated and gated runs. Fail-proof: `enabled()` forced `true`
+→ ungated run emits 19 `phase ` lines → restored. Checks:
+`cargo test --workspace` (336+3, 2 ignored), `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --release -p grus-core sta`
+(183, 2 ignored) — all green at v0.3.2. No golden file touched (`git
+status` clean outside the listed sources + `docs/`). The optimization
+plan and ticket order are in
+`kurena/tasks/perf-profile/design/plan.md`; the raw log is at
+`/tmp/perf-measure.log` (regenerate with `measure.sh` — it is not
+committed, the driver is).
+
+### 2026-11-22 — perf-par-slew: parallel propagate_slew (v0.3.3)
+
+`propagate_slew`'s level loop now computes each pin in parallel and
+applies collected updates in level order — the same shape
+`sta.eval.walk` uses (`level.len() < 32` serial, else
+`par_iter().filter_map(..).collect()` + ordered apply) — plus a serial
+per-level replay of same-level-earlier sequential arcs. The replay is
+required only for the `include_seq=false` levelization fallback (ibex's
+clock-gate cycle); under `include_seq=true` seq edges are ordering edges
+and the scan never fires. Design: `kurena/tasks/perf-par-slew/design/`.
+
+**Before/after wall** — `median (min–max)` ms, REPS=5, same machine
+(M4 mini) and flags as the baseline entry; before = v0.3.2 baseline
+column, re-measurement not repeated per plan:
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `sta` placement RC — gcd | 50 (50–50) | 40 (40–40) | ×1.25 |
+| `sta` placement RC — picorv32 | 860 (750–870) | 320 (280–380) | ×2.7 |
+| `sta` placement RC — aes | 1480 (1410–1790) | 470 (410–530) | ×3.1 |
+| `sta` placement RC — ibex | 670 (620–690) | 410 (370–410) | ×1.6 |
+| `sta` placement RC — jpeg | 6000 (5990–6060) | 2060 (2010–2110) | **×2.9** |
+| `sta` routed SPEF — gcd | 50 (40–50) | 40 (40–40) | ×1.25 |
+| `sta` routed SPEF — picorv32 | 900 (790–900) | 360 (360–420) | ×2.5 |
+| `sta` routed SPEF — aes | 1460 (1380–1950) | 510 (480–520) | ×2.9 |
+| `sta` routed SPEF — ibex | 730 (680–770) | 490 (430–540) | ×1.5 |
+| `sta` routed SPEF — jpeg | 6230 (6160–6340) | 2370 (2280–2470) | ×2.6 |
+| `sta` rcx SPEF — gcd | 50 (50–50) | 30 (20–50) | ~noise |
+| `sta` rcx SPEF — picorv32 | 1020 (930–1030) | 490 (390–540) | ×2.1 |
+| `power` placement RC — gcd | 50 (50–50) | 40 (30–40) | ×1.25 |
+| `power` placement RC — picorv32 | 870 (810–910) | 350 (310–350) | ×2.5 |
+| `power` placement RC — aes | 1400 (1360–1450) | 490 (440–490) | ×2.9 |
+| `power` placement RC — ibex | 710 (680–820) | 440 (390–440) | ×1.6 |
+| `power` placement RC — jpeg | 6100 (6000–6110) | 2170 (2100–2190) | ×2.8 |
+
+**Phase** (`sta --parasitics placement`, median ms):
+`sta.prepare.clock.slew` jpeg 4840 → **889 (×5.4)** — share of `sta`
+wall 81% → 43%; aes 1149 → 204 (×5.6), picorv32 667 → 133 (×5.0), ibex
+333 → 74 (×4.5), gcd 20.5 → 12.0. Under `power` the nested phase reads
+the same (jpeg `power.slews` envelope 5749 → 1824; nested
+`sta.prepare.clock.slew` 901, `sta.eval.walk` 830 — nested phases are
+counted under both names, same convention as the baseline entry).
+
+**Achieved vs. ceiling**: plan assumed k = 3 (jpeg `sta` 6.0 s → ~2.7
+s); the M4 mini's 10 cores plus the DMP-dominated inner loop give the
+phase itself ×5.4, and wall lands at 2.06 s — ahead of the conservative
+ceiling, behind the k = 10 Amdahl floor (~1.6 s). Residual, named:
+(1) `sta.eval.walk` (855 jpeg) is now the co-dominant phase — untouched
+here; (2) inside `clock.slew`, serial per-level residue (port seeding,
+ordered apply, the fixup scan, <32-pin levels) and level-boundary
+barriers; (3) DMP table evals partially memory-bound (effective k ≈ 5.4
+of 10 cores); (4) ibex pays the `topological_levels` include_seq=true
+retry inside the phase before falling back — its wall gain (×1.6) is
+bounded by a now-dominant `sta.eval.walk` (237 ms) plus SPEF/DEF loads.
+
+**Equivalence**: all committed goldens untouched (`git status` clean
+under `tests/designs/**`); `cargo test --workspace` (336+3, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --release -p grus-core sta` (183, 2 ignored) all green.
+`--json` byte-identity pre/post on 8 cells: picorv32/aes/ibex/jpeg ×
+(placement RC, routed SPEF) — `cmp`-clean. Determinism:
+`RAYON_NUM_THREADS` 1/4/10 `cmp`-clean on jpeg *and* ibex `sta
+--parasitics placement` (ibex takes the `include_seq=false` fallback —
+the mode the seq replay exists for); merge/apply order is level-order
+collect + disjoint writes, no HashMap-iteration or arrival-order
+dependence (`latch_borrow` is `BTreeMap` keyed lookup only).
+`GRUS_PHASE_TIMING=1` still emits `sta.prepare.clock.slew`. Fail-proof:
+apply step broken to write `slew_max` only → 6 tests red
+(`test_propagated_clock_gate_merges_enable_arc_slew`,
+`test_sta_edge_clock_gate_propagated`,
+`test_gcd_propagated_clock_matches_opensta`,
+`test_picorv32_propagated_clock_matches_opensta`,
+`test_sta_edge_latch_borrow_propagated`,
+`test_sta_edge_min_pulse_width_propagated` — golden diffs show
+`slew_*_min_ns: ours=inf`) → restored green. **Fixup coverage probe
+(honest)**: a temporary `eprintln!` on the replay branch fired 0 times
+across all five committed designs including ibex — no committed input
+exercises a same-level-earlier seq edge, so the replay is
+defensive-but-required (it preserves semantics the levelization cannot
+prove absent), not covered-by-golden.
+
+**What was run**: `REPS=5 sh kurena/tasks/perf-profile/measure.sh
+/tmp/perf-par-slew2.log` (full 45-cell matrix on the v0.3.3 release
+binary; raw log not committed, script is). Note: a first run
+(`/tmp/perf-par-slew.log`) overlapped a background `cargo test
+--release` build and showed inflated ibex/`place` reps (e.g. ibex
+`sta.spef` median 1270); the tabled numbers are the second, idle-machine
+run — the interference run kept min-bounds consistent, no regression
+hid.
+
+### 2026-11-22 — perf-slewonly-power: slew-only sta_pin_slews (v0.3.4)
+
+`sta_pin_slews` no longer pays for `run_sta_detail`. `prepare_sta` gains a
+`for_slew` flag that skips the `sta.prepare.clock.*` block when its only
+consumer is pulse-width checks (i.e. no `set_propagated_clock`); source
+seeding is extracted into `eval_seed_state` shared by `eval_sta` and the new
+`slew_eval`, which replays the same levelized walk — same net sinks, same
+arc legs, same `driver_response` lookups — but merges only
+`slew_max`/`slew_min` and a reachability bit (no arrival/required, no CRPR,
+no endpoint collection, no checks). A latch-borrow Q driving a non-clock
+net makes downstream slew depend on the borrow window `eval_sta` computes,
+so `uncovered_borrow` detects that case and falls back to
+`eval_state_full` (the full walk minus the report); ibex trips it (one
+borrow Q onto a data net). Public signature unchanged — no `main.rs`,
+`power.rs`, or `sta/mod.rs` edits. Design:
+`kurena/tasks/perf-slewonly-power/design/`.
+
+**Before/after wall** — `median (min–max)` ms, REPS=5, same machine
+(M4 mini) and flags; before = v0.3.3 (`perf-par-slew` run for the
+placement cells — its `power` path is untouched since — plus a fresh
+v0.3.3 run for the zero-wire/VCD cells it did not cover):
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `power` zero wire — gcd | 10 (10–320) | 10 (10–10) | ~noise — loads dominate |
+| `power` zero wire — picorv32 | 80 (80–90) | 40 (30–40) | ×2.0 |
+| `power` zero wire — aes | 90 (90–100) | 60 (50–60) | ×1.5 |
+| `power` zero wire — ibex | 120 (110–140) | 50 (50–80) | ×2.4 |
+| `power` zero wire — jpeg | 350 (330–370) | 150 (140–170) | ×2.3 |
+| `power` placement RC — gcd | 40 (30–40) | 10 (10–10) | ×4.0 |
+| `power` placement RC — picorv32 | 350 (310–350) | 140 (140–140) | ×2.5 |
+| `power` placement RC — aes | 490 (440–490) | 200 (190–230) | ×2.5 |
+| `power` placement RC — ibex | 440 (390–440) | 290 (290–300) | ×1.5 |
+| `power` placement RC — jpeg | 2170 (2100–2190) | 1030 (990–1050) | **×2.1** |
+| `power --vcd` gcd | 890 (670–990) | 500 (490–510) | see note |
+
+`power --vcd` is dominated by `power.activity.load` (~479 of ~500 ms —
+untouched code, the before run's reps ranged 670–990); the slew share is
+`power.slews` 23.7 → 9.1 ms. Zero-wire gcd stays ~10 ms: it is all file
+loads; `power.slews` there was already under the noise floor.
+
+**Phase** (`power --parasitics placement`, median ms): `power.slews`
+envelope jpeg 1824 → **808**, aes 405 → 152, picorv32 267 → 98, ibex 331 →
+218 (fallback — see below), gcd 23.5 → 7.3. Moved keys: `sta.slew.seeds` /
+`sta.slew.walk` now nest under `power.slews`; `sta.eval.seeds|walk|
+endpoints*` no longer fire under `power` on the non-fallback designs, and
+`sta.prepare.clock.slew|walk|loads` are skipped entirely on these SDCs
+(no propagated clocks — the block only served pulse-width checks).
+`slew_eval` is also ~10% cheaper
+per leg than the full walk (jpeg `sta.slew.walk` 771 vs before
+`sta.eval.walk` 830: no arrival/required/CRPR arithmetic, no endpoint
+bookkeeping). **Fallback**: ibex's `uncovered_borrow` routes it through
+`eval_state_full` — `sta.eval.seeds|walk|endpoints(.pulse)` still fire
+inside `power.slews` (walk 205 ms, endpoint collection ~1 ms); only the
+report tail (`sta.assemble`, `sta.partition.*`) and the
+`sta.prepare.clock.*` block are skipped, which still buys the
+prepare-side skip.
+
+**Achieved vs. ceiling**: the plan estimated jpeg `power` ~1.3 s on
+`sta.eval.walk` removal alone; the measured 1.03 s lands ahead of that
+because the `sta.prepare.clock.*` skip (901 ms on jpeg) also fired — none
+of the committed SDCs use `set_propagated_clock`, so pulse-width-only
+clock propagation is pure waste under `power`. Residual, named: (1)
+`sta.slew.walk` itself — jpeg 771 ms, the same DMP-dominated inner loop
+as `eval.walk`, now ~75% of `power` wall; (2) ibex's borrow fallback
+keeps `sta.eval.walk` (205 of its 290); (3) input loads — `power.load.def`
+61 + `power.parasitics` 82 + `power.cells` 31 now sum to ~17% of jpeg
+wall; (4) `power.activity.resolve` ~19.
+
+**Equivalence**: all committed goldens untouched (`git status` clean
+under `tests/designs/**`); `cargo test --workspace` (341+3, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
+--release -p grus-core sta` (188, 2 ignored) all green. Parity is proven
+by test, not assumed: `test_sta_pin_slews_parity_committed_designs`
+compares full-eval `PinTimingState` slew against `sta_pin_slews` **per
+pin and per transition** on gcd (zero-wire / placement RC / routed SPEF),
+picorv32, ibex, aes, jpeg; `..._parity_propagated` covers
+propagated-clock SDCs (gcd, picorv32), `..._parity_exceptions` the
+`fp_allregs` exceptions fixture, `..._parity_microbench` the `mb`/`mbw`
+power fixtures, and `..._latch_borrow_fallback` asserts the predicate
+fires on the borrow fixture then compares through the public path. Every
+case asserts `slew_max` through the public `PinSlew` and additionally
+compares the internal replay state's `slew_min` against the full eval
+state — the min side is where the borrow fixture actually diverges under
+a naive replay.
+Fail-proof: `merge_slew` fed input slews instead of driver outputs → 4
+parity groups red → restored green; `uncovered_borrow` forced `false` →
+latch-borrow test red → restored. Two further probes showed why the
+fallback is structural, not cosmetic: under a broken predicate the
+borrow fixture diverged in `slew_min` at the latch Q pins, and a
+synthetic uncovered-borrow edit on ibex diverged `slew_max` too (−inf vs
+8.69 ns on pin 32170). Determinism: `RAYON_NUM_THREADS=1` parity suite
+green (updates are still collect-then-ordered-apply).
+
+**What was run**: `REPS=5 sh kurena/tasks/perf-profile/measure.sh
+/tmp/perf-slewonly-power3.log` (full 38-cell matrix on the v0.3.4 release
+binary; raw log not committed, the script is). Before cells:
+`power.placement.*` from `/tmp/perf-par-slew2.log` (v0.3.3 — the `power`
+code path is byte-identical between v0.3.3 and the pre-change worktree);
+`power.zerowire.*` and `power.vcd.gcd` measured on the v0.3.3 binary
+into `/tmp/perf-slewonly-before.log`. Note: a first v0.3.4 matrix
+(`/tmp/perf-slewonly-power.log`) ran while a background build was still
+draining and showed inflated `power.*` reps (picorv32 `sta.slew.walk`
+240–743 ms vs 91 steady-state); a power-only idle re-run
+(`/tmp/perf-slewonly-power2.log`) agreed with the tabled log within ±15%
+(jpeg `power` 880 vs 1030), so the table uses the second full-matrix run
+— min-bounds consistent, no regression hid.
+
+### 2026-11-22 — perf-legal-passes: incremental extrema + argmin slide (v0.3.5)
+
+`place.legal.pass1/2/3` keep their ordered serial structure but stop
+rescanning incident nets: one shared `NetExtrema` cache is built once
+inside `place.legal.pre` and maintained exactly across all accepted
+moves (insert-into-top-2; full rescan only when a moved pin held a
+maintained slot — `LegalizeResult.refine_extrema_rebuilds` = 191 /
+6,389 / 13,347 / 9,895 / 37,630 rescan-nets on gcd / picorv32 / aes /
+ibex / jpeg; passes 2/3 evaluations now cost O(moved pins) instead of
+O(net degree). Pass 3's median-of-other-pins candidate is replaced by
+the exact site-grid argmin of the convex piecewise-linear span sum
+(limits + `snap_down`/`snap_up` of each per-net kink `dx = o_lo - c_lo`
+and `dx = o_hi - c_hi`) — the one deliberate semantic change; pass 1's
+band index is rekeyed `(width, x, mi, cell)` so collection scans
+same-width entries only. Design: `kurena/tasks/perf-legal-passes/design/`.
+
+**Before/after wall** — median (min–max) ms, REPS=5, M4 mini:
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `place` — gcd | 10 (10–260) | 10 (0–10) | ×1.0 |
+| `place` — picorv32 | 350 (350–360) | 320 (310–320) | ×1.09 |
+| `place` — aes | 380 (370–380) | 370 (370–370) | ×1.03 |
+| `place` — ibex | 560 (560–560) | 480 (480–490) | ×1.17 |
+| `place` — jpeg | 2170 (2150–2180) | 1560 (1550–1610) | ×1.39 |
+
+**Phase** (jpeg `place`, median ms): `pass1` 250.5 → 250.6, `pass2`
+334.4 → 28.2, `pass3` 357.8 → 28.4, `abacus` 22.4 → 22.5, `resync`
+6.9 → 6.9, `pre` 4.8 → 5.4 (now includes the one-time extrema build
+that previously ran 4× inside pass1), `verify` 3.3 → 3.3. `Legalization`
+elapsed line: 987 → 348 ms.
+
+**HPWL per design** (`final_hpwl` dbu, before → after, Δ%): gcd
+4,395,223 → 4,368,029 (−0.62%); picorv32 212,135,994 → 210,965,952
+(−0.55%); aes 333,486,044 → 332,026,306 (−0.44%); ibex 413,760,839 →
+412,479,824 (−0.31%); jpeg 1,018,912,430 → 1,015,606,273 (−0.32%) —
+every design improved (the argmin candidate set weakly dominates the
+old 3-point sample per cell). OpenROAD golden gaps all still ≤5%
+(gated by the E2 tests): gcd −3.6%, picorv32 +4.3%, aes −1.2%, ibex
+−1.5%, jpeg −1.6% vs `*.reference.json` `placed_hpwl_dbu`.
+
+**Achieved vs. ceiling**: the plan's ×1.3 ceiling was set off the
+v0.3.2 tabled jpeg `place` of 4,190 ms → ~3.2 s. The same-session
+before here is 2,170 ms — that table was taken on a busier machine
+(every untouched phase, `place.gp.*` and the non-`place` cells alike,
+measures ~2× faster today: `sta.placement.jpeg` 1,070 ms now vs 2,060
+in the perf-slewonly-power entry). Against the honest before, `place`
+improved ×1.39 (jpeg) — ahead of the ceiling. Residual, named: (1)
+`place.gp.*` untouched — ~73% of the new jpeg `place` wall
+(density 515 / wl 347 / step 200 / init 79); (2) `pass1` is now the
+dominant serial legal phase (251 ms) — its evaluations were already
+extrema-cached since F5 (`evaluate_trial_swap_ro`), so the remaining
+cost is candidate volume and accepts, not net scans; (3)
+`resync`+`pre`+`verify`+`abacus` tail ~38 ms; (4) the 37,630 rebuilds
+are dominated by 2-pin nets, whose every moved pin is extremal by
+definition — rescan frequency there is inherent, but each rescan is a
+2-pin scan.
+
+**Equivalence**: `verify_legality` + all committed E2 goldens green
+(`cargo test --workspace` 343+3, 2 ignored; clippy `-D warnings`;
+`cargo test --release -p grus-core sta` 188, 2 ignored). Passes
+1/2 + the pass-3 evaluator proven bit-identical, not assumed:
+temporarily restoring the old median-of-other-pins candidate on top of
+the new code made all five `--out-def`s `cmp`-clean against the
+pre-change `/tmp/<d>.before.def` — the entire out-def divergence is
+the enlarged candidate set. Determinism: 2× jpeg + picorv32 `cmp`
+clean, `RAYON_NUM_THREADS=1` jpeg `cmp` clean. Fail-proof: (a) dropping
+the `lo[1]`/`hi[1]` insert branches →
+`test_incremental_extrema_matches_full_rebuild` red → restored (the
+`v <= lo[1].val` variant is value-neutral by design — a tied value is
+already covered — and correctly stayed green); (b) dropping the `hi`
+membership check → same test red → restored; (c) dropping `snap_up`
+from the kink candidates → `test_pass3_candidates_hit_site_argmin` red
+(spans=[(1189,2581,33,46),(-1036,291,-848,-838)] cand 2755 vs brute
+2750) → restored; (d) `surviving_extremum_owner` fed `0` instead of
+the sliding cell → `test_picorv32_place_and_legalize` red at the 5%
+golden gate (+5.27%) → restored.
+
+**What was run**: before — the five `place` commands of
+`kurena/tasks/perf-profile/measure.sh` run by hand on the pre-change
+v0.3.4 release binary, `GRUS_PHASE_TIMING=1`, 5 reps each into
+`/tmp/perf-legal-before.log` (`/tmp/<d>.before.def` kept), on an idle
+machine. After — `REPS=5 sh kurena/tasks/perf-profile/measure.sh
+/tmp/perf-legal-passes.log`, the full matrix on the v0.3.5 binary on
+the same idle machine; the non-`place` cells double as the
+no-regression check (all within noise of the slew-ticket binaries at
+this machine's current speed — `sta.placement.jpeg` 1,070 ms).
+`refine_extrema_rebuilds` was read from a temporary `eprintln`
+(removed after recording; the committed `LegalizeResult` field holds
+the value). Raw logs not committed; the driver is.
+
+### 2026-11-22 — perf-parsers: allocation-free SPEF/DEF/VCD scans (v0.3.6)
+
+Mechanical scan/tokenize work in the three serial readers: per-line and
+per-group `Vec`/`String` churn removed (fixed 5-slot SPEF token buffer,
+inline DEF `read_conn_group`, one reused statement scratch per counted
+section, `Cow` unescape on both name paths, `get_mut`-first VCD map
+access, precomputed VCD bit names), SPEF NAME_MAP rekeyed to the `*N`
+digit-slice of the input line (zero-alloc probes — chosen over the
+u32 rekey so indices beyond `u32` keep exact semantics), `fast-float2`
+for SPEF `*D_NET`/`*CAP`/`*RES`/unit numerics, `xxh3` on the
+per-token/per-connection hash maps (SPEF `name_map`/`owner`, DEF
+`cell_name_to_id`/`io_pin_name_to_id`, VCD `decls`/`activity`/`signals`).
+No format-semantics changes; `split_ascii_whitespace` note: inside a
+SPEF token, non-ASCII whitespace now stays part of the word instead of
+splitting — such input still fails at the same line (numeric parse or
+field count), never silently; all committed SPEF and error tests are
+ASCII. Design: `kurena/tasks/perf-parsers/design/`.
+
+**Phase before/after** — median (min–max) ms, REPS=5, same M4 mini,
+both matrices in one session:
+
+| phase | cell | before | after | speedup |
+|---|---|---|---|---|
+| `sta.spef.read` | jpeg | 161 (159–165) | 115 (114–127) | ×1.39 |
+| `sta.spef.read` | picorv32 (rcx) | 81 (80–84) | 60 (59–64) | ×1.34 |
+| `sta.spef.read` | ibex | 44 (43–46) | 32 (31–37) | ×1.36 |
+| `sta.spef.read` | aes | 29 (29–31) | 21 (21–23) | ×1.36 |
+| `sta.spef.read` | picorv32 | 23 (22–24) | 17 (17–19) | ×1.34 |
+| `sta.spef.read` | gcd / gcd (rcx) | 1 / 2 | 1 / 1 (1–2) | — |
+| `sta.load.def` | jpeg `sta.placement` | 58 (58–60) | 49 (48–50) | ×1.19 |
+| `sta.load.def` | jpeg `sta.spef` | 60 (57–60) | 47 (47–48) | ×1.26 |
+| `sta.load.def` | jpeg `sta.zerowire` | 58 (58–60) | 50 (49–56) | ×1.17 |
+| `power.load.def` | jpeg `power.placement` | 58 (57–60) | 48 (47–52) | ×1.21 |
+| `power.load.def` | jpeg `power.zerowire` | 59 (58–59) | 47 (47–48) | ×1.26 |
+| `cong.load` | jpeg (LEF + DEF scope) | 59 (58–60) | 48 (47–51) | ×1.23 |
+| `power.activity.load` | `power.vcd.gcd` | 420 (418–445) | 276 (276–282) | ×1.52 |
+
+DEF parse on the other designs: `sta.load.def`/`power.load.def` aes
+12 → 10, ibex 16 → 13, picorv32 10 → 8 — uniform ~×1.2.
+
+**Cell wall** — same runs:
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `sta.spef.jpeg` | 1650 (1650–1670) | 1380 (1360–1380) | ×1.20 |
+| `sta.spef_rcx.picorv32` | 300 (300–310) | 260 (260–270) | ×1.15 |
+| `sta.placement.jpeg` | 1500 | 1320 (1280–1370) | ×1.14 |
+| `power.placement.jpeg` | 870 | 720 (710–740) | ×1.21 |
+| `power.vcd.gcd` | 440 (430–460) | 290 (290–300) | ×1.52 |
+| `congestion.jpeg` | 120 | 110 (100–110) | ×1.09 |
+
+Controls (untouched paths) flat within noise: `place.*` (jpeg
+1740 → 1600 is the 3940-ms before-outlier leaving the median; aes /
+picorv32 / gcd ×1.00, ibex ×0.96), `sta.zerowire.*`, `power.zerowire.*`,
+and every ≤ 50 ms cell.
+
+**Achieved vs. plan**: the plan estimated ~×2 per phase; achieved is
+×1.2–1.5 (×1.34–1.39 `sta.spef.read`, ~×1.2 `*.load.def` /
+`cong.load`, ×1.52 `power.activity.load`). Residuals, named: (1)
+`cong.load` keeps its untouched LEF share (LEF is out of file scope) —
+the DEF-side gain inside it matches `*.load.def`; (2) file read +
+UTF-8 validate (~few ms on 10–40 MB inputs; `memmap2` precedent in
+`lef.rs`); (3) `db.strings.intern` SipHash interner (out of file
+scope); (4) per-connection `cell_pins` pin-name match and per-cell
+`lib_pin` scan — O(few) structure lookups; (5) SPEF `ended`/`halves`
+owned-name clones and the per-net `nets` insert (output structure, not
+scan); (6) DEF `net_pins_list`/`current_pins`/`net_names_vec` per-net
+Vecs — result structure, not scanning; (7) VCD `FastMap→HashMap`
+boundary collect, `dur`/`sa` per-bit Vec traffic, and the closing
+scoped-signal pass.
+
+**Equivalence**: `cargo test --workspace` (346 + 3, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo test --release -p grus-core sta` (188, 2 ignored — the strict
+SPEF/DEF consumers). Identical-output proof, not just goldens:
+`cmp`-clean `--json` from the v0.3.5 vs v0.3.6 binaries for
+`sta.spef.jpeg`, `sta.spef_rcx.picorv32`, `sta.placement.jpeg`, and
+`sta.zerowire.jpeg`; `congestion.jpeg` and `power.vcd.gcd` stdout
+identical after stripping the inherently nondeterministic elapsed-ms
+field (all reported congestion / power numbers bit-identical).
+Error-path coverage: every line-numbered reject + truncation test
+green, plus three new DEF tests for the `( component pin )` group
+shapes no test covered — extra word, single word, unterminated.
+Fail-proof (per AGENTS §7): (a) SPEF `resolve` with the `:suffix`
+append dropped → `converts_units_and_resolves_the_name_map` red →
+restored; (b) DEF `read_conn_group` accepting `( comp pin extra )` →
+`test_connection_group_with_extra_word_is_an_error` (added for this —
+the 3-word group shape was untested) red → restored; (c) VCD
+`bits.len() != decl.nbits` early-return dropping short writes →
+`test_short_vector_writes_left_extend` red → restored.
+
+**What was run**: before — `REPS=5 sh
+kurena/tasks/perf-profile/measure.sh /tmp/perf-parsers-before.log`
+on the full matrix with a release binary built from the pre-change
+v0.3.5 tree; after — the identical command into
+`/tmp/perf-parsers-after.log` on the v0.3.6 binary, same idle M4
+mini, same session. Output-identity `cmp`s used the same two
+binaries (`/tmp/grus-eda.before` kept). Raw logs not committed; the
+driver is.
+
+### 2026-11-22 — perf-dmp-hotloop: per-call exact-key memo of the DMP `table` closure (v0.3.7)
+
+`Context::driver_response` — the NLDM table read behind the DMP
+effective-capacitance solve — is the deepest remaining inner loop after
+v0.3.6 (~75% of `power` wall via `sta.slew.walk`, ~60% of `sta` wall via
+`sta.eval.walk`/`sta.prepare.clock.slew` on jpeg). Mechanism chosen by
+instrumented call counts, per the ticket's decision rule (full counts
+and the rejected alternatives in
+`kurena/tasks/perf-dmp-hotloop/design/`):
+
+- **Cross-call `driver_response` exact repeats: 0.0%.** 897,452 pi-path
+  calls on jpeg `sta` (seeds 8,750; clock.slew 448,726; eval.walk
+  439,976 — all bitwise-unique keys), 448,726 on jpeg `power` slew.walk,
+  156,617 on ibex `sta` — every key unique. A run-scoped memo scores
+  zero hits; rejected.
+- **Intra-call `table(c)` repeats: 21.6%** (jpeg `sta`
+  5,384,658/24,921,651 evals; jpeg `power` 21.6%; ibex 21.8%). `table`
+  is ~all of `eval_2d` (49.9M of 49.9M), so the dedupe removes ~21.6%
+  of `eval_2d` calls. Shipped.
+- **`rc_crossing` Brent share: 43.7%** (jpeg `sta` 49.36M calls; 56.3%
+  closed-form). Untouchable under bit-identity — any bracket/Brent
+  change shifts roots by ≤ tol → different f64 → `cmp`-dirty. Named
+  residual.
+- `eval_2d` leaf share of `sample` on jpeg `sta.placement` ~6%
+  (125/1,979 samples) — below the gate for site-level hardening;
+  `fit_ramp_duration` 71.5% degenerate early-returns; `pi_charge` 100%
+  discrete (zero numeric fallbacks).
+
+Shipped mechanism (`dmp.rs` `memo_table` + one wrap site in
+`analysis.rs`): `solve_dmp` and `driver_waveform_slew` re-read the same
+`c` points (`is_lumped_bailout` in both, `residual(hi)`, the `rd_of`
+slope lookups); a per-call `RefCell<Vec>` memo keyed on `c.to_bits()`
+(linear scan — ~22 distinct keys per call) dedupes them. A hit returns
+the stored pair of a pure function — bitwise identical to
+re-evaluation — so output is unchanged by construction. Per-call scope:
+no shared-mutable state crosses rayon threads.
+
+**Cell wall** — `measure.sh`, `REPS=5`, median ms (range), same idle
+M4 mini:
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `sta.placement.jpeg` | 1290 (1270–1340) | 1090 (1070–1100) | ×1.18 |
+| `sta.spef.jpeg` | 1370 (1360–1390) | 1170 (1170–1200) | ×1.17 |
+| `sta.zerowire.jpeg` | 120 | 110 (100–110) | ×1.09 |
+| `power.placement.jpeg` | 740 (720–740) | 630 (630–650) | ×1.17 |
+| `sta.placement.ibex` | 260 (250–280) | 210 | ×1.24 |
+| `sta.spef.ibex` | 290 (280–300) | 240 | ×1.21 |
+| `power.placement.ibex` | 220 | 190 | ×1.16 |
+| `sta.placement.aes` | 280 (280–290) | 240 (240–250) | ×1.17 |
+| `sta.spef.aes` | 310 (300–320) | 270 (260–270) | ×1.15 |
+| `power.placement.aes` | 170 (170–180) | 150 | ×1.13 |
+| `sta.spef.picorv32` | 210 (200–210) | 190 (180–190) | ×1.11 |
+| `sta.spef_rcx.picorv32` | 260 (250–300) | 230 (230–240) | ×1.13 |
+| `power.placement.picorv32` | 130 | 110 | ×1.18 |
+| `sta.placement.picorv32` | 190 | 190 | — |
+| `congestion.jpeg` | 110 | 100 (100–110) | — |
+| `place.jpeg` | 1600 | 1570 | — |
+
+Controls flat within noise: every `*.zerowire.*` except jpeg-zerowire's
+DMP path, `congestion.*`, `place.*`, `power.vcd.gcd`, and all ≤ 50 ms
+cells.
+
+**Phases** — same runs, median ms:
+
+| phase | cell | before | after | Δ |
+|---|---|---|---|---|
+| `sta.eval.walk` | jpeg `sta.placement` | 547 | 463 | −84 |
+| `sta.prepare.clock.slew` | jpeg `sta.placement` | 580 | 481 | −98 |
+| `sta.eval.walk` | jpeg `sta.spef` | 541 | 446 | −94 |
+| `sta.prepare.clock.slew` | jpeg `sta.spef` | 563 | 466 | −97 |
+| `sta.slew.walk` | jpeg `power.placement` | 543 | 448 | −95 |
+| `power.slews` | jpeg `power.placement` | 569 | 473 | −96 |
+| `sta.eval.walk` | ibex `sta.placement` | 160 | 123 | −37 |
+| `sta.prepare.clock.slew` | ibex `sta.placement` | 50 | 39 | −10 |
+| `power.slews` | ibex `power.placement` | 165 | 133 | −32 |
+| `sta.eval.walk` | aes `sta.placement` | 123 | 106 | −16 |
+| `sta.prepare.clock.slew` | aes `sta.placement` | 127 | 108 | −19 |
+| `power.slews` | aes `power.placement` | 131 | 109 | −22 |
+| `power.slews` | picorv32 `power.placement` | 90 | 73 | −18 |
+
+**Achieved vs. plan**: the count-derived ceiling was ~21.6% of
+`eval_2d` inside the walks; measured is ~15–20% off the DMP phases and
+×1.13–1.24 cell wall — larger than the naive ceiling, consistent with
+the memo also removing `eval_2d`'s per-call setup (index clamps, bilinear
+weight computes) on every hit. Residuals, named: (1) `rc_crossing`
+Brent — 43.7% of 49M calls, bit-identity-barred here, the largest
+remaining lever inside the walks; (2) `fit_ramp_duration` /
+`pi_waveform_slew` transcendental work — ~330 `sample` hits, structural;
+(3) the serial `sta.prepare.clock.slew` Kahn walk itself remains the
+top jpeg phase (481 ms) — parallelizing it was `perf-par-slew`'s scope
+and its remaining serial fraction is next-ticket material.
+
+**Equivalence**: `cargo test --workspace` (347 + 3, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo test --release -p grus-core sta` (189, 2 ignored). `--json`
+`cmp`-clean v0.3.6 vs v0.3.7 for `sta.placement` on jpeg and ibex;
+`RAYON_NUM_THREADS=1/4/10` all `cmp`-clean on jpeg `sta.placement`.
+New unit test `sta::dmp::tests::memo_table_hits_are_bitwise_exact`:
+same-`c` hits once, distinct `c` misses, `+0.0`/`-0.0` are distinct
+`to_bits()` keys, returned pairs compared by bits. Fail-proof (per
+AGENTS §7): the memo changed to always return its first entry →
+jpeg `sta.placement --json` `cmp` red → exact-key restored →
+`cmp`-clean again. (A weaker `>> 8` quantized-key mutation stayed
+`cmp`-clean — observed `c` values differ by ≥ 5%, so no collision —
+recorded as a negative result, not the fail-proof.)
+
+**What was run**: before — `REPS=5 sh
+kurena/tasks/perf-profile/measure.sh /tmp/perf-dmp-before.log` on the
+full matrix with a release binary built from the pre-change v0.3.6
+tree (ephemeral instrumentation reverted); after — the identical
+command into `/tmp/perf-dmp-after.log` on the v0.3.7 binary, same
+idle M4 mini, same session. Count instrumentation was a temporary
+patch (kept at `/tmp/dmp-counters.patch`), run once on jpeg
+`sta`/`power` + ibex `sta`, then reverted. Raw logs not committed;
+the driver is.

@@ -1,0 +1,517 @@
+warning: `/var/empty/.tclsh-history' is not writable.
+openroad> <y130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+1
+openroad> <f/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef, created 14 layers, 25 vias
+openroad> <0A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+[WARNING ODB-0220] WARNING (LEFPARS-2008): NOWIREEXTENSIONATPIN statement is obsolete in version 5.6 or later.
+The NOWIREEXTENSIONATPIN statement will be ignored. See file /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef at line 2.
+
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef, created 437 library cells
+openroad> read_def /work/tests/designs/sta_edge/check_arcs/check_arcs.def
+[INFO ODB-0127] Reading DEF file: /work/tests/designs/sta_edge/check_arcs/check_arcs.def
+[INFO ODB-0128] Design: check_arcs
+[INFO ODB-0130]     Created 6 pins.
+[INFO ODB-0131]     Created 14 components and 99 component-terminals.
+[INFO ODB-0133]     Created 16 nets and 38 connections.
+[INFO ODB-0134] Finished DEF file: /work/tests/designs/sta_edge/check_arcs/check_arcs.def
+openroad> 
+openroad> puts "=== scenario propagated.sdc ==="
+=== scenario propagated.sdc ===
+openroad> read_sdc /work/tests/designs/sta_edge/check_arcs/propagated.sdc
+openroad> 
+openroad> puts "=== Q0 command surface ==="
+=== Q0 command surface ===
+openroad> puts "*check*          : [lsort [info commands *check*]]"
+*check*          : check_3dblox check_antennas check_axioms check_placement check_power_grid check_setup report_annotated_check report_check_types report_checks report_pulse_width_checks set_assigned_check set_clock_gating_check set_data_check unset_data_check
+openroad> puts "sta::*check*     : [lsort [info commands sta::*check*]]"
+sta::*check*     : ::sta::PathEnd_check_crpr ::sta::PathEnd_check_role ::sta::PathEnd_is_check ::sta::PathEnd_is_data_check ::sta::PathEnd_is_latch_check ::sta::check_argc_eq0 ::sta::check_argc_eq0or1 ::sta::check_argc_eq1 ::sta::check_argc_eq1or2 ::sta::check_argc_eq2 ::sta::check_argc_eq3 ::sta::check_argc_eq4 ::sta::check_axioms ::sta::check_axioms_cmd ::sta::check_capacitance_limits ::sta::check_cardinal ::sta::check_exception_from_pins ::sta::check_exception_pins ::sta::check_exception_to_pins ::sta::check_fanout_limits ::sta::check_float ::sta::check_for_key_args ::sta::check_integer ::sta::check_nocase_flag ::sta::check_path_divider ::sta::check_percent ::sta::check_positive_float ::sta::check_positive_integer ::sta::check_setup ::sta::check_setup_cmd ::sta::check_slew_limits ::sta::check_timing_cmd ::sta::check_unit ::sta::check_unit_scale ::sta::disable_clock_gating_check_inst ::sta::disable_clock_gating_check_pin ::sta::gated_clk_checks_enabled ::sta::max_capacitance_check_limit ::sta::max_capacitance_check_slack ::sta::max_capacitance_check_slack_limit ::sta::max_fanout_check_limit ::sta::max_fanout_check_slack ::sta::max_fanout_check_slack_limit ::sta::max_skew_check_slack ::sta::max_slew_check_limit ::sta::max_slew_check_slack ::sta::max_slew_check_slack_limit ::sta::min_period_check_slack ::sta::min_pulse_width_check_pins ::sta::min_pulse_width_check_slack ::sta::min_pulse_width_checks ::sta::parse_min_max_all_check_flags ::sta::recovery_removal_checks_enabled ::sta::report_annotated_check ::sta::report_annotated_check_cmd ::sta::report_check_types ::sta::report_checks ::sta::report_max_skew_check ::sta::report_max_skew_checks ::sta::report_min_period_check ::sta::report_min_period_checks ::sta::report_mpw_check ::sta::report_mpw_checks ::sta::report_pulse_width_checks ::sta::set_assigned_check ::sta::set_assigned_check1 ::sta::set_assigned_check2 ::sta::set_clock_gating_check ::sta::set_clock_gating_check1 ::sta::set_clock_gating_check_clk_cmd ::sta::set_clock_gating_check_cmd ::sta::set_clock_gating_check_instance_cmd ::sta::set_clock_gating_check_pin_cmd ::sta::set_data_check ::sta::set_data_check_cmd ::sta::set_gated_clk_checks_enabled ::sta::set_recovery_removal_checks_enabled ::sta::timing_role_is_check ::sta::trace_gated_clk_checks_enabled ::sta::trace_recovery_removal_checks_enabled ::sta::unset_data_check ::sta::unset_data_check_cmd ::sta::unset_data_checks_cmd ::sta::unset_disable_clock_gating_check_inst ::sta::unset_disable_clock_gating_check_pin
+openroad> puts "*data*           : [lsort [info commands *data*]]"
+*data*           : set_data_check unset_data_check
+openroad> puts "*three*          : [lsort [info commands *three*]]"
+*three*          : 
+openroad> puts "*non_seq*        : [lsort [info commands *non_seq*]]"
+*non_seq*        : 
+openroad> puts "*preserve*       : [lsort [info commands *preserve*]]"
+*preserve*       : 
+openroad> 
+openroad> <max_slew -max_capacitance -max_fanout -violators} {
+...>     puts "--- report_check_types $flag ---"
+...>     if {[catch {report_check_types $flag} err]} {
+...>         puts "error: $err"
+...>     }
+...> }
+--- report_check_types -data_setup ---
+[ERROR STA-0562] report_check_types -data_setup is not a known keyword or flag.
+error: STA-0562
+--- report_check_types -data_hold ---
+[ERROR STA-0562] report_check_types -data_hold is not a known keyword or flag.
+error: STA-0562
+--- report_check_types -recovery ---
+Group                                  Slack
+--------------------------------------------
+asynchronous                            1.14
+
+--- report_check_types -removal ---
+Group                                  Slack
+--------------------------------------------
+asynchronous                            0.40
+
+--- report_check_types -clock_gating_setup ---
+Group                                  Slack
+--------------------------------------------
+No paths found.
+
+--- report_check_types -clock_gating_hold ---
+Group                                  Slack
+--------------------------------------------
+No paths found.
+
+--- report_check_types -max_delay ---
+Group                                  Slack
+--------------------------------------------
+core_clk                                1.09
+
+--- report_check_types -min_delay ---
+Group                                  Slack
+--------------------------------------------
+core_clk                                0.63
+
+--- report_check_types -min_period ---
+--- report_check_types -min_pulse_width ---
+                                     Required  Actual
+Pin                                    Width   Width   Slack
+------------------------------------------------------------
+u_fbn/CLK_N (low)                       0.32    2.00    1.68 (MET)
+
+--- report_check_types -max_slew ---
+max slew
+
+Pin                                    Limit    Slew   Slack
+------------------------------------------------------------
+u_ff/Q                                  1.50    0.47    1.03 (MET)
+
+--- report_check_types -max_capacitance ---
+max capacitance
+
+Pin                                    Limit     Cap   Slack
+------------------------------------------------------------
+u_einv/Z                                0.07    0.00    0.07 (MET)
+
+--- report_check_types -max_fanout ---
+--- report_check_types -violators ---
+Group                                  Slack
+--------------------------------------------
+No paths found.
+
+openroad> 
+openroad> <_setup non_seq_hold three_state recovery removal} {
+...>     puts "--- find_timing_paths -path_delay $pd ---"
+...>     if {[catch {set pe_list [find_timing_paths -path_delay $pd]} err]} {
+...>         puts "error: $err"
+...>     } else {
+...>         puts "path count: [llength $pe_list]"
+...>         foreach pe $pe_list { puts "  end: [get_full_name [$pe pin]]" }
+...>     }
+...> }
+--- find_timing_paths -path_delay data_setup ---
+[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise, min_fall, max, max_rise, max_fall or min_max.
+error: STA-0510
+--- find_timing_paths -path_delay data_hold ---
+[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise, min_fall, max, max_rise, max_fall or min_max.
+error: STA-0510
+--- find_timing_paths -path_delay non_seq_setup ---
+[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise, min_fall, max, max_rise, max_fall or min_max.
+error: STA-0510
+--- find_timing_paths -path_delay non_seq_hold ---
+[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise, min_fall, max, max_rise, max_fall or min_max.
+error: STA-0510
+--- find_timing_paths -path_delay three_state ---
+[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise, min_fall, max, max_rise, max_fall or min_max.
+error: STA-0510
+--- find_timing_paths -path_delay recovery ---
+[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise, min_fall, max, max_rise, max_fall or min_max.
+error: STA-0510
+--- find_timing_paths -path_delay removal ---
+[ERROR STA-0510] find_timing_paths -path_delay must be min, min_rise, min_fall, max, max_rise, max_fall or min_max.
+error: STA-0510
+openroad> 
+openroad> puts "=== Q1 non_seq_* on u_fbp/u_fbn (dfbbp_1/dfbbn_1) ==="
+=== Q1 non_seq_* on u_fbp/u_fbn (dfbbp_1/dfbbn_1) ===
+openroad> foreach p {u_fbp/RESET_B u_fbp/SET_B u_fbn/RESET_B u_fbn/SET_B} {
+...> <nt_path_count 10 -group_path_count 100000]} err]} {
+...>         puts "$p error: $err"
+...>     } else {
+...>         puts "$p path count: [llength $pe_list]"
+...>         foreach pe $pe_list { puts "  end: [get_full_name [$pe pin]]" }
+...>     }
+...> }
+u_fbp/RESET_B path count: 1
+  end: u_fbp/RESET_B
+u_fbp/SET_B path count: 1
+  end: u_fbp/SET_B
+u_fbn/RESET_B path count: 1
+  end: u_fbn/RESET_B
+u_fbn/SET_B path count: 1
+  end: u_fbn/SET_B
+openroad> <u_fbp/RESET_B] -format full -endpoint_path_count 10
+Startpoint: rst_n (input port clocked by core_clk)
+Endpoint: u_fbp (recovery check against rising-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.10    0.10   clock network delay (propagated)
+   0.50    0.60 ^ input external delay
+   0.00    0.60 ^ rst_n (in)
+   0.11    0.71 ^ u_rst/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    0.71 ^ u_fbp/RESET_B (sky130_fd_sc_hd__dfbbp_1)
+           0.71   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.24    4.24   clock network delay (propagated)
+  -0.05    4.19   clock uncertainty
+   0.00    4.19   clock reconvergence pessimism
+           4.19 ^ u_fbp/CLK (sky130_fd_sc_hd__dfbbp_1)
+  -0.05    4.14   library recovery time
+           4.14   data required time
+---------------------------------------------------------
+           4.14   data required time
+          -0.71   data arrival time
+---------------------------------------------------------
+           3.43   slack (MET)
+
+
+openroad> <s u_fbp/SET_B] -format full -endpoint_path_count 10
+Startpoint: set_n (input port clocked by core_clk)
+Endpoint: u_fbp (recovery check against rising-edge clock core_clk)
+Path Group: asynchronous
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.10    0.10   clock network delay (propagated)
+   0.90    1.00 ^ input external delay
+   0.00    1.00 ^ set_n (in)
+   0.13    1.13 ^ u_set/X (sky130_fd_sc_hd__clkbuf_2)
+   0.00    1.13 ^ u_fbp/SET_B (sky130_fd_sc_hd__dfbbp_1)
+           1.13   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.24    4.24   clock network delay (propagated)
+  -0.05    4.19   clock uncertainty
+   0.00    4.19   clock reconvergence pessimism
+           4.19 ^ u_fbp/CLK (sky130_fd_sc_hd__dfbbp_1)
+   0.05    4.24   library recovery time
+           4.24   data required time
+---------------------------------------------------------
+           4.24   data required time
+          -1.13   data arrival time
+---------------------------------------------------------
+           3.12   slack (MET)
+
+
+openroad> foreach p {u_fbp/RESET_B u_fbp/SET_B} {
+...>     puts "--- report_arrival $p ---"
+...> <get_pins $p]} err]} { puts "report_arrival: $err" }
+...> }
+--- report_arrival u_fbp/RESET_B ---
+ (core_clk ^) r 0.71:0.71 f 0.72:0.72
+--- report_arrival u_fbp/SET_B ---
+ (core_clk ^) r 1.13:1.13 f 1.14:1.14
+openroad> 
+openroad> puts "=== Q2 three_state_* on u_ebuf/u_einv/u_evp ==="
+=== Q2 three_state_* on u_ebuf/u_einv/u_evp ===
+openroad> <nt_path_count 10 -group_path_count 100000]} err]} {
+...>     puts "find -from te error: $err"
+...> } else {
+...>     puts "find -from te path count: [llength $pe_list]"
+...>     foreach pe $pe_list { puts "  end: [get_full_name [$pe pin]]" }
+...> }
+find -from te path count: 12
+  end: u_cap3/D
+  end: u_cap1/D
+  end: u_cap2/D
+  end: u_cap3/D
+  end: u_cap1/D
+  end: u_cap2/D
+  end: u_cap3/D
+  end: u_cap1/D
+  end: u_cap2/D
+  end: u_cap1/D
+  end: u_cap2/D
+  end: u_cap3/D
+openroad> report_checks -to [get_pins u_cap1/D] -format full
+Startpoint: d_in (input port clocked by core_clk)
+Endpoint: u_cap1 (rising edge-triggered flip-flop clocked by core_clk)
+Path Group: core_clk
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.10    0.10   clock network delay (propagated)
+   0.70    0.80 v input external delay
+   0.00    0.80 v d_in (in)
+   0.16    0.96 v u_dbuf/X (sky130_fd_sc_hd__buf_2)
+   0.11    1.08 v u_ebuf/Z (sky130_fd_sc_hd__ebufn_1)
+   0.00    1.08 v u_cap1/D (sky130_fd_sc_hd__dfxtp_1)
+           1.08   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.24    4.24   clock network delay (propagated)
+  -0.05    4.19   clock uncertainty
+   0.00    4.19   clock reconvergence pessimism
+           4.19 ^ u_cap1/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.10    4.09   library setup time
+           4.09   data required time
+---------------------------------------------------------
+           4.09   data required time
+          -1.08   data arrival time
+---------------------------------------------------------
+           3.02   slack (MET)
+
+
+openroad> foreach p {u_ebuf/Z u_einv/Z u_evp/Z u_fbp/Q u_fbn/Q_N} {
+...>     puts "--- report_arrival $p ---"
+...> <get_pins $p]} err]} { puts "report_arrival: $err" }
+...> }
+--- report_arrival u_ebuf/Z ---
+ (core_clk ^) r 0.99:1.07 f 0.96:1.08
+--- report_arrival u_einv/Z ---
+ (core_clk ^) r 0.99:1.04 f 0.96:1.04
+--- report_arrival u_evp/Z ---
+ (core_clk ^) r 0.97:1.05 f 0.98:1.06
+--- report_arrival u_fbp/Q ---
+ (core_clk ^) r 0.73:0.73 f 0.67:0.67
+--- report_arrival u_fbn/Q_N ---
+ (core_clk v) r 2.72:2.72 f 2.60:2.60
+openroad> 
+openroad> puts "=== Q3 three_state edge model (report_edges/report_slews) ==="
+=== Q3 three_state edge model (report_edges/report_slews) ===
+openroad> report_edges -from [get_pins u_ebuf/TE_B] -to [get_pins u_ebuf/Z]
+TE_B -> Z tristate disable
+  ^ -> 0Z 0.05:0.05
+  ^ -> 1Z 0.03:0.03
+TE_B -> Z tristate enable
+  v -> Z1 0.09:0.09
+  v -> Z0 0.09:0.09
+openroad> report_edges -from [get_pins u_ebuf/A] -to [get_pins u_ebuf/Z]
+A -> Z combinational
+  ^ -> ^ 0.13:0.13
+  v -> v 0.11:0.11
+openroad> report_edges -from [get_pins u_einv/TE_B] -to [get_pins u_einv/Z]
+TE_B -> Z tristate disable
+  ^ -> 0Z 0.05:0.05
+  ^ -> 1Z 0.02:0.02
+TE_B -> Z tristate enable
+  v -> Z1 0.09:0.09
+  v -> Z0 0.09:0.09
+openroad> report_edges -from [get_pins u_einv/A] -to [get_pins u_einv/Z]
+A -> Z combinational
+  ^ -> v 0.05:0.05
+  v -> ^ 0.07:0.07
+openroad> report_edges -from [get_pins u_evp/TE] -to [get_pins u_evp/Z]
+TE -> Z tristate disable
+  v -> 0Z 0.01:0.01
+  v -> 1Z 0.11:0.11
+TE -> Z tristate enable
+  ^ -> Z1 0.12:0.12
+  ^ -> Z0 0.04:0.04
+openroad> report_edges -from [get_pins u_evp/A] -to [get_pins u_evp/Z]
+A -> Z combinational
+  ^ -> v 0.05:0.05
+  v -> ^ 0.07:0.07
+openroad> foreach p {u_ebuf/Z u_einv/Z u_evp/Z} {
+...>     puts "--- report_slews $p ---"
+...> < [get_pins $p]} err]} { puts "report_slews: $err" }
+...> }
+--- report_slews u_ebuf/Z ---
+u_ebuf/Z ^ 0.00:0.08 v 0.00:0.03
+--- report_slews u_einv/Z ---
+u_einv/Z ^ 0.00:0.07 v 0.00:0.03
+--- report_slews u_evp/Z ---
+u_evp/Z ^ 0.00:0.07 v 0.00:0.03
+openroad> foreach n {z1 z2 z3} {
+...>     puts "--- report_net $n ---"
+...> <net $n -digits 6} err]} { puts "report_net: $err" }
+...> }
+--- report_net z1 ---
+Net z1
+ Pin capacitance: 0.003934-0.003941
+ Wire capacitance: 0.000000
+ Total capacitance: 0.003934-0.003941
+ Number of drivers: 1
+ Number of loads: 1
+ Number of pins: 2
+
+Driver pins
+ u_ebuf/Z tristate (sky130_fd_sc_hd__ebufn_1) 0.002260 (7, 9)
+
+Load pins
+ u_cap1/D input (sky130_fd_sc_hd__dfxtp_1) 0.001674-0.001681 (9, 9)
+
+--- report_net z2 ---
+Net z2
+ Pin capacitance: 0.003667-0.003674
+ Wire capacitance: 0.000000
+ Total capacitance: 0.003667-0.003674
+ Number of drivers: 1
+ Number of loads: 1
+ Number of pins: 2
+
+Driver pins
+ u_einv/Z tristate (sky130_fd_sc_hd__einvn_1) 0.001993 (6, 12)
+
+Load pins
+ u_cap2/D input (sky130_fd_sc_hd__dfxtp_1) 0.001674-0.001681 (9, 12)
+
+--- report_net z3 ---
+Net z3
+ Pin capacitance: 0.003600-0.003607
+ Wire capacitance: 0.000000
+ Total capacitance: 0.003600-0.003607
+ Number of drivers: 1
+ Number of loads: 1
+ Number of pins: 2
+
+Driver pins
+ u_evp/Z tristate (sky130_fd_sc_hd__einvp_1) 0.001926 (6, 15)
+
+Load pins
+ u_cap3/D input (sky130_fd_sc_hd__dfxtp_1) 0.001674-0.001681 (9, 15)
+
+openroad> 
+openroad> puts "=== Q2 transient set_disable_timing u_ebuf A->Z ==="
+=== Q2 transient set_disable_timing u_ebuf A->Z ===
+openroad> <le_timing [get_cells u_ebuf] -from A -to Z} err]} {
+...>     puts "set_disable_timing error: $err"
+...> } else {
+...> <find_timing_paths -to [get_pins u_cap1/D]]} err]} {
+...>         puts "find -to u_cap1/D error: $err"
+...>     } else {
+...>         puts "u_cap1/D path count after disable A->Z: [llength $pe_list]"
+...>     }
+...>     report_checks -to [get_pins u_cap1/D] -format full
+...> }
+u_cap1/D path count after disable A->Z: 1
+Startpoint: te (input port clocked by core_clk)
+Endpoint: u_cap1 (rising edge-triggered flip-flop clocked by core_clk)
+Path Group: core_clk
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.10    0.10   clock network delay (propagated)
+   0.70    0.80 v input external delay
+   0.00    0.80 v te (in)
+   0.15    0.95 v u_teb/X (sky130_fd_sc_hd__buf_2)
+   0.09    1.04 v u_ebuf/Z (sky130_fd_sc_hd__ebufn_1)
+   0.00    1.04 v u_cap1/D (sky130_fd_sc_hd__dfxtp_1)
+           1.04   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.24    4.24   clock network delay (propagated)
+  -0.05    4.19   clock uncertainty
+   0.00    4.19   clock reconvergence pessimism
+           4.19 ^ u_cap1/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.10    4.10   library setup time
+           4.10   data required time
+---------------------------------------------------------
+           4.10   data required time
+          -1.04   data arrival time
+---------------------------------------------------------
+           3.05   slack (MET)
+
+
+openroad> 
+openroad> puts "=== Q2 transient set_disable_timing u_evp TE->Z ==="
+=== Q2 transient set_disable_timing u_evp TE->Z ===
+openroad> <le_timing [get_cells u_evp] -from TE -to Z} err]} {
+...>     puts "set_disable_timing error: $err"
+...> } else {
+...> <find_timing_paths -to [get_pins u_cap3/D]]} err]} {
+...>         puts "find -to u_cap3/D error: $err"
+...>     } else {
+...> <path count after disable TE->Z: [llength $pe_list]"
+...>     }
+...>     report_checks -to [get_pins u_cap3/D] -format full
+...> }
+u_cap3/D path count after disable TE->Z: 1
+Startpoint: d_in (input port clocked by core_clk)
+Endpoint: u_cap3 (rising edge-triggered flip-flop clocked by core_clk)
+Path Group: core_clk
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock core_clk (rise edge)
+   0.10    0.10   clock network delay (propagated)
+   0.70    0.80 v input external delay
+   0.00    0.80 v d_in (in)
+   0.16    0.96 v u_dbuf/X (sky130_fd_sc_hd__buf_2)
+   0.07    1.03 ^ u_evp/Z (sky130_fd_sc_hd__einvp_1)
+   0.00    1.03 ^ u_cap3/D (sky130_fd_sc_hd__dfxtp_1)
+           1.03   data arrival time
+
+   4.00    4.00   clock core_clk (rise edge)
+   0.24    4.24   clock network delay (propagated)
+  -0.05    4.19   clock uncertainty
+   0.00    4.19   clock reconvergence pessimism
+           4.19 ^ u_cap3/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.06    4.14   library setup time
+           4.14   data required time
+---------------------------------------------------------
+           4.14   data required time
+          -1.03   data arrival time
+---------------------------------------------------------
+           3.10   slack (MET)
+
+
+openroad> 
+openroad> puts "=== Q4 Clear/Preset stay count-only ==="
+=== Q4 Clear/Preset stay count-only ===
+openroad> <_timing_paths -through [get_pins u_fbp/Q]]} err]} {
+...>     puts "find -through u_fbp/Q error: $err"
+...> } else {
+...>     puts "paths through u_fbp/Q: [llength $pe_list]"
+...> }
+paths through u_fbp/Q: 0
+openroad> <iming_paths -through [get_pins u_fbn/Q_N]]} err]} {
+...>     puts "find -through u_fbn/Q_N error: $err"
+...> } else {
+...>     puts "paths through u_fbn/Q_N: [llength $pe_list]"
+...> }
+paths through u_fbn/Q_N: 0
+openroad> report_check_types
+Group                                  Slack
+--------------------------------------------
+asynchronous                            0.40
+core_clk                                0.63
+asynchronous                            1.14
+core_clk                                1.09
+
+max slew
+
+Pin                                    Limit    Slew   Slack
+------------------------------------------------------------
+u_ff/Q                                  1.50    0.47    1.03 (MET)
+
+max capacitance
+
+Pin                                    Limit     Cap   Slack
+------------------------------------------------------------
+u_einv/Z                                0.07    0.00    0.07 (MET)
+
+                                     Required  Actual
+Pin                                    Width   Width   Slack
+------------------------------------------------------------
+u_fbn/CLK_N (low)                       0.32    2.00    1.68 (MET)
+
+openroad> exit
+unable to write history to `/var/empty/.tclsh-history'
+

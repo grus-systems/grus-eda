@@ -11,12 +11,18 @@ its numbers agree with that tool's.
 > **Research prototype — read the skip summary.** `sta` covers a subset of
 > SDC (stock LibreLane `write_sdc` output parses unchanged) and models clocks
 > both ideally and via `set_propagated_clock`, including latch `D -> Q` and
-> time borrowing for `sky130_fd_sc_hd` shapes. Asynchronous `Clear`/`Preset`
-> and `min_pulse_width` arcs are counted as skips, and cells driven far
-> outside their Liberty timing tables can diverge from OpenSTA. Every run
-> prints what it left out as counts and shares of the design's arcs and
-> endpoints; `--strict` exits non-zero when anything was skipped and `--json
-> <path>` writes the same summary machine-readably.
+> time borrowing for `sky130_fd_sc_hd` shapes. Recognised check arcs the
+> endpoint model does not evaluate (`non_seq_*`, `preserve`,
+> async `Clear`/`Preset`, and `min_pulse_width` arcs whose pin is off the
+> clock network — clock-pin `min_pulse_width` arcs and `three_state_*`
+> enable/disable arcs are evaluated) are counted
+> and shown
+> but exempt from `--strict`: they add checks outside the reported set rather
+> than altering an arrival. Cells driven far outside their Liberty timing
+> tables can diverge from OpenSTA. Every run prints what it left out as
+> counts and shares of the design's arcs and endpoints; `--strict` exits
+> non-zero when a skip can change a reported number, and `--json <path>`
+> writes the same summary machine-readably.
 
 ## Why
 

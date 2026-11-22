@@ -72,6 +72,7 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
     let edge_cols = nx.saturating_sub(1);
     let edge_rows = ny.saturating_sub(1);
 
+    let t_route = crate::timing::phase("cong.route");
     // Pass 1: Probabilistic Demand (RISA)
     grid.h_demand.fill(0.0);
     grid.v_demand.fill(0.0);
@@ -174,221 +175,221 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
             }
             changed = true;
 
-        let x1 = p1.x as usize;
-        let y1 = p1.y as usize;
-        let x2 = p2.x as usize;
-        let y2 = p2.y as usize;
+            let x1 = p1.x as usize;
+            let y1 = p1.y as usize;
+            let x2 = p2.x as usize;
+            let y2 = p2.y as usize;
 
-        // 2. Evaluate L-routes using pure overflow cost
-        let mut l_hv_cost = 0.0f64;
-        for x in x_min..x_max.min(edge_cols) {
-            let d = grid.h_demand[y1 * edge_cols + x];
-            let c = grid.h_cap[y1 * edge_cols + x];
-            l_hv_cost += overflow_cost(d, c);
-        }
-        for y in y_min..y_max.min(edge_rows) {
-            let d = grid.v_demand[y * nx + x2];
-            let c = grid.v_cap[y * nx + x2];
-            l_hv_cost += overflow_cost(d, c);
-        }
+            // 2. Evaluate L-routes using pure overflow cost
+            let mut l_hv_cost = 0.0f64;
+            for x in x_min..x_max.min(edge_cols) {
+                let d = grid.h_demand[y1 * edge_cols + x];
+                let c = grid.h_cap[y1 * edge_cols + x];
+                l_hv_cost += overflow_cost(d, c);
+            }
+            for y in y_min..y_max.min(edge_rows) {
+                let d = grid.v_demand[y * nx + x2];
+                let c = grid.v_cap[y * nx + x2];
+                l_hv_cost += overflow_cost(d, c);
+            }
 
-        let mut l_vh_cost = 0.0f64;
-        for y in y_min..y_max.min(edge_rows) {
-            let d = grid.v_demand[y * nx + x1];
-            let c = grid.v_cap[y * nx + x1];
-            l_vh_cost += overflow_cost(d, c);
-        }
-        for x in x_min..x_max.min(edge_cols) {
-            let d = grid.h_demand[y2 * edge_cols + x];
-            let c = grid.h_cap[y2 * edge_cols + x];
-            l_vh_cost += overflow_cost(d, c);
-        }
+            let mut l_vh_cost = 0.0f64;
+            for y in y_min..y_max.min(edge_rows) {
+                let d = grid.v_demand[y * nx + x1];
+                let c = grid.v_cap[y * nx + x1];
+                l_vh_cost += overflow_cost(d, c);
+            }
+            for x in x_min..x_max.min(edge_cols) {
+                let d = grid.h_demand[y2 * edge_cols + x];
+                let c = grid.h_cap[y2 * edge_cols + x];
+                l_vh_cost += overflow_cost(d, c);
+            }
 
-        let mut best_cost = l_hv_cost;
-        let mut best_route = RouteChoice::Lhv;
+            let mut best_cost = l_hv_cost;
+            let mut best_route = RouteChoice::Lhv;
 
-        if l_vh_cost < best_cost {
-            best_cost = l_vh_cost;
-            best_route = RouteChoice::Lvh;
-        }
+            if l_vh_cost < best_cost {
+                best_cost = l_vh_cost;
+                best_route = RouteChoice::Lvh;
+            }
 
-        // 3. Evaluate Z-routes (with a small 2-bend tie-breaker) if both L-routes overflow
-        if best_cost > 0.0 {
-            if x_max > x_min + 1 {
-                let dx = x_max - x_min;
-                let mut pref1 = vec![0.0f64; dx + 1];
-                let mut pref2 = vec![0.0f64; dx + 1];
-                for i in 0..dx {
-                    let x = x_min + i;
-                    if x < edge_cols {
-                        let d1 = grid.h_demand[y1 * edge_cols + x];
-                        let c1 = grid.h_cap[y1 * edge_cols + x];
-                        pref1[i + 1] = pref1[i] + overflow_cost(d1, c1);
+            // 3. Evaluate Z-routes (with a small 2-bend tie-breaker) if both L-routes overflow
+            if best_cost > 0.0 {
+                if x_max > x_min + 1 {
+                    let dx = x_max - x_min;
+                    let mut pref1 = vec![0.0f64; dx + 1];
+                    let mut pref2 = vec![0.0f64; dx + 1];
+                    for i in 0..dx {
+                        let x = x_min + i;
+                        if x < edge_cols {
+                            let d1 = grid.h_demand[y1 * edge_cols + x];
+                            let c1 = grid.h_cap[y1 * edge_cols + x];
+                            pref1[i + 1] = pref1[i] + overflow_cost(d1, c1);
 
-                        let d2 = grid.h_demand[y2 * edge_cols + x];
-                        let c2 = grid.h_cap[y2 * edge_cols + x];
-                        pref2[i + 1] = pref2[i] + overflow_cost(d2, c2);
-                    } else {
-                        pref1[i + 1] = pref1[i];
-                        pref2[i + 1] = pref2[i];
+                            let d2 = grid.h_demand[y2 * edge_cols + x];
+                            let c2 = grid.h_cap[y2 * edge_cols + x];
+                            pref2[i + 1] = pref2[i] + overflow_cost(d2, c2);
+                        } else {
+                            pref1[i + 1] = pref1[i];
+                            pref2[i + 1] = pref2[i];
+                        }
+                    }
+
+                    for x_mid in (x_min + 1)..x_max {
+                        let m = x_mid - x_min;
+                        let h_cost = if x1 < x2 {
+                            pref1[m] + (pref2[dx] - pref2[m])
+                        } else {
+                            (pref1[dx] - pref1[m]) + pref2[m]
+                        };
+
+                        let mut v_cost = 0.0f64;
+                        for y in y_min..y_max.min(edge_rows) {
+                            let d = grid.v_demand[y * nx + x_mid];
+                            let c = grid.v_cap[y * nx + x_mid];
+                            v_cost += overflow_cost(d, c);
+                        }
+
+                        let total_z_cost = h_cost + v_cost + 0.01;
+                        if total_z_cost < best_cost {
+                            best_cost = total_z_cost;
+                            best_route = RouteChoice::Zhvh(x_mid);
+                        }
                     }
                 }
 
-                for x_mid in (x_min + 1)..x_max {
-                    let m = x_mid - x_min;
-                    let h_cost = if x1 < x2 {
-                        pref1[m] + (pref2[dx] - pref2[m])
-                    } else {
-                        (pref1[dx] - pref1[m]) + pref2[m]
-                    };
+                if y_max > y_min + 1 {
+                    let dy = y_max - y_min;
+                    let mut pref1 = vec![0.0f64; dy + 1];
+                    let mut pref2 = vec![0.0f64; dy + 1];
+                    for i in 0..dy {
+                        let y = y_min + i;
+                        if y < edge_rows {
+                            let d1 = grid.v_demand[y * nx + x1];
+                            let c1 = grid.v_cap[y * nx + x1];
+                            pref1[i + 1] = pref1[i] + overflow_cost(d1, c1);
 
-                    let mut v_cost = 0.0f64;
-                    for y in y_min..y_max.min(edge_rows) {
-                        let d = grid.v_demand[y * nx + x_mid];
-                        let c = grid.v_cap[y * nx + x_mid];
-                        v_cost += overflow_cost(d, c);
+                            let d2 = grid.v_demand[y * nx + x2];
+                            let c2 = grid.v_cap[y * nx + x2];
+                            pref2[i + 1] = pref2[i] + overflow_cost(d2, c2);
+                        } else {
+                            pref1[i + 1] = pref1[i];
+                            pref2[i + 1] = pref2[i];
+                        }
                     }
 
-                    let total_z_cost = h_cost + v_cost + 0.01;
-                    if total_z_cost < best_cost {
-                        best_cost = total_z_cost;
-                        best_route = RouteChoice::Zhvh(x_mid);
+                    for y_mid in (y_min + 1)..y_max {
+                        let m = y_mid - y_min;
+                        let v_cost = if y1 < y2 {
+                            pref1[m] + (pref2[dy] - pref2[m])
+                        } else {
+                            (pref1[dy] - pref1[m]) + pref2[m]
+                        };
+
+                        let mut h_cost = 0.0f64;
+                        for x in x_min..x_max.min(edge_cols) {
+                            let d = grid.h_demand[y_mid * edge_cols + x];
+                            let c = grid.h_cap[y_mid * edge_cols + x];
+                            h_cost += overflow_cost(d, c);
+                        }
+
+                        let total_z_cost = v_cost + h_cost + 0.01;
+                        if total_z_cost < best_cost {
+                            best_cost = total_z_cost;
+                            best_route = RouteChoice::Zvhv(y_mid);
+                        }
                     }
                 }
             }
 
-            if y_max > y_min + 1 {
-                let dy = y_max - y_min;
-                let mut pref1 = vec![0.0f64; dy + 1];
-                let mut pref2 = vec![0.0f64; dy + 1];
-                for i in 0..dy {
-                    let y = y_min + i;
-                    if y < edge_rows {
-                        let d1 = grid.v_demand[y * nx + x1];
-                        let c1 = grid.v_cap[y * nx + x1];
-                        pref1[i + 1] = pref1[i] + overflow_cost(d1, c1);
-
-                        let d2 = grid.v_demand[y * nx + x2];
-                        let c2 = grid.v_cap[y * nx + x2];
-                        pref2[i + 1] = pref2[i] + overflow_cost(d2, c2);
-                    } else {
-                        pref1[i + 1] = pref1[i];
-                        pref2[i + 1] = pref2[i];
-                    }
-                }
-
-                for y_mid in (y_min + 1)..y_max {
-                    let m = y_mid - y_min;
-                    let v_cost = if y1 < y2 {
-                        pref1[m] + (pref2[dy] - pref2[m])
-                    } else {
-                        (pref1[dy] - pref1[m]) + pref2[m]
-                    };
-
-                    let mut h_cost = 0.0f64;
+            // 4. Commit +1.0 demand along the chosen route and record path
+            let mut path = Vec::with_capacity((x_max - x_min) + (y_max - y_min));
+            match best_route {
+                RouteChoice::Lhv => {
                     for x in x_min..x_max.min(edge_cols) {
-                        let d = grid.h_demand[y_mid * edge_cols + x];
-                        let c = grid.h_cap[y_mid * edge_cols + x];
-                        h_cost += overflow_cost(d, c);
-                    }
-
-                    let total_z_cost = v_cost + h_cost + 0.01;
-                    if total_z_cost < best_cost {
-                        best_cost = total_z_cost;
-                        best_route = RouteChoice::Zvhv(y_mid);
-                    }
-                }
-            }
-        }
-
-        // 4. Commit +1.0 demand along the chosen route and record path
-        let mut path = Vec::with_capacity((x_max - x_min) + (y_max - y_min));
-        match best_route {
-            RouteChoice::Lhv => {
-                for x in x_min..x_max.min(edge_cols) {
-                    let idx = y1 * edge_cols + x;
-                    grid.h_demand[idx] += 1.0;
-                    path.push(GridEdge::H(idx));
-                }
-                for y in y_min..y_max.min(edge_rows) {
-                    let idx = y * nx + x2;
-                    grid.v_demand[idx] += 1.0;
-                    path.push(GridEdge::V(idx));
-                }
-            }
-            RouteChoice::Lvh => {
-                for y in y_min..y_max.min(edge_rows) {
-                    let idx = y * nx + x1;
-                    grid.v_demand[idx] += 1.0;
-                    path.push(GridEdge::V(idx));
-                }
-                for x in x_min..x_max.min(edge_cols) {
-                    let idx = y2 * edge_cols + x;
-                    grid.h_demand[idx] += 1.0;
-                    path.push(GridEdge::H(idx));
-                }
-            }
-            RouteChoice::Zhvh(x_mid) => {
-                if x1 < x2 {
-                    for x in x_min..x_mid.min(edge_cols) {
                         let idx = y1 * edge_cols + x;
                         grid.h_demand[idx] += 1.0;
                         path.push(GridEdge::H(idx));
                     }
-                    for x in x_mid..x_max.min(edge_cols) {
-                        let idx = y2 * edge_cols + x;
-                        grid.h_demand[idx] += 1.0;
-                        path.push(GridEdge::H(idx));
-                    }
-                } else {
-                    for x in x_mid..x_max.min(edge_cols) {
-                        let idx = y1 * edge_cols + x;
-                        grid.h_demand[idx] += 1.0;
-                        path.push(GridEdge::H(idx));
-                    }
-                    for x in x_min..x_mid.min(edge_cols) {
-                        let idx = y2 * edge_cols + x;
-                        grid.h_demand[idx] += 1.0;
-                        path.push(GridEdge::H(idx));
-                    }
-                }
-                for y in y_min..y_max.min(edge_rows) {
-                    let idx = y * nx + x_mid;
-                    grid.v_demand[idx] += 1.0;
-                    path.push(GridEdge::V(idx));
-                }
-            }
-            RouteChoice::Zvhv(y_mid) => {
-                if y1 < y2 {
-                    for y in y_min..y_mid.min(edge_rows) {
-                        let idx = y * nx + x1;
-                        grid.v_demand[idx] += 1.0;
-                        path.push(GridEdge::V(idx));
-                    }
-                    for y in y_mid..y_max.min(edge_rows) {
-                        let idx = y * nx + x2;
-                        grid.v_demand[idx] += 1.0;
-                        path.push(GridEdge::V(idx));
-                    }
-                } else {
-                    for y in y_mid..y_max.min(edge_rows) {
-                        let idx = y * nx + x1;
-                        grid.v_demand[idx] += 1.0;
-                        path.push(GridEdge::V(idx));
-                    }
-                    for y in y_min..y_mid.min(edge_rows) {
+                    for y in y_min..y_max.min(edge_rows) {
                         let idx = y * nx + x2;
                         grid.v_demand[idx] += 1.0;
                         path.push(GridEdge::V(idx));
                     }
                 }
-                for x in x_min..x_max.min(edge_cols) {
-                    let idx = y_mid * edge_cols + x;
-                    grid.h_demand[idx] += 1.0;
-                    path.push(GridEdge::H(idx));
+                RouteChoice::Lvh => {
+                    for y in y_min..y_max.min(edge_rows) {
+                        let idx = y * nx + x1;
+                        grid.v_demand[idx] += 1.0;
+                        path.push(GridEdge::V(idx));
+                    }
+                    for x in x_min..x_max.min(edge_cols) {
+                        let idx = y2 * edge_cols + x;
+                        grid.h_demand[idx] += 1.0;
+                        path.push(GridEdge::H(idx));
+                    }
+                }
+                RouteChoice::Zhvh(x_mid) => {
+                    if x1 < x2 {
+                        for x in x_min..x_mid.min(edge_cols) {
+                            let idx = y1 * edge_cols + x;
+                            grid.h_demand[idx] += 1.0;
+                            path.push(GridEdge::H(idx));
+                        }
+                        for x in x_mid..x_max.min(edge_cols) {
+                            let idx = y2 * edge_cols + x;
+                            grid.h_demand[idx] += 1.0;
+                            path.push(GridEdge::H(idx));
+                        }
+                    } else {
+                        for x in x_mid..x_max.min(edge_cols) {
+                            let idx = y1 * edge_cols + x;
+                            grid.h_demand[idx] += 1.0;
+                            path.push(GridEdge::H(idx));
+                        }
+                        for x in x_min..x_mid.min(edge_cols) {
+                            let idx = y2 * edge_cols + x;
+                            grid.h_demand[idx] += 1.0;
+                            path.push(GridEdge::H(idx));
+                        }
+                    }
+                    for y in y_min..y_max.min(edge_rows) {
+                        let idx = y * nx + x_mid;
+                        grid.v_demand[idx] += 1.0;
+                        path.push(GridEdge::V(idx));
+                    }
+                }
+                RouteChoice::Zvhv(y_mid) => {
+                    if y1 < y2 {
+                        for y in y_min..y_mid.min(edge_rows) {
+                            let idx = y * nx + x1;
+                            grid.v_demand[idx] += 1.0;
+                            path.push(GridEdge::V(idx));
+                        }
+                        for y in y_mid..y_max.min(edge_rows) {
+                            let idx = y * nx + x2;
+                            grid.v_demand[idx] += 1.0;
+                            path.push(GridEdge::V(idx));
+                        }
+                    } else {
+                        for y in y_mid..y_max.min(edge_rows) {
+                            let idx = y * nx + x1;
+                            grid.v_demand[idx] += 1.0;
+                            path.push(GridEdge::V(idx));
+                        }
+                        for y in y_min..y_mid.min(edge_rows) {
+                            let idx = y * nx + x2;
+                            grid.v_demand[idx] += 1.0;
+                            path.push(GridEdge::V(idx));
+                        }
+                    }
+                    for x in x_min..x_max.min(edge_cols) {
+                        let idx = y_mid * edge_cols + x;
+                        grid.h_demand[idx] += 1.0;
+                        path.push(GridEdge::H(idx));
+                    }
                 }
             }
-        }
             segment_paths[seg_idx] = path;
         }
         if !changed {
@@ -444,7 +445,11 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
             let mut heap = std::collections::BinaryHeap::new();
 
             dist[src_y][src_x] = 0.0;
-            heap.push(DijkstraState { cost: 0.0, x: src_x, y: src_y });
+            heap.push(DijkstraState {
+                cost: 0.0,
+                x: src_x,
+                y: src_y,
+            });
 
             while let Some(DijkstraState { cost, x, y }) = heap.pop() {
                 if x == dst_x && y == dst_y {
@@ -463,7 +468,11 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                     if next_cost < dist[y][nx_coord] {
                         dist[y][nx_coord] = next_cost;
                         prev[y][nx_coord] = Some((x, y, GridEdge::H(edge_idx)));
-                        heap.push(DijkstraState { cost: next_cost, x: nx_coord, y });
+                        heap.push(DijkstraState {
+                            cost: next_cost,
+                            x: nx_coord,
+                            y,
+                        });
                     }
                 }
                 // Neighbor Left (x - 1, y)
@@ -475,7 +484,11 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                     if next_cost < dist[y][nx_coord] {
                         dist[y][nx_coord] = next_cost;
                         prev[y][nx_coord] = Some((x, y, GridEdge::H(edge_idx)));
-                        heap.push(DijkstraState { cost: next_cost, x: nx_coord, y });
+                        heap.push(DijkstraState {
+                            cost: next_cost,
+                            x: nx_coord,
+                            y,
+                        });
                     }
                 }
                 // Neighbor Up (x, y + 1)
@@ -487,7 +500,11 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                     if next_cost < dist[ny_coord][x] {
                         dist[ny_coord][x] = next_cost;
                         prev[ny_coord][x] = Some((x, y, GridEdge::V(edge_idx)));
-                        heap.push(DijkstraState { cost: next_cost, x, y: ny_coord });
+                        heap.push(DijkstraState {
+                            cost: next_cost,
+                            x,
+                            y: ny_coord,
+                        });
                     }
                 }
                 // Neighbor Down (x, y - 1)
@@ -499,7 +516,11 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
                     if next_cost < dist[ny_coord][x] {
                         dist[ny_coord][x] = next_cost;
                         prev[ny_coord][x] = Some((x, y, GridEdge::V(edge_idx)));
-                        heap.push(DijkstraState { cost: next_cost, x, y: ny_coord });
+                        heap.push(DijkstraState {
+                            cost: next_cost,
+                            x,
+                            y: ny_coord,
+                        });
                     }
                 }
             }
@@ -535,7 +556,10 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         }
     }
 
+    drop(t_route);
+
     // Congestion Report Aggregation
+    let t_report = crate::timing::phase("cong.report");
     let num_edges = grid.h_demand.len() + grid.v_demand.len();
     let mut total_overflow = 0.0f64;
     let mut max_edge_overflow = 0.0f32;
@@ -632,6 +656,7 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         .zip(grid.v_raw_cap.iter())
         .map(|((&d, &c), &raw)| edge_usage_ratio(d, c, raw))
         .collect();
+    drop(t_report);
 
     CongestionReport {
         nx,
@@ -653,8 +678,12 @@ pub fn estimate_congestion(
     layer_adjustments: Option<&[f32]>,
     gcell_tracks_override: Option<i32>,
 ) -> (GCellGrid, CongestionReport) {
+    let t_grid = crate::timing::phase("cong.grid");
     let mut grid = GCellGrid::build(design_db, tech_db, layer_adjustments, gcell_tracks_override);
+    drop(t_grid);
+    let t_decompose = crate::timing::phase("cong.decompose");
     let segments = decompose_design_nets(design_db, tech_db, &grid);
+    drop(t_decompose);
     let report = route_segments(&mut grid, &segments);
     (grid, report)
 }
@@ -662,12 +691,12 @@ pub fn estimate_congestion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, require, sky130_hd};
     use crate::congestion::gcell::GPoint;
-    use std::collections::{HashMap, HashSet};
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
+    use crate::test_support::{design_dir, require, sky130_hd};
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_pass1_and_pass2_routing() {
@@ -708,7 +737,8 @@ mod tests {
         let report = route_segments(&mut grid, &[s_h, s_v, s_2d]);
 
         // Total demand across all edges must equal total wirelength (2 + 2 + 4 = 8)
-        let total_demand: f32 = grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
+        let total_demand: f32 =
+            grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
         assert_eq!(total_demand, 8.0, "Total committed demand must equal 8.0");
 
         assert_eq!(report.nx, 3);
@@ -723,22 +753,31 @@ mod tests {
         let def_path = design_dir("gcd").join("gcd.placed.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !def_path.exists() {
-            panic!("Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
-                   tlef_path, lef_path, def_path);
+            panic!(
+                "Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
+                tlef_path, lef_path, def_path
+            );
         }
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+            .expect("Failed to load TechDb")
+            .0;
 
-        let design_db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         // Baseline routing on gcd.placed.def (default adjustments: met1 0.30, met2..met5 0.20)
         let (grid, report) = estimate_congestion(&design_db, &tech_db, None, None);
-        let total_demand: f32 = grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
-        assert_eq!(total_demand, 788.0, "Total routed demand must match RSMT wirelength exactly (788)");
-        assert_eq!(report.total_overflow, 0.0, "Baseline placed gcd should have 0 overflow");
+        let total_demand: f32 =
+            grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
+        assert_eq!(
+            total_demand, 788.0,
+            "Total routed demand must match RSMT wirelength exactly (788)"
+        );
+        assert_eq!(
+            report.total_overflow, 0.0,
+            "Baseline placed gcd should have 0 overflow"
+        );
 
         // Variant Set A: Sweep layer adjustments alpha in [0.50, 0.70, 0.80, 0.85, 0.90]
         let alphas = [0.50f32, 0.70, 0.80, 0.85, 0.90];
@@ -748,19 +787,30 @@ mod tests {
         for &alpha in &alphas {
             let adj = [0.0f32, alpha, alpha, alpha, alpha, alpha];
             let (_g, rep) = estimate_congestion(&design_db, &tech_db, Some(&adj), None);
-            println!("Alpha {:.2}: total_overflow = {:.1}, max_edge_ovf = {:.1}, top05 = {:.2}, ovf_gcells = {}",
-                     alpha, rep.total_overflow, rep.max_edge_overflow, rep.top_05pct_overflow, rep.overflow_gcells);
+            println!(
+                "Alpha {:.2}: total_overflow = {:.1}, max_edge_ovf = {:.1}, top05 = {:.2}, ovf_gcells = {}",
+                alpha,
+                rep.total_overflow,
+                rep.max_edge_overflow,
+                rep.top_05pct_overflow,
+                rep.overflow_gcells
+            );
             assert!(
                 rep.total_overflow >= prev_ovf,
                 "Overflow must monotonically increase with layer adjustment: alpha {:.2} ({}) < prev ({})",
-                alpha, rep.total_overflow, prev_ovf
+                alpha,
+                rep.total_overflow,
+                prev_ovf
             );
             prev_ovf = rep.total_overflow;
             ovfs.push(rep.total_overflow);
         }
 
         // Check ranking: alpha 0.90 overflow must be strictly greater than alpha 0.80 overflow
-        assert!(ovfs[4] > ovfs[2], "Alpha 0.90 overflow must exceed alpha 0.80");
+        assert!(
+            ovfs[4] > ovfs[2],
+            "Alpha 0.90 overflow must exceed alpha 0.80"
+        );
     }
 
     #[test]
@@ -770,7 +820,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+            .expect("Failed to load TechDb")
+            .0;
 
         let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path).expect("Reference JSON");
@@ -795,11 +846,16 @@ mod tests {
             let (_g80, rep80) = estimate_congestion(&design_db, &tech_db, Some(&adj80), None);
             ovfs_80.push(rep80.total_overflow);
 
-            println!("Util {}: grid={}x{}, total_cap_75 = {:.0}, total_demand_75 = {:.0}, ovf_75 = {:.1}, ovf_80 = {:.1}",
-                     util, _g75.nx, _g75.ny,
-                     _g75.h_cap.iter().sum::<f32>() + _g75.v_cap.iter().sum::<f32>(),
-                     _g75.h_demand.iter().sum::<f32>() + _g75.v_demand.iter().sum::<f32>(),
-                     rep75.total_overflow, rep80.total_overflow);
+            println!(
+                "Util {}: grid={}x{}, total_cap_75 = {:.0}, total_demand_75 = {:.0}, ovf_75 = {:.1}, ovf_80 = {:.1}",
+                util,
+                _g75.nx,
+                _g75.ny,
+                _g75.h_cap.iter().sum::<f32>() + _g75.v_cap.iter().sum::<f32>(),
+                _g75.h_demand.iter().sum::<f32>() + _g75.v_demand.iter().sum::<f32>(),
+                rep75.total_overflow,
+                rep80.total_overflow
+            );
         }
 
         // Verify that overflow ranks all 4 utilization variants in the exact same strictly increasing order as OpenROAD
@@ -819,7 +875,9 @@ mod tests {
             assert!(
                 ovfs_80[i] > ovfs_75[i],
                 "Alpha 0.80 overflow ({}) must strictly exceed alpha 0.75 overflow ({}) for util {}",
-                ovfs_80[i], ovfs_75[i], utils[i]
+                ovfs_80[i],
+                ovfs_75[i],
+                utils[i]
             );
         }
 
@@ -870,7 +928,8 @@ mod tests {
 
     /// Reads the `# key value` header and the `H|V x y usage capacity` lines of a usage dump.
     fn parse_usage_dump(path: &std::path::Path) -> UsageDump {
-        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("usage dump {path:?}: {e}"));
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("usage dump {path:?}: {e}"));
         let mut header = HashMap::new();
         let mut h = Vec::new();
         let mut v = Vec::new();
@@ -995,19 +1054,34 @@ mod tests {
         index: impl Fn(&DumpEdge) -> usize,
     ) -> DirectionResult {
         let support: Vec<DumpEdge> = edges.iter().copied().filter(|e| e.capacity > 0.0).collect();
-        let zero_capacity_with_usage = edges.iter().filter(|e| e.capacity <= 0.0 && e.usage > 0.0).count();
-        assert!(!support.is_empty(), "{label}: dump has no edge with capacity > 0");
+        let zero_capacity_with_usage = edges
+            .iter()
+            .filter(|e| e.capacity <= 0.0 && e.usage > 0.0)
+            .count();
+        assert!(
+            !support.is_empty(),
+            "{label}: dump has no edge with capacity > 0"
+        );
 
         let reference: Vec<f64> = support.iter().map(|e| e.usage / e.capacity).collect();
         let our_ratio: Vec<f64> = support.iter().map(|e| ours[index(e)] as f64).collect();
 
         // Control 1: the reference shifted one GCell in +x. Edge (x, y) is paired with the reference
         // at (x - 1, y), and 0 where that edge is not in the support.
-        let reference_at: HashMap<(usize, usize), f64> =
-            support.iter().zip(&reference).map(|(e, &r)| ((e.x, e.y), r)).collect();
+        let reference_at: HashMap<(usize, usize), f64> = support
+            .iter()
+            .zip(&reference)
+            .map(|(e, &r)| ((e.x, e.y), r))
+            .collect();
         let shifted: Vec<f64> = support
             .iter()
-            .map(|e| if e.x == 0 { 0.0 } else { reference_at.get(&(e.x - 1, e.y)).copied().unwrap_or(0.0) })
+            .map(|e| {
+                if e.x == 0 {
+                    0.0
+                } else {
+                    reference_at.get(&(e.x - 1, e.y)).copied().unwrap_or(0.0)
+                }
+            })
             .collect();
 
         // Control 2: the reference values permuted over the support. Twenty fixed seeds give a
@@ -1040,20 +1114,34 @@ mod tests {
             hot_ours.len(),
             hot_ref.len(),
         );
-        DirectionResult { support: support.len(), rho, null_rho, overlap }
+        DirectionResult {
+            support: support.len(),
+            rho,
+            null_rho,
+            overlap,
+        }
     }
 
     #[test]
     fn test_rank_correlation_and_overlap_helpers() {
-        assert_eq!(average_ranks(&[10.0, 20.0, 20.0, 30.0]), vec![1.0, 2.5, 2.5, 4.0]);
+        assert_eq!(
+            average_ranks(&[10.0, 20.0, 20.0, 30.0]),
+            vec![1.0, 2.5, 2.5, 4.0]
+        );
 
         let a = [0.3, 0.1, 0.7, 0.5];
         assert!((spearman(&a, &a) - 1.0).abs() < 1e-12);
         // Ranks of a are 2,1,4,3; these are 5 minus those, so the order is exactly reversed.
         assert!((spearman(&a, &[3.0, 4.0, 1.0, 2.0]) + 1.0).abs() < 1e-12);
         // Tied ranks: a = 1,2,3,4 against b = 1,1,2,2 (ranks 1.5,1.5,3.5,3.5) gives 4 / sqrt(20).
-        assert!((spearman(&[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 2.0, 2.0]) - 4.0 / 20f64.sqrt()).abs() < 1e-12);
-        assert!(spearman(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]).is_nan(), "constant side is undefined");
+        assert!(
+            (spearman(&[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 2.0, 2.0]) - 4.0 / 20f64.sqrt()).abs()
+                < 1e-12
+        );
+        assert!(
+            spearman(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]).is_nan(),
+            "constant side is undefined"
+        );
 
         // 20 values: the 5% set is 1 edge, and a tie at the cut value enlarges it.
         let mut values = vec![0.0; 20];
@@ -1077,8 +1165,11 @@ mod tests {
         let dump = parse_usage_dump(&require(design_dir("aes").join("aes.gcell_usage.txt")));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
-        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse aes.util65.def");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let design_db =
+            parse_def(&def_path, &tech_db, None).expect("Failed to parse aes.util65.def");
 
         // The dump was routed with `set_global_routing_layer_adjustment met1-met5 0.3`.
         let adj = [0.0f32, 0.3, 0.3, 0.3, 0.3, 0.3];
@@ -1094,17 +1185,29 @@ mod tests {
         assert_eq!(ny * (nx - 1), report.h_usage_ratio.len(), "H edge count");
         assert_eq!((ny - 1) * nx, report.v_usage_ratio.len(), "V edge count");
 
-        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| e.y * (nx - 1) + e.x);
+        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| {
+            e.y * (nx - 1) + e.x
+        });
         let v = compare_direction("V", &dump.v, &report.v_usage_ratio, |e| e.y * nx + e.x);
 
         for (label, r) in [("H", &h), ("V", &v)] {
-            assert!(r.rho >= 0.60, "{label}: Spearman rho {:.4} below 0.60 (support {})", r.rho, r.support);
+            assert!(
+                r.rho >= 0.60,
+                "{label}: Spearman rho {:.4} below 0.60 (support {})",
+                r.rho,
+                r.support
+            );
             assert!(
                 r.rho >= r.null_rho + 0.15,
                 "{label}: rho {:.4} must exceed the control null {:.4} by 0.15",
-                r.rho, r.null_rho
+                r.rho,
+                r.null_rho
             );
-            assert!(r.overlap >= 0.45, "{label}: hot-set overlap {:.4} below 0.45", r.overlap);
+            assert!(
+                r.overlap >= 0.45,
+                "{label}: hot-set overlap {:.4} below 0.45",
+                r.overlap
+            );
         }
     }
 
@@ -1117,8 +1220,11 @@ mod tests {
         let dump = parse_usage_dump(&require(design_dir("jpeg").join("jpeg.gcell_usage.txt")));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
-        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse jpeg.util65.def");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let design_db =
+            parse_def(&def_path, &tech_db, None).expect("Failed to parse jpeg.util65.def");
 
         // The dump was routed with `set_global_routing_layer_adjustment met1-met5 0.2` (ORFS jpeg value).
         let adj = [0.0f32, 0.2, 0.2, 0.2, 0.2, 0.2];
@@ -1134,17 +1240,29 @@ mod tests {
         assert_eq!(ny * (nx - 1), report.h_usage_ratio.len(), "H edge count");
         assert_eq!((ny - 1) * nx, report.v_usage_ratio.len(), "V edge count");
 
-        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| e.y * (nx - 1) + e.x);
+        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| {
+            e.y * (nx - 1) + e.x
+        });
         let v = compare_direction("V", &dump.v, &report.v_usage_ratio, |e| e.y * nx + e.x);
 
         for (label, r) in [("H", &h), ("V", &v)] {
-            assert!(r.rho >= 0.60, "{label}: Spearman rho {:.4} below 0.60 (support {})", r.rho, r.support);
+            assert!(
+                r.rho >= 0.60,
+                "{label}: Spearman rho {:.4} below 0.60 (support {})",
+                r.rho,
+                r.support
+            );
             assert!(
                 r.rho >= r.null_rho + 0.15,
                 "{label}: rho {:.4} must exceed the control null {:.4} by 0.15",
-                r.rho, r.null_rho
+                r.rho,
+                r.null_rho
             );
-            assert!(r.overlap >= 0.45, "{label}: hot-set overlap {:.4} below 0.45", r.overlap);
+            assert!(
+                r.overlap >= 0.45,
+                "{label}: hot-set overlap {:.4} below 0.45",
+                r.overlap
+            );
         }
     }
 
@@ -1157,8 +1275,11 @@ mod tests {
         let dump = parse_usage_dump(&require(design_dir("ibex").join("ibex.gcell_usage.txt")));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
-        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse ibex.util65.def");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let design_db =
+            parse_def(&def_path, &tech_db, None).expect("Failed to parse ibex.util65.def");
 
         // The dump was routed with `set_global_routing_layer_adjustment met1-met5 0.2` (ORFS ibex value).
         let adj = [0.0f32, 0.2, 0.2, 0.2, 0.2, 0.2];
@@ -1174,17 +1295,29 @@ mod tests {
         assert_eq!(ny * (nx - 1), report.h_usage_ratio.len(), "H edge count");
         assert_eq!((ny - 1) * nx, report.v_usage_ratio.len(), "V edge count");
 
-        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| e.y * (nx - 1) + e.x);
+        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| {
+            e.y * (nx - 1) + e.x
+        });
         let v = compare_direction("V", &dump.v, &report.v_usage_ratio, |e| e.y * nx + e.x);
 
         for (label, r) in [("H", &h), ("V", &v)] {
-            assert!(r.rho >= 0.60, "{label}: Spearman rho {:.4} below 0.60 (support {})", r.rho, r.support);
+            assert!(
+                r.rho >= 0.60,
+                "{label}: Spearman rho {:.4} below 0.60 (support {})",
+                r.rho,
+                r.support
+            );
             assert!(
                 r.rho >= r.null_rho + 0.15,
                 "{label}: rho {:.4} must exceed the control null {:.4} by 0.15",
-                r.rho, r.null_rho
+                r.rho,
+                r.null_rho
             );
-            assert!(r.overlap >= 0.45, "{label}: hot-set overlap {:.4} below 0.45", r.overlap);
+            assert!(
+                r.overlap >= 0.45,
+                "{label}: hot-set overlap {:.4} below 0.45",
+                r.overlap
+            );
         }
     }
 
@@ -1196,11 +1329,16 @@ mod tests {
         let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
         let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
         let def_path = require(design_dir("picorv32").join("picorv32.util65.def"));
-        let dump = parse_usage_dump(&require(design_dir("picorv32").join("picorv32.gcell_usage.txt")));
+        let dump = parse_usage_dump(&require(
+            design_dir("picorv32").join("picorv32.gcell_usage.txt"),
+        ));
 
         let mut interner = StringInterner::new();
-        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner).expect("Failed to load TechDb");
-        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse picorv32.util65.def");
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let design_db =
+            parse_def(&def_path, &tech_db, None).expect("Failed to parse picorv32.util65.def");
 
         // The dump was routed with `set_global_routing_layer_adjustment met1-met5 0.3`.
         let adj = [0.0f32, 0.3, 0.3, 0.3, 0.3, 0.3];
@@ -1216,17 +1354,29 @@ mod tests {
         assert_eq!(ny * (nx - 1), report.h_usage_ratio.len(), "H edge count");
         assert_eq!((ny - 1) * nx, report.v_usage_ratio.len(), "V edge count");
 
-        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| e.y * (nx - 1) + e.x);
+        let h = compare_direction("H", &dump.h, &report.h_usage_ratio, |e| {
+            e.y * (nx - 1) + e.x
+        });
         let v = compare_direction("V", &dump.v, &report.v_usage_ratio, |e| e.y * nx + e.x);
 
         for (label, r) in [("H", &h), ("V", &v)] {
-            assert!(r.rho >= 0.60, "{label}: Spearman rho {:.4} below 0.60 (support {})", r.rho, r.support);
+            assert!(
+                r.rho >= 0.60,
+                "{label}: Spearman rho {:.4} below 0.60 (support {})",
+                r.rho,
+                r.support
+            );
             assert!(
                 r.rho >= r.null_rho + 0.15,
                 "{label}: rho {:.4} must exceed the control null {:.4} by 0.15",
-                r.rho, r.null_rho
+                r.rho,
+                r.null_rho
             );
-            assert!(r.overlap >= 0.45, "{label}: hot-set overlap {:.4} below 0.45", r.overlap);
+            assert!(
+                r.overlap >= 0.45,
+                "{label}: hot-set overlap {:.4} below 0.45",
+                r.overlap
+            );
         }
     }
 }

@@ -1,11 +1,11 @@
-use std::cell::RefCell;
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
-use rayon::prelude::*;
 use crate::congestion::gcell::{GCellGrid, GPoint, SteinerSegment};
 use crate::design_db::DesignDb;
 use crate::interner::NetId;
 use crate::tech_db::TechDb;
+use rayon::prelude::*;
+use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 
 #[derive(Default)]
 struct ExactRsmtScratch {
@@ -152,7 +152,13 @@ pub(crate) fn exact_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
             sc.from_u.resize(table_len, 0);
         }
 
-        let ExactRsmtScratch { dist, d, d_split, split_choice, from_u } = &mut *sc;
+        let ExactRsmtScratch {
+            dist,
+            d,
+            d_split,
+            split_choice,
+            from_u,
+        } = &mut *sc;
         let dist = &mut dist[..dist_len];
         let d = &mut d[..table_len];
         let d_split = &mut d_split[..table_len];
@@ -268,8 +274,26 @@ pub(crate) fn exact_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
                 add_path(v_coords[v], v_coords[u]);
             }
             let (s1, s2) = split_choice[mask * nv + u];
-            trace_dp(s1 as usize, u, nv, pts, v_coords, split_choice, from_u, add_path);
-            trace_dp(s2 as usize, u, nv, pts, v_coords, split_choice, from_u, add_path);
+            trace_dp(
+                s1 as usize,
+                u,
+                nv,
+                pts,
+                v_coords,
+                split_choice,
+                from_u,
+                add_path,
+            );
+            trace_dp(
+                s2 as usize,
+                u,
+                nv,
+                pts,
+                v_coords,
+                split_choice,
+                from_u,
+                add_path,
+            );
         }
 
         let all = num_subsets - 1;
@@ -283,7 +307,16 @@ pub(crate) fn exact_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
             }
         }
 
-        trace_dp(all, best_root, nv, unique, &v_coords, split_choice, from_u, &mut add_path);
+        trace_dp(
+            all,
+            best_root,
+            nv,
+            unique,
+            &v_coords,
+            split_choice,
+            from_u,
+            &mut add_path,
+        );
         edges
     });
 
@@ -396,7 +429,8 @@ pub(crate) fn heuristic_rsmt_points(unique: &[Pt]) -> Vec<(Pt, Pt)> {
                 let dy = (nodes[v].1 - nodes[j].1).unsigned_abs();
                 // Prefer same-row (smaller |dy|) connections on equal-distance Prim ties to match horizontal std-cell topology.
                 if d < min_dist[j]
-                    || (d == min_dist[j] && (dy < best_dy[j] || (dy == best_dy[j] && v < parent[j])))
+                    || (d == min_dist[j]
+                        && (dy < best_dy[j] || (dy == best_dy[j] && v < parent[j])))
                 {
                     min_dist[j] = d;
                     best_dy[j] = dy;
@@ -454,7 +488,8 @@ fn heuristic_lflip_small(nodes: &mut Vec<Pt>, edges: &mut Vec<(usize, usize)>) {
                         let is_better = match best_candidate {
                             None => true,
                             Some((best_gain, best_e1, best_e2, ..)) => {
-                                gain > best_gain || (gain == best_gain && (e1, e2) < (best_e1, best_e2))
+                                gain > best_gain
+                                    || (gain == best_gain && (e1, e2) < (best_e1, best_e2))
                             }
                         };
                         if is_better {
@@ -524,8 +559,7 @@ fn heuristic_lflip_heap(nodes: &mut Vec<Pt>, edges: &mut Vec<(usize, usize)>) {
     }
     impl Ord for HeapCand {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            (self.gain, self.seq1, self.seq2)
-                .cmp(&(other.gain, other.seq1, other.seq2))
+            (self.gain, self.seq1, self.seq2).cmp(&(other.gain, other.seq1, other.seq2))
         }
     }
     impl PartialOrd for HeapCand {
@@ -659,10 +693,16 @@ fn heuristic_lflip_heap(nodes: &mut Vec<Pt>, edges: &mut Vec<(usize, usize)>) {
 /// Constructs a Rectilinear Steiner Minimal Tree over GCell points (see `build_rsmt_points`).
 pub fn build_net_rsmt(pts: &[GPoint]) -> Vec<SteinerSegment> {
     let pts: Vec<Pt> = pts.iter().map(|p| (p.x as i32, p.y as i32)).collect();
-    let to_g = |p: Pt| GPoint { x: p.0 as u16, y: p.1 as u16 };
+    let to_g = |p: Pt| GPoint {
+        x: p.0 as u16,
+        y: p.1 as u16,
+    };
     build_rsmt_points(&pts)
         .into_iter()
-        .map(|(a, b)| SteinerSegment { p1: to_g(a), p2: to_g(b) })
+        .map(|(a, b)| SteinerSegment {
+            p1: to_g(a),
+            p2: to_g(b),
+        })
         .collect()
 }
 
@@ -693,7 +733,12 @@ pub fn decompose_design_nets(
     if n < 512 {
         let mut all_segs = Vec::new();
         for net_idx in 0..n {
-            all_segs.extend(decompose_net(design_db, tech_db, grid, NetId(net_idx as u32)));
+            all_segs.extend(decompose_net(
+                design_db,
+                tech_db,
+                grid,
+                NetId(net_idx as u32),
+            ));
         }
         return all_segs;
     }
@@ -712,10 +757,10 @@ pub fn decompose_design_nets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
+    use crate::test_support::{design_dir, sky130_hd};
     use std::collections::{HashMap, HashSet, VecDeque};
 
     fn verify_connectivity(pts: &[GPoint], segs: &[SteinerSegment]) {
@@ -815,8 +860,14 @@ mod tests {
         // MST on these 4 points has wirelength 13; optimal RSMT introduces Steiner point (2, 2)
         // reducing wirelength to 9.
         assert_eq!(hpwl, 9);
-        assert_eq!(rsmt_wl, 9, "RSMT wirelength should be 9 for optimal Steiner point at (2, 2)");
-        assert!(rsmt_wl < 13, "RSMT wirelength must be strictly less than MST wirelength 13");
+        assert_eq!(
+            rsmt_wl, 9,
+            "RSMT wirelength should be 9 for optimal Steiner point at (2, 2)"
+        );
+        assert!(
+            rsmt_wl < 13,
+            "RSMT wirelength must be strictly less than MST wirelength 13"
+        );
         verify_connectivity(&pts, &segs);
     }
 
@@ -827,16 +878,18 @@ mod tests {
         let def_path = design_dir("gcd").join("gcd.placed.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !def_path.exists() {
-            panic!("Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
-                   tlef_path, lef_path, def_path);
+            panic!(
+                "Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
+                tlef_path, lef_path, def_path
+            );
         }
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+            .expect("Failed to load TechDb")
+            .0;
 
-        let design_db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
@@ -848,7 +901,8 @@ mod tests {
 
         let ref_total_demand = ref_json["grt_total_edge_demand"]
             .as_u64()
-            .expect("grt_total_edge_demand in reference JSON") as u32;
+            .expect("grt_total_edge_demand in reference JSON")
+            as u32;
         assert_eq!(ref_total_demand, 812, "OpenROAD reference demand is 812");
 
         let mut total_rsmt_wl = 0u32;
@@ -872,7 +926,11 @@ mod tests {
             let k = unique.len();
 
             if k <= 1 {
-                assert!(segs.is_empty(), "Intra-GCell net {} should produce 0 segments", net_idx);
+                assert!(
+                    segs.is_empty(),
+                    "Intra-GCell net {} should produce 0 segments",
+                    net_idx
+                );
                 continue;
             }
 
@@ -887,7 +945,9 @@ mod tests {
             assert!(
                 net_rsmt_wl >= gcell_hpwl,
                 "Net {} RSMT WL ({}) must be >= GCell HPWL ({})",
-                net_idx, net_rsmt_wl, gcell_hpwl
+                net_idx,
+                net_rsmt_wl,
+                gcell_hpwl
             );
 
             if k <= 3 {
@@ -903,12 +963,18 @@ mod tests {
             total_rsmt_wl += net_rsmt_wl;
         }
 
-        println!("Multi-GCell nets: {}, Degree <= 3 nets: {}", multi_gcell_nets, degree_le3_count);
+        println!(
+            "Multi-GCell nets: {}, Degree <= 3 nets: {}",
+            multi_gcell_nets, degree_le3_count
+        );
         println!("Total RSMT wirelength (GCell units): {}", total_rsmt_wl);
         println!("OpenROAD GRT total edge demand: {}", ref_total_demand);
 
         // RSMT total edge length on gcd
-        assert_eq!(total_rsmt_wl, 788, "Total RSMT wirelength on gcd must be 788");
+        assert_eq!(
+            total_rsmt_wl, 788,
+            "Total RSMT wirelength on gcd must be 788"
+        );
         assert!(total_rsmt_wl > 0);
         // Compare with OpenROAD's global routing edge demand
         let diff = (total_rsmt_wl as f64 - ref_total_demand as f64).abs();
@@ -924,7 +990,9 @@ mod tests {
     fn points(seed: u64, k: usize) -> Vec<Pt> {
         let mut state = seed;
         let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) % 60) as i32
         };
         (0..k).map(|_| (next(), next())).collect()
@@ -940,10 +1008,22 @@ mod tests {
             unique.dedup();
             let precise = build_precise_rsmt_points(&pts);
             let greedy = build_rsmt_points(&pts);
-            assert!(total_length(&precise) <= total_length(&greedy), "seed {seed}");
-            let (min_x, max_x) = (unique.iter().map(|p| p.0).min().unwrap(), unique.iter().map(|p| p.0).max().unwrap());
-            let (min_y, max_y) = (unique.iter().map(|p| p.1).min().unwrap(), unique.iter().map(|p| p.1).max().unwrap());
-            assert!(total_length(&precise) >= ((max_x - min_x) + (max_y - min_y)) as u32, "below HPWL, seed {seed}");
+            assert!(
+                total_length(&precise) <= total_length(&greedy),
+                "seed {seed}"
+            );
+            let (min_x, max_x) = (
+                unique.iter().map(|p| p.0).min().unwrap(),
+                unique.iter().map(|p| p.0).max().unwrap(),
+            );
+            let (min_y, max_y) = (
+                unique.iter().map(|p| p.1).min().unwrap(),
+                unique.iter().map(|p| p.1).max().unwrap(),
+            );
+            assert!(
+                total_length(&precise) >= ((max_x - min_x) + (max_y - min_y)) as u32,
+                "below HPWL, seed {seed}"
+            );
             // Every terminal is reachable from the first one.
             let mut reached = std::collections::HashSet::from([unique[0]]);
             let mut grew = true;
@@ -957,8 +1037,15 @@ mod tests {
                     }
                 }
             }
-            assert!(unique.iter().all(|p| reached.contains(p)), "disconnected, seed {seed}");
-            assert_eq!(precise, build_precise_rsmt_points(&pts), "not deterministic, seed {seed}");
+            assert!(
+                unique.iter().all(|p| reached.contains(p)),
+                "disconnected, seed {seed}"
+            );
+            assert_eq!(
+                precise,
+                build_precise_rsmt_points(&pts),
+                "not deterministic, seed {seed}"
+            );
         }
     }
 
@@ -1007,7 +1094,8 @@ mod tests {
                         let d = manhattan(unique[best_v], unique[j]);
                         let dy = (unique[best_v].1 - unique[j].1).unsigned_abs();
                         if d < min_dist[j]
-                            || (d == min_dist[j] && (dy < best_dy[j] || (dy == best_dy[j] && best_v < parent[j])))
+                            || (d == min_dist[j]
+                                && (dy < best_dy[j] || (dy == best_dy[j] && best_v < parent[j])))
                         {
                             min_dist[j] = d;
                             best_dy[j] = dy;
@@ -1020,9 +1108,20 @@ mod tests {
             let (mut n2, mut e2) = (unique, mst_edges);
             heuristic_lflip_small(&mut n1, &mut e1);
             heuristic_lflip_heap(&mut n2, &mut e2);
-            let segs1: Vec<_> = e1.into_iter().filter(|&(a, b)| n1[a] != n1[b]).map(|(a, b)| (n1[a], n1[b])).collect();
-            let segs2: Vec<_> = e2.into_iter().filter(|&(a, b)| n2[a] != n2[b]).map(|(a, b)| (n2[a], n2[b])).collect();
-            assert_eq!(segs1, segs2, "seed {seed} mismatch between heap and quadratic L-flip");
+            let segs1: Vec<_> = e1
+                .into_iter()
+                .filter(|&(a, b)| n1[a] != n1[b])
+                .map(|(a, b)| (n1[a], n1[b]))
+                .collect();
+            let segs2: Vec<_> = e2
+                .into_iter()
+                .filter(|&(a, b)| n2[a] != n2[b])
+                .map(|(a, b)| (n2[a], n2[b]))
+                .collect();
+            assert_eq!(
+                segs1, segs2,
+                "seed {seed} mismatch between heap and quadratic L-flip"
+            );
         }
     }
 }

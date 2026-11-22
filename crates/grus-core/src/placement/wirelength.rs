@@ -1,7 +1,7 @@
-use rayon::prelude::*;
 use crate::design_db::{DesignDb, PlacementStatus};
 use crate::interner::{CellId, NetId, PinId};
 use crate::tech_db::{MacroClass, TechDb};
+use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct WaWirelengthPrecomp {
@@ -27,8 +27,10 @@ impl WaWirelengthPrecomp {
                         pin_dy_um[p] = design_db.pin_offset_y_dbu[p] as f32 / dbu_per_um;
                     } else {
                         let (px_dbu, py_dbu) = design_db.pin_pos_dbu(PinId(p as u32), tech_db);
-                        pin_dx_um[p] = (px_dbu - design_db.cell_x_dbu[cell_idx]) as f32 / dbu_per_um;
-                        pin_dy_um[p] = (py_dbu - design_db.cell_y_dbu[cell_idx]) as f32 / dbu_per_um;
+                        pin_dx_um[p] =
+                            (px_dbu - design_db.cell_x_dbu[cell_idx]) as f32 / dbu_per_um;
+                        pin_dy_um[p] =
+                            (py_dbu - design_db.cell_y_dbu[cell_idx]) as f32 / dbu_per_um;
                     }
                 }
                 None => {
@@ -228,14 +230,16 @@ fn eval_net_wa(
     let inv_gamma_a_y_minus_sq = inv_gamma * (inv_a_y_minus * inv_a_y_minus);
 
     for entry in pin_cache.iter() {
-        let grad_x_plus =
-            entry.ap_x * inv_gamma_a_x_plus_sq * ((gamma_f64 + entry.t_x_plus) * a_x_plus - b_x_plus);
+        let grad_x_plus = entry.ap_x
+            * inv_gamma_a_x_plus_sq
+            * ((gamma_f64 + entry.t_x_plus) * a_x_plus - b_x_plus);
         let grad_x_minus = entry.am_x
             * inv_gamma_a_x_minus_sq
             * ((gamma_f64 - entry.t_x_minus) * a_x_minus + b_x_minus);
 
-        let grad_y_plus =
-            entry.ap_y * inv_gamma_a_y_plus_sq * ((gamma_f64 + entry.t_y_plus) * a_y_plus - b_y_plus);
+        let grad_y_plus = entry.ap_y
+            * inv_gamma_a_y_plus_sq
+            * ((gamma_f64 + entry.t_y_plus) * a_y_plus - b_y_plus);
         let grad_y_minus = entry.am_y
             * inv_gamma_a_y_minus_sq
             * ((gamma_f64 - entry.t_y_minus) * a_y_minus + b_y_minus);
@@ -371,12 +375,12 @@ pub fn compute_wa_wirelength_and_grad(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
     use crate::design_db::Orient;
     use crate::interner::{MacroId, MacroPinId, PinDir, StringInterner};
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
     use crate::tech_db::{MacroClass, MacroDef, MacroPin, RectDbu};
+    use crate::test_support::{design_dir, sky130_hd};
 
     #[test]
     fn test_synthetic_wa_wirelength_and_gradient() {
@@ -477,8 +481,16 @@ mod tests {
         let pin_gy_orig = pin_grad_y.clone();
 
         // 1. Shift Invariance Check: translating by (+5000.0, +5000.0) um
-        let shift_x = vec![cell_x_um[0] + 5000.0, cell_x_um[1] + 5000.0, cell_x_um[2] + 5000.0];
-        let shift_y = vec![cell_y_um[0] + 5000.0, cell_y_um[1] + 5000.0, cell_y_um[2] + 5000.0];
+        let shift_x = vec![
+            cell_x_um[0] + 5000.0,
+            cell_x_um[1] + 5000.0,
+            cell_x_um[2] + 5000.0,
+        ];
+        let shift_y = vec![
+            cell_y_um[0] + 5000.0,
+            cell_y_um[1] + 5000.0,
+            cell_y_um[2] + 5000.0,
+        ];
 
         let wl_shift = compute_wa_wirelength_and_grad(
             &design_db,
@@ -492,8 +504,19 @@ mod tests {
             &mut cell_grad_y,
         );
 
-        println!("wl_orig = {}, wl_shift = {}, diff = {}", wl_orig, wl_shift, (wl_orig - wl_shift).abs());
-        assert!((wl_orig - wl_shift).abs() < 1e-4, "Shift invariance failed on wirelength: orig={}, shift={}, diff={}", wl_orig, wl_shift, (wl_orig - wl_shift).abs());
+        println!(
+            "wl_orig = {}, wl_shift = {}, diff = {}",
+            wl_orig,
+            wl_shift,
+            (wl_orig - wl_shift).abs()
+        );
+        assert!(
+            (wl_orig - wl_shift).abs() < 1e-4,
+            "Shift invariance failed on wirelength: orig={}, shift={}, diff={}",
+            wl_orig,
+            wl_shift,
+            (wl_orig - wl_shift).abs()
+        );
         for i in 0..3 {
             assert!(
                 (pin_gx_orig[i] - pin_grad_x[i]).abs() < 1e-6,
@@ -550,7 +573,10 @@ mod tests {
             assert!(
                 rel_x < 1e-4,
                 "Cell {} X grad mismatch: analytical={}, fd={}, rel_err={}",
-                c, ana_x, fd_x, rel_x
+                c,
+                ana_x,
+                fd_x,
+                rel_x
             );
 
             // Y direction
@@ -588,7 +614,10 @@ mod tests {
             assert!(
                 rel_y < 1e-4,
                 "Cell {} Y grad mismatch: analytical={}, fd={}, rel_err={}",
-                c, ana_y, fd_y, rel_y
+                c,
+                ana_y,
+                fd_y,
+                rel_y
             );
         }
     }
@@ -600,15 +629,17 @@ mod tests {
         let def_path = design_dir("gcd").join("gcd.placed.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !def_path.exists() {
-            panic!("Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
-                   tlef_path, lef_path, def_path);
+            panic!(
+                "Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
+                tlef_path, lef_path, def_path
+            );
         }
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let design_db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+            .expect("Failed to load TechDb")
+            .0;
+        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path).expect("Reference JSON");
@@ -619,7 +650,10 @@ mod tests {
         // 1. Verify movable cell count matches logic instances
         let logic_instances = ref_json["logic_instances"].as_u64().unwrap() as usize;
         let movable_count = precomp.movable_cell_mask.iter().filter(|&&b| b).count();
-        assert_eq!(movable_count, logic_instances, "Movable cell count must equal logic instances (233)");
+        assert_eq!(
+            movable_count, logic_instances,
+            "Movable cell count must equal logic instances (233)"
+        );
 
         let num_cells = design_db.num_cells();
         let mut cell_x_um = vec![0.0f32; num_cells];
@@ -637,7 +671,8 @@ mod tests {
         assert!(
             (calc_hpwl_um - placed_hpwl_um).abs() < 1e-3,
             "Calculated HPWL {} um must match reference {} um within 1e-3",
-            calc_hpwl_um, placed_hpwl_um
+            calc_hpwl_um,
+            placed_hpwl_um
         );
 
         // 3. Verify monotonic convergence of WA wirelength as gamma decreases
@@ -664,12 +699,15 @@ mod tests {
             assert!(
                 wa <= placed_hpwl_um + 1e-3,
                 "WA wirelength ({}) must be bounded above by HPWL ({})",
-                wa, placed_hpwl_um
+                wa,
+                placed_hpwl_um
             );
             assert!(
                 wa > prev_wa,
                 "WA wirelength must strictly increase as gamma decreases: gamma {} ({}) <= prev ({})",
-                gamma, wa, prev_wa
+                gamma,
+                wa,
+                prev_wa
             );
             prev_wa = wa;
         }
@@ -678,7 +716,8 @@ mod tests {
         assert!(
             (prev_wa - placed_hpwl_um).abs() < 0.01,
             "WA wirelength at gamma=0.001 ({}) must be within 0.01 um of HPWL ({})",
-            prev_wa, placed_hpwl_um
+            prev_wa,
+            placed_hpwl_um
         );
 
         // 4. Verify analytical cell gradients against central finite differences at gamma = 5.0 um
@@ -696,7 +735,10 @@ mod tests {
             &mut cell_grad_y,
         );
         let eval_time = t0.elapsed();
-        println!("WA Wirelength + Gradient single evaluation time: {:?}", eval_time);
+        println!(
+            "WA Wirelength + Gradient single evaluation time: {:?}",
+            eval_time
+        );
 
         let ana_gx = cell_grad_x.clone();
         let ana_gy = cell_grad_y.clone();
@@ -710,8 +752,16 @@ mod tests {
         for c in 0..num_cells {
             if !precomp.movable_cell_mask[c] {
                 // Assert fixed cells have 0.0 gradient
-                assert_eq!(ana_gx[c], 0.0, "Fixed cell {} must have cell_grad_x == 0", c);
-                assert_eq!(ana_gy[c], 0.0, "Fixed cell {} must have cell_grad_y == 0", c);
+                assert_eq!(
+                    ana_gx[c], 0.0,
+                    "Fixed cell {} must have cell_grad_x == 0",
+                    c
+                );
+                assert_eq!(
+                    ana_gy[c], 0.0,
+                    "Fixed cell {} must have cell_grad_y == 0",
+                    c
+                );
                 continue;
             }
 
@@ -754,13 +804,19 @@ mod tests {
                 assert!(
                     rel_x < 1e-4,
                     "Cell {} X grad relative error too high: ana={}, fd={}, rel_err={}",
-                    c, ana_x, fd_x, rel_x
+                    c,
+                    ana_x,
+                    fd_x,
+                    rel_x
                 );
             } else {
                 assert!(
                     diff_x < 1e-6,
                     "Cell {} X grad absolute error too high: ana={}, fd={}, diff={}",
-                    c, ana_x, fd_x, diff_x
+                    c,
+                    ana_x,
+                    fd_x,
+                    diff_x
                 );
             }
 
@@ -803,13 +859,19 @@ mod tests {
                 assert!(
                     rel_y < 1e-4,
                     "Cell {} Y grad relative error too high: ana={}, fd={}, rel_err={}",
-                    c, ana_y, fd_y, rel_y
+                    c,
+                    ana_y,
+                    fd_y,
+                    rel_y
                 );
             } else {
                 assert!(
                     diff_y < 1e-6,
                     "Cell {} Y grad absolute error too high: ana={}, fd={}, diff={}",
-                    c, ana_y, fd_y, diff_y
+                    c,
+                    ana_y,
+                    fd_y,
+                    diff_y
                 );
             }
         }
