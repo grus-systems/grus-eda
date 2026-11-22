@@ -6289,7 +6289,8 @@ cells.
 the `any_propagated || (!for_slew && pulse_width_checks)` gate fires it
 once per `sta.*` cell (every committed design carries `min_pulse_width`
 arcs) — a serial tail, jpeg `sta.placement` 7.9 (6.3–8.0) →
-6.1 (5.9–7.4) ms and ≤ ~2.2 ms on the other `sta.*` cells. Under `power.*`
+6.1 (5.9–7.4) ms, jpeg `sta.spef`/`sta.zerowire` ~5.9–6.4 both
+runs, and ≤ ~2.2 ms on the other designs' `sta.*` cells. Under `power.*`
 the slew prep's `for_slew` skips the whole `sta.prepare.clock.*` block
 on these ideal-clock SDCs, so it fires zero times there.
 
