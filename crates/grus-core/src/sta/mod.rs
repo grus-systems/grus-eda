@@ -5,9 +5,10 @@ pub mod parasitics;
 pub mod sdc;
 
 pub use analysis::{
-    CriticalPath, EndpointKind, EndpointReport, PathCorner, PathEdge, PathStage,
-    PathTransition, PinSlew, SkipReason, SkippedEndpoint, StaReport, merge_corner_reports,
-    run_sta, run_sta_quiet, run_sta_quiet_with_paths, run_sta_with_paths, sta_pin_slews,
+    CriticalPath, DomainSummary, EndpointKind, EndpointReport, PathCorner, PathEdge, PathStage,
+    PathTransition, PinSlew, SkipReason, SkippedEndpoint, SlackBucket, SlackBucketKind, StaReport,
+    merge_corner_reports, run_sta, run_sta_quiet, run_sta_quiet_with_paths, run_sta_with_paths,
+    sta_pin_slews,
 };
 pub use parasitics::{
     NetParasitics, WireRc, estimate_guide_parasitics, estimate_placement_parasitics,

@@ -1011,6 +1011,45 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     violating,
                 );
             }
+            if !report.domains.is_empty() {
+                println!("domains:");
+                println!(
+                    "  {:<12} {:>9} {:>10} {:>10} {:>10} {:>10} {:>8} {:>7}",
+                    "clock", "endpoints", "wns_max", "tns_max", "wns_min", "tns_min",
+                    "v_setup", "v_hold",
+                );
+                for d in &report.domains {
+                    println!(
+                        "  {:<12} {:>9} {:>+10.6} {:>+10.6} {:>+10.6} {:>+10.6} {:>8} {:>7}",
+                        d.clock.as_deref().unwrap_or("(none)"),
+                        d.endpoints,
+                        d.wns_max_ns,
+                        d.tns_max_ns,
+                        d.wns_min_ns,
+                        d.tns_min_ns,
+                        d.setup_violations,
+                        d.hold_violations,
+                    );
+                }
+            }
+            if !report.slack_histogram.is_empty() {
+                let label = |b: grus_core::sta::SlackBucketKind| match b {
+                    grus_core::sta::SlackBucketKind::Negative => "<0",
+                    grus_core::sta::SlackBucketKind::P0To20 => "0-20%",
+                    grus_core::sta::SlackBucketKind::P20To50 => "20-50%",
+                    grus_core::sta::SlackBucketKind::Over50 => ">50%",
+                    grus_core::sta::SlackBucketKind::NoPeriod => "no_period",
+                };
+                let parts: Vec<String> = report
+                    .slack_histogram
+                    .iter()
+                    .map(|b| format!("{}: {}", label(b.bucket), b.count))
+                    .collect();
+                println!(
+                    "slack histogram (share of capture period): {}",
+                    parts.join("   ")
+                );
+            }
             print_skip_summary(&report);
             if !report.critical_paths.is_empty() {
                 println!("paths (worst {} per corner):", args.paths);

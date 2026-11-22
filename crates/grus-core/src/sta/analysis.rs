@@ -243,6 +243,15 @@ pub struct EndpointReport {
     pub(crate) worst_max_slack_ns: Option<f32>,
     #[serde(skip)]
     pub(crate) worst_min_slack_ns: Option<f32>,
+    /// `dom` of the reported candidate (picked `max` `Worst`, `min`'s as
+    /// fallback) — `None` when the reported check has no clock anchor.
+    /// Drives `domains`/`slack_histogram`; never serialized.
+    #[serde(skip)]
+    pub(crate) domain_row: Option<usize>,
+    /// `sdc.clocks[row].period_ns` at `domain_row`, carried so
+    /// `merge_corner_reports` can bucket without an `Sdc`.
+    #[serde(skip)]
+    pub(crate) domain_period_ns: Option<f32>,
 }
 
 /// What kind of timing endpoint an [`SkippedEndpoint`] was.
@@ -632,6 +641,53 @@ pub struct CriticalPath {
     pub note: Option<String>,
 }
 
+/// One clock domain's slack roll-up. `clock` is the `create_clock` name;
+/// `null` marks the unattributed row (endpoints whose reported check has
+/// no clock anchor — internal delay-check leaves, unclocked captures).
+#[derive(Clone, Debug, Serialize)]
+pub struct DomainSummary {
+    pub clock: Option<String>,
+    /// Endpoints whose *reported* check anchors on this domain.
+    pub endpoints: u32,
+    /// Same folds as `StaReport`'s globals, over this row's subset:
+    /// min(`worst_max_slack_ns`), Σ min(0, `worst_max_slack_ns`), and the
+    /// hold-side twins. `wns` is `INFINITY` on an empty row (serializes
+    /// as `null`, same convention as the globals).
+    pub wns_max_ns: f32,
+    pub tns_max_ns: f32,
+    pub wns_min_ns: f32,
+    pub tns_min_ns: f32,
+    pub setup_violations: u32,
+    pub hold_violations: u32,
+}
+
+/// Slack bucket key of `slack_histogram`: the endpoint's
+/// `worst_max_slack_ns` expressed as a fraction of its capture period.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackBucketKind {
+    /// `s < 0` — count equals `setup_violations` by construction.
+    Negative,
+    /// `0 <= s < 0.2 * P`
+    #[serde(rename = "p0_to_20")]
+    P0To20,
+    /// `0.2 * P <= s <= 0.5 * P` — the 0.5 boundary lands here.
+    #[serde(rename = "p20_to_50")]
+    P20To50,
+    /// `s > 0.5 * P`
+    #[serde(rename = "over_50")]
+    Over50,
+    /// No period reference (`domain_period_ns` is `None`) or no max-side
+    /// candidate to bucket.
+    NoPeriod,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SlackBucket {
+    pub bucket: SlackBucketKind,
+    pub count: u32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StaReport {
     pub wns_max_ns: f32,
@@ -652,6 +708,16 @@ pub struct StaReport {
     /// hold's `min` rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub critical_paths: Vec<CriticalPath>,
+    /// One row per `sdc.clocks` entry, in file order, plus a trailing
+    /// `clock: null` row iff any endpoint is unattributed. Empty array
+    /// when no clocks are declared.
+    #[serde(default)]
+    pub domains: Vec<DomainSummary>,
+    /// Worst max-slack distribution over `endpoints`, bucketed by share
+    /// of the capture period. Always all five buckets, `Negative` first,
+    /// `NoPeriod` last; counts sum to `endpoints.len()`.
+    #[serde(default)]
+    pub slack_histogram: Vec<SlackBucket>,
     pub skipped: SkipReport,
 }
 
@@ -2528,7 +2594,7 @@ fn run_sta_detail(
     let outcome = eval_sta(&prepared, None, &HashSet::new(), prepared.skipped.clone())?;
     let t_asm = crate::timing::phase("sta.assemble");
     let (mut report, polarities) =
-        assemble_sta_report(outcome.entries, outcome.pulse_rows, outcome.skipped);
+        assemble_sta_report(outcome.entries, outcome.pulse_rows, outcome.skipped, sdc);
     drop(t_asm);
     if path_count > 0 {
         report.critical_paths = trace_critical_paths(
@@ -3729,12 +3795,95 @@ fn slew_eval_state(prepared: &StaPrepared) -> Result<Vec<PinTimingState>> {
     }
 }
 
+/// `domains` + `slack_histogram` from the endpoint list alone:
+/// `clock_names[row]` is the JSON/stdout name of `domain_row == row`,
+/// in `sdc.clocks` order. `assemble_sta_report` passes the Sdc names;
+/// `merge_corner_reports` passes the clock names of `setup.domains`
+/// (same row order). Pure: identical inputs give identical rows, which
+/// is what the consistency test re-derives. Grouping is by `domain_row`
+/// index, not by name — two `create_clock`s may share a `-name` and
+/// each is still its own row.
+fn summarize_domains(
+    endpoints: &[EndpointReport],
+    clock_names: &[String],
+) -> (Vec<DomainSummary>, Vec<SlackBucket>) {
+    let empty = || DomainSummary {
+        clock: None,
+        endpoints: 0,
+        wns_max_ns: f32::INFINITY,
+        tns_max_ns: 0.0,
+        wns_min_ns: f32::INFINITY,
+        tns_min_ns: 0.0,
+        setup_violations: 0,
+        hold_violations: 0,
+    };
+    // Slot `clock_names.len()` accumulates the unattributed row.
+    let mut acc: Vec<DomainSummary> = (0..=clock_names.len()).map(|_| empty()).collect();
+    let mut buckets = [0u32; 5];
+    for e in endpoints {
+        let row = e
+            .domain_row
+            .filter(|&r| r < clock_names.len())
+            .unwrap_or(clock_names.len());
+        let d = &mut acc[row];
+        d.endpoints += 1;
+        if let Some(s) = e.worst_max_slack_ns {
+            d.wns_max_ns = d.wns_max_ns.min(s);
+            d.tns_max_ns += s.min(0.0);
+            d.setup_violations += u32::from(s < 0.0);
+        }
+        if let Some(s) = e.worst_min_slack_ns {
+            d.wns_min_ns = d.wns_min_ns.min(s);
+            d.tns_min_ns += s.min(0.0);
+            d.hold_violations += u32::from(s < 0.0);
+        }
+        // `s < 0` wins over a missing period — that is what keeps the
+        // `negative` count identical to `setup_violations`.
+        let bucket = match e.worst_max_slack_ns {
+            Some(s) if s < 0.0 => SlackBucketKind::Negative,
+            Some(s) => match e.domain_period_ns {
+                Some(p) if s < 0.2 * p => SlackBucketKind::P0To20,
+                Some(p) if s <= 0.5 * p => SlackBucketKind::P20To50,
+                Some(_) => SlackBucketKind::Over50,
+                None => SlackBucketKind::NoPeriod,
+            },
+            None => SlackBucketKind::NoPeriod,
+        };
+        buckets[bucket as usize] += 1;
+    }
+    let unattributed = acc.pop().expect("unattributed slot");
+    let mut domains: Vec<DomainSummary> = clock_names
+        .iter()
+        .zip(acc)
+        .map(|(name, mut d)| {
+            d.clock = Some(name.clone());
+            d
+        })
+        .collect();
+    if unattributed.endpoints > 0 {
+        domains.push(unattributed);
+    }
+    let slack_histogram = [
+        SlackBucketKind::Negative,
+        SlackBucketKind::P0To20,
+        SlackBucketKind::P20To50,
+        SlackBucketKind::Over50,
+        SlackBucketKind::NoPeriod,
+    ]
+    .into_iter()
+    .zip(buckets)
+    .map(|(bucket, count)| SlackBucket { bucket, count })
+    .collect();
+    (domains, slack_histogram)
+}
+
 /// Sort endpoint entries by pin name and reduce them to the report plus the
 /// per-endpoint polarities parallel to `report.endpoints`.
 fn assemble_sta_report(
     mut entries: EndpointEntries,
     mut pulse_rows: Vec<PulseWidthCheckReport>,
     skipped: SkipReport,
+    sdc: &Sdc,
 ) -> (StaReport, Vec<(PinId, EndpointPolarities)>) {
     entries.sort_by(|a, b| a.1.pin.cmp(&b.1.pin));
     pulse_rows.sort_by(|a, b| a.pin.cmp(&b.pin).then(a.edge.cmp(&b.edge)));
@@ -3750,6 +3899,8 @@ fn assemble_sta_report(
             .map(|s| s.min(0.0))
             .sum::<f32>()
     };
+    let clock_names: Vec<String> = sdc.clocks.iter().map(|c| c.name.clone()).collect();
+    let (domains, slack_histogram) = summarize_domains(&endpoints, &clock_names);
     (
         StaReport {
             wns_max_ns: wns(|e| e.worst_max_slack_ns),
@@ -3767,6 +3918,8 @@ fn assemble_sta_report(
             endpoints,
             pulse_width_checks: pulse_rows,
             critical_paths: Vec::new(),
+            domains,
+            slack_histogram,
             skipped,
         },
         polarities,
@@ -5344,6 +5497,8 @@ fn run_sta_partitioned(
                             slew: s.slew_max[pol],
                             class: u16::MAX,
                             from_pin: u32::MAX,
+                            // `!captured` anchors at the delay value alone.
+                            dom: if captured { cap_row as u8 } else { u8::MAX },
                         });
                     }
                 }
@@ -5398,6 +5553,7 @@ fn run_sta_partitioned(
                             slew: s.slew_min[pol],
                             class: u16::MAX,
                             from_pin: u32::MAX,
+                            dom: if captured { cap_row as u8 } else { u8::MAX },
                         });
                     }
                 }
@@ -5422,6 +5578,7 @@ fn run_sta_partitioned(
                             slew: s.slew_max[pol],
                             class: u16::MAX,
                             from_pin: u32::MAX,
+                            dom: out_row as u8,
                         });
                     }
                 }
@@ -5442,6 +5599,7 @@ fn run_sta_partitioned(
                             slew: s.slew_min[pol],
                             class: u16::MAX,
                             from_pin: u32::MAX,
+                            dom: out_row as u8,
                         });
                     }
                 }
@@ -5522,6 +5680,7 @@ fn run_sta_partitioned(
                             slew: s.slew_max[pol],
                             class: ci as u16,
                             from_pin: u32::MAX,
+                            dom: u8::MAX,
                         };
                         if pols.max[pol].is_none_or(|w| cand.slack < w.slack) {
                             pols.max[pol] = Some(cand);
@@ -5536,6 +5695,7 @@ fn run_sta_partitioned(
                             slew: s.slew_min[pol],
                             class: ci as u16,
                             from_pin: u32::MAX,
+                            dom: u8::MAX,
                         };
                         if pols.min[pol].is_none_or(|w| cand.slack < w.slack) {
                             pols.min[pol] = Some(cand);
@@ -5564,6 +5724,7 @@ fn run_sta_partitioned(
                     min.as_ref(),
                     max.map(|w| w.slack),
                     min.map(|w| w.slack),
+                    sdc,
                 ),
                 pols,
             ));
@@ -5862,7 +6023,7 @@ fn run_sta_partitioned(
     }
 
     let t_asm = crate::timing::phase("sta.assemble");
-    let (mut report, polarities) = assemble_sta_report(entries, pulse_rows, skipped);
+    let (mut report, polarities) = assemble_sta_report(entries, pulse_rows, skipped, sdc);
     drop(t_asm);
     if path_count > 0 {
         report.critical_paths = trace_critical_paths(
@@ -5898,6 +6059,11 @@ struct Worst {
     /// Winning `-from get_pins` startpoint pin of a segment delay check;
     /// `u32::MAX` = none (ordinary launch).
     from_pin: u32,
+    /// `Sdc::clocks` row of the check/anchor that produced this
+    /// candidate; `u8::MAX` = no clock anchor. Same bookkeeping family
+    /// as `class`/`from_pin` — drives `domains` via the reported
+    /// candidate, never serialized.
+    dom: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -6472,6 +6638,7 @@ fn record_endpoint(
                 min.as_ref(),
                 pick_worst_polarity(&worst.max).map(|w| w.slack),
                 pick_worst_polarity(&worst.min).map(|w| w.slack),
+                cx.sdc,
             ),
             cands,
         )),
@@ -7348,6 +7515,7 @@ fn collect_endpoints(
                 slew: s.slew_max[pol],
                 class: u16::MAX,
                 from_pin: u32::MAX,
+                dom: cap,
             });
             cands.min[pol] = Some(Worst {
                 arr: arr_min,
@@ -7361,6 +7529,7 @@ fn collect_endpoints(
                 slew: s.slew_min[pol],
                 class: u16::MAX,
                 from_pin: u32::MAX,
+                dom: cap,
             });
         }
         record_endpoint(
@@ -7546,6 +7715,7 @@ fn collect_endpoints(
                 slew: s.slew_max[pol],
                 class: u16::MAX,
                 from_pin: u32::MAX,
+                dom: cap,
             });
             cands.min[pol] = Some(Worst {
                 arr: arr_min,
@@ -7555,6 +7725,7 @@ fn collect_endpoints(
                 slew: s.slew_min[pol],
                 class: u16::MAX,
                 from_pin: u32::MAX,
+                dom: cap,
             });
         }
         record_endpoint(
@@ -7741,6 +7912,7 @@ fn collect_endpoints(
                             },
                             class: u16::MAX,
                             from_pin: u32::MAX,
+                            dom: out_row as u8,
                         };
                         let (slot, wslot) = if corner == 1 {
                             (&mut cands.max[pol], &mut worst.max[pol])
@@ -7811,7 +7983,16 @@ fn endpoint_report(
     min: Option<&Worst>,
     worst_max: Option<f32>,
     worst_min: Option<f32>,
+    sdc: &Sdc,
 ) -> EndpointReport {
+    // The endpoint lands in the domain of its *reported* check — the
+    // max side's candidate when one exists, else the min side's.
+    let domain_row = max
+        .or(min)
+        .and_then(|w| (w.dom != u8::MAX).then_some(w.dom as usize));
+    let domain_period_ns = domain_row
+        .and_then(|r| sdc.clocks.get(r))
+        .map(|c| c.period_ns);
     EndpointReport {
         pin,
         max_arr_ns: max.map(|w| w.arr),
@@ -7824,6 +8005,8 @@ fn endpoint_report(
         min_slew_ns: min.map(|w| w.slew),
         worst_max_slack_ns: worst_max,
         worst_min_slack_ns: worst_min,
+        domain_row,
+        domain_period_ns,
     }
 }
 
@@ -7850,6 +8033,16 @@ pub fn merge_corner_reports(setup: StaReport, hold: StaReport) -> Result<StaRepo
         .iter()
         .map(|e| {
             let h = hold_by_pin[e.pin.as_str()];
+            // The merged max side *is* setup's reported check and keeps its
+            // anchor; a min-only endpoint reports hold's check, falling back
+            // to setup's row when hold's check carries no anchor either.
+            let (domain_row, domain_period_ns) = if e.max_slack_ns.is_some() {
+                (e.domain_row, e.domain_period_ns)
+            } else {
+                h.domain_row.map_or((e.domain_row, e.domain_period_ns), |r| {
+                    (Some(r), h.domain_period_ns)
+                })
+            };
             EndpointReport {
                 pin: e.pin.clone(),
                 max_arr_ns: e.max_arr_ns,
@@ -7862,6 +8055,8 @@ pub fn merge_corner_reports(setup: StaReport, hold: StaReport) -> Result<StaRepo
                 min_slew_ns: h.min_slew_ns,
                 worst_max_slack_ns: e.worst_max_slack_ns,
                 worst_min_slack_ns: h.worst_min_slack_ns,
+                domain_row,
+                domain_period_ns,
             }
         })
         .collect();
@@ -7875,6 +8070,15 @@ pub fn merge_corner_reports(setup: StaReport, hold: StaReport) -> Result<StaRepo
             .map(|s| s.min(0.0))
             .sum::<f32>()
     };
+    // `setup.domains` emits every `sdc.clocks` row in SDC order with the
+    // unattributed row last, so its `clock` column is the same name list
+    // `assemble_sta_report` built — the merge needs no `Sdc`.
+    let clock_names: Vec<String> = setup
+        .domains
+        .iter()
+        .filter_map(|d| d.clock.clone())
+        .collect();
+    let (domains, slack_histogram) = summarize_domains(&endpoints, &clock_names);
     Ok(StaReport {
         wns_max_ns: wns(|e| e.worst_max_slack_ns),
         tns_max_ns: tns(|e| e.worst_max_slack_ns),
@@ -7893,6 +8097,8 @@ pub fn merge_corner_reports(setup: StaReport, hold: StaReport) -> Result<StaRepo
             setup.pulse_width_checks,
             hold.pulse_width_checks,
         )?,
+        domains,
+        slack_histogram,
         // Each corner run traces both sides of its own state; the merged
         // report keeps setup's `max` paths and hold's `min` paths, matching
         // the slack fields' source rule.
@@ -11724,6 +11930,300 @@ mod tests {
         assert_eq!(report.skipped.cross_domain_endpoints, 0);
     }
 
+    fn sta_fixture_report(dir_name: &str, def_name: &str, sdc_name: &str) -> StaReport {
+        let lib_dir = sky130_hd();
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let dir = design_dir(dir_name);
+        let design = parse_def(&dir.join(def_name), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join(sdc_name)).expect("SDC");
+        run_sta(&design, &lib, &sdc, None).expect("sta")
+    }
+
+    /// E9.2 `domains`/`slack_histogram` on the two-clock fixture.
+    /// `t2_selmc`'s `set_multicycle_path -from [get_clocks cka]` drives the
+    /// partitioned compose, so the asserted pin->domain membership exercises
+    /// the `..w`-inherited `dom` on rewritten candidates and the
+    /// `cap`/`out_row` stamps. The membership sets below are hardcoded from
+    /// the fixture topology (`u_fa*`/`ya` on `cka`, `u_fb*`/`yb` on `ckb`,
+    /// `u_fx` captured `ckb`, `u_fy` captured `cka`), verified against the
+    /// run — this is the test the fail-proof targets: a recompute-over-
+    /// `endpoints` test cannot catch mis-attribution because it shares
+    /// `domain_row` with what it checks.
+    #[test]
+    fn test_domain_summary_two_clock() {
+        let report = sta_fixture_report("sta_clocks", "two_clock.def", "t2_selmc.sdc");
+        assert_eq!(report.endpoints.len(), 8);
+        // Two populated rows in SDC file order; every endpoint is
+        // attributed — no `clock: null` row.
+        assert_eq!(report.domains.len(), 2, "{:?}", report.domains);
+        assert_eq!(report.domains[0].clock.as_deref(), Some("cka"));
+        assert_eq!(report.domains[1].clock.as_deref(), Some("ckb"));
+        let members = |row: usize| -> HashSet<&str> {
+            report
+                .endpoints
+                .iter()
+                .filter(|e| e.domain_row == Some(row))
+                .map(|e| e.pin.as_str())
+                .collect()
+        };
+        assert_eq!(
+            members(0),
+            HashSet::from(["u_fa0/D", "u_fa1/D", "u_fy/D", "ya"]),
+            "cka members"
+        );
+        assert_eq!(
+            members(1),
+            HashSet::from(["u_fb0/D", "u_fb1/D", "u_fx/D", "yb"]),
+            "ckb members"
+        );
+        assert_eq!(report.domains[0].endpoints, 4);
+        assert_eq!(report.domains[1].endpoints, 4);
+        // Subset bounds vs the globals: a domain's folds are over a subset
+        // of the endpoint set, so each sits at or inside the global fold;
+        // the global wns is one row's wns.
+        for d in &report.domains {
+            assert!(d.wns_max_ns >= report.wns_max_ns, "{}", d.clock.as_deref().unwrap_or("(none)"));
+            assert!(d.wns_min_ns >= report.wns_min_ns);
+            assert!(d.tns_max_ns >= report.tns_max_ns);
+            assert!(d.tns_min_ns >= report.tns_min_ns);
+        }
+        assert_eq!(
+            report.domains[0]
+                .wns_max_ns
+                .min(report.domains[1].wns_max_ns),
+            report.wns_max_ns
+        );
+    }
+
+    /// The acceptance's "per-domain values equal the same quantities
+    /// recomputed from `endpoints`": independent folds over
+    /// `report.endpoints` grouped by `domain_row`, the partition algebra
+    /// (Σ endpoints, min wns, Σ tns, Σ violations), and the 5-bucket
+    /// histogram recompute. Covers the partitioned compose (`t2_selmc` and
+    /// `md_basic`'s `set_max_delay`) — the same recompute also runs on the
+    /// single-state path implicitly through `t2_selmc`'s leaf endpoints.
+    #[test]
+    fn test_domain_summary_consistency() {
+        for report in [
+            sta_fixture_report("sta_clocks", "two_clock.def", "t2_selmc.sdc"),
+            sta_fixture_report("sta_exceptions", "exceptions.def", "md_basic.sdc"),
+        ] {
+            let n_named = report
+                .domains
+                .iter()
+                .position(|d| d.clock.is_none())
+                .unwrap_or(report.domains.len());
+            // A `clock: null` row is legal only as the last row.
+            assert!(report.domains[..n_named].iter().all(|d| d.clock.is_some()));
+            for (i, d) in report.domains.iter().enumerate() {
+                // Same grouping `summarize_domains` applies: named rows
+                // 0..n_named, everything else in the unattributed slot.
+                let members: Vec<&EndpointReport> = report
+                    .endpoints
+                    .iter()
+                    .filter(|e| {
+                        e.domain_row.filter(|&r| r < n_named).unwrap_or(n_named) == i
+                    })
+                    .collect();
+                let wns = |f: fn(&EndpointReport) -> Option<f32>| {
+                    members.iter().filter_map(|e| f(e)).fold(f32::INFINITY, f32::min)
+                };
+                let tns = |f: fn(&EndpointReport) -> Option<f32>| {
+                    members.iter().filter_map(|e| f(e)).map(|s| s.min(0.0)).sum::<f32>()
+                };
+                assert_eq!(d.endpoints as usize, members.len(), "row {i}");
+                assert_eq!(d.wns_max_ns, wns(|e| e.worst_max_slack_ns), "row {i} wns_max");
+                assert_eq!(d.tns_max_ns, tns(|e| e.worst_max_slack_ns), "row {i} tns_max");
+                assert_eq!(d.wns_min_ns, wns(|e| e.worst_min_slack_ns), "row {i} wns_min");
+                assert_eq!(d.tns_min_ns, tns(|e| e.worst_min_slack_ns), "row {i} tns_min");
+                assert_eq!(
+                    d.setup_violations as usize,
+                    members
+                        .iter()
+                        .filter(|e| e.worst_max_slack_ns.is_some_and(|s| s < 0.0))
+                        .count(),
+                    "row {i} setup_violations"
+                );
+                assert_eq!(
+                    d.hold_violations as usize,
+                    members
+                        .iter()
+                        .filter(|e| e.worst_min_slack_ns.is_some_and(|s| s < 0.0))
+                        .count(),
+                    "row {i} hold_violations"
+                );
+            }
+            // Partition algebra: the rows partition the endpoint set, so the
+            // globals are the rows' folds.
+            assert_eq!(
+                report.domains.iter().map(|d| d.endpoints).sum::<u32>() as usize,
+                report.endpoints.len()
+            );
+            let gmin = |f: fn(&DomainSummary) -> f32| {
+                report.domains.iter().map(f).fold(f32::INFINITY, f32::min)
+            };
+            assert_eq!(gmin(|d| d.wns_max_ns), report.wns_max_ns);
+            assert_eq!(gmin(|d| d.wns_min_ns), report.wns_min_ns);
+            let gsum = |f: fn(&DomainSummary) -> f32| report.domains.iter().map(f).sum::<f32>();
+            assert!(
+                (gsum(|d| d.tns_max_ns) - report.tns_max_ns).abs() < 1e-5,
+                "sum of domain tns_max {} != global {}",
+                gsum(|d| d.tns_max_ns),
+                report.tns_max_ns
+            );
+            assert!((gsum(|d| d.tns_min_ns) - report.tns_min_ns).abs() < 1e-5);
+            assert_eq!(
+                report.domains.iter().map(|d| d.setup_violations).sum::<u32>(),
+                report.setup_violations
+            );
+            assert_eq!(
+                report.domains.iter().map(|d| d.hold_violations).sum::<u32>(),
+                report.hold_violations
+            );
+            // Histogram recompute from `endpoints`, independent of
+            // `summarize_domains`'s own bucket match.
+            let mut counts = [0u32; 5];
+            for e in &report.endpoints {
+                let b = match e.worst_max_slack_ns {
+                    Some(s) if s < 0.0 => SlackBucketKind::Negative,
+                    Some(s) => match e.domain_period_ns {
+                        Some(p) if s < 0.2 * p => SlackBucketKind::P0To20,
+                        Some(p) if s <= 0.5 * p => SlackBucketKind::P20To50,
+                        Some(_) => SlackBucketKind::Over50,
+                        None => SlackBucketKind::NoPeriod,
+                    },
+                    None => SlackBucketKind::NoPeriod,
+                };
+                counts[b as usize] += 1;
+            }
+            assert_eq!(report.slack_histogram.len(), 5);
+            for (b, &count) in report.slack_histogram.iter().zip(counts.iter()) {
+                assert_eq!(b.count, count, "bucket {:?}", b.bucket);
+            }
+            assert_eq!(
+                report.slack_histogram.iter().map(|b| b.count).sum::<u32>() as usize,
+                report.endpoints.len()
+            );
+            assert_eq!(report.slack_histogram[0].count, report.setup_violations);
+        }
+    }
+
+    /// `sta --json` schema: `domains` rows carry exactly the eight documented
+    /// keys, `slack_histogram` emits all five buckets in the fixed order with
+    /// the documented names, and `endpoints[]` rows leak no crate-internal
+    /// domain bookkeeping.
+    #[test]
+    fn test_domain_summary_json_schema() {
+        let report = sta_fixture_report("sta_clocks", "two_clock.def", "t2_selmc.sdc");
+        let v = serde_json::to_value(&report).expect("report serializes");
+        for row in v["domains"].as_array().expect("domains array") {
+            let keys: HashSet<&str> = row
+                .as_object()
+                .expect("domain row object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                HashSet::from([
+                    "clock",
+                    "endpoints",
+                    "wns_max_ns",
+                    "tns_max_ns",
+                    "wns_min_ns",
+                    "tns_min_ns",
+                    "setup_violations",
+                    "hold_violations"
+                ])
+            );
+            assert!(row["clock"].is_string() || row["clock"].is_null());
+        }
+        let hist = v["slack_histogram"].as_array().expect("histogram array");
+        let names: Vec<&str> = hist
+            .iter()
+            .map(|b| b["bucket"].as_str().expect("bucket name"))
+            .collect();
+        assert_eq!(
+            names,
+            ["negative", "p0_to_20", "p20_to_50", "over_50", "no_period"]
+        );
+        for e in v["endpoints"].as_array().expect("endpoints array") {
+            let obj = e.as_object().expect("endpoint object");
+            assert!(!obj.contains_key("domain_row"));
+            assert!(!obj.contains_key("domain_period_ns"));
+        }
+    }
+
+    /// `merge_corner_reports` domain rule: the merged max side keeps setup's
+    /// row (the merged max check *is* setup's reported check), a min-only
+    /// endpoint takes hold's row with setup's as fallback. Also the
+    /// degenerate input: helper endpoints carry `domain_row: None`, so the
+    /// merged report must emit a consistent `clock: null` row.
+    #[test]
+    fn test_domain_summary_merge() {
+        // Degenerate: no domain info on either side -> one unattributed row
+        // covering every endpoint; positive slacks with no period reference
+        // land in `no_period`.
+        let setup = report(vec![endpoint("a/Q", 0.5, 0.1), endpoint("b/Q", 0.2, 0.3)]);
+        let hold = report(vec![endpoint("a/Q", 0.9, 0.4), endpoint("b/Q", 0.1, 0.2)]);
+        let merged = merge_corner_reports(setup, hold).expect("merge");
+        assert_eq!(merged.domains.len(), 1);
+        assert!(merged.domains[0].clock.is_none());
+        assert_eq!(merged.domains[0].endpoints as usize, merged.endpoints.len());
+        assert_eq!(merged.slack_histogram[4].bucket, SlackBucketKind::NoPeriod);
+        assert_eq!(
+            merged.slack_histogram[4].count as usize,
+            merged.endpoints.len()
+        );
+
+        // Attributed: `a/Q` reports a max check in setup -> keeps row 0;
+        // `b/Q` is min-only in setup -> takes hold's row 1.
+        let mut sa = endpoint("a/Q", 0.5, 0.1);
+        sa.domain_row = Some(0);
+        sa.domain_period_ns = Some(2.0);
+        let mut sb = endpoint("b/Q", 0.2, 0.3);
+        sb.max_arr_ns = None;
+        sb.max_req_ns = None;
+        sb.max_slack_ns = None;
+        sb.max_slew_ns = None;
+        sb.worst_max_slack_ns = None;
+        sb.domain_row = Some(0);
+        sb.domain_period_ns = Some(2.0);
+        let setup = report_domains(vec![sa, sb], &["cka", "ckb"]);
+        let mut ha = endpoint("a/Q", 0.9, 0.4);
+        ha.domain_row = Some(0);
+        ha.domain_period_ns = Some(2.0);
+        let mut hb = endpoint("b/Q", 0.1, 0.2);
+        hb.domain_row = Some(1);
+        hb.domain_period_ns = Some(1.0);
+        let hold = report_domains(vec![ha, hb], &["cka", "ckb"]);
+        let merged = merge_corner_reports(setup, hold).expect("merge");
+        let b = merged
+            .endpoints
+            .iter()
+            .find(|e| e.pin == "b/Q")
+            .expect("b/Q");
+        assert_eq!(
+            b.domain_row,
+            Some(1),
+            "min-only merged endpoint takes hold's domain row"
+        );
+        assert_eq!(merged.domains.len(), 2);
+        assert_eq!(merged.domains[0].clock.as_deref(), Some("cka"));
+        assert_eq!(merged.domains[0].endpoints, 1, "cka keeps a/Q only");
+        assert_eq!(merged.domains[1].clock.as_deref(), Some("ckb"));
+        assert_eq!(merged.domains[1].endpoints, 1, "ckb gains the merged-min b/Q");
+    }
+
     /// `mc-xdomain`/`mc-selectors` scenario matrix: `tests/designs/sta_clocks/*.reference.json`
     /// was emitted by `probe.sh` (OpenSTA in the LibreLane container). In every
     /// scenario each reported endpoint must equal OpenSTA's row at
@@ -13746,6 +14246,8 @@ mod tests {
             min_slew_ns: Some(0.0),
             worst_max_slack_ns: Some(max_slack),
             worst_min_slack_ns: Some(min_slack),
+            domain_row: None,
+            domain_period_ns: None,
         }
     }
 
@@ -13784,8 +14286,19 @@ mod tests {
             endpoints,
             pulse_width_checks: Vec::new(),
             critical_paths: Vec::new(),
+            domains: Vec::new(),
+            slack_histogram: Vec::new(),
             skipped: SkipReport::default(),
         }
+    }
+
+    /// `report()` plus the domain blocks, as `assemble_sta_report` would
+    /// fill them for the given `create_clock` names.
+    fn report_domains(endpoints: Vec<EndpointReport>, clock_names: &[&str]) -> StaReport {
+        let mut r = report(endpoints);
+        let names: Vec<String> = clock_names.iter().map(|s| s.to_string()).collect();
+        (r.domains, r.slack_histogram) = summarize_domains(&r.endpoints, &names);
+        r
     }
 
     #[test]
