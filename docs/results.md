@@ -8658,3 +8658,109 @@ the diagnostic test; axis prints carry per-map labels (`refpwr`/`n7`/
 `#[allow(dead_code)]` — it rides into `Deviation` and prints in the
 top-5 rows. `cargo test -p grus-core --test irdrop` 2/2 green,
 `cargo clippy -p grus-core --tests -D warnings` clean.
+
+### 2026-11-23 — e7-drc-geom: LEF+DEF geometry model + width family (v0.9.0)
+
+`crates/grus-core/src/drc/{geom,width}.rs` + `NETS` routed-geometry
+retention in `readers/def.rs`. The committed Magic goldens
+(`<d>.drc.reference.json`, `generate_drc_ref.sh`, image
+`ghcr.io/librelane/librelane:3.0.16`) are **reused, not regenerated** —
+no container step ran for this ticket.
+
+**Geometry census** (`test_nets_geometry_retained`/`test_drc_parse_and_assemble_deterministic`
+prints, `cargo test -p grus-core --test drc -- --nocapture`):
+
+```
+gcd:      nets=269   wire_rects=1734   routed_vias=1797
+picorv32: nets=6811  wire_rects=60056  routed_vias=60028
+```
+
+| layer | gcd shapes | signal/special | via | pin/obs/io | picorv32 shapes | signal/special | via | pin/obs/io |
+|---|---|---|---|---|---|---|---|---|
+| li1 | 4272 | 0/0 | 884 | 2006/1382/0 | 130798 | 0/0 | 26365 | 64152/40281/0 |
+| met1 | 4611 | 1110/30 | 1797 | 808/866/0 | 144141 | 35281/174 | 58676 | 24211/25799/0 |
+| met2 | 1621 | 591/30 | 971 | 0/0/29 | 58926 | 23492/522 | 34617 | 0/0/295 |
+| met3 | 177 | 32/30 | 90 | 0/0/25 | 4788 | 1234/522 | 2918 | 0/0/114 |
+| met4 | 39 | 1/2 | 34 | 0/0/2 | 691 | 49/6 | 630 | 0/0/6 |
+| met5 | 6 | 0/2 | 2 | 0/0/2 | 30 | 0/6 | 18 | 0/0/6 |
+| mcon (cut) | 884 | — | 884 | — | 26365 | — | 26365 | — |
+| via (cut) | 1033 | — | 1033 | — | 34399 | — | 34399 | — |
+| via2 (cut) | 148 | — | 148 | — | 3872 | — | 3872 | — |
+| via3 (cut) | 122 | — | 122 | — | 2178 | — | 2178 | — |
+| via4 (cut) | 2 | — | 2 | — | 18 | — | 18 | — |
+
+Via instance names resolve through `resolve_def_via` (DEF `VIAS`
+generated vias first, then LEF `VIA` via `TechDb::via_defs`) — same
+code path as `pdn.rs`; an unknown name errors loudly with line + net.
+
+**Width verdict** — `check_width` on the assembled `DrcDesign`, all 13
+`lef_expressible` rules, both routed DEFs: **0 violations**, consistent
+with `magic_per_rule` carrying no entry for any implemented id (the
+only golden keys are `nwell.*` — out of scope, §3 taxonomy). Rule-name
+parity: every `WIDTH_RULES[i].rule` is inside the golden's
+lef_expressible id set and every `rule_name` matches a
+`magic_rules_checked.names` template verbatim (asserted by
+`test_width_rules_join_golden`).
+
+| rule | LEF bound | gcd | picorv32 |
+|---|---|---|---|
+| li.c1 / li.1 / li.7 | 170 | 0 | 0 |
+| mcon.1 | 170 | 0 | 0 |
+| met1.1 / met2.1 | 140 | 0 | 0 |
+| met3.1 / met4.1 | 300 | 0 | 0 |
+| met5.1 | 1600 | 0 | 0 |
+| via.1a | 150 | 0 | 0 |
+| via2.1a | 200 | 0 | 0 |
+| via3.1 | 200 | 0 | 0 |
+| via4.1 | 800 | 0 | 0 |
+
+**Mutation fixture** (`test_width_mutation_met1`): one
+`NEW met1 480` SPECIALNETS rail in `gcd.routed.def` → `NEW met1 100`
+(replacement count asserted == 1). Result: exactly one `Violation` —
+`rule "met1.1"`, `measured_dbu 100`, `bound_dbu 140`, on net VGND.
+Unmutated control: 0.
+
+**Fail-proof record** (AGENTS §7.7): `measured < bound` → `<=`:
+
+- `drc::width::tests::test_check_width_bound_parity_and_strictness` —
+  `exact-bound rect must pass: left 3 right 2` (the at-bound rect
+  flagged).
+- `test_width_zero_violations` — `gcd: 3927 width violations`.
+- `test_width_mutation_met1` — failed (count ≠ 1).
+- Restored `<`; all green. **Process find**: the first break was
+  masked — merge-relief's `relieved` accumulated `&=` over per-axis
+  checks, so a rect with no strictly sub-bound axis was relieved
+  unconditionally; the check was restructured so relief requires an
+  actual sub-bound axis (also the geometrically right direction: one
+  dissolving axis covers the other pair since the union covers the
+  whole perpendicular span). This is recorded as the relief-condition
+  bug the fail-proof existed to catch.
+
+**Corrections vs the design draft** (all driven by real-DEF evidence;
+`design/def-grammar.md` records each):
+
+- *Square caps, not flush.* Flush perpendicular expansion produced 39
+  false `met1.1` findings on gcd (45×140 / 25×140 / 5×140 stubs) —
+  Magic's 0 verdict only reproduces under square (extended) caps.
+  `SPECIALNETS` keeps perpendicular expansion (PDN mesh semantics pin
+  it); the divergence is recorded in `docs/e7-drc.md` §6.
+- *`( x y 0 )` points.* picorv32 wires carry a third `0` coordinate;
+  NETS records now keep parens (`keep_parens`) so the third token is
+  consumed as a reserved coordinate, not the next point's `x`.
+- *`+ NONDEFAULTRULE` supported.* `gcd.cts.def` uses it; the earlier
+  hard-bail broke the CTS tests. `NONDEFAULTRULES` `+ LAYER l WIDTH w`
+  is parsed into a per-layer override (unknown name/attribute bails).
+- *Merge-relief.* The draft's "every shape independently meets bound"
+  assumption failed on real `RECT` stubs (e.g. a 140×25 met2 stub);
+  relief dissolves a narrow boundary pair only when same-layer drawn
+  metal covers the whole perpendicular span and the chained union
+  spans `bound` on the narrow axis — `MacroObs` excluded (not
+  fabricated metal).
+
+**Checks run**: `cargo test --workspace` (483 lib + 5 drc + 2 irdrop +
+6 bin passed, 2 pre-existing jpeg ignores; lib ~113 s),
+`cargo clippy --workspace --all-targets -- -D warnings` (clean),
+`cargo test -p grus-core --test drc` (5/5, ~1.1 s — parse + assemble +
+check both designs). Version `0.8.0 → 0.9.0`: `PdnVia.geom` is a
+required field on a public struct (breaking for literal construction;
+0.x minor per AGENTS §5).

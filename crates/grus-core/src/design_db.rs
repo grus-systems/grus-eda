@@ -88,8 +88,37 @@ pub enum PdnConn {
     Instance { inst: SymbolId, pin: SymbolId },
 }
 
-/// A SPECIALNETS via-stack record `NEW <layer> 0 … ( x y ) <viaName>`,
-/// resolved through the DEF `VIAS` section or a LEF `VIA` definition.
+/// How a `PdnVia`'s shapes are derived at expansion time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ViaGeom {
+    /// LEF `VIA` — index into `TechDb::via_defs`; `rects` verbatim.
+    Lef(u32),
+    /// DEF `VIAS + VIARULE` generated via — rects from params.
+    Generated(GeneratedViaGeom),
+}
+
+/// DEF `VIAS` generated-via parameters (`+ CUTSIZE` etc.), retained at
+/// parse. `enc_*` are symmetric overhangs per OpenDB semantics:
+/// `(botX, botY, topX, topY)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedViaGeom {
+    pub cut_w_dbu: i32,
+    pub cut_h_dbu: i32,
+    pub rows: u32,
+    pub cols: u32,
+    /// Edge-to-edge cut spacing; `+ CUTSPACING` absent means 0.
+    pub cut_spacing_x_dbu: i32,
+    pub cut_spacing_y_dbu: i32,
+    pub enc_bot_x_dbu: i32,
+    pub enc_bot_y_dbu: i32,
+    pub enc_top_x_dbu: i32,
+    pub enc_top_y_dbu: i32,
+}
+
+/// A DEF via-stack record `pt <viaName>` (or the `NEW <layer> 0 …
+/// ( x y ) <viaName>` link in SPECIALNETS), resolved through the DEF
+/// `VIAS` section or a LEF `VIA` definition. Shared by `PdnNet` and
+/// `NetGeom` — the name predates that use.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PdnVia {
     /// DEF-spelled via name (kept for diagnostics).
@@ -101,8 +130,22 @@ pub struct PdnVia {
     pub cut: SymbolId,
     /// Parallel cuts (`+ ROWCOL` product or LEF cut-RECT count).
     pub cut_count: u32,
+    /// Shape recipe — LEF rects verbatim or generated-from-params.
+    pub geom: ViaGeom,
     pub x_dbu: i32,
     pub y_dbu: i32,
+}
+
+/// Routed shapes of one `NETS` net — same shape vocabulary `PdnNet`
+/// proved for SPECIALNETS.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetGeom {
+    /// Two-point segments + `RECT` stubs, half-width-expanded at parse
+    /// by the layer's LEF `WIDTH` (regular-net wires carry no width
+    /// token). Statement order.
+    pub wire_rects: Vec<(LayerId, RectDbu)>,
+    /// Via instances, path order.
+    pub vias: Vec<PdnVia>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -164,6 +207,10 @@ pub struct DesignDb {
     pub net_def_spellings: Vec<SymbolId>,
     pub net_pin_offsets: Vec<u32>, // length num_nets + 1
     pub net_pin_ids: Vec<PinId>, // driver pin (if any) is always placed first at net_pin_offsets[net]
+    /// Per-net routed geometry from `NETS`, parallel to `net_names`.
+    /// Empty for non-DEF sources (verilog/yosys) that never populate it.
+    #[serde(default)]
+    pub net_geoms: Vec<NetGeom>,
 }
 
 impl DesignDb {
@@ -206,6 +253,18 @@ impl DesignDb {
     /// special net declares lands in `PdnNet::wire_rects`.
     pub fn special_wire_rects(&self) -> impl Iterator<Item = (LayerId, RectDbu)> + '_ {
         self.pdn_nets.iter().flat_map(|n| n.wire_rects.iter().copied())
+    }
+
+    /// Flat view over every signal net's wire rects — every routed
+    /// segment a `NETS` record declares lands in `NetGeom::wire_rects`.
+    pub fn signal_wire_rects(&self) -> impl Iterator<Item = (LayerId, RectDbu)> + '_ {
+        self.net_geoms.iter().flat_map(|n| n.wire_rects.iter().copied())
+    }
+
+    /// Routed geometry of `net`; `None` only on non-DEF designs where
+    /// `net_geoms` is not populated.
+    pub fn net_geom(&self, net: NetId) -> Option<&NetGeom> {
+        self.net_geoms.get(net.0 as usize)
     }
 
     /// Net lookup by DEF name, for `pdn` and tests.
@@ -365,6 +424,9 @@ fn truncated_axis(base: i32, off: i32, frac: bool, mirrored: bool) -> i32 {
 /// - **I6 — `net_def_spellings`.** `len() ∈ {0, num_nets()}`; the guide
 ///   emitter uses per-net spellings only when the lengths match, and both
 ///   states stay valid.
+/// - **I7 — `net_geoms`.** `len() ∈ {0, num_nets()}`; `0` only for
+///   non-DEF sources (verilog/yosys) that never populate routed
+///   geometry.
 ///
 /// Cost policy (recorded choice): `connect_pin`/`disconnect_pin` edit
 /// `net_pin_ids` in place — one `Vec::remove`/`insert` plus an
@@ -474,6 +536,9 @@ impl DesignDb {
         if self.net_def_spellings.len() == self.net_names.len() {
             let spelling = self.strings.intern(&escape_def_name(name));
             self.net_def_spellings.push(spelling);
+        }
+        if self.net_geoms.len() == self.net_names.len() {
+            self.net_geoms.push(NetGeom::default());
         }
         let net_id = NetId(self.net_names.len() as u32);
         self.net_names.push(self.strings.intern(name));
@@ -798,6 +863,13 @@ mod tests {
             db.net_def_spellings.is_empty() || db.net_def_spellings.len() == nn,
             "I6 net_def_spellings length {} vs num_nets {nn}",
             db.net_def_spellings.len()
+        );
+
+        // I7 — net_geoms is empty or matches num_nets.
+        assert!(
+            db.net_geoms.is_empty() || db.net_geoms.len() == nn,
+            "I7 net_geoms length {} vs num_nets {nn}",
+            db.net_geoms.len()
         );
     }
 
