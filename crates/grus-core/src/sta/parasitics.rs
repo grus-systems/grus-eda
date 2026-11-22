@@ -2420,6 +2420,69 @@ mod tests {
         assert!(worst_ns < 1e-9, "Elmore drifted by {worst_ns} ns");
     }
 
+    /// e4-topology census gate on our own emitted guides (route ->
+    /// `build_guides` -> `estimate_guide_parasitics`, no golden files):
+    /// no `*P` port pin may land on a dead island — a dead port forces
+    /// OpenSTA's lumped fallback (gcd `resp_val` was the +250 ps e2e
+    /// extreme before the rung/bend coverage) — and no dead component
+    /// may chain past its self-parented root: every remaining island is
+    /// a one-node unpaired stub, the same class OpenROAD's reference
+    /// guide carries.
+    #[test]
+    fn test_guide_parasitics_no_dead_ports_or_multi_node_islands() {
+        for design_name in ["gcd", "picorv32"] {
+            let lib_dir = sky130_hd();
+            let dir = design_dir(design_name);
+            let mut interner = StringInterner::new();
+            let tech = load_tech_db(
+                &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+                &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+                &mut interner,
+            )
+            .expect("LEF")
+            .0;
+            let design = parse_def(
+                &crate::test_support::require(dir.join(format!("{design_name}.placed.def"))),
+                &tech,
+                None,
+            )
+            .expect("DEF");
+            let routed = crate::congestion::route_design(&design, &tech, None, None);
+            let guides = crate::congestion::guide::build_guides(&design, &tech, &routed);
+            let net_boxes: Vec<(NetId, Vec<GuideBox>)> =
+                guides.iter().map(|g| (g.net, g.boxes.clone())).collect();
+            let p = estimate_guide_parasitics(&design, &tech, &routed.grid, &net_boxes);
+
+            let (mut dead_ports, mut dead_chained) = (0usize, 0usize);
+            for n in 0..design.num_nets() {
+                let net = NetId(n as u32);
+                let Some(t) = p.net(net) else { continue };
+                for (i, &pin) in design.net_pins(net).iter().enumerate() {
+                    if design.pin_cells[pin.0 as usize].is_none()
+                        && t.dead[t.pin_node[i] as usize]
+                    {
+                        dead_ports += 1;
+                    }
+                }
+                dead_chained += (0..t.dead.len())
+                    .filter(|&i| {
+                        t.dead[i]
+                            && t.parent[i] as usize != i
+                            && t.dead[t.parent[i] as usize]
+                    })
+                    .count();
+            }
+            assert_eq!(
+                dead_ports, 0,
+                "{design_name}: port pins left on dead guide islands"
+            );
+            assert_eq!(
+                dead_chained, 0,
+                "{design_name}: multi-node dead islands remain in emitted guide"
+            );
+        }
+    }
+
     /// Direction (a) gate: our guide-RC model on OpenROAD's committed
     /// guide must reproduce `estimate_parasitics -global_routing`'s
     /// per-net `*D_NET` totals within `max(5%, 1 fF)`. Names normalize by

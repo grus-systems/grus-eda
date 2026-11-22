@@ -100,10 +100,10 @@ pub fn build_guides(
         }
 
         // Box order is semantic: `updateVias` pairs only consecutive
-        // same-point segments on adjacent layers, so every pin's
-        // [access, met1] stub pair is emitted next to the strip box whose
-        // wire segment touches the pin's cell — strip runs split at pin
-        // GCells so a covered pin cell is always a strip start/end.
+        // same-point segments on adjacent layers, so every pin's rung
+        // stack is emitted next to the strip box whose wire segment
+        // touches the pin's cell — strip runs split at pin GCells so a
+        // covered pin cell is always a strip start/interior/end cell.
         let runs_of = |indices: &BTreeSet<usize>| -> Vec<(usize, usize)> {
             let mut runs = Vec::new();
             let mut run: Option<(usize, usize)> = None;
@@ -181,9 +181,13 @@ pub fn build_guides(
                 !bound_to_v[i] && met1.is_some() && covered(&h_runs, y, x).is_some()
             })
             .collect();
-        // Stub chain per pin cell: accesses below the covering strip's
-        // layer plus the met1 rung when it is also below it; accesses at
-        // or above the strip layer keep their own stub (dead island).
+        // Rung stack per pin cell (docs/e4-guides.md §6): a bound cell
+        // emits one contiguous zero-length stack so access layers
+        // at/above the covering strip chain into the wire node —
+        // `updateVias` pairs a zls only upward, so the stack anchors on
+        // the strip layer `S` (the rung that shares the wire's node).
+        // Unbound cells keep the accesses+met1 group: no strip exists
+        // to anchor rungs (dead islands — the recorded residual).
         let cover_layer = |i: usize| {
             if bound_to_v[i] {
                 met2.map(|l| l.0)
@@ -195,37 +199,65 @@ pub fn build_guides(
             .unwrap_or(u8::MAX)
         };
         let met1_id = met1.map(|l| l.0);
-        let stub_chain: Vec<BTreeSet<u8>> = (0..pin_cells.len())
+        let top_layer = tech_db.routing_layers.len().saturating_sub(1) as u8;
+        let covers: Vec<u8> = (0..pin_cells.len()).map(&cover_layer).collect();
+        let stub_stack: Vec<Vec<u8>> = (0..pin_cells.len())
             .map(|i| {
-                let cov = cover_layer(i);
-                let mut chain: BTreeSet<u8> = pin_accesses[i]
-                    .iter()
-                    .copied()
-                    .filter(|&a| a < cov)
-                    .collect();
-                if let Some(m) = met1_id
-                    && m < cov
-                {
-                    chain.insert(m);
+                let s = covers[i];
+                if s == u8::MAX {
+                    // Unbound: no strip anchors the stack, but a
+                    // contiguous rung still chains the access layers —
+                    // OpenROAD covers a pin cell through conn+1 (the
+                    // pin-attach probe layer — measured: picorv32's
+                    // uncovered io cells emit li1..met4 for a met3 port),
+                    // so the stack climbs to max(accesses)+1. A pin
+                    // whose lookup lands on the stack keeps every access
+                    // layer live; otherwise the stack stays a dead
+                    // island (the recorded residual).
+                    let lo = pin_accesses[i].iter().copied().chain(met1_id).min();
+                    return pin_accesses[i]
+                        .iter()
+                        .copied()
+                        .max()
+                        .zip(lo)
+                        .map(|(hi, lo)| (lo..=(hi + 1).min(top_layer)).collect())
+                        .unwrap_or_default();
                 }
-                chain
-            })
-            .collect();
-        let stub_extra: Vec<BTreeSet<u8>> = (0..pin_cells.len())
-            .map(|i| {
-                let cov = cover_layer(i);
-                pin_accesses[i]
-                    .iter()
-                    .copied()
-                    .filter(|&a| a >= cov)
-                    .collect()
+                match pin_accesses[i].iter().copied().filter(|&a| a >= s).max() {
+                    // Accesses all below the strip: contiguous rungs
+                    // min..S — the top rung lands adjacent to the wire
+                    // and pairs into it.
+                    None => pin_accesses[i]
+                        .iter()
+                        .copied()
+                        .min()
+                        .map(|lo| (lo..s).collect())
+                        .unwrap_or_default(),
+                    // An access at/above the strip cannot pair into it —
+                    // rungs climb contiguously from the lowest of
+                    // {accesses below S, met1, S} to the top access and
+                    // pair among themselves at the wire's node. The
+                    // met1 fill keeps the met1<->met2 bridge at pin
+                    // cells that are also H/V junctions.
+                    Some(hi) => {
+                        let lo = pin_accesses[i]
+                            .iter()
+                            .copied()
+                            .filter(|&a| a < s)
+                            .chain(met1_id)
+                            .chain([s])
+                            .min()
+                            .expect("S is a member");
+                        (lo..=hi).collect()
+                    }
+                }
             })
             .collect();
 
         let ctx = StubCtx {
             cells: &pin_cells,
-            chain: &stub_chain,
-            extra: &stub_extra,
+            stack: &stub_stack,
+            cover: &covers,
             cell_rect: &gcell_rect,
         };
         let mut boxes: Vec<GuideBox> = Vec::new();
@@ -266,6 +298,33 @@ pub fn build_guides(
                 &mut boxes,
             );
         }
+        // Bend via-stacks: a non-pin GCell covered by both an H and a V
+        // run holds wire endpoints on met1 and met2 with no resistor
+        // between them — the two layer subtrees stay disjoint. A
+        // consecutive same-point box pair pairs into an met1->met2 via
+        // under updateVias, the same coverage OpenROAD's own guide gives
+        // a bend cell (same rect on both layers). Bound pin cells
+        // already bridge through their rung stack; unbound ones are
+        // never strip-covered.
+        if let (Some(m1), Some(m2)) = (met1, met2) {
+            let pin_set: BTreeSet<(usize, usize)> = pin_cells.iter().copied().collect();
+            let mut bends: BTreeSet<(usize, usize)> = BTreeSet::new();
+            for (x, runs) in &v_runs {
+                let x = *x;
+                for &(a, b) in runs {
+                    for y in a..=b + 1 {
+                        if !pin_set.contains(&(x, y)) && covered(&h_runs, y, x).is_some() {
+                            bends.insert((y, x));
+                        }
+                    }
+                }
+            }
+            for &(y, x) in &bends {
+                let rect = gcell_rect(x, y);
+                boxes.push(GuideBox { layer: m1, rect });
+                boxes.push(GuideBox { layer: m2, rect });
+            }
+        }
         for i in 0..pin_cells.len() {
             if !bound_to_v[i] && !bound_to_h[i] {
                 ctx.group_before(i, &mut boxes);
@@ -276,13 +335,12 @@ pub fn build_guides(
     guides
 }
 
-/// Pin-cell stub emission context: each cell's stub chain (layers below
-/// the covering strip — these pair into the wire) and its extra stubs
-/// (access layers at/above the strip — dead islands).
+/// Pin-cell stub emission context: each cell's contiguous rung stack
+/// (ascending layer ids; `u8::MAX` cover marks unbound cells).
 struct StubCtx<'a> {
     cells: &'a [(usize, usize)],
-    chain: &'a [BTreeSet<u8>],
-    extra: &'a [BTreeSet<u8>],
+    stack: &'a [Vec<u8>],
+    cover: &'a [u8],
     cell_rect: &'a dyn Fn(usize, usize) -> RectDbu,
 }
 
@@ -296,27 +354,27 @@ impl StubCtx<'_> {
     }
 
     /// Stub group before a strip wire (start cell, interior split, or
-    /// unbound): the extra stubs (access at/above the strip — unpairable,
-    /// each keeps its own self-loop as in OpenROAD) go first so the
-    /// chain's top stub lands adjacent to the wire and can pair.
+    /// unbound): the rung stack ascending — a below-strip top rung pairs
+    /// into the wire, and an at/above-strip rung shares the wire's node
+    /// with the rungs above it pairing among themselves.
     fn group_before(&self, i: usize, boxes: &mut Vec<GuideBox>) {
-        for &l in &self.extra[i] {
-            self.push(i, l, boxes);
-        }
-        for &l in &self.chain[i] {
+        for &l in &self.stack[i] {
             self.push(i, l, boxes);
         }
     }
 
-    /// Stub group after a strip's last wire (end cell): the chain top
-    /// first so it pairs with the wire — OpenROAD's own tail convention
-    /// (`_000_`: `[met2-wire, met1, li1]`), where the stubs below it
-    /// then keep their self-loops.
+    /// Stub group after a strip's last wire (end cell): below-strip
+    /// rungs descending first — the top one raises into the wire
+    /// (OpenROAD's own tail convention, `_000_`: `[met2-wire, met1,
+    /// li1]`, lower rungs keep their self-loops) — then the
+    /// strip-layer-and-above rungs ascending, anchored on the node the
+    /// wire shares.
     fn group_after(&self, i: usize, boxes: &mut Vec<GuideBox>) {
-        for &l in self.chain[i].iter().rev() {
+        let s = self.cover[i];
+        for &l in self.stack[i].iter().rev().filter(|&&l| l < s) {
             self.push(i, l, boxes);
         }
-        for &l in &self.extra[i] {
+        for &l in self.stack[i].iter().filter(|&&l| l >= s) {
             self.push(i, l, boxes);
         }
     }
@@ -325,10 +383,11 @@ impl StubCtx<'_> {
 /// Emits one direction's strips: every run (edges `a..=b`, covering
 /// cells `a..=b+1` on its line) splits at each pin GCell bound to this
 /// direction — an unbound or opposite-bound cell gains nothing from a
-/// split — and interleaves the bound cells' stub group: extras then the
-/// chain before the wire at a start/interior cell, chain descending
-/// then extras after it at an end cell — so `updateVias` sees the
-/// chain's top stub consecutive with a same-point `L+1` wire endpoint.
+/// split — and interleaves the bound cells' stub group: the rung stack
+/// ascending before the wire at a start/interior cell, below-strip
+/// rungs descending then the rest ascending after it at an end cell —
+/// so `updateVias` sees the stack consecutive with a same-point wire
+/// endpoint.
 fn emit_strips(
     runs: &[(usize, Vec<(usize, usize)>)],
     vertical: bool,
@@ -1045,5 +1104,117 @@ mod tests {
         assert_eq!(guides[1].boxes.len(), 2);
         assert!(has(&guides[1], 0, 0, 0, 100, 100));
         assert!(has(&guides[1], 1, 0, 0, 100, 100));
+    }
+
+    /// H∩V junction coverage: a non-pin GCell covered by both an H and a
+    /// V run carries wire ends on met1 and met2 with no resistor between
+    /// them — the two layer subtrees stay disjoint islands. The emitter
+    /// appends a consecutive same-point met1/met2 pair per such cell so
+    /// `updateVias` bridges the bend (e4-topology: the dominant
+    /// multi-node island class before this was a detour branch detached
+    /// at its bend). A strip-covered pin cell does NOT get a bend pair —
+    /// its rung stack already bridges the junction.
+    #[test]
+    fn bend_pairs_bridge_strip_junction() {
+        let tech = mini_tech();
+        let design = mini_design();
+        // H(3),H(4): row 1 x=0..=1 -> met1 cells (0,1)..(2,1).
+        // V(1): col 1 gap 0 -> met2 cells (1,0),(1,1).
+        // V(6): col 2 gap 1 -> met2 cells (2,1),(2,2); pin B sits at
+        // (2,1), bound to this strip.
+        let r = routed(
+            mini_grid(),
+            vec![vec![
+                GridEdge::H(3),
+                GridEdge::H(4),
+                GridEdge::V(1),
+                GridEdge::V(6),
+            ]],
+        );
+        let guides = build_guides(&design, &tech, &r);
+        let g = &guides[0];
+        let bend_rect = RectDbu::new(100, 100, 200, 200);
+        // The junction cell (1,1) emits a met1/met2 pair, adjacent in the
+        // box stream so updateVias pairs it.
+        let pos = g
+            .boxes
+            .iter()
+            .position(|b| b.layer == LayerId(1) && b.rect == bend_rect)
+            .expect("met1 bend box at (1,1)");
+        assert_eq!(
+            g.boxes[pos + 1],
+            GuideBox {
+                layer: LayerId(2),
+                rect: bend_rect
+            },
+            "met2 bend box must follow the met1 bend box"
+        );
+        // B's cell (2,1) is also H∩V covered but carries a bound pin:
+        // its rung stack is [li1, met1] (the met2 strip wire is the
+        // strip rung) — no met1/met2 bend pair may appear at its rect.
+        let b_rect = RectDbu::new(200, 100, 300, 200);
+        for w in g.boxes.windows(2) {
+            assert!(
+                !(w[0].rect == b_rect
+                    && w[1].rect == b_rect
+                    && w[0].layer == LayerId(1)
+                    && w[1].layer == LayerId(2)),
+                "bound pin cell emitted a bend pair: {g:?}"
+            );
+        }
+        // B's rung chain: li1, met1 ascending, immediately followed by
+        // the met2 wire box — updateVias pairs the chain into the wire.
+        let b_stub = g
+            .boxes
+            .iter()
+            .position(|b| b.layer == LayerId(0) && b.rect == b_rect)
+            .expect("B access stub");
+        assert_eq!(g.boxes[b_stub + 1].layer, LayerId(1));
+        assert_eq!(g.boxes[b_stub + 1].rect, b_rect);
+        assert_eq!(g.boxes[b_stub + 2].layer, LayerId(2));
+        assert_eq!(g.boxes[b_stub + 2].rect, RectDbu::new(200, 100, 300, 300));
+    }
+
+    /// Unbound pin cells emit a contiguous rung stack up to `access+1`
+    /// (the conn+1 coverage OpenROAD gives port cells, measured on
+    /// picorv32's uncovered io cells): a met2-layer I/O pin under a
+    /// 4-layer tech emits met1..met3 so the stack reaches one layer
+    /// above the pin's access layer.
+    #[test]
+    fn unbound_stub_climbs_above_io_layer() {
+        let mut tech = mini_tech();
+        let sym = tech.strings.intern("met3");
+        tech.routing_layers.push(RoutingLayer {
+            name: sym,
+            dir: LayerDir::Horizontal,
+            pitch_dbu: 100,
+            width_dbu: 50,
+            offset_dbu: 0,
+            res_per_sq: 0.0,
+            cap_per_sq_um: 0.0,
+            edge_cap_per_um: 0.0,
+        });
+        tech.rebuild_maps();
+        let design = mini_design();
+        // A lone H edge far from C's cell: no strip covers (3,2).
+        let r = routed(mini_grid(), vec![vec![GridEdge::H(0)]]);
+        let guides = build_guides(&design, &tech, &r);
+        let g = &guides[0];
+        let c_rect = RectDbu::new(300, 200, 400, 300);
+        // C's access layer is met2 (id 2): the stack is met1, met2, met3
+        // — contiguous, ascending, one layer above the access.
+        let pos = g
+            .boxes
+            .iter()
+            .position(|b| b.rect == c_rect)
+            .expect("C stub group");
+        assert_eq!(
+            g.boxes[pos..pos + 3]
+                .iter()
+                .map(|b| b.layer.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "unbound io stub stack must climb to access+1: {g:?}"
+        );
     }
 }

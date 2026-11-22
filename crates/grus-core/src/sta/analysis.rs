@@ -7515,14 +7515,11 @@ mod tests {
         };
         /// E4 criterion-4 gate on gcd fails the strict `max(5 ps, 1%)` bound; these
         /// floors hold the measured total residual while the decomposition test
-        /// tracks each named axis. Dominant cause (e4-1 topology axis): our guide
-        /// routes some nets differently than OpenROAD's — `resp_val` is the
-        /// extreme case: OpenROAD's guide leaves the port on a connected stub
-        /// while ours puts it on a dead island, so OpenSTA sees a lumped
-        /// parasitic on our net and a pi model on its own (+250 ps on
-        /// `resp_val.max_arr_ns`, the e2e max). Second cause (e4-2 parasitics
-        /// axis): our guide still yields more self-loop stubs than OpenROAD's
-        /// reference guide, plus `EST-0026` warned-pin coverage.
+        /// tracks each named axis. After the e4-topology rung/bend coverage
+        /// (every `*P` port now chains to its driver; all dead components are
+        /// one-node stubs) the topology-axis max dropped 250.8 -> 210.6 ps; the
+        /// residual is route-path divergence plus our still-larger self-loop
+        /// stub count vs the reference guide (`EST-0026` warned-pin coverage).
         /// See docs/results.md `e4-sta-e2e`.
         const GCD_GUIDE: Tol = Tol {
             arr_abs_ns: 0.26,
@@ -7530,32 +7527,34 @@ mod tests {
             slew_rel: 0.25,
             ..Tol::STRICT
         };
-        /// Same verdict on picorv32, one order of magnitude wider: the guide
-        /// nets' larger RC amplifies the island-stub linking (parasitics axis
-        /// median +1,408 ps) and the guide-coverage gap (topology axis median
-        /// +523 ps, 249 `EST-0026` pins). Engine axis stays in the recorded
-        /// `PICORV32_SPEF` driver-stage band (see `PICORV32_GUIDE_ENGINE`).
-        /// See docs/results.md `e4-sta-e2e`.
+        /// picorv32 is the named e4-topology residual: fully-connected emission
+        /// vs the reference's dead detour islands. Our guide bridges every
+        /// strip junction, so high-fanout nets carry real distributed RC while
+        /// OpenROAD's guide leaves their detour branches dead (lumped). Worst
+        /// endpoint `_11316_/D` (+2.33 ns, probed via OpenSTA `report_checks`
+        /// on both SPEFs): the `_00012_` net (`_09979_/Q`, fanout 273) is 431
+        /// fF/245 pins dead in the reference but fully live in ours — driver
+        /// cap 1.50 -> 2.00 pF, delay +0.98 ns, slew 7.34 -> 9.91 ns feeding
+        /// +1.27 ns on the next stage. The `_027xx_`/`_028xx_` writeback buses
+        /// and `_0000x` decoder nets carry the same class (measured max arr
+        /// 2.512 ns, max slack 2.516 ns, TNS 127.9 ns). See docs/results.md
+        /// `e4-sta-e2e`.
         const PICORV32_GUIDE: Tol = Tol {
-            arr_abs_ns: 2.2,
-            slack_abs_ns: 2.2,
+            arr_abs_ns: 2.6,
+            slack_abs_ns: 2.6,
             slew_rel: 2.5,
-            tns_abs_ns: 111.0,
+            tns_abs_ns: 135.0,
             ..Tol::STRICT
         };
         /// picorv32 engine axis on our guide SPEF: OpenSTA vs our STA on the
-        /// same file. Under island-era SPEFs the tail is ~17 endpoints: a few
-        /// dead-pin nets whose lumped/pi boundary is genuinely fuzzy in
-        /// OpenSTA (probed boundary ~1/3 island wire-cap share; the band is
-        /// inconsistent between structurally identical nets), dead-pin slews
-        /// carrying the driver-waveform gap with no wire RC to mask it
-        /// (max 26.7% on a 28 ps slew), and the recorded E3.5 shared-stage
-        /// `Rd`/Ceff residual amplified by guide nets' larger RC
-        /// (`_0995x`/`_11xxx` max_arr ~1.2%, `mem_la_addr[4]` 22 ps).
-        /// See docs/results.md `e4-sta-e2e`.
+        /// same file. With the guide fully connected the residual is the
+        /// recorded E3.5 shared-stage `Rd`/Ceff gap amplified by the newly
+        /// live high-fanout RC trees — ~74 ps slack on the `_113xx_` regfile
+        /// cluster (max 0.75% arrival). See docs/results.md `e4-sta-e2e`.
         const PICORV32_GUIDE_ENGINE: Tol = Tol {
             arr_rel: 0.03,
             arr_abs_ns: 0.04,
+            slack_abs_ns: 0.08,
             slew_rel: 0.28,
             tns_abs_ns: 0.01,
             ..Tol::PICORV32_SPEF

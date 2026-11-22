@@ -109,23 +109,40 @@ block; gcd's `_003_` — two pins in one GCell — does).
 - Boxes within a net keep `NetGuide.boxes` order — it is semantic, since
   `updateVias` pairs only consecutive same-point segments. `write_guides`
   dedups exact duplicates on first occurrence but never re-sorts.
-- Builder order: `met1` H strips, then `met2` V strips, then unbound
-  pin-cell stub groups. Each pin GCell carries a stub **chain**
-  (access layers strictly below the covering strip plus the `met1`
-  rung — these pair into the wire) and **extra** stubs (access layers
-  at/above the strip — dead islands by construction). Runs split at
-  every bound pin cell so a covered pin cell is always a strip
-  start/interior/end cell:
-  - pin cell at a strip **start** or **interior** split point: stub
-    group goes *before* the following wire, extras first then the
-    chain ascending — the chain's top stub lands adjacent to the
-    wire's `L` segment and pairs;
+- Builder order: `met1` H strips, then `met2` V strips, then **bend
+  via-stacks**, then unbound pin-cell stub groups. Each pin GCell
+  carries one contiguous **rung stack** of zero-length same-cell
+  boxes (`updateVias` pairs a stack only when its rungs are
+  consecutive and adjacent-layer — a non-contiguous group leaves
+  every unpaired rung a dead self-loop). A pin cell **bound** to a
+  covering strip emits a contiguous stack: when every access sits
+  below the strip layer `S` the rungs are `min(accesses)..S` (the
+  strip wire itself is the `S` rung); when an access sits at/above
+  `S` the stack instead climbs `min(accesses below S, met1, S)..=
+  max(accesses)` — the `met1` fill keeps the `met1`↔`met2` bridge at
+  pin cells that are also H/V junctions. Runs split at every bound
+  pin cell so a
+  covered pin cell is always a strip start/interior/end cell:
+  - pin cell at a strip **start** or **interior** split point: the
+    rung stack goes *before* the following wire, ascending — its top
+    rung lands adjacent to the wire's `L` segment and pairs;
   - pin cell at a strip **end**: stub group goes *after* the last
-    wire, chain descending first — mirrors OpenROAD's own tail
-    convention (`_000_`: `[met2-wire, met1, li1]` → the met1 stub
-    pairs, the access stub keeps its self-loop);
-  - pin cell covered by **no** strip: group appended last, same
-    order as the before-case (extras, then chain).
+    wire, below-`S` rungs descending first — mirrors OpenROAD's own
+    tail convention (`_000_`: `[met2-wire, met1, li1]` → the met1
+    stub pairs, the access stub keeps its self-loop);
+  - pin cell covered by **no** strip (unbound): the stack climbs from
+    min(accesses, `met1`) through `max(accesses)+1` — OpenROAD covers
+    a pin cell through `conn+1`, measured on picorv32's uncovered io
+    cells (a `met3` port emits `li1..met4`). This is what keeps a
+    `*P` port off a dead island even where no route strip covers its
+    cell.
+- **Bend via-stacks** (e4-topology): a non-pin GCell covered by both
+  an H and a V run appends its GCell rect on `met1` then `met2`,
+  consecutively — the same-point pair bridges the bend the way
+  OpenROAD's own guide covers a turn cell. Without it the met1/met2
+  subtrees of the same net stay disjoint and every downstream pin
+  lands on a dead island (the dominant multi-node class). Bound pin
+  cells are excluded — their rung stack already bridges.
 - Two runs of `route` produce byte-identical files
   (`test_guide_emit_deterministic`).
 
