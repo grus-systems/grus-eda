@@ -7769,6 +7769,276 @@ pre-existing `jpeg` placement/dmp ignores), `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --release -p grus-core sta`.
 `kurena/tasks/ux-sta-paths/spec/` untouched; no commits made.
 
+### 2026-11-23 — E9.2/3 — per-domain slack summary + slack histogram (v0.6.1)
+
+`StaReport` gains `domains` (one row per `create_clock` plus a `clock:
+null` unattributed row when needed) and `slack_histogram` (five buckets
+on `worst_max_slack_ns` as a fraction of the capture period), both
+computed by a pure `summarize_domains(&endpoints, &clock_names)` fold;
+`Worst` carries `dom` (the `Sdc::clocks` row of the check that produced
+the candidate) so attribution rides the reported check through both the
+single-state and the partitioned compose paths. No reference tool
+involved — the numbers are folds of our own endpoint rows, and the
+tests re-derive them from `endpoints`.
+
+**Fixture** (`sta_clocks/two_clock.def` + `t2_selmc.sdc`, CLI run):
+8 endpoints, two populated domain rows, no unattributed row.
+
+```text
+STA (zero wire): endpoints=8, setup wns=-0.287329 tns=-0.287329 viol=1, hold wns=-1.851203 tns=-6.513370 viol=5, elapsed=0.72ms
+pulse-width checks: 12 (0 violating)
+domains:
+  clock        endpoints    wns_max    tns_max    wns_min    tns_min  v_setup  v_hold
+  cka                  4  +0.607976  +0.000000  -1.851203  -4.986837        0       3
+  ckb                  4  -0.287329  -0.287329  -0.851203  -1.526533        1       2
+slack histogram (share of capture period): <0: 1   0-20%: 0   20-50%: 1   >50%: 6   no_period: 0
+```
+
+`--json /tmp/t2_selmc.json`: `domains` 2 rows `cka`/`ckb` (membership
+`cka = {u_fa0/D, u_fa1/D, u_fy/D, ya}`, `ckb = {u_fb0/D, u_fb1/D,
+u_fx/D, yb}` — asserted in `test_domain_summary_two_clock`),
+`slack_histogram` 5 buckets summing to 8, `endpoints[]` rows carry no
+`domain_row`/`domain_period_ns` keys. `md_basic.sdc` on
+`sta_exceptions/exceptions.def` (the partitioned compose) yields one
+`core_clk` row over 5 endpoints, no `null` row — the `set_max_delay`
+rewrite keeps the replaced check's anchor. `t2_selmd.sdc` on the same
+DEF does emit a `(none)` row (`endpoints: 1`): the `set_max_delay
+-from [get_clocks cka]` internal-path leaf gets `dom = u8::MAX`.
+
+**Attribution rule** (documented in `docs/e9-reporting.md` §8): each
+endpoint lands in the `Sdc::clocks` row of its *reported* check —
+`clock_domain[clk]` for register/gate candidates, `out_row` of the
+last-producing anchored `-clock` entry for output ports (max preferred,
+the same last-group-wins rule the `EndpointReport` comment records for
+`t2_clkcor2`), delay-rewritten checks keep the replaced check's anchor,
+`req = N` leaves and unclocked captures are unattributed. Merge rule
+(`--lib-hold`): a merged max side keeps setup's `(domain_row, period)`,
+a min-only endpoint takes hold's with setup's as fallback; rows are
+recomputed from the merged `endpoints` with setup's clock names.
+
+**Fail-proof**: forced `domain_row = Some(0)` for every endpoint in
+`endpoint_report`. Result: `test_domain_summary_two_clock` red —
+
+```text
+assertion `left == right` failed: cka members
+  left: {"u_fa1/D", "u_fb0/D", "u_fb1/D", "u_fa0/D", "u_fy/D", "u_fx/D", "ya", "yb"}
+ right: {"u_fy/D", "u_fa0/D", "u_fa1/D", "ya"}
+```
+
+— all eight endpoints attributed to `cka`. `test_domain_summary_
+consistency` stayed green under the corruption **by design**: it
+recomputes over the same `domain_row` it checks, which is exactly why
+the fixture test hardcodes pin->domain membership. Restored; the test
+is green again.
+
+**Version**: `0.6.0 -> 0.6.1`, **patch** — additive JSON fields and
+stdout text only: no new CLI flag, no API signature change beyond
+private types, no `StaReport` consumer breaks (`v0.4.0`/`v0.5.0`/
+`v0.6.0` minors each added a command or flag; this ticket adds none).
+
+**Checks run**: `cargo test --workspace` — `grus-core` 406 passed / 2
+ignored, `grus-eda` 4 passed, doc-tests 0 (335 s); `cargo clippy
+--workspace --all-targets -- -D warnings` — clean. `kurena/tasks/
+ux-sta-summary/spec/` untouched; no commits made.
+
+### 2026-11-23 — E9.4+E9.5 — `--top` suffix matching + SDC examples doc (v0.6.1)
+
+Ticket `ux-top-sdc` (review items 4+5 of
+`docs/history/run-2026-11-22-large-design.md`). CLI validation and docs only;
+no golden regeneration and no OpenSTA run.
+
+**Pre-change finding (single-top auto-accept).** Omitting `--top` already
+worked before this change: `parse_yosys_json` selects the first
+non-blackbox module with cells (first module as fallback), the Verilog
+reader takes the first `module` declaration, and `check_top_name(None, ..)`
+was a no-op. No command path demanded `--top` on single-module input, so no
+auto-detection code was added — the change only records the state and adds
+coverage: the successful `check-e0` invocation in
+`cli_end_to_end_gcd_flow_and_validation` now omits `--top` (JSON + Verilog +
+DEF on gcd), and a `floorplan --json gcd.synth.json --out <tmp>` call
+without `--top` passes and its output is deleted.
+
+**Matching rule.** `check_top_name` now accepts `requested == actual` or
+`requested` equal to the non-empty segment after the last literal `\` in
+the loaded design name (`actual.rsplit('\\').next()`). Everything else
+keeps the existing loud error
+`{kind} design name {actual:?} does not match --top {top:?}`. The comparison
+runs on the loaded `DesignDb.design_name`, not the raw file spelling.
+
+`check_top_name_matching_rules` (`actual = "$paramod$abc\\sub\\picorv32"`):
+
+| `--top` | expected | observed |
+|---|---|---|
+| `Some(actual)` exact | accept | PASS |
+| `Some("picorv32")` final segment | accept | PASS |
+| `None` omitted | accept | PASS |
+| `Some("sub")` non-final segment | reject | PASS |
+| `Some("$paramod$abc")` prefix | reject | PASS |
+| `Some("corv32")` / `Some("picorv")` substring | reject | PASS |
+| `Some("picorv32x")` superstring | reject | PASS |
+| `Some("")` empty | reject | PASS |
+
+Both `check-e0` and `floorplan` `--top` help strings now state the accepted
+forms and the omitted-argument behavior. No substring/prefix/glob matching
+was added — a looser rule would let a wrong-design slip look like a match.
+
+**SDC examples doc.** `docs/sdc-examples.md` ships exactly three fenced
+`sdc` blocks, each traced to a committed fixture:
+
+1. One clock + I/O delays — `tests/designs/gcd/gcd.sdc` verbatim.
+2. Asynchronous clock groups — `tests/designs/sta_clocks/t2_grp.sdc`
+   verbatim on `two_clock.def`.
+3. FF enable/select as data — the `sel`/`y`/`clk` subset of
+   `tests/designs/sta_exceptions/base.sdc` on `exceptions.def` (`sel`
+   drives `u_mux/S`/`u_mux2/S`; only `clk` has `create_clock`).
+
+`sdc_examples_parse` in `main.rs` extracts all three blocks via
+`include_str!` and requires `blocks.len() == 3`, feeding each through
+`grus_core::sta::parse_sdc` — all parse. Semantic coverage stays with the
+existing fixture tests (GCD STA tests, `test_sta_clocks_match_opensta`
+scenario coverage, `sta_exceptions` tests).
+
+**Async report semantics (recorded for the doc).** In the committed
+`two_clock.reference.json`, `t2_int` has 8 timed endpoints and `t2_grp` has
+5 — `set_clock_groups -asynchronous` removes the cross-domain candidates
+`u_fb0/D`, `u_fx/D`, `u_fy/D` by desugaring to pairwise false-path cuts,
+accounted under `skipped.false_path_endpoints`.
+`skipped.cross_domain_endpoints` remains the defensive diagnostic for an
+ungrouped/unpairable cross-domain path; committed scenarios pair, so
+`t2_grp` reports `cross_domain_endpoints == 0` — an intentional cut shows
+as `false_path`, never `CrossDomain`. `t2_grpa.sdc` (`-allow_paths`) is the
+contrast fixture, not the cut-path example. `t2_int.sdc` is the
+unconstrained two-clock reference.
+
+**Version.** `[workspace.package] version` `0.6.0 -> 0.6.1` (patch): a
+backward-compatible widening of CLI argument acceptance plus docs/tests;
+no schema or reference-format change.
+
+**Checks run** (this worktree, Apple Silicon, debug profile):
+
+- `cargo test -p grus-eda -- check_top_name_matching_rules sdc_examples_parse` — 2 passed.
+- `cargo test -p grus-eda -- cli_end_to_end_gcd_flow_and_validation` — 1 passed (0.80 s).
+- `cargo test --workspace` — 402 grus-core lib + 6 grus-eda bin tests passed, 2 ignored (pre-existing `jpeg` placement/dmp ignores).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+### 2026-11-23 — e7-drc-ref: Magic/OpenROAD DRC reference goldens on gcd + picorv32 (reference-only)
+
+E7 ticket 1 (`kurena/tasks/e7-drc-ref/`). New committed script
+`tests/designs/generate_drc_ref.sh <design> <routed-def>` — same
+host-wrapper shape as `generate_cts_ref.sh`/`generate_irdrop_ref.sh`
+(re-invokes inside `ghcr.io/librelane/librelane:3.0.16`, repo at `/work`,
+PDK at `/pdk`). Five steps: A `check_antennas -verbose` on the input
+routed DEF; B `-output_drc` DRT-report discovery (e6 `runs/drt/*.drc*.rpt`
+→ `<d>.drc.rpt`; if none, the verbatim generate_ref.sh step-5b route is
+re-run into `runs/drc/` and the re-routed DEF's SHA decides
+`regenerated_identical` vs `regenerated_divergent` — never silently);
+C Magic full deck (`lef read` tlef+cell lef → `def read` → `load` →
+`select top cell` → `drc euclidean on` → `drc style drc(full)` →
+`drc check` → `drc catchup` → `drc count` + `drc count total` +
+`drc listall why`); D the `add_spacing_probe_wire` sanity control (one
+`NEW` `met2` segment on a different signal net at 0.03 µm edge gap,
+then the identical Magic sequence); E assembly into
+`<design>.drc.reference.json`.
+
+**Commands verbatim**: `bash tests/designs/generate_drc_ref.sh gcd
+tests/designs/gcd/gcd.routed.def` and `bash
+tests/designs/generate_drc_ref.sh picorv32
+tests/designs/picorv32/picorv32.routed.def`. gcd run end-to-end twice
+after the final parser fix (byte-identical JSON both times); picorv32
+run three times total (byte-identical). picorv32's input is
+gitignored — regenerate via `tests/designs/picorv32/generate_ref.sh`
+step 5b. One named deterministic divergence: `drt_report_*` says
+`existing` while the gitignored `picorv32.drc.rpt` is on disk; a fresh
+tree takes the regen path and records `regenerated_*` (same count 0).
+
+**Correction to the 2026-11-22 P-DRC probe**: its "0 DRC errors on
+`gcd.routed.def`" was premature — the probe ran `drc count total`
+without `drc catchup`, while `drc check` is still running
+asynchronously. With `catchup`, the hierarchy-wide count is **305** on
+gcd (flat top-level `drc count` = 0; all errors sit inside the
+sky130_fd_sc_hd masters' nwell geometry). `drc count`/`drc count
+total` return `""` and print `Total DRC errors found: N`; the two
+totals are different surfaces (flat vs hierarchical merged regions) and
+neither equals the `drc listall why` bbox-fragment sum (426 on gcd) —
+all three are recorded separately.
+
+**Measured** (all script-emitted; see `docs/e7-drc.md` §§1–4):
+
+| surface | gcd | picorv32 |
+|---|---|---|
+| `magic_total` (`drc count total`, merged regions) | 305 | 8049 |
+| `magic_count_flat` (`drc count`, top-level only) | 0 | 0 |
+| `magic_listall_bbox_total` | 426 | 11082 |
+| clean per-rule bboxes | nwell.4: 300, nwell.2a: 120, nwell.1: 6 | nwell.4: 8084, nwell.2a: 2756, nwell.1: 242 |
+| `drt_drc_count` | 0 (`regenerated_identical`, sha `e3b0c44298fc1c14`) | 0 (`existing` rpt, sha `e3b0c44298fc1c14`) |
+| `antenna_violations` (net / pin) | 0 / 0 | 19 / 19 (side-area ratio 400 limits on met1/met2) |
+| broken DEF `magic_total` | 307 (+2 regions) | 8051 |
+| `new_rules_vs_clean` | `Metal2 spacing < 0.14um (met2.2)` | same |
+| `violated_rules_in_checked_deck` | true | true |
+
+Grammar pinned along the way: `check_antennas -verbose` prints one
+`Net:` block per violating net with `(VIOLATED)` on the failing
+`Required ratio` line and returns the net count as its Tcl result;
+`quit -force` is not a Magic exit form (plain `exit`); the image has no
+`awk` (all parsing is python3); two `sky130A.tech` `why` strings carry
+unclosed quotes (`rect_only *mimcap`/`*mimcap2`), which the per-logical-
+line extractor survives; `drc listall why` alternates
+`{why-string} {bbox-list}`. Taxonomy (corrected 2026-11-24, card-#35
+review): 278 `drc`-section statements / 239 unique names, classified by
+parenthesized Magic rule id — 50 unique (55 statements)
+`lef_expressible` (routing/cut ids `li`/`mcon`/`via`–`via4`/`met1`–`met5`
+with no device-layer reference), 189 unique (223 statements)
+`magic_only`, 0 `unclassified`, 0 `antenna` (antenna checks are not in
+the `drc` deck). Both denominators are recorded in the JSON.
+
+**Runtime** (`runs/drc/runtime.json`, kept out of the golden for byte
+reproduction): gcd ≈ 22 s total (19 s of it the DRT regen); picorv32
+≈ 105 s (61 s antenna check, ~20 s each Magic pass).
+
+**Artifacts** (all committed):
+
+| file | size | SHA-256 (first 16) |
+|---|---|---|
+| `tests/designs/generate_drc_ref.sh` | 32,918 B | `—` (script, not a golden) |
+| `tests/designs/gcd/gcd.drc.reference.json` | 36,601 B | `42827e2cd1fb6722` |
+| `tests/designs/picorv32/picorv32.drc.reference.json` | 50,296 B | `2ef1c935cc338e8f` |
+
+Evidence trail (gitignored): `tests/designs/<d>/runs/drc/` —
+`antenna.log`, `magic_clean.log`, `magic_broken.log`,
+`mutation.json`, `<d>.drc.broken.def`, `<d>.drc.regen.rpt` +
+`gcd.routed.regen.def` (gcd regen path), `runtime.json`.
+
+**What was run**: the committed script end-to-end on both designs
+(gcd ×5 successful runs, picorv32 ×4 across the parser iterations — the
+last two runs of each byte-identical), plus `bash -n` after every
+edit. Nothing Cargo-visible changed; **no version bump** (reference-only).
+`kurena/tasks/e7-drc-ref/spec/` untouched; no commits made. `cargo test
+--workspace` passed (402 lib + 4 bin tests, 2 ignored — pre-existing
+jpeg placement/dmp ignores); `cargo clippy --workspace --all-targets --
+-D warnings` passed clean.
+
+**Card-#35 follow-ups (2026-11-24, dev `HEAD`)**: the reviewer warned on
+four points, all fixed in `generate_drc_ref.sh` and the goldens
+regenerated end-to-end on both designs (Magic totals unchanged
+305/8049; only the taxonomy block moved).
+(1) `lef_expressible` was keyword-based and swept in diffusion/tap/FET/
+cap/well rules — now classified by the parenthesized Magic rule id
+(routing/cut ids only, and only when the `why` text names no device
+layer): 50 unique / 55 statements, down from 195.
+(2) DRT report discovery globbed `runs/drt/*.drc*.rpt` and took the
+first hit for any input — now reports are paired to the input DEF by
+stem (`<d>.routed.def`→`<d>.drc.rpt`, `*.drt.routed.def`→e6
+`*baseline*`, `<stem>.def`→`<stem>.drc.rpt`/`runs/drt/<stem>.drc*.rpt`);
+>1 pairing aborts, 0 falls through to regeneration.
+(3) `catch {drc count}`/`catch {drc count total}`/`catch {drc catchup}`
+now emit `-STATUS` markers and step E fails on nonzero status or a
+missing marker — no stale "Total DRC errors found" line can stand in.
+(4) `DRC_DEF` now defaults to the script's `$2` so direct in-container
+invocation works without the host wrapper's env.
+Rerun evidence: `generate_drc_ref.sh gcd gcd.routed.def` and
+`picorv32 picorv32.routed.def` rerun post-fix; JSONs byte-stable in
+every field except the corrected taxonomy. Still reference-only — no
+version bump.
 ### 2026-11-23 — e8-pdn-parse: per-net PDN model + connectivity census
 
 E8 ticket 2 (`kurena/tasks/e8-pdn-parse/`). Replaces the flat

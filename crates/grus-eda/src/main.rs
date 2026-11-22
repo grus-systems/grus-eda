@@ -92,7 +92,10 @@ struct CheckE0Args {
     #[arg(long, help = "Path to gate-level Verilog (.v) file")]
     verilog: Option<PathBuf>,
 
-    #[arg(long, help = "Top-level module name")]
+    #[arg(
+        long,
+        help = "Top-level design name (exact name or final hierarchy segment after `\\`; omit to auto-select)"
+    )]
     top: Option<String>,
 }
 
@@ -185,7 +188,10 @@ struct FloorplanArgs {
     #[arg(long, help = "Path to gate-level Verilog (.v) file")]
     verilog: Option<PathBuf>,
 
-    #[arg(long, help = "Top-level module name")]
+    #[arg(
+        long,
+        help = "Top-level design name (exact name or final hierarchy segment after `\\`; omit to auto-select)"
+    )]
     top: Option<String>,
 
     #[arg(long, help = "Path to output floorplan DEF (.def) file")]
@@ -474,9 +480,14 @@ fn print_congestion_summary(
     );
 }
 
+fn top_name_matches(requested: &str, actual: &str) -> bool {
+    !requested.is_empty()
+        && (requested == actual || actual.rsplit('\\').next() == Some(requested))
+}
+
 fn check_top_name(expected: Option<&str>, kind: &str, actual: &str) -> anyhow::Result<()> {
     if let Some(top) = expected
-        && actual != top
+        && !top_name_matches(top, actual)
     {
         anyhow::bail!("{kind} design name {actual:?} does not match --top {top:?}");
     }
@@ -1011,6 +1022,45 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     violating,
                 );
             }
+            if !report.domains.is_empty() {
+                println!("domains:");
+                println!(
+                    "  {:<12} {:>9} {:>10} {:>10} {:>10} {:>10} {:>8} {:>7}",
+                    "clock", "endpoints", "wns_max", "tns_max", "wns_min", "tns_min",
+                    "v_setup", "v_hold",
+                );
+                for d in &report.domains {
+                    println!(
+                        "  {:<12} {:>9} {:>+10.6} {:>+10.6} {:>+10.6} {:>+10.6} {:>8} {:>7}",
+                        d.clock.as_deref().unwrap_or("(none)"),
+                        d.endpoints,
+                        d.wns_max_ns,
+                        d.tns_max_ns,
+                        d.wns_min_ns,
+                        d.tns_min_ns,
+                        d.setup_violations,
+                        d.hold_violations,
+                    );
+                }
+            }
+            if !report.slack_histogram.is_empty() {
+                let label = |b: grus_core::sta::SlackBucketKind| match b {
+                    grus_core::sta::SlackBucketKind::Negative => "<0",
+                    grus_core::sta::SlackBucketKind::P0To20 => "0-20%",
+                    grus_core::sta::SlackBucketKind::P20To50 => "20-50%",
+                    grus_core::sta::SlackBucketKind::Over50 => ">50%",
+                    grus_core::sta::SlackBucketKind::NoPeriod => "no_period",
+                };
+                let parts: Vec<String> = report
+                    .slack_histogram
+                    .iter()
+                    .map(|b| format!("{}: {}", label(b.bucket), b.count))
+                    .collect();
+                println!(
+                    "slack histogram (share of capture period): {}",
+                    parts.join("   ")
+                );
+            }
             print_skip_summary(&report);
             if !report.critical_paths.is_empty() {
                 println!("paths (worst {} per corner):", args.paths);
@@ -1530,6 +1580,34 @@ mod tests {
     }
 
     #[test]
+    fn check_top_name_matching_rules() {
+        let actual = "$paramod$abc\\sub\\picorv32";
+
+        assert!(check_top_name(Some(actual), "netlist", actual).is_ok());
+        assert!(check_top_name(Some("picorv32"), "netlist", actual).is_ok());
+        assert!(check_top_name(None, "netlist", actual).is_ok());
+
+        for top in ["sub", "$paramod$abc", "corv32", "picorv", "picorv32x", ""] {
+            let err = check_top_name(Some(top), "netlist", actual).unwrap_err();
+            assert!(err.to_string().contains("does not match --top"));
+        }
+    }
+
+    #[test]
+    fn sdc_examples_parse() {
+        let doc = include_str!("../../../docs/sdc-examples.md");
+        let blocks: Vec<&str> = doc
+            .split("```sdc")
+            .skip(1)
+            .map(|rest| rest.split("```").next().unwrap())
+            .collect();
+        assert_eq!(blocks.len(), 3);
+        for block in blocks {
+            grus_core::sta::parse_sdc(block).expect("documented SDC example must parse");
+        }
+    }
+
+    #[test]
     fn cli_end_to_end_gcd_flow_and_validation() {
         let hd = sky130_hd();
         let lib = require(hd.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
@@ -1570,7 +1648,8 @@ mod tests {
         .unwrap());
         assert!(err_top.is_err(), "mismatched --top must fail");
 
-        // 2. E0: check-e0 across Liberty, LEF, JSON, Verilog, DEF with matching --top
+        // 2. E0: check-e0 across Liberty, LEF, JSON, Verilog, DEF. `--top` is
+        // omitted: single-top inputs auto-select through all three readers.
         run(Cli::try_parse_from([
             "grus-eda",
             "check-e0",
@@ -1586,11 +1665,27 @@ mod tests {
             gcd.join("gcd.synth.v").to_str().unwrap(),
             "--def",
             gcd.join("gcd.placed.def").to_str().unwrap(),
-            "--top",
-            "gcd",
         ])
         .unwrap())
         .expect("check-e0 must succeed");
+
+        // floorplan auto-selects the single module the same way.
+        let fp_def = std::env::temp_dir().join("grus_cli_test_gcd_floorplan.def");
+        run(Cli::try_parse_from([
+            "grus-eda",
+            "floorplan",
+            "--tlef",
+            tlef.to_str().unwrap(),
+            "--lef",
+            lef.to_str().unwrap(),
+            "--json",
+            gcd.join("gcd.synth.json").to_str().unwrap(),
+            "--out",
+            fp_def.to_str().unwrap(),
+        ])
+        .unwrap())
+        .expect("floorplan without --top must succeed");
+        let _ = std::fs::remove_file(&fp_def);
 
         // 3. E2: place -> out_def
         run(Cli::try_parse_from([

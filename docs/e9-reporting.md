@@ -2,7 +2,8 @@
 
 Reporting features layered on the finished STA state (E3). This document is
 written ticket by ticket; it currently covers the `critical_paths` block of
-`grus-eda sta --paths N` (ticket `ux-sta-paths`).
+`grus-eda sta --paths N` (ticket `ux-sta-paths`) and the `domains` /
+`slack_histogram` summary blocks (ticket `ux-sta-summary`).
 
 ## 1. `critical_paths` JSON schema
 
@@ -158,3 +159,86 @@ paths (worst 3 per corner):
 
 `arrival`, `+delay`, edge kind, pin, `^`/`v`; `note:` lines follow the path
 they belong to.
+
+## 8. `domains` JSON schema
+
+```jsonc
+"domains": [
+  {
+    "clock": "cka",               // create_clock name; null = unattributed row
+    "endpoints": 4,               // endpoints whose reported check anchors here
+    "wns_max_ns": -0.123456,      // min(worst_max_slack_ns) over the row's subset
+    "tns_max_ns": -1.234567,      // Σ min(0, worst_max_slack_ns)
+    "wns_min_ns": 0.012345,       // same folds, min corner
+    "tns_min_ns": 0.0,
+    "setup_violations": 1,        // worst_max_slack_ns < 0
+    "hold_violations": 0          // worst_min_slack_ns < 0
+  }
+]
+```
+
+- One row per `sdc.clocks` entry in file order (virtual `create_clock`s
+  included; a zero-capture domain emits `endpoints: 0`, `wns: null`,
+  `tns: 0`, `violations: 0`), then a `clock: null` row iff any endpoint
+  is unattributed.
+- Attribution: the `Sdc::clocks` row of the endpoint's *reported*
+  check — `clock_domain[clk]` for register/gate checks, the
+  last-producing `-clock` anchor for output ports (the same
+  last-group-wins rule `EndpointReport` documents for the reported row,
+  `t2_clkcor2`), delay-rewritten checks keep the replaced check's
+  anchor, leaf/`req = N` checks and unclocked captures are unattributed.
+- A port anchored on several `-clock`s lands in **one** domain — the
+  anchor of its reported (last-producing, max-preferred) candidate — and
+  its `worst_*` slacks, which fold every anchor's check, travel with it
+  into that row's folds. This is the documented approximation, matching
+  OpenSTA's one-row-per-endpoint table while `worst_slack` spans all
+  path groups.
+- Under `--lib-hold` the merged rows are recomputed from the merged
+  `endpoints` with setup's clock names (same SDC row order): a merged
+  max side keeps setup's row, a min-only endpoint takes hold's row with
+  setup's as fallback.
+- Σ `endpoints` across rows equals `endpoints.len()` — attribution is a
+  partition, so `min(rows.wns_*)` equals the global wns and `Σ tns` /
+  `Σ violations` equal the globals.
+
+## 9. `slack_histogram` JSON schema
+
+```jsonc
+"slack_histogram": [
+  { "bucket": "negative",  "count": 1 },   // s < 0 — equals setup_violations
+  { "bucket": "p0_to_20",  "count": 3 },   // 0 <= s < 0.2*P
+  { "bucket": "p20_to_50", "count": 2 },   // 0.2*P <= s <= 0.5*P
+  { "bucket": "over_50",   "count": 2 },   // s > 0.5*P
+  { "bucket": "no_period", "count": 0 }    // no period reference or no max check
+]
+```
+
+- `s` = `worst_max_slack_ns`, `P` = the endpoint's *capture* period (the
+  lattice the required time was computed on — a cross-domain check is
+  judged against its own capture period, not the launch's). `s < 0`
+  buckets as `negative` even with no period reference — that is what
+  keeps `negative.count == setup_violations` exact.
+- All five buckets always present, in this order; counts sum to
+  `endpoints.len()`.
+- Note for JSON consumers: `worst_*` is crate-internal; `max_slack_ns`
+  reproduces every bucket except multi-anchor ports (one endpoint may
+  shift between `negative`/positive buckets).
+- `pulse_width_checks` never enter `endpoints` and are in neither block
+  — same exclusion as the global wns/tns.
+
+## 10. Stdout
+
+The two blocks print after the wns/tns and pulse-width lines, before the
+skip summary (`two_clock.def` + `t2_selmc.sdc`):
+
+```text
+domains:
+  clock        endpoints    wns_max    tns_max    wns_min    tns_min  v_setup  v_hold
+  cka                  4  +0.607976  +0.000000  -1.851203  -4.986837        0       3
+  ckb                  4  -0.287329  -0.287329  -0.851203  -1.526533        1       2
+slack histogram (share of capture period): <0: 1   0-20%: 0   20-50%: 1   >50%: 6   no_period: 0
+```
+
+An unattributed row prints its clock as `(none)`; an empty domain's wns
+prints `inf` (the `INFINITY` fold, same value the JSON serializes as
+`null`).
