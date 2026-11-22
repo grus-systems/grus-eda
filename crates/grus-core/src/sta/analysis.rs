@@ -534,6 +534,104 @@ impl SkipReport {
     }
 }
 
+/// Which timing corner a [`CriticalPath`] was reported on: `Max` is the
+/// setup/late side, `Min` the hold/early side — the same `max_*`/`min_*`
+/// naming as the rest of the report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathCorner {
+    Max,
+    Min,
+}
+
+/// How a [`PathStage`]'s pin was reached from the previous stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathEdge {
+    /// Register/latch clock pin (or latch enable) — the path's launch anchor,
+    /// carrying the seeded/propagated clock arrival as both delay and arrival.
+    Clock,
+    /// Latch enable pin of a `LatchOpen` launch (a data-clock pin, not a flop CK).
+    LatchOpen,
+    /// Top-level input port launch anchor: one stage folding clock latency,
+    /// edge offset, `set_input_delay` and the driving-cell/wire delay.
+    Port,
+    /// `set_*_delay -from get_pins` segment-check startpoint.
+    Pin,
+    /// Combinational or `clk -> Q` cell arc (`driver_response` delay, derated).
+    CellArc,
+    /// Net traversal driver -> sink (Elmore wire delay; `ln2 * Elmore` for a
+    /// port-driven net; 0 under the zero-wire model).
+    Net,
+}
+
+/// Transition at a [`PathStage`]'s pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathTransition {
+    Rise,
+    Fall,
+}
+
+impl PathTransition {
+    fn of(pol: usize) -> Self {
+        if pol == RISE {
+            Self::Rise
+        } else {
+            Self::Fall
+        }
+    }
+}
+
+/// One ordered stage of a [`CriticalPath`], from the launch anchor to the
+/// endpoint pin.
+#[derive(Clone, Debug, Serialize)]
+pub struct PathStage {
+    /// `inst/pin` for cell pins, bare port name for top-level pins.
+    pub pin: String,
+    pub edge: PathEdge,
+    pub transition: PathTransition,
+    /// This stage's own delay contribution in ns: the derated cell-arc or
+    /// wire delay (a latch `D -> Q` borrow stage folds the borrow clamp into
+    /// this value), or the launch/external anchor value for `clock`/`port`.
+    /// `arrival_ns` always equals the previous stage's `arrival_ns` plus
+    /// `delay_ns`.
+    pub delay_ns: f32,
+    /// Cumulative arrival at `pin`, ns — the recorded state extreme.
+    pub arrival_ns: f32,
+    /// Recorded pin slew; `null` where unreached.
+    pub slew_ns: Option<f32>,
+}
+
+/// One worst-slack startpoint -> endpoint trace (`--paths` / `critical_paths`).
+#[derive(Clone, Debug, Serialize)]
+pub struct CriticalPath {
+    pub corner: PathCorner,
+    /// Register cell name, input port, or `-from` pin.
+    pub startpoint: String,
+    /// Launch clock name when the startpoint has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startpoint_clock: Option<String>,
+    /// Check pin (`inst/pin`) or output port name.
+    pub endpoint: String,
+    /// Capture clock name when the endpoint has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_clock: Option<String>,
+    /// The reported check values, not re-derived from the stages:
+    /// `data_arrival_ns` can sit a period off the last stage's `arrival_ns`
+    /// on a realigned hold/cross-domain path (see `docs/e9-reporting.md`).
+    pub data_arrival_ns: f32,
+    pub required_ns: f32,
+    pub slack_ns: f32,
+    /// Ordered launch -> endpoint; `stages[0]` is the clock/port/pin anchor.
+    pub stages: Vec<PathStage>,
+    /// Honest record of anything untraceable: an un-traced predecessor
+    /// (named pin), an ambiguous launch anchor, an undeclared launch, a
+    /// `-from` pin segment start, a union-state trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StaReport {
     pub wns_max_ns: f32,
@@ -548,6 +646,12 @@ pub struct StaReport {
     /// Evaluated `min_pulse_width` checks, one row per (check pin, pulse
     /// direction with a constraint table). Sorted by pin name, `High` first.
     pub pulse_width_checks: Vec<PulseWidthCheckReport>,
+    /// Worst-`--paths` startpoint -> endpoint traces per corner; absent from
+    /// JSON when empty — either `--paths` was not passed or no endpoint
+    /// produced a trace. `merge_corner_reports` keeps setup's `max` rows and
+    /// hold's `min` rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub critical_paths: Vec<CriticalPath>,
     pub skipped: SkipReport,
 }
 
@@ -2338,7 +2442,20 @@ pub fn run_sta(
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
 ) -> Result<StaReport> {
-    run_sta_inner(design, lib, sdc, parasitics, true).map(|(report, _)| report)
+    run_sta_inner(design, lib, sdc, parasitics, true, 0).map(|(report, _)| report)
+}
+
+/// [`run_sta`] plus `critical_paths`: the `path_count` worst-slack endpoints
+/// per corner get a full startpoint -> endpoint stage trace. `0` matches
+/// [`run_sta`].
+pub fn run_sta_with_paths(
+    design: &DesignDb,
+    lib: &LibDb,
+    sdc: &Sdc,
+    parasitics: Option<&NetParasitics>,
+    path_count: usize,
+) -> Result<StaReport> {
+    run_sta_inner(design, lib, sdc, parasitics, true, path_count).map(|(report, _)| report)
 }
 
 /// [`run_sta`] without the per-category skip warnings on stderr; the caller
@@ -2349,7 +2466,19 @@ pub fn run_sta_quiet(
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
 ) -> Result<StaReport> {
-    run_sta_inner(design, lib, sdc, parasitics, false).map(|(report, _)| report)
+    run_sta_inner(design, lib, sdc, parasitics, false, 0).map(|(report, _)| report)
+}
+
+/// [`run_sta_with_paths`] without the skip warnings; the corner-merge path
+/// uses this so each corner can report its own warnings.
+pub fn run_sta_quiet_with_paths(
+    design: &DesignDb,
+    lib: &LibDb,
+    sdc: &Sdc,
+    parasitics: Option<&NetParasitics>,
+    path_count: usize,
+) -> Result<StaReport> {
+    run_sta_inner(design, lib, sdc, parasitics, false, path_count).map(|(report, _)| report)
 }
 
 fn run_sta_inner(
@@ -2358,8 +2487,16 @@ fn run_sta_inner(
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
     emit_warnings: bool,
+    path_count: usize,
 ) -> Result<(StaReport, Vec<PinTimingState>)> {
-    let (report, state, _) = run_sta_detail(design, lib, sdc, parasitics, emit_warnings)?;
+    let (report, state, _) = run_sta_detail(
+        design,
+        lib,
+        sdc,
+        parasitics,
+        emit_warnings,
+        path_count,
+    )?;
     Ok((report, state))
 }
 
@@ -2372,7 +2509,7 @@ pub(crate) fn run_sta_with_state(
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
 ) -> Result<(StaReport, Vec<PinTimingState>)> {
-    let (report, state, _) = run_sta_detail(design, lib, sdc, parasitics, true)?;
+    let (report, state, _) = run_sta_detail(design, lib, sdc, parasitics, true, 0)?;
     Ok((report, state))
 }
 
@@ -2382,16 +2519,28 @@ fn run_sta_detail(
     sdc: &Sdc,
     parasitics: Option<&NetParasitics>,
     emit_warnings: bool,
-) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
+    path_count: usize,
+) -> Result<StaDetail> {
     let prepared = prepare_sta(design, lib, sdc, parasitics, false)?;
     if !sdc.exceptions.is_empty() || !sdc.path_delays.is_empty() || !sdc.clock_groups.is_empty() {
-        return run_sta_partitioned(&prepared, emit_warnings);
+        return run_sta_partitioned(&prepared, emit_warnings, path_count);
     }
     let outcome = eval_sta(&prepared, None, &HashSet::new(), prepared.skipped.clone())?;
     let t_asm = crate::timing::phase("sta.assemble");
-    let (report, polarities) =
+    let (mut report, polarities) =
         assemble_sta_report(outcome.entries, outcome.pulse_rows, outcome.skipped);
     drop(t_asm);
+    if path_count > 0 {
+        report.critical_paths = trace_critical_paths(
+            &prepared,
+            &report,
+            &polarities,
+            &outcome.state,
+            &[],
+            &[],
+            path_count,
+        );
+    }
     if emit_warnings {
         emit_sta_warnings(&report);
     }
@@ -3431,7 +3580,7 @@ fn uncovered_borrow(prepared: &StaPrepared) -> bool {
 fn eval_state_full(prepared: &StaPrepared) -> Result<Vec<PinTimingState>> {
     let sdc = prepared.cx.sdc;
     if !sdc.exceptions.is_empty() || !sdc.path_delays.is_empty() || !sdc.clock_groups.is_empty() {
-        return Ok(run_sta_partitioned(prepared, false)?.1);
+        return Ok(run_sta_partitioned(prepared, false, 0)?.1);
     }
     Ok(eval_sta(prepared, None, &HashSet::new(), prepared.skipped.clone())?.state)
 }
@@ -3586,11 +3735,11 @@ fn assemble_sta_report(
     mut entries: EndpointEntries,
     mut pulse_rows: Vec<PulseWidthCheckReport>,
     skipped: SkipReport,
-) -> (StaReport, Vec<EndpointPolarities>) {
+) -> (StaReport, Vec<(PinId, EndpointPolarities)>) {
     entries.sort_by(|a, b| a.1.pin.cmp(&b.1.pin));
     pulse_rows.sort_by(|a, b| a.pin.cmp(&b.pin).then(a.edge.cmp(&b.edge)));
     let (endpoints, polarities): (Vec<_>, Vec<_>) =
-        entries.into_iter().map(|(_, r, p)| (r, p)).unzip();
+        entries.into_iter().map(|(pin, r, p)| (r, (pin, p))).unzip();
     let wns = |f: fn(&EndpointReport) -> Option<f32>| {
         endpoints.iter().filter_map(f).fold(f32::INFINITY, f32::min)
     };
@@ -3617,6 +3766,7 @@ fn assemble_sta_report(
                 .count() as u32,
             endpoints,
             pulse_width_checks: pulse_rows,
+            critical_paths: Vec::new(),
             skipped,
         },
         polarities,
@@ -4234,7 +4384,8 @@ fn emit_sta_warnings(report: &StaReport) {
 fn run_sta_partitioned(
     prepared: &StaPrepared,
     emit_warnings: bool,
-) -> Result<(StaReport, Vec<PinTimingState>, Vec<EndpointPolarities>)> {
+    path_count: usize,
+) -> Result<StaDetail> {
     let cx = &prepared.cx;
     let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
     let graph = &prepared.graph;
@@ -4497,6 +4648,7 @@ fn run_sta_partitioned(
 
     let mut class_maps = Vec::with_capacity(classes.len());
     let mut class_states = Vec::with_capacity(classes.len());
+    let mut class_borrows = Vec::with_capacity(classes.len());
     for (sigma, keys) in &classes {
         // A `set_max_delay` covering a latch's D pin silences its transparent
         // `D -> Q` borrow arc for the whole signature class — downstream paths
@@ -4529,6 +4681,9 @@ fn run_sta_partitioned(
                 .collect::<HashMap<u32, EndpointPolarities>>(),
         );
         class_states.push(outcome.state);
+        // `--paths` replays the borrow window per class: the set a delay
+        // rule silenced for this class, same as `eval_sta` saw it.
+        class_borrows.push(disabled_borrow);
     }
 
     // Compose per endpoint: a class's candidates survive unless a false path
@@ -4685,13 +4840,14 @@ fn run_sta_partitioned(
                     let Some(mut w) = pols.max[pol] else { continue };
                     let unc = unc_worst(sdc, s.dom_max[pol], out_row, false);
                     if let Some(pins) = &delay_max_pins {
-                        let Some(arr) =
+                        let Some((fp, arr)) =
                             pin_segment_arrival(pins, &class_states[ci], w.dly, pol, false)
                         else {
                             pols.max[pol] = None;
                             continue;
                         };
                         w.arr = arr;
+                        w.from_pin = fp;
                     } else {
                         w.arr = w.dly;
                     }
@@ -4731,7 +4887,7 @@ fn run_sta_partitioned(
                         // or uncertainty. Each reached pin yields its own
                         // constrained path; the largest segment arrival is
                         // worst, and with none reached the polarity drops.
-                        let Some(arr) =
+                        let Some((fp, arr)) =
                             pin_segment_arrival(pins, &class_states[ci], w.dly, pol, false)
                         else {
                             pols.max[pol] = None;
@@ -4742,6 +4898,7 @@ fn run_sta_partitioned(
                             arr,
                             req,
                             slack: req - arr,
+                            from_pin: fp,
                             ..w
                         });
                         continue;
@@ -4840,13 +4997,14 @@ fn run_sta_partitioned(
                     let Some(mut w) = pols.min[pol] else { continue };
                     let unc = unc_worst(sdc, s.dom_min[pol], out_row, true);
                     if let Some(pins) = &delay_min_pins {
-                        let Some(arr) =
+                        let Some((fp, arr)) =
                             pin_segment_arrival(pins, &class_states[ci], w.dly, pol, true)
                         else {
                             pols.min[pol] = None;
                             continue;
                         };
                         w.arr = arr;
+                        w.from_pin = fp;
                     } else {
                         w.arr = w.dly;
                     }
@@ -4877,7 +5035,7 @@ fn run_sta_partitioned(
                                 * sdc.derate(false, DERATE_CHECK, false, check_transition(
                                     &lib.arcs[hold_arc as usize],
                                 ));
-                        let Some(arr) =
+                        let Some((fp, arr)) =
                             pin_segment_arrival(pins, &class_states[ci], w.dly, pol, true)
                         else {
                             pols.min[pol] = None;
@@ -4888,6 +5046,7 @@ fn run_sta_partitioned(
                             arr,
                             req,
                             slack: arr - req,
+                            from_pin: fp,
                             ..w
                         });
                         continue;
@@ -5020,9 +5179,12 @@ fn run_sta_partitioned(
                     (pols.max[pol], &mut best_max[pol]),
                     (pols.min[pol], &mut best_min[pol]),
                 ] {
-                    if let Some(w) = cand
+                    // Stamp the winning candidate's class so `--paths`
+                    // traces against `class_states[ci]`, not the union.
+                    if let Some(mut w) = cand
                         && best.is_none_or(|b| w.slack < b.slack)
                     {
+                        w.class = ci as u16;
                         *best = Some(w);
                     }
                 }
@@ -5180,6 +5342,8 @@ fn run_sta_partitioned(
                             req,
                             slack: req - arr,
                             slew: s.slew_max[pol],
+                            class: u16::MAX,
+                            from_pin: u32::MAX,
                         });
                     }
                 }
@@ -5232,6 +5396,8 @@ fn run_sta_partitioned(
                             req,
                             slack: arr - req,
                             slew: s.slew_min[pol],
+                            class: u16::MAX,
+                            from_pin: u32::MAX,
                         });
                     }
                 }
@@ -5254,6 +5420,8 @@ fn run_sta_partitioned(
                             req,
                             slack: req - arr,
                             slew: s.slew_max[pol],
+                            class: u16::MAX,
+                            from_pin: u32::MAX,
                         });
                     }
                 }
@@ -5272,6 +5440,8 @@ fn run_sta_partitioned(
                             req,
                             slack: arr - req,
                             slew: s.slew_min[pol],
+                            class: u16::MAX,
+                            from_pin: u32::MAX,
                         });
                     }
                 }
@@ -5350,6 +5520,8 @@ fn run_sta_partitioned(
                             req: n,
                             slack: n - s.arrival_max[pol],
                             slew: s.slew_max[pol],
+                            class: ci as u16,
+                            from_pin: u32::MAX,
                         };
                         if pols.max[pol].is_none_or(|w| cand.slack < w.slack) {
                             pols.max[pol] = Some(cand);
@@ -5362,6 +5534,8 @@ fn run_sta_partitioned(
                             req: n,
                             slack: s.arrival_min[pol] - n,
                             slew: s.slew_min[pol],
+                            class: ci as u16,
+                            from_pin: u32::MAX,
                         };
                         if pols.min[pol].is_none_or(|w| cand.slack < w.slack) {
                             pols.min[pol] = Some(cand);
@@ -5688,8 +5862,19 @@ fn run_sta_partitioned(
     }
 
     let t_asm = crate::timing::phase("sta.assemble");
-    let (report, polarities) = assemble_sta_report(entries, pulse_rows, skipped);
+    let (mut report, polarities) = assemble_sta_report(entries, pulse_rows, skipped);
     drop(t_asm);
+    if path_count > 0 {
+        report.critical_paths = trace_critical_paths(
+            prepared,
+            &report,
+            &polarities,
+            &merged,
+            &class_states,
+            &class_borrows,
+            path_count,
+        );
+    }
     if emit_warnings {
         emit_sta_warnings(&report);
     }
@@ -5706,6 +5891,13 @@ struct Worst {
     req: f32,
     slack: f32,
     slew: f32,
+    /// Partitioned-run signature class whose `class_states` produced this
+    /// candidate; `u16::MAX` = trace against the state handed to the tracer
+    /// (single-state runs and the deferred-endpoint union compose).
+    class: u16,
+    /// Winning `-from get_pins` startpoint pin of a segment delay check;
+    /// `u32::MAX` = none (ordinary launch).
+    from_pin: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -5714,12 +5906,531 @@ struct EndpointPolarities {
     min: [Option<Worst>; 2],
 }
 
+/// `run_sta_detail`/`run_sta_partitioned` return shape: the report, the
+/// timing state that produced it, and per-endpoint polarity candidates kept
+/// index-aligned with `report.endpoints` for the path tracer.
+type StaDetail = (
+    StaReport,
+    Vec<PinTimingState>,
+    Vec<(PinId, EndpointPolarities)>,
+);
+
 fn pick_worst_polarity(pair: &[Option<Worst>; 2]) -> Option<Worst> {
     match (pair[RISE], pair[FALL]) {
         (Some(r), Some(f)) => Some(if f.slack < r.slack { f } else { r }),
         (Some(w), None) | (None, Some(w)) => Some(w),
         (None, None) => None,
     }
+}
+
+/// Same pick as [`pick_worst_polarity`] but keeps the polarity index — the
+/// tracer needs it to read the corner state at each pin.
+fn worst_polarity(pair: &[Option<Worst>; 2]) -> Option<(usize, Worst)> {
+    match (pair[RISE], pair[FALL]) {
+        (Some(r), Some(f)) => Some(if f.slack < r.slack {
+            (FALL, f)
+        } else {
+            (RISE, r)
+        }),
+        (Some(w), None) => Some((RISE, w)),
+        (None, Some(w)) => Some((FALL, w)),
+        (None, None) => None,
+    }
+}
+
+/// Tolerance matching a replayed predecessor arrival against the recorded
+/// pin extreme: the engine sums `f32` nanoseconds, so exact equality is the
+/// norm and 1e-6 ns absorbs the last-bit spread of differently ordered sums.
+const TRACE_EPS_NS: f32 = 1e-6;
+
+/// Worst-`path_count` [`CriticalPath`] traces per corner: endpoints ranked
+/// by their *reported* check slack of the corner (ties keep the report's
+/// name order), each traced backward through the timing state that produced
+/// it. `max_slack_ns`/`min_slack_ns` — not `worst_*` — is the ranking key:
+/// a multi-anchor output port's `worst_*` can name a path-group check the
+/// stored `EndpointPolarities` does not carry, while the reported slack is
+/// always the last-group check we can reconstruct (`t2_clkcor2`).
+/// `class_states`/`disabled_borrows` carry the partitioned run's per-class
+/// eval state; a `Worst` without a class tag traces against `union_state`.
+fn trace_critical_paths(
+    prepared: &StaPrepared,
+    report: &StaReport,
+    endpoints: &[(PinId, EndpointPolarities)],
+    union_state: &[PinTimingState],
+    class_states: &[Vec<PinTimingState>],
+    disabled_borrows: &[HashSet<(u32, u32)>],
+    path_count: usize,
+) -> Vec<CriticalPath> {
+    let empty_borrow = HashSet::new();
+    let mut out = Vec::new();
+    for corner in [PathCorner::Max, PathCorner::Min] {
+        let slack = |e: &EndpointReport| match corner {
+            PathCorner::Max => e.max_slack_ns,
+            PathCorner::Min => e.min_slack_ns,
+        };
+        let mut ranked: Vec<usize> = (0..report.endpoints.len())
+            .filter(|&i| slack(&report.endpoints[i]).is_some())
+            .collect();
+        ranked.sort_by(|&a, &b| {
+            slack(&report.endpoints[a])
+                .unwrap()
+                .total_cmp(&slack(&report.endpoints[b]).unwrap())
+        });
+        for &i in ranked.iter().take(path_count) {
+            let (pin, pols) = &endpoints[i];
+            let pair = match corner {
+                PathCorner::Max => &pols.max,
+                PathCorner::Min => &pols.min,
+            };
+            let Some((pol, w)) = worst_polarity(pair) else {
+                continue;
+            };
+            let state = if w.class == u16::MAX {
+                union_state
+            } else {
+                &class_states[w.class as usize]
+            };
+            let borrow = disabled_borrows
+                .get(w.class as usize)
+                .unwrap_or(&empty_borrow);
+            out.push(trace_path(prepared, state, borrow, *pin, corner, pol, &w));
+        }
+    }
+    out
+}
+
+/// A predecessor candidate the walk can replay: a combinational (or borrow)
+/// arc, a `clk -> Q` launch seed, a latch open-edge launch, or an input-port
+/// seed — each with the arrival it would contribute at the current pin.
+enum TracePred {
+    Arc { src: PinId, src_pol: usize },
+    Launch(usize),
+    Latch(usize),
+    Port(usize),
+}
+
+/// Backward walk of one endpoint's winning path: at each pin the predecessor
+/// whose replayed contribution matches the recorded arrival wins, with the
+/// same formulas `eval_sta` merged them by. The walk stops at a launch seed
+/// (clock stage emitted), a port seed, a `-from` pin, or — honestly noted —
+/// at any pin whose recorded extreme no candidate reproduces.
+fn trace_path(
+    prepared: &StaPrepared,
+    state: &[PinTimingState],
+    disabled_borrow: &HashSet<(u32, u32)>,
+    ep: PinId,
+    corner: PathCorner,
+    pol: usize,
+    worst: &Worst,
+) -> CriticalPath {
+    let cx = &prepared.cx;
+    let (design, lib, sdc) = (cx.design, cx.lib, cx.sdc);
+    let graph = &prepared.graph;
+    let levelized = &prepared.levelized;
+    let late = corner == PathCorner::Max;
+    let arr_at = |s: &PinTimingState, pol: usize| {
+        if late { s.arrival_max[pol] } else { s.arrival_min[pol] }
+    };
+    let slew_at = |s: &PinTimingState, pol: usize| {
+        let v = if late { s.slew_max[pol] } else { s.slew_min[pol] };
+        (v.is_finite()).then_some(v)
+    };
+    let stage = |pin: PinId, edge: PathEdge, pol: usize, delay: f32, arrival: f32| PathStage {
+        pin: cx.pin_name(pin),
+        edge,
+        transition: PathTransition::of(pol),
+        delay_ns: delay,
+        arrival_ns: arrival,
+        slew_ns: slew_at(&state[pin.0 as usize], pol),
+    };
+    // Replay `eval_sta`'s latch `D -> Q` borrow cap for one candidate: the
+    // data arrival clamped to the closing edge's cap, `None` when the window
+    // does not admit it. Max corner only — the min side never merges borrow.
+    let borrow_arrival = |src: &PinTimingState, src_pol: usize, li: u32, s_in: f32| -> Option<f32> {
+        let info = &graph.latch_info[li as usize];
+        let en = &state[info.enable.0 as usize];
+        let close_pol = 1 - info.open_pol;
+        let en_dom = prepared.clock_domain[info.enable.0 as usize];
+        if !en.reached(info.open_pol) || !en.reached(close_pol) || en_dom == u8::MAX {
+            return None;
+        }
+        let en_clk = &sdc.clocks[en_dom as usize];
+        let open = en.arrival_min[info.open_pol];
+        let mut close = en.arrival_min[close_pol];
+        if close <= open {
+            close += en_clk.period_ns;
+        }
+        let pulse = close - open;
+        let setup_table = constraint_table(&lib.arcs[info.setup_arc as usize], src_pol)?;
+        let setup = eval_nldm_constraint(setup_table, s_in, en.slew_max[close_pol])
+            * sdc.derate(
+                true,
+                DERATE_CHECK,
+                false,
+                check_transition(&lib.arcs[info.setup_arc as usize]),
+            );
+        let unc = unc_worst(sdc, src.dom_max[src_pol], en_dom as usize, false);
+        if src.arrival_max[src_pol] <= open - unc {
+            return None;
+        }
+        Some(src.arrival_max[src_pol].min(open + pulse - unc - setup))
+    };
+    let clock_name = |pin: PinId| {
+        let d = prepared.clock_domain[pin.0 as usize];
+        (d != u8::MAX).then(|| sdc.clocks[d as usize].name.clone())
+    };
+    let cell_name = |pin: PinId| {
+        let name = cx.pin_name(pin);
+        name.rsplit_once('/')
+            .map_or(name.clone(), |(cell, _)| cell.to_string())
+    };
+
+    let mut rev: Vec<PathStage> = Vec::new();
+    let mut note: Option<String> = None;
+    let mut startpoint = String::new();
+    let mut startpoint_clock: Option<String> = None;
+    let mut visited: HashSet<(u32, usize)> = HashSet::new();
+    let mut cur = ep;
+    let mut cur_pol = pol;
+    loop {
+        if cur.0 == worst.from_pin {
+            rev.push(stage(cur, PathEdge::Pin, cur_pol, 0.0, arr_at(&state[cur.0 as usize], cur_pol)));
+            startpoint = cx.pin_name(cur);
+            note = Some(
+                "segment check: path starts at the set_*_delay -from pin".to_string(),
+            );
+            break;
+        }
+        if !visited.insert((cur.0, cur_pol)) {
+            note = Some(format!("untraced at {}: pin revisited", cx.pin_name(cur)));
+            break;
+        }
+        let p = cur.0 as usize;
+        let target = arr_at(&state[p], cur_pol);
+        // A sink on a data net has exactly one predecessor: the net driver
+        // through the wire delay (Elmore; `ln2 * Elmore` when a port drives
+        // the net; zero under the zero-wire model).
+        if !design.pin_is_driver[p]
+            && let Some((net_idx, pin_idx, drv)) = levelized.pin_driver[p]
+            && !graph.clock_net[net_idx as usize]
+        {
+            let wire = prepared
+                .wire_delays_per_net
+                .get(net_idx as usize)
+                .and_then(|w| w.as_ref());
+            let elmore = wire.map_or(0.0, |w| w[cur_pol][pin_idx as usize]);
+            let raw = if design.pin_cells[drv.0 as usize].is_none() {
+                std::f32::consts::LN_2 * elmore
+            } else {
+                elmore
+            };
+            let delay = raw * sdc.derate(late, DERATE_NET, false, cur_pol);
+            rev.push(stage(cur, PathEdge::Net, cur_pol, delay, target));
+            cur = drv;
+            continue;
+        }
+        // Driver-side candidates, in `eval_sta`'s scan order: combinational
+        // arcs first (`incoming_to` order), then the launch seeds. Every
+        // candidate within `TRACE_EPS_NS` of the recorded extreme is legal;
+        // the corner's best wins, first-seen on exact ties.
+        let mut winner: Option<(f32, TracePred)> = None;
+        let consider = |cand: f32, pred: TracePred, winner: &mut Option<(f32, TracePred)>| {
+            if !cand.is_finite() || (cand - target).abs() > TRACE_EPS_NS {
+                return;
+            }
+            let better = match winner {
+                None => true,
+                Some((b, _)) => {
+                    if late {
+                        cand > *b
+                    } else {
+                        cand < *b
+                    }
+                }
+            };
+            if better {
+                *winner = Some((cand, pred));
+            }
+        };
+        if let Some(out_net) = design.pin_nets[p]
+            && !graph.clock_net[out_net.0 as usize]
+        {
+            for &(src_pin, lib_arc) in levelized.incoming_to(cur) {
+                let arc = &lib.arcs[lib_arc as usize];
+                let src = &state[src_pin.0 as usize];
+                let borrow = graph.latch_borrow.get(&(src_pin.0, p as u32));
+                // Min corner never merges a borrow leg, and a `set_max_delay`
+                // covering the D pin silences it class-wide — `eval_sta`
+                // applies both filters before the window check.
+                if borrow.is_some()
+                    && (!late || disabled_borrow.contains(&(src_pin.0, p as u32)))
+                {
+                    continue;
+                }
+                let legs: &[(usize, usize)] = if borrow.is_some() {
+                    &[(RISE, RISE), (FALL, FALL)]
+                } else {
+                    arc_legs(arc)
+                };
+                for &(src_pol, dst_pol) in legs {
+                    if dst_pol != cur_pol || !src.reached(src_pol) {
+                        continue;
+                    }
+                    if (arc.timing_type == TimingType::CombinationalRise && dst_pol != RISE)
+                        || (arc.timing_type == TimingType::CombinationalFall && dst_pol != FALL)
+                    {
+                        continue;
+                    }
+                    let (Some(delay_table), Some(slew_table)) = delay_tables(arc, dst_pol)
+                    else {
+                        continue;
+                    };
+                    let s_in = if late {
+                        src.slew_max[src_pol]
+                    } else {
+                        src.slew_min[src_pol]
+                    };
+                    let (delay, _) =
+                        cx.driver_response(out_net, dst_pol, delay_table, slew_table, s_in);
+                    let derated = delay * sdc.derate(late, DERATE_CELL, false, src_pol);
+                    let Some(arr_in) = (match borrow {
+                        Some(&li) => borrow_arrival(src, src_pol, li, s_in),
+                        None => Some(arr_at(src, src_pol)),
+                    }) else {
+                        continue;
+                    };
+                    consider(
+                        arr_in + derated,
+                        TracePred::Arc { src: src_pin, src_pol },
+                        &mut winner,
+                    );
+                }
+            }
+        }
+        for (i, seed) in prepared.launch_seeds.iter().enumerate() {
+            if seed.q == cur {
+                let pair = &seed.pairs[cur_pol];
+                consider(
+                    if late { pair.arr_max } else { pair.arr_min },
+                    TracePred::Launch(i),
+                    &mut winner,
+                );
+            }
+        }
+        for (i, seed) in prepared.latch_seeds.iter().enumerate() {
+            if seed.q == cur {
+                let pair = &seed.pairs[cur_pol];
+                consider(
+                    if late { pair.arr_max } else { pair.arr_min },
+                    TracePred::Latch(i),
+                    &mut winner,
+                );
+            }
+        }
+        for (i, seed) in prepared.port_seeds.iter().enumerate() {
+            if seed.pin == cur {
+                let (arr_max, arr_min, _, _) = seed.per_pol[cur_pol];
+                consider(
+                    if late { arr_max } else { arr_min },
+                    TracePred::Port(i),
+                    &mut winner,
+                );
+            }
+        }
+        match winner {
+            None => {
+                let on_clock_net = design.pin_nets[p]
+                    .is_some_and(|n| graph.clock_net[n.0 as usize]);
+                let why = if on_clock_net {
+                    "pin sits on a clock network"
+                } else {
+                    "no predecessor reproduces the recorded arrival"
+                };
+                note = Some(format!("untraced at {}: {why}", cx.pin_name(cur)));
+                break;
+            }
+            Some((_, TracePred::Arc { src, src_pol })) => {
+                // `target - src arrival` is the stage's whole contribution:
+                // the derated arc delay for an ordinary leg, that delay minus
+                // the borrow clamp for a latch `D -> Q` leg — the recorded
+                // arrival chain stays exact either way.
+                let src_arr = arr_at(&state[src.0 as usize], src_pol);
+                rev.push(stage(cur, PathEdge::CellArc, cur_pol, target - src_arr, target));
+                cur = src;
+                cur_pol = src_pol;
+            }
+            Some((_, TracePred::Launch(i))) => {
+                let l = &graph.launches[i];
+                // Edge-0 launches of undeclared registers used a zero clock
+                // state (`t2_u2`); a reached pin means the seeded clock.
+                let clk_arr = if state[l.clk.0 as usize].reached(l.edge) {
+                    arr_at(&state[l.clk.0 as usize], l.edge)
+                } else {
+                    0.0
+                };
+                rev.push(stage(cur, PathEdge::CellArc, cur_pol, target - clk_arr, target));
+                rev.push(stage(l.clk, PathEdge::Clock, l.edge, clk_arr, clk_arr));
+                startpoint = cell_name(l.clk);
+                startpoint_clock = clock_name(l.clk);
+                if startpoint_clock.is_none() {
+                    note = Some("launch on no declared clock (edge-0 launch)".to_string());
+                }
+                break;
+            }
+            Some((_, TracePred::Latch(i))) => {
+                let o = &graph.latch_opens[i];
+                let en_arr = arr_at(&state[o.enable.0 as usize], o.open_pol);
+                rev.push(stage(cur, PathEdge::CellArc, cur_pol, target - en_arr, target));
+                rev.push(stage(o.enable, PathEdge::LatchOpen, o.open_pol, en_arr, en_arr));
+                startpoint = cell_name(o.enable);
+                startpoint_clock = clock_name(o.enable);
+                if startpoint_clock.is_none() {
+                    note = Some("latch enable on no declared clock".to_string());
+                }
+                break;
+            }
+            Some((_, TracePred::Port(i))) => {
+                let seed = &prepared.port_seeds[i];
+                rev.push(stage(cur, PathEdge::Port, cur_pol, target, target));
+                startpoint = cx.port_name(cur).to_string();
+                let (clock, port_note) =
+                    resolve_port_clock(prepared, seed.pin, late, cur_pol, target);
+                startpoint_clock = clock;
+                note = port_note;
+                break;
+            }
+        }
+    }
+
+    rev.reverse();
+    let (capture_clock, cap_note) = capture_clock_name(prepared, ep, late);
+    if note.is_none() {
+        note = cap_note;
+    }
+    CriticalPath {
+        corner,
+        startpoint,
+        startpoint_clock,
+        endpoint: cx.pin_name(ep),
+        capture_clock,
+        data_arrival_ns: worst.arr,
+        required_ns: worst.req,
+        slack_ns: worst.slack,
+        stages: rev,
+        note,
+    }
+}
+
+/// `startpoint_clock` of a port launch: replay `prepare_sta`'s per-anchor
+/// composition (`latency + edge 0 + input delay + driving-cell delay`) and
+/// name the row reproducing the recorded seed arrival. Ambiguous or
+/// unreproduced anchors name the first surviving row with a `note`, and an
+/// unanchored corner has no clock at all.
+fn resolve_port_clock(
+    prepared: &StaPrepared,
+    pin: PinId,
+    late: bool,
+    pol: usize,
+    target: f32,
+) -> (Option<String>, Option<String>) {
+    let cx = &prepared.cx;
+    let sdc = cx.sdc;
+    let anchors = sdc.declared_input_clock_rows(cx.port_name(pin));
+    let rows = &anchors[usize::from(late)];
+    if rows.is_empty() {
+        return (None, Some("port launch on no anchored clock row".to_string()));
+    }
+    let mut skipped = SkipReport::default();
+    let drive = cx.port_drive(pin, &mut skipped);
+    let drv = if late { drive[pol].3 } else { drive[pol].2 };
+    let matching: Vec<usize> = rows
+        .iter()
+        .filter(|&&(row, delay)| {
+            let arr =
+                sdc.clock_row_latency_ns(row) + sdc.clocks[row].edge_offset(0) + delay + drv;
+            (arr - target).abs() <= TRACE_EPS_NS
+        })
+        .map(|&(row, _)| row)
+        .collect();
+    let name = |row: usize| sdc.clocks[row].name.clone();
+    match (matching.as_slice(), rows) {
+        ([row], _) => (Some(name(*row)), None),
+        ([row, ..], _) => (
+            Some(name(*row)),
+            Some("several input-delay anchors match; first named".to_string()),
+        ),
+        ([], rows) => (
+            Some(name(rows[0].0)),
+            Some("anchor replay diverged; first surviving anchor named".to_string()),
+        ),
+    }
+}
+
+/// `capture_clock` of a traced endpoint: the check's clock pin domain for a
+/// register or clock gate, the output-delay anchor rows for a port (unique
+/// row named plainly; a multi-anchor port names the first with a `note`),
+/// nothing for a `-to` delay check on a leaf.
+fn capture_clock_name(
+    prepared: &StaPrepared,
+    ep: PinId,
+    late: bool,
+) -> (Option<String>, Option<String>) {
+    let cx = &prepared.cx;
+    let sdc = cx.sdc;
+    let design = cx.design;
+    let name_of = |pin: PinId| {
+        let d = prepared.clock_domain[pin.0 as usize];
+        (d != u8::MAX).then(|| sdc.clocks[d as usize].name.clone())
+    };
+    if let Ok(i) = prepared
+        .graph
+        .checks
+        .binary_search_by_key(&ep.0, |&(d, _)| d)
+    {
+        return match prepared.graph.checks[i].1.clk {
+            Some(clk) => (
+                name_of(clk),
+                (prepared.clock_domain[clk.0 as usize] == u8::MAX)
+                    .then(|| "capture clock pin on no declared clock".to_string()),
+            ),
+            None => (None, Some("check pin without a clock pin".to_string())),
+        };
+    }
+    if let Some(g) = prepared
+        .graph
+        .gating_enables
+        .iter()
+        .find(|g| g.enable == ep)
+    {
+        return (
+            name_of(g.clk_pin),
+            (prepared.clock_domain[g.clk_pin.0 as usize] == u8::MAX)
+                .then(|| "gate clock pin on no declared clock".to_string()),
+        );
+    }
+    if design.pin_cells[ep.0 as usize].is_none()
+        && design.pin_dirs[ep.0 as usize] == PinDir::Output
+    {
+        let anchors = sdc.declared_output_clock_rows(cx.port_name(ep));
+        let mut rows: Vec<usize> = anchors[usize::from(late)]
+            .iter()
+            .map(|&(r, _)| r)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        return match rows.as_slice() {
+            [row] => (Some(sdc.clocks[*row].name.clone()), None),
+            [row, ..] => (
+                Some(sdc.clocks[*row].name.clone()),
+                Some("multi-anchor output port; first anchor named".to_string()),
+            ),
+            [] => (None, None),
+        };
+    }
+    (
+        None,
+        Some("internal path endpoint (delay check)".to_string()),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6266,8 +6977,8 @@ fn pin_segment_arrival(
     ep_dly: f32,
     pol: usize,
     min_side: bool,
-) -> Option<f32> {
-    let mut seg: Option<f32> = None;
+) -> Option<(u32, f32)> {
+    let mut seg: Option<(u32, f32)> = None;
     for &fp in pins {
         let pin_dly = if min_side {
             states[fp as usize].dly_min[pol]
@@ -6278,7 +6989,10 @@ fn pin_segment_arrival(
             continue;
         }
         let v = ep_dly - pin_dly;
-        seg = Some(seg.map_or(v, |a| if min_side { a.min(v) } else { a.max(v) }));
+        seg = Some(match seg {
+            Some((p, a)) if (min_side && a < v) || (!min_side && a > v) => (p, a),
+            _ => (fp, v),
+        });
     }
     seg
 }
@@ -6632,6 +7346,8 @@ fn collect_endpoints(
                 req: req_max,
                 slack: slack_max,
                 slew: s.slew_max[pol],
+                class: u16::MAX,
+                from_pin: u32::MAX,
             });
             cands.min[pol] = Some(Worst {
                 arr: arr_min,
@@ -6643,6 +7359,8 @@ fn collect_endpoints(
                 req: req_min,
                 slack: slack_min,
                 slew: s.slew_min[pol],
+                class: u16::MAX,
+                from_pin: u32::MAX,
             });
         }
         record_endpoint(
@@ -6826,6 +7544,8 @@ fn collect_endpoints(
                 req: req_max,
                 slack: slack_max,
                 slew: s.slew_max[pol],
+                class: u16::MAX,
+                from_pin: u32::MAX,
             });
             cands.min[pol] = Some(Worst {
                 arr: arr_min,
@@ -6833,6 +7553,8 @@ fn collect_endpoints(
                 req: req_min,
                 slack: slack_min,
                 slew: s.slew_min[pol],
+                class: u16::MAX,
+                from_pin: u32::MAX,
             });
         }
         record_endpoint(
@@ -7017,6 +7739,8 @@ fn collect_endpoints(
                             } else {
                                 s.slew_min[pol]
                             },
+                            class: u16::MAX,
+                            from_pin: u32::MAX,
                         };
                         let (slot, wslot) = if corner == 1 {
                             (&mut cands.max[pol], &mut worst.max[pol])
@@ -7169,6 +7893,19 @@ pub fn merge_corner_reports(setup: StaReport, hold: StaReport) -> Result<StaRepo
             setup.pulse_width_checks,
             hold.pulse_width_checks,
         )?,
+        // Each corner run traces both sides of its own state; the merged
+        // report keeps setup's `max` paths and hold's `min` paths, matching
+        // the slack fields' source rule.
+        critical_paths: setup
+            .critical_paths
+            .into_iter()
+            .filter(|p| p.corner == PathCorner::Max)
+            .chain(
+                hold.critical_paths
+                    .into_iter()
+                    .filter(|p| p.corner == PathCorner::Min),
+            )
+            .collect(),
         skipped: merge_skip_reports(setup.skipped, hold.skipped),
     })
 }
@@ -7411,11 +8148,11 @@ mod tests {
         let pins: HashSet<u32> = [0, 1].into_iter().collect();
         assert_eq!(
             pin_segment_arrival(&pins, &states, 1.0, 0, false),
-            Some(0.5)
+            Some((1, 0.5))
         );
         assert_eq!(
             pin_segment_arrival(&pins, &states, 1.0, 0, true),
-            Some(0.75)
+            Some((1, 0.75))
         );
         let unreached: HashSet<u32> = [0].into_iter().collect();
         assert_eq!(pin_segment_arrival(&unreached, &states, 1.0, 0, false), None);
@@ -7832,10 +8569,10 @@ mod tests {
                 .expect("SPEF");
             let parasitics_s =
                 crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
-            let (rp, _, _) = run_sta_detail(&design, &lib, &sdc, Some(&parasitics_p), true)
+            let (rp, _, _) = run_sta_detail(&design, &lib, &sdc, Some(&parasitics_p), true, 0)
                 .expect("placement STA");
             let (rs, _, _) =
-                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_s), true).expect("SPEF STA");
+                run_sta_detail(&design, &lib, &sdc, Some(&parasitics_s), true, 0).expect("SPEF STA");
             assert_eq!(
                 rp.endpoints.len(),
                 rs.endpoints.len(),
@@ -8876,8 +9613,13 @@ mod tests {
             } else if let Some((_, stages)) = cur.as_mut() {
                 let w: Vec<&str> = line.split_whitespace().collect();
                 // A stage line ends with `^|v <pin> (<cell>)`; an output line has fanout and cap in front of slew/delay/time.
+                // A port endpoint's last row is `^|v <port> (out)` — bare port
+                // name, no `/` (`gcd.paths_max.txt`'s `resp_msg[15]`).
                 let n = w.len();
-                if n < 5 || !(w[n - 3] == "^" || w[n - 3] == "v") || !w[n - 2].contains('/') {
+                if n < 5
+                    || !(w[n - 3] == "^" || w[n - 3] == "v")
+                    || !(w[n - 2].contains('/') || w[n - 1] == "(out)")
+                {
                     continue;
                 }
                 let num = |s: &str| s.parse::<f64>().ok();
@@ -9034,6 +9776,319 @@ mod tests {
                     our_slew - st.slew
                 );
                 prev_err = err;
+            }
+        }
+    }
+
+    /// `N.NNNNNN slack (MET|VIOLATED)` values in file order, parallel to
+    /// `parse_paths`' output — the per-path summary line of a `report_checks`
+    /// block.
+    fn path_slacks(text: &str) -> Vec<f64> {
+        text.lines()
+            .filter(|l| l.contains("slack ("))
+            .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+            .collect()
+    }
+
+    /// Shared gcd fixture load for the `--paths` tests: placed DEF + routed
+    /// SPEF parasitics (the `placed_spef` mode of `gcd.sta.reference.json`).
+    fn gcd_paths_report(path_count: usize) -> (StaReport, DesignDb) {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("gcd");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design = parse_def(&dir.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&dir.join("gcd.sdc")).expect("SDC");
+        let spef = crate::readers::load_spef(&dir.join("gcd.routed.spef")).expect("SPEF");
+        let par = crate::sta::spef_parasitics(&design, &spef).expect("SPEF parasitics");
+        let report =
+            run_sta_with_paths(&design, &lib, &sdc, Some(&par), path_count).expect("STA");
+        (report, design)
+    }
+
+    /// E9: `sta --paths 3` on gcd vs OpenSTA `report_checks`
+    /// (`generate_paths_ref.sh`, pinned LibreLane image): same three
+    /// endpoints per corner in the same order, verbatim pin sequences,
+    /// per-stage delay and arrival within `max(5 ps, 1%)`.
+    #[test]
+    fn test_gcd_critical_paths_vs_opensta() {
+        let dir = design_dir("gcd");
+        let (report, _) = gcd_paths_report(3);
+        assert_eq!(report.critical_paths.len(), 6);
+        for (corner, file) in [
+            (PathCorner::Max, "gcd.paths_max.txt"),
+            (PathCorner::Min, "gcd.paths_min.txt"),
+        ] {
+            let text = std::fs::read_to_string(dir.join(file))
+                .unwrap_or_else(|e| panic!("{file}: {e}"));
+            let refs = parse_paths(&text);
+            let slacks = path_slacks(&text);
+            assert_eq!(refs.len(), 3, "{file}: ref path count");
+            assert_eq!(slacks.len(), 3, "{file}: ref slack count");
+            let ours: Vec<&CriticalPath> = report
+                .critical_paths
+                .iter()
+                .filter(|p| p.corner == corner)
+                .collect();
+            assert_eq!(ours.len(), 3, "{file}: our path count");
+            let mut max_delay_res = 0.0f64;
+            for (i, ((ref_ep, ref_stages), &ref_slack)) in
+                refs.iter().zip(slacks.iter()).enumerate()
+            {
+                // Ref `Endpoint:` names the cell (`_409_`) or the port
+                // (`resp_msg[15]`); ours names the check pin (`_409_/D`).
+                let p = *ours
+                    .iter()
+                    .find(|p| {
+                        p.endpoint == *ref_ep
+                            || p.endpoint.starts_with(&format!("{ref_ep}/"))
+                    })
+                    .unwrap_or_else(|| panic!("{file}: no trace ending at {ref_ep}"));
+                assert_eq!(
+                    ours[i].endpoint, p.endpoint,
+                    "{file}: worst-N order differs at rank {i}"
+                );
+                let ref_pins: Vec<&str> =
+                    ref_stages.iter().map(|s| s.pin.as_str()).collect();
+                let our_pins: Vec<&str> =
+                    p.stages.iter().map(|s| s.pin.as_str()).collect();
+                assert_eq!(our_pins, ref_pins, "{file} {ref_ep}: pin sequence");
+                for (s, r) in p.stages.iter().zip(ref_stages.iter()) {
+                    let d_bound = 0.005f64.max(0.01 * r.delay.abs());
+                    let d_res = (s.delay_ns as f64 - r.delay).abs();
+                    max_delay_res = max_delay_res.max(d_res);
+                    assert!(
+                        d_res <= d_bound,
+                        "{file} {ref_ep} {}: delay ours {:.6} ref {:.6}",
+                        r.pin,
+                        s.delay_ns,
+                        r.delay
+                    );
+                    let a_bound = 0.005f64.max(0.01 * r.arrival.abs());
+                    let a_res = (s.arrival_ns as f64 - r.arrival).abs();
+                    assert!(
+                        a_res <= a_bound,
+                        "{file} {ref_ep} {}: arrival ours {:.6} ref {:.6}",
+                        r.pin,
+                        s.arrival_ns,
+                        r.arrival
+                    );
+                    assert_eq!(
+                        s.transition == PathTransition::Rise,
+                        r.pol == RISE,
+                        "{file} {ref_ep} {}: transition",
+                        r.pin
+                    );
+                }
+                let s_bound = 0.005f64.max(0.01 * ref_slack.abs());
+                assert!(
+                    (p.slack_ns as f64 - ref_slack).abs() <= s_bound,
+                    "{file} {ref_ep}: slack ours {:.6} ref {:.6}",
+                    p.slack_ns,
+                    ref_slack
+                );
+            }
+            println!("{file}: max per-stage delay residual {max_delay_res:.6} ns");
+        }
+    }
+
+    /// Structural invariants of the same gcd run plus the JSON surface:
+    /// anchor-first stages, exact `arrival = prev + delay` chaining, path
+    /// slack equal to the endpoint row's corner slack, `critical_paths`
+    /// absent at `--paths 0`, and the documented schema keys.
+    #[test]
+    fn test_critical_paths_structure_gcd() {
+        let (report, _) = gcd_paths_report(3);
+        for p in &report.critical_paths {
+            assert!(
+                matches!(
+                    p.stages[0].edge,
+                    PathEdge::Clock | PathEdge::LatchOpen | PathEdge::Port | PathEdge::Pin
+                ),
+                "{}: first stage is the launch anchor",
+                p.endpoint
+            );
+            // After the launch anchor, cell output (arc) and cell input
+            // (net) stages alternate; a check pin ends on a net stage.
+            for (i, w) in p.stages.windows(2).enumerate().skip(1) {
+                assert_ne!(
+                    w[0].edge, w[1].edge,
+                    "{} stage {i}: arc and net stages must alternate",
+                    p.endpoint
+                );
+            }
+            assert_eq!(
+                p.stages.last().unwrap().edge,
+                PathEdge::Net,
+                "{}: endpoint is a net sink",
+                p.endpoint
+            );
+            for i in 1..p.stages.len() {
+                let exp = p.stages[i - 1].arrival_ns + p.stages[i].delay_ns;
+                assert!(
+                    (p.stages[i].arrival_ns - exp).abs() <= TRACE_EPS_NS,
+                    "{} stage {i}: arrival chain broken",
+                    p.endpoint
+                );
+            }
+            let ep = report
+                .endpoints
+                .iter()
+                .find(|e| e.pin == p.endpoint)
+                .expect("path endpoint in report");
+            let row_slack = match p.corner {
+                PathCorner::Max => ep.max_slack_ns,
+                PathCorner::Min => ep.min_slack_ns,
+            };
+            assert_eq!(row_slack, Some(p.slack_ns), "{}: slack", p.endpoint);
+        }
+
+        // `--paths 0` keeps `critical_paths` empty and out of the JSON.
+        let (report0, _) = gcd_paths_report(0);
+        assert!(report0.critical_paths.is_empty());
+        let v = serde_json::to_value(&report0).expect("serialize");
+        assert!(v.get("critical_paths").is_none());
+
+        let v = serde_json::to_value(&report).expect("serialize");
+        let cp = &v["critical_paths"];
+        assert_eq!(cp.as_array().map_or(0, Vec::len), 6);
+        for k in [
+            "corner",
+            "startpoint",
+            "startpoint_clock",
+            "endpoint",
+            "capture_clock",
+            "data_arrival_ns",
+            "required_ns",
+            "slack_ns",
+            "stages",
+        ] {
+            assert!(cp[0].get(k).is_some(), "critical_paths[0].{k} missing");
+        }
+        for k in ["pin", "edge", "transition", "delay_ns", "arrival_ns", "slew_ns"] {
+            assert!(
+                cp[0]["stages"][0].get(k).is_some(),
+                "critical_paths[0].stages[0].{k} missing"
+            );
+        }
+        assert_eq!(cp[0]["corner"], "max");
+        assert_eq!(cp[0]["stages"][0]["edge"], "clock");
+        assert_eq!(cp[0]["stages"][0]["transition"], "rise");
+    }
+
+    /// Partitioned runs (timing exceptions) tag each endpoint's winning
+    /// `Worst` with its signature class; the traces must still reconstruct:
+    /// `md_basic` keeps a delay-checked endpoint, `md_pin`'s
+    /// `-from [get_pins]` names a segment startpoint, and `latch_borrow`'s
+    /// `delay_allregs` puts a latch-open launch or a borrow-through stage on
+    /// some worst path.
+    #[test]
+    fn test_critical_paths_exceptions() {
+        let lib_dir = sky130_hd();
+        let exc_dir = design_dir("sta_exceptions");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design =
+            parse_def(&exc_dir.join("exceptions.def"), &tech, Some(&lib)).expect("DEF");
+        let sdc = load_sdc(&exc_dir.join("md_basic.sdc")).expect("SDC");
+        let report = run_sta_with_paths(&design, &lib, &sdc, None, 8).expect("STA");
+        assert!(
+            !report.critical_paths.is_empty(),
+            "md_basic must leave traceable endpoints"
+        );
+        for p in &report.critical_paths {
+            for i in 1..p.stages.len() {
+                let exp = p.stages[i - 1].arrival_ns + p.stages[i].delay_ns;
+                assert!(
+                    (p.stages[i].arrival_ns - exp).abs() <= TRACE_EPS_NS,
+                    "{} stage {i}: arrival chain broken",
+                    p.endpoint
+                );
+            }
+            let ep = report
+                .endpoints
+                .iter()
+                .find(|e| e.pin == p.endpoint)
+                .expect("path endpoint in report");
+            let row_slack = match p.corner {
+                PathCorner::Max => ep.max_slack_ns,
+                PathCorner::Min => ep.min_slack_ns,
+            };
+            assert_eq!(row_slack, Some(p.slack_ns), "{}: slack", p.endpoint);
+        }
+
+        // `-from [get_pins u_ff0/CLK]` names a launch clock pin: the rule is
+        // a launch-source filter and the path still opens at the clock edge
+        // (measured `t2_mdx` semantics — `clk_launch` resolution, not
+        // `from_pins`).
+        let sdc = load_sdc(&exc_dir.join("md_pin.sdc")).expect("SDC");
+        let report = run_sta_with_paths(&design, &lib, &sdc, None, 50).expect("STA");
+        let p = report
+            .critical_paths
+            .iter()
+            .find(|p| p.endpoint == "u_ff1/D" && p.corner == PathCorner::Max)
+            .expect("md_pin keeps a max-corner check on u_ff1/D");
+        assert_eq!(p.stages[0].edge, PathEdge::Clock);
+        assert_eq!(p.stages[0].pin, "u_ff0/CLK");
+
+        // `-from [get_pins u_ff0/Q]` is a segment startpoint: the trace
+        // starts at the pin itself with a `pin` anchor and the note.
+        let sdc = load_sdc(&exc_dir.join("md_pinseg.sdc")).expect("SDC");
+        let report = run_sta_with_paths(&design, &lib, &sdc, None, 50).expect("STA");
+        let p = report
+            .critical_paths
+            .iter()
+            .find(|p| p.endpoint == "u_ff1/D" && p.corner == PathCorner::Max)
+            .expect("md_pinseg keeps a max-corner check on u_ff1/D");
+        assert_eq!(p.stages[0].edge, PathEdge::Pin);
+        assert_eq!(p.stages[0].pin, "u_ff0/Q");
+        assert!(
+            p.note.as_deref().is_some_and(|n| n.contains("-from")),
+            "md_pinseg trace must note the segment start: {:?}",
+            p.note
+        );
+
+        // Latch fixture: `delay_allregs` keeps worst paths through the
+        // latches — a `LatchOpen` anchor or a borrow `cell_arc` through D->Q
+        // must appear on some trace.
+        let latch_dir = design_dir("sta_edge").join("latch_borrow");
+        let ldesign =
+            parse_def(&latch_dir.join("latch_borrow.def"), &tech, Some(&lib)).expect("DEF");
+        let lsdc = load_sdc(&latch_dir.join("delay_allregs.sdc")).expect("SDC");
+        let lreport = run_sta_with_paths(&ldesign, &lib, &lsdc, None, 50).expect("STA");
+        assert!(
+            lreport.critical_paths.iter().any(|p| {
+                p.stages[0].edge == PathEdge::LatchOpen
+                    || p.stages
+                        .iter()
+                        .any(|s| s.pin.ends_with("/Q") && s.edge == PathEdge::CellArc)
+            }),
+            "delay_allregs must trace a latch-open or borrow-through path"
+        );
+        for p in &lreport.critical_paths {
+            for i in 1..p.stages.len() {
+                let exp = p.stages[i - 1].arrival_ns + p.stages[i].delay_ns;
+                assert!(
+                    (p.stages[i].arrival_ns - exp).abs() <= TRACE_EPS_NS,
+                    "{} stage {i}: arrival chain broken",
+                    p.endpoint
+                );
             }
         }
     }
@@ -10013,7 +11068,7 @@ mod tests {
             }
         };
         let (report, state, polarities) =
-            run_sta_detail(&design, &lib, &sdc, parasitics.as_ref(), true).expect("STA");
+            run_sta_detail(&design, &lib, &sdc, parasitics.as_ref(), true, 0).expect("STA");
 
         let reference: serde_json::Value =
             serde_json::from_slice(&std::fs::read(gcd.join(golden_file)).expect("golden file"))
@@ -10045,7 +11100,7 @@ mod tests {
                 failures.push(format!("{name}: missing"));
                 continue;
             };
-            let ep = &polarities[idx];
+            let ep = &polarities[idx].1;
             let max = resolve_tied_polarity(
                 pick_worst_polarity(&ep.max).unwrap(),
                 &ep.max,
@@ -10247,7 +11302,7 @@ mod tests {
         label: &str,
     ) {
         let (_report, full, _pol) =
-            run_sta_detail(design, lib, sdc, parasitics, false).expect("full STA");
+            run_sta_detail(design, lib, sdc, parasitics, false, 0).expect("full STA");
         let prepared = prepare_sta(design, lib, sdc, parasitics, true).expect("prepare");
         let replay = slew_eval_state(&prepared).expect("slew state");
         let fast = sta_pin_slews(design, lib, sdc, parasitics).expect("slew-only STA");
@@ -10431,7 +11486,7 @@ mod tests {
             crate::sta::spef_parasitics(&design, &spef_doc).expect("SPEF parasitics")
         });
         let (report, _, polarities) =
-            run_sta_detail(&design, &lib, &sdc, parasitics.as_ref(), true).expect("STA");
+            run_sta_detail(&design, &lib, &sdc, parasitics.as_ref(), true, 0).expect("STA");
 
         let reference: serde_json::Value = serde_json::from_slice(
             &std::fs::read(case_dir.join(format!("{case}.reference.json"))).expect("golden file"),
@@ -10463,7 +11518,7 @@ mod tests {
                 failures.push(format!("{name}: missing"));
                 continue;
             };
-            let ep = &polarities[idx];
+            let ep = &polarities[idx].1;
             let max = resolve_tied_polarity(
                 pick_worst_polarity(&ep.max).unwrap(),
                 &ep.max,
@@ -10709,7 +11764,7 @@ mod tests {
                 let sdc = load_sdc(&sdc_path)
                     .unwrap_or_else(|e| panic!("{name}: unexpected parse failure: {e}"));
                 let (report, _, polarities) =
-                    run_sta_detail(&design, &lib, &sdc, None, true).expect("STA");
+                    run_sta_detail(&design, &lib, &sdc, None, true, 0).expect("STA");
                 let golden_eps = golden["endpoints"].as_array().expect("endpoints");
                 let is_deferred = |pin: &str| {
                     report
@@ -10739,7 +11794,7 @@ mod tests {
                         }
                         continue;
                     };
-                    let ep = &polarities[idx];
+                    let ep = &polarities[idx].1;
                     // A `null` corner in the golden means OpenSTA produced no
                     // check there (`t2_clkcor2`) — our corner candidates must
                     // be empty too, not just out of tolerance.
@@ -12590,7 +13645,7 @@ mod tests {
         )
         .expect("DEF");
         let sdc = load_sdc(&design_dir("sta_edge").join("propagated_clock/edge.sdc")).expect("SDC");
-        let (_report, state, _pol) = run_sta_detail(&design, &lib, &sdc, None, true).expect("STA");
+        let (_report, state, _pol) = run_sta_detail(&design, &lib, &sdc, None, true, 0).expect("STA");
         let cx = Context {
             design: &design,
             lib: &lib,
@@ -12728,6 +13783,7 @@ mod tests {
                 .count() as u32,
             endpoints,
             pulse_width_checks: Vec::new(),
+            critical_paths: Vec::new(),
             skipped: SkipReport::default(),
         }
     }
@@ -12868,7 +13924,7 @@ mod tests {
             }
             let sdc = load_sdc(&dir.join(format!("{name}.sdc"))).expect("SDC");
             let (report, _, _) =
-                run_sta_detail(&design, &lib, &sdc, None, true).expect("partitioned STA");
+                run_sta_detail(&design, &lib, &sdc, None, true, 0).expect("partitioned STA");
             compared += 1;
             let ref_endpoints = golden["endpoints"].as_array().expect("endpoints");
             assert_eq!(
@@ -12964,7 +14020,7 @@ mod tests {
 
         let run = |sdc_name: &str| {
             let sdc = load_sdc(&dir.join(format!("{sdc_name}.sdc"))).expect("SDC");
-            run_sta_detail(&design, &lib, &sdc, None, false).expect("STA")
+            run_sta_detail(&design, &lib, &sdc, None, false, 0).expect("STA")
         };
 
         // u_ff0 -> u_ff1 false path covers only the u_ff0 launch source: the
@@ -13114,7 +14170,7 @@ mod tests {
         .0;
         let design = parse_def(&case_dir.join("check_arcs.def"), &tech, Some(&lib)).expect("DEF");
         let sdc = load_sdc(&case_dir.join("ideal.sdc")).expect("SDC");
-        let (report, _, _) = run_sta_detail(&design, &lib, &sdc, None, false).expect("STA");
+        let (report, _, _) = run_sta_detail(&design, &lib, &sdc, None, false, 0).expect("STA");
         let expected: BTreeMap<String, usize> = [
             ("Clear", 4),
             ("MinPulseWidth", 4),

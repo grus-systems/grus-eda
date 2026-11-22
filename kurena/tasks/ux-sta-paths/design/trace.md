@@ -129,7 +129,11 @@ revisits a pin — defensive; the graph is a DAG by construction.
 - **`-from get_pins` pin start** (`worst.from_pin != u32::MAX`): emit
   `{from_pin, edge: "pin", delay_ns: 0, arrival_ns: state.arr_field}` as the
   terminal stage; `startpoint` = that pin's name; `startpoint_clock` = `None`;
-  `note` = `"set_*_delay -from pin segment"`.
+  `note` = `"set_*_delay -from pin segment"`. Only *non-clock* launch pins
+  land in `from_pin` — `-from [get_pins inst/CLK]` resolves through
+  `clk_launch` (measured `t2_mdx`: a launch-source filter, not a segment
+  start), so that rule's trace still opens at the `clock` anchor; the walk's
+  `cur == from_pin` check at the loop head is the only segment-stop needed.
 
 ## 4. Endpoint & path-level fields
 
