@@ -6425,3 +6425,90 @@ routed DEF, voltage CSV) are under the gitignored
 `tests/designs/gcd/runs/probes/` and can be regenerated from
 `p_gr.tcl`/`p_gr_readback.tcl`/`p_gr_tiny.tcl`/`p_gr_drt.tcl`/`p_cts.tcl`/
 `p_ird*.tcl`/`p_drc.tcl` there.
+
+### 2026-11-22 — e4-guides-emit: OpenROAD-format route guides from committed paths (v0.3.9)
+
+E4 ticket 1 (`kurena/tasks/e4-guides-emit/`). `grus-eda route --tlef --lef
+--def --guide-out [--gcell-tracks N] [--layer-adjust a]` now emits one
+OpenROAD `global_route -guide_file`-format block per net — `net` / `(` /
+`xlo ylo xhi yhi layer` / `)` in DBU — built from the congestion router's
+**committed** `GridEdge` paths (previously discarded by `route_segments`).
+Horizontal committed edges become `met1` strips, vertical edges `met2`
+strips; contiguous runs merge into one rectangle; every pin adds a stub
+pair (instance: first LEF macro-pin port layer, typically `li1`; I/O: DEF
+`+ LAYER` via new `DesignDb::pin_io_layer`; both plus `met1`). Nets with
+fewer than 2 pins emit no block — matching OpenROAD, which carries no
+block for picorv32's 67 `irq`/`pcpi_*` port-only nets. Semantics in
+`docs/e4-guides.md`; the spec dir `kurena/tasks/e4-guides-emit/spec/` is
+untouched.
+
+**Reference** (`generate_ref.sh` step 5c, appended after step 5b in both
+designs; committed scripts run end-to-end as written in the pinned image
+`ghcr.io/librelane/librelane:3.0.16`):
+`set_routing_layers -signal met1-met5 -clock met3-met5`,
+`set_global_routing_layer_adjustment met1 0.30` + `met2-met5 0.20`,
+`global_route -guide_file <design>.guide -congestion_iterations 100` →
+committed `tests/designs/gcd/gcd.guide` (269 nets, 1,953 boxes, 59 KiB)
+and `tests/designs/picorv32/picorv32.guide` (6,744 nets, 63,427 boxes,
+2,137,576 B — above the 1 MB golden guideline, committed anyway because
+the comparison tests assert against it directly). Full-script reruns left
+every other golden byte-identical (`git diff` clean apart from the new
+files).
+
+**Topology comparison** (`congestion::guide::tests::test_gcd_guide_matches_openroad`,
+`test_picorv32_guide_matches_openroad`; per-net positive-area rectangle
+intersection, layer-blind primary score, layer-aware diagnostic):
+
+| design | ref boxes | our boxes | delta | weighted share | layer-aware | median | min | nets < 0.70 | missing | ours-only | over | under |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| gcd | 1,953 | 1,999 | +2.4% | 0.975 | 0.943 | 1.000 | 0.600 | 5/269 | 0 | 0 | 101 | 22 |
+| picorv32 | 63,427 | 59,494 | -6.2% | 0.960 | 0.911 | 1.000 | 0.300 | 99/6744 | 0 | 0 | 2,236 | 909 |
+
+Both provisional gates pass on both designs: weighted overlap share
+>= 0.70 and |total delta| <= 15%. Worst gcd share `_154_` = 0.60; worst
+picorv32 `alu_out_q[8]` = 0.30. Root causes for the residual:
+
+- **Layer coverage**: ours emit strips on `met1`/`met2` only (plus stubs);
+  the reference spreads routes over `met1`-`met5`, so upper-layer ref
+  boxes can never intersect ours — this bounds the layer-aware diagnostic
+  and contributes most non-covered area.
+- **Sub-0.70 nets**: our router commits different Steiner/detour paths
+  than FastRoute where congestion resolved differently — legal routes,
+  geometrically different. Median share is still 1.000 on both designs.
+- **Box-count -6.2% (picorv32)**: the reference emits per-segment plus
+  via-enclosure boxes; we merge each maximal contiguous edge run into one
+  strip, producing fewer larger boxes. gcd's +2.4% is mostly stub pairs.
+
+**Guide net names** are written in raw DEF token spelling
+(`DesignDb::net_def_spellings`, captured verbatim from the NETS section):
+OpenDB stores the token as read, so `req_msg[0]` must be emitted
+unescaped while `ctrl.state.out\[1\]` keeps its escape. Writing
+escape-normalized names raised `GRT-0234` "Cannot find net" in
+`read_guides` until the verbatim spelling was used.
+
+**Read-back** (`tests/designs/gcd/check_guide_readback.sh`, pinned image):
+`read_guides` accepts our emitted gcd guide; `set_wire_rc -layer met2` +
+`estimate_parasitics -global_routing -spef_file` ran and wrote
+`gcd.ours.guide.spef` (203,723 B). `estimate_parasitics -global_routing`
+was therefore exercised end-to-end on our guides; `EST-0026` "Missing
+route to pin" warnings remain on pins whose stub covers the pin GCell but
+not the exact pin point (warnings, not failures).
+
+**Fail-proof**: dropping all pin stubs (`net_pins(..).iter().take(0)`)
+turned the gcd test red — 457 vs 1,953 boxes (-76.6%) — then restored.
+Fail-proof for the overlap gate: name-matching was verified both ways
+(raw-vs-escaped spellings moved missing nets 34 -> 0).
+
+**Runtime** (debug build, `Runtime:` line of `grus-eda route`): gcd load
+31 ms / route+emit 3 ms; picorv32 load 79 ms / route+emit 112 ms.
+
+**Out of scope, recorded**: clock nets are routed on signal layers (the
+route CLI loads no SDC); guide-based parasitics and end-to-end `sta`
+comparison stay deferred to the next E4 tickets.
+
+**What was run**: `tests/designs/gcd/generate_ref.sh` and
+`tests/designs/picorv32/generate_ref.sh` in full (steps 0-8 incl. new 5c)
+inside the pinned image; `cargo run -p grus-eda -- route` on both placed
+DEFs; `bash tests/designs/gcd/check_guide_readback.sh`; `cargo test -p
+grus-core guide::`; workspace `cargo test`, `clippy -D warnings`, and the
+release STA regression on the final tree.

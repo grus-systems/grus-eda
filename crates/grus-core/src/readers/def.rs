@@ -470,6 +470,7 @@ fn add_component(
         db.pin_nets.push(None); // linked during NETS
         db.pin_offset_x_dbu.push(mpin.offset_x_dbu);
         db.pin_offset_y_dbu.push(mpin.offset_y_dbu);
+        db.pin_io_layer.push(None);
         db.pin_is_driver.push(is_driver);
         db.cell_pin_ids.push(pin_id);
     }
@@ -480,6 +481,7 @@ fn add_component(
 
 fn add_pin(
     db: &mut DesignDb,
+    tech_db: &TechDb,
     io_pin_name_to_id: &mut FastMap<String, PinId>,
     words: &[&str],
     line: usize,
@@ -492,6 +494,7 @@ fn add_pin(
     let mut dir = PinDir::Inout;
     let mut x = 0;
     let mut y = 0;
+    let mut layer = None;
     let mut layer_off_x = 0;
     let mut layer_off_y = 0;
     let mut is_special = false;
@@ -513,11 +516,21 @@ fn add_pin(
                 };
             }
             "LAYER" => {
-                let [_, x1, y1, x2, y2] = args else {
+                let [lname, x1, y1, x2, y2] = args else {
                     bail!(
                         "DEF line {line}: pin {pin_name} `+ LAYER` needs `layer ( x1 y1 ) ( x2 y2 )`"
                     );
                 };
+                layer = Some(
+                    tech_db
+                        .strings
+                        .get(lname)
+                        .and_then(|s| tech_db.layer_by_name.get(&s))
+                        .copied()
+                        .with_context(|| {
+                            format!("DEF line {line}: pin {pin_name} `+ LAYER` uses layer {lname}, which the LEF does not define")
+                        })?,
+                );
                 let x1: i32 = number(x1, "pin LAYER x1", line)?;
                 let y1: i32 = number(y1, "pin LAYER y1", line)?;
                 let x2: i32 = number(x2, "pin LAYER x2", line)?;
@@ -553,6 +566,7 @@ fn add_pin(
     db.pin_nets.push(None);
     db.pin_offset_x_dbu.push(x + layer_off_x);
     db.pin_offset_y_dbu.push(y + layer_off_y);
+    db.pin_io_layer.push(layer);
     db.pin_is_driver.push(is_driver);
 
     if !is_special {
@@ -789,7 +803,7 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
             }
             DefToken::Word("PINS") => {
                 for_each_record(&mut lexer, "PINS", |words, line| {
-                    add_pin(&mut db, &mut io_pin_name_to_id, words, line)
+                    add_pin(&mut db, tech_db, &mut io_pin_name_to_id, words, line)
                 })?;
             }
             DefToken::Word("SPECIALNETS") => {
@@ -805,12 +819,15 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
                 let declared = section_count(&mut lexer, "NETS")?;
                 let mut net_pins_list: Vec<Vec<PinId>> = Vec::new();
                 let mut net_names_vec: Vec<String> = Vec::new();
+                let mut net_spellings_vec: Vec<String> = Vec::new();
 
                 loop {
                     match lexer.next_token() {
                         DefToken::Word("-") => {
-                            let net_name = match lexer.next_token() {
-                                DefToken::Word(w) => unescape_def_name_cow(w).into_owned(),
+                            let (net_name, spelling) = match lexer.next_token() {
+                                DefToken::Word(w) => {
+                                    (unescape_def_name_cow(w).into_owned(), w.to_string())
+                                }
                                 other => bail!(
                                     "DEF line {}: expected a net name after `-`, found {other:?}",
                                     lexer.line()
@@ -818,6 +835,7 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
                             };
                             let net_id = NetId(net_names_vec.len() as u32);
                             net_names_vec.push(net_name.clone());
+                            net_spellings_vec.push(spelling);
                             let mut current_pins: Vec<PinId> = Vec::new();
 
                             // Connections `( comp pin )` come first; then `+` attributes and routed
@@ -895,6 +913,9 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
 
                 for name in &net_names_vec {
                     db.net_names.push(db.strings.intern(name));
+                }
+                for spelling in &net_spellings_vec {
+                    db.net_def_spellings.push(db.strings.intern(spelling));
                 }
 
                 for mut pins in net_pins_list {
