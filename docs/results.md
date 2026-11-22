@@ -6413,7 +6413,8 @@ KLayout are both in the image. `magic -dnull -noconsole -rcfile
 → `drc check` → `drc count total`.
 
 - Result: **0 DRC errors** on the committed `gcd.routed.def` (consistent with
-  the committed empty `gcd.drc.rpt`); per-rule breakdown surface is
+  the `gcd.drc.rpt` that `generate_ref.sh` emits — gitignored, not
+  committed); per-rule breakdown surface is
   `drc listall why`. Decision: the E7 standalone scoping keeps its
   independent reference — Magic reads foreign routed DEFs in this image.
 
