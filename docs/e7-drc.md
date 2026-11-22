@@ -68,15 +68,20 @@ requirement (met1/met2 side-area 400.00 limits on picorv32);
 
 `generate_drc_ref.sh` extracts every `why` string from the `drc` section
 of `sky130A.tech` (lines ~4164–4961): **278 statements, 239 unique
-names**. Classification (recorded per name in
-`magic_rules_checked.classification`):
+names**. The classifier keys on the parenthesized Magic rule id
+(`(met1.3)`, `(licon.1c + li.5)`, `(diff/tap.23)` — first id wins), not
+prose keywords: a spacing/width/area statement on diffusion, taps, poly,
+wells, FETs, or caps is not checkable from LEF+DEF, so the earlier
+keyword-based split (195 "lef_expressible") was overstated and has been
+corrected. Both denominators are recorded in the JSON
+(`classification_unique` / `classification_statements`).
 
-| Class | Count (of 278) | Meaning | Claim boundary |
-|---|---|---|---|
-| `lef_expressible` | 195 | width / spacing / distance / space / enclosure / overlap / area / length keyword rules | A LEF+DEF checker can assert equality with Magic on these — the E7 subset-checker scope |
-| `magic_only` | 34 | corners/angles, must-contain/abut, surround/overhang, holes, junction/device constructs | Never claimable from LEF+DEF data |
-| `unclassified` → reviewed: **magic_only** | 10 | LV↔MV diffusion spacing (4× `diff/tap.23`), `licon.11`/`.10` contact-to-gate (4×), LD FET drain-to-source (2× `denmos`/`depmos`) — spacing-shaped but on voltage-domain or transistor constructs LEF cannot express | Same |
-| `antenna` | 0 | no `why` string in the `drc` section mentions antenna/ratio — antenna checks are a separate Magic surface, not part of `drc check` | Covered by `check_antennas`, not by `drc listall` |
+| Class | Unique (of 239) | Statements (of 278) | Meaning | Claim boundary |
+|---|---|---|---|---|
+| `lef_expressible` | 50 | 55 | rule id ∈ {li, mcon, via, via2–via4, met1–met5} with no device-layer reference in the text — pure routing/cut geometry | A LEF+DEF checker can assert equality with Magic on these — the E7 subset-checker scope |
+| `magic_only` | 189 | 223 | every other id: diffusion/tap/poly (`diff/tap`, `psd`, `nsd`), wells (`nwell`, `dnwell`, `hvi`), contacts to device layers (`licon`), FET/varactor/cap (`denmos`, `depmos`, `varac`, `capm`, `cap2m`), photodiode/SONOS/RDL/pad constructs, angle rules (`x.*`), and routing ids whose text references MiM caps (`via3.* + via3.4`, `met4.3 - via3.4`) or device contacts (`li.5` poly/diff overlap) | Never claimable from LEF+DEF data |
+| `unclassified` | 0 | 0 | every name in this deck carries a parenthesized id; a name without one would land here rather than be guessed | — |
+| `antenna` | 0 | 0 | no `why` string in the `drc` section mentions antenna/ratio — antenna checks are a separate Magic surface, not part of `drc check` | Covered by `check_antennas`, not by `drc listall` |
 
 Two sky130A.tech statements (`rect_only *mimcap`, `rect_only *mimcap2`)
 carry an unclosed `"` — a PDK tech-file defect. The extractor joins

@@ -31,7 +31,7 @@
 #   Step E (python3): assembles <design>.drc.reference.json — Magic
 #     total + per-rule counts + version, the tech-file `drc`-section
 #     rule taxonomy (each `why` string classified lef_expressible /
-#     antenna / magic_only / unclassified by the keyword classifier in
+#     antenna / magic_only / unclassified by the rule-id classifier in
 #     step E), the DRT report count, the antenna count, and the
 #     sanity-control block. Every value is script-emitted; nothing is
 #     hand-written.
@@ -70,13 +70,28 @@ if [ ! -f "${REPO_ROOT}/${DEF_REL}" ]; then
     exit 1
 fi
 
-# A DRT report is discovered, not re-run — but when none exists the
-# step-B fallback re-routes from <d>.placed.def + <d>.sdc, so those
-# become conditional requirements.
+# A DRT report is discovered, not re-run — but when none pairs with the
+# input DEF the step-B fallback re-routes from <d>.placed.def + <d>.sdc,
+# so those become conditional requirements. Pairing is by input stem:
+#   <d>.routed.def   -> <d>.drc.rpt             (generate_ref.sh 5b)
+#   *.drt.routed.def -> runs/drt/*baseline*.drc*.rpt (e6-drt-ref)
+#   <stem>.def       -> <stem>.drc.rpt / runs/drt/<stem>.drc*.rpt
+drt_candidates() {
+    local base="$1" stem
+    stem="$(basename "${DEF_REL}" .def)"
+    shopt -s nullglob
+    if [[ "${DEF_REL}" == *.drt.routed.def ]]; then
+        printf '%s\n' "${base}/runs/drt/"*baseline*.drc*.rpt
+    elif [ "${stem}" = "${DESIGN}.routed" ]; then
+        [ -f "${base}/${DESIGN}.drc.rpt" ] && printf '%s\n' "${base}/${DESIGN}.drc.rpt"
+    else
+        [ -f "${base}/${stem}.drc.rpt" ] && printf '%s\n' "${base}/${stem}.drc.rpt"
+        printf '%s\n' "${base}/runs/drt/${stem}"*.drc*.rpt
+    fi
+    shopt -u nullglob
+}
 drt_report_exists() {
-    compgen -G "${SCRIPT_DIR}/${DESIGN}/runs/drt/*.drc*.rpt" > /dev/null && return 0
-    compgen -G "${SCRIPT_DIR}/${DESIGN}/${DESIGN}.drc.*.rpt" > /dev/null && return 0
-    [ -f "${SCRIPT_DIR}/${DESIGN}/${DESIGN}.drc.rpt" ]
+    [ -n "$(drt_candidates "${SCRIPT_DIR}/${DESIGN}")" ]
 }
 if ! drt_report_exists; then
     for f in "${DESIGN}.placed.def" "${DESIGN}.sdc"; do
@@ -112,6 +127,7 @@ if [ ! -f /.dockerenv ] && [ ! -f /nix/var/nix/profiles/default/bin/openroad ]; 
 fi
 
 export DRC_DESIGN="${DRC_DESIGN:-${DESIGN}}"
+export DRC_DEF="${DRC_DEF:-${DEF_REL}}"
 DEF_ABS="/work/${DEF_REL}"
 DRC_RUN_DIR="/work/tests/designs/${DESIGN}/runs/drc"
 mkdir -p "${DRC_RUN_DIR}"
@@ -171,20 +187,14 @@ fi
 #         regeneration via the verbatim step-5b route sequence.
 DRT_RPT=""
 DRT_SOURCE="existing"
-shopt -s nullglob
-e6_reports=( "/work/tests/designs/${DESIGN}/runs/drt/"*.drc*.rpt "/work/tests/designs/${DESIGN}/${DESIGN}.drc."*.rpt )
-shopt -u nullglob
-if [ "${#e6_reports[@]}" -gt 0 ]; then
-    # For *.drt.routed.def inputs prefer the baseline variant's report.
-    if [[ "${DEF_REL}" == *.drt.routed.def ]]; then
-        for f in "${e6_reports[@]}"; do
-            if [[ "${f}" == *baseline* ]]; then DRT_RPT="${f}"; break; fi
-        done
-    fi
-    [ -z "${DRT_RPT}" ] && DRT_RPT="${e6_reports[0]}"
-elif [ -f "/work/tests/designs/${DESIGN}/${DESIGN}.drc.rpt" ]; then
-    DRT_RPT="/work/tests/designs/${DESIGN}/${DESIGN}.drc.rpt"
+# Reuse the pairing rule defined above; >1 candidate is ambiguous input.
+mapfile -t cands < <(drt_candidates "/work/tests/designs/${DESIGN}")
+if [ "${#cands[@]}" -gt 1 ]; then
+    echo "Error: ${#cands[@]} DRT reports pair with input ${DEF_REL} (ambiguous; keep exactly one):" >&2
+    printf '  %s\n' "${cands[@]}" >&2
+    exit 1
 fi
+[ "${#cands[@]}" -eq 1 ] && DRT_RPT="${cands[0]}"
 
 if [ -z "${DRT_RPT}" ]; then
     # No report found: regenerate via the exact generate_ref.sh step-5b
@@ -244,12 +254,15 @@ select top cell
 drc euclidean on
 drc style drc(full)
 drc check
-catch {drc catchup} cupres
+set cupcode [catch {drc catchup} cupres]
+puts "DRCREF-CATCHUP-STATUS $cupcode"
 puts "DRCREF-CATCHUP {$cupres}"
 puts "DRCREF-COUNT-BEGIN"
-catch {drc count} c1
+set c1code [catch {drc count} c1]
+puts "DRCREF-COUNT-RAW-STATUS $c1code"
 puts "DRCREF-COUNT-RAW {$c1}"
-catch {drc count total} c2
+set c2code [catch {drc count total} c2]
+puts "DRCREF-COUNT-TOTAL-STATUS $c2code"
 puts "DRCREF-COUNT-TOTAL {$c2}"
 puts "DRCREF-WHY-BEGIN"
 set whys [drc listall why]
@@ -453,12 +466,15 @@ select top cell
 drc euclidean on
 drc style drc(full)
 drc check
-catch {drc catchup} cupres
+set cupcode [catch {drc catchup} cupres]
+puts "DRCREF-CATCHUP-STATUS $cupcode"
 puts "DRCREF-CATCHUP {$cupres}"
 puts "DRCREF-COUNT-BEGIN"
-catch {drc count} c1
+set c1code [catch {drc count} c1]
+puts "DRCREF-COUNT-RAW-STATUS $c1code"
 puts "DRCREF-COUNT-RAW {$c1}"
-catch {drc count total} c2
+set c2code [catch {drc count total} c2]
+puts "DRCREF-COUNT-TOTAL-STATUS $c2code"
 puts "DRCREF-COUNT-TOTAL {$c2}"
 puts "DRCREF-WHY-BEGIN"
 set whys [drc listall why]
@@ -485,6 +501,7 @@ EOF
 #         expectation loudly; emit <design>.drc.reference.json.
 SECONDS=0
 python3 - "${DESIGN}" "${DEF_REL}" "${DRT_RPT}" "${DRT_SOURCE}" <<'PYEOF'
+import collections
 import hashlib
 import json
 import re
@@ -522,12 +539,21 @@ def parse_magic(log_path):
     # marker belongs to that command. `drc count` is top-level only;
     # `drc count total` is hierarchy-wide. Neither equals the listall
     # bbox-fragment sum: count tallies merged error regions.
+    ms = re.search(r"^DRCREF-CATCHUP-STATUS (\d+)$", log, re.M)
+    if ms is None or ms.group(1) != "0":
+        fail(f"{log_path}: drc catchup failed or status marker missing")
     for key, pat in (("count_raw", r"^DRCREF-COUNT-RAW \{(.*)\}$"),
                      ("count_total", r"^DRCREF-COUNT-TOTAL \{(.*)\}$")):
         m = re.search(pat, log, re.M)
         if m is None:
             fail(f"{log_path}: missing marker for {key}")
         out[key] = m.group(1)
+        ms = re.search(r"^DRCREF-" + key.upper().replace("_", "-")
+                       + r"-STATUS (\d+)$", log, re.M)
+        if ms is None:
+            fail(f"{log_path}: missing catch-status marker for {key}")
+        if ms.group(1) != "0":
+            fail(f"{log_path}: drc command for {key} failed: {out[key]}")
         prev = re.findall(r"Total DRC errors found:\s*(-?\d+)",
                           log[:m.start()])
         if not prev:
@@ -691,22 +717,40 @@ for ln in logical:
 if not names:
     fail("sky130A.tech drc section yielded zero rule names")
 
+# Classify by the parenthesized Magic rule id, not by prose keywords:
+# a spacing/width/area statement on diffusion, taps, poly, wells, FETs,
+# or caps is NOT checkable from LEF+DEF. Only ids naming a routing layer
+# (li, met1..met5) or a cut layer (mcon, via, via2..via4) whose text
+# does not reference a device-layer construct count as lef_expressible.
+# Composite ids like "(licon.1c + li.5)" and "(nwell.5a, 7)" classify on
+# their FIRST id. Every name in this deck carries an id; a name without
+# one lands in unclassified rather than being guessed.
+ROUTING_IDS = {"li", "mcon", "via", "via2", "via3", "via4"} | \
+              {f"met{i}" for i in range(1, 6)}
+DEVICE_RE = re.compile(
+    r"diff|poly|tap\b|fet|cap|well|photo|resistor|diode|npn|pnp|sonos|"
+    r"varactor|varac|latch|glass|rdl|ind|pad", re.I)
+
+def rule_id(name):
+    m = re.search(r"\(([^()]*)\)\s*$", name)
+    if m is None:
+        return None
+    return re.split(r"[,\s+]", m.group(1).strip())[0].split(".")[0]
+
 def classify(name):
     n = name.lower()
     if "antenn" in n or "ratio" in n:
         return "antenna"
-    if any(k in n for k in ("spacing", "space", "distance", "width",
-                            "enclosure", "overlap", "area", "length")):
+    rid = rule_id(name)
+    if rid in ROUTING_IDS and not DEVICE_RE.search(n):
         return "lef_expressible"
-    if any(k in n for k in ("corner", "must", "surround", "notch", "hole",
-                            "halo", "abut", "junction", "butted", "angle",
-                            "permitted", "bend", "rectangular", "cross",
-                            "contain", "straddle", "unrelated", "exact",
-                            "extend", "overhang", "photodiode", "sonos")):
+    if rid is not None:
         return "magic_only"
     return "unclassified"
 
 classification = {n: classify(n) for n in names}
+stmt_classification = collections.Counter(classify(n) for n in names)
+uniq_classification = collections.Counter(classification.values())
 
 # ---------- sanity control ----------
 mutation = json.load(open(f"{run}/mutation.json"))
@@ -759,10 +803,15 @@ out = {
     "magic_count_matches_bbox_sum": clean["count_matches_bbox_sum"],
     "magic_rules_checked": {
         "source": "/pdk/sky130A/libs.tech/magic/sky130A.tech drc section",
+        # `count` is statement-weighted (the deck repeats a why string per
+        # variant); `unique_count` dedupes by the why string itself.
         "count": len(names),
+        "unique_count": len(classification),
         "names": names,
         "classification": classification,
-        "classification_method": "keyword classifier in generate_drc_ref.sh step E; reviewed in docs/e7-drc.md",
+        "classification_statements": dict(stmt_classification),
+        "classification_unique": dict(uniq_classification),
+        "classification_method": "rule-id classifier in generate_drc_ref.sh step E (parenthesized Magic rule id: routing/cut ids without device-layer references are lef_expressible); reviewed in docs/e7-drc.md",
     },
     "drt_drc_count": drt_count,
     "drt_report_file": drt_rel,

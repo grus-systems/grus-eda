@@ -7983,10 +7983,13 @@ Grammar pinned along the way: `check_antennas -verbose` prints one
 `awk` (all parsing is python3); two `sky130A.tech` `why` strings carry
 unclosed quotes (`rect_only *mimcap`/`*mimcap2`), which the per-logical-
 line extractor survives; `drc listall why` alternates
-`{why-string} {bbox-list}`. Taxonomy: 278 `drc`-section statements,
-239 unique names — 195 `lef_expressible`, 34 `magic_only`, 10
-`unclassified` (reviewed as magic_only in `docs/e7-drc.md` §3), 0
-`antenna` (antenna checks are not in the `drc` deck).
+`{why-string} {bbox-list}`. Taxonomy (corrected 2026-11-24, card-#35
+review): 278 `drc`-section statements / 239 unique names, classified by
+parenthesized Magic rule id — 50 unique (55 statements)
+`lef_expressible` (routing/cut ids `li`/`mcon`/`via`–`via4`/`met1`–`met5`
+with no device-layer reference), 189 unique (223 statements)
+`magic_only`, 0 `unclassified`, 0 `antenna` (antenna checks are not in
+the `drc` deck). Both denominators are recorded in the JSON.
 
 **Runtime** (`runs/drc/runtime.json`, kept out of the golden for byte
 reproduction): gcd ≈ 22 s total (19 s of it the DRT regen); picorv32
@@ -7997,8 +8000,8 @@ reproduction): gcd ≈ 22 s total (19 s of it the DRT regen); picorv32
 | file | size | SHA-256 (first 16) |
 |---|---|---|
 | `tests/designs/generate_drc_ref.sh` | 32,918 B | `—` (script, not a golden) |
-| `tests/designs/gcd/gcd.drc.reference.json` | 37,036 B | `4c740c2d3256f2b1` |
-| `tests/designs/picorv32/picorv32.drc.reference.json` | 50,731 B | `42c10b28836eb8f2` |
+| `tests/designs/gcd/gcd.drc.reference.json` | 36,601 B | `42827e2cd1fb6722` |
+| `tests/designs/picorv32/picorv32.drc.reference.json` | 50,296 B | `2ef1c935cc338e8f` |
 
 Evidence trail (gitignored): `tests/designs/<d>/runs/drc/` —
 `antenna.log`, `magic_clean.log`, `magic_broken.log`,
@@ -8013,3 +8016,26 @@ edit. Nothing Cargo-visible changed; **no version bump** (reference-only).
 --workspace` passed (402 lib + 4 bin tests, 2 ignored — pre-existing
 jpeg placement/dmp ignores); `cargo clippy --workspace --all-targets --
 -D warnings` passed clean.
+
+**Card-#35 follow-ups (2026-11-24, dev `HEAD`)**: the reviewer warned on
+four points, all fixed in `generate_drc_ref.sh` and the goldens
+regenerated end-to-end on both designs (Magic totals unchanged
+305/8049; only the taxonomy block moved).
+(1) `lef_expressible` was keyword-based and swept in diffusion/tap/FET/
+cap/well rules — now classified by the parenthesized Magic rule id
+(routing/cut ids only, and only when the `why` text names no device
+layer): 50 unique / 55 statements, down from 195.
+(2) DRT report discovery globbed `runs/drt/*.drc*.rpt` and took the
+first hit for any input — now reports are paired to the input DEF by
+stem (`<d>.routed.def`→`<d>.drc.rpt`, `*.drt.routed.def`→e6
+`*baseline*`, `<stem>.def`→`<stem>.drc.rpt`/`runs/drt/<stem>.drc*.rpt`);
+>1 pairing aborts, 0 falls through to regeneration.
+(3) `catch {drc count}`/`catch {drc count total}`/`catch {drc catchup}`
+now emit `-STATUS` markers and step E fails on nonzero status or a
+missing marker — no stale "Total DRC errors found" line can stand in.
+(4) `DRC_DEF` now defaults to the script's `$2` so direct in-container
+invocation works without the host wrapper's env.
+Rerun evidence: `generate_drc_ref.sh gcd gcd.routed.def` and
+`picorv32 picorv32.routed.def` rerun post-fix; JSONs byte-stable in
+every field except the corrected taxonomy. Still reference-only — no
+version bump.
