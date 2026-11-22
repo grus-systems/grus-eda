@@ -32,7 +32,7 @@ runs want to interleave without rebuilding.
 
 ## 2. SPEF (`spef.md` S1–S5)
 
-Order inside the file: S2's `u32` NAME_MAP + `Cow` `resolve` first
+Order inside the file: S2's `*N` digit-slice NAME_MAP key + `Cow` `resolve` first
 (signature change ripples least), then S1 token scratch, S3 ascii
 split, S4 fast-float, S5 map hashers.
 - **Gate**: suite green (incl. every `load_spef` consumer test); SPEF

@@ -493,12 +493,13 @@ pub fn memo_table<'a>(
 ) -> impl Fn(f64) -> (f64, f64) + 'a {
     move |c| {
         let bits = c.to_bits();
-        let mut entries = entries.borrow_mut();
-        if let Some(&(_, d, s)) = entries.iter().find(|e| e.0 == bits) {
+        // Lookup and insert borrow separately so a `table` that ever reaches
+        // this RefCell re-entrantly cannot hit a held `borrow_mut`.
+        if let Some(&(_, d, s)) = entries.borrow().iter().find(|e| e.0 == bits) {
             return (d, s);
         }
         let (d, s) = table(c);
-        entries.push((bits, d, s));
+        entries.borrow_mut().push((bits, d, s));
         (d, s)
     }
 }

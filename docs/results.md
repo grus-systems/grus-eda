@@ -5286,8 +5286,13 @@ divide-by-two.
   `CACHE_VERSION` bumped to 9.
 - `activity.rs`: `seq_function_table` (per sequential-driver net, the
   data net plus the output polarity from the Liberty `function` —
-  `function == state_var` copies `P`; `== state_var_n` or `!state_var`
-  copies `1 - P`; density copied unchanged either way). `propagate`
+  `function == state_var` copies `P`; `== state_var_n` copies `1 - P`;
+  `function` is interned verbatim (never parsed), so the match is
+  exact-name — a `!IQ`-style function would not equal `state_var_n` and
+  lands `Unknown` (unclassifiable, never a silent guess); the sky130
+  census shows every sequential output's function is exactly `IQ` or
+  `IQ_N`, so exact match is complete on the committed PDK; density
+  copied unchanged either way). `propagate`
   unifies combinational and sequential producers in one Kahn
   worklist — resolved Q nets re-enable later combinational cones and
   other sequential D inputs (fixed point in a single ordered pass,
@@ -5774,9 +5779,10 @@ reps): jpeg `sta --spef` 308 MB, `sta`/`power` placement RC 232/236 MB,
 No swap; no rep hit the machine's 16 GB.
 
 **What was run**: `REPS=5 sh kurena/tasks/perf-profile/measure.sh
-/tmp/perf-measure.log` (45 cells × 5 reps = 225 runs; `sta.spef_rcx`
-and `power.vcd` cells gated on committed artifacts — aes/ibex/jpeg have
-no `*.rcx.spef`, only gcd has a committed VCD). Gate proof: ungated
+/tmp/perf-measure.log` (38 cells × 5 reps = 190 runs — the script's 7
+base cells × 5 designs, `sta.spef_rcx` gated on committed artifacts
+(fires on gcd + picorv32; aes/ibex/jpeg have no `*.rcx.spef`),
+`power.vcd` gated likewise (gcd only — the committed VCD)). Gate proof: ungated
 stderr on gcd `sta` is the pre-change byte stream (`lef: skipped…`,
 `warning:`); `GRUS_PHASE_TIMING=1` adds `phase ` lines to stderr only,
 stdout identical (`elapsed=` varies by run as before). Byte-identity:
@@ -5809,23 +5815,26 @@ column, re-measurement not repeated per plan:
 
 | cell | before | after | speedup |
 |---|---|---|---|
-| `sta` placement RC — gcd | 50 (50–50) | 40 (40–40) | ×1.25 |
+| `sta` placement RC — gcd | 50 (50–50) | 40 (40–40) | ~noise |
 | `sta` placement RC — picorv32 | 860 (750–870) | 320 (280–380) | ×2.7 |
 | `sta` placement RC — aes | 1480 (1410–1790) | 470 (410–530) | ×3.1 |
 | `sta` placement RC — ibex | 670 (620–690) | 410 (370–410) | ×1.6 |
 | `sta` placement RC — jpeg | 6000 (5990–6060) | 2060 (2010–2110) | **×2.9** |
-| `sta` routed SPEF — gcd | 50 (40–50) | 40 (40–40) | ×1.25 |
+| `sta` routed SPEF — gcd | 50 (40–50) | 40 (40–40) | ~noise |
 | `sta` routed SPEF — picorv32 | 900 (790–900) | 360 (360–420) | ×2.5 |
 | `sta` routed SPEF — aes | 1460 (1380–1950) | 510 (480–520) | ×2.9 |
 | `sta` routed SPEF — ibex | 730 (680–770) | 490 (430–540) | ×1.5 |
 | `sta` routed SPEF — jpeg | 6230 (6160–6340) | 2370 (2280–2470) | ×2.6 |
 | `sta` rcx SPEF — gcd | 50 (50–50) | 30 (20–50) | ~noise |
 | `sta` rcx SPEF — picorv32 | 1020 (930–1030) | 490 (390–540) | ×2.1 |
-| `power` placement RC — gcd | 50 (50–50) | 40 (30–40) | ×1.25 |
+| `power` placement RC — gcd | 50 (50–50) | 40 (30–40) | ~noise |
 | `power` placement RC — picorv32 | 870 (810–910) | 350 (310–350) | ×2.5 |
 | `power` placement RC — aes | 1400 (1360–1450) | 490 (440–490) | ×2.9 |
 | `power` placement RC — ibex | 710 (680–820) | 440 (390–440) | ×1.6 |
 | `power` placement RC — jpeg | 6100 (6000–6110) | 2170 (2100–2190) | ×2.8 |
+
+gcd wall rows sit at the `/usr/bin/time` 10 ms quantum — marked
+`~noise` like the rcx row.
 
 **Phase** (`sta --parasitics placement`, median ms):
 `sta.prepare.clock.slew` jpeg 4840 → **889 (×5.4)** — share of `sta`
@@ -5874,7 +5883,7 @@ defensive-but-required (it preserves semantics the levelization cannot
 prove absent), not covered-by-golden.
 
 **What was run**: `REPS=5 sh kurena/tasks/perf-profile/measure.sh
-/tmp/perf-par-slew2.log` (full 45-cell matrix on the v0.3.3 release
+/tmp/perf-par-slew2.log` (full 38-cell matrix on the v0.3.3 release
 binary; raw log not committed, script is). Note: a first run
 (`/tmp/perf-par-slew.log`) overlapped a background `cargo test
 --release` build and showed inflated ibex/`place` reps (e.g. ibex
@@ -5921,7 +5930,9 @@ v0.3.3 run for the zero-wire/VCD cells it did not cover):
 `power --vcd` is dominated by `power.activity.load` (~479 of ~500 ms —
 untouched code, the before run's reps ranged 670–990); the slew share is
 `power.slews` 23.7 → 9.1 ms. Zero-wire gcd stays ~10 ms: it is all file
-loads; `power.slews` there was already under the noise floor.
+loads; `power.slews` there was already under the noise floor. The gcd
+placement-RC `×4.0` carries the same 10 ms-quantum caveat — the
+direction is phase-timer-backed, the magnitude is approximate.
 
 **Phase** (`power --parasitics placement`, median ms): `power.slews`
 envelope jpeg 1824 → **808**, aes 405 → 152, picorv32 267 → 98, ibex 331 →
@@ -6090,14 +6101,20 @@ section, `Cow` unescape on both name paths, `get_mut`-first VCD map
 access, precomputed VCD bit names), SPEF NAME_MAP rekeyed to the `*N`
 digit-slice of the input line (zero-alloc probes — chosen over the
 u32 rekey so indices beyond `u32` keep exact semantics), `fast-float2`
-for SPEF `*D_NET`/`*CAP`/`*RES`/unit numerics, `xxh3` on the
+for SPEF `*D_NET`/`*CAP`/`*RES` numerics (`unit_scale` keeps std
+`parse` — once per `*_UNIT` header line, cold), `xxh3` on the
 per-token/per-connection hash maps (SPEF `name_map`/`owner`, DEF
 `cell_name_to_id`/`io_pin_name_to_id`, VCD `decls`/`activity`/`signals`).
 No format-semantics changes; `split_ascii_whitespace` note: inside a
 SPEF token, non-ASCII whitespace now stays part of the word instead of
-splitting — such input still fails at the same line (numeric parse or
-field count), never silently; all committed SPEF and error tests are
-ASCII. Design: `kurena/tasks/perf-parsers/design/`.
+splitting — a merged token still hits the same-line rejects when the
+count lands on a wrong arity, but it can also produce a *valid-shaped*
+entry whose node name carries the non-ASCII byte (`*CAP 1 a\u{a0}b 0.5`
+parses as a ground cap on the merged name instead of erroring) — a
+format-invalid input surfacing as a dangling node name that matches
+nothing else in the file, not a silent corruption of a real net; all
+committed SPEF and error tests are ASCII. Design:
+`kurena/tasks/perf-parsers/design/`.
 
 **Phase before/after** — median (min–max) ms, REPS=5, same M4 mini,
 both matrices in one session:
@@ -6120,6 +6137,12 @@ both matrices in one session:
 
 DEF parse on the other designs: `sta.load.def`/`power.load.def` aes
 12 → 10, ibex 16 → 13, picorv32 10 → 8 — uniform ~×1.2.
+
+Sub-50 ms phase rows are `Instant`-timed, not the `/usr/bin/time`
+quantum the wall cells carry; before/after rep ranges are
+non-overlapping, so the speedups are measured but small-magnitude. The
+DEF-parse tail (≤3 ms deltas) reads direction-only at 5 reps. The gcd
+`sta.spef.read` row is below rep noise and stays unmarked (`—`).
 
 **Cell wall** — same runs:
 
@@ -6244,29 +6267,41 @@ Controls flat within noise: every `*.zerowire.*` except jpeg-zerowire's
 DMP path, `congestion.*`, `place.*`, `power.vcd.gcd`, and all ≤ 50 ms
 cells.
 
-**Phases** — same runs, median ms:
+**Phases** — same runs, `median (min–max)` ms:
 
 | phase | cell | before | after | Δ |
 |---|---|---|---|---|
-| `sta.eval.walk` | jpeg `sta.placement` | 547 | 463 | −84 |
-| `sta.prepare.clock.slew` | jpeg `sta.placement` | 580 | 481 | −98 |
-| `sta.eval.walk` | jpeg `sta.spef` | 541 | 446 | −94 |
-| `sta.prepare.clock.slew` | jpeg `sta.spef` | 563 | 466 | −97 |
-| `sta.slew.walk` | jpeg `power.placement` | 543 | 448 | −95 |
-| `power.slews` | jpeg `power.placement` | 569 | 473 | −96 |
-| `sta.eval.walk` | ibex `sta.placement` | 160 | 123 | −37 |
-| `sta.prepare.clock.slew` | ibex `sta.placement` | 50 | 39 | −10 |
-| `power.slews` | ibex `power.placement` | 165 | 133 | −32 |
-| `sta.eval.walk` | aes `sta.placement` | 123 | 106 | −16 |
-| `sta.prepare.clock.slew` | aes `sta.placement` | 127 | 108 | −19 |
-| `power.slews` | aes `power.placement` | 131 | 109 | −22 |
-| `power.slews` | picorv32 `power.placement` | 90 | 73 | −18 |
+| `sta.eval.walk` | jpeg `sta.placement` | 547 (539–569) | 463 (449–465) | −84 |
+| `sta.prepare.clock.slew` | jpeg `sta.placement` | 580 (568–597) | 481 (468–488) | −98 |
+| `sta.eval.walk` | jpeg `sta.spef` | 541 (538–552) | 446 (446–448) | −94 |
+| `sta.prepare.clock.slew` | jpeg `sta.spef` | 563 (556–572) | 466 (462–498) | −97 |
+| `sta.slew.walk` | jpeg `power.placement` | 543 (528–548) | 448 (445–458) | −95 |
+| `power.slews` | jpeg `power.placement` | 569 (554–575) | 473 (469–483) | −96 |
+| `sta.eval.walk` | ibex `sta.placement` | 160 (151–176) | 123 (123–125) | −37 |
+| `sta.prepare.clock.slew` | ibex `sta.placement` | 50 (48–53) | 39 (39–40) | −10 |
+| `power.slews` | ibex `power.placement` | 165 (163–166) | 133 (132–133) | −32 |
+| `sta.eval.walk` | aes `sta.placement` | 123 (122–129) | 106 (103–107) | −16 |
+| `sta.prepare.clock.slew` | aes `sta.placement` | 127 (124–134) | 108 (108–110) | −19 |
+| `power.slews` | aes `power.placement` | 131 (127–136) | 109 (108–112) | −22 |
+| `power.slews` | picorv32 `power.placement` | 90 (88–91) | 73 (72–74) | −18 |
 
-**Achieved vs. plan**: the count-derived ceiling was ~21.6% of
-`eval_2d` inside the walks; measured is ~15–20% off the DMP phases and
-×1.13–1.24 cell wall — larger than the naive ceiling, consistent with
-the memo also removing `eval_2d`'s per-call setup (index clamps, bilinear
-weight computes) on every hit. Residuals, named: (1) `rc_crossing`
+`sta.prepare.clock.walk` is absent from the table, not from the runs:
+the `any_propagated || (!for_slew && pulse_width_checks)` gate fires it
+once per `sta.*` cell (every committed design carries `min_pulse_width`
+arcs) — a serial tail, jpeg `sta.placement` 7.9 (6.3–8.0) →
+6.1 (5.9–7.4) ms and ≤ ~2.2 ms on the other `sta.*` cells. Under `power.*`
+the slew prep's `for_slew` skips the whole `sta.prepare.clock.*` block
+on these ideal-clock SDCs, so it fires zero times there.
+
+**Achieved vs. plan**: the counted bound is the intra-call repeat share
+R = 21.6% of `table(c)` evals inside the walks (`eval_2d` is ~all of
+`table` — 49.9M/49.9M — so the bound applies to the DMP fraction of
+each walk phase); measured phase deltas land at −13%…−23% — jpeg walks
+−15…−17.5% (`eval.walk` 547→463 = −15.4%, `clock.slew` 580→481 =
+−17.0%, `slew.walk` 543→448 = −17.5%), ibex `eval.walk` −23%, aes
+−13.3% — consistent with the bound plus `eval_2d`'s per-call setup
+(index clamps, bilinear weights) removed on every hit, which is why
+some rows exceed R. Residuals, named: (1) `rc_crossing`
 Brent — 43.7% of 49M calls, bit-identity-barred here, the largest
 remaining lever inside the walks; (2) `fit_ramp_duration` /
 `pi_waveform_slew` transcendental work — ~330 `sample` hits, structural;

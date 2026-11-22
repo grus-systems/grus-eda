@@ -473,7 +473,8 @@ fn net_other_x_extrema(
 
 // Exact incremental `NetExtrema` maintenance after a move has been committed to `db`.
 // `moved` is `(pin, new_x, new_y)` for every moved pin of `net`; `move_y = false` marks
-// an x-only move (passes 2/3 never touch y). A moved pin occupying a maintained top-2
+// an x-only move (passes 2/3 never touch y) — the tuples' `new_y` element is then
+// unread, so those call sites push a placeholder `0`. A moved pin occupying a maintained top-2
 // slot on any affected axis forces a full rescan of the net — a non-extremal moved pin
 // only inserts its new value into the top-2. Returns true on a rescan.
 fn update_net_extrema(
@@ -884,9 +885,9 @@ fn equal_width_swap_pass_fast(
         candidates.sort_unstable();
 
         for &(mi2, c2) in &candidates {
-            if cell_w_dbu[c2] != w1 {
-                continue;
-            }
+            // Same width is guaranteed by the band key — the partition bounds
+            // select `(w1, x…)` entries only; the assert pins the invariant.
+            debug_assert!(cell_w_dbu[c2] == w1);
             let x2 = design_db.cell_x_dbu[c2];
             let y2 = design_db.cell_y_dbu[c2];
 
@@ -914,6 +915,9 @@ fn equal_width_swap_pass_fast(
                 band_insert(&mut bands[b1], (w1, x1, mi2, c2));
                 merge_sorted_nets(&cell_nets[c1], &cell_nets[c2], &mut incident);
                 for &n in &incident {
+                    if net_ext[n].pin_count <= 1 {
+                        continue;
+                    }
                     moved_buf.clear();
                     for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[c1], n) {
                         let (px, py) = geom.pin_pos(design_db, pin);
@@ -1443,6 +1447,9 @@ pub fn legalize_placement(
                     // Only the two cells' own pins move, so the after-extrema are the
                     // surviving unmoved top-2 folded with the moved pins' new x.
                     moved_buf.clear();
+                    // The `0` is the unread `new_y` placeholder — the tuples'
+                    // y element is only consumed under `update_net_extrema`'s
+                    // `move_y = true`, and the x-fold below never reads it.
                     for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[ca], n) {
                         moved_buf.push((pin, pin_x[pin.0 as usize] + dxa, 0));
                     }
@@ -1474,6 +1481,9 @@ pub fn legalize_placement(
                     design_db.cell_x_dbu[ca] = new_xa;
                     design_db.cell_x_dbu[cb] = new_xb;
                     for &n in &incident_buf {
+                        if net_ext[n].pin_count <= 1 {
+                            continue;
+                        }
                         moved_buf.clear();
                         for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[ca], n) {
                             moved_buf.push((pin, pin_x[pin.0 as usize] + dxa, 0));
@@ -1588,6 +1598,9 @@ pub fn legalize_placement(
                     design_db.cell_x_dbu[c] = best_x;
                     let dx = best_x - orig_x;
                     for &net in incident {
+                        if net_ext[net].pin_count <= 1 {
+                            continue;
+                        }
                         moved_buf.clear();
                         for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[c], net) {
                             moved_buf.push((pin, pin_x[pin.0 as usize] + dx, 0));
