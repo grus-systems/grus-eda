@@ -549,8 +549,15 @@ readers: `sta.spef.read` ×1.34–1.39, `*.load.def`/`cong.load` ~×1.2,
 `power.activity.load` ×1.52; jpeg `sta.spef` cell wall 1650 → 1380 ms,
 `power.vcd.gcd` 440 → 290 ms — `docs/results.md` 2026-11-22
 perf-parsers entry), and
-`sta.eval.walk`/`sta.slew.walk` is the co-dominant phase on both `sta`
-and `power` after these tickets (the shared DMP-dominated inner
-loop). Every optimization ticket lands only with a
-bit-identical-or-tolerance-named fast path and a `docs/results.md`
+~~`perf-dmp-hotloop`~~ **done** (per-call `to_bits()`-keyed memo of
+the DMP `table` closure — instrumented counts first: 0.0% cross-call
+`driver_response` exact repeats killed the run-scoped memo, 21.6%
+intra-call `table(c)` repeats chose the mechanism, 43.7%
+`rc_crossing` Brent share named residual; jpeg `sta.placement`
+1290 → 1090 ms, `power.placement` 740 → 630 ms, `cmp`-clean
+throughout — `docs/results.md` 2026-11-22 perf-dmp-hotloop entry).
+`sta.prepare.clock.slew` / `sta.eval.walk` remain the co-dominant
+phases on `sta` and `power` (the shared DMP inner loop, now minus
+the `eval_2d` redundancy). Every optimization ticket lands only with
+a bit-identical-or-tolerance-named fast path and a `docs/results.md`
 number, per the usual discipline.
