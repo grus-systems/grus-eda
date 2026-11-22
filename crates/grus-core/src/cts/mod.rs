@@ -162,9 +162,21 @@ mod tests {
         }
     }
 
+    /// Temp DEF names must be unique per call — same-design tests run in
+    /// parallel threads of one process, so a shared `{tag}_{pid}` path
+    /// races another test's write/remove against our read.
+    static TEMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn temp_def(tag: &str) -> std::path::PathBuf {
+        let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "grus_e5_cts_{tag}_{}_{seq}.def",
+            std::process::id()
+        ))
+    }
+
     fn emit_def_string(db: &DesignDb, tech: &TechDb, tag: &str) -> String {
-        let tmp =
-            std::env::temp_dir().join(format!("grus_e5_cts_{tag}_{}.def", std::process::id()));
+        let tmp = temp_def(tag);
         write_def_full(db, tech, &tmp).expect("write_def_full");
         let text = std::fs::read_to_string(&tmp).expect("read emitted DEF");
         let _ = std::fs::remove_file(&tmp);
@@ -423,10 +435,7 @@ mod tests {
         let report = run_cts(&mut db, &tech, &lib, &sdc, &CtsConfig::default()).expect("run_cts");
         verify_legality(&db, &tech).expect("verify_legality in-memory");
 
-        let tmp = std::env::temp_dir().join(format!(
-            "grus_e5_cts_roundtrip_{design_name}_{}.def",
-            std::process::id()
-        ));
+        let tmp = temp_def(&format!("roundtrip_{design_name}"));
         write_def_full(&db, &tech, &tmp).expect("write_def_full");
         let db2 = parse_def(&tmp, &tech, Some(&lib)).expect("re-parse emitted DEF");
         let _ = std::fs::remove_file(&tmp);
@@ -840,10 +849,7 @@ mod tests {
             .collect();
         let report = run_cts(&mut db, &tech, &lib, &sdc, &CtsConfig::default()).expect("run_cts");
 
-        let tmp = std::env::temp_dir().join(format!(
-            "grus_e5_cts_run_{design_name}_{}.def",
-            std::process::id()
-        ));
+        let tmp = temp_def(&format!("run_{design_name}"));
         write_def_full(&db, &tech, &tmp).expect("write_def_full");
         let emitted = std::fs::read_to_string(&tmp).expect("read emitted DEF");
         let (db2, sta, state) = sta_on_def(&tech, &lib, &sdc, &tmp);
@@ -1252,9 +1258,19 @@ mod tests {
             cref.latency_max_ns,
             cref.skew_hold_ns * 1000.0,
         );
+        // name -> driving net for the worst-5's clknet_* attribution.
+        let pin_id_by_name: HashMap<String, PinId> = (0..run.db2.num_pins())
+            .map(|i| PinId(i as u32))
+            .map(|p| (sta_pin_name(&run.db2, p), p))
+            .collect();
         println!("  {design_name} clock-pin worst-5 (ours vs golden arr_rise_max):");
         for (diff, pin, ours, reference) in pin_rows.iter().take(5) {
-            println!("    {pin} ours={ours:.6} ref={reference:.6} diff={diff:.6}");
+            let net = pin_id_by_name
+                .get(pin.as_str())
+                .and_then(|p| run.db2.pin_nets[p.0 as usize])
+                .map(|n| run.db2.strings.resolve(run.db2.net_names[n.0 as usize]).to_string())
+                .unwrap_or_else(|| "?".to_string());
+            println!("    {pin} (net {net}) ours={ours:.6} ref={reference:.6} diff={diff:.6}");
         }
         assert!(
             failures.is_empty(),

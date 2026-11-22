@@ -3,7 +3,11 @@
 E5 tickets 3–4 (`e5-cts-tree` `v0.5.0`, `e5-cts-e2e` `v0.5.1`): build a
 depth-balanced buffer tree on every design clock's root net, legalize the
 inserted cells only, emit a CTS DEF and a census report — then score that
-DEF against the committed TritonCTS goldens end to end. TritonCTS reference
+DEF against the committed TritonCTS goldens end to end. Versioning:
+ticket 3 bumped **minor** because it added new public surface (the
+`grus-eda cts` subcommand and the `cts` module API); ticket 4 bumped
+**patch** — it only added test gates, the host-side `generate_cts_ours.sh`
+script, and docs against the already-shipped surface. TritonCTS reference
 artifacts for `gcd` and `picorv32` were committed by `e5-cts-ref`; the
 `DesignDb` mutation API came from `e5-insert-api`. Ticket 3 asserts the
 tree *class* (depth, census, legality, propagated-clock reachability);

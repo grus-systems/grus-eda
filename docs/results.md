@@ -7521,7 +7521,12 @@ criterion 1 going red on picorv32 at +34.35 ps before
 LibreLane container byte-reproduced `picorv32.cts.def` (SHA-256 prefix
 `59556c0c7a4da5e4`, matches the README record) and both committed
 goldens (`git diff` empty) — the decomposition input is the same DEF the
-golden was scored on. `cargo test -p grus-core cts::` — 15/15 green,
+golden was scored on. Ours-side artifact SHA-256 prefixes:
+`gcd.cts.ours.def` `d27c8a0a79c27161`, `gcd.cts.ours.report.json`
+`aa695e4503b143d3`, `picorv32.cts.ours.def` `b59ef94b45b05bd7`,
+`picorv32.cts.ours.report.json` `14b36ac65449e94e` — the picorv32 pair
+regenerates byte-identically on a second host (`generate_cts_ours.sh`
+rerun 2026-11-23, `write_def_full` is deterministic). `cargo test -p grus-core cts::` — 15/15 green,
 including the new `test_{gcd,picorv32}_cts_e2e` gates,
 `test_{gcd,picorv32}_cts_decomposition` (prints the axis table above),
 `test_gcd_cts_ours_def_deterministic` (committed artifact == fresh
@@ -7546,3 +7551,24 @@ The heavy `cargo test --release -p grus-core sta` regression: **run** —
 this ticket adds tests, a script and docs with no API change (the
 `0.4.0 → 0.5.0` minor was the ticket's explicit instruction; none given
 here).
+
+**Card #34 review follow-ups (2026-11-23, post-merge)**:
+- *medium — temp-DEF race*: `emit_def_string`, the DEF roundtrip and
+  `cts_sta_run` all wrote `grus_e5_cts_<tag>_<pid>.def`, a path shared
+  across same-design tests running in parallel threads of one process —
+  one test could remove/truncate the file between another's write and
+  read. Fixed by funneling every test temp DEF through `temp_def()`,
+  which adds a per-process `AtomicUsize` sequence number to the pid
+  (test-only change; shipped code untouched).
+- *low — worst-5 attribution*: `cts_decomposition`'s worst-clock-pin
+  print now resolves each pin's driving net and emits it (`net
+  clknet_*`), the record needed to tell a buffer-stage residual from a
+  leaf-segment one.
+- *low — doc records*: ours-side SHA-256 prefixes added above;
+  `docs/status.md` now lists every named `CtsTol`/skew floor;
+  `docs/e5-cts.md` records the patch-vs-minor rationale.
+- Verified: `cargo test -p grus-core --lib cts` 15/15 green after
+  regenerating the gitignored `picorv32.cts.def` +
+  `picorv32.cts.ours.def` fixtures (`picorv32.cts.ours.def` SHA-256
+  `b59ef94b45b05bd7`, identical to the remote-worktree emission —
+  `write_def_full` determinism holds across hosts).
