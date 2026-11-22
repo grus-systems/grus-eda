@@ -106,8 +106,11 @@ block; gcd's `_003_` — two pins in one GCell — does).
 ## 7. Determinism
 
 - Nets emit in `net_names` order (DEF order).
-- Boxes within a net emit sorted by `(layer, yl, xl, xh, yh)`; `write_guides`
-  sorts + dedups so the order holds regardless of caller order.
+- Boxes within a net keep `NetGuide.boxes` order — it is semantic, since
+  `updateVias` pairs only consecutive same-point segments. `write_guides`
+  dedups exact duplicates on first occurrence but never re-sorts; the
+  builder emits boxes in a deterministic order (strips split at bound
+  pin cells, pairing-aware stub emission).
 - Two runs of `route` produce byte-identical files
   (`test_guide_emit_deterministic`).
 
@@ -211,26 +214,44 @@ attaches to the net's nearest node in the driver's component
 (Manhattan), carrying no cap — our tree needs a path to the driver
 where OpenROAD leaves the pin dangling.
 
-**Disconnected islands.** OpenROAD's segment graph is not always
-connected — a stub box that never pairs into an `L+1` segment stays a
-self-loop island, and whole detour branches can end up in a second
-component (gcd `_132_`: 118 route nodes, two components; OpenROAD's
-own SPEF writes island nodes with self-loop resistors). Our
-`NetRcTree` is a single BFS tree, so after the driver-rooted BFS each
-remaining component links in through a `1e-6` kΩ stub-resistor edge to
-the nearest tree node — transparent as a resistor, and it keeps every
-node's cap inside the emitted SPEF so `Σ*CAP == total_wire_cap_pf`
-round-trips through `parse_spef`/`spef_parasitics`. It is **not**
-electrically transparent for timing: the edge makes the island
-subtree's real wire RC part of the driver-rooted Elmore path, where
-OpenROAD's island pins see no wire delay and island caps never load
-the driver's path. Measured on gcd as the dominant e2e residual
-(+202 ps median / +341 ps max on the parasitics axis — §11).
-Pins attached by OpenROAD to island nodes land on those same nodes;
-the pin resistor rides the island's stub link. Note `spef_parasitics`
-still *rejects* OpenROAD's own guide SPEF on such nets (a
-`Missing route` pin bail — pre-existing strictness, unchanged here);
-our emitted SPEF is always connected and reads back fine.
+**Disconnected islands (dead components).** OpenROAD's segment graph is
+not always connected — a stub box that never pairs into an `L+1`
+segment stays a self-loop island, and whole detour branches can end up
+in a second component (gcd `_132_`: 118 route nodes, two components).
+OpenROAD's SPEF leaves such components electrically dead: island `*CAP`
+entries stay, unpaired stubs become `n n r` self-loop resistors, and no
+resistor joins an island to the driver's component — island pins see no
+wire delay and island caps never load the driver's path.
+
+`NetRcTree` mirrors this instead of bridging: after the driver-rooted
+BFS, each remaining component is appended as a **dead subtree** rooted
+at its lowest-index node as a self-parented sentinel. Island caps stay
+in `wire_cap_pf`/`total_wire_cap_pf` (so `Σ*CAP == *D_NET` round-trips),
+self-loops are recorded per node and re-emitted verbatim by
+`write_spef`, and `elmore_ns` returns 0 for pins on dead nodes. The
+same rules apply to `spef_parasitics` on the read-back side (a dead
+`*RES` component is kept, not rejected).
+
+**Lumped fallback.** OpenSTA does not always reduce a partially
+connected net to pi/elmore. Probed with `report_dcalc` on the
+gcd/picorv32 guide SPEFs (no `Pi model` line → the driver is looked up
+at `total_output_net_capacitance`, and every pin — live or dead — gets
+zero wire delay):
+
+- a dead `*P` **port** always forces the lumped fallback (the elmore
+  reduction cannot produce a port delay); the lumped load is the
+  pin-capacitance sum only — wire capacitance is excluded entirely
+  (measured on `gcd.guide.ours.spef` `_332_`/`_284_`, `picorv32`
+  `mem_la_wdata[14]`);
+- with only dead `*I` pins, the net goes lumped once the island carries
+  roughly a third of the net's wire capacitance — the probed band
+  (~0.29–0.34) is itself inconsistent between structurally identical
+  nets, so `NetRcTree::lumped` implements `dead_cap >= 0.32 * total`
+  as an approximation, documented as such.
+
+The `lumped` flag then suppresses the pi model (`pi_models[..] = None`,
+so `driver_response` evaluates the tables at the pin-cap load) and
+makes `wire_delays` return zero for every pin.
 
 ## 11. End-to-End Guide STA Golden (E4 ticket 3, measured 2026-11-22)
 

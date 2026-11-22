@@ -58,14 +58,19 @@ change honestly).
 - `pi_model`: nothing flows from a dead subtree to node 0 (the dead root's
   parent is itself), so island wire caps and island pin caps are excluded
   from the driver's moments automatically once the bridge is gone.
-- **Open question — island sink pin cap loading.** Whether OpenSTA still
-  charges an unreachable `*CONN` pin's Liberty capacitance to the driver's
-  net load is not settled by the SPEF text. Default: exclude (matches
-  "do not load the driver's path"). Decision rule: after implementation,
-  if a residual pattern on island-bearing nets (gcd `_132_`/`_057_` class)
-  reproduces a missing-pin-cap-sized shift in the decomposition's
-  parasitics/engine axis, inject the pin cap at node 0 instead. Record the
-  choice and evidence in `docs/results.md` either way.
+- **Resolved — island sink pin cap loading.** `report_dcalc` probes on
+  the guide SPEFs show OpenSTA's answer is not per-pin but per-net: when
+  the net stays pi/elmore, dead pins' caps do not load the driver; when
+  OpenSTA takes its **lumped fallback** the driver is looked up at the
+  pin-capacitance sum of *all* pins and every pin gets zero wire delay.
+  The lumped condition, as probed: a dead `*P` port always forces it;
+  dead `*I` pins alone trigger it once the island carries roughly a
+  third of the wire capacitance. `NetRcTree::lumped` implements
+  `dead_port || dead_cap >= 0.32 * total` — the band is inconsistent
+  between structurally identical nets, so this is a documented
+  approximation, not a replica of OpenSTA's internal criterion.
+  `dead_wire_cap_pf` is kept alongside `total_wire_cap_pf` so
+  `net_load` charges only live wire cap on non-lumped nets.
 - `total_wire_cap_pf` = Σ `wire_cap_pf` over **all** nodes including dead —
   per-net `*D_NET` and the e4-2 cap gate are unchanged by construction.
 

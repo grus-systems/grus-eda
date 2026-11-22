@@ -6797,3 +6797,77 @@ pinned image; `cargo test -p grus-core guide` (21 tests: both gates,
 both engine residuals, both decompositions, plus e4-2 cap gates);
 `sta --spef --json` on both designs for the worst-5 tables;
 `GRUS_PHASE_TIMING` runs above; the two fail-proof mutations above.
+
+### 2026-11-22 — e4-guide-islands: dead guide-stub islands (v0.3.12)
+
+E4 ticket (`kurena/tasks/e4-guide-islands/`): removes the dominant
+parasitics-axis residual named in the `e4-sta-e2e` entry above.
+`NetRcTree` no longer bridges unreachable components into the driver
+tree through `SPEF_STUB_RES_KOHM`; each is appended as a dead
+self-parented subtree (island `*CAP`s retained, `n n r` self-loops
+re-emitted, `elmore_ns` = 0 on dead nodes), and `spef_parasitics` stops
+bailing on disconnected `*RES` components. On the emission side, guide
+strips are split at bound pin cells and `write_guides` preserves the
+builder's box order (it is semantic for `updateVias` pairing).
+
+**Lumped-model decision (probed, then approximated).** OpenSTA does not
+always pi-reduce a partially connected net. `report_dcalc` on the
+gcd/picorv32 guide SPEFs shows the lumped fallback (pin-capacitance
+load only, zero wire delay on every pin) fires whenever a `*P` port
+sits on a dead component — OpenSTA needs an elmore port delay the
+reduction cannot produce — and, for `*I`-only dead pins, once the
+island's wire-cap share passes roughly a third of the net total. The
+boundary band itself is not reproducible: structurally identical nets
+in the 0.29–0.34 range classify both ways, so `NetRcTree::lumped`
+implements `dead_port || dead_cap >= 0.32 * total` as a documented
+approximation (probed consistent on `alu_out[6]` PI / `alu_out[4]`
+lumped / `mem_la_addr[4]` PI / `mem_la_wdata[14]` lumped /
+`_01291_` lumped / `resp_msg[3]`-`[4]` lumped / `resp_val` lumped).
+This replaces the provisional any-dead-pin rule, which misclassified
+PI nets like `pcpi_rs2[10]` (6 dead pins, PI in OpenSTA).
+
+**Decomposition re-measured** (`test_<d>_guide_sta_decomposition`, ps):
+
+| axis | gcd med | gcd p95 | gcd max | picorv32 med | picorv32 p95 | picorv32 max |
+|---|---|---|---|---|---|---|
+| topology (e4-1) | 15.78 | 50.50 | 250.80 | 437.25 | 524.90 | 626.66 |
+| parasitics (e4-2) | 0.003 | 0.24 | 6.53 | 0.00 | 11.38 | 91.83 |
+| engine | 1.43 | 1.96 | 2.11 | 1.08 | 7.04 | 51.03 |
+| total (gate) | 14.35 | 48.07 | 250.80 | 438.77 | 523.86 | 626.66 |
+
+The parasitics axis collapses from +202/+1408 ps median to ~0 — the
+island-semantics residual is gone; remaining parasitics outliers are
+self-loop population differences, not connectivity semantics. The gate
+residual is now the e4-1 topology axis: our guides still differ from
+OpenROAD's (gcd `resp_val` — our guide puts the port on a dead island
+where OpenROAD's keeps it connected, +250.8 ps = the gcd max; picorv32
+`_108xx_` register bank ~+627 ps).
+
+**Floors updated.** `GCD_GUIDE` `arr_abs`/`slack_abs` 0.25/0.20 →
+0.26/0.26 (holds the `resp_val` guide-divergence extreme).
+`PICORV32_GUIDE_ENGINE` widened: under island-era SPEFs the tail is ~17
+endpoints — fuzzy-band lumped/pi cases, dead-pin slews carrying the
+driver-waveform gap unmasked (max 26.7% on a 28 ps slew), and the E3.5
+shared-stage residual amplified by upstream high-share lumped nets
+(`_11244_`/`_11307_` ~37 ps, `mem_la_addr[4]` 22 ps) →
+`arr_rel 0.03 / arr_abs 0.04 / slew_rel 0.28 / tns_abs 0.01`. gcd's
+engine residual still fits `GCD_SPEF` (max 2.11 ps).
+
+**Artifacts.** `generate_guide_ours_spef.sh` rerun on both designs
+after the 0.3.12 bump (`*VERSION "0.3.12"`); `gcd.guide.ours.spef` +
+`gcd.guide.sta.reference.json` committed. `generate_ref.sh` step 9c
+goldens are unchanged — OpenSTA timing does not depend on the
+`*VERSION` line, and the RC content is byte-identical to the island-era
+emission the goldens were generated against.
+
+**What was run.** `cargo test -p grus-core guide` (25 tests),
+`cargo test --workspace` (377+3), `cargo clippy --workspace
+--all-targets -D warnings`; `generate_guide_ours_spef.sh` on both
+designs; `check_guide_readback.sh` on both designs (`read_guides` +
+`estimate_parasitics` accepted, `EST-0026` counts unchanged: gcd 11 /
+picorv32 249); `report_dcalc` lumped/pi probes on gcd/picorv32 guide
+SPEFs in the pinned image (`resp_val`, `mem_la_wdata[12]`/`[14]`,
+`alu_out[6]`, `mem_la_addr[4]`). Step-9c golden rerun not repeated —
+`gcd.guide.sta.reference.json` was generated against the same
+island-era `gcd.ours.guide`/ours.spef RC content that stands now;
+only the `*VERSION` line differs.

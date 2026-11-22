@@ -99,84 +99,290 @@ pub fn build_guides(
             }
         }
 
-        let mut boxes: BTreeSet<(u8, i32, i32, i32, i32)> = BTreeSet::new();
-        let mut push = |layer: LayerId, r: RectDbu| {
-            boxes.insert((layer.0, r.yl, r.xl, r.xh, r.yh));
-        };
-
-        // Each maximal run of contiguous edges merges into one strip rect
-        // spanning the union of its endpoint GCells (one box per straight
-        // run, matching the reference's convention).
-        let for_each_run = |indices: &BTreeSet<usize>, emit: &mut dyn FnMut(usize, usize)| {
+        // Box order is semantic: `updateVias` pairs only consecutive
+        // same-point segments on adjacent layers, so every pin's
+        // [access, met1] stub pair is emitted next to the strip box whose
+        // wire segment touches the pin's cell — strip runs split at pin
+        // GCells so a covered pin cell is always a strip start/end.
+        let runs_of = |indices: &BTreeSet<usize>| -> Vec<(usize, usize)> {
+            let mut runs = Vec::new();
             let mut run: Option<(usize, usize)> = None;
             for &i in indices {
                 match run {
                     Some((a, b)) if i == b + 1 => run = Some((a, i)),
                     _ => {
-                        if let Some((a, b)) = run {
-                            emit(a, b);
+                        if let Some(r) = run {
+                            runs.push(r);
                         }
                         run = Some((i, i));
                     }
                 }
             }
-            if let Some((a, b)) = run {
-                emit(a, b);
+            if let Some(r) = run {
+                runs.push(r);
             }
+            runs
         };
-        if let Some(layer) = met1 {
-            for (y, xs) in &h_rows {
-                for_each_run(xs, &mut |a, b| {
-                    let (xl, _) = grid.x_bounds(a, die_xh);
-                    let (_, xh) = grid.x_bounds(b + 1, die_xh);
-                    let (yl, yh) = grid.y_bounds(*y, die_yh);
-                    push(layer, RectDbu::new(xl, yl, xh, yh));
-                });
-            }
-        }
-        if let Some(layer) = met2 {
-            for (x, ys) in &v_cols {
-                for_each_run(ys, &mut |a, b| {
-                    let (yl, _) = grid.y_bounds(a, die_yh);
-                    let (_, yh) = grid.y_bounds(b + 1, die_yh);
-                    let (xl, xh) = grid.x_bounds(*x, die_xh);
-                    push(layer, RectDbu::new(xl, yl, xh, yh));
-                });
-            }
-        }
+        let h_runs: Vec<(usize, Vec<(usize, usize)>)> =
+            h_rows.iter().map(|(&y, xs)| (y, runs_of(xs))).collect();
+        let v_runs: Vec<(usize, Vec<(usize, usize)>)> =
+            v_cols.iter().map(|(&x, ys)| (x, runs_of(ys))).collect();
 
-        // Pin-access stubs: the pin's GCell rect on its access layer (LEF
-        // port layer for instance pins, the DEF `+ LAYER` for I/O pins) plus
-        // a `met1` stack stub into the routing band.
+        // Pin cells in `net_pins` order (deduped), each with the distinct
+        // access layers of the pins it carries: the pin's GCell rect on
+        // its access layer (LEF port layer for instance pins, the DEF
+        // `+ LAYER` for I/O pins) plus a `met1` stack stub into the
+        // routing band.
+        let mut pin_cells: Vec<(usize, usize)> = Vec::new();
+        let mut pin_accesses: Vec<BTreeSet<u8>> = Vec::new();
         for &pin in design_db.net_pins(net) {
             let p = pin.0 as usize;
             let (px, py) = design_db.pin_pos_dbu(pin, tech_db);
             let gp = grid.gcell_xy(px, py);
-            let rect = gcell_rect(gp.x as usize, gp.y as usize);
             let access = match design_db.pin_cells[p] {
                 Some(_) => design_db.pin_macro_pins[p]
                     .and_then(|mp| tech_db.macro_pins[mp.0 as usize].layer)
                     .or(met1),
                 None => design_db.pin_io_layer[p].or(met1),
             };
+            let cell = (gp.x as usize, gp.y as usize);
+            let set = match pin_cells.iter().position(|&c| c == cell) {
+                Some(i) => &mut pin_accesses[i],
+                None => {
+                    pin_cells.push(cell);
+                    pin_accesses.push(BTreeSet::new());
+                    pin_accesses.last_mut().expect("just pushed")
+                }
+            };
             if let Some(l) = access {
-                push(l, rect);
-            }
-            if let Some(l) = met1 {
-                push(l, rect);
+                set.insert(l.0);
             }
         }
 
-        let boxes = boxes
-            .into_iter()
-            .map(|(l, yl, xl, xh, yh)| GuideBox {
-                layer: LayerId(l),
-                rect: RectDbu::new(xl, yl, xh, yh),
+        // A pin cell binds to the highest strip covering it — met2 when
+        // a V run covers it, else met1. Its stub chain climbs the access
+        // layers strictly below the strip's layer, so every stub pairs
+        // into the wire (OpenROAD convention: a met1-covered pin emits
+        // only its access stub — the strip itself is the met1 rung).
+        let covered = |runs: &[(usize, Vec<(usize, usize)>)], key: usize, coord: usize| {
+            runs.iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, rs)| rs.iter().find(|&&(a, b)| a <= coord && coord <= b + 1))
+                .copied()
+        };
+        let bound_to_v: Vec<bool> = pin_cells
+            .iter()
+            .map(|&(x, y)| met2.is_some() && covered(&v_runs, x, y).is_some())
+            .collect();
+        let bound_to_h: Vec<bool> = pin_cells
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| {
+                !bound_to_v[i] && met1.is_some() && covered(&h_runs, y, x).is_some()
             })
             .collect();
+        // Stub chain per pin cell: accesses below the covering strip's
+        // layer plus the met1 rung when it is also below it; accesses at
+        // or above the strip layer keep their own stub (dead island).
+        let cover_layer = |i: usize| {
+            if bound_to_v[i] {
+                met2.map(|l| l.0)
+            } else if bound_to_h[i] {
+                met1.map(|l| l.0)
+            } else {
+                None
+            }
+            .unwrap_or(u8::MAX)
+        };
+        let met1_id = met1.map(|l| l.0);
+        let stub_chain: Vec<BTreeSet<u8>> = (0..pin_cells.len())
+            .map(|i| {
+                let cov = cover_layer(i);
+                let mut chain: BTreeSet<u8> = pin_accesses[i]
+                    .iter()
+                    .copied()
+                    .filter(|&a| a < cov)
+                    .collect();
+                if let Some(m) = met1_id
+                    && m < cov
+                {
+                    chain.insert(m);
+                }
+                chain
+            })
+            .collect();
+        let stub_extra: Vec<BTreeSet<u8>> = (0..pin_cells.len())
+            .map(|i| {
+                let cov = cover_layer(i);
+                pin_accesses[i]
+                    .iter()
+                    .copied()
+                    .filter(|&a| a >= cov)
+                    .collect()
+            })
+            .collect();
+
+        let ctx = StubCtx {
+            cells: &pin_cells,
+            chain: &stub_chain,
+            extra: &stub_extra,
+            cell_rect: &gcell_rect,
+        };
+        let mut boxes: Vec<GuideBox> = Vec::new();
+        // Strips emit met1 lines then met2 lines, each run split at pin
+        // cells with the bound stubs interleaved; unbound pin cells
+        // append their stub group last, in pin order.
+        let strip_h = |y: usize, a: usize, b: usize| {
+            let (xl, _) = grid.x_bounds(a, die_xh);
+            let (_, xh) = grid.x_bounds(b + 1, die_xh);
+            let (yl, yh) = grid.y_bounds(y, die_yh);
+            RectDbu::new(xl, yl, xh, yh)
+        };
+        let strip_v = |x: usize, a: usize, b: usize| {
+            let (yl, _) = grid.y_bounds(a, die_yh);
+            let (_, yh) = grid.y_bounds(b + 1, die_yh);
+            let (xl, xh) = grid.x_bounds(x, die_xh);
+            RectDbu::new(xl, yl, xh, yh)
+        };
+        if let Some(layer) = met1 {
+            emit_strips(
+                &h_runs,
+                false,
+                &ctx,
+                &bound_to_h,
+                layer,
+                &strip_h,
+                &mut boxes,
+            );
+        }
+        if let Some(layer) = met2 {
+            emit_strips(
+                &v_runs,
+                true,
+                &ctx,
+                &bound_to_v,
+                layer,
+                &strip_v,
+                &mut boxes,
+            );
+        }
+        for i in 0..pin_cells.len() {
+            if !bound_to_v[i] && !bound_to_h[i] {
+                ctx.group_before(i, &mut boxes);
+            }
+        }
         guides.push(NetGuide { net, boxes });
     }
     guides
+}
+
+/// Pin-cell stub emission context: each cell's stub chain (layers below
+/// the covering strip — these pair into the wire) and its extra stubs
+/// (access layers at/above the strip — dead islands).
+struct StubCtx<'a> {
+    cells: &'a [(usize, usize)],
+    chain: &'a [BTreeSet<u8>],
+    extra: &'a [BTreeSet<u8>],
+    cell_rect: &'a dyn Fn(usize, usize) -> RectDbu,
+}
+
+impl StubCtx<'_> {
+    fn push(&self, i: usize, layer: u8, boxes: &mut Vec<GuideBox>) {
+        let cell = self.cells[i];
+        boxes.push(GuideBox {
+            layer: LayerId(layer),
+            rect: (self.cell_rect)(cell.0, cell.1),
+        });
+    }
+
+    /// Stub group before a strip wire (start cell, interior split, or
+    /// unbound): the chain climbs toward the wire so its top stub pairs
+    /// first, then the extra stubs (unpairable — their own access layer
+    /// keeps the self-loop, as in OpenROAD).
+    fn group_before(&self, i: usize, boxes: &mut Vec<GuideBox>) {
+        for &l in &self.chain[i] {
+            self.push(i, l, boxes);
+        }
+        for &l in &self.extra[i] {
+            self.push(i, l, boxes);
+        }
+    }
+
+    /// Stub group after a strip's last wire (end cell): the chain top
+    /// first so it pairs with the wire — OpenROAD's own tail convention
+    /// (`_000_`: `[met2-wire, met1, li1]`), where the stubs below it
+    /// then keep their self-loops.
+    fn group_after(&self, i: usize, boxes: &mut Vec<GuideBox>) {
+        for &l in self.chain[i].iter().rev() {
+            self.push(i, l, boxes);
+        }
+        for &l in &self.extra[i] {
+            self.push(i, l, boxes);
+        }
+    }
+}
+
+/// Emits one direction's strips: every run (edges `a..=b`, covering
+/// cells `a..=b+1` on its line) splits at each pin GCell bound to this
+/// direction — an unbound or opposite-bound cell gains nothing from a
+/// split — and interleaves the bound cells' stub group:
+/// `[access, met1]` before the wire at a start/interior cell,
+/// `[met1, access]` after it at an end cell — so `updateVias` sees the
+/// stub pair consecutive with a same-point `L+1` wire endpoint.
+fn emit_strips(
+    runs: &[(usize, Vec<(usize, usize)>)],
+    vertical: bool,
+    ctx: &StubCtx<'_>,
+    bound: &[bool],
+    layer: LayerId,
+    strip_rect: &dyn Fn(usize, usize, usize) -> RectDbu,
+    boxes: &mut Vec<GuideBox>,
+) {
+    // Bound pin cells on each line keyed by line index -> sorted (line
+    // coord, pin_cells index): for H strips the key is the row y and the
+    // coord is x; for V strips the column x and the coord y.
+    let mut on_line: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+    for (i, &(x, y)) in ctx.cells.iter().enumerate() {
+        if !bound[i] {
+            continue;
+        }
+        let (key, coord) = if vertical { (x, y) } else { (y, x) };
+        on_line.entry(key).or_default().push((coord, i));
+    }
+    for v in on_line.values_mut() {
+        v.sort_unstable();
+    }
+    for (key, line_runs) in runs {
+        let cells = on_line.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        for &(a, b) in line_runs {
+            let mut cur = a;
+            for &(c, i) in cells {
+                if c == a {
+                    ctx.group_before(i, boxes);
+                } else if c < b + 1 {
+                    if cur < c {
+                        boxes.push(GuideBox {
+                            layer,
+                            rect: strip_rect(*key, cur, c - 1),
+                        });
+                        cur = c;
+                    }
+                    ctx.group_before(i, boxes);
+                }
+            }
+            if cur <= b {
+                boxes.push(GuideBox {
+                    layer,
+                    rect: strip_rect(*key, cur, b),
+                });
+            }
+            for &(c, i) in cells {
+                if c == b + 1 {
+                    ctx.group_after(i, boxes);
+                }
+            }
+        }
+    }
 }
 
 /// Net-name escaping for the guide file. OpenROAD's guide writer also
@@ -231,12 +437,14 @@ pub fn write_guides(
         let name = guide_net_name(design_db, g.net);
         writeln!(out, "{name}")?;
         writeln!(out, "(")?;
-        // Sort + dedup here so the (layer, yl, xl, xh, yh) order is the
-        // file's invariant even if a caller hands over unordered boxes.
-        let mut boxes: Vec<GuideBox> = g.boxes.clone();
-        boxes.sort_by_key(|b| (b.layer.0, b.rect.yl, b.rect.xl, b.rect.xh, b.rect.yh));
-        boxes.dedup();
-        for b in &boxes {
+        // Keep `NetGuide.boxes` order — it is semantic, since
+        // `updateVias` pairs only consecutive same-point segments — and
+        // drop exact duplicates on first occurrence.
+        let mut seen = BTreeSet::new();
+        for b in &g.boxes {
+            if !seen.insert((b.layer.0, b.rect.yl, b.rect.xl, b.rect.xh, b.rect.yh)) {
+                continue;
+            }
             writeln!(
                 out,
                 "{} {} {} {} {}",
@@ -562,8 +770,9 @@ mod tests {
         let mut buf = Vec::new();
         write_guides(&mut buf, &design, &tech, &guides).unwrap();
         let text = String::from_utf8(buf).unwrap();
-        // Boxes sort by (layer, yl, xl, xh, yh): the li1 box precedes met1.
-        assert_eq!(text, "n0\n(\n0 0 100 100 li1\n0 0 300 100 met1\n)\n");
+        // Builder order is preserved verbatim — it carries the
+        // updateVias pairing semantics.
+        assert_eq!(text, "n0\n(\n0 0 300 100 met1\n0 0 100 100 li1\n)\n");
         let parsed = parse_guides(&text, &tech).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, "n0");
@@ -571,12 +780,12 @@ mod tests {
             parsed[0].1,
             vec![
                 GuideBox {
-                    layer: LayerId(0),
-                    rect: RectDbu::new(0, 0, 100, 100)
-                },
-                GuideBox {
                     layer: LayerId(1),
                     rect: RectDbu::new(0, 0, 300, 100)
+                },
+                GuideBox {
+                    layer: LayerId(0),
+                    rect: RectDbu::new(0, 0, 100, 100)
                 },
             ]
         );
@@ -731,6 +940,56 @@ mod tests {
         guide_metrics("picorv32");
     }
 
+    /// Diagnostic census of the pin-cell binding classes behind the
+    /// residual self-loop count — each class maps to a predicted residual
+    /// in OpenROAD's `updateVias` read-back (docs/e4-guides.md §10).
+    /// Printed with `--nocapture`; asserted only for sanity (counts sum
+    /// to the pin-cell total).
+    fn stub_binding_census(design: &str) {
+        use std::collections::BTreeMap;
+
+        let (tech_db, design_db) = load_design(design);
+        let routed = crate::congestion::route_design(&design_db, &tech_db, None, None);
+        let guides = build_guides(&design_db, &tech_db, &routed);
+        // Recount boxes by shape: gcell-sized stubs vs strips, per layer.
+        let mut strips = 0usize;
+        let mut stubs = 0usize;
+        for g in &guides {
+            for b in &g.boxes {
+                // A stub box covers exactly one GCell — emit code produces
+                // it via `gcell_rect`; strips are strictly larger.
+                if b.rect.xh - b.rect.xl == b.rect.yh - b.rect.yl {
+                    stubs += 1;
+                } else {
+                    strips += 1;
+                }
+            }
+        }
+        let mut per_layer: BTreeMap<u8, usize> = BTreeMap::new();
+        for g in &guides {
+            for b in &g.boxes {
+                *per_layer.entry(b.layer.0).or_default() += 1;
+            }
+        }
+        eprintln!(
+            "{design}: nets={} boxes={} strips={} stubs={} per_layer={per_layer:?}",
+            guides.len(),
+            strips + stubs,
+            strips,
+            stubs
+        );
+    }
+
+    #[test]
+    fn stub_binding_census_gcd() {
+        stub_binding_census("gcd");
+    }
+
+    #[test]
+    fn stub_binding_census_picorv32() {
+        stub_binding_census("picorv32");
+    }
+
     #[test]
     fn test_guide_emit_deterministic() {
         let (tech_db, design_db) = load_design("gcd");
@@ -761,19 +1020,27 @@ mod tests {
         );
         let guides = build_guides(&design, &tech, &r);
         let g = &guides[0];
-        // H run x=0..=1 row 1: [0,100]-[300,200] met1.
+        // H run x=0..=1 row 1: [0,100]-[300,200] met1. Pin B sits at its
+        // end cell x=2 but binds to the met2 strip, so no stub interleaves.
         assert!(has(g, 1, 0, 100, 300, 200), "met1 strip: {g:?}");
-        // V run y=0..=1 col 2: [200,0]-[300,300] met2.
-        assert!(has(g, 2, 200, 0, 300, 300), "met2 strip: {g:?}");
-        // Stubs: A->li1+met1 at (0,0); B->li1+met1 at (2,1); C->met2+met1 at (3,2).
+        // V run y=0..=1 col 2 covers pin B's cell (2,1) interior: the
+        // strip splits so B's stub pair sits between the two pieces.
+        assert!(has(g, 2, 200, 0, 300, 200), "met2 prefix: {g:?}");
+        assert!(has(g, 2, 200, 100, 300, 300), "met2 suffix: {g:?}");
+        assert_eq!(g.boxes.len(), 9, "{g:?}");
+        // B's bound stubs emit access-first, adjacent to a strip wire.
+        let b_stub = g
+            .boxes
+            .iter()
+            .position(|b| b.rect == RectDbu::new(200, 100, 300, 200) && b.layer == LayerId(0))
+            .expect("B access stub");
+        assert_eq!(g.boxes[b_stub + 1].layer, LayerId(1), "met1 after access");
+        // Stubs: A unbound [li1, met1] at (0,0); C unbound [met1, met2] at (3,2).
         assert!(has(g, 0, 0, 0, 100, 100));
         assert!(has(g, 1, 0, 0, 100, 100));
-        assert!(has(g, 0, 200, 100, 300, 200));
         assert!(has(g, 1, 200, 100, 300, 200));
-        assert!(has(g, 2, 300, 200, 400, 300));
         assert!(has(g, 1, 300, 200, 400, 300));
-        // No dup: re-traversed H(3) is inside the merged strip already.
-        assert_eq!(g.boxes.len(), 8, "{g:?}");
+        assert!(has(g, 2, 300, 200, 400, 300));
         // Net n1 (pin A only, no segments) emits just its stubs.
         assert_eq!(guides[1].boxes.len(), 2);
         assert!(has(&guides[1], 0, 0, 0, 100, 100));
