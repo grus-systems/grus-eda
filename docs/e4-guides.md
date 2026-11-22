@@ -108,9 +108,24 @@ block; gcd's `_003_` — two pins in one GCell — does).
 - Nets emit in `net_names` order (DEF order).
 - Boxes within a net keep `NetGuide.boxes` order — it is semantic, since
   `updateVias` pairs only consecutive same-point segments. `write_guides`
-  dedups exact duplicates on first occurrence but never re-sorts; the
-  builder emits boxes in a deterministic order (strips split at bound
-  pin cells, pairing-aware stub emission).
+  dedups exact duplicates on first occurrence but never re-sorts.
+- Builder order: `met1` H strips, then `met2` V strips, then unbound
+  pin-cell stub groups. Each pin GCell carries a stub **chain**
+  (access layers strictly below the covering strip plus the `met1`
+  rung — these pair into the wire) and **extra** stubs (access layers
+  at/above the strip — dead islands by construction). Runs split at
+  every bound pin cell so a covered pin cell is always a strip
+  start/interior/end cell:
+  - pin cell at a strip **start** or **interior** split point: stub
+    group goes *before* the following wire, extras first then the
+    chain ascending — the chain's top stub lands adjacent to the
+    wire's `L` segment and pairs;
+  - pin cell at a strip **end**: stub group goes *after* the last
+    wire, chain descending first — mirrors OpenROAD's own tail
+    convention (`_000_`: `[met2-wire, met1, li1]` → the met1 stub
+    pairs, the access stub keeps its self-loop);
+  - pin cell covered by **no** strip: group appended last, same
+    order as the before-case (extras, then chain).
 - Two runs of `route` produce byte-identical files
   (`test_guide_emit_deterministic`).
 
@@ -278,4 +293,6 @@ starts clean:
 
 Our side regenerates via `tests/designs/generate_guide_ours_spef.sh`
 (release binary; `*VERSION` stamped from the workspace version).
-Verdict and named-cause numbers: `docs/results.md` `e4-sta-e2e`.
+Verdict and named-cause numbers: `docs/results.md` `e4-sta-e2e` and
+`e4-guide-islands` (the island-semantics fix — parasitics-axis median
+collapsed to ~0; the gate residual is now the e4-1 topology axis).

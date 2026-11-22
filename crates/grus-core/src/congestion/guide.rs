@@ -296,14 +296,14 @@ impl StubCtx<'_> {
     }
 
     /// Stub group before a strip wire (start cell, interior split, or
-    /// unbound): the chain climbs toward the wire so its top stub pairs
-    /// first, then the extra stubs (unpairable — their own access layer
-    /// keeps the self-loop, as in OpenROAD).
+    /// unbound): the extra stubs (access at/above the strip — unpairable,
+    /// each keeps its own self-loop as in OpenROAD) go first so the
+    /// chain's top stub lands adjacent to the wire and can pair.
     fn group_before(&self, i: usize, boxes: &mut Vec<GuideBox>) {
-        for &l in &self.chain[i] {
+        for &l in &self.extra[i] {
             self.push(i, l, boxes);
         }
-        for &l in &self.extra[i] {
+        for &l in &self.chain[i] {
             self.push(i, l, boxes);
         }
     }
@@ -325,10 +325,10 @@ impl StubCtx<'_> {
 /// Emits one direction's strips: every run (edges `a..=b`, covering
 /// cells `a..=b+1` on its line) splits at each pin GCell bound to this
 /// direction — an unbound or opposite-bound cell gains nothing from a
-/// split — and interleaves the bound cells' stub group:
-/// `[access, met1]` before the wire at a start/interior cell,
-/// `[met1, access]` after it at an end cell — so `updateVias` sees the
-/// stub pair consecutive with a same-point `L+1` wire endpoint.
+/// split — and interleaves the bound cells' stub group: extras then the
+/// chain before the wire at a start/interior cell, chain descending
+/// then extras after it at an end cell — so `updateVias` sees the
+/// chain's top stub consecutive with a same-point `L+1` wire endpoint.
 fn emit_strips(
     runs: &[(usize, Vec<(usize, usize)>)],
     vertical: bool,
@@ -359,7 +359,7 @@ fn emit_strips(
             for &(c, i) in cells {
                 if c == a {
                     ctx.group_before(i, boxes);
-                } else if c < b + 1 {
+                } else if c < b + 1 && c > a {
                     if cur < c {
                         boxes.push(GuideBox {
                             layer,
@@ -940,11 +940,11 @@ mod tests {
         guide_metrics("picorv32");
     }
 
-    /// Diagnostic census of the pin-cell binding classes behind the
-    /// residual self-loop count — each class maps to a predicted residual
-    /// in OpenROAD's `updateVias` read-back (docs/e4-guides.md §10).
-    /// Printed with `--nocapture`; asserted only for sanity (counts sum
-    /// to the pin-cell total).
+    /// Diagnostic census of the emitted box stream — per-layer box count
+    /// plus a strip/stub split (square, single-GCell boxes are stubs).
+    /// Print-only diagnostic for `--nocapture`; the strip/stub classes
+    /// behind the residual self-loop count are documented in
+    /// docs/e4-guides.md §10.
     fn stub_binding_census(design: &str) {
         use std::collections::BTreeMap;
 

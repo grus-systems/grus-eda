@@ -634,6 +634,11 @@ impl Context<'_> {
                     }
                 })
         });
+        // Dead pins still contribute their pin capacitance: on a lumped net
+        // the whole pin-cap sum is OpenSTA's load, and on a pi/elmore net
+        // the pi model (not this sum) drives the cell lookup — the only
+        // place a dead pin cap leaks through is the `set_driving_cell`
+        // port path, which was left unprobed (≤ one pin cap).
         wire + self
             .design
             .net_pins(net)

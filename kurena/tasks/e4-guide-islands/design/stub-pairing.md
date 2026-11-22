@@ -72,3 +72,24 @@ dropped for strips/stubs; dedup still applies):
   so per-net caps are unchanged; the e4-2 gate must stay 269/269 and
   6744/6744.
 - `resolve_guide_nets`, `escape_guide_name`, `guide_net_name` unchanged.
+
+## As-implemented refinements (review fixes)
+
+- **chain/extra split.** A pin GCell can carry several pins with distinct
+  access layers, so the `[access, met1]` pair generalizes: the stub
+  **chain** is the accesses strictly below the covering strip plus the
+  `met1` rung; the **extra** stubs are the accesses at/above the strip
+  (dead islands by construction — their own layer never meets an `L+1`
+  wire).
+- **extras emit before the chain** in the before-position. Emitting
+  `chain` then `extra` (the first cut) put the extra stub between the
+  chain top and the wire, so neither could pair — two dead stubs where
+  the extras-first order leaves one. End cells keep the OpenROAD tail
+  convention (chain descending first, then extras).
+- **run bounds.** The interior branch requires `a < c < b + 1`; an
+  earlier cut let cells before the run (`c < a`) re-emit their stub
+  group for every later run on the line — phantom duplicates in
+  `NetGuide.boxes` (dedup'd away by `write_guides`, but polluting
+  `guide_metrics` counts and in-memory consumers).
+- Measured census, topology delta, and the fail-proof record live in
+  `docs/results.md` (`e4-guide-islands` entry, 2026-11-22).
