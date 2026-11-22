@@ -652,11 +652,17 @@ tolerances, probe evidence — is in
   on the TritonCTS DEF vs ours within `max(5 ps, 1%)` per endpoint.
 - Progress: ticket 1 `e5-cts-ref` committed the TritonCTS goldens; ticket 2
   `e5-insert-api` landed the `DesignDb` mutation API; ticket 3 `e5-cts-tree`
-  (`v0.5.0`) landed the depth-balanced constructor — `grus-eda cts` emits
-  legal CTS DEFs in the TritonCTS census league (gcd 6/depth 2, picorv32
-  230/depth 4) with informational propagated-STA readings; see
-  `docs/e5-cts.md`. Remaining: dummy-load repair and the strict e2e
-  comparison (`e5-cts-e2e`).
+  (`v0.5.0`) landed the depth-balanced constructor; ticket 4 `e5-cts-e2e`
+  (`v0.5.1`) scored our CTS DEFs against the committed goldens — criteria 2
+  (insertion) met on both designs, criterion 1 (skew) met on gcd, and the
+  named residual is **tree-shape** (our depth-balanced tree equalizes
+  buffer count, not per-pin RC): picorv32 skew +34.4 ps over bound (engine
+  residual on the same tree ≤0.41 ps), gcd hold-side endpoint fields ~9.5
+  ps early, picorv32 endpoints up to 94.4 ps with a secondary engine axis
+  on the `_1145x` reset-launched cluster; see `docs/e5-cts.md` and
+  `docs/results.md`. Remaining: dummy-load repair
+  (`repair_clock_nets`-class work) and, if the skew residual is to be
+  closed, a per-pin RC/latency balancing pass.
 - Sizing: ~6–8 tickets (M–L).
 
 ### E8. IR drop (power-grid analysis)

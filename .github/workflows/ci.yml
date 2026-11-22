@@ -47,6 +47,15 @@ jobs:
         if: ${{ hashFiles('tests/designs/picorv32/picorv32.rcx.spef') == '' }}
         run: tests/designs/picorv32/generate_ref.sh
 
+      # The picorv32 CTS DEF is gitignored but test_picorv32_cts_decomposition
+      # requires it; the script's two committed goldens must byte-reproduce —
+      # a drift is a finding, not something to commit (E0 lesson 1).
+      - name: Generate picorv32 CTS reference
+        if: ${{ hashFiles('tests/designs/picorv32/picorv32.cts.def') == '' }}
+        run: |
+          tests/designs/generate_cts_ref.sh picorv32
+          git diff --exit-code -- tests/designs/picorv32/picorv32.cts.reference.json tests/designs/picorv32/picorv32.cts.sta.reference.json
+
       - name: Generate aes reference inputs
         if: ${{ hashFiles('tests/designs/aes/aes.util65.def') == '' }}
         run: tests/designs/aes/generate_ref.sh
@@ -96,6 +105,7 @@ jobs:
             tests/designs/picorv32/picorv32.rcx.spef
             tests/designs/picorv32/picorv32.sta.reference.json
             tests/designs/picorv32/picorv32.util65.def
+            tests/designs/picorv32/picorv32.cts.def
             tests/designs/picorv32/pins_routed.txt
             tests/designs/aes/aes.synth.v
             tests/designs/aes/aes.synth.json

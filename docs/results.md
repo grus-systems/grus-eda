@@ -7397,3 +7397,152 @@ dropping `connect_pin(out_pin, net)` leaves every tree net driverless —
 restored, all green. Test helper `member_name`'s unreachable `None` arm
 removed (merged into `sta_pin_name`). `cargo test -p grus-core cts` and
 clippy re-verified green after the changes.
+
+### 2026-11-23 — e5-cts-e2e: strict scoring vs the TritonCTS goldens (v0.5.1)
+
+E5 ticket 4 (`kurena/tasks/e5-cts-e2e/`), the final E5 gate: propagated-
+clock STA on our CTS DEF scored **per endpoint** against the committed
+`<d>.cts.sta.reference.json` (criteria 3), plus skew (criterion 1) and max
+insertion delay (criterion 2) against `<d>.cts.reference.json`, with the
+census + clock-net HPWL printed as the criterion-4 honesty gate. Ours-side
+DEFs come from the new committed host script
+`tests/designs/generate_cts_ours.sh <d>` (`grus-eda cts` on
+`<d>.placed.def` + `<d>.cts.sdc`): gcd's pair is committed
+(`gcd.cts.ours.def` 56,644 B, `gcd.cts.ours.report.json` 593 B);
+picorv32's are gitignored (DEF 1,478,078 B > 1 MB) and regenerate
+byte-identically. Harness: `cts_sta_run` / `cts_e2e` /
+`cts_decomposition` in `crates/grus-core/src/cts/mod.rs`; our STA runs
+`estimate_placement_parasitics` (met2) on the re-parsed emitted DEF, the
+exact `cts_placement_rc` regime the golden was collected under.
+
+**Criterion verdicts**
+
+| Criterion | Bound | gcd | picorv32 |
+|---|---|---|---|
+| 1 — skew | `max(25 ps, 25%)` of ref spread | **met**: ours 2.150 ps vs ref 1.372 ps | **named residual — tree-shape**: ours 70.563 ps vs ref 36.209 ps (+34.35 ps over bound) |
+| 2 — max insertion delay | within 15% of `latency_max` | **met**: 0.306086 vs 0.314567 ns (−2.7%) | **met**: 0.802071 vs 0.793474 ns (+1.1%) |
+| 3 — per-endpoint STA | `max(5 ps, 1%)` on arr/req/slack (slew measured, `arr_rel` + 5 ps default) | **named residual — tree-shape**: 42/424 fields out, all `min_req` (36 regs, ~9.5 ps) + 6 `min_arr` | **named residual — tree-shape dominant, engine secondary**: 3,068/14,384 fields + `tns_max` out (max \|diff\| 94.4 ps) |
+| 4 — census + clock-net HPWL | informational | printed | printed |
+
+**Criterion 1 — skew.** The bound compares *spreads* (max−min of the
+clock-pin `arrival_max` rise surfaces vs `latency_max − latency_min`),
+not the signed `skew_setup`/`skew_hold` scalars — the reference-setup
+axis quantifies that convention gap (gcd |`skew_setup`| = spread = 1.373
+ps; picorv32 34.165 ps vs spread 36.209 ps, a 2.0 ps definition gap
+between `worst_clock_skew` and the latency fields). gcd **met**
+(|2.150 − 1.372| = 0.78 ps ≤ 25 ps). picorv32 is a **named tree-shape
+residual**: our depth-balanced tree equalizes buffer *count* (depth 4
+everywhere) but not per-pin RC — fast sinks land at 0.7315 ns (ref min
+0.7573) while the slow tail reaches 0.8021 ns (ref max 0.7935), so our
+spread is nearly double. The engine is *not* the cause: ours-STA on
+TritonCTS's own DEF reproduces every one of its 1,597 clock-pin
+latencies to ≤ **0.41 ps** and its spread to 0.17 ps (36.037 vs 36.209
+ps). Held by `PICORV32_CTS_SKEW_ABS_NS = 0.036` (measured gap 34.35 ps).
+
+**Criterion 2 — max insertion delay.** Both met: gcd ours 0.306086 vs ref
+0.314567 ns (−2.7% ≤ 15%); picorv32 ours 0.802071 vs ref 0.793474 ns
+(+1.1%).
+
+**Criterion 3 — per-endpoint STA** (the `total` axis below; `engine` =
+our STA on the reference CTS DEF vs golden, `tree-shape` = our STA on
+our DEF vs our STA on the reference DEF — per-field max |diff|, ps):
+
+| Axis | design | max_arr | max_req | max_slack | max_slew | min_arr | min_req | min_slack | min_slew |
+|---|---|---|---|---|---|---|---|---|---|
+| engine | gcd | 5.69 | 0.60 | 5.69 | 10.09 | 1.37 | 0.48 | 1.20 | 4.22 |
+| tree-shape | gcd | 9.41 | 9.58 | 9.41 | 0.04 | 9.41 | 9.59 | 9.41 | 0.06 |
+| total | gcd | 14.77 | 9.26 | 14.77 | 10.09 | 9.52 | 9.26 | 9.52 | 4.28 |
+| engine | picorv32 | 62.49 | 54.04 | 37.03 | 16.91 | 7.63 | 6.60 | 2.28 | 15.90 |
+| tree-shape | picorv32 | 63.52 | 94.62 | 63.72 | 0.27 | 66.22 | 61.81 | 64.33 | 15.45 |
+| total | picorv32 | 64.53 | 94.43 | 71.45 | 16.91 | 64.89 | 61.60 | 63.52 | 15.90 |
+
+- **gcd — named tree-shape residual** (42/424 fields): our tree's
+  insertion delay sits ~9.5 ps *below* TritonCTS's (ours 0.3039–0.3061 vs
+  ref 0.3132–0.3146 ns — 6 buffers vs 5 `clkbuf_16` + 3 dummy loads), so
+  every capture `min_req` shifts ~9.5 ps early (36 register `D` pins at
+  ref ~0.28 ns, bound 5 ps) and 6 output-port `min_arr` rows exceed
+  marginally. The engine axis on the same DEF leaves ≤0.6 ps on
+  `min_req` — the residual is the tree, not the timing engine. Held by
+  `GCD_CTS.arr_abs_ns = 0.016` (measured total max 14.77 ps on
+  `resp_val` arr/slack); all other fields stay on the criterion bound.
+  WNS/TNS: `wns_max` ours 1.340619 vs ref 1.334227 (+6.4 ps, inside the
+  1% arm), `wns_min` +1.0 ps, TNS 0 both corners.
+- **picorv32 — named tree-shape (dominant) + engine (secondary)
+  residual** (3,068/14,384 fields + `tns_max`): per-pin insertion
+  deltas of up to 59.4 ps (`_10350_` cluster, ours 0.7316 vs ref-tree
+  0.7909 ns) push hold-side fields on ~1.2 ns paths past the floor
+  (min: `min_req` 1,364 + `min_arr` 1,251, max |diff| ~65 ps) and shift
+  the launch/capture on setup fields (`max_req` 94.4 ps at `_11459_/D`,
+  `max_slack` 71.5 ps at `_11313_/D`). On top sits the engine axis —
+  ours vs golden on TritonCTS's *own* tree leaves arr 62.5/req 54.0/
+  slack 37.0 ps on the `_1145x`/`_09987_` `resetn`-launched cluster, the
+  recorded E3.5 cell-stage gap (`PICORV32_PROPAGATED`'s named regime),
+  wider here because real propagated launches expose the same slow-slew
+  stages; min-side engine is ≤7.6 ps. Held by `PICORV32_CTS`:
+  `arr_abs 0.095`, `slack_abs 0.072`, `slew_abs 0.017` (new field —
+  the `Tol` slew arm hardcodes 5 ps and our measured slew residual is
+  16.9 ps on 23–55 ps slews, tree-shifted clock-pin slews feeding the
+  launch stages), `tns_abs 2.6` (measured `tns_max` diff 2.520 ns:
+  ours −93.516 vs ref −96.036 — the 2.5% arm gives 2.40 ns).
+  WNS: `wns_max` −1.767606 vs −1.779235 (+11.6 ps), `wns_min` +2.9 ps.
+  `unmapped_cells=3,150` and `unreached_endpoints=106` equal the placed-
+  design baseline (counted skips, not CTS regressions); endpoint sets
+  matched exactly (1,798/1,798 pins, 8/8 fields).
+
+**Criterion 4 — census + clock-net HPWL (informational).**
+
+| Field | gcd ref | gcd ours | picorv32 ref | picorv32 ours |
+|---|---|---|---|---|
+| `sinks` / `tree_depth` | 35 / 2 | **35 / 2** | 1,597 / 4 | **1,597 / 4** |
+| `inserted_instances` | 8 (5 tree + 3 dummy) | 6 | 253 (197 + 56) | 230 |
+| tree buffers by type | `clkbuf_16` ×5 | `clkbuf_16` ×1 + `clkbuf_8` ×5 | `clkbuf_8` ×68 + `clkbuf_16` ×129 | `clkbuf_16` ×1 + `clkbuf_8` ×229 |
+| `clock_subnets` | 5 | 6 | 197 | 230 |
+| `clock_net_wirelength_um` | 370.244 | 428.107 | 12,749.174 | 16,260.659 |
+| `avg_sink_wirelength_um` | 120.660 | 18.307 | 756.540 | 16.734 |
+| `def_components` / `def_signal_nets` | 392 / 274 | 390 / 275 | 10,458 / 7,008 | 10,435 / 7,041 |
+
+`avg_sink_wirelength_um` remains a *different quantity* than the
+reference's `CTS-0101` (ours: mean sink→leaf-buffer Manhattan) — printed,
+never equated (`docs/e5-cts.md` §3).
+
+**Fail-proof** (tests.md): (a) skipping `run_cts` in `cts_sta_run` — the
+gcd gate goes red on all 35 clock-pin sanity rows (ours ~1–2 ps vs ref
+~0.31 ns, the unbuffered-net regime) plus criterion 2 (0.0026 vs
+0.3146 ns); restored green. (b) swapping `latency_max`→`latency_min` in
+the criterion-2 bound stays **green** on gcd — the 15% arm (~47 ps)
+cannot discriminate the reference's 1.37 ps min/max gap; bound
+discrimination for the clock surface is instead evidenced by (a) and by
+criterion 1 going red on picorv32 at +34.35 ps before
+`PICORV32_CTS_SKEW_ABS_NS` was applied. Recorded, not silently widened.
+
+**What was run**: `bash tests/designs/generate_cts_ours.sh gcd` and
+`… picorv32` verbatim (release `grus-eda cts`, 0.64 ms / 7.09 ms);
+`tests/designs/generate_cts_ref.sh picorv32` inside the committed
+LibreLane container byte-reproduced `picorv32.cts.def` (SHA-256 prefix
+`59556c0c7a4da5e4`, matches the README record) and both committed
+goldens (`git diff` empty) — the decomposition input is the same DEF the
+golden was scored on. `cargo test -p grus-core cts::` — 15/15 green,
+including the new `test_{gcd,picorv32}_cts_e2e` gates,
+`test_{gcd,picorv32}_cts_decomposition` (prints the axis table above),
+`test_gcd_cts_ours_def_deterministic` (committed artifact == fresh
+emission) and `test_picorv32_cts_def_deterministic`; the e2e gate also
+asserts the emitted STA input text equals `emit_cts_def`'s output.
+`cargo test --workspace` — **399 grus-core + 4 grus-eda tests pass, 0
+failures** (2 pre-existing jpeg ignores); the first run failed 3
+`test_picorv32_guide_*` on missing gitignored artifacts (same gap the
+`e5-cts-tree` worktree hit): regenerated on-host —
+`tests/designs/generate_guide_ours_spef.sh picorv32` for
+`picorv32.guide.ours.spef` + `runs/guide-check/picorv32.ours.guide`, then
+`generate_ref.sh` steps **5d** and **9c** only, verbatim-extracted
+(`runs/gen_guide_missing.sh`, gitignored) inside
+`ghcr.io/librelane/librelane:3.0.16` producing `picorv32.guide.spef` and
+`picorv32.guide.sta.reference.json`; the committed
+`picorv32.guide.caps.txt` re-extraction is byte-identical (`git diff`
+empty). `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+The heavy `cargo test --release -p grus-core sta` regression: **run** —
+213 tests pass, 0 failures (2 pre-existing jpeg ignores), 15.9 s.
+
+**Version note**: `0.5.0 → 0.5.1` **patch** per AGENTS.md §5's 0.x rule —
+this ticket adds tests, a script and docs with no API change (the
+`0.4.0 → 0.5.0` minor was the ticket's explicit instruction; none given
+here).
