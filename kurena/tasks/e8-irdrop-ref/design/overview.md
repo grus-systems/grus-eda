@@ -40,16 +40,20 @@ ticket.
   (`conventions.md`): (a) PDNSim's embedded per-instance power
   estimate, and (b) `set_pdnsim_inst_power -inst <name> -power <watts>`
   fed from `report_power -instances [get_cells *]` produced in the same
-  container run. Convention (b) is the expected mirror for the E8
-  engine (our N7 `power` emits per-instance power); the golden pins the
-  choice and the measured delta.
-- **Two openroad processes, one per convention.** The
-  clean-state precedent (step 9b/9c, `generate_cts_ref.sh` step C):
-  process A measures connectivity + the embedded convention + dumps the
-  per-instance power report; a python step turns that report into a
-  sourced Tcl of `set_pdnsim_inst_power` calls; process B measures the
-  explicit convention. This also isolates the convention-B measurement
-  from any solution-reuse state in process A.
+  container run. Measured outcome (2026-11-23): the annotation is
+  **additive** to the computed estimate (the step-C2 all-zero probe
+  leaves the solve untouched while zeroing the reported total), so (b)
+  cannot substitute an external estimator — the mirror pin is
+  **`embedded`**, which is also the P-IRD scoping regime. The sta feed
+  and the zeroed probe stay in the golden as the evidence.
+- **Three openroad processes.** The clean-state precedent (step 9b/9c,
+  `generate_cts_ref.sh` step C): process A measures connectivity + the
+  embedded convention + dumps the per-instance power report; a python
+  step turns that report into a sourced Tcl of `set_pdnsim_inst_power`
+  calls; process B measures the explicit convention; process C2
+  annotates every instance to `0.0` and re-measures (the additive-vs-
+  substitute discriminator). Fresh processes isolate each measurement
+  from any `-allow_reuse` solution state.
 - **Both nets, both semantics.** `check_power_grid` and
   `analyze_power_grid -voltage_file` run on `VPWR` **and** `VGND`. The
   golden records whether the `VGND` report describes a bounce (rise) or

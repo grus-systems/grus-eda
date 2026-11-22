@@ -67,6 +67,33 @@ artifacts that did emit, and the fallback is named in
 written reason in the commit — it contradicts the engine's planned
 architecture.
 
+## Measured outcome (2026-11-23, implementation)
+
+The delta is **not** ~0, and the mechanism is now pinned by a third
+measurement added to the script (step C2, `zeroed`): annotating every
+instance `-power 0.0` leaves the solve's drops **byte-identical** to
+embedded (`voltage_map_identical_to_embedded: true` on both nets and
+both designs) while the reported total reads `0.00e+00 W`. The
+`sta_per_instance` run's ~2× drop (gcd VPWR 5.91e-04 → 1.18e-03,
+picorv32 VPWR 4.30e-03 → 8.60e-03) then decomposes exactly: in this
+image `set_pdnsim_inst_power` is **additive** — the annotation sets the
+per-instance power shown in the report's Total-power line **and** adds
+that much current on top of OpenSTA's computed estimate in the solve.
+It does not substitute.
+
+That makes the "unrepresentable" branch of the decision rule fire in a
+stronger sense than the enumerated examples: convention (b) as designed
+— our per-instance numbers substituted for OpenSTA's — cannot exist on
+this surface; any explicit feed produces `computed + annotated`. The
+pinned `convention_mirrored` is therefore **`embedded`**: the embedded
+path is where an external per-instance power estimate maps onto the
+solve (our engine supplies N7 power where PDNSim calls OpenSTA power),
+and it is also the P-IRD scoping regime (1.04 mW / 0.591 mV) the E8
+done-when tolerances were scoped against. `sta_per_instance` stays in
+the golden with its delta and `zeroed_probe` as the measured evidence
+of the annotation model — useful later if the engine ever needs the
+annotation surface (e.g. per-instance override experiments).
+
 ## Relationship to the scoping gate
 
 Done-when criterion 3 (`done-when.md` §E8) asks: what drives the

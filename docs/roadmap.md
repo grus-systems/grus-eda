@@ -676,6 +676,19 @@ tolerances, probe evidence — is in
   within `max(5%, 1 mV)` of the reference on `gcd.placed.def`; the
   current-source convention (embedded estimate vs `set_pdnsim_inst_power`)
   pinned by the golden ticket.
+- Progress 2026-11-23 (ticket `e8-irdrop-ref`): reference committed —
+  `tests/designs/generate_irdrop_ref.sh` runs `check_power_grid` +
+  `analyze_power_grid -voltage_file` on VPWR+VGND in the pinned image on
+  both designs and byte-reproduces its goldens on rerun. Embedded numbers
+  match the P-IRD scoping (gcd VPWR total 1.04 mW, supply 1.80 V, avg
+  drop 0.223 mV, worst 0.591 mV, 384 CSV rows; VGND worst bounce 0.559
+  mV; picorv32 VPWR worst 4.30 mV / VGND 3.61 mV, 10,205 rows). The
+  convention item resolved **embedded**: `set_pdnsim_inst_power` is
+  additive to the computed estimate — feeding OpenSTA's per-instance
+  power doubles the drop (gcd 0.591→1.18 mV) and the all-zero probe
+  leaves the solve byte-identical to embedded while reporting 0.00 W —
+  so the explicit feed cannot substitute an external estimator. See
+  `docs/results.md` 2026-11-23.
 - Missing: SPECIALNETS via extraction, LEF `VIA` resistance, resistor mesh,
   a sparse DC solve (new dependency).
 - Sizing: ~4–6 tickets (M).

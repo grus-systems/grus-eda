@@ -7572,3 +7572,115 @@ here).
   `picorv32.cts.ours.def` fixtures (`picorv32.cts.ours.def` SHA-256
   `b59ef94b45b05bd7`, identical to the remote-worktree emission —
   `write_def_full` determinism holds across hosts).
+
+### 2026-11-23 — e8-irdrop-ref: PDNSim reference goldens on gcd + picorv32
+
+E8 ticket 1 (`kurena/tasks/e8-irdrop-ref/`). New committed script
+`tests/designs/generate_irdrop_ref.sh <design>` — same host-wrapper
+shape as `generate_cts_ref.sh` (re-invokes itself inside
+`ghcr.io/librelane/librelane:3.0.16`, repo at `/work`, PDK at `/pdk`,
+`-u $(id -u):$(id -g)`). Three `openroad -no_init -no_splash` processes
+per design: A = command-surface probe + `check_power_grid` + design and
+per-instance `report_power` + embedded `analyze_power_grid
+-voltage_file`; B = explicit `set_pdnsim_inst_power` feed
+(`inst_power.tcl` emitted by a python step from `report_power
+-instances [get_cells *] -digits 12`, the **Total** column, name is the
+last report column) + re-analysis; C2 = every instance annotated
+`-power 0.0` + re-analysis (the additive-vs-substitute discriminator).
+
+**Commands verbatim**: `bash tests/designs/generate_irdrop_ref.sh gcd`
+and `bash tests/designs/generate_irdrop_ref.sh picorv32`, each run
+twice inside the pinned image; the second run byte-reproduced every
+committed artifact (SHA-256 sets identical — rerun count 1 per design
+after the initial generation). The gitignored
+`tests/designs/<d>/runs/irdrop/` scratch (transcripts `irdrop_{a,b,c}.log`,
+`inst_power.rpt`, `inst_power.tcl`, `step_a.json`, `*.zeroed.csv`)
+holds the evidence trail.
+
+**Measured grammar** (written into the parsers, kept as `report_lines`
+in the goldens): the `analyze_power_grid` report is a fenced block
+`########## IR report #################` … `######################################`
+with `Net / Corner / Total power / Supply voltage / Worstcase voltage /
+Average voltage / Average IR drop / Worstcase IR drop / Percentage
+drop` fields; it carries a Total-power line, so `total_power_source` is
+`analyze_report`. The deviation label is `IR drop` for **both** rails —
+`drop_semantics` records the physics instead (`drop` below the 1.80 V
+supply on POWER, `bounce` above the 0 V rail on GROUND; the sign check
+aborts on a mismatch). `check_power_grid` returns `1` on a connected
+net (catch `code=0 result=1`). Bare-call probes error
+`PSM-0057`/`-0058`/`-0063` ("Argument … not specified"), catch `1`.
+Transcript caveat: command echo makes markers appear inside
+`openroad>`/`...>` lines — every marker match anchors at `^`.
+
+**gcd vs the P-IRD scoping numbers** (embedded convention; the script
+reads `gcd.sdc` where the P-IRD probe did not — the embedded total did
+not move):
+
+| metric | P-IRD scoping | measured embedded | verdict |
+|---|---|---|---|
+| total power | 1.04 mW | 1.04e-03 W | matches |
+| supply voltage | 1.80 V | 1.80e+00 V | matches |
+| avg IR drop (VPWR) | 0.223 mV | 2.23e-04 V | matches |
+| worst IR drop (VPWR) | 0.591 mV | 5.91e-04 V | matches |
+| voltage CSV rows | 384+ | 384 per net | matches |
+| connectivity | "All shapes on net VPWR are connected." | verbatim on VPWR **and** VGND | matches |
+
+New beyond scoping — VGND (bounce semantics): embedded avg
+2.05e-04 V / worst 5.59e-04 V above the 0 V rail (0.03 %); sta feed avg
+4.10e-04 / worst 1.12e-03 (0.06 %); zeroed total 0.00 W, worst
+5.59e-04, map byte-identical to embedded.
+
+**Current-source convention — pinned: `embedded`.** The explicit feed
+does not reproduce the embedded regime: sta deltas are ~+1× the
+embedded drop (gcd VPWR worst 5.91e-04 → 1.18e-03, avg 2.23e-04 →
+4.46e-04; VGND 5.59e-04 → 1.12e-03; reported `Total power` stays
+1.04e-03 = the annotated sum). The `zeroed_probe` nails the mechanism:
+annotating all 384 instances to 0.0 W reports `Total power` 0.00e+00
+**and** leaves drops and the voltage map byte-identical to embedded —
+in this image `set_pdnsim_inst_power` overrides the *reported* power
+but is **additive** to the computed estimate in the solve
+(`computed + annotated`; feeding the computed values back therefore
+doubles the current). An external per-instance estimator cannot be
+substituted through this surface, so the E8 engine mirrors the
+embedded convention — same structure ("per-instance power → current
+sources → solve"), our N7 power where PDNSim calls OpenSTA's, and it is
+the 1.04 mW / 0.591 mV regime the done-when tolerances were scoped on.
+`inst_power_feed` (gcd): `def_components`/`inst_count`/`report_rows`/
+`applied` = 384 across the board (physical cells included, at 0 W);
+design `report_power` total 1.036152e-03 W vs annotated sum
+1.0361524e-03 W.
+
+**picorv32 — included.** `picorv32.placed.def` (gitignored, seeded) +
+`picorv32.sdc`, 10,205 components, `report_rows == inst_count ==
+def_components == 10205` (TAP/endcap rows at 0 W), no name-format edge
+(bus-bracket names feed `set_pdnsim_inst_power -inst {…}` cleanly).
+Embedded: VPWR supply 1.80 V, avg drop 2.67e-04, worst 4.30e-03
+(0.24 %); VGND bounce avg 2.54e-04, worst 3.61e-03 (0.20 %); total
+power 1.44e-02 W both nets. sta feed doubles exactly (VPWR worst
+8.60e-03, VGND 7.22e-03); zeroed probe identical to embedded on both
+nets. Connectivity: "All shapes on net VPWR are connected." / "…VGND…".
+
+**Artifacts** (all committed, every CSV under the 1 MB rule):
+
+| file | size | SHA-256 (first 16) |
+|---|---|---|
+| `tests/designs/gcd/gcd.irdrop.reference.json` | 7,509 B | `1c7579fd86c831f3` |
+| `tests/designs/gcd/gcd.irdrop.voltage.vpwr.embedded.csv` | 17,926 B, 384 rows | `104751f49d4bf55e` |
+| `tests/designs/gcd/gcd.irdrop.voltage.vpwr.sta.csv` | 17,926 B, 384 rows | `fcc5496eb45dcf47` |
+| `tests/designs/gcd/gcd.irdrop.voltage.vgnd.embedded.csv` | 17,926 B, 384 rows | `9695415708cc1811` |
+| `tests/designs/gcd/gcd.irdrop.voltage.vgnd.sta.csv` | 17,926 B, 384 rows | `a9ba5afc6fc1507c` |
+| `tests/designs/picorv32/picorv32.irdrop.reference.json` | 7,537 B | `0fe609c65736bd23` |
+| `tests/designs/picorv32/picorv32.irdrop.voltage.vpwr.embedded.csv` | 502,848 B, 10,205 rows | `b6dec368639e38a7` |
+| `tests/designs/picorv32/picorv32.irdrop.voltage.vpwr.sta.csv` | 502,848 B, 10,205 rows | `8a254e1420e42c9a` |
+| `tests/designs/picorv32/picorv32.irdrop.voltage.vgnd.embedded.csv` | 502,777 B, 10,205 rows | `3086c0d21564e1aa` |
+| `tests/designs/picorv32/picorv32.irdrop.voltage.vgnd.sta.csv` | 502,777 B, 10,205 rows | `d83d534262d34079` |
+
+**What was run**: the committed script end-to-end on both designs,
+twice each (byte-identical artifacts); a one-shot exploratory probe
+(`runs/irdrop/probe*.tcl`, gitignored) beforehand to pin the report
+grammar and the additive-annotation semantics — its two measurements
+(embedded analysis and the all-zero annotation) are what steps A and C2
+of the committed script now reproduce deterministically. Nothing else:
+no solver work, no version bump (reference-only, nothing
+Cargo-visible). `cargo test --workspace` and `cargo clippy --workspace
+--all-targets -- -D warnings` both pass.

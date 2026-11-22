@@ -1,0 +1,220 @@
+{
+  "design": "gcd",
+  "input_def": "gcd.placed.def",
+  "input_sdc": "gcd.sdc",
+  "image": "ghcr.io/librelane/librelane:3.0.16",
+  "convention_mirrored": "embedded",
+  "conventions": [
+    "embedded",
+    "sta_per_instance"
+  ],
+  "inst_power_feed": {
+    "source": "report_power -instances [get_cells *] -digits 12",
+    "def_components": 384,
+    "inst_count": 384,
+    "report_rows": 384,
+    "applied": 384,
+    "design_report_total_w": 0.001036152,
+    "inst_feed_total_w": 0.0010361523807115639
+  },
+  "nets": {
+    "VGND": {
+      "use": "GROUND",
+      "connectivity": "All shapes on net VGND are connected.",
+      "connectivity_code": 0,
+      "connectivity_result": "1",
+      "conventions": {
+        "embedded": {
+          "total_power_w": 0.00104,
+          "total_power_source": "analyze_report",
+          "supply_voltage_v": 0.0,
+          "worstcase_voltage_v": 0.000559,
+          "average_voltage_v": 0.000205,
+          "average_drop_v": 0.000205,
+          "worst_drop_v": 0.000559,
+          "drop_percent": 0.03,
+          "report_wording": "drop",
+          "corner": "default",
+          "report_lines": [
+            "Net              : VGND",
+            "Corner           : default",
+            "Total power      : 1.04e-03 W",
+            "Supply voltage   : 0.00e+00 V",
+            "Worstcase voltage: 5.59e-04 V",
+            "Average voltage  : 2.05e-04 V",
+            "Average IR drop  : 2.05e-04 V",
+            "Worstcase IR drop: 5.59e-04 V",
+            "Percentage drop  : 0.03 %"
+          ],
+          "drop_semantics": "bounce",
+          "csv_file": "gcd.irdrop.voltage.vgnd.embedded.csv",
+          "csv_rows": 384,
+          "csv_size_bytes": 17926,
+          "csv_sha256_16": "9695415708cc1811"
+        },
+        "sta_per_instance": {
+          "total_power_w": 0.00104,
+          "total_power_source": "analyze_report",
+          "supply_voltage_v": 0.0,
+          "worstcase_voltage_v": 0.00112,
+          "average_voltage_v": 0.00041,
+          "average_drop_v": 0.00041,
+          "worst_drop_v": 0.00112,
+          "drop_percent": 0.06,
+          "report_wording": "drop",
+          "corner": "default",
+          "report_lines": [
+            "Net              : VGND",
+            "Corner           : default",
+            "Total power      : 1.04e-03 W",
+            "Supply voltage   : 0.00e+00 V",
+            "Worstcase voltage: 1.12e-03 V",
+            "Average voltage  : 4.10e-04 V",
+            "Average IR drop  : 4.10e-04 V",
+            "Worstcase IR drop: 1.12e-03 V",
+            "Percentage drop  : 0.06 %"
+          ],
+          "drop_semantics": "bounce",
+          "csv_file": "gcd.irdrop.voltage.vgnd.sta.csv",
+          "csv_rows": 384,
+          "csv_size_bytes": 17926,
+          "csv_sha256_16": "a9ba5afc6fc1507c"
+        }
+      },
+      "zeroed_probe": {
+        "total_power_w": 0.0,
+        "total_power_source": "analyze_report",
+        "supply_voltage_v": 0.0,
+        "worstcase_voltage_v": 0.000559,
+        "average_voltage_v": 0.000205,
+        "average_drop_v": 0.000205,
+        "worst_drop_v": 0.000559,
+        "drop_percent": 0.03,
+        "report_wording": "drop",
+        "corner": "default",
+        "report_lines": [
+          "Net              : VGND",
+          "Corner           : default",
+          "Total power      : 0.00e+00 W",
+          "Supply voltage   : 0.00e+00 V",
+          "Worstcase voltage: 5.59e-04 V",
+          "Average voltage  : 2.05e-04 V",
+          "Average IR drop  : 2.05e-04 V",
+          "Worstcase IR drop: 5.59e-04 V",
+          "Percentage drop  : 0.03 %"
+        ],
+        "drop_semantics": "bounce",
+        "voltage_map_identical_to_embedded": true,
+        "csv_rows": 384,
+        "csv_sha256_16": "9695415708cc1811"
+      },
+      "delta": {
+        "worst_drop_v": 0.0005609999999999999,
+        "average_drop_v": 0.000205,
+        "total_power_w": 0.0,
+        "average_voltage_v": 0.000205,
+        "voltage_maps_identical": false
+      },
+      "conventions_share_voltage_map": false
+    },
+    "VPWR": {
+      "use": "POWER",
+      "connectivity": "All shapes on net VPWR are connected.",
+      "connectivity_code": 0,
+      "connectivity_result": "1",
+      "conventions": {
+        "embedded": {
+          "total_power_w": 0.00104,
+          "total_power_source": "analyze_report",
+          "supply_voltage_v": 1.8,
+          "worstcase_voltage_v": 1.8,
+          "average_voltage_v": 1.8,
+          "average_drop_v": 0.000223,
+          "worst_drop_v": 0.000591,
+          "drop_percent": 0.03,
+          "report_wording": "drop",
+          "corner": "default",
+          "report_lines": [
+            "Net              : VPWR",
+            "Corner           : default",
+            "Total power      : 1.04e-03 W",
+            "Supply voltage   : 1.80e+00 V",
+            "Worstcase voltage: 1.80e+00 V",
+            "Average voltage  : 1.80e+00 V",
+            "Average IR drop  : 2.23e-04 V",
+            "Worstcase IR drop: 5.91e-04 V",
+            "Percentage drop  : 0.03 %"
+          ],
+          "drop_semantics": "drop",
+          "csv_file": "gcd.irdrop.voltage.vpwr.embedded.csv",
+          "csv_rows": 384,
+          "csv_size_bytes": 17926,
+          "csv_sha256_16": "104751f49d4bf55e"
+        },
+        "sta_per_instance": {
+          "total_power_w": 0.00104,
+          "total_power_source": "analyze_report",
+          "supply_voltage_v": 1.8,
+          "worstcase_voltage_v": 1.8,
+          "average_voltage_v": 1.8,
+          "average_drop_v": 0.000446,
+          "worst_drop_v": 0.00118,
+          "drop_percent": 0.07,
+          "report_wording": "drop",
+          "corner": "default",
+          "report_lines": [
+            "Net              : VPWR",
+            "Corner           : default",
+            "Total power      : 1.04e-03 W",
+            "Supply voltage   : 1.80e+00 V",
+            "Worstcase voltage: 1.80e+00 V",
+            "Average voltage  : 1.80e+00 V",
+            "Average IR drop  : 4.46e-04 V",
+            "Worstcase IR drop: 1.18e-03 V",
+            "Percentage drop  : 0.07 %"
+          ],
+          "drop_semantics": "drop",
+          "csv_file": "gcd.irdrop.voltage.vpwr.sta.csv",
+          "csv_rows": 384,
+          "csv_size_bytes": 17926,
+          "csv_sha256_16": "fcc5496eb45dcf47"
+        }
+      },
+      "zeroed_probe": {
+        "total_power_w": 0.0,
+        "total_power_source": "analyze_report",
+        "supply_voltage_v": 1.8,
+        "worstcase_voltage_v": 1.8,
+        "average_voltage_v": 1.8,
+        "average_drop_v": 0.000223,
+        "worst_drop_v": 0.000591,
+        "drop_percent": 0.03,
+        "report_wording": "drop",
+        "corner": "default",
+        "report_lines": [
+          "Net              : VPWR",
+          "Corner           : default",
+          "Total power      : 0.00e+00 W",
+          "Supply voltage   : 1.80e+00 V",
+          "Worstcase voltage: 1.80e+00 V",
+          "Average voltage  : 1.80e+00 V",
+          "Average IR drop  : 2.23e-04 V",
+          "Worstcase IR drop: 5.91e-04 V",
+          "Percentage drop  : 0.03 %"
+        ],
+        "drop_semantics": "drop",
+        "voltage_map_identical_to_embedded": true,
+        "csv_rows": 384,
+        "csv_sha256_16": "104751f49d4bf55e"
+      },
+      "delta": {
+        "worst_drop_v": 0.000589,
+        "average_drop_v": 0.000223,
+        "total_power_w": 0.0,
+        "average_voltage_v": 0.0,
+        "voltage_maps_identical": false
+      },
+      "conventions_share_voltage_map": false
+    }
+  }
+}

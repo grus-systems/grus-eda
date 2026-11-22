@@ -77,25 +77,40 @@ puts "IRD-PROBE [catch {check_power_grid} r]; $r"
 ```
 
 The step-B parser asserts each `IRD-PROBE` line reports an error
-(`catch` result 1) naming the missing argument — an unmatched surface
-(i.e. a bare call succeeding or a different command existing) aborts
+(`catch` result 1) — in this image the catch result is the bare PSM
+code and the preceding `[ERROR <code>] <text>` transcript line carries
+"Argument <flag> not specified."; both are recorded. An unmatched
+surface (a bare call succeeding or a different command existing) aborts
 the script, it never defaults.
 
-### A1 — connectivity (verbatim verdict)
+### A1 — power/ground nets + connectivity (verbatim verdict)
+
+The analyzed nets are enumerated from the DEF itself, not hardcoded:
 
 ```tcl
-catch {check_power_grid -net VPWR} conn_vpwr
-puts "IRD-CONN VPWR err=$conn_vpwr"
-catch {check_power_grid -net VGND} conn_vgnd
-puts "IRD-CONN VGND err=$conn_vgnd"
+set block [ord::get_db_block]
+set pdn_nets {}
+foreach net [$block getNets] {
+    if {[$net isSpecial]} {
+        puts "IRD-NET [$net getName] [$net getSigType]"
+        lappend pdn_nets [$net getName]
+    }
+}
+foreach n $pdn_nets {
+    set code [catch {check_power_grid -net $n} res]
+    puts "IRD-CONN $n code=$code result=$res"
+}
 ```
 
 The `PSM-0040`-class verdict lines print to `irdrop_a.log` inside the
 command on success; the `catch` keeps a failed check (`PSM-0069`-class
 error) from aborting the process — a connectivity failure is a real
 finding recorded via the `IRD-CONN` line, not a script failure. The
-parser extracts both the verdict text and the `IRD-CONN` error field
-verbatim into the golden.
+parser extracts the verdict text plus the `IRD-CONN` `code` (catch
+status) and `result` (the command's own return value — `1` on a
+connected net) verbatim into the golden. `getSigType` is cross-checked
+against the DEF `+ USE` map in step B (gcd/picorv32: `VPWR`→POWER,
+`VGND`→GROUND).
 
 ### A2 — per-instance power report (the convention-(b) feed)
 
@@ -127,8 +142,9 @@ a valid measurement; a silently truncated one is not.
 ### A3 — embedded convention
 
 ```tcl
-analyze_power_grid -net VPWR -voltage_file /work/tests/designs/$D/runs/irdrop/vpwr.embedded.csv
-analyze_power_grid -net VGND -voltage_file /work/tests/designs/$D/runs/irdrop/vgnd.embedded.csv
+foreach n $pdn_nets {
+    analyze_power_grid -net $n -voltage_file /work/tests/designs/$D/runs/irdrop/[string tolower $n].embedded.csv
+}
 exit
 ```
 
@@ -157,9 +173,11 @@ and does:
 2. Extract the connectivity verdict lines for VPWR and VGND verbatim.
 3. Parse each `analyze_power_grid` report block into the metric set in
    `golden.md`; every unmatched expectation is a script failure.
-4. Parse `inst_power.rpt` rows (`inst_name internal switching leakage
-   total`); every row must be a name in the DEF `COMPONENTS` name set
-   plus 4 parseable floats. Three counts go into the golden:
+4. Parse `inst_power.rpt` rows (`internal switching leakage total
+   inst_name` — the name is the **last** column; measured grammar). The
+   table is exactly two header lines + a dash separator + rows; every
+   row must be 4 parseable floats plus a name in the DEF `COMPONENTS`
+   name set. Three counts go into the golden:
    `def_components` (odb insts), `inst_count` (`llength [get_cells *]`
    — the list fed to `-instances`), `report_rows` (parsed rows).
    `report_rows == inst_count` is asserted — a report that silently
@@ -187,8 +205,9 @@ read_liberty ...; read_lef ...; read_lef ...
 read_def /work/tests/designs/$D/$D.placed.def
 read_sdc /work/tests/designs/$D/$D.sdc
 source /work/tests/designs/$D/runs/irdrop/inst_power.tcl
-analyze_power_grid -net VPWR -voltage_file /work/tests/designs/$D/runs/irdrop/vpwr.sta.csv
-analyze_power_grid -net VGND -voltage_file /work/tests/designs/$D/runs/irdrop/vgnd.sta.csv
+foreach n $pdn_nets {
+    analyze_power_grid -net $n -voltage_file /work/tests/designs/$D/runs/irdrop/[string tolower $n].sta.csv
+}
 exit
 ```
 
@@ -197,11 +216,26 @@ Rationale for the second process: `analyze_power_grid` carries an
 running convention (b) in a fresh process keeps the two measurements
 independent and matches the clean-parasitics precedent.
 
+## Step C2 — zeroed-annotation semantics probe (third process)
+
+Added during implementation when the sta run showed a ~2× delta. A
+third `openroad` process, tee'd to `runs/irdrop/irdrop_c.log`, re-reads
+the same inputs, annotates **every** instance to `0.0` via
+`set_pdnsim_inst_power`, prints `IRD-ZERO applied=<count>` (asserted
+equal to `def_components`), and re-measures both nets into
+`<net>.zeroed.csv`. Substitution semantics would collapse the drop to
+~0; measured instead (both designs): reported `Total power` 0.00 W,
+drop and voltage map identical to embedded — the annotation is
+additive to OpenSTA's computed power. This is the committed evidence
+behind `convention_mirrored: embedded`.
+
 ## Step D — golden assembly + CSV naming
 
 A second `python3` heredoc:
 
-1. Parses `irdrop_b.log` into the same per-net metric set.
+1. Parses `irdrop_b.log` and `irdrop_c.log` into the same per-net
+   metric set (the C blocks become `zeroed_probe`; the C2 CSVs are
+   compared byte-for-byte against embedded and not committed).
 2. Compares each net's embedded vs explicit voltage CSV byte-for-byte.
    Naming rule (per `goal.md`): if the two conventions produce a
    byte-identical CSV for a net, commit one file
@@ -230,6 +264,14 @@ A second `python3` heredoc:
   `inst_power.rpt` row/name mismatch → python `sys.exit`.
 - `set_pdnsim_inst_power` error inside step C (e.g. `findInst` miss on
   a name-format edge) → Tcl aborts; investigate, don't catch.
+
+## Transcript-marker caveat (found in implementation)
+
+The openroad transcript echoes the Tcl commands themselves behind
+`openroad>` / `...>` prompts, so marker strings like `IRD-FATAL`,
+`IRD-NET`, `IRD-SURFACE`, `IRD-CONN` appear inside echoed `puts` text.
+Every marker match — the `grep` and the python regexes — anchors at
+line start (`^IRD-…`), which matches tool output only.
 
 ## Determinism
 
