@@ -8375,19 +8375,24 @@ scalars reported as deltas. Reference total current is
 `total_power_w / current_scale_v` (the only golden quantity OpenROAD's
 report does not print).
 
-**Commands run** (debug binary, host macOS M-series, `/usr/bin/time -l`):
+**Commands run** (release binary `target/release/grus-eda`, host macOS
+M-series, `/usr/bin/time -l`, `--out-dir tests/designs/<d>` so the six
+outputs below are the committed artifacts):
 
 ```
-./target/debug/grus-eda irdrop \
+/usr/bin/time -l ./target/release/grus-eda irdrop \
   --lib $PDK/lib/sky130_fd_sc_hd__tt_025C_1v80.lib \
   --tlef $PDK/techlef/sky130_fd_sc_hd__nom.tlef \
   --lef $PDK/lef/sky130_fd_sc_hd.lef \
   --def tests/designs/<d>/<d>.placed.def --sdc tests/designs/<d>/<d>.sdc \
-  --reference tests/designs/<d>/<d>.irdrop.reference.json --out-dir /tmp/irdrop-<d>
+  --reference tests/designs/<d>/<d>.irdrop.reference.json \
+  --out-dir tests/designs/<d>
 ```
 
 (no activity file → default activity, no parasitics — the same input
-regime as `generate_irdrop_ref.sh`'s embedded analysis.)
+regime as `generate_irdrop_ref.sh`'s embedded analysis.) Committed
+outputs: `tests/designs/gcd/gcd.irdrop.voltage.ours.{vpwr,vgnd}.csv`,
+`gcd.irdrop.summary.ours.json`, and the three `picorv32.` counterparts.
 
 **gcd** (244 nodes, 2 sources, 384 sinks per net; source clamps 1.80 V /
 0.0 V):
@@ -8452,9 +8457,12 @@ holds to the direct solve's rounding noise — measured max |v − Vs| =
 (exact equality over-claims Cholesky); `total_current_a == 0` stays
 exact because nothing is stamped. `tests.md` item 4 corrected.
 
-**Runtime/RSS** (debug build, solve-only elapsed from the CLI log; RSS
-is whole-process): gcd 2.92 ms / 3.05 ms per net, 25.3 MB peak;
-picorv32 158.7 ms / 159.6 ms per net, 41.8 MB peak, 0.72 s wall total.
+**Runtime/RSS** (release build; `elapsed_ms` in the CLI line and the
+summary JSON measures only the `solve_pdn_net` call — matrix assembly
+plus Cholesky — mesh build, row generation and CSV I/O are excluded;
+RSS is whole-process `/usr/bin/time -l` peak): gcd VPWR 0.78 ms /
+VGND 1.28 ms solve elapsed, 23,216,128 B peak RSS; picorv32 VPWR
+9.42 ms / VGND 10.93 ms solve elapsed, 41,893,888 B peak RSS.
 Matrix sizes: 240×240 (gcd), ~5.4k×5.4k (picorv32), nnz ≈ 3× resistor
 count.
 
@@ -8468,3 +8476,12 @@ pre-existing jpeg ignores; `finished in 113.46s`),
 `cargo clippy --workspace --all-targets -- -D warnings` (clean),
 `cargo test -p grus-core --lib pdn::solve` 12/12 including both
 real-design row contracts. `kurena/tasks/e8-solve/spec/` untouched.
+
+**Card-#43 follow-ups** (2026-11-23, same commit): the six prescribed
+outputs were regenerated with the release binary into the design
+directories and committed (paths above); runtime/RSS re-measured on
+the release build. `solve_with_sink_currents` now takes an explicit
+`net_label` so `PdnSolve.net` carries the resolved net name instead of
+`SymbolId(N)` debug text. `elapsed_ms` is documented and now measures
+only the solve call (assembly + Cholesky); previously it also covered
+mesh build, row generation and CSV output.

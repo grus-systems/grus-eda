@@ -1,0 +1,101 @@
+{
+  "design": "picorv32",
+  "current_scale_v": 1.8,
+  "estimator_total_power_w": 0.008127580380243266,
+  "nets": [
+    {
+      "csv_file": "picorv32.irdrop.voltage.ours.vgnd.csv",
+      "csv_rows": 10205,
+      "elapsed_ms": 10.926041,
+      "summary": {
+        "net": "VGND",
+        "use_kind": "Ground",
+        "nodes": 5489,
+        "source_nodes": 6,
+        "resistors": 5666,
+        "sinks": 10205,
+        "source_voltage_v": 0.0,
+        "current_scale_v": 1.8,
+        "injected_power_w": 0.008127580380243466,
+        "uninjected_power_w": -1.682681771697503e-16,
+        "total_current_a": 0.004515322433468592,
+        "average_voltage_v": 0.00015990103899623097,
+        "worstcase_voltage_v": 0.0007210298617464229,
+        "average_drop_v": 0.00015990103899623097,
+        "worst_drop_v": 0.0007210298617464229,
+        "drop_percent": 0.04005721454146794,
+        "drop_semantics": "bounce",
+        "solver_method": "nalgebra-sparse CscCholesky",
+        "iterations": 0,
+        "residual_inf": 3.854941058175012e-19,
+        "residual_rel_inf": 1.3673341658893926e-17,
+        "max_source_error_v": 0.0
+      },
+      "reference": {
+        "total_power_w": 0.0144,
+        "supply_voltage_v": 0.0,
+        "average_voltage_v": 0.000254,
+        "worstcase_voltage_v": 0.00361,
+        "average_drop_v": 0.000254,
+        "worst_drop_v": 0.00361,
+        "total_current_a": 0.008,
+        "csv_rows": 10205
+      },
+      "deltas": {
+        "total_power_w": -0.006272419619756534,
+        "total_current_a": -0.003484677566531408,
+        "average_voltage_v": -0.00009409896100376903,
+        "worstcase_voltage_v": -0.0028889701382535772,
+        "average_drop_v": -0.00009409896100376903,
+        "worst_drop_v": -0.0028889701382535772
+      }
+    },
+    {
+      "csv_file": "picorv32.irdrop.voltage.ours.vpwr.csv",
+      "csv_rows": 10205,
+      "elapsed_ms": 9.421125,
+      "summary": {
+        "net": "VPWR",
+        "use_kind": "Power",
+        "nodes": 5468,
+        "source_nodes": 6,
+        "resistors": 5645,
+        "sinks": 10205,
+        "source_voltage_v": 1.8,
+        "current_scale_v": 1.8,
+        "injected_power_w": 0.008127580380243466,
+        "uninjected_power_w": -1.682681771697503e-16,
+        "total_current_a": 0.004515322433468592,
+        "average_voltage_v": 1.7998353197243957,
+        "worstcase_voltage_v": 1.7991982297283966,
+        "average_drop_v": 0.00016468027560382495,
+        "worst_drop_v": 0.0008017702716034414,
+        "drop_percent": 0.044542792866857854,
+        "drop_semantics": "drop",
+        "solver_method": "nalgebra-sparse CscCholesky",
+        "iterations": 0,
+        "residual_inf": 1.687538997430238e-14,
+        "residual_rel_inf": 2.329660102067721e-16,
+        "max_source_error_v": 0.0
+      },
+      "reference": {
+        "total_power_w": 0.0144,
+        "supply_voltage_v": 1.8,
+        "average_voltage_v": 1.8,
+        "worstcase_voltage_v": 1.8,
+        "average_drop_v": 0.000267,
+        "worst_drop_v": 0.0043,
+        "total_current_a": 0.008,
+        "csv_rows": 10205
+      },
+      "deltas": {
+        "total_power_w": -0.006272419619756534,
+        "total_current_a": -0.003484677566531408,
+        "average_voltage_v": -0.00016468027560434528,
+        "worstcase_voltage_v": -0.0008017702716034414,
+        "average_drop_v": -0.00010231972439617504,
+        "worst_drop_v": -0.0034982297283965586
+      }
+    }
+  ]
+}

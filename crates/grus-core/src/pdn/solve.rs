@@ -189,13 +189,14 @@ pub fn solve_with_sink_currents(
     use_kind: PdnUse,
     options: &SolveOptions,
     sink_currents: &[f64],
+    net_label: &str,
 ) -> Result<PdnSolve> {
     solve_inner(
         mesh,
         use_kind,
         options,
         sink_currents,
-        format!("{:?}", mesh.net),
+        net_label.to_string(),
     )
 }
 
@@ -590,7 +591,7 @@ mod tests {
             current_scale_v: 1.8,
         };
         let solve =
-            solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[0.01]).unwrap();
+            solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[0.01], "net").unwrap();
         // V_leaf = 1.8 - I*(R1+R2) = 1.8 - 0.05
         assert!((solve.node_voltages_v[2] - 1.75).abs() <= 1e-12);
         assert!((solve.sink_voltages_v[0] - 1.75).abs() <= 1e-12);
@@ -609,7 +610,7 @@ mod tests {
             current_scale_v: 1.8,
         };
         let solve =
-            solve_with_sink_currents(&mesh, PdnUse::Ground, &options, &[0.01]).unwrap();
+            solve_with_sink_currents(&mesh, PdnUse::Ground, &options, &[0.01], "net").unwrap();
         // V_leaf = I*(R1+R2) = 0.05 above the 0 V clamp.
         assert!((solve.node_voltages_v[2] - 0.05).abs() <= 1e-12);
         let s = &solve.summary;
@@ -629,7 +630,7 @@ mod tests {
         };
         let currents = vec![0.001; mesh.sinks.len()];
         let solve =
-            solve_with_sink_currents(&mesh, PdnUse::Power, &options, &currents).unwrap();
+            solve_with_sink_currents(&mesh, PdnUse::Power, &options, &currents, "net").unwrap();
         for &s in &mesh.sources {
             assert_eq!(solve.node_voltages_v[s as usize], 1.8);
         }
@@ -650,7 +651,8 @@ mod tests {
             };
             let currents = vec![0.0; mesh.sinks.len()];
             let solve =
-                solve_with_sink_currents(&mesh, use_kind, &options, &currents).unwrap();
+                solve_with_sink_currents(&mesh, use_kind, &options, &currents, "net")
+                    .unwrap();
             // The exact answer is `vs` on every free node; the Cholesky
             // factor/solve returns it plus rounding noise (measured
             // ≤ 7.1e-15 V). The bound is far below the six-significant-
@@ -694,6 +696,7 @@ mod tests {
                 current_scale_v: 1.8,
             },
             &[0.01],
+            "net",
         )
         .unwrap();
         // Add a second, parallel 2 Ω resistor: equivalent 1 Ω.
@@ -711,6 +714,7 @@ mod tests {
                 current_scale_v: 1.8,
             },
             &[0.01],
+            "net",
         )
         .unwrap();
         // Single R=2: V = 1.8 - 0.02; parallel pair R=1: V = 1.8 - 0.01.
@@ -725,12 +729,12 @@ mod tests {
             source_voltage_v: 1.8,
             current_scale_v: 1.8,
         };
-        assert!(solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[0.1, 0.2]).is_err());
+        assert!(solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[0.1, 0.2], "net").is_err());
         // Negative currents are legal (negative Liberty internal-power
         // energies feed through as signed current sources).
-        assert!(solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[-0.1]).is_ok());
-        assert!(solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[f64::NAN]).is_err());
-        assert!(solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[f64::INFINITY]).is_err());
+        assert!(solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[-0.1], "net").is_ok());
+        assert!(solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[f64::NAN], "net").is_err());
+        assert!(solve_with_sink_currents(&mesh, PdnUse::Power, &options, &[f64::INFINITY], "net").is_err());
         assert!(
             solve_with_sink_currents(
                 &mesh,
@@ -739,7 +743,8 @@ mod tests {
                     source_voltage_v: f64::NAN,
                     current_scale_v: 1.8
                 },
-                &[0.1]
+                &[0.1],
+                "net",
             )
             .is_err()
         );
@@ -751,19 +756,20 @@ mod tests {
                     source_voltage_v: 1.8,
                     current_scale_v: 0.0
                 },
-                &[0.1]
+                &[0.1],
+                "net",
             )
             .is_err()
         );
         // Non POWER/GROUND use kinds are rejected.
         assert!(
-            solve_with_sink_currents(&mesh, PdnUse::Signal, &options, &[0.1]).is_err()
+            solve_with_sink_currents(&mesh, PdnUse::Signal, &options, &[0.1], "net").is_err()
         );
         // No sources at all: validate() reports NoSources.
         let mut no_src = analytic_mesh();
         no_src.sources.clear();
         no_src.nodes[0].is_source = false;
-        assert!(solve_with_sink_currents(&no_src, PdnUse::Power, &options, &[0.1]).is_err());
+        assert!(solve_with_sink_currents(&no_src, PdnUse::Power, &options, &[0.1], "net").is_err());
         // A dangling free node is caught by validate() before factoring.
         let mut dangling = analytic_mesh();
         dangling.nodes.push(MeshNode {
@@ -774,7 +780,7 @@ mod tests {
             dangling: false,
         });
         assert!(
-            solve_with_sink_currents(&dangling, PdnUse::Power, &options, &[0.1]).is_err()
+            solve_with_sink_currents(&dangling, PdnUse::Power, &options, &[0.1], "net").is_err()
         );
     }
 

@@ -1502,8 +1502,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let name = design.strings.resolve(net.name).to_string();
                 let block = embedded(&name)?;
                 let supply = field(block, &name, "supply_voltage_v")?;
-                let t_net = std::time::Instant::now();
                 let mesh = grus_core::pdn::build_mesh(&design, &tech_db, net)?;
+                let t_solve = std::time::Instant::now();
                 let solve = grus_core::pdn::solve_pdn_net(
                     &design,
                     net,
@@ -1526,7 +1526,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         .map_err(|e| anyhow::anyhow!("create {:?}: {e}", csv_path))?);
                     grus_core::pdn::write_voltage_csv(&rows, &mut out)?;
                 }
-                let elapsed_ms = t_net.elapsed().as_secs_f64() * 1000.0;
+                let elapsed_ms = t_solve.elapsed().as_secs_f64() * 1000.0;
 
                 let reference = grus_core::pdn::IrDropReference {
                     total_power_w: field(block, &name, "total_power_w")?,
