@@ -133,10 +133,10 @@
         "[WARNING GRT-0281] Net clk has a large fanout of 1598 terminals."
       ],
       "timing": {
-        "global_route_s": 1.509,
-        "detailed_route_s": 751.176,
-        "check_antennas_s": 101.834,
-        "total_route_s": 854.519
+        "global_route_s": 1.597,
+        "detailed_route_s": 791.159,
+        "check_antennas_s": 81.337,
+        "total_route_s": 874.093
       }
     },
     "delegated": {
@@ -261,10 +261,10 @@
         "[WARNING GRT-0281] Net clk has a large fanout of 1598 terminals."
       ],
       "timing": {
-        "read_guides_s": 0.232,
-        "detailed_route_s": 989.539,
-        "check_antennas_s": 94.034,
-        "total_route_s": 1083.805
+        "read_guides_s": 0.335,
+        "detailed_route_s": 825.885,
+        "check_antennas_s": 88.412,
+        "total_route_s": 914.632
       }
     }
   },
@@ -281,6 +281,6 @@
       "M2M3_PR": 81,
       "M3M4_PR": -30
     },
-    "total_route_s": 229.286
+    "total_route_s": 40.539
   }
 }
