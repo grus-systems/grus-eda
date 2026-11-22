@@ -6285,11 +6285,13 @@ cells.
 | `power.slews` | aes `power.placement` | 131 (127–136) | 109 (108–112) | −22 |
 | `power.slews` | picorv32 `power.placement` | 90 (88–91) | 73 (72–74) | −18 |
 
-`sta.prepare.clock.walk` does not appear — it fires zero times on
-ideal-clock cells (the `any_propagated || pulse_width_checks` gate; the
-absent line is data, same convention as the baseline table). Where it
-fires it is a small serial tail: jpeg `sta.placement` 7.9 (6.3–8.0) →
-6.1 (5.9–7.4) ms.
+`sta.prepare.clock.walk` is absent from the table, not from the runs:
+the `any_propagated || (!for_slew && pulse_width_checks)` gate fires it
+once per `sta.*` cell (every committed design carries `min_pulse_width`
+arcs) — a serial tail, jpeg `sta.placement` 7.9 (6.3–8.0) →
+6.1 (5.9–7.4) ms and ≤ ~2.2 ms on the other `sta.*` cells. Under `power.*`
+the slew prep's `for_slew` skips the whole `sta.prepare.clock.*` block
+on these ideal-clock SDCs, so it fires zero times there.
 
 **Achieved vs. plan**: the counted bound is the intra-call repeat share
 R = 21.6% of `table(c)` evals inside the walks (`eval_2d` is ~all of
