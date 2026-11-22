@@ -7043,3 +7043,116 @@ census on committed/baseline/post/read-back SPEFs; OpenSTA
 `report_checks -to _11316_/D` on `picorv32.guide.spef` and
 `picorv32.guide.ours.spef` for the per-net evidence; the two
 fail-proof mutations above.
+
+### 2026-11-22 — e5-cts-ref: TritonCTS reference artifacts on gcd + picorv32 (reference-only)
+
+E5 ticket 1 (`kurena/tasks/e5-cts-ref/`). New generator
+`tests/designs/generate_cts_ref.sh <design>` in
+`ghcr.io/librelane/librelane:3.0.16`, mirroring `generate_prop_ref.sh`
+(no LibreLane flow re-run; committed `<d>.placed.def`/`<d>.sdc` are the
+only design inputs). Three steps:
+
+- **A** (one `openroad -no_init -no_splash`, transcript tee'd to
+  `runs/cts/cts.log`): pre-CTS instance-name snapshot,
+  `clock_tree_synthesis -root_buf sky130_fd_sc_hd__clkbuf_16 -buf_list
+  "sky130_fd_sc_hd__clkbuf_8 sky130_fd_sc_hd__clkbuf_4 sky130_fd_sc_hd__clkbuf_2" -wire_unit 20`
+  (P-CTS-identical flags), `repair_clock_nets`, `set_wire_rc -layer
+  met2` + `estimate_parasitics -placement`, then the report surface
+  (`report_cts_config`, `report_cts`, `report_clock_skew -setup/-hold
+  -digits 6`, `worst_clock_skew -setup/-hold`), per-pin propagated
+  latency collection, the odb inserted-instance census
+  (`runs/cts/cts_census.txt` + `cts_scalars.tcl`), and `write_def
+  <d>.cts.def` — all in one process so the DEF is exactly the state
+  the reports describe.
+- **B** (python3 in-container, sed-free like the `*DATE` fix): parses
+  `cts.log` + census/scalars into `<d>.cts.reference.json`. Every
+  unmatched expectation aborts; census-vs-report cross-checks warn on
+  stderr (none fired — the fanout≤1 dummy classifier agrees with
+  `report_cts` exactly on both designs).
+- **C** (second `openroad` process, clean parasitics): reads the
+  just-written `<d>.cts.def` + `<d>.cts.sdc` (`<d>.sdc` +
+  `set_propagated_clock`, committed input), `set_wire_rc -layer met2`
+  + `estimate_parasitics -placement`, then `sta::worst_slack`/endpoint
+  + `clock_pins` collection (procs verbatim from
+  `generate_prop_ref.sh`, `-group_path_count 100000`) →
+  `<d>.cts.sta.reference.json`, block `cts_placement_rc`.
+
+**Measured vs the P-CTS scoping numbers** (same flags, so all rows
+should reproduce — they do):
+
+| quantity | P-CTS (2026-11-22) | measured | verdict |
+|---|---|---|---|
+| tree buffers | 5 `clkbuf_16` | 5 `clkbuf_16` | confirmed |
+| dummy loads | 3 (`clkbuf_4`×1, `clkbuf_8`×2) | 3 (`clkbuf_4`×1, `clkbuf_8`×2) | confirmed |
+| sinks | 35 | 35 | confirmed |
+| tree depth | 2 | 2 | confirmed |
+| avg sink wirelength | 120.66 µm | 120.66 µm | confirmed |
+| clock-pin latency | ≈ 0.31 ns | 0.313195–0.314567 ns | confirmed |
+| skew setup/hold | ≈ 0 ps | −1.3728 ps both | confirmed |
+
+Additional gcd metrics: `inserted_instances` 8, `clock_subnets` 5,
+clock-net HPWL 370.244 µm (6 nets: root `clk` + 5 `clknet_*`),
+post-CTS `def_components` 392 / `def_signal_nets` 274. STA golden:
+53 endpoints + 35 clock pins, wns_max 1.334227 / wns_min 0.491733 ns.
+
+**picorv32 included** (no deferral needed — same single clock, ~40 s
+per step-A run, deterministic): inserted 253 = 197 tree buffers
+(`clkbuf_16`×129 + `clkbuf_8`×68) + 56 dummy loads — and TritonCTS
+picks inverters as dummies here (`clkinv_2`×11, `clkinvlp_4`×6,
+`bufinv_16`×4, `inv_6`×1, `clkbuf_4`×19, `clkbuf_8`×15), reported by
+`report_cts` itself and matched exactly by the census. 197 subnets,
+1,597 sinks, depth 4, avg sink wirelength 756.54 µm, clock-net HPWL
+12,749.174 µm, latency 0.757265–0.793474 ns, skew −34.16 ps both
+corners, `def_components` 10,458 / `def_signal_nets` 7,008. STA
+golden: 1,798 endpoints + 1,597 clock pins, wns_max −1.779235 /
+wns_min 0.401982 ns.
+
+**Field sources** (the committed script emits what the surface
+actually reports — two corrections vs the design doc):
+
+- `skew_setup/hold_ns`: `worst_clock_skew` Tcl return value (−0.0013728
+  ns on gcd — signed source−target latency of the worst pair); the
+  `report_clock_skew -digits 6` table (−0.001373) is the cross-check.
+- `latency_max/min_ns`: **not** from `report_clock_skew` — that table
+  prints only the worst skew pair. Collected per pin in step A as the
+  propagated `arrival_max_rise` on `all_registers` `is_clock` pins
+  (rise edge only; fall arrivals sit a half-period out and are not the
+  insertion delay).
+- `cts_root_buf`: `CTS-0050` "Root buffer is …" — `report_cts_config`
+  reports `-root_buf: undefined` (command args do not persist into the
+  config state). `cts_buf_list` from the `-buf_list:` config line.
+- `cts_wire_unit`: `report_cts_config` emits the internal value in
+  DBU — `20000` for the `-wire_unit 20` argument; recorded as emitted.
+- `tree_depth`: `CTS-0102` "Path depth 2 - 2" (`report_cts` has no
+  depth line); `avg_sink_wirelength_um` from `CTS-0101`; `sinks`/
+  `clock_subnets`/`tree_buffers`/`dummy_loads` from `report_cts`.
+- `clock_net_wirelength_um`: `report_cts` carries no wirelength →
+  census HPWL via `getTermBBox` over every net attached to an inserted
+  instance (root net through the root buffer's input included); basis
+  field records `hpwl`.
+
+**Artifacts** (all byte-reproduced by a second full script run on the
+same host; `git diff` empty — TritonCTS and `write_def` are
+deterministic on both designs):
+
+| artifact | bytes | SHA-256 (first 16) | committed? |
+|---|---|---|---|
+| `gcd.cts.def` | 105,811 | `325a95488237b04f` | yes |
+| `gcd.cts.reference.json` | 791 | `5672f4918d242fbc` | yes |
+| `gcd.cts.sta.reference.json` | 21,414 | `3fcc79a272ea6ccf` | yes |
+| `gcd.cts.sdc` | 277 | `adb137385d39b618` | yes (input) |
+| `picorv32.cts.def` | 2,506,664 | `59556c0c7a4da5e4` | no (gitignored, >1 MB) |
+| `picorv32.cts.reference.json` | 991 | `85cb7fa2005fdc9d` | yes |
+| `picorv32.cts.sta.reference.json` | 832,483 | `9f923ee3f8313a6f` | yes (<1 MB rule, like `picorv32.propagated.reference.json`) |
+| `picorv32.cts.sdc` | 277 | `8cec2422f81224fb` | yes (input) |
+
+**What was run**: `tests/designs/generate_cts_ref.sh gcd` 3× and
+`... picorv32` 2× on the M-series Mac (arm64, Docker via Colima); the
+last two runs of each are byte-identical to the committed artifacts.
+Step-0 report-surface probes live in
+`tests/designs/gcd/runs/cts/p_cts_probe*.tcl` (gitignored). One
+implementation bug was caught and fixed before the recorded runs:
+taking `latency_max` over both edges mixed the half-period fall
+arrival (2.86 ns) into the insertion delay — rise-edge only now.
+No consumer test reads these goldens yet (that is the next E5
+ticket); no Cargo-visible change, so no version bump.
