@@ -25,9 +25,15 @@ names the offending name/id.
 - **I4 — driver-first.** If any pin in a net's segment has
   `pin_is_driver`, segment index 0 is a driver (i.e.
   `net_driver(net) == Some(seg[0])`).
-- **I5 — `io_pins`.** Exactly the pins with `pin_cells == None`, in
-  `PinId` order; the mutators never touch it (inserted cells produce
-  only instance pins).
+- **I5 — `io_pins`.** The non-special primary I/O ports in `PinId`
+  order — a subset of the `pin_cells == None` pins. `+ SPECIAL` DEF
+  ports (gcd's `VGND`/`VPWR`) also have `pin_cells == None` but are not
+  in `io_pins` (`readers/def.rs` `add_pin` skips pushing them); the
+  mutators never touch `io_pins` (inserted cells produce only instance
+  pins). Consequence for the round-trip test: `write_def_full` emits
+  only `io_pins`, so the re-read DEF drops the two special ports and
+  `num_pins` comes back lower by that count — a pre-existing emission
+  limitation, asserted explicitly in the test rather than hidden.
 - **I6 — `net_def_spellings`.** `len() ∈ {0, num_nets()}`. The
   `guide.rs` emitter uses per-net spellings only when the lengths match
   (`congestion/guide.rs:469`); both states stay valid.
