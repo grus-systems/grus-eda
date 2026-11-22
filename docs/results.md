@@ -7768,3 +7768,83 @@ again.
 pre-existing `jpeg` placement/dmp ignores), `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --release -p grus-core sta`.
 `kurena/tasks/ux-sta-paths/spec/` untouched; no commits made.
+
+### 2026-11-23 — E9.4+E9.5 — `--top` suffix matching + SDC examples doc (v0.6.1)
+
+Ticket `ux-top-sdc` (review items 4+5 of
+`docs/history/run-2026-11-22-large-design.md`). CLI validation and docs only;
+no golden regeneration and no OpenSTA run.
+
+**Pre-change finding (single-top auto-accept).** Omitting `--top` already
+worked before this change: `parse_yosys_json` selects the first
+non-blackbox module with cells (first module as fallback), the Verilog
+reader takes the first `module` declaration, and `check_top_name(None, ..)`
+was a no-op. No command path demanded `--top` on single-module input, so no
+auto-detection code was added — the change only records the state and adds
+coverage: the successful `check-e0` invocation in
+`cli_end_to_end_gcd_flow_and_validation` now omits `--top` (JSON + Verilog +
+DEF on gcd), and a `floorplan --json gcd.synth.json --out <tmp>` call
+without `--top` passes and its output is deleted.
+
+**Matching rule.** `check_top_name` now accepts `requested == actual` or
+`requested` equal to the non-empty segment after the last literal `\` in
+the loaded design name (`actual.rsplit('\\').next()`). Everything else
+keeps the existing loud error
+`{kind} design name {actual:?} does not match --top {top:?}`. The comparison
+runs on the loaded `DesignDb.design_name`, not the raw file spelling.
+
+`check_top_name_matching_rules` (`actual = "$paramod$abc\\sub\\picorv32"`):
+
+| `--top` | expected | observed |
+|---|---|---|
+| `Some(actual)` exact | accept | PASS |
+| `Some("picorv32")` final segment | accept | PASS |
+| `None` omitted | accept | PASS |
+| `Some("sub")` non-final segment | reject | PASS |
+| `Some("$paramod$abc")` prefix | reject | PASS |
+| `Some("corv32")` / `Some("picorv")` substring | reject | PASS |
+| `Some("picorv32x")` superstring | reject | PASS |
+| `Some("")` empty | reject | PASS |
+
+Both `check-e0` and `floorplan` `--top` help strings now state the accepted
+forms and the omitted-argument behavior. No substring/prefix/glob matching
+was added — a looser rule would let a wrong-design slip look like a match.
+
+**SDC examples doc.** `docs/sdc-examples.md` ships exactly three fenced
+`sdc` blocks, each traced to a committed fixture:
+
+1. One clock + I/O delays — `tests/designs/gcd/gcd.sdc` verbatim.
+2. Asynchronous clock groups — `tests/designs/sta_clocks/t2_grp.sdc`
+   verbatim on `two_clock.def`.
+3. FF enable/select as data — the `sel`/`y`/`clk` subset of
+   `tests/designs/sta_exceptions/base.sdc` on `exceptions.def` (`sel`
+   drives `u_mux/S`/`u_mux2/S`; only `clk` has `create_clock`).
+
+`sdc_examples_parse` in `main.rs` extracts all three blocks via
+`include_str!` and requires `blocks.len() == 3`, feeding each through
+`grus_core::sta::parse_sdc` — all parse. Semantic coverage stays with the
+existing fixture tests (GCD STA tests, `test_sta_clocks_match_opensta`
+scenario coverage, `sta_exceptions` tests).
+
+**Async report semantics (recorded for the doc).** In the committed
+`two_clock.reference.json`, `t2_int` has 8 timed endpoints and `t2_grp` has
+5 — `set_clock_groups -asynchronous` removes the cross-domain candidates
+`u_fb0/D`, `u_fx/D`, `u_fy/D` by desugaring to pairwise false-path cuts,
+accounted under `skipped.false_path_endpoints`.
+`skipped.cross_domain_endpoints` remains the defensive diagnostic for an
+ungrouped/unpairable cross-domain path; committed scenarios pair, so
+`t2_grp` reports `cross_domain_endpoints == 0` — an intentional cut shows
+as `false_path`, never `CrossDomain`. `t2_grpa.sdc` (`-allow_paths`) is the
+contrast fixture, not the cut-path example. `t2_int.sdc` is the
+unconstrained two-clock reference.
+
+**Version.** `[workspace.package] version` `0.6.0 -> 0.6.1` (patch): a
+backward-compatible widening of CLI argument acceptance plus docs/tests;
+no schema or reference-format change.
+
+**Checks run** (this worktree, Apple Silicon, debug profile):
+
+- `cargo test -p grus-eda -- check_top_name_matching_rules sdc_examples_parse` — 2 passed.
+- `cargo test -p grus-eda -- cli_end_to_end_gcd_flow_and_validation` — 1 passed (0.80 s).
+- `cargo test --workspace` — 402 grus-core lib + 6 grus-eda bin tests passed, 2 ignored (pre-existing `jpeg` placement/dmp ignores).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
