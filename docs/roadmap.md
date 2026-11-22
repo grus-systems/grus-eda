@@ -713,8 +713,21 @@ surface, from the first large-design run's feedback
   BFS) + `MeshCensus`. Both designs validate clean; census recorded in
   `docs/results.md` (no PDNSim mesh golden exists — the e2e ticket gates
   the solve).
-- Missing: a sparse DC solve (new dependency), per-instance current
-  sources (N7 output).
+- Progress 2026-11-23 (ticket `e8-solve`, v0.7.3): sparse DC solve
+  landed — `pdn::solve` stamps the mesh into a conductance CSC, clamps
+  source nodes to each golden `supply_voltage_v` (exact, assigned not
+  factored), injects the N7 per-instance feed as `P/V` sink currents,
+  and solves with `nalgebra-sparse` `CscCholesky` (direct, SPD reduced
+  system). `grus-eda irdrop` emits PDNSim-shaped
+  `*.irdrop.voltage.ours.<net>.csv` — first five columns verbatim-equal
+  to the golden row set on all four nets — plus a summary JSON with
+  ‖GV−I‖∞ (≤ 1.7e-14 A abs / ≤ 2.3e-16 rel), worst/avg drop and bounce,
+  and deltas vs the golden scalars. Per-pin and worst-drop deltas sit
+  inside the done-when tolerances on both designs; the residual gap is
+  the N7↔OpenSTA estimator feed (-72.5 % total on gcd, -43.5 % on
+  picorv32), quantified in `docs/results.md` 2026-11-23.
+- Remaining: nothing structural — E8's engine is complete; tighter
+  drop agreement tracks the N7 estimator, not the solver.
 - Sizing: ~4–6 tickets (M).
 
 ### E9. Reporting / usability surface

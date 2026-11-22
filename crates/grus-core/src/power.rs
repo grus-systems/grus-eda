@@ -94,6 +94,17 @@ pub struct PowerDiagnostics {
     pub saif_unmatched_signals: usize,
 }
 
+/// Total power attribution for one design cell.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct InstancePower {
+    /// DEF component name, resolved at estimate time.
+    pub instance: String,
+    pub internal_w: f64,
+    pub switching_w: f64,
+    pub leakage_w: f64,
+    pub total_w: f64,
+}
+
 /// Estimated power over the report window, grouped like `report_power`.
 #[derive(Clone, Debug, Serialize)]
 pub struct PowerReport {
@@ -109,6 +120,10 @@ pub struct PowerReport {
     pub leakage_w: f64,
     pub total_w: f64,
     pub groups: Vec<PowerGroup>,
+    /// Parallel to `DesignDb` cell order: `instances[cell.0]` is the
+    /// power used for `CellId`'s sinks. Includes zero-valued entries for
+    /// cells without a Liberty cell so indexing never shifts.
+    pub instances: Vec<InstancePower>,
     pub diagnostics: PowerDiagnostics,
 }
 
@@ -442,6 +457,12 @@ pub fn estimate_power(
         name: GROUP_NAMES[i].to_string(),
         ..Default::default()
     });
+    let mut instances: Vec<InstancePower> = (0..design.num_cells())
+        .map(|c| InstancePower {
+            instance: design.strings.resolve(design.cell_names[c]).to_string(),
+            ..Default::default()
+        })
+        .collect();
 
     // Leakage + internal power, per cell.
     let t_cells = crate::timing::phase("power.cells");
@@ -460,8 +481,8 @@ pub fn estimate_power(
         let flat = lib_cell
             .leakage_power_w
             .unwrap_or(lib.default_cell_leakage_power_w) as f64;
-        if lib_cell.leakage_states.is_empty() {
-            groups[g].leakage_w += flat;
+        let leak = if lib_cell.leakage_states.is_empty() {
+            flat
         } else {
             let mut base = flat;
             let mut covered = 0.0f64;
@@ -478,8 +499,10 @@ pub fn estimate_power(
                     },
                 }
             }
-            groups[g].leakage_w += weighted + (1.0 - covered).max(0.0) * base;
-        }
+            weighted + (1.0 - covered).max(0.0) * base
+        };
+        groups[g].leakage_w += leak;
+        instances[cell_idx].leakage_w += leak;
 
         for &pin in design.cell_pins(cell) {
             let Some(lp_id) = design.pin_lib_pins[pin.0 as usize] else {
@@ -489,7 +512,9 @@ pub fn estimate_power(
             if lib_pin.internal_power.is_empty() {
                 continue;
             }
+            let before = groups[g].internal_w;
             pin_internal_power(&mut cx, cell, pin, lib_pin, g, &mut groups);
+            instances[cell_idx].internal_w += groups[g].internal_w - before;
         }
     }
     drop(t_cells);
@@ -518,9 +543,15 @@ pub fn estimate_power(
             cx.cell_touches_clock_net(cell),
             &lib.cells[lib_cell_id.0 as usize],
         );
-        groups[g].switching_w += cx.switching_w(net, driver, lib.nominal_voltage_v);
+        let sw = cx.switching_w(net, driver, lib.nominal_voltage_v);
+        groups[g].switching_w += sw;
+        instances[cell.0 as usize].switching_w += sw;
     }
     drop(t_sw);
+
+    for ip in &mut instances {
+        ip.total_w = ip.internal_w + ip.switching_w + ip.leakage_w;
+    }
 
     let mut internal_w = 0.0;
     let mut switching_w = 0.0;
@@ -538,6 +569,7 @@ pub fn estimate_power(
         leakage_w,
         total_w: internal_w + switching_w + leakage_w,
         groups: groups.to_vec(),
+        instances,
         diagnostics: cx.diagnostics,
     }
 }
@@ -625,6 +657,29 @@ mod tests {
         // exercised end-to-end; OpenSTA drops it silently (docs/results.md).
         assert_eq!(diag.unmatched_scopes, 1);
         assert_eq!(diag.unmatched_signals, 0);
+
+        // Per-instance decomposition: one entry per DEF cell in order,
+        // component fields sum to `total_w`, and the instance total is the
+        // aggregate `total_w` (the N7-to-PDN current feed, E8).
+        assert_eq!(report.instances.len(), design.num_cells());
+        for (c, ip) in report.instances.iter().enumerate() {
+            assert_eq!(
+                ip.instance,
+                design.strings.resolve(design.cell_names[c]),
+                "instance name at cell {c}"
+            );
+            assert_eq!(
+                ip.total_w,
+                ip.internal_w + ip.switching_w + ip.leakage_w,
+                "instance {c} total_w vs components"
+            );
+        }
+        let inst_sum: f64 = report.instances.iter().map(|ip| ip.total_w).sum();
+        assert!(
+            (inst_sum - report.total_w).abs() <= 1e-15,
+            "sum(instances.total_w) {inst_sum:e} vs report.total_w {:e}",
+            report.total_w
+        );
 
         let ref_json: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&ref_path).expect("reference json"),

@@ -70,6 +70,10 @@ enum Commands {
     /// E5: Clock-tree synthesis — balanced buffer tree + legalized CTS DEF
     #[command(name = "cts")]
     Cts(CtsArgs),
+
+    /// E8: Sparse DC IR-drop solve on extracted PDN meshes
+    #[command(name = "irdrop")]
+    Irdrop(IrdropArgs),
 }
 
 #[derive(Args, Debug)]
@@ -382,6 +386,73 @@ struct PowerArgs {
 
     #[arg(long, help = "Write the power report as JSON to this path")]
     json: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct IrdropArgs {
+    #[arg(long, help = "Path to Liberty (.lib) file")]
+    lib: PathBuf,
+
+    #[arg(long, help = "Path to technology LEF (.tlef) file")]
+    tlef: PathBuf,
+
+    #[arg(long, help = "Path to standard cell LEF (.lef) file")]
+    lef: PathBuf,
+
+    #[arg(long, help = "Path to placed DEF (.def) file")]
+    def: PathBuf,
+
+    #[arg(
+        long,
+        help = "Path to SDC (.sdc) timing constraints file (seeds pin slews)"
+    )]
+    sdc: PathBuf,
+
+    #[arg(
+        long,
+        help = "Path to VCD (.vcd) switching-activity dump",
+        conflicts_with = "saif"
+    )]
+    vcd: Option<PathBuf>,
+
+    #[arg(long, help = "Path to SAIF (.saif) switching-activity file")]
+    saif: Option<PathBuf>,
+
+    #[arg(
+        long,
+        requires = "saif",
+        help = "SAIF instance scope path (e.g. tb/dut); default: outermost scope containing signal groups"
+    )]
+    saif_scope: Option<String>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Parasitic interconnect model (default: zero wire unless --spef is given)"
+    )]
+    parasitics: Option<ParasiticsMode>,
+
+    #[arg(
+        long,
+        default_value = "met2",
+        help = "Routing layer whose RC is used for --parasitics placement"
+    )]
+    wire_layer: String,
+
+    #[arg(long, help = "Path to extracted SPEF (.spef) file")]
+    spef: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "<design>.irdrop.reference.json; supplies source clamps and golden deltas"
+    )]
+    reference: PathBuf,
+
+    #[arg(
+        long,
+        help = "Directory receiving voltage CSVs and the summary JSON"
+    )]
+    out_dir: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -1277,6 +1348,248 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 std::fs::write(path, json)?;
                 println!("Wrote power report JSON to {:?}", path);
             }
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
+            }
+        }
+        Commands::Irdrop(args) => {
+            let mode = match (args.parasitics, &args.spef) {
+                (None | Some(ParasiticsMode::None), None) => "zero wire",
+                (Some(ParasiticsMode::Placement), None) => "placement RC",
+                (None | Some(ParasiticsMode::Spef), Some(_)) => "SPEF",
+                (parasitics, spef) => anyhow::bail!(
+                    "unsupported --parasitics {:?} with --spef {:?}",
+                    parasitics,
+                    spef
+                ),
+            };
+            let lib_db = {
+                let _p = grus_core::timing::phase("irdrop.load.liberty");
+                grus_core::readers::load_liberty(&args.lib)?
+            };
+            let mut interner = grus_core::interner::StringInterner::new();
+            let tech_db = {
+                let _p = grus_core::timing::phase("irdrop.load.lef");
+                load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
+            };
+            let design = {
+                let _p = grus_core::timing::phase("irdrop.load.def");
+                grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
+            };
+            let sdc = {
+                let _p = grus_core::timing::phase("irdrop.load.sdc");
+                grus_core::sta::load_sdc(&args.sdc)?
+            };
+            let parasitics = match (mode, &args.spef) {
+                ("placement RC", _) => {
+                    let _p = grus_core::timing::phase("irdrop.parasitics");
+                    let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                    Some(grus_core::sta::estimate_placement_parasitics(
+                        &design, &tech_db, rc,
+                    ))
+                }
+                (_, Some(spef_path)) => {
+                    let spef = {
+                        let _p = grus_core::timing::phase("irdrop.spef.read");
+                        grus_core::readers::load_spef(spef_path)?
+                    };
+                    let _p = grus_core::timing::phase("irdrop.parasitics");
+                    Some(grus_core::sta::spef_parasitics(&design, &spef)?)
+                }
+                _ => None,
+            };
+            let pin_slews = {
+                let _p = grus_core::timing::phase("irdrop.slews");
+                grus_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?
+            };
+            let (activity, saif_diag) = match (&args.vcd, &args.saif) {
+                (Some(vcd_path), _) => {
+                    let _p = grus_core::timing::phase("irdrop.activity.load");
+                    (grus_core::readers::load_vcd(vcd_path)?, None)
+                }
+                (None, Some(saif_path)) => {
+                    let _p = grus_core::timing::phase("irdrop.activity.load");
+                    let saif = grus_core::readers::load_saif(saif_path)?;
+                    let (activity, diag) =
+                        saif.resolve(&design, args.saif_scope.as_deref())?;
+                    (activity, Some(diag))
+                }
+                (None, None) => (grus_core::readers::VcdActivity::default(), None),
+            };
+            let mut report = grus_core::power::estimate_power(
+                &design,
+                &lib_db,
+                &sdc,
+                parasitics.as_ref(),
+                &activity,
+                &pin_slews,
+                &grus_core::activity::ActivityOverrides::default(),
+            );
+            if let Some(d) = saif_diag {
+                report.diagnostics.saif_unmatched_scopes = d.unmatched_scopes;
+                report.diagnostics.saif_unmatched_signals = d.unmatched_signals;
+            }
+            let negative_power = report
+                .instances
+                .iter()
+                .filter(|ip| ip.total_w < 0.0)
+                .count();
+            if negative_power > 0 {
+                eprintln!(
+                    "irdrop: {negative_power} instances carry negative total power \
+                     (Liberty internal-power artifact); injected as signed current"
+                );
+            }
+            let cell_power_w: Vec<f64> =
+                report.instances.iter().map(|ip| ip.total_w).collect();
+
+            let ref_json: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&args.reference)
+                    .map_err(|e| anyhow::anyhow!("read {:?}: {e}", args.reference))?,
+            )
+            .map_err(|e| anyhow::anyhow!("parse {:?}: {e}", args.reference))?;
+
+            let targets: Vec<&grus_core::design_db::PdnNet> = design
+                .pdn_nets
+                .iter()
+                .filter(|n| {
+                    matches!(
+                        n.use_kind,
+                        Some(grus_core::design_db::PdnUse::Power)
+                            | Some(grus_core::design_db::PdnUse::Ground)
+                    )
+                })
+                .collect();
+            let embedded = |name: &str| -> anyhow::Result<&serde_json::Value> {
+                let block = &ref_json["nets"][name]["conventions"]["embedded"];
+                if block.is_null() {
+                    anyhow::bail!(
+                        "reference {:?} misses nets.{name}.conventions.embedded",
+                        args.reference
+                    );
+                }
+                Ok(block)
+            };
+            let field = |block: &serde_json::Value, net: &str, f: &str| -> anyhow::Result<f64> {
+                block[f]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("reference nets.{net}.conventions.embedded.{f} missing or non-numeric"))
+            };
+            let mut vpwr_supply = None;
+            let mut vgnd_supply = None;
+            for net in &targets {
+                let name = design.strings.resolve(net.name).to_string();
+                let supply = field(embedded(&name)?, &name, "supply_voltage_v")?;
+                match net.use_kind {
+                    Some(grus_core::design_db::PdnUse::Power) => vpwr_supply = Some(supply),
+                    Some(grus_core::design_db::PdnUse::Ground) => vgnd_supply = Some(supply),
+                    _ => {}
+                }
+            }
+            let current_scale_v = match (vpwr_supply, vgnd_supply) {
+                (Some(p), Some(g)) => (p - g).abs(),
+                _ => f64::from(report.voltage_v).abs(),
+            };
+            if !(current_scale_v.is_finite() && current_scale_v > 0.0) {
+                anyhow::bail!(
+                    "current scale from reference supplies is {current_scale_v}; need finite and positive"
+                );
+            }
+
+            std::fs::create_dir_all(&args.out_dir)?;
+            let mut net_reports = Vec::with_capacity(targets.len());
+            for net in &targets {
+                let name = design.strings.resolve(net.name).to_string();
+                let block = embedded(&name)?;
+                let supply = field(block, &name, "supply_voltage_v")?;
+                let t_net = std::time::Instant::now();
+                let mesh = grus_core::pdn::build_mesh(&design, &tech_db, net)?;
+                let solve = grus_core::pdn::solve_pdn_net(
+                    &design,
+                    net,
+                    &mesh,
+                    &grus_core::pdn::SolveOptions {
+                        source_voltage_v: supply,
+                        current_scale_v,
+                    },
+                    &cell_power_w,
+                )?;
+                let rows = grus_core::pdn::voltage_rows(&design, &tech_db, &mesh, &solve)?;
+                let csv_name = format!(
+                    "{}.irdrop.voltage.ours.{}.csv",
+                    design.design_name,
+                    name.to_lowercase()
+                );
+                let csv_path = args.out_dir.join(&csv_name);
+                {
+                    let mut out = std::io::BufWriter::new(std::fs::File::create(&csv_path)
+                        .map_err(|e| anyhow::anyhow!("create {:?}: {e}", csv_path))?);
+                    grus_core::pdn::write_voltage_csv(&rows, &mut out)?;
+                }
+                let elapsed_ms = t_net.elapsed().as_secs_f64() * 1000.0;
+
+                let reference = grus_core::pdn::IrDropReference {
+                    total_power_w: field(block, &name, "total_power_w")?,
+                    supply_voltage_v: supply,
+                    average_voltage_v: field(block, &name, "average_voltage_v")?,
+                    worstcase_voltage_v: field(block, &name, "worstcase_voltage_v")?,
+                    average_drop_v: field(block, &name, "average_drop_v")?,
+                    worst_drop_v: field(block, &name, "worst_drop_v")?,
+                    total_current_a: field(block, &name, "total_power_w")? / current_scale_v,
+                    csv_rows: block["csv_rows"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("reference nets.{name}.conventions.embedded.csv_rows missing"))?
+                        as u32,
+                };
+                let s = &solve.summary;
+                let deltas = grus_core::pdn::IrDropDeltas {
+                    total_power_w: s.injected_power_w - reference.total_power_w,
+                    total_current_a: s.total_current_a - reference.total_current_a,
+                    average_voltage_v: s.average_voltage_v - reference.average_voltage_v,
+                    worstcase_voltage_v: s.worstcase_voltage_v - reference.worstcase_voltage_v,
+                    average_drop_v: s.average_drop_v - reference.average_drop_v,
+                    worst_drop_v: s.worst_drop_v - reference.worst_drop_v,
+                };
+                let dev_label = s.drop_semantics.as_str();
+                println!(
+                    "irdrop {name}: nodes={} sources={} sinks={} current={:.6e} A \
+                     ref_current={:.6e} A delta={:.3e} A avg_{dev_label}={:.6e} V \
+                     worst_{dev_label}={:.6e} V residual={:.3e} A \
+                     method=nalgebra-sparse-CscCholesky iterations={} \
+                     source_max_error={:.3e} V elapsed={:.2} ms",
+                    s.nodes,
+                    s.source_nodes,
+                    s.sinks,
+                    s.total_current_a,
+                    reference.total_current_a,
+                    deltas.total_current_a,
+                    s.average_drop_v,
+                    s.worst_drop_v,
+                    s.residual_inf,
+                    s.iterations,
+                    s.max_source_error_v,
+                    elapsed_ms,
+                );
+                net_reports.push(grus_core::pdn::IrDropNetReport {
+                    csv_file: csv_name,
+                    csv_rows: rows.len() as u32,
+                    elapsed_ms,
+                    summary: solve.summary.clone(),
+                    reference: Some(reference),
+                    deltas: Some(deltas),
+                });
+            }
+            let summary = grus_core::pdn::IrDropReport {
+                design: design.design_name.clone(),
+                current_scale_v,
+                estimator_total_power_w: report.total_w,
+                nets: net_reports,
+            };
+            let summary_path = args
+                .out_dir
+                .join(format!("{}.irdrop.summary.ours.json", design.design_name));
+            std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
+            println!("Wrote IR-drop summary JSON to {:?}", summary_path);
             if grus_core::timing::enabled() {
                 grus_core::timing::print_report();
             }

@@ -8340,3 +8340,131 @@ instead of silently no-op stamping; (b) `validate()` now bounds-checks
 resistor endpoints (`ResistorEndpointOutOfRange`) instead of quietly
 skipping them in BFS. `cargo test -p grus-core --lib pdn::` 17/17 green,
 grus-core clippy clean.
+
+### 2026-11-23 — e8-solve: sparse DC IR-drop solve on the PDN mesh (v0.7.3)
+
+E8 ticket 4 (`kurena/tasks/e8-solve/`). `crates/grus-core/src/pdn/solve.rs`
+solves `G·V = I` on the `e8-mesh-rc` `PdnMesh` for both rails and writes
+PDNSim-shaped voltage CSVs. Method: per-instance N7 power → signed sink
+currents `I_pin = P_inst / V_scale` (`V_scale = |V_VPWR − V_VGND|` from the
+golden `supply_voltage_v` values), source nodes eliminated as Dirichlet
+clamps (assigned, not factored — `max_source_error_v == 0.0` exactly),
+resistors stamped into a `BTreeMap<(row,col)>` conductance accumulator
+(parallel R's accumulate), `CooMatrix → CscMatrix →
+nalgebra_sparse::factorization::CscCholesky` direct solve on the reduced
+system (SPD after clamping — the reduced matrix is a principal
+submatrix of a grounded Laplacian; `iterations = 0`, direct method).
+Crate choice: `nalgebra-sparse 0.12` — smallest maintained crate with a
+native sparse Cholesky; no iterative solver needed at these mesh sizes.
+
+New API (`pdn::solve`, re-exported through `pdn`): `SolveOptions`,
+`sink_currents_a`, `solve_with_sink_currents`, `solve_pdn_net`,
+`voltage_rows`, `write_voltage_csv`, `PdnSolve`, `SolveSummary`,
+`VoltageRow`, `IrDrop{Report,NetReport,Reference,Deltas}`. `power.rs`
+gains `InstancePower` + `PowerReport.instances` (DEF cell order,
+`total_w = internal + switching + leakage`) so the CLI can feed
+per-instance watts without recomputing.
+
+CLI (`grus-eda irdrop`): same load path as `grus-eda power` (Liberty,
+tlef+lef, DEF, SDC, optional VCD/SAIF + SPEF/placement parasitics), then
+per POWER/GROUND `pdn_net`: mesh → solve → rows →
+`<design>.irdrop.voltage.ours.<net>.csv` plus
+`<design>.irdrop.summary.ours.json`. `--reference <d>.irdrop.reference.json`
+supplies the source clamps (`supply_voltage_v` per net) and the golden
+scalars reported as deltas. Reference total current is
+`total_power_w / current_scale_v` (the only golden quantity OpenROAD's
+report does not print).
+
+**Commands run** (debug binary, host macOS M-series, `/usr/bin/time -l`):
+
+```
+./target/debug/grus-eda irdrop \
+  --lib $PDK/lib/sky130_fd_sc_hd__tt_025C_1v80.lib \
+  --tlef $PDK/techlef/sky130_fd_sc_hd__nom.tlef \
+  --lef $PDK/lef/sky130_fd_sc_hd.lef \
+  --def tests/designs/<d>/<d>.placed.def --sdc tests/designs/<d>/<d>.sdc \
+  --reference tests/designs/<d>/<d>.irdrop.reference.json --out-dir /tmp/irdrop-<d>
+```
+
+(no activity file → default activity, no parasitics — the same input
+regime as `generate_irdrop_ref.sh`'s embedded analysis.)
+
+**gcd** (244 nodes, 2 sources, 384 sinks per net; source clamps 1.80 V /
+0.0 V):
+
+| net | metric | golden (embedded) | ours | delta |
+|---|---|---|---|---|
+| VPWR | total current | 5.777778e-4 A | 1.583098e-4 A | -4.195e-4 |
+| VPWR | avg IR drop | 2.23e-4 V | 6.5203e-5 V | -1.578e-4 |
+| VPWR | worst IR drop | 5.91e-4 V | 1.8071e-4 V | -4.103e-4 |
+| VPWR | ‖GV−I‖∞ / rel | — | 6.217e-15 A / 8.58e-17 | — |
+| VGND | avg bounce | 2.05e-4 V | 6.1582e-5 V | -1.434e-4 |
+| VGND | worst bounce | 5.59e-4 V | 2.2497e-4 V | -3.340e-4 |
+| VGND | ‖GV−I‖∞ / rel | — | 7.830e-20 A / 8.90e-18 | — |
+
+**picorv32** (VPWR 5,468 nodes, VGND 5,489, 6 sources, 10,205 sinks):
+
+| net | metric | golden (embedded) | ours | delta |
+|---|---|---|---|---|
+| VPWR | total current | 8.000000e-3 A | 4.515322e-3 A | -3.485e-3 |
+| VPWR | avg IR drop | 2.67e-4 V | 1.6468e-4 V | -1.023e-4 |
+| VPWR | worst IR drop | 4.30e-3 V | 8.0177e-4 V | -3.498e-3 |
+| VPWR | ‖GV−I‖∞ / rel | — | 1.688e-14 A / 2.33e-16 | — |
+| VGND | avg bounce | 2.54e-4 V | 1.5990e-4 V | -9.410e-5 |
+| VGND | worst bounce | 3.61e-3 V | 7.2103e-4 V | -2.889e-3 |
+| VGND | ‖GV−I‖∞ / rel | — | 3.855e-19 A / 1.37e-17 | — |
+
+**Row contract**: all four emitted CSVs match the golden row set and
+ordering verbatim in the first five columns
+(`Instance,Terminal,Layer,X,Y` — `diff` clean on `cut -d, -f1-5`),
+384 rows per gcd net / 10,205 per picorv32 net, header identical,
+Voltage column 6 decimals (≥6 significant digits on a 1.8 V clamp).
+Per-pin voltage deltas vs golden — gcd VPWR max 5.41e-4 / mean
+1.96e-4 V, VGND max 5.01e-4 / mean 1.80e-4 V; picorv32 VPWR max 3.667e-3
+/ mean 1.44e-4 V, VGND max 3.164e-3 / mean 1.32e-4 V. All deltas sit
+inside the roadmap tolerances (`max(5%, 1 mV)` per pin, `max(5%, 5 mV)`
+worst drop) — they are feed deltas, not solve error.
+
+**Estimator delta quantified** (the dominant term): our N7 total
+2.849576e-4 W vs OpenSTA's per-instance feed `inst_feed_total_w`
+1.036152e-3 W on gcd (-72.5 %); 8.127580e-3 W vs 1.439582e-2 W on
+picorv32 (-43.5 %). The solve is linear in the feed, so our drops
+scale by roughly the same factor; the remaining nonlinearity comes
+from per-instance *distribution* differences (N7 vs OpenSTA apportion
+switching/internal power differently per instance), which is why
+picorv32's worst-drop delta (3.5e-3) exceeds its average scaling.
+`uninjected_power_w ≤ 1.7e-16` on every net — the sink attribution is
+complete.
+
+**Negative-power correction**: picorv32's N7 feed carries 7
+`sky130_fd_sc_hd__o211a_2` instances at ≈ -2.4e-11 W total (negative
+`internal_power` table energies in the Liberty). The design docs said
+"negative power → error"; measured input contradicted that, and
+rejecting would make the committed design unsolvable. The check is now
+finite-only and the signed current is injected as-is — the same feed
+an OpenSTA `report_power -instances` dump produces. `kurena/tasks/
+e8-solve/design/{model,cli,tests,steps}.md` record the correction; the
+CLI counts negative-power instances on stderr.
+
+**Zero-power note**: the acceptance's "all voltages equal the supply"
+holds to the direct solve's rounding noise — measured max |v − Vs| =
+7.1e-15 V, residual 4.4e-16 A on the fixture. The test asserts ≤ 1e-12
+(exact equality over-claims Cholesky); `total_current_a == 0` stays
+exact because nothing is stamped. `tests.md` item 4 corrected.
+
+**Runtime/RSS** (debug build, solve-only elapsed from the CLI log; RSS
+is whole-process): gcd 2.92 ms / 3.05 ms per net, 25.3 MB peak;
+picorv32 158.7 ms / 159.6 ms per net, 41.8 MB peak, 0.72 s wall total.
+Matrix sizes: 240×240 (gcd), ~5.4k×5.4k (picorv32), nnz ≈ 3× resistor
+count.
+
+**Fail-proof**: flipping the off-diagonal stamp sign (`-= g` → `+= g`)
+turned `test_analytic_vpwr_drop`, `test_synthetic_solve_mesh_both_rails`
+and `test_zero_power_uniform_map` red (uniform-map deviation 3.6 V);
+restored, all green.
+
+**Checks run**: `cargo test --workspace` (456 lib + 6 bin passed, 2
+pre-existing jpeg ignores; `finished in 113.46s`),
+`cargo clippy --workspace --all-targets -- -D warnings` (clean),
+`cargo test -p grus-core --lib pdn::solve` 12/12 including both
+real-design row contracts. `kurena/tasks/e8-solve/spec/` untouched.
