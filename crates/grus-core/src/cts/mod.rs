@@ -148,24 +148,15 @@ mod tests {
             .unwrap_or_else(|| panic!("net `{name}` not in design"))
     }
 
-    /// `inst/pin` for instance pins, `PIN/port` for primary I/O — the
-    /// cross-DB member identity.
-    fn member_name(db: &DesignDb, p: PinId) -> String {
+    /// STA-style `inst/pin` name (bare port name for io pins), matching
+    /// `Context::pin_name`'s formatting.
+    fn sta_pin_name(db: &DesignDb, p: PinId) -> String {
         match db.pin_cells[p.0 as usize] {
             Some(c) => format!(
                 "{}/{}",
                 db.strings.resolve(db.cell_names[c.0 as usize]),
                 db.strings.resolve(db.pin_names[p.0 as usize])
             ),
-            None => format!("PIN/{}", db.strings.resolve(db.pin_names[p.0 as usize])),
-        }
-    }
-
-    /// STA-style `inst/pin` name (bare port name for io pins), matching
-    /// `Context::pin_name`'s formatting.
-    fn sta_pin_name(db: &DesignDb, p: PinId) -> String {
-        match db.pin_cells[p.0 as usize] {
-            Some(_) => member_name(db, p),
             None => db.strings.resolve(db.pin_names[p.0 as usize]).to_string(),
         }
     }

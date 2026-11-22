@@ -7386,3 +7386,14 @@ All outputs gitignored — no repo-visible artifact. The optional heavy
 "version bumped (minor)" instruction; under AGENTS.md §5's 0.x rule a
 feature addition would be a patch — the deviation is recorded, not silent
 (same disposition as the `0.3.13 → 0.4.0` bump).
+
+**Card #33 review follow-ups** (local fixup): `run_cts` now bails on
+`max_loads < 2` — 1 yields one group per load, the same non-terminating
+shape the fail-proof mutation produced, so the public API closes the
+footgun the review named. The second tests.md fail-proof was run:
+dropping `connect_pin(out_pin, net)` leaves every tree net driverless —
+`test_cts_tree_structure_gcd` red on "tree net has a driver" and both
+`test_cts_propagated_sta_*` red on sinks losing propagated arrival;
+restored, all green. Test helper `member_name`'s unreachable `None` arm
+removed (merged into `sta_pin_name`). `cargo test -p grus-core cts` and
+clippy re-verified green after the changes.

@@ -285,8 +285,8 @@ pub fn run_cts(
     if cfg.buf_list.is_empty() {
         bail!("cts: buffer list is empty");
     }
-    if cfg.max_loads == 0 {
-        bail!("cts: max_loads must be >= 1");
+    if cfg.max_loads < 2 {
+        bail!("cts: max_loads must be >= 2 (1 yields one group per load — the tree never terminates)");
     }
     // Validate every configured macro before mutating: it must exist in
     // the tech DB and have exactly one non-power input and output pin.
