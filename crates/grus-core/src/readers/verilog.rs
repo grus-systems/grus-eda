@@ -587,6 +587,7 @@ pub fn parse_verilog_bytes(
         db.pin_nets.push(net_id);
         db.pin_offset_x_dbu.push(0);
         db.pin_offset_y_dbu.push(0);
+        db.pin_io_layer.push(None);
         db.pin_is_driver.push(is_driver);
         db.io_pins.push(pin_id);
 
@@ -662,6 +663,7 @@ pub fn parse_verilog_bytes(
             db.pin_nets.push(net_id);
             db.pin_offset_x_dbu.push(mpin.offset_x_dbu);
             db.pin_offset_y_dbu.push(mpin.offset_y_dbu);
+            db.pin_io_layer.push(None);
             db.pin_is_driver.push(is_driver);
             db.cell_pin_ids.push(pin_id);
 

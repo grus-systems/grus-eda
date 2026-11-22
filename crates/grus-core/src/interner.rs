@@ -354,6 +354,7 @@ mod tests {
         db.pin_nets.push(Some(NetId(0)));
         db.pin_offset_x_dbu.push(0);
         db.pin_offset_y_dbu.push(50_000);
+        db.pin_io_layer.push(None);
         db.pin_is_driver.push(true); // primary input drives net 0
         db.io_pins.push(PinId(0));
 
@@ -365,6 +366,7 @@ mod tests {
         db.pin_nets.push(Some(NetId(1)));
         db.pin_offset_x_dbu.push(100_000);
         db.pin_offset_y_dbu.push(50_000);
+        db.pin_io_layer.push(None);
         db.pin_is_driver.push(false); // primary output is sink of net 1
         db.io_pins.push(PinId(1));
 
@@ -377,6 +379,7 @@ mod tests {
         db.pin_nets.push(Some(NetId(0)));
         db.pin_offset_x_dbu.push(230);
         db.pin_offset_y_dbu.push(1360);
+        db.pin_io_layer.push(None);
         db.pin_is_driver.push(false);
 
         db.pin_names.push(p1_name);
@@ -387,6 +390,7 @@ mod tests {
         db.pin_nets.push(Some(NetId(1)));
         db.pin_offset_x_dbu.push(400);
         db.pin_offset_y_dbu.push(1360);
+        db.pin_io_layer.push(None);
         db.pin_is_driver.push(true); // instance output drives net 1
 
         // Cell 0 SoA

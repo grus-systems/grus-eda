@@ -53,6 +53,10 @@ enum Commands {
     /// E1: Estimate global-routing congestion directly from placed DEF
     Congestion(CongestionArgs),
 
+    /// E4: Global routing — committed edge paths emitted as an OpenROAD-format route guide
+    #[command(name = "route")]
+    Route(RouteArgs),
+
     /// E2: Global placement + Abacus legalization, emitting placed DEF
     Place(PlaceArgs),
 
@@ -130,6 +134,31 @@ struct CongestionArgs {
 
     #[arg(long, help = "Print ASCII routing congestion heatmap")]
     heatmap: bool,
+}
+
+#[derive(Args, Debug)]
+struct RouteArgs {
+    #[arg(long, help = "Path to technology LEF (.tlef) file")]
+    tlef: PathBuf,
+
+    #[arg(long, help = "Path to standard cell LEF (.lef) file")]
+    lef: PathBuf,
+
+    #[arg(long, help = "Path to placed DEF (.def) file")]
+    def: PathBuf,
+
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), help = "GCell grid track supply (default: from the DEF GCELLGRID)")]
+    gcell_tracks: Option<u32>,
+
+    #[arg(
+        long,
+        value_parser = parse_unit_interval,
+        help = "Uniform layer adjustment factor (0.0 to 1.0)"
+    )]
+    layer_adjust: Option<f32>,
+
+    #[arg(long, help = "Path to output route guide file (OpenROAD global_route -guide_file format)")]
+    guide_out: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -328,6 +357,78 @@ struct PowerArgs {
     json: Option<PathBuf>,
 }
 
+/// Shared load path of the `congestion` and `route` arms: tech + placed DEF
+/// plus the `--layer-adjust`/`--gcell-tracks` mapping.
+struct CongestionInputs {
+    tech_db: grus_core::tech_db::TechDb,
+    design_db: grus_core::design_db::DesignDb,
+    layer_adjustments: Option<Vec<f32>>,
+    gcell_tracks_override: Option<i32>,
+    elapsed_load_ms: f64,
+}
+
+fn load_congestion_inputs(
+    tlef: &Path,
+    lef: &Path,
+    def: &Path,
+    layer_adjust: Option<f32>,
+    gcell_tracks: Option<u32>,
+) -> anyhow::Result<CongestionInputs> {
+    println!("Loading technology from {:?} and {:?}", tlef, lef);
+    let mut interner = grus_core::interner::StringInterner::new();
+    let t_load = std::time::Instant::now();
+    let (tech_db, design_db) = {
+        let _p = grus_core::timing::phase("cong.load");
+        let tech_db = load_lef_tech_db(tlef, lef, &mut interner)?;
+        let design_db = grus_core::readers::parse_def(def, &tech_db, None)?;
+        (tech_db, design_db)
+    };
+    let elapsed_load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
+
+    let layer_adjustments = layer_adjust.map(|alpha| {
+        (0..tech_db.routing_layers.len())
+            .map(|i| if i == 0 { 0.0f32 } else { alpha })
+            .collect::<Vec<f32>>()
+    });
+
+    Ok(CongestionInputs {
+        tech_db,
+        design_db,
+        layer_adjustments,
+        gcell_tracks_override: gcell_tracks.map(|t| t as i32),
+        elapsed_load_ms,
+    })
+}
+
+fn print_congestion_summary(
+    loaded: &CongestionInputs,
+    grid: &grus_core::congestion::GCellGrid,
+    report: &grus_core::congestion::CongestionReport,
+    elapsed_route_ms: f64,
+) {
+    let total_cap: f32 = grid.h_cap.iter().sum::<f32>() + grid.v_cap.iter().sum::<f32>();
+    let total_demand: f32 = grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
+    println!(
+        "Congestion Estimation: design={}, grid={}x{}, tile_w={} dbu, tile_h={} dbu",
+        loaded.design_db.design_name, grid.nx, grid.ny, grid.gcell_w_dbu, grid.gcell_h_dbu
+    );
+    println!(
+        "Routing Resources: total_capacity={:.0}, total_demand={:.0}, total_overflow={:.1}",
+        total_cap, total_demand, report.total_overflow
+    );
+    println!(
+        "Congestion Metrics: max_edge_overflow={:.1}, top_05pct_overflow={:.2}, overflow_gcells={}/{}",
+        report.max_edge_overflow,
+        report.top_05pct_overflow,
+        report.overflow_gcells,
+        grid.nx * grid.ny
+    );
+    println!(
+        "Runtime: load={:.2}ms, estimation={:.2}ms",
+        loaded.elapsed_load_ms, elapsed_route_ms
+    );
+}
+
 fn check_top_name(expected: Option<&str>, kind: &str, actual: &str) -> anyhow::Result<()> {
     if let Some(top) = expected
         && actual != top
@@ -442,60 +543,70 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Congestion(args) => {
-            println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
-            let mut interner = grus_core::interner::StringInterner::new();
-            let t_load = std::time::Instant::now();
-            let (tech_db, design_db) = {
-                let _p = grus_core::timing::phase("cong.load");
-                let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
-                let design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
-                (tech_db, design_db)
-            };
-            let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
-
-            let layer_adjustments = args.layer_adjust.map(|alpha| {
-                (0..tech_db.routing_layers.len())
-                    .map(|i| if i == 0 { 0.0f32 } else { alpha })
-                    .collect::<Vec<f32>>()
-            });
-            let gcell_tracks_override = args.gcell_tracks.map(|t| t as i32);
-
+            let loaded = load_congestion_inputs(
+                &args.tlef,
+                &args.lef,
+                &args.def,
+                args.layer_adjust,
+                args.gcell_tracks,
+            )?;
             let t_route = std::time::Instant::now();
             let (grid, report) = grus_core::congestion::estimate_congestion(
-                &design_db,
-                &tech_db,
-                layer_adjustments.as_deref(),
-                gcell_tracks_override,
+                &loaded.design_db,
+                &loaded.tech_db,
+                loaded.layer_adjustments.as_deref(),
+                loaded.gcell_tracks_override,
             );
             let elapsed_route = t_route.elapsed().as_secs_f64() * 1000.0;
 
-            let total_cap: f32 = grid.h_cap.iter().sum::<f32>() + grid.v_cap.iter().sum::<f32>();
-            let total_demand: f32 =
-                grid.h_demand.iter().sum::<f32>() + grid.v_demand.iter().sum::<f32>();
-
-            println!(
-                "Congestion Estimation: design={}, grid={}x{}, tile_w={} dbu, tile_h={} dbu",
-                design_db.design_name, grid.nx, grid.ny, grid.gcell_w_dbu, grid.gcell_h_dbu
-            );
-            println!(
-                "Routing Resources: total_capacity={:.0}, total_demand={:.0}, total_overflow={:.1}",
-                total_cap, total_demand, report.total_overflow
-            );
-            println!(
-                "Congestion Metrics: max_edge_overflow={:.1}, top_05pct_overflow={:.2}, overflow_gcells={}/{}",
-                report.max_edge_overflow,
-                report.top_05pct_overflow,
-                report.overflow_gcells,
-                grid.nx * grid.ny
-            );
-            println!(
-                "Runtime: load={:.2}ms, estimation={:.2}ms",
-                elapsed_load, elapsed_route
-            );
+            print_congestion_summary(&loaded, &grid, &report, elapsed_route);
 
             if args.heatmap {
                 print_heatmap(grid.nx, grid.ny, &report.gcell_usage_ratio);
             }
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
+            }
+        }
+        Commands::Route(args) => {
+            let loaded = load_congestion_inputs(
+                &args.tlef,
+                &args.lef,
+                &args.def,
+                args.layer_adjust,
+                args.gcell_tracks,
+            )?;
+            let t_route = std::time::Instant::now();
+            let routed = grus_core::congestion::route_design(
+                &loaded.design_db,
+                &loaded.tech_db,
+                loaded.layer_adjustments.as_deref(),
+                loaded.gcell_tracks_override,
+            );
+            let guides = grus_core::congestion::build_guides(
+                &loaded.design_db,
+                &loaded.tech_db,
+                &routed,
+            );
+            let box_count: usize = guides.iter().map(|g| g.boxes.len()).sum();
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&args.guide_out)?);
+            grus_core::congestion::write_guides(
+                &mut out,
+                &loaded.design_db,
+                &loaded.tech_db,
+                &guides,
+            )?;
+            use std::io::Write as _;
+            out.flush()?;
+            let elapsed_route = t_route.elapsed().as_secs_f64() * 1000.0;
+
+            print_congestion_summary(&loaded, &routed.grid, &routed.report, elapsed_route);
+            println!(
+                "Guide: nets={} boxes={} wrote {:?}",
+                guides.len(),
+                box_count,
+                args.guide_out
+            );
             if grus_core::timing::enabled() {
                 grus_core::timing::print_report();
             }

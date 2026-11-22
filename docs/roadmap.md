@@ -577,13 +577,19 @@ tolerances, probe evidence — is in
 - In: `tlef` + `lef` + placed `def`. Out: OpenROAD-format guide file +
   guide-based SPEF via the existing `--spef-out` path.
 - Reuses almost everything E1 built: `GCellGrid::build`, `decompose_net`
-  RSMT, `route_segments` (committed paths exist internally and are discarded
-  today), `NetRcTree`/`NetParasitics`, SPEF writer.
+  RSMT, `route_segments` committed paths (preserved in `RoutedDesign` since
+  `v0.3.9`), `NetRcTree`/`NetParasitics`, SPEF writer.
 - Done when (on `gcd.placed.def`, then `picorv32.placed.def`): per-net
   guide-box overlap ≥ 0.70 vs `global_route -guide_file`; guide-box total
   within 15%; our RC on OpenROAD's guides *and* our guides fed back via
   `read_guides` agree with `estimate_parasitics -global_routing` SPEF within
   `max(5%, 1 fF)` per net; end-to-end `sta` within `max(5 ps, 1%)`.
+- Progress 2026-11-22 (`v0.3.9`, ticket `e4-guides-emit`): guide emission
+  and the topology criteria are done — `grus-eda route --guide-out` writes
+  OpenROAD-format guides with weighted overlap `0.975` gcd / `0.960`
+  picorv32 and box deltas `+2.4%` / `-6.2%`; `read_guides` +
+  `estimate_parasitics -global_routing` accept our guide in the pinned
+  image. Guide parasitics and the end-to-end `sta` criterion remain open.
 - Probe note: guide parasitics halve the placement-estimate gap to routed
   truth on gcd (median per-net C diff vs RCX: 27.6% vs 44.2%).
 - Sizing: ~6–8 tickets (M). Ticket sketch in `design/order.md`.

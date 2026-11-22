@@ -85,11 +85,17 @@ pub struct DesignDb {
     pub pin_nets: Vec<Option<NetId>>,
     pub pin_offset_x_dbu: Vec<i32>, // relative to cell (or absolute for I/O port)
     pub pin_offset_y_dbu: Vec<i32>,
+    pub pin_io_layer: Vec<Option<LayerId>>, // DEF `+ LAYER` of primary I/O pins; None for instance pins
     pub pin_is_driver: Vec<bool>,
     pub io_pins: Vec<PinId>, // indices of primary I/O ports (where pin_cells[p] == None)
 
     // --- Net SoA & CSR (indexed by NetId) ---
     pub net_names: Vec<SymbolId>,
+    /// Raw NETS-section spelling per net (escape characters kept). OpenDB
+    /// stores net names verbatim, so route-guide emission must reproduce
+    /// this token for `read_guides` to match nets. Empty for non-DEF
+    /// sources; then guide emission falls back to escaping `net_names`.
+    pub net_def_spellings: Vec<SymbolId>,
     pub net_pin_offsets: Vec<u32>, // length num_nets + 1
     pub net_pin_ids: Vec<PinId>, // driver pin (if any) is always placed first at net_pin_offsets[net]
 }
