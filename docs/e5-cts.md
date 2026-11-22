@@ -1,23 +1,25 @@
 # E5: Clock-Tree Synthesis — Implementation Spec
 
-E5 ticket 3 (`e5-cts-tree`, `v0.5.0`): build a depth-balanced buffer tree on
-every design clock's root net, legalize the inserted cells only, emit a CTS
-DEF and a census report. TritonCTS reference artifacts for `gcd` and
-`picorv32` were committed by `e5-cts-ref`; the `DesignDb` mutation API came
-from `e5-insert-api`. The strict skew/latency golden comparison is the next
-ticket (`e5-cts-e2e`) — this stage asserts the tree *class* (depth, census,
-legality, propagated-clock reachability), not field-exact equivalence.
+E5 tickets 3–4 (`e5-cts-tree` `v0.5.0`, `e5-cts-e2e` `v0.5.1`): build a
+depth-balanced buffer tree on every design clock's root net, legalize the
+inserted cells only, emit a CTS DEF and a census report — then score that
+DEF against the committed TritonCTS goldens end to end. TritonCTS reference
+artifacts for `gcd` and `picorv32` were committed by `e5-cts-ref`; the
+`DesignDb` mutation API came from `e5-insert-api`. Ticket 3 asserts the
+tree *class* (depth, census, legality, propagated-clock reachability);
+ticket 4 adds the strict skew/latency/endpoint comparison — see §6 for its
+verdicts.
 
 ---
 
-## 1. Done Criteria (this ticket)
+## 1. Done Criteria (ticket 3)
 
 | What | Reference | Done When | Status |
 |---|---|---|---|
 | `grus-eda cts` end to end | TritonCTS `clock_tree_synthesis` on `gcd.placed.def`, `picorv32.placed.def` | emitted DEF `parse_def` re-reads + `verify_legality` accepts; clock nets decomposed into buffer-driven segments | **met** (`cts::tests::test_cts_def_roundtrip_*`, `cli_cts_parse_and_gcd_e2e`) |
 | Depth + buffer census | `<d>.cts.reference.json` | TritonCTS league: depth 2 / single-digit buffers on gcd, ~depth 4 / ~200 on picorv32; never one-buffer-per-sink | **met** (gcd 6 bufs/depth 2, picorv32 230 bufs/depth 4 — see `docs/results.md`) |
 | Report JSON | `<d>.cts.reference.json` | emitted per run (`--report`); buffer counts per type, sink count, depth, clock-net HPWL; field names mirror the reference | **met** (schema below) |
-| Propagated-clock STA | `<d>.cts.sta.reference.json` | runs in `cargo test` on our CTS DEF; gcd arrival spread + insertion delay recorded as **informational** | **met** (`test_cts_propagated_sta_*`); strict comparison deferred to `e5-cts-e2e` — stated, not claimed |
+| Propagated-clock STA | `<d>.cts.sta.reference.json` | runs in `cargo test` on our CTS DEF; gcd arrival spread + insertion delay recorded as **informational** | **met** (`test_cts_propagated_sta_*`); the strict comparison is ticket 4 (§6) |
 | Mutation boundary | — | non-clock components/nets byte-identical in emitted DEF; control-net HPWL unchanged | **met** (`test_cts_untouched_def_identical`) |
 | Checks | — | `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings`; fail-proof red/restore recorded | **met** (see `docs/results.md`) |
 
@@ -186,3 +188,48 @@ load-bearing property.
 - picorv32's negative setup WNS (−1.77 ns) matches the reference's own
   (−1.78 ns on its `cts_placement_rc` golden) — a design property, not a
   CTS regression.
+
+---
+
+## 6. Strict e2e comparison (ticket 4 `e5-cts-e2e`, `v0.5.1`)
+
+Ours-side DEFs come from `tests/designs/generate_cts_ours.sh <d>` — host-side
+`grus-eda cts` on `<d>.placed.def` + `<d>.cts.sdc`, emitting
+`<d>.cts.ours.def` + `<d>.cts.ours.report.json` (gcd's pair committed,
+picorv32's gitignored > 1 MB, both byte-deterministic). The gate
+(`cts_e2e`, tests `test_{gcd,picorv32}_cts_e2e`) re-parses the emitted DEF,
+runs `estimate_placement_parasitics` (met2) + propagated STA — the golden's
+`cts_placement_rc` regime — and compares per endpoint field; the reference
+`worst_clock_skew` scalars are not the skew bound (see the reference-setup
+axis). `cts_decomposition` (`test_{gcd,picorv32}_cts_decomposition`,
+`--nocapture`) prints the three axes every outside-bound value is named
+from: **engine** (our STA on the reference DEF vs golden), **tree-shape**
+(our STA on our DEF vs our STA on the reference DEF), **total** (our STA on
+our DEF vs golden — the gated comparison).
+
+| Criterion | Bound | gcd | picorv32 |
+|---|---|---|---|
+| 1 skew (clock-pin spread) | `max(25 ps, 25%)` | **met** — 2.150 vs 1.372 ps | **named residual, tree-shape** — 70.563 vs 36.209 ps |
+| 2 max insertion delay | within 15% | **met** — 0.306086 vs 0.314567 ns | **met** — 0.802071 vs 0.793474 ns |
+| 3 per-endpoint STA | `max(5 ps, 1%)` | **named residual, tree-shape** — 42/424 fields (`min_req`/`min_arr`, ~9.5 ps early) | **named residual, tree-shape + engine** — 3,068/14,384 fields + `tns_max` |
+| 4 census + HPWL | informational | printed | printed |
+
+Why the residual is tree-side, not engine-side: on the same TritonCTS DEF
+our engine reproduces every clock-pin latency to ≤0.41 ps (picorv32) /
+≤0.23 ps (gcd), so a spread or latency gap in `total` can only come from
+the tree we built. Root cause named: depth balance equalizes *buffer
+count* along every root→sink path, not per-pin RC — our fast pins land at
+0.7315 ns where the reference's min sits at 0.7573 ns (59 ps apart at the
+`_10350_` cluster), and our slow tail reaches 0.8021 vs ref 0.7935 ns.
+Closing it needs a latency/RC-aware balancing pass (dummy-load repair and
+per-pin RC equalization are the TritonCTS mechanisms ours lacks — §5);
+the floors in `CtsTol`/`PICORV32_CTS_SKEW_ABS_NS` hold the measured
+values, each documented in `docs/results.md` (`e5-cts-e2e`).
+
+The reference-setup axis also records a convention gap worth knowing
+before comparing skews: the golden's `skew_setup`/`skew_hold` scalars
+(`worst_clock_skew -setup/-hold`, signed) differ from the latency-fields
+spread the criterion bounds — gcd −1.373 ps ≈ spread 1.372 ps (same
+quantity, sign aside); picorv32 −34.165 ps vs spread 36.209 ps (2.0 ps of
+definition gap, setup checks a register→register pair while the latency
+fields span all 1,597 pins).
