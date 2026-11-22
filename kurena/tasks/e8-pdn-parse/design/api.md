@@ -107,21 +107,22 @@ pub struct PdnNode {
 pub struct PdnCensus { /* model.md */ }
 
 /// Build the per-net graph: conn expansion, same-layer union, via
-/// links, pin attach, source marking. Returns the graph plus the
-/// resolved pin→node table the acceptance calls the attach table.
-pub fn build_graph(db: &DesignDb, net: &PdnNet) -> PdnGraph;
+/// links, pin attach, source marking. Panics on conn-expansion errors;
+/// `try_build_graph` is the `Result`-returning twin.
+pub fn build_graph(db: &DesignDb, tech_db: &TechDb, net: &PdnNet) -> PdnGraph;
+pub fn try_build_graph(db: &DesignDb, tech_db: &TechDb, net: &PdnNet) -> Result<PdnGraph>;
 
 /// Connectivity verdict + census for one net.
-pub fn check_net(db: &DesignDb, net: &PdnNet) -> (PdnGraph, PdnCensus);
+pub fn check_net(db: &DesignDb, tech_db: &TechDb, net: &PdnNet) -> (PdnGraph, PdnCensus);
 
 /// Convenience: every `+ USE POWER`/`GROUND` net's census.
-pub fn census(db: &DesignDb) -> Vec<PdnCensus>;
+pub fn census(db: &DesignDb, tech_db: &TechDb) -> Vec<PdnCensus>;
 ```
 
-`build_graph` returns `PdnGraph` by value; errors surface through
-`anyhow::Result` on a thin wrapper `try_build_graph` only where
-user-input lookups can fail (`Instance` conn names) — attachable-pin
-math is infallible.
+`tech_db` is a parameter — attachability needs `MacroPin::rects`. Errors
+surface through `anyhow::Result` on `try_build_graph` only where
+user-input lookups can fail (`TopPin`/`Instance` conn names);
+attachable-pin math is infallible.
 
 ## `def.rs` / `lef.rs` (internal)
 
@@ -130,8 +131,8 @@ math is infallible.
 enum DefVia { Generated { lower, upper, cut, cut_count }, Fixed(SymbolId), Inline }
 struct DefViaMap(FastMap<String, DefVia>);
 
-fn add_def_via(tech_db: &TechDb, words: &[&str], line: usize)
-    -> Result<(String, DefVia)>;
+fn add_def_via(db: &mut DesignDb, tech_db: &TechDb, words: &[&str],
+               line: usize) -> Result<(String, DefVia)>;
 fn add_special_net(db: &mut DesignDb, tech_db: &TechDb, vias: &DefViaMap,
                    words: &[&str], line: usize) -> Result<()>;
 

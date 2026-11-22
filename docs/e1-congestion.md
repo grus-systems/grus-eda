@@ -120,7 +120,7 @@ pub struct CongestionReport {
      - `FW`: `(cx + r.yl, cy + r.xl, cx + r.yh, cy + r.xh)`
      - `FE`: `(cx + h - r.yh, cy + w - r.xh, cx + h - r.yl, cy + w - r.xl)`
    - **Power/Ground Wires (`SPECIALNETS`)**:
-     Include every routed non-via wire rectangle `(layer, rect)` in `DesignDb::special_wire_rects` (`VPWR`/`VGND` `FOLLOWPIN` rails on `met1`, `STRIPE` straps on `met4`/`met5`, and `DRCFILL` patches on `met2`/`met3`).
+     Include every routed non-via wire rectangle `(layer, rect)` — `DesignDb::special_wire_rects()` flattens `pdn_nets` (`VPWR`/`VGND` `FOLLOWPIN` rails on `met1`, `STRIPE` straps on `met4`/`met5`, and `DRCFILL` patches on `met2`/`met3`).
    - **Per-Edge 1D Cross-Track Interval Union & Track Deduction**:
      For each routing layer $l$ with pitch $P_l = \text{pitch\_dbu}(l)$ and layer adjustment $\alpha_l \in [0.0, 1.0]$ (default `sky130hd` adjustments: `met1: 0.30`, `met2..met5: 0.20`, overridable via uniform or per-layer adjustment):
      - If layer $l$ is `Horizontal`:

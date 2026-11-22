@@ -7768,3 +7768,51 @@ again.
 pre-existing `jpeg` placement/dmp ignores), `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --release -p grus-core sta`.
 `kurena/tasks/ux-sta-paths/spec/` untouched; no commits made.
+
+### 2026-11-23 — e8-pdn-parse: per-net PDN model + connectivity census
+
+E8 ticket 2 (`kurena/tasks/e8-pdn-parse/`). Replaces the flat
+`DesignDb::special_wire_rects` field with `pdn_nets: Vec<PdnNet>` — each
+`PdnNet` keeps `+ USE`, connection groups verbatim, half-width-expanded
+`wire_rects`, and `PdnVia` stacks resolved through LEF `VIA` defs
+(`TechDb::via_defs` + `CutLayer`/`via_res_ohm_above`; no name heuristics).
+DEF `VIAS` records (generated `+ VIARULE`/`+ LAYERS`/`+ ROWCOL`, fixed
+`+ VIA`, inline `+ RECT`/`POLYGON` rejected only when referenced) parse into
+a run-local map ahead of `SPECIALNETS`. New `pdn` module:
+`try_build_graph`/`build_graph`/`check_net`/`census` — conn expansion,
+same-layer rect-overlap union, via edges, macro-pin rect attach, top-level
+pin source marking. `DesignDb::special_wire_rects()` flattens the per-net
+rects for the gcell blockage consumer. Public/additive API → workspace
+version `0.7.0`.
+
+**Ours**: `cargo test -p grus-core --lib pdn::tests -- --nocapture` —
+5 tests, `finished in 0.69s` (debug build; includes both designs' LEF+DEF
+loads and graph construction).
+
+| metric | reference (`*.irdrop.reference.json` / embedded CSV) | ours (`PdnCensus`) | diff | pass? |
+|---|---|---|---|---|
+| gcd VPWR conn verdict | `check_power_grid` connectivity `"1"` (code 0) | `all_shapes_connected = true`, `nodes = 1`, `source_nodes = 1` | 0 | PASS |
+| gcd VPWR attached terminals | 384 rows (`voltage.vpwr.embedded.csv`) | `attached_terminals = 384` (`attachable 384`, `unattached 0`, `unreachable 0`) | 0 | PASS |
+| gcd VGND attached terminals | 384 rows (`voltage.vgnd.embedded.csv`) | `attached_terminals = 384` | 0 | PASS |
+| gcd VPWR/VGND geometry | DEF `SPECIALNETS` records | `wire_rects = 47`, `vias = 46`, `conn_pins = 676` per net | n/a (parse census) | PASS |
+| picorv32 VPWR conn verdict | `check_power_grid` connectivity `"1"` | `all_shapes_connected = true`, `nodes = 1`, `source_nodes = 1` | 0 | PASS |
+| picorv32 VPWR attached terminals | 10,205 rows | `attached_terminals = 10,205` (`attachable 10,205`, `unattached 0`, `unreachable 0`) | 0 | PASS |
+| picorv32 VGND attached terminals | 10,205 rows | `attached_terminals = 10,205` | 0 | PASS |
+| picorv32 VPWR/VGND geometry | DEF `SPECIALNETS` records | `wire_rects = 615`, `vias = 792`, `conn_pins = 17,261` per net | n/a (parse census) | PASS |
+
+`conn_pins` counts the conn-group expansion (676 ≈ 2×(384 comps − 46 empty)
++ pins; 17,261 for picorv32's 10,205 comps — `* VNB`/`VPB`/`VPWR`/`VGND`
+groups expand over components whose macro has the pin); `attachable` is the
+subset whose macro pin layer exists in the net's wire layers.
+
+**Fail-proof**: deleted the via-edge union in `pdn::build_graph`
+(`(Some(a), Some(b)) => nuf.union(a, b)` → `(Some(_a), Some(_b)) => {}`).
+All 5 `pdn::tests` went red (golden censuses, synthetic connectivity,
+unattached-pin, fail-proof tests) — every net's nodes split per layer.
+Restored; all green again.
+
+**Checks run**: `cargo test --workspace` (424 lib + 4 bin tests, 2 ignored
+— pre-existing `jpeg` ignores; `finished in 248.69s`), `cargo clippy
+--workspace --all-targets -- -D warnings` (clean), `cargo test -p grus-core
+--lib pdn::tests` (5/5). `kurena/tasks/e8-pdn-parse/spec/` untouched; no
+commits made.

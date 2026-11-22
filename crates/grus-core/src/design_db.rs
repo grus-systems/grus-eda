@@ -48,6 +48,63 @@ pub struct TrackGrid {
     pub layers: Vec<LayerId>,
 }
 
+/// One DEF `SPECIALNETS` record: a power-delivery (or other special) net's
+/// routed shapes, via stacks, and connection groups verbatim.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PdnNet {
+    pub name: SymbolId,
+    pub use_kind: Option<PdnUse>,
+    /// `( comp pin )` groups verbatim; expanded by `pdn::build_graph` so the
+    /// parse makes no COMPONENTS/PINS ordering assumption.
+    pub conns: Vec<PdnConn>,
+    /// Two-point wire segments, half-width expanded. `width == 0` segments
+    /// never land here — they are the via-stack records in `vias`.
+    pub wire_rects: Vec<(LayerId, RectDbu)>,
+    pub vias: Vec<PdnVia>,
+}
+
+/// DEF `+ USE` keyword on a special net.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PdnUse {
+    Power,
+    Ground,
+    Signal,
+    Clock,
+    Analog,
+    Reset,
+    Scan,
+    TieOff,
+    Ring,
+}
+
+/// A SPECIALNETS `( comp pin )` connection group.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum PdnConn {
+    /// `( PIN <name> )` — a top-level bterm; the net's voltage source.
+    TopPin(SymbolId),
+    /// `( * <pin> )` — every component's pin named `<pin>`.
+    AllInstances(SymbolId),
+    /// `( <inst> <pin> )` — a single instance's pin.
+    Instance { inst: SymbolId, pin: SymbolId },
+}
+
+/// A SPECIALNETS via-stack record `NEW <layer> 0 … ( x y ) <viaName>`,
+/// resolved through the DEF `VIAS` section or a LEF `VIA` definition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PdnVia {
+    /// DEF-spelled via name (kept for diagnostics).
+    pub name: SymbolId,
+    /// Endpoints of the stack link.
+    pub lower: LayerId,
+    pub upper: LayerId,
+    /// Cut layer; resistance via `TechDb::cut_layer_by_name`.
+    pub cut: SymbolId,
+    /// Parallel cuts (`+ ROWCOL` product or LEF cut-RECT count).
+    pub cut_count: u32,
+    pub x_dbu: i32,
+    pub y_dbu: i32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GCellGridDef {
     pub is_x: bool, // true = GCELLGRID X, false = GCELLGRID Y
@@ -65,7 +122,10 @@ pub struct DesignDb {
     pub rows: Vec<PlacementRow>,
     pub tracks: Vec<TrackGrid>,
     pub gcell_grids: Vec<GCellGridDef>,
-    pub special_wire_rects: Vec<(LayerId, RectDbu)>, // PDN stripes/rails from SPECIALNETS
+    /// SPECIALNETS records (PDN stripes/rails and via stacks), one `PdnNet`
+    /// per DEF net name.
+    #[serde(default)]
+    pub pdn_nets: Vec<PdnNet>,
 
     // --- Cell SoA (indexed by CellId) ---
     pub cell_names: Vec<SymbolId>,
@@ -139,6 +199,35 @@ impl DesignDb {
         let start = self.net_pin_offsets[idx] as usize;
         let end = self.net_pin_offsets[idx + 1] as usize;
         &self.net_pin_ids[start..end]
+    }
+
+    /// Flat view over every special net's wire rects — identical coverage to
+    /// the removed `special_wire_rects` field: every two-point segment any
+    /// special net declares lands in `PdnNet::wire_rects`.
+    pub fn special_wire_rects(&self) -> impl Iterator<Item = (LayerId, RectDbu)> + '_ {
+        self.pdn_nets.iter().flat_map(|n| n.wire_rects.iter().copied())
+    }
+
+    /// Net lookup by DEF name, for `pdn` and tests.
+    pub fn pdn_net(&self, name: &str) -> Option<&PdnNet> {
+        let sym = self.strings.get(name)?;
+        self.pdn_nets.iter().find(|n| n.name == sym)
+    }
+
+    /// Macro-coords rect → oriented macro-coords rect (`w`/`h` = macro size).
+    /// Shared by `congestion::gcell` (blockages) and `pdn` (pin attach); the
+    /// caller translates by the cell's placement point.
+    pub(crate) fn orient_rect(r: RectDbu, w: i32, h: i32, orient: Orient) -> RectDbu {
+        match orient {
+            Orient::N => r,
+            Orient::S => RectDbu::new(w - r.xh, h - r.yh, w - r.xl, h - r.yl),
+            Orient::W => RectDbu::new(h - r.yh, r.xl, h - r.yl, r.xh),
+            Orient::E => RectDbu::new(r.yl, w - r.xh, r.yh, w - r.xl),
+            Orient::FN => RectDbu::new(w - r.xh, r.yl, w - r.xl, r.yh),
+            Orient::FS => RectDbu::new(r.xl, h - r.yh, r.xh, h - r.yl),
+            Orient::FW => RectDbu::new(r.yl, r.xl, r.yh, r.xh),
+            Orient::FE => RectDbu::new(h - r.yh, w - r.xh, h - r.yl, w - r.xl),
+        }
     }
 
     pub fn net_driver(&self, net: NetId) -> Option<PinId> {

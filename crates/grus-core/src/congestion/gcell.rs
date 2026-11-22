@@ -1,4 +1,4 @@
-use crate::design_db::{DesignDb, Orient, PlacementStatus};
+use crate::design_db::{DesignDb, PlacementStatus};
 use crate::interner::LayerId;
 use crate::tech_db::{LayerDir, TechDb};
 
@@ -199,27 +199,14 @@ impl GCellGrid {
 
                     for &(obs_layer, r) in mac.obs_rects.iter().chain(mac.pin_obs_rects.iter()) {
                         if obs_layer == layer_id {
-                            let (xl, yl, xh, yh) = match orient {
-                                Orient::N => (cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh),
-                                Orient::S => {
-                                    (cx + w - r.xh, cy + h - r.yh, cx + w - r.xl, cy + h - r.yl)
-                                }
-                                Orient::W => (cx + h - r.yh, cy + r.xl, cx + h - r.yl, cy + r.xh),
-                                Orient::E => (cx + r.yl, cy + w - r.xh, cx + r.yh, cy + w - r.xl),
-                                Orient::FN => (cx + w - r.xh, cy + r.yl, cx + w - r.xl, cy + r.yh),
-                                Orient::FS => (cx + r.xl, cy + h - r.yh, cx + r.xh, cy + h - r.yl),
-                                Orient::FW => (cx + r.yl, cy + r.xl, cx + r.yh, cy + r.xh),
-                                Orient::FE => {
-                                    (cx + h - r.yh, cy + w - r.xh, cx + h - r.yl, cy + w - r.xl)
-                                }
-                            };
-                            obstacles.push((xl, yl, xh, yh));
+                            let r = DesignDb::orient_rect(r, w, h, orient);
+                            obstacles.push((cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh));
                         }
                     }
                 }
             }
 
-            for &(wire_layer, r) in &design_db.special_wire_rects {
+            for (wire_layer, r) in design_db.special_wire_rects() {
                 if wire_layer == layer_id {
                     obstacles.push((r.xl, r.yl, r.xh, r.yh));
                 }
