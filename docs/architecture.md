@@ -450,7 +450,7 @@ pub struct DesignDb {
     pub rows: Vec<PlacementRow>,
     pub tracks: Vec<TrackGrid>,
     pub gcell_grids: Vec<GCellGridDef>,
-    pub special_wire_rects: Vec<(LayerId, RectDbu)>, // PDN stripes/rails from SPECIALNETS
+    pub pdn_nets: Vec<PdnNet>, // SPECIALNETS records: wire rects + via stacks + conns
 
     // --- Cell SoA (indexed by CellId) ---
     pub cell_names: Vec<SymbolId>,

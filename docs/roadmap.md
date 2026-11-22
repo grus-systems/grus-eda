@@ -692,8 +692,22 @@ surface, from the first large-design run's feedback
   leaves the solve byte-identical to embedded while reporting 0.00 W —
   so the explicit feed cannot substitute an external estimator. See
   `docs/results.md` 2026-11-23.
-- Missing: SPECIALNETS via extraction, LEF `VIA` resistance, resistor mesh,
-  a sparse DC solve (new dependency).
+- Progress 2026-11-23 (ticket `e8-pdn-parse`): per-net PDN model landed —
+  `DesignDb::pdn_nets` (`PdnNet`: conn groups verbatim, `+ USE`,
+  half-width-expanded `wire_rects`, `PdnVia` stacks). DEF `VIAS` records
+  resolve generated (`+ VIARULE`/`+ LAYERS`/`+ ROWCOL`), fixed (`+ VIA`), and
+  inline (`+ RECT`/`POLYGON`) forms; LEF `VIA` blocks give `ViaDef` layer
+  triples so DEF via names resolve without name heuristics, and `CutLayer` +
+  `via_res_ohm_above` carry the cut resistances (`via_res_ohm(cut, count)`).
+  `pdn::check_net` expands conns, attaches each `MacroPin` port rect to
+  same-layer wires, and unions rect components through via edges: on
+  `gcd.placed.def` VPWR/VGND each give 1 node, `attached_terminals` 384 =
+  embedded CSV rows, `unreachable_pins` empty — agreeing with
+  `check_power_grid` in `gcd.irdrop.reference.json`; picorv32 gives
+  10,205 = 10,205 rows on both rails. `special_wire_rects()` keeps the gcell
+  blockage view. See `docs/results.md` 2026-11-23.
+- Missing: resistor mesh, a sparse DC solve (new dependency), per-instance
+  current sources (N7 output).
 - Sizing: ~4–6 tickets (M).
 
 ### E9. Reporting / usability surface

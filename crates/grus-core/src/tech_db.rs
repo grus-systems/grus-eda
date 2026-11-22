@@ -77,6 +77,28 @@ pub struct MacroPin {
     pub rects: Vec<(LayerId, RectDbu)>,
 }
 
+/// A LEF `TYPE CUT` layer. `above` is the routing layer directly below it in
+/// LEF stack order — the index `via_res_ohm_above` is keyed on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CutLayer {
+    pub name: SymbolId,
+    pub above: LayerId,
+}
+
+/// A LEF `VIA` block, reduced to the layer triple + parallel cut count the
+/// PDN model needs; cut/bottom/top RECT geometry is not stored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ViaDef {
+    pub name: SymbolId,
+    pub lower: LayerId,
+    pub upper: LayerId,
+    /// Cut-layer name; resistance via `cut_layer_by_name → cut_layers[..].above`.
+    pub cut: SymbolId,
+    /// Parallel cuts — the total `RECT` count across the `VIA`'s cut-layer
+    /// groups (DEF-generated vias carry the per-instance count in `+ ROWCOL`).
+    pub cut_count: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MacroDef {
     pub name: SymbolId,
@@ -107,10 +129,24 @@ pub struct TechDb {
     /// per CUT layer, finalized into `via_res_ohm_above` by `load_tech_db`.
     #[serde(skip)]
     pub cut_res_above: Vec<(u8, f32)>,
+    /// CUT layers in LEF order (`licon`, which sits below every routing
+    /// layer, is not recorded — it has no `above`).
+    #[serde(default)]
+    pub cut_layers: Vec<CutLayer>,
+    /// LEF `VIA` definitions by name.
+    #[serde(default)]
+    pub via_defs: Vec<ViaDef>,
     pub macros: Vec<MacroDef>,
     pub macro_pins: Vec<MacroPin>,
     #[serde(skip)]
     pub layer_by_name: HashMap<SymbolId, LayerId>,
+    /// Cut-layer name → `cut_layers` index; populated during `parse_layer`
+    /// and rebuilt by `rebuild_maps`.
+    #[serde(skip)]
+    pub cut_layer_by_name: HashMap<SymbolId, u32>,
+    /// LEF `VIA` name → `via_defs` index; same lifecycle as `layer_by_name`.
+    #[serde(skip)]
+    pub via_by_name: HashMap<SymbolId, u32>,
     #[serde(skip)]
     pub macro_by_name: HashMap<SymbolId, MacroId>,
 }
@@ -133,6 +169,29 @@ impl TechDb {
         for (i, mac) in self.macros.iter().enumerate() {
             self.macro_by_name.insert(mac.name, MacroId(i as u16));
         }
+
+        self.cut_layer_by_name.clear();
+        self.cut_layer_by_name.reserve(self.cut_layers.len());
+        for (i, cut) in self.cut_layers.iter().enumerate() {
+            self.cut_layer_by_name.insert(cut.name, i as u32);
+        }
+
+        self.via_by_name.clear();
+        self.via_by_name.reserve(self.via_defs.len());
+        for (i, via) in self.via_defs.iter().enumerate() {
+            self.via_by_name.insert(via.name, i as u32);
+        }
+    }
+
+    /// Per-instance resistance of a resolved via: the cut layer's
+    /// `via_res_ohm_above` divided by the parallel cut count. `None` when the
+    /// cut layer is unknown or carries no RESISTANCE.
+    pub fn via_res_ohm(&self, cut: SymbolId, cut_count: u32) -> Option<f32> {
+        let idx = *self.cut_layer_by_name.get(&cut)? as usize;
+        let res = *self
+            .via_res_ohm_above
+            .get(self.cut_layers[idx].above.0 as usize)?;
+        (res != 0.0).then_some(res / cut_count.max(1) as f32)
     }
 
     pub fn macro_pins(&self, mac: &MacroDef) -> &[MacroPin] {

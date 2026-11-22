@@ -1,5 +1,10 @@
-use crate::design_db::{DesignDb, GCellGridDef, Orient, PlacementRow, PlacementStatus, TrackGrid};
-use crate::interner::{CellId, LibPinId, MacroPinId, NetId, PinDir, PinId};
+use crate::design_db::{
+    DesignDb, GCellGridDef, Orient, PdnConn, PdnNet, PdnUse, PdnVia, PlacementRow, PlacementStatus,
+    TrackGrid,
+};
+use crate::interner::{
+    CellId, LayerId, LibPinId, MacroPinId, NetId, PinDir, PinId, StringInterner, SymbolId,
+};
 use crate::lib_db::LibDb;
 use crate::tech_db::{RectDbu, TechDb};
 use anyhow::{Context, Result, anyhow, bail};
@@ -597,82 +602,493 @@ fn add_pin(
     Ok(())
 }
 
-fn add_special_net(db: &mut DesignDb, tech_db: &TechDb, words: &[&str], line: usize) -> Result<()> {
-    // Wire segments: `ROUTED|NEW layer width ( x1 y1 ) ( x2 y2 )`, where `*` repeats the previous coordinate.
-    let mut last_x = 0;
-    let mut last_y = 0;
-    let mut i = 0;
-    while i < words.len() {
-        if (words[i] == "ROUTED" || words[i] == "NEW") && i + 2 < words.len() {
-            let lname = words[i + 1];
-            let width: i32 = number(words[i + 2], "SPECIALNETS wire width", line)?;
-            i += 3;
+/// A DEF `VIAS` record resolved at parse time. Parse-local — SPECIALNETS via
+/// names consult this map first, then `TechDb::via_by_name`.
+enum DefVia {
+    /// `+ VIARULE` + `+ LAYERS` triple, fully resolved.
+    Generated {
+        lower: LayerId,
+        upper: LayerId,
+        cut: SymbolId,
+        cut_count: u32,
+    },
+    /// `+ VIA <lefViaName>` — the name interned in `db.strings`; resolved
+    /// through `tech_db.via_by_name` when SPECIALNETS references it (a name
+    /// absent from the LEF simply misses there).
+    Fixed(SymbolId),
+    /// `+ RECT`/`+ POLYGON` inline via — no resolvable layer stack. Tolerated
+    /// when defined; errors only when SPECIALNETS references it.
+    Inline,
+}
 
-            if let Some(&lid) = tech_db
-                .strings
-                .get(lname)
-                .and_then(|s| tech_db.layer_by_name.get(&s))
-            {
-                while i < words.len() && words[i] != "NEW" && words[i] != "ROUTED" {
-                    if words[i] == "+" && i + 2 < words.len() && words[i + 1] == "SHAPE" {
+type DefViaMap = FastMap<String, DefVia>;
+
+fn add_def_via(
+    db: &mut DesignDb,
+    tech_db: &TechDb,
+    words: &[&str],
+    line: usize,
+) -> Result<(String, DefVia)> {
+    let [name, attributes @ ..] = words else {
+        bail!("DEF line {line}: VIAS record without a via name");
+    };
+    let via_name = unescape_def_name_cow(name).into_owned();
+
+    let mut viarule = false;
+    let mut layers: Option<(LayerId, SymbolId, LayerId)> = None;
+    let mut cut_count = 1u32;
+    let mut fixed: Option<SymbolId> = None;
+    let mut inline = false;
+    for attr in split_attributes(attributes, line) {
+        let (keyword, args) = attr?;
+        match keyword {
+            // The rule name is kept only for diagnostics: `+ LAYERS` is
+            // authoritative for the stack.
+            "VIARULE" => {
+                viarule = true;
+                if args.len() != 1 {
+                    bail!("DEF line {line}: VIAS via {via_name} `+ VIARULE` takes one rule name");
+                }
+            }
+            "LAYERS" => {
+                let [bot, cut, top] = args else {
+                    bail!(
+                        "DEF line {line}: VIAS via {via_name} `+ LAYERS` needs `<bottom> <cut> <top>`"
+                    );
+                };
+                let routing = |lname: &str| -> Result<LayerId> {
+                    tech_db
+                        .strings
+                        .get(lname)
+                        .and_then(|s| tech_db.layer_by_name.get(&s))
+                        .copied()
+                        .with_context(|| {
+                            format!("DEF line {line}: VIAS via {via_name} `+ LAYERS` uses layer {lname}, which the LEF does not define as routing")
+                        })
+                };
+                let cut_sym = tech_db.strings.get(cut).with_context(|| {
+                    format!("DEF line {line}: VIAS via {via_name} `+ LAYERS` cut layer {cut} is not in the LEF")
+                })?;
+                if !tech_db.cut_layer_by_name.contains_key(&cut_sym) {
+                    bail!(
+                        "DEF line {line}: VIAS via {via_name} `+ LAYERS` middle layer {cut} is not a CUT layer"
+                    );
+                }
+                layers = Some((routing(bot)?, cut_sym, routing(top)?));
+            }
+            "ROWCOL" => {
+                let [r, c] = args else {
+                    bail!("DEF line {line}: VIAS via {via_name} `+ ROWCOL` needs `<rows> <cols>`");
+                };
+                let r: u32 = number(r, "VIAS ROWCOL rows", line)?;
+                let c: u32 = number(c, "VIAS ROWCOL cols", line)?;
+                cut_count = r * c;
+            }
+            "CUTSIZE" => {
+                let [x, y] = args else {
+                    bail!("DEF line {line}: VIAS via {via_name} `+ CUTSIZE` needs two numbers");
+                };
+                number::<i32>(x, "VIAS CUTSIZE x", line)?;
+                number::<i32>(y, "VIAS CUTSIZE y", line)?;
+            }
+            "CUTSPACING" => {
+                let [x, y] = args else {
+                    bail!("DEF line {line}: VIAS via {via_name} `+ CUTSPACING` needs two numbers");
+                };
+                number::<i32>(x, "VIAS CUTSPACING x", line)?;
+                number::<i32>(y, "VIAS CUTSPACING y", line)?;
+            }
+            "ENCLOSURE" => {
+                let [a, b, c, d] = args else {
+                    bail!("DEF line {line}: VIAS via {via_name} `+ ENCLOSURE` needs four numbers");
+                };
+                number::<i32>(a, "VIAS ENCLOSURE", line)?;
+                number::<i32>(b, "VIAS ENCLOSURE", line)?;
+                number::<i32>(c, "VIAS ENCLOSURE", line)?;
+                number::<i32>(d, "VIAS ENCLOSURE", line)?;
+            }
+            "VIA" => {
+                let [lef_name] = args else {
+                    bail!("DEF line {line}: VIAS via {via_name} `+ VIA` takes one LEF via name");
+                };
+                fixed = Some(db.strings.intern(&unescape_def_name_cow(lef_name)));
+            }
+            // Inline-via geometry and attributes the model does not read.
+            "RECT" | "POLYGON" => inline = true,
+            "PATTERN" | "MASK" | "FILL_SHAPE" | "STYLE" | "PROPERTY" => {}
+            other => bail!("DEF line {line}: unknown VIAS attribute `+ {other}`"),
+        }
+    }
+
+    let via = if let Some((lower, cut, upper)) = layers {
+        if !viarule {
+            bail!("DEF line {line}: VIAS via {via_name} has `+ LAYERS` without `+ VIARULE`");
+        }
+        let (lo, hi) = if lower.0 <= upper.0 {
+            (lower, upper)
+        } else {
+            (upper, lower)
+        };
+        DefVia::Generated {
+            lower: lo,
+            upper: hi,
+            cut,
+            cut_count,
+        }
+    } else if viarule {
+        // The grammar requires `+ LAYERS` on a generated via.
+        bail!("DEF line {line}: VIAS via {via_name} has `+ VIARULE` but no `+ LAYERS`");
+    } else if let Some(sym) = fixed {
+        DefVia::Fixed(sym)
+    } else if inline {
+        DefVia::Inline
+    } else {
+        bail!("DEF line {line}: VIAS via {via_name} has no via definition");
+    };
+    Ok((via_name, via))
+}
+
+/// Resolves a SPECIALNETS via name to `(lower, upper, cut, cut_count)`:
+/// the DEF `VIAS` map first, then LEF `VIA` definitions. Name-pattern
+/// heuristics are never consulted — a renamed via resolves by its declared
+/// layer triple.
+fn resolve_def_via(
+    tech_db: &TechDb,
+    def_vias: &DefViaMap,
+    name: &str,
+    net_name: &str,
+    line: usize,
+) -> Result<(LayerId, LayerId, SymbolId, u32)> {
+    let from_lef = |sym: SymbolId| -> Option<(LayerId, LayerId, SymbolId, u32)> {
+        tech_db.via_by_name.get(&sym).map(|&i| {
+            let vd = &tech_db.via_defs[i as usize];
+            (vd.lower, vd.upper, vd.cut, vd.cut_count)
+        })
+    };
+    match def_vias.get(name) {
+        Some(DefVia::Generated {
+            lower,
+            upper,
+            cut,
+            cut_count,
+        }) => Ok((*lower, *upper, *cut, *cut_count)),
+        Some(DefVia::Inline) => bail!(
+            "DEF line {line}: SPECIALNETS net {net_name} uses via {name}, which defines no resolvable layer stack"
+        ),
+        Some(DefVia::Fixed(lef_sym)) => from_lef(*lef_sym).with_context(|| {
+            format!("DEF line {line}: SPECIALNETS net {net_name} uses via {name}, which the LEF does not define")
+        }),
+        None => {
+            let sym = tech_db.strings.get(name);
+            sym.and_then(from_lef).with_context(|| {
+                format!("DEF line {line}: SPECIALNETS net {net_name} uses via {name}, which neither the VIAS section nor the LEF defines")
+            })
+        }
+    }
+}
+
+fn parse_pdn_use(word: &str, net_name: &str, line: usize) -> Result<PdnUse> {
+    Ok(match word {
+        "POWER" => PdnUse::Power,
+        "GROUND" => PdnUse::Ground,
+        "SIGNAL" => PdnUse::Signal,
+        "CLOCK" => PdnUse::Clock,
+        "ANALOG" => PdnUse::Analog,
+        "RESET" => PdnUse::Reset,
+        "SCAN" => PdnUse::Scan,
+        "TIEOFF" => PdnUse::TieOff,
+        "RING" => PdnUse::Ring,
+        other => bail!("DEF line {line}: SPECIALNETS net {net_name} has unknown `+ USE {other}`"),
+    })
+}
+
+/// A point coordinate: a number, or `*` repeating the same axis' previous
+/// value (`repeat`).
+fn special_coord(word: Option<&&str>, repeat: i32, net_name: &str, line: usize) -> Result<i32> {
+    match word {
+        Some(&"*") => Ok(repeat),
+        Some(&w) => w
+            .parse::<i32>()
+            .map_err(|_| anyhow!("DEF line {line}: SPECIALNETS net {net_name} coordinate `{w}` is not a number")),
+        None => bail!("DEF line {line}: SPECIALNETS net {net_name} wire statement ends mid-point"),
+    }
+}
+
+fn is_coord(w: &str) -> bool {
+    w == "*" || w.parse::<i32>().is_ok()
+}
+
+/// Mutable accumulators a wire statement writes through: emitted geometry
+/// and the running last-point state `*` coordinates read back.
+struct WireSink<'a> {
+    interner: &'a mut StringInterner,
+    wire_rects: &'a mut Vec<(LayerId, RectDbu)>,
+    vias: &'a mut Vec<PdnVia>,
+    last_x: i32,
+    last_y: i32,
+    net_name: &'a str,
+}
+
+/// The body of a `ROUTED`/`NEW`/`FIXED`/`COVER`/`SHIELD`/`TRUNK` wire
+/// statement, `i` pointing at `<layerName>`. Returns the index of the next
+/// statement (a `NEW`/`ROUTED`/`+` word, or the end of the record).
+fn parse_special_wire(
+    tech_db: &TechDb,
+    def_vias: &DefViaMap,
+    sink: &mut WireSink,
+    rest: &[&str],
+    mut i: usize,
+    line: usize,
+) -> Result<usize> {
+    let net_name = sink.net_name;
+    let lname = rest.get(i).copied().with_context(|| {
+        format!("DEF line {line}: SPECIALNETS net {net_name} wire statement without a layer name")
+    })?;
+    let width: i32 = number(
+        rest.get(i + 1).copied().unwrap_or(""),
+        "SPECIALNETS wire width",
+        line,
+    )?;
+    i += 2;
+    let lid = tech_db
+        .strings
+        .get(lname)
+        .and_then(|s| tech_db.layer_by_name.get(&s))
+        .copied()
+        .with_context(|| {
+            format!("DEF line {line}: SPECIALNETS net {net_name} wire uses layer {lname}, which the LEF does not define as routing")
+        })?;
+
+    loop {
+        let Some(&w) = rest.get(i) else { return Ok(i) };
+        match w {
+            "NEW" | "ROUTED" => return Ok(i),
+            "+" => {
+                let kw = rest.get(i + 1).copied().with_context(|| {
+                    format!("DEF line {line}: SPECIALNETS net {net_name} has `+` without an attribute keyword")
+                })?;
+                match kw {
+                    // One argument each; the model keeps none of them.
+                    "SHAPE" | "MASK" | "STYLE" | "VOLTAGE" | "NONDEFAULTRULE" => {
+                        rest.get(i + 2).with_context(|| {
+                            format!("DEF line {line}: SPECIALNETS net {net_name} `+ {kw}` needs an argument")
+                        })?;
                         i += 3;
-                        continue;
                     }
-                    if words[i] == "+SHAPE" || words[i] == "SHAPE" {
+                    // Anything else is a new `+` statement inside the same
+                    // net record (a repeated `+ ROUTED`/`+ FIXED`/..., or a
+                    // net-level attribute like `+ USE`): hand it back to the
+                    // dispatcher, which owns that keyword set and its errors.
+                    _ => return Ok(i),
+                }
+            }
+            _ => {
+                // First point of a record: `x y`.
+                let x1 = special_coord(rest.get(i), sink.last_x, net_name, line)?;
+                let y1 = special_coord(rest.get(i + 1), sink.last_y, net_name, line)?;
+                i += 2;
+                match rest.get(i) {
+                    Some(&w2) if is_coord(w2) => {
+                        // A second point — a wire segment. `*` repeats the
+                        // same axis' previous coordinate (x1/y1 here).
+                        let x2 = special_coord(rest.get(i), x1, net_name, line)?;
+                        let y2 = special_coord(rest.get(i + 1), y1, net_name, line)?;
                         i += 2;
-                        continue;
-                    }
-                    if i + 3 < words.len() {
-                        // One parse per candidate coordinate: `None` probes out,
-                        // `Some(None)` is `*` (repeat the previous coordinate).
-                        let coord = |w: &str| -> Option<Option<i32>> {
-                            if w == "*" {
-                                Some(None)
+                        sink.last_x = x2;
+                        sink.last_y = y2;
+                        if width > 0 {
+                            let half = width / 2;
+                            let rect = if y1 == y2 {
+                                RectDbu::new(x1.min(x2), y1 - half, x1.max(x2), y1 + half)
+                            } else if x1 == x2 {
+                                RectDbu::new(x1 - half, y1.min(y2), x1 + half, y1.max(y2))
                             } else {
-                                w.parse::<i32>().ok().map(Some)
-                            }
-                        };
-                        let probes = (
-                            coord(words[i]),
-                            coord(words[i + 1]),
-                            coord(words[i + 2]),
-                            coord(words[i + 3]),
-                        );
-                        if let (Some(x1), Some(y1), Some(x2), Some(y2)) = probes {
-                            let x1 = x1.unwrap_or(last_x);
-                            let y1 = y1.unwrap_or(last_y);
-                            let x2 = x2.unwrap_or(x1);
-                            let y2 = y2.unwrap_or(y1);
-
-                            last_x = x2;
-                            last_y = y2;
-                            i += 4;
-
-                            if width > 0 {
-                                let half = width / 2;
-                                let rect = if y1 == y2 {
-                                    RectDbu::new(x1.min(x2), y1 - half, x1.max(x2), y1 + half)
-                                } else if x1 == x2 {
-                                    RectDbu::new(x1 - half, y1.min(y2), x1 + half, y1.max(y2))
-                                } else {
-                                    RectDbu::new(
-                                        x1.min(x2) - half,
-                                        y1.min(y2) - half,
-                                        x1.max(x2) + half,
-                                        y1.max(y2) + half,
-                                    )
-                                };
-                                db.special_wire_rects.push((lid, rect));
-                            }
-                            continue;
+                                RectDbu::new(
+                                    x1.min(x2) - half,
+                                    y1.min(y2) - half,
+                                    x1.max(x2) + half,
+                                    y1.max(y2) + half,
+                                )
+                            };
+                            sink.wire_rects.push((lid, rect));
                         }
                     }
-                    i += 1;
+                    Some(&via_name) if !matches!(via_name, "+" | "NEW" | "ROUTED") => {
+                        // A via-stack record at (x1, y1) — the `width == 0`
+                        // link between consecutive layers.
+                        sink.last_x = x1;
+                        sink.last_y = y1;
+                        i += 1;
+                        let (lower, upper, cut, cut_count) =
+                            resolve_def_via(tech_db, def_vias, via_name, net_name, line)?;
+                        if lid != lower && lid != upper {
+                            bail!(
+                                "DEF line {line}: SPECIALNETS net {net_name} records via {via_name} on layer {lname}, which is neither of its endpoints"
+                            );
+                        }
+                        sink.vias.push(PdnVia {
+                            name: sink.interner.intern(&unescape_def_name_cow(via_name)),
+                            lower,
+                            upper,
+                            cut,
+                            cut_count,
+                            x_dbu: x1,
+                            y_dbu: y1,
+                        });
+                        // After a via name the point list ends; the next word
+                        // must open a new statement.
+                        match rest.get(i) {
+                            None | Some(&"+" | &"NEW" | &"ROUTED") => return Ok(i),
+                            Some(&bad) => bail!(
+                                "DEF line {line}: unexpected `{bad}` after via {via_name} in SPECIALNETS net {net_name}"
+                            ),
+                        }
+                    }
+                    _ => bail!(
+                        "DEF line {line}: SPECIALNETS net {net_name} has a one-point wire stub on layer {lname}"
+                    ),
                 }
-                continue;
             }
         }
-        i += 1;
+    }
+}
+
+fn add_special_net(
+    db: &mut DesignDb,
+    tech_db: &TechDb,
+    def_vias: &DefViaMap,
+    words: &[&str],
+    line: usize,
+) -> Result<()> {
+    let [name, rest @ ..] = words else {
+        bail!("DEF line {line}: SPECIALNETS record without a net name");
+    };
+    let net_name = unescape_def_name_cow(name).into_owned();
+    let net_sym = db.strings.intern(&net_name);
+
+    // Connection groups `( comp pin )` up to the first `+`/`NEW`/`ROUTED`
+    // word — parentheses were dropped by the statement reader, so groups are
+    // exactly two words.
+    let mut conns = Vec::new();
+    let mut i = 0;
+    while i + 1 < rest.len() && !matches!(rest[i], "+" | "NEW" | "ROUTED") {
+        let comp = rest[i];
+        let pin = rest[i + 1];
+        if matches!(comp, "+" | "NEW" | "ROUTED") || matches!(pin, "+" | "NEW" | "ROUTED") {
+            bail!("DEF line {line}: SPECIALNETS net {net_name} has a malformed connection group");
+        }
+        conns.push(if comp == "PIN" {
+            PdnConn::TopPin(db.strings.intern(&unescape_def_name_cow(pin)))
+        } else if comp == "*" {
+            PdnConn::AllInstances(db.strings.intern(&unescape_def_name_cow(pin)))
+        } else {
+            PdnConn::Instance {
+                inst: db.strings.intern(&unescape_def_name_cow(comp)),
+                pin: db.strings.intern(&unescape_def_name_cow(pin)),
+            }
+        });
+        i += 2;
+    }
+    if i < rest.len() && !matches!(rest[i], "+" | "NEW" | "ROUTED") {
+        bail!("DEF line {line}: SPECIALNETS net {net_name} has a trailing odd word in its connection list");
+    }
+
+    let mut use_kind = None;
+    let mut wire_rects = Vec::new();
+    let mut net_vias = Vec::new();
+    let mut sink = WireSink {
+        interner: &mut db.strings,
+        wire_rects: &mut wire_rects,
+        vias: &mut net_vias,
+        last_x: 0,
+        last_y: 0,
+        net_name: &net_name,
+    };
+
+    while i < rest.len() {
+        match rest[i] {
+            "+" => {
+                let kw = rest.get(i + 1).copied().with_context(|| {
+                    format!("DEF line {line}: SPECIALNETS net {net_name} has `+` without an attribute keyword")
+                })?;
+                i += 2;
+                match kw {
+                    "USE" => {
+                        let arg = rest.get(i).copied().with_context(|| {
+                            format!("DEF line {line}: SPECIALNETS net {net_name} `+ USE` needs a keyword")
+                        })?;
+                        let new_use = parse_pdn_use(arg, &net_name, line)?;
+                        if use_kind.is_some_and(|u| u != new_use) {
+                            bail!(
+                                "DEF line {line}: SPECIALNETS net {net_name} has conflicting `+ USE` attributes"
+                            );
+                        }
+                        use_kind = Some(new_use);
+                        i += 1;
+                    }
+                    "SHIELD" => {
+                        // `+ SHIELD shieldNetName` prefixes the same wire
+                        // body; the shield metal belongs to this net.
+                        rest.get(i).copied().with_context(|| {
+                            format!("DEF line {line}: SPECIALNETS net {net_name} `+ SHIELD` needs a shield net name")
+                        })?;
+                        i += 1;
+                        while matches!(rest.get(i), Some(&"+"))
+                            && matches!(rest.get(i + 1), Some(&("SHAPE" | "MASK" | "STYLE")))
+                        {
+                            i += 3;
+                        }
+                        i = parse_special_wire(tech_db, def_vias, &mut sink, rest, i, line)?;
+                    }
+                    "ROUTED" | "FIXED" | "COVER" | "TRUNK" => {
+                        i = parse_special_wire(tech_db, def_vias, &mut sink, rest, i, line)?;
+                    }
+                    // Attributes the model does not read; `SUBNET` is not one —
+                    // subnets carry their own wires this schema cannot model.
+                    "SOURCE" | "PATTERN" | "ESTCAP" | "WEIGHT" | "ORIGINAL" | "FIXEDBUMP"
+                    | "FREQUENCY" | "VOLTAGE" | "PROPERTY" | "SYNTHESIZED" | "NONDEFAULTRULE"
+                    | "XTALK" => {
+                        while i < rest.len() && !matches!(rest[i], "+" | "NEW" | "ROUTED") {
+                            i += 1;
+                        }
+                    }
+                    "SUBNET" => bail!(
+                        "DEF line {line}: SPECIALNETS net {net_name} `+ SUBNET` is not supported"
+                    ),
+                    other => bail!(
+                        "DEF line {line}: unknown SPECIALNETS attribute `+ {other}` on net {net_name}"
+                    ),
+                }
+            }
+            "NEW" => {
+                i = parse_special_wire(tech_db, def_vias, &mut sink, rest, i + 1, line)?;
+            }
+            other => bail!("DEF line {line}: unexpected `{other}` in SPECIALNETS net {net_name}"),
+        }
+    }
+
+    // A repeated net name merges records; a conflicting `+ USE` is an error.
+    match db.pdn_nets.iter_mut().find(|n| n.name == net_sym) {
+        Some(net) => {
+            if let Some(u) = use_kind {
+                match net.use_kind {
+                    Some(existing) if existing != u => bail!(
+                        "DEF line {line}: SPECIALNETS net {net_name} repeats with a conflicting `+ USE`"
+                    ),
+                    _ => net.use_kind = Some(u),
+                }
+            }
+            net.conns.extend(conns);
+            net.wire_rects.extend(wire_rects);
+            net.vias.extend(net_vias);
+        }
+        None => db.pdn_nets.push(PdnNet {
+            name: net_sym,
+            use_kind,
+            conns,
+            wire_rects,
+            vias: net_vias,
+        }),
     }
     Ok(())
 }
@@ -690,6 +1106,10 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
 
     let mut cell_name_to_id: FastMap<String, CellId> = FastMap::default();
     let mut io_pin_name_to_id: FastMap<String, PinId> = FastMap::default();
+    // `VIAS` is parsed when reached; SPECIALNETS via records resolve eagerly
+    // against it, so a DEF placing SPECIALNETS first errors on the unknown
+    // via name — a named assumption (OpenROAD writers emit VIAS first).
+    let mut def_vias: DefViaMap = FastMap::default();
     let mut saw_end_design = false;
 
     loop {
@@ -829,12 +1249,18 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
             }
             DefToken::Word("SPECIALNETS") => {
                 for_each_record(&mut lexer, "SPECIALNETS", |words, line| {
-                    add_special_net(&mut db, tech_db, words, line)
+                    add_special_net(&mut db, tech_db, &def_vias, words, line)
                 })?;
             }
-            // Vias and non-default rules are not in the database: they come from the tech
-            // LEF and only constrain routing, which the STA model does not read.
-            DefToken::Word("VIAS") => skip_section(&mut lexer, "VIAS")?,
+            // Non-default rules constrain detailed routing only, which no
+            // stage reads.
+            DefToken::Word("VIAS") => {
+                for_each_record(&mut lexer, "VIAS", |words, line| {
+                    let (name, via) = add_def_via(&mut db, tech_db, words, line)?;
+                    def_vias.insert(name, via);
+                    Ok(())
+                })?;
+            }
             DefToken::Word("NONDEFAULTRULES") => skip_section(&mut lexer, "NONDEFAULTRULES")?,
             DefToken::Word("NETS") => {
                 let declared = section_count(&mut lexer, "NETS")?;
@@ -1872,6 +2298,370 @@ END DESIGN
             let result = parse_def_bytes(&MINI_DEF.as_bytes()[..n], &tech, None);
             if n < trailer_end {
                 assert!(result.is_err(), "prefix of {n} bytes was accepted");
+            }
+        }
+    }
+
+    /// Two routing layers, one cut layer, a LEF `VIA` with a non-descriptive
+    /// name, and a cell with a `met1` power pin.
+    const PDN_LEF: &str = r#"
+VERSION 5.8 ;
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+LAYER via12
+  TYPE CUT ;
+  RESISTANCE 15.0 ;
+END via12
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+END met2
+LAYER met3
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met3
+VIA stack_a
+  LAYER via12 ;
+    RECT -0.075 -0.075 0.075 0.075 ;
+  LAYER met1 ;
+    RECT -0.16 -0.13 0.16 0.13 ;
+  LAYER met2 ;
+    RECT -0.13 -0.16 0.13 0.16 ;
+END stack_a
+MACRO CELL
+  CLASS CORE ;
+  SIZE 1.0 BY 1.0 ;
+  PIN VPWR
+    DIRECTION INOUT ;
+    USE POWER ;
+    PORT
+      LAYER met1 ;
+        RECT 0.0 -0.05 0.2 0.05 ;
+    END
+  END VPWR
+END CELL
+END LIBRARY
+"#;
+
+    /// `stack_a` via one met1 rail to one met2 stripe at (1000, 0); the
+    /// top-level `VPWR` pad sits on the stripe.
+    const PDN_DEF: &str = r#"VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN pdn ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 2000 2000 ) ;
+ROW ROW_0 unithd 0 0 N DO 4 BY 1 STEP 460 2720 ;
+TRACKS X 170 DO 100 STEP 340 LAYER met1 ;
+COMPONENTS 2 ;
+- u1 CELL + PLACED ( 0 0 ) N ;
+- u2 CELL + PLACED ( 500 0 ) N ;
+END COMPONENTS
+PINS 1 ;
+- VPWR + NET VPWR + SPECIAL + DIRECTION INOUT + USE POWER
+  + PORT
+    + LAYER met2 ( -50 -50 ) ( 50 50 )
+    + PLACED ( 1000 1800 ) N ;
+END PINS
+VIAS 1 ;
+- via12_inst + VIA stack_a ;
+END VIAS
+SPECIALNETS 1 ;
+- VPWR ( PIN VPWR ) ( * VPWR ) + USE POWER
+  + ROUTED met1 100 + SHAPE FOLLOWPIN ( 0 0 ) ( 2000 0 )
+  NEW met2 100 + SHAPE STRIPE ( 1000 0 ) ( 1000 2000 )
+  NEW met2 0 + SHAPE STRIPE ( 1000 0 ) via12_inst
+  ;
+END SPECIALNETS
+END DESIGN
+"#;
+
+    fn pdn_tech() -> TechDb {
+        let mut interner = StringInterner::new();
+        let mut tech_db = TechDb::new();
+        parse_lef_bytes(PDN_LEF.as_bytes(), &mut tech_db, &mut interner)
+            .expect("PDN LEF must parse");
+        tech_db.strings = interner.clone();
+        tech_db.rebuild_maps();
+        tech_db
+    }
+
+    fn pdn_def_error(def: &str) -> String {
+        match parse_def_bytes(def.as_bytes(), &pdn_tech(), None) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("malformed DEF was accepted:\n{def}"),
+        }
+    }
+
+    /// Routing `LayerId` by name in the design's tech namespace.
+    fn layer_id(tech: &TechDb, name: &str) -> crate::interner::LayerId {
+        tech.layer_by_name[&tech.strings.get(name).expect(name)]
+    }
+
+    #[test]
+    fn test_specialnet_parse_wires_and_vias() {
+        let tech = pdn_tech();
+        let db = parse_def_bytes(PDN_DEF.as_bytes(), &tech, None).expect("PDN DEF must parse");
+        assert_eq!(db.pdn_nets.len(), 1);
+        let net = &db.pdn_nets[0];
+        assert_eq!(db.strings.resolve(net.name), "VPWR");
+        assert_eq!(net.use_kind, Some(PdnUse::Power));
+        assert_eq!(net.conns.len(), 2);
+
+        // met1 rail (100 wide → ±50 dbu), met2 stripe.
+        assert_eq!(net.wire_rects.len(), 2);
+        let met1 = layer_id(&tech, "met1");
+        let met2 = layer_id(&tech, "met2");
+        assert_eq!(
+            net.wire_rects[0],
+            (met1, RectDbu::new(0, -50, 2000, 50)),
+            "met1 rail"
+        );
+        assert_eq!(
+            net.wire_rects[1],
+            (met2, RectDbu::new(950, 0, 1050, 2000)),
+            "met2 stripe"
+        );
+        assert_eq!(net.vias.len(), 1);
+        let via = &net.vias[0];
+        assert_eq!(db.strings.resolve(via.name), "via12_inst");
+        assert_eq!(db.strings.resolve(via.cut), "via12");
+        assert_eq!(via.cut_count, 1);
+        assert_eq!((via.x_dbu, via.y_dbu), (1000, 0));
+        // Resolved through the DEF `VIAS` record's `+ VIA stack_a`, whose
+        // endpoints are the LEF VIA's routing layers.
+        assert_eq!(via.lower, met1);
+        assert_eq!(via.upper, met2);
+    }
+
+    #[test]
+    fn test_specialnet_via_resolves_lef_name_without_def_via() {
+        let def = PDN_DEF.replace("via12_inst", "stack_a").replace(
+            "VIAS 1 ;\n- via12_inst + VIA stack_a ;\nEND VIAS\n",
+            "",
+        );
+        let db = parse_def_bytes(def.as_bytes(), &pdn_tech(), None).expect("must parse");
+        let via = &db.pdn_nets[0].vias[0];
+        assert_eq!(db.strings.resolve(via.cut), "via12");
+    }
+
+    #[test]
+    fn test_specialnet_via_unknown_name_is_an_error() {
+        // Rename only the SPECIALNETS reference; the VIAS record still
+        // defines `via12_inst` so `no_such_via` is defined nowhere.
+        let msg = pdn_def_error(&PDN_DEF.replace(
+            "( 1000 0 ) via12_inst",
+            "( 1000 0 ) no_such_via",
+        ));
+        assert!(msg.contains("no_such_via") && msg.contains("VIAS"), "{msg}");
+    }
+
+    #[test]
+    fn test_specialnet_generated_via_uses_rowcol_cut_count() {
+        let def = PDN_DEF.replace(
+            "- via12_inst + VIA stack_a ;",
+            "- via12_inst + VIARULE RULE + CUTSIZE 150 150 + LAYERS met1 via12 met2 + CUTSPACING 170 170 + ENCLOSURE 85 165 55 85 + ROWCOL 1 3 ;",
+        );
+        let db = parse_def_bytes(def.as_bytes(), &pdn_tech(), None).expect("must parse");
+        let via = &db.pdn_nets[0].vias[0];
+        assert_eq!(via.cut_count, 3);
+        assert_eq!(db.strings.resolve(via.cut), "via12");
+    }
+
+    #[test]
+    fn test_specialnet_viarule_without_layers_is_an_error() {
+        let msg = pdn_def_error(&PDN_DEF.replace(
+            "- via12_inst + VIA stack_a ;",
+            "- via12_inst + VIARULE RULE ;",
+        ));
+        assert!(msg.contains("via12_inst") && msg.contains("LAYERS"), "{msg}");
+    }
+
+    #[test]
+    fn test_specialnet_inline_via_is_an_error_when_used() {
+        let msg = pdn_def_error(&PDN_DEF.replace(
+            "- via12_inst + VIA stack_a ;",
+            "- via12_inst + RECT met1 ( 0 0 ) ( 10 10 ) ;",
+        ));
+        assert!(msg.contains("via12_inst") && msg.contains("no resolvable layer stack"), "{msg}");
+    }
+
+    #[test]
+    fn test_specialnet_via_on_foreign_layer_is_an_error() {
+        // `stack_a` spans met1↔met2; recording it on met3 (a routing layer
+        // the via does not touch) is inconsistent.
+        let msg = pdn_def_error(&PDN_DEF.replace(
+            "NEW met2 0 + SHAPE STRIPE ( 1000 0 ) via12_inst",
+            "NEW met3 0 + SHAPE STRIPE ( 1000 0 ) via12_inst",
+        ));
+        assert!(msg.contains("met3") && msg.contains("neither of its endpoints"), "{msg}");
+    }
+
+    #[test]
+    fn test_specialnet_unknown_use_is_an_error() {
+        let msg = pdn_def_error(&PDN_DEF.replace("+ USE POWER", "+ USE CHARGE"));
+        assert!(msg.contains("USE CHARGE"), "{msg}");
+    }
+
+    #[test]
+    fn test_specialnet_subnet_is_an_error() {
+        let msg = pdn_def_error(&PDN_DEF.replace("+ USE POWER", "+ SUBNET VPWR_a ( u1 VPWR ) + USE POWER"));
+        assert!(msg.contains("SUBNET"), "{msg}");
+    }
+
+    #[test]
+    fn test_specialnet_stub_wire_is_an_error() {
+        // A wire statement whose point list is a single coordinate pair and
+        // no via name is a one-point stub.
+        let msg = pdn_def_error(&PDN_DEF.replace(
+            "NEW met2 0 + SHAPE STRIPE ( 1000 0 ) via12_inst",
+            "NEW met2 0 + SHAPE STRIPE ( 1000 0 )",
+        ));
+        assert!(msg.contains("one-point"), "{msg}");
+    }
+
+    /// `- VPWR ( * VPWR )` wildcard conn plus wire statements used by the
+    /// recurring-statement and SHIELD tests. met1 only.
+    const SPECIAL_DEF: &str = r#"VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN sp ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 2000 2000 ) ;
+ROW ROW_0 unithd 0 0 N DO 1 BY 1 STEP 460 2720 ;
+COMPONENTS 1 ;
+- u1 INV + PLACED ( 0 0 ) N ;
+END COMPONENTS
+PINS 1 ;
+- VPWR + NET VPWR + SPECIAL + DIRECTION INOUT + USE POWER
+  + PORT
+    + LAYER met1 ( -50 -50 ) ( 50 50 )
+    + PLACED ( 100 1800 ) N ;
+END PINS
+SPECIALNETS 1 ;
+- VPWR ( PIN VPWR ) ( * VPWR ) + USE POWER
+  + ROUTED met1 100 + SHAPE FOLLOWPIN ( 0 0 ) ( 2000 0 )
+  + FIXED met1 200 + SHAPE STRIPE ( 1000 0 ) ( 1000 2000 )
+  + SHIELD sig1 met1 100 + SHAPE STRIPE ( 0 100 ) ( 2000 100 )
+  + USE POWER
+  ;
+END SPECIALNETS
+END DESIGN
+"#;
+
+    /// A second `+ ROUTED`/`+ FIXED` statement inside one net record, plus a
+    /// net-level `+ USE` after the wires, must re-dispatch instead of
+    /// erroring as an unknown wire attribute.
+    #[test]
+    fn test_special_wire_recurrent_statements() {
+        let db = parse_def_bytes(SPECIAL_DEF.as_bytes(), &mini_tech(), None)
+            .expect("recurring wire statements must parse");
+        let net = db.pdn_net("VPWR").expect("VPWR");
+        assert_eq!(net.use_kind, Some(PdnUse::Power));
+        // ROUTED + FIXED + SHIELD bodies = three wire rects.
+        assert_eq!(net.wire_rects.len(), 3);
+    }
+
+    /// `+ SHIELD` consumes its shield-net name, then carries the same wire
+    /// body — it must not parse the name as a layer.
+    #[test]
+    fn test_special_wire_shield_parses() {
+        let db = parse_def_bytes(SPECIAL_DEF.as_bytes(), &mini_tech(), None)
+            .expect("SHIELD wire must parse");
+        let net = db.pdn_net("VPWR").expect("VPWR");
+        let rects = net
+            .wire_rects
+            .iter()
+            .map(|(_, r)| (r.xl, r.yl, r.xh, r.yh))
+            .collect::<Vec<_>>();
+        // The shield stripe: met1 width 100 around y=100.
+        assert!(rects.contains(&(0, 50, 2000, 150)), "shield rect missing: {rects:?}");
+    }
+
+    /// An odd word in the connection list errors loudly.
+    #[test]
+    fn test_special_net_malformed_conn_fails() {
+        let def = SPECIAL_DEF.replace("( PIN VPWR ) ( * VPWR )", "( PIN VPWR ) ODDWORD");
+        let err = mini_def_error(&def);
+        assert!(err.contains("malformed connection"), "{err}");
+    }
+
+    #[test]
+    fn test_gcd_specialnets() {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let def_path = require(design_dir("gcd").join("gcd.placed.def"));
+
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
+
+        assert_eq!(db.pdn_nets.len(), 2);
+        let layer = |name: &str| {
+            tech_db.layer_by_name[&tech_db.strings.get(name).expect(name)]
+        };
+        for (name, use_kind, top, wildcard, well) in [
+            ("VPWR", PdnUse::Power, "VPWR", "VPWR", "VPB"),
+            ("VGND", PdnUse::Ground, "VGND", "VGND", "VNB"),
+        ] {
+            let net = db.pdn_net(name).expect(name);
+            assert_eq!(net.use_kind, Some(use_kind));
+            assert_eq!(net.wire_rects.len(), 47, "{name}");
+            assert_eq!(net.vias.len(), 46, "{name}");
+
+            // 15 rails per routed layer met1..met3, one met4 stripe, one
+            // met5 stripe.
+            for (lname, want) in [("met1", 15), ("met2", 15), ("met3", 15), ("met4", 1), ("met5", 1)] {
+                let got = net
+                    .wire_rects
+                    .iter()
+                    .filter(|(l, _)| *l == layer(lname))
+                    .count();
+                assert_eq!(got, want, "{name} {lname}");
+            }
+
+            // Conns verbatim: ( PIN <net> ) ( * <well> ) ( * <net> ).
+            let names = |s: SymbolId| db.strings.resolve(s);
+            assert_eq!(net.conns.len(), 3, "{name}");
+            assert!(matches!(&net.conns[0], PdnConn::TopPin(s) if names(*s) == top));
+            assert!(matches!(&net.conns[1], PdnConn::AllInstances(s) if names(*s) == well));
+            assert!(matches!(&net.conns[2], PdnConn::AllInstances(s) if names(*s) == wildcard));
+
+            // Every via resolves through a VIAS `+ VIARULE` record: stacks
+            // metN↔metN+1 with ROWCOL cut counts.
+            for via in &net.vias {
+                let vn = db.strings.resolve(via.name);
+                let (want_cut, want_cc) = if vn.starts_with("via2_3") {
+                    ("via", 5)
+                } else if vn.starts_with("via3_4") {
+                    ("via2", 4)
+                } else if vn.starts_with("via4_5") {
+                    ("via3", 4)
+                } else if vn.starts_with("via5_6") {
+                    ("via4", 1)
+                } else {
+                    panic!("unexpected via {vn}");
+                };
+                assert_eq!(db.strings.resolve(via.cut), want_cut, "{vn}");
+                assert_eq!(via.cut_count, want_cc, "{vn}");
+                assert_eq!(via.upper.0, via.lower.0 + 1, "{vn} is not adjacent");
             }
         }
     }

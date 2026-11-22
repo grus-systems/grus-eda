@@ -1,5 +1,7 @@
 use crate::interner::{LayerId, MacroId, PinDir, StringInterner};
-use crate::tech_db::{LayerDir, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer, TechDb};
+use crate::tech_db::{
+    CutLayer, LayerDir, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer, TechDb, ViaDef,
+};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -253,8 +255,9 @@ pub fn parse_lef_bytes(
         } else if word.eq_ignore_ascii_case("PROPERTYDEFINITIONS") {
             skip_block(&mut lexer, "PROPERTYDEFINITIONS")?;
             count_skip(&mut report, word);
-        } else if word.eq_ignore_ascii_case("VIA")
-            || word.eq_ignore_ascii_case("VIARULE")
+        } else if word.eq_ignore_ascii_case("VIA") {
+            parse_via(&mut lexer, tech_db, interner)?;
+        } else if word.eq_ignore_ascii_case("VIARULE")
             || word.eq_ignore_ascii_case("NONDEFAULTRULE")
         {
             count_skip(&mut report, word);
@@ -437,14 +440,22 @@ fn parse_layer(
         bail!("LEF: LAYER {layer_name} is not terminated by END {layer_name} (truncated file?)");
     }
 
-    if is_cut
-        && let Some(res) = cut_res_ohm
-        && !tech_db.routing_layers.is_empty()
-    {
+    if is_cut && !tech_db.routing_layers.is_empty() {
         // The cut layer sits above the routing layer parsed just before it;
-        // `load_tech_db` resolves these into `via_res_ohm_above`.
-        let below = tech_db.routing_layers.len() - 1;
-        tech_db.cut_res_above.push((below as u8, res));
+        // `load_tech_db` resolves the resistance into `via_res_ohm_above`.
+        // A cut layer before the first routing layer (`licon`) has no `above`
+        // and is not recorded.
+        let below = LayerId(tech_db.routing_layers.len() as u8 - 1);
+        let cut_sym = interner.intern(&layer_name);
+        let cut_idx = tech_db.cut_layers.len() as u32;
+        tech_db.cut_layers.push(CutLayer {
+            name: cut_sym,
+            above: below,
+        });
+        tech_db.cut_layer_by_name.insert(cut_sym, cut_idx);
+        if let Some(res) = cut_res_ohm {
+            tech_db.cut_res_above.push((below.0, res));
+        }
     }
 
     if is_routing {
@@ -483,6 +494,100 @@ fn parse_layer(
         });
     }
 
+    Ok(())
+}
+
+/// A `VIA` block: `LAYER`/`RECT` groups plus attributes the model does not
+/// keep. Only the routing/cut classification and the cut-`RECT` count are
+/// recorded — DEF `+ VIA` records and `e8-mesh-rc` resistance lookup need
+/// nothing more.
+fn parse_via(
+    lexer: &mut LefLexer,
+    tech_db: &mut TechDb,
+    interner: &mut StringInterner,
+) -> Result<()> {
+    let via_name = required_word(lexer, "VIA name")?.to_string();
+    // (name sym, routing layer, cut-layer index, RECT count) per LAYER group.
+    let mut groups: Vec<(crate::interner::SymbolId, Option<LayerId>, Option<u32>, u32)> =
+        Vec::new();
+    let mut closed = false;
+
+    while let Some(tok) = lexer.next_token() {
+        if let Token::Word(w) = tok {
+            if w.eq_ignore_ascii_case("END") {
+                end_block(lexer, "VIA", Some(&via_name))?;
+                closed = true;
+                break;
+            } else if w.eq_ignore_ascii_case("LAYER") {
+                let lname = required_word(lexer, "VIA LAYER")?.to_string();
+                let lsym = interner.intern(&lname);
+                let routing = tech_db.layer_by_name.get(&lsym).copied();
+                let cut = tech_db.cut_layer_by_name.get(&lsym).copied();
+                if routing.is_none() && cut.is_none() {
+                    bail!(
+                        "LEF line {}: VIA {via_name} LAYER {lname} is neither a routing nor a cut layer",
+                        lexer.line()
+                    );
+                }
+                groups.push((lsym, routing, cut, 0));
+                lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("RECT") {
+                let Some(group) = groups.last_mut() else {
+                    bail!(
+                        "LEF line {}: VIA {via_name} RECT before any LAYER",
+                        lexer.line()
+                    );
+                };
+                // Geometry is validated but not stored — the model needs
+                // only the parallel cut count.
+                let _ = required_f32(lexer, "VIA RECT x1")?;
+                let _ = required_f32(lexer, "VIA RECT y1")?;
+                let _ = required_f32(lexer, "VIA RECT x2")?;
+                let _ = required_f32(lexer, "VIA RECT y2")?;
+                group.3 += 1;
+                lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("DEFAULT") || w.eq_ignore_ascii_case("TOPOFSTACKONLY")
+            {
+                // Bare markers with no `;`-terminated statement.
+            } else {
+                // FOREIGN, PATTERN, RESISTANCE, PROPERTY, MASK, …: `;`-terminated
+                // attributes the model does not read.
+                lexer.skip_to_semi();
+            }
+        }
+    }
+    if !closed {
+        bail!("LEF: VIA {via_name} is not terminated by END {via_name} (truncated file?)");
+    }
+
+    if groups.is_empty() {
+        // An empty `VIA name END name` block records nothing.
+        return Ok(());
+    }
+    let routing: Vec<LayerId> = groups.iter().filter_map(|g| g.1).collect();
+    let cuts: Vec<usize> = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.2.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    if routing.len() < 2 || cuts.is_empty() {
+        bail!("LEF: VIA {via_name} needs at least two routing layers and one cut layer");
+    }
+
+    let via_sym = interner.intern(&via_name);
+    if tech_db.via_by_name.contains_key(&via_sym) {
+        bail!("LEF: VIA {via_name} is defined more than once");
+    }
+    let idx = tech_db.via_defs.len() as u32;
+    tech_db.via_defs.push(ViaDef {
+        name: via_sym,
+        lower: *routing.iter().min_by_key(|l| l.0).unwrap(),
+        upper: *routing.iter().max_by_key(|l| l.0).unwrap(),
+        cut: groups[cuts[0]].0,
+        cut_count: cuts.iter().map(|&i| groups[i].3).sum(),
+    });
+    tech_db.via_by_name.insert(via_sym, idx);
     Ok(())
 }
 
@@ -1305,13 +1410,14 @@ END
         assert_eq!(db.macros.len(), 1);
         assert_eq!(report.skipped["FOO"], 1);
         assert_eq!(report.skipped["VERSION"], 1);
-        // Lowercase `via` still counts under the uppercased keyword.
-        assert_eq!(report.skipped["VIA"], 2);
+        // `VIA` blocks are parsed now — both the empty uppercase record and
+        // the lowercase one record nothing but count as consumed, not skipped.
+        assert!(!report.skipped.contains_key("VIA"));
         assert_eq!(report.skipped["VIARULE"], 1);
         assert_eq!(report.skipped["NONDEFAULTRULE"], 1);
         assert_eq!(report.skipped["PROPERTYDEFINITIONS"], 1);
         assert_eq!(report.skipped["SPACING"], 1);
-        assert_eq!(report.total(), 8);
+        assert_eq!(report.total(), 6);
     }
 
     const KNOWN_LEF: &str = r#"
@@ -1346,5 +1452,170 @@ END
 
         assert!(report.skipped.is_empty());
         assert_eq!(report.total(), 0);
+    }
+
+    /// A `VIA` whose name spells nothing about layers — resolution must come
+    /// from its `LAYER` groups, not the name.
+    const VIA_TLEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+
+LAYER via12
+  TYPE CUT ;
+  RESISTANCE 15.0 ;
+END via12
+
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+END met2
+
+VIA xyzzy DEFAULT
+  LAYER via12 ;
+    RECT -0.075 -0.075 0.075 0.075 ;
+    RECT -0.075 -0.075 0.075 0.075 ;
+  LAYER met1 ;
+    RECT -0.16 -0.13 0.16 0.13 ;
+  LAYER met2 ;
+    RECT -0.13 -0.16 0.13 0.16 ;
+END xyzzy
+"#;
+
+    fn parse_via_tlef() -> (StringInterner, TechDb) {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(VIA_TLEF.as_bytes(), &mut db, &mut interner).unwrap();
+        db.strings = interner.clone();
+        // `load_tech_db` folds `cut_res_above` into `via_res_ohm_above`;
+        // `parse_lef_bytes` alone does not.
+        db.via_res_ohm_above = vec![0.0; db.routing_layers.len()];
+        for (below, res) in std::mem::take(&mut db.cut_res_above) {
+            db.via_res_ohm_above[below as usize] = res;
+        }
+        db.rebuild_maps();
+        (interner, db)
+    }
+
+    #[test]
+    fn test_via_renamed_still_resolves_by_layer_triple() {
+        let (interner, db) = parse_via_tlef();
+        let layer = |name: &str| db.layer_by_name[&interner.get(name).unwrap()];
+
+        assert_eq!(db.via_defs.len(), 1);
+        let vd = &db.via_defs[0];
+        assert_eq!(interner.resolve(vd.name), "xyzzy");
+        assert_eq!(vd.lower, layer("met1"));
+        assert_eq!(vd.upper, layer("met2"));
+        assert_eq!(interner.resolve(vd.cut), "via12");
+        assert_eq!(vd.cut_count, 2);
+
+        // The cut layer sits above met1; two parallel cuts halve the 15 Ω.
+        assert_eq!(db.via_res_ohm(vd.cut, 2), Some(7.5));
+        assert_eq!(db.via_res_ohm(vd.cut, 1), Some(15.0));
+        // A name unknown to the CUT-layer map has no resistance.
+        assert_eq!(db.via_res_ohm(interner.get("met1").unwrap(), 1), None);
+    }
+
+    #[test]
+    fn test_via_without_a_cut_layer_is_an_error() {
+        let text = edit_fixture(
+            VIA_TLEF,
+            "  LAYER via12 ;\n    RECT -0.075 -0.075 0.075 0.075 ;\n    RECT -0.075 -0.075 0.075 0.075 ;\n",
+            "",
+        );
+        let msg = lef_error(&text);
+        assert!(msg.contains("xyzzy") && msg.contains("cut layer"), "{msg}");
+    }
+
+    #[test]
+    fn test_via_on_an_unknown_layer_is_an_error() {
+        // The indented `LAYER <name> ;` inside the VIA block is the group
+        // header; `LAYER via12` alone would hit the layer's own definition.
+        let text = edit_fixture(VIA_TLEF, "  LAYER via12 ;", "  LAYER via99 ;");
+        let msg = lef_error(&text);
+        assert!(msg.contains("via99") && msg.contains("neither a routing nor a cut"), "{msg}");
+    }
+
+    #[test]
+    fn test_unterminated_via_is_an_error() {
+        let text = edit_fixture(VIA_TLEF, "END xyzzy", "");
+        let msg = lef_error(&text);
+        assert!(msg.contains("VIA xyzzy") && msg.contains("not terminated"), "{msg}");
+    }
+
+    #[test]
+    fn test_duplicate_via_name_is_an_error() {
+        // A second full definition of `xyzzy` after the first.
+        let dup = VIA_TLEF.replace(
+            "END xyzzy",
+            "END xyzzy\nVIA xyzzy\n  LAYER via12 ;\n    RECT -0.075 -0.075 0.075 0.075 ;\n  LAYER met1 ;\n    RECT -0.16 -0.13 0.16 0.13 ;\n  LAYER met2 ;\n    RECT -0.13 -0.16 0.13 0.16 ;\nEND xyzzy",
+        );
+        let msg = lef_error(&dup);
+        assert!(msg.contains("xyzzy") && msg.contains("more than once"), "{msg}");
+    }
+
+    #[test]
+    fn test_sky130_tlef_via_defs() {
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        if !tlef_path.is_file() || !lef_path.is_file() {
+            panic!("PDK LEF files missing under {:?}", sky130_hd());
+        }
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load sky130 TechDb")
+            .0;
+
+        let layer = |name: &str| {
+            tech_db.layer_by_name[&tech_db.strings.get(name).expect(name)]
+        };
+        let via = |name: &str| {
+            let sym = tech_db.strings.get(name).expect(name);
+            &tech_db.via_defs[tech_db.via_by_name[&sym] as usize]
+        };
+
+        // `licon` precedes the first routing layer and is not a PDN cut;
+        // `mcon`..`via4` are.
+        assert!(tech_db
+            .strings
+            .get("licon")
+            .is_none_or(|s| !tech_db.cut_layer_by_name.contains_key(&s)));
+        for name in ["mcon", "via", "via2", "via3", "via4"] {
+            let s = tech_db.strings.get(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(tech_db.cut_layer_by_name.contains_key(&s), "{name}");
+        }
+
+        // The DEF via names in the test designs resolve through these
+        // fixed-via definitions.
+        let vd = via("L1M1_PR");
+        assert_eq!(vd.lower, layer("li1"));
+        assert_eq!(vd.upper, layer("met1"));
+        assert_eq!(tech_db.strings.resolve(vd.cut), "mcon");
+        // nom corner: mcon RESISTANCE 9.30, one cut RECT.
+        assert_eq!(vd.cut_count, 1);
+        assert_eq!(tech_db.via_res_ohm(vd.cut, vd.cut_count), Some(9.30));
+
+        let vd = via("M1M2_PR");
+        assert_eq!(vd.lower, layer("met1"));
+        assert_eq!(vd.upper, layer("met2"));
+        assert_eq!(tech_db.strings.resolve(vd.cut), "via");
+        assert_eq!(vd.cut_count, 1);
+        // nom corner: via RESISTANCE 4.50 over 5 parallel cuts (ROWCOL 1 5).
+        assert_eq!(tech_db.via_res_ohm(vd.cut, 5), Some(0.90));
+
+        let vd = via("M4M5_PR");
+        assert_eq!(vd.lower, layer("met4"));
+        assert_eq!(vd.upper, layer("met5"));
+        assert_eq!(tech_db.strings.resolve(vd.cut), "via4");
     }
 }
