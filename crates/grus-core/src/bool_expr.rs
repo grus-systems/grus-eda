@@ -347,6 +347,9 @@ pub fn prob(e: &BoolExpr, p: &[f64]) -> Option<f64> {
 
 /// `P(∂f/∂x_i)` — the probability input `i` is sensitized:
 /// `prob(f(x_i=0) ⊕ f(x_i=1))`. `0.0` when `f` does not reference `i`.
+/// `prob`'s `MAX_OPS` budget resets per call, so a single `sensitivity` —
+/// and a gate's `(1 + n_inputs)` `prob`+`sensitivity` sweep — has a
+/// per-call work bound, not a shared per-gate budget.
 pub fn sensitivity(e: &BoolExpr, i: usize, p: &[f64]) -> Option<f64> {
     let v = i as u16;
     let f0 = cofactor(e, v, false);

@@ -2,6 +2,7 @@
 
 Offline scan of
 `$PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib`
+(`PDK_ROOT` env var, default `~/.ciel` — same fallback as `measure.sh`)
 (2026-11-22, **cell-level** `ff`/`latch` groups only — 8-space indent;
 24 `test_cell` groups carry their own `ff` copies (`next_state : "D"`,
 functional-mode view) and are excluded here exactly as the parser
@@ -53,10 +54,12 @@ the lib — an unmatched function is unclassifiable, not a silent guess.
 
 ```bash
 python3 - <<'EOF'
+import os
 import re
 from collections import Counter
-lib = open('$PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/lib/'
-           'sky130_fd_sc_hd__tt_025C_1v80.lib').read()
+pdk = os.environ.get('PDK_ROOT', os.path.expanduser('~/.ciel'))
+lib = open(os.path.join(pdk, 'sky130A/libs.ref/sky130_fd_sc_hd/lib/'
+                        'sky130_fd_sc_hd__tt_025C_1v80.lib')).read()
 cells = re.findall(r'(?ms)^    cell \("([^"]+)"\) \{(.*?)\n    \}\n', lib)
 ff, la = Counter(), Counter()
 for name, body in cells:

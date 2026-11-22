@@ -35,7 +35,7 @@ Engine phases (`crates/grus-core/src/sta/analysis.rs`):
 | `sta.prepare.launch` | launch + latch `LaunchSeed` build | `launch_seeds`/`latch_seeds` collects |
 | `sta.partition.ctx` | `ExceptionCtx` build (name→id maps) | `run_sta_partitioned` head to `ctx` |
 | `sta.partition.rules` | selector resolution + `set_clock_groups` desugar + signature classes | rules/class_map section |
-| `sta.partition.compose` | post-class endpoint composition + merged pulse eval | after the class loop |
+| `sta.partition.compose` | post-class endpoint composition | after the class loop |
 | `sta.eval.seeds` | port/launch/latch seed merge | `eval_sta` head |
 | `sta.eval.walk` | levelized data-arrival loop | `for lvl in …` |
 | `sta.eval.endpoints` | `collect_endpoints` total | call in `eval_sta` |
@@ -82,7 +82,7 @@ keep those lines unchanged; the stderr phases decompose inside them.
 | `place.gp.density` | `compute_density_and_forces` calls (FFT Poisson solve) | per-iteration + final calls; count = iterations+1 |
 | `place.gp.wl` | `compute_wa_wirelength_and_grad` calls | per-iteration |
 | `place.gp.step` | gradient precondition + BB step + `compute_hpwl_um` + update | remainder of the loop body |
-| `place.legal.abacus` | Step 1–3: obstacle subrows, coordinate conversion, cluster insertion, verify | `legalize_placement` to `post_abacus_hpwl_dbu` |
+| `place.legal.abacus` | Step 1–3: obstacle subrows, coordinate conversion, cluster insertion | `legalize_placement` to `post_abacus_hpwl_dbu` |
 | `place.legal.pre` | `cell_nets`/`PinGeomCache`/`cell_pin_nets` build | Step 4 head |
 | `place.legal.pass1` | `equal_width_swap_pass_fast` | ×4 rounds |
 | `place.legal.resync` | sub-row resync + `pin_x` rebuild | ×4 |
