@@ -37,12 +37,35 @@ impl WireRc {
 }
 
 /// RC tree of one net, rooted at the driver. Nodes are in BFS order, so a parent always
-/// precedes its children and both Elmore passes are plain loops.
+/// precedes its children and both Elmore passes are plain loops. Components the
+/// driver's BFS cannot reach (guide-parasitics dead islands) are appended as
+/// dead subtrees: the component root carries `parent[v] == v` and `dead[v]`,
+/// keeping the island's caps in `total_wire_cap_pf` without joining it to the
+/// driver's Elmore path — the self-loop/disconnected shape OpenROAD's
+/// `-global_routing` SPEF writes.
 #[derive(Clone, Debug)]
 pub struct NetRcTree {
     parent: Vec<u32>,
     edge_r_kohm: Vec<f32>,
     wire_cap_pf: Vec<f32>,
+    /// Nodes of components unreachable from the driver. Dead pins get no
+    /// wire delay; dead caps only load the driver when `lumped` is set.
+    dead: Vec<bool>,
+    /// Unpaired zero-length stub segments as `(tree node, kohm)` — emitted
+    /// as `n n r` self-loop resistors, matching OpenROAD's SPEF.
+    self_loops: Vec<(u32, f32)>,
+    /// OpenSTA falls back to a lumped parasitic (pin-capacitance load, zero
+    /// wire delay) for nets whose dead island is large enough that the
+    /// pi/elmore reduction is not worth building, and whenever a `*P` port
+    /// sits on an island. `report_dcalc` probes on the gcd/picorv32 guide
+    /// SPEFs put the boundary at roughly a third of total wire capacitance;
+    /// the band itself is inconsistent between nets, so the fraction is an
+    /// approximation, not an exact replica of OpenSTA's internals.
+    pub lumped: bool,
+    /// Wire capacitance on dead (unreachable) nodes. A live-part pi model
+    /// never sees these caps, so `net_load` subtracts them for non-lumped
+    /// nets.
+    pub dead_wire_cap_pf: f32,
     /// Tree node of each pin of the net, in `DesignDb::net_pins` order.
     pin_node: Vec<u32>,
     pub total_wire_cap_pf: f32,
@@ -59,8 +82,13 @@ impl NetRcTree {
         }
         let (mut y2, mut y3) = (vec![0.0f64; n], vec![0.0f64; n]);
         // Children come after their parent, so a reverse sweep sees every child's final moments.
+        // A self-parented dead-component root is skipped: nothing flows from a
+        // dead subtree to the driver node.
         for v in (1..n).rev() {
             let (p, r) = (self.parent[v] as usize, self.edge_r_kohm[v] as f64);
+            if p == v {
+                continue;
+            }
             let (a1, a2, a3) = (y1[v], y2[v], y3[v]);
             y2[p] += a2 - r * a1 * a1;
             y3[p] += a3 - 2.0 * r * a1 * a2 + r * r * a1 * a1 * a1;
@@ -71,6 +99,8 @@ impl NetRcTree {
 
     /// Elmore delay (ns) from the driver to each pin of the net, in `net_pins` order.
     /// `pin_caps_pf[i]` is the pin capacitance of pin `i` for the transition being analysed.
+    /// Pins on dead (unreachable) nodes get 0 — OpenSTA gives island pins no
+    /// wire delay.
     pub fn elmore_ns(&self, pin_caps_pf: &[f32]) -> Vec<f32> {
         let n = self.parent.len();
         let mut downstream = self.wire_cap_pf.clone();
@@ -79,15 +109,28 @@ impl NetRcTree {
         }
         for v in (1..n).rev() {
             let p = self.parent[v] as usize;
+            if p == v {
+                continue;
+            }
             downstream[p] += downstream[v];
         }
         let mut tau = vec![0.0f32; n];
         for v in 1..n {
-            tau[v] = tau[self.parent[v] as usize] + self.edge_r_kohm[v] * downstream[v];
+            let p = self.parent[v] as usize;
+            if p == v {
+                continue;
+            }
+            tau[v] = tau[p] + self.edge_r_kohm[v] * downstream[v];
         }
         self.pin_node
             .iter()
-            .map(|&node| tau[node as usize])
+            .map(|&node| {
+                if self.dead[node as usize] {
+                    0.0
+                } else {
+                    tau[node as usize]
+                }
+            })
             .collect()
     }
 }
@@ -239,6 +282,10 @@ fn build_net_tree<F: Fn(&[Pt]) -> Vec<(Pt, Pt)>>(
     }
     let pin_node = pin_point.iter().map(|&p| node_of[p]).collect();
     Some(NetRcTree {
+        dead: vec![false; parent.len()],
+        self_loops: Vec::new(),
+        lumped: false,
+        dead_wire_cap_pf: 0.0,
         parent,
         edge_r_kohm: edge_r,
         wire_cap_pf: wire_cap,
@@ -249,7 +296,10 @@ fn build_net_tree<F: Fn(&[Pt]) -> Vec<(Pt, Pt)>>(
 
 /// Builds the RC trees from an extracted SPEF. SPEF capacitance is wire-only (`PIN_CAP NONE`), so
 /// sink pin capacitance is added later, exactly as for the placement estimate. Resistor loops are
-/// broken by a BFS spanning tree from the driver; self-loops and parallel resistors are dropped.
+/// broken by a BFS spanning tree from the driver; `n n r` self-loops are kept for
+/// re-emission and parallel resistors are dropped. Components the driver's BFS
+/// cannot reach (guide-SPEF dead islands) are appended as dead subtrees instead
+/// of failing — OpenSTA accepts such nets and gives their pins no wire delay.
 pub fn spef_parasitics(design: &DesignDb, spef: &Spef) -> Result<NetParasitics> {
     let n_nets = design.num_nets();
     let build_one = |n: usize| -> Result<Option<NetRcTree>> {
@@ -307,8 +357,11 @@ fn spef_net_tree(
     let cap_nodes: Vec<(usize, f32)> = spef_net.caps.iter().map(|(n, c)| (intern(n), *c)).collect();
     let node_count = index.len();
     let mut adjacency: Vec<Vec<(usize, f32)>> = vec![Vec::new(); node_count];
+    let mut self_loop_ends: Vec<(usize, f32)> = Vec::new();
     for &(a, b, r) in &resistor_ends {
-        if a != b {
+        if a == b {
+            self_loop_ends.push((a, r));
+        } else {
             adjacency[a].push((b, r));
             adjacency[b].push((a, r));
         }
@@ -339,34 +392,59 @@ fn spef_net_tree(
     let mut parent = vec![0u32];
     let mut edge_r = vec![0.0f32];
     let mut wire_cap = vec![node_cap[root]];
+    let mut dead = vec![false];
     let mut head = 0;
-    while head < order.len() {
-        let u = order[head];
-        let u_node = head;
-        head += 1;
-        for &(v, r) in &adjacency[u] {
-            if node_of[v] != u32::MAX {
-                continue;
+    let mut dead_component = false;
+    while order.len() < adjacency.len() {
+        while head < order.len() {
+            let u = order[head];
+            let u_node = head;
+            head += 1;
+            for &(v, r) in &adjacency[u] {
+                if node_of[v] != u32::MAX {
+                    continue;
+                }
+                node_of[v] = order.len() as u32;
+                order.push(v);
+                parent.push(u_node as u32);
+                edge_r.push(r);
+                wire_cap.push(node_cap[v]);
+                dead.push(dead_component);
             }
-            node_of[v] = order.len() as u32;
-            order.push(v);
-            parent.push(u_node as u32);
-            edge_r.push(r);
-            wire_cap.push(node_cap[v]);
         }
-    }
-    let mut pin_node = Vec::with_capacity(pins.len());
-    for (&p, name) in pin_point.iter().zip(&pin_names) {
-        if node_of[p] == u32::MAX {
-            bail!("SPEF net {net_name}: pin {name} is not connected to the driver by resistors");
+        if order.len() == adjacency.len() {
+            break;
         }
-        pin_node.push(node_of[p]);
+        // A component the driver cannot reach: the lowest-index unreached
+        // node becomes a self-parented dead root (deterministic), its
+        // subtree BFSs in with `dead` set. Pins on it keep their nodes but
+        // get no wire delay — OpenSTA's island semantics.
+        let v = (0..adjacency.len())
+            .find(|&v| node_of[v] == u32::MAX)
+            .expect("fewer nodes than order length");
+        node_of[v] = order.len() as u32;
+        parent.push(order.len() as u32);
+        order.push(v);
+        edge_r.push(0.0);
+        wire_cap.push(node_cap[v]);
+        dead.push(true);
+        dead_component = true;
     }
+    let pin_node: Vec<u32> = pin_point.iter().map(|&p| node_of[p]).collect();
+    let self_loops = self_loop_ends
+        .iter()
+        .map(|&(v, r)| (node_of[v], r))
+        .collect();
+    let (lumped, dead_wire_cap_pf) = lumped_flag(design, pins, &dead, &wire_cap, &pin_node);
     let total = wire_cap.iter().sum();
     Ok(NetRcTree {
         parent,
         edge_r_kohm: edge_r,
         wire_cap_pf: wire_cap,
+        dead,
+        self_loops,
+        lumped,
+        dead_wire_cap_pf,
         pin_node,
         total_wire_cap_pf: total,
     })
@@ -398,13 +476,16 @@ impl GSeg {
 
 /// Route-point graph of one guide net: nodes keyed by `(x, y, layer)`
 /// (pin leaves intern by position only), half-split caps per node,
-/// resistor edges as `(neighbor, kohm)` adjacency.
+/// resistor edges as `(neighbor, kohm)` adjacency. Same-layer zero-length
+/// segments (unpaired stubs) record `(node, kohm)` self-loops instead of
+/// adjacency — OpenROAD emits them as `n n r` resistors.
 #[derive(Default)]
 struct RouteGraph {
     node_of: HashMap<(i32, i32, u8), usize>,
     pt: Vec<(i32, i32)>,
     cap: Vec<f32>,
     adj: Vec<Vec<(usize, f32)>>,
+    self_loops: Vec<(usize, f32)>,
 }
 
 impl RouteGraph {
@@ -427,7 +508,9 @@ impl RouteGraph {
     }
 
     fn edge(&mut self, a: usize, b: usize, r: f32) {
-        if a != b {
+        if a == b {
+            self.self_loops.push((a, r));
+        } else {
             self.adj[a].push((b, r));
             self.adj[b].push((a, r));
         }
@@ -941,13 +1024,14 @@ fn guide_net_tree(
     // BFS spanning tree from the driver pin leaf — the same shape the
     // SPEF path builds. OpenROAD's segment graph can be genuinely
     // disconnected (a stub box that never pairs into a via stays a
-    // self-loop island, and whole detour branches can detach; its SPEF
-    // writes those nodes anyway, which is what `*D_NET` parity is
-    // measured on). A `NetRcTree` must be a single tree, so each
-    // remaining component links in through a stub-resistor edge
-    // (`SPEF_STUB_RES_KOHM`, electrically transparent) to the nearest
-    // node already in the tree — preserving every node's cap through
-    // `write_spef` without changing delays.
+    // self-loop island, and whole detour branches can detach). Its SPEF
+    // leaves such components electrically dead: `*CAP` entries stay on the
+    // island nodes and unpaired stubs become `n n r` self-loops, but no
+    // resistor joins an island to the driver's component — island pins
+    // see no wire delay and island caps never load the driver's path.
+    // Each remaining component is therefore appended as a dead subtree:
+    // the lowest-index unreached node roots it as a self-parented
+    // sentinel, and the component BFSs in with `dead` set.
     let root = pin_leaf[0];
     let mut tree_of = vec![u32::MAX; g.pt.len()];
     let mut order = vec![root];
@@ -955,7 +1039,9 @@ fn guide_net_tree(
     let mut parent = vec![0u32];
     let mut edge_r = vec![0.0f32];
     let mut wire_cap = vec![g.cap[root]];
+    let mut dead = vec![false];
     let mut head = 0;
+    let mut dead_component = false;
     while order.len() < g.pt.len() {
         while head < order.len() {
             let u = order[head];
@@ -970,6 +1056,7 @@ fn guide_net_tree(
                 parent.push(u_node as u32);
                 edge_r.push(r);
                 wire_cap.push(g.cap[v]);
+                dead.push(dead_component);
             }
         }
         if order.len() == g.pt.len() {
@@ -978,36 +1065,61 @@ fn guide_net_tree(
         let v = (0..g.pt.len())
             .find(|&v| tree_of[v] == u32::MAX)
             .expect("fewer nodes than order length");
-        let (px, py) = g.pt[v];
-        let &u = order
-            .iter()
-            .min_by_key(|&&w| {
-                let (nx, ny) = g.pt[w];
-                (nx - px).abs() + (ny - py).abs()
-            })
-            .expect("non-empty tree");
         tree_of[v] = order.len() as u32;
+        parent.push(order.len() as u32);
         order.push(v);
-        parent.push(tree_of[u]);
-        edge_r.push(SPEF_STUB_RES_KOHM);
+        edge_r.push(0.0);
         wire_cap.push(g.cap[v]);
+        dead.push(true);
+        dead_component = true;
     }
-    let mut pin_node = Vec::with_capacity(pins.len());
-    for (i, &leaf) in pin_leaf.iter().enumerate() {
-        assert!(
-            tree_of[leaf] != u32::MAX,
-            "guide net {}: pin {i} is not connected to the driver",
-            design.strings.resolve(design.net_names[net.0 as usize]),
-        );
-        pin_node.push(tree_of[leaf]);
-    }
+    let pin_node: Vec<u32> = pin_leaf.iter().map(|&leaf| tree_of[leaf]).collect();
+    let self_loops = g.self_loops.iter().map(|&(v, r)| (tree_of[v], r)).collect();
+    let (lumped, dead_wire_cap_pf) = lumped_flag(design, pins, &dead, &wire_cap, &pin_node);
     Some(NetRcTree {
         parent,
         edge_r_kohm: edge_r,
         wire_cap_pf: wire_cap,
+        dead,
+        self_loops,
+        lumped,
+        dead_wire_cap_pf,
         pin_node,
         total_wire_cap_pf: g.cap.iter().sum(),
     })
+}
+
+/// OpenSTA's lumped fallback decision for partially connected parasitics,
+/// as probed by `report_dcalc` on the gcd/picorv32 guide SPEFs: a dead
+/// `*P` port always forces the fallback (OpenSTA needs an elmore delay to
+/// every port, so the reduction cannot succeed); with only dead `*I` pins
+/// the net goes lumped once the island carries roughly a third of the wire
+/// capacitance. The band itself is inconsistent between structurally
+/// identical nets, so the fraction is an approximation of OpenSTA's
+/// behavior, not a literal replica.
+fn lumped_flag(
+    design: &DesignDb,
+    pins: &[PinId],
+    dead: &[bool],
+    wire_cap: &[f32],
+    pin_node: &[u32],
+) -> (bool, f32) {
+    let dead_cap: f32 = wire_cap
+        .iter()
+        .zip(dead)
+        .map(|(&c, &d)| if d { c } else { 0.0 })
+        .sum();
+    let dead_pin = pin_node.iter().any(|&n| dead[n as usize]);
+    if !dead_pin {
+        return (false, dead_cap);
+    }
+    let total: f32 = wire_cap.iter().sum();
+    let dead_port = pins
+        .iter()
+        .zip(pin_node)
+        .any(|(&p, &n)| dead[n as usize] && design.pin_cells[p.0 as usize].is_none());
+    let lumped = dead_port || dead_cap >= total * 0.32;
+    (lumped, dead_cap)
 }
 
 /// Escapes the characters OpenSTA's SPEF parser treats specially: `$` (an
@@ -1137,11 +1249,21 @@ pub fn write_spef(design: &DesignDb, lib: &LibDb, parasitics: &NetParasitics) ->
         out.push_str("*RES\n");
         serial = 0;
         for v in 1..nnodes {
+            // Self-parented dead-component roots emit no resistor — no edge
+            // joins an island to the driver's component.
+            if tree.parent[v] as usize == v {
+                continue;
+            }
             serial += 1;
             out.push_str(&format!(
                 "{serial} {} {} {}\n",
                 node_names[tree.parent[v] as usize], node_names[v], tree.edge_r_kohm[v]
             ));
+        }
+        for &(node, r) in &tree.self_loops {
+            serial += 1;
+            let name = &node_names[node as usize];
+            out.push_str(&format!("{serial} {name} {name} {r}\n"));
         }
         for (name, primary) in &stubs {
             serial += 1;
@@ -1969,7 +2091,8 @@ mod tests {
 
     /// A met2 vertical run between met1 stubs: the layer-pair links are
     /// via1 resistors (4.5 ohm), and a trailing li1 stub that pairs with
-    /// nothing stays a self-loop island — it must not break the tree.
+    /// nothing stays a dead self-loop island — no edge joins it to the
+    /// driver tree; it surfaces as a `n n 0.0093` self-loop resistor.
     #[test]
     fn test_guide_via_transition() {
         let (design, grid) = guide_design();
@@ -1981,22 +2104,30 @@ mod tests {
                 guide_box(1, 0, 0, 100, 100),   // met1 stub (50,50)
                 guide_box(2, 0, 0, 100, 300),   // met2 wire (50,50)-(50,250)
                 guide_box(1, 0, 200, 100, 300), // met1 stub (50,250)
-                guide_box(0, 0, 200, 100, 300), // li1 stub (50,250) -> island
+                guide_box(0, 0, 200, 100, 300), // li1 stub (50,250) -> dead island
             ],
         )];
         let p = estimate_guide_parasitics(&design, &tech, &grid, &boxes);
         let tree = p.net(NetId(1)).expect("n1 tree");
         // 7 route nodes (li1(50,50), m1(50,50), m2(50,50), m2(50,150),
-        // m2(50,250), m1(50,250), li1(50,250)) + 2 pin leaves; the
-        // disconnected li1(50,250) island links in through a 1e-6 kohm
-        // stub edge.
+        // m2(50,250), m1(50,250), li1(50,250)) + 2 pin leaves; li1(50,250)
+        // is a self-parented dead root carrying a 0.0093 self-loop.
         assert_eq!(tree.parent.len(), 9);
+        assert_eq!(tree.dead.iter().filter(|&&d| d).count(), 1);
+        assert_eq!(tree.self_loops.len(), 1);
+        assert!((tree.self_loops[0].1 - 0.0093).abs() < 1e-6);
+        let li1_island = tree.self_loops[0].0 as usize;
+        assert!(tree.dead[li1_island]);
+        assert_eq!(tree.parent[li1_island] as usize, li1_island);
         let rs = sorted_edge_r(tree);
         // met2: r = 0.25/0.1/1000 = 0.0025 kohm/um; 2 x 0.1 um links.
         // Vias: li1->m1 at (50,50) 9.3 ohm; m1->m2 twice at 4.5 ohm.
         // Pin wires on met1: c0:B pt (30,10) -> 0.06 um; c2:B pt (30,210)
-        // -> 0.06 um, each plus the 9.3 ohm cut.
-        let expect = [1e-6f32, 0.00025, 0.00025, 0.0045, 0.0045, 0.0093, 0.0096, 0.0096];
+        // -> 0.06 um, each plus the 9.3 ohm cut. The dead root's 0.0 edge
+        // sorts first — it is the sentinel, not a real resistor.
+        let expect = [
+            0.0f32, 0.00025, 0.00025, 0.0045, 0.0045, 0.0093, 0.0096, 0.0096,
+        ];
         assert_eq!(rs.len(), expect.len());
         for (r, e) in rs.iter().zip(expect) {
             assert!((r - e).abs() < 1e-6, "edge R {r} != {e} (all: {rs:?})");
@@ -2007,6 +2138,145 @@ mod tests {
             "total cap {}",
             tree.total_wire_cap_pf
         );
+    }
+
+    /// Dead-island semantics end to end on a small fixture: a sink pin
+    /// attached to an unpaired-stub island keeps its caps in
+    /// `total_wire_cap_pf` but gets zero wire delay, and `write_spef`
+    /// emits `n n r` self-loops with no resistor joining the island to
+    /// the driver component — OpenROAD's `-global_routing` shape.
+    #[test]
+    fn test_guide_island_dead_semantics() {
+        let (design, grid) = guide_design();
+        let tech = guide_tech();
+        // n0 = c0:A -> c1:B. The met1 strip covers cells (0,0)-(1,0) only;
+        // the sink cell (2,0) carries a lone li1 stub -> dead island that
+        // c1:B's pin resistor lands on. The met1 stub at (50,50) stays
+        // unpaired (no met2 coverage) -> self-loop on a live node.
+        let boxes = vec![(
+            NetId(0),
+            vec![
+                guide_box(0, 0, 0, 100, 100),   // li1 stub (50,50)
+                guide_box(1, 0, 0, 100, 100),   // met1 stub (50,50) -> self-loop
+                guide_box(1, 0, 0, 200, 100),   // met1 wire (50,50)-(150,50)
+                guide_box(0, 200, 0, 300, 100), // li1 stub (250,50) -> island
+            ],
+        )];
+        let p = estimate_guide_parasitics(&design, &tech, &grid, &boxes);
+        let tree = p.net(NetId(0)).expect("n0 tree");
+        // Nodes: li1(50,50), m1(50,50), m1(150,50), li1(250,50) + 2 leaves.
+        assert_eq!(tree.parent.len(), 6);
+        // The island chain li1(250,50) -> sink leaf is dead; pin 1 (c1:B)
+        // gets no wire delay while the driver pin keeps a real one.
+        assert!(!tree.dead[tree.pin_node[0] as usize]);
+        assert!(tree.dead[tree.pin_node[1] as usize]);
+        let delays = tree.elmore_ns(&[0.0, 0.0]);
+        assert_eq!(delays[1], 0.0, "island pin must see no wire delay");
+        // Both stub self-loops survive: met1 (0.0045) on the live node,
+        // li1 (0.0093) on the dead one.
+        let mut loop_rs: Vec<f32> = tree.self_loops.iter().map(|&(_, r)| r).collect();
+        loop_rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(loop_rs.len(), 2);
+        assert!((loop_rs[0] - 0.0045).abs() < 1e-6);
+        assert!((loop_rs[1] - 0.0093).abs() < 1e-6);
+        // met1 wire 0.1 um (2e-5) + pin wires 0.08 (m1) + 0.06 (li1) um
+        // -> 2e-5 + 1.6e-5 + 1.2e-5; the island pin wire still counts.
+        assert!(
+            (tree.total_wire_cap_pf - 4.8e-5).abs() < 1e-9,
+            "total cap {}",
+            tree.total_wire_cap_pf
+        );
+
+        // The emitted SPEF must not bridge the island: every resistor is
+        // either fully inside the dead component or fully outside; the two
+        // self-loops appear verbatim. Round-trip re-read keeps the dead pin.
+        let text = write_spef(&design, &LibDb::default(), &p).expect("write_spef");
+        let spef = parse_spef(&text).expect("parse_spef");
+        let net = &spef.nets["n0"];
+        // The dead component is exactly {dead root, sink pin leaf} here.
+        let mut dead_root = tree.pin_node[1] as usize;
+        while tree.parent[dead_root] as usize != dead_root {
+            dead_root = tree.parent[dead_root] as usize;
+        }
+        let island_name = format!("n0:{dead_root}");
+        let on_island = |name: &str| name == island_name || name == "c1:B";
+        for (a, b, _) in &net.resistors {
+            assert_eq!(
+                on_island(a),
+                on_island(b),
+                "resistor {a} {b} bridges the dead component"
+            );
+        }
+        let mut self_rs: Vec<f32> = net
+            .resistors
+            .iter()
+            .filter(|(a, b, _)| a == b)
+            .map(|(_, _, r)| *r)
+            .collect();
+        self_rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(self_rs.len(), 2);
+        assert!((self_rs[0] - 0.0045).abs() < 1e-6, "{self_rs:?}");
+        assert!((self_rs[1] - 0.0093).abs() < 1e-6, "{self_rs:?}");
+        let reparsed = spef_parasitics(&design, &spef).expect("spef_parasitics");
+        let rt = reparsed.net(NetId(0)).expect("round-trip n0 tree");
+        assert!(rt.dead[rt.pin_node[1] as usize]);
+        assert_eq!(rt.elmore_ns(&[0.0, 0.0])[1], 0.0);
+        assert_eq!(rt.total_wire_cap_pf, tree.total_wire_cap_pf);
+    }
+
+    /// The reader accepts a SPEF whose sink pin sits on a component the
+    /// driver cannot reach (OpenROAD writes island pins into `*CONN`
+    /// anyway): the pin maps dead instead of bailing.
+    #[test]
+    fn test_spef_dead_component_pin() {
+        let (design, _grid) = guide_design();
+        // n0 = c0:A -> c1:B; the sink lands on a dangling stub node.
+        let text = concat!(
+            "*SPEF \"ieee 1481-1999\"\n*DESIGN \"guide_design\"\n",
+            "*DATE \"00:00:00 Thu 01 01, 1970\"\n*VENDOR \"t\"\n*PROGRAM \"t\"\n*VERSION \"0\"\n",
+            "*DESIGN_FLOW \"PIN_CAP NONE\"\n*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER []\n",
+            "*T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 KOHM\n*L_UNIT 1 HENRY\n\n",
+            "*D_NET n0 0.0001\n*CONN\n*I c0:A O *D cell\n*I c1:B I *D cell\n",
+            "*CAP\n1 c0:A 0.00005\n2 n0:1 0.00005\n3 n0:2 0\n4 c1:B 0\n",
+            "*RES\n1 c0:A n0:1 0.01\n2 n0:2 n0:2 0.0093\n3 n0:2 c1:B 0.001\n*END\n",
+        );
+        let spef = parse_spef(text).expect("parse_spef");
+        let p = spef_parasitics(&design, &spef).expect("dead pin must not bail");
+        let tree = p.net(NetId(0)).expect("n0 tree");
+        assert!(tree.dead[tree.pin_node[1] as usize]);
+        assert_eq!(tree.elmore_ns(&[0.0, 0.0])[1], 0.0);
+        assert_eq!(tree.self_loops.len(), 1);
+        assert!((tree.total_wire_cap_pf - 0.0001).abs() < 1e-9);
+    }
+
+    /// OpenROAD's own `gcd.guide.spef` carries dead islands (`_057_`'s
+    /// island pin): `spef_parasitics` reads it now instead of bailing.
+    #[test]
+    fn test_spef_parasitics_accepts_openroad_guide_spef() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("gcd");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design = parse_def(&dir.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let spef = load_spef(&dir.join("gcd.guide.spef")).expect("guide SPEF");
+        let p = spef_parasitics(&design, &spef).expect("guide SPEF with islands must read");
+        let mut dead_nets = 0;
+        for n in 0..design.num_nets() {
+            if let Some(t) = p.net(NetId(n as u32)) {
+                dead_nets += t.dead.iter().any(|&d| d) as usize;
+            }
+        }
+        // Measured 2026-11-22: 152 of 269 guide nets carry >= 1 island node
+        // (self-loops on live nodes account for the rest of the 325 loops).
+        assert_eq!(dead_nets, 152, "dead-island net census changed");
     }
 
     /// Both pins in one GCell: stub boxes only, no route — the tree must

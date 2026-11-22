@@ -607,6 +607,14 @@ tolerances, probe evidence — is in
   inside the recorded band. Remaining open item: guide-quality
   improvements (met3–met5 band, stub coverage) and island-faithful
   parasitics — not the e2e harness. See `docs/results.md` `e4-sta-e2e`.
+- Progress 2026-11-22 (`v0.3.12`, ticket `e4-guide-islands`): the named
+  dominant cause is fixed — dead components stay dead in `NetRcTree`
+  (island caps retained, `n n r` self-loops emitted, dead pins get zero
+  wire delay) and OpenSTA's lumped fallback is modelled (dead port →
+  lumped, ~1/3 dead-cap share → lumped, probed approximation). The
+  parasitics-axis median collapses +202/+1,408 ps → ~0; the e2e
+  residual is now the e4-1 topology axis (gcd `resp_val` +250.8 ps,
+  picorv32 `_108xx_` +627 ps). See `docs/results.md` `e4-guide-islands`.
 - Probe note: guide parasitics halve the placement-estimate gap to routed
   truth on gcd (median per-net C diff vs RCX: 27.6% vs 44.2%).
 - Sizing: ~6–8 tickets (M). Ticket sketch in `design/order.md`.
