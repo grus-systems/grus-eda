@@ -70,21 +70,44 @@ repeat pools, each counted separately ([`counts.md`](counts.md)):
 
 ## Mechanisms (chosen by the counts — see [`counts.md`](counts.md))
 
-- **M1 — run-scoped exact-key memo of `driver_response`**
-  ([`memoization.md`](memoization.md)): `thread_local!`
-  `HashMap<DrvKey, (f32, f32)>`, key on bitwise inputs plus a
-  per-`Context` epoch. Bit-identical by construction (same key →
-  same stored value); no shared-mutable state crosses rayon
-  threads. Covers every call site at once, including partition
-  classes.
-- **M2 — per-call memo of the `table` closure**: `c.to_bits()`-keyed
-  memo inside `driver_response`, single-threaded, dedupes the
-  intra-call `eval_2d` repeats. Bit-identical; small absolute win —
-  ships only if the counts justify it.
-- **M4 — `eval_2d` site hardening** (`nldm.rs`): only
-  arithmetic-preserving edits allowed (e.g. bounds-check elision —
-  *not* reciprocal-multiply, which perturbs f32 bits). Ships only if
-  `eval_2d` shows in the counts.
+**Counts landed 2026-11-22** (ephemeral counters, release build,
+jpeg `sta`/`power` and ibex `sta` placement RC, patch kept at
+`/tmp/dmp-counters.patch`, reverted):
+
+- `driver_response` pi-path exact-repeat share `R = 0.0%` — every
+  one of the 897,452 calls on jpeg `sta` is a bitwise-unique key
+  (per-walk: seeds 8,750; clock.slew 448,726; eval.walk 439,976 —
+  all unique; jpeg `power` slew.walk 448,726 all unique; ibex
+  `sta` 156,617 all unique). **M1 is dead: a run-scoped memo would
+  score literally zero hits.**
+- Intra-call `table(c)` repeat share **21.6%** of `table` evals
+  (jpeg `sta` 5,384,658/24,921,651; jpeg `power` 21.6%; ibex 21.8%)
+  — and `table(c)` is ~all of `eval_2d` (49.9M of 49.9M), so the
+  dedupe removes ~21.6% of `eval_2d` calls. Clears the M2 gate
+  (≥ ~15%).
+- `rc_crossing` brent share **43.7%** (jpeg `sta`: 49.36M calls,
+  56.3% closed-form, 43.7% brent — all brent-accepted, zero
+  40-iteration fallbacks). Unfixable under bit-identity → residual.
+- `eval_2d` leaf share of `sample` on jpeg `sta.placement` ~6%
+  (125/1979 samples). Below the M4 gate (~20%) → M4 not shipped.
+- `fit_ramp_duration` 71.5% degenerate early-return; `pi_charge`
+  100% discrete; `pi_waveform_slew` 100% two-pole Brent;
+  `driver_waveform_slew` `is_lumped_bailout` early-return 27/897,452
+  (the solve already bailed).
+
+- **M1 — run-scoped exact-key memo of `driver_response`**:
+  ~~selected~~ **rejected by the counts** — `R = 0.0%`, zero hits.
+- **M2 — per-call memo of the `table` closure** — **chosen**:
+  `c.to_bits()`-keyed memo inside `driver_response`, single-threaded
+  `RefCell<Vec>` linear scan (~22 distinct `c` per call), dedupes the
+  intra-call `eval_2d` repeats shared between `solve_dmp`'s
+  `is_lumped_bailout`/`residual(hi)`/`rd_of` and
+  `driver_waveform_slew`'s `is_lumped_bailout`/`delay_slope`.
+  Bit-identical (pure function, exact key). Expected ceiling ≈
+  21.6% of `eval_2d` ≈ ~1–2% of the walk — small, but it is the
+  only redundancy the counts found.
+- **M4 — `eval_2d` site hardening** (`nldm.rs`): rejected by the
+  counts — ~6% leaf share, below the ~20% gate.
 
 ## Equivalence bar
 

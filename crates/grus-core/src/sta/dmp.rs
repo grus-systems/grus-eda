@@ -6,6 +6,8 @@
 //! delay (50%) and slew (20%-80%); `ceff` is then adjusted until the charge that this source
 //! delivers into the pi-model load up to the 50% crossing equals the charge delivered into `ceff`.
 
+use std::cell::RefCell;
+
 /// Driving-point pi model: `c1` at the driver, `rpi` in series, `c2` at the far end.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct PiModel {
@@ -480,6 +482,27 @@ fn pi_charge_numeric(pi: &PiModel, rd: f64, t0: f64, dt: f64, tx: f64) -> f64 {
 /// Table of a driver arc: `table(c)` returns the table `(delay, slew)` at load `c`.
 pub type DriverTable<'a> = &'a dyn Fn(f64) -> (f64, f64);
 
+/// Per-call memo of a [`DriverTable`]. `table` is a pure function of the load, so a hit on the
+/// `c.to_bits()` key returns the stored pair — bitwise identical to re-evaluation. One
+/// `driver_response` evaluates the same `c` several times (`is_lumped_bailout` in both
+/// `solve_dmp` and `driver_waveform_slew`, `residual(hi)`, the `rd_of` slope lookups); a linear
+/// `Vec` scan wins over a hash map at the ~22 distinct keys a call produces.
+pub fn memo_table<'a>(
+    entries: &'a RefCell<Vec<(u64, f64, f64)>>,
+    table: DriverTable<'a>,
+) -> impl Fn(f64) -> (f64, f64) + 'a {
+    move |c| {
+        let bits = c.to_bits();
+        let mut entries = entries.borrow_mut();
+        if let Some(&(_, d, s)) = entries.iter().find(|e| e.0 == bits) {
+            return (d, s);
+        }
+        let (d, s) = table(c);
+        entries.push((bits, d, s));
+        (d, s)
+    }
+}
+
 fn delay_slope(table: DriverTable, c: f64) -> f64 {
     let h = 0.05 * c;
     ((table(c + h).0 - table(c - h).0) / (2.0 * h)).max(1e-6)
@@ -584,6 +607,30 @@ mod tests {
     /// A linear driver: delay = 0.7 * rd * c + 0.05, slew = 2.2 * rd * c + 0.02 (ns, pF, kohm).
     fn linear_table(rd: f64) -> impl Fn(f64) -> (f64, f64) {
         move |c| (0.7 * rd * c + 0.05, 2.2 * rd * c + 0.02)
+    }
+
+    #[test]
+    fn memo_table_hits_are_bitwise_exact() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let raw = |c: f64| {
+            calls.set(calls.get() + 1);
+            (c, c * 2.0 + 0.01)
+        };
+        let entries = RefCell::new(Vec::new());
+        let table = memo_table(&entries, &raw);
+        let a = table(0.5);
+        let b = table(0.5);
+        assert_eq!(a.0.to_bits(), b.0.to_bits());
+        assert_eq!(a.1.to_bits(), b.1.to_bits());
+        assert_eq!(calls.get(), 1);
+        let c = table(0.75);
+        assert_eq!(calls.get(), 2);
+        assert_ne!(c.0.to_bits(), a.0.to_bits());
+        // Signed zeros are distinct keys, matching the pure function's behavior.
+        assert_ne!(table(-0.0).0.to_bits(), a.0.to_bits());
+        assert_ne!(table(-0.0).0.to_bits(), table(0.0).0.to_bits());
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]

@@ -6180,3 +6180,120 @@ v0.3.5 tree; after — the identical command into
 mini, same session. Output-identity `cmp`s used the same two
 binaries (`/tmp/grus-eda.before` kept). Raw logs not committed; the
 driver is.
+
+### 2026-11-22 — perf-dmp-hotloop: per-call exact-key memo of the DMP `table` closure (v0.3.7)
+
+`Context::driver_response` — the NLDM table read behind the DMP
+effective-capacitance solve — is the deepest remaining inner loop after
+v0.3.6 (~75% of `power` wall via `sta.slew.walk`, ~60% of `sta` wall via
+`sta.eval.walk`/`sta.prepare.clock.slew` on jpeg). Mechanism chosen by
+instrumented call counts, per the ticket's decision rule (full counts
+and the rejected alternatives in
+`kurena/tasks/perf-dmp-hotloop/design/`):
+
+- **Cross-call `driver_response` exact repeats: 0.0%.** 897,452 pi-path
+  calls on jpeg `sta` (seeds 8,750; clock.slew 448,726; eval.walk
+  439,976 — all bitwise-unique keys), 448,726 on jpeg `power` slew.walk,
+  156,617 on ibex `sta` — every key unique. A run-scoped memo scores
+  zero hits; rejected.
+- **Intra-call `table(c)` repeats: 21.6%** (jpeg `sta`
+  5,384,658/24,921,651 evals; jpeg `power` 21.6%; ibex 21.8%). `table`
+  is ~all of `eval_2d` (49.9M of 49.9M), so the dedupe removes ~21.6%
+  of `eval_2d` calls. Shipped.
+- **`rc_crossing` Brent share: 43.7%** (jpeg `sta` 49.36M calls; 56.3%
+  closed-form). Untouchable under bit-identity — any bracket/Brent
+  change shifts roots by ≤ tol → different f64 → `cmp`-dirty. Named
+  residual.
+- `eval_2d` leaf share of `sample` on jpeg `sta.placement` ~6%
+  (125/1,979 samples) — below the gate for site-level hardening;
+  `fit_ramp_duration` 71.5% degenerate early-returns; `pi_charge` 100%
+  discrete (zero numeric fallbacks).
+
+Shipped mechanism (`dmp.rs` `memo_table` + one wrap site in
+`analysis.rs`): `solve_dmp` and `driver_waveform_slew` re-read the same
+`c` points (`is_lumped_bailout` in both, `residual(hi)`, the `rd_of`
+slope lookups); a per-call `RefCell<Vec>` memo keyed on `c.to_bits()`
+(linear scan — ~22 distinct keys per call) dedupes them. A hit returns
+the stored pair of a pure function — bitwise identical to
+re-evaluation — so output is unchanged by construction. Per-call scope:
+no shared-mutable state crosses rayon threads.
+
+**Cell wall** — `measure.sh`, `REPS=5`, median ms (range), same idle
+M4 mini:
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `sta.placement.jpeg` | 1290 (1270–1340) | 1090 (1070–1100) | ×1.18 |
+| `sta.spef.jpeg` | 1370 (1360–1390) | 1170 (1170–1200) | ×1.17 |
+| `sta.zerowire.jpeg` | 120 | 110 (100–110) | ×1.09 |
+| `power.placement.jpeg` | 740 (720–740) | 630 (630–650) | ×1.17 |
+| `sta.placement.ibex` | 260 (250–280) | 210 | ×1.24 |
+| `sta.spef.ibex` | 290 (280–300) | 240 | ×1.21 |
+| `power.placement.ibex` | 220 | 190 | ×1.16 |
+| `sta.placement.aes` | 280 (280–290) | 240 (240–250) | ×1.17 |
+| `sta.spef.aes` | 310 (300–320) | 270 (260–270) | ×1.15 |
+| `power.placement.aes` | 170 (170–180) | 150 | ×1.13 |
+| `sta.spef.picorv32` | 210 (200–210) | 190 (180–190) | ×1.11 |
+| `sta.spef_rcx.picorv32` | 260 (250–300) | 230 (230–240) | ×1.13 |
+| `power.placement.picorv32` | 130 | 110 | ×1.18 |
+| `sta.placement.picorv32` | 190 | 190 | — |
+| `congestion.jpeg` | 110 | 100 (100–110) | — |
+| `place.jpeg` | 1600 | 1570 | — |
+
+Controls flat within noise: every `*.zerowire.*` except jpeg-zerowire's
+DMP path, `congestion.*`, `place.*`, `power.vcd.gcd`, and all ≤ 50 ms
+cells.
+
+**Phases** — same runs, median ms:
+
+| phase | cell | before | after | Δ |
+|---|---|---|---|---|
+| `sta.eval.walk` | jpeg `sta.placement` | 547 | 463 | −84 |
+| `sta.prepare.clock.slew` | jpeg `sta.placement` | 580 | 481 | −98 |
+| `sta.eval.walk` | jpeg `sta.spef` | 541 | 446 | −94 |
+| `sta.prepare.clock.slew` | jpeg `sta.spef` | 563 | 466 | −97 |
+| `sta.slew.walk` | jpeg `power.placement` | 543 | 448 | −95 |
+| `power.slews` | jpeg `power.placement` | 569 | 473 | −96 |
+| `sta.eval.walk` | ibex `sta.placement` | 160 | 123 | −37 |
+| `sta.prepare.clock.slew` | ibex `sta.placement` | 50 | 39 | −10 |
+| `power.slews` | ibex `power.placement` | 165 | 133 | −32 |
+| `sta.eval.walk` | aes `sta.placement` | 123 | 106 | −16 |
+| `sta.prepare.clock.slew` | aes `sta.placement` | 127 | 108 | −19 |
+| `power.slews` | aes `power.placement` | 131 | 109 | −22 |
+| `power.slews` | picorv32 `power.placement` | 90 | 73 | −18 |
+
+**Achieved vs. plan**: the count-derived ceiling was ~21.6% of
+`eval_2d` inside the walks; measured is ~15–20% off the DMP phases and
+×1.13–1.24 cell wall — larger than the naive ceiling, consistent with
+the memo also removing `eval_2d`'s per-call setup (index clamps, bilinear
+weight computes) on every hit. Residuals, named: (1) `rc_crossing`
+Brent — 43.7% of 49M calls, bit-identity-barred here, the largest
+remaining lever inside the walks; (2) `fit_ramp_duration` /
+`pi_waveform_slew` transcendental work — ~330 `sample` hits, structural;
+(3) the serial `sta.prepare.clock.slew` Kahn walk itself remains the
+top jpeg phase (481 ms) — parallelizing it was `perf-par-slew`'s scope
+and its remaining serial fraction is next-ticket material.
+
+**Equivalence**: `cargo test --workspace` (347 + 3, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo test --release -p grus-core sta` (189, 2 ignored). `--json`
+`cmp`-clean v0.3.6 vs v0.3.7 for `sta.placement` on jpeg and ibex;
+`RAYON_NUM_THREADS=1/4/10` all `cmp`-clean on jpeg `sta.placement`.
+New unit test `sta::dmp::tests::memo_table_hits_are_bitwise_exact`:
+same-`c` hits once, distinct `c` misses, `+0.0`/`-0.0` are distinct
+`to_bits()` keys, returned pairs compared by bits. Fail-proof (per
+AGENTS §7): the memo changed to always return its first entry →
+jpeg `sta.placement --json` `cmp` red → exact-key restored →
+`cmp`-clean again. (A weaker `>> 8` quantized-key mutation stayed
+`cmp`-clean — observed `c` values differ by ≥ 5%, so no collision —
+recorded as a negative result, not the fail-proof.)
+
+**What was run**: before — `REPS=5 sh
+kurena/tasks/perf-profile/measure.sh /tmp/perf-dmp-before.log` on the
+full matrix with a release binary built from the pre-change v0.3.6
+tree (ephemeral instrumentation reverted); after — the identical
+command into `/tmp/perf-dmp-after.log` on the v0.3.7 binary, same
+idle M4 mini, same session. Count instrumentation was a temporary
+patch (kept at `/tmp/dmp-counters.patch`), run once on jpeg
+`sta`/`power` + ibex `sta`, then reverted. Raw logs not committed;
+the driver is.

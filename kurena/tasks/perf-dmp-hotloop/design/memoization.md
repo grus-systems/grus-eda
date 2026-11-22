@@ -1,9 +1,76 @@
-# perf-dmp-hotloop — M1: run-scoped exact-key memo of `driver_response`
+# perf-dmp-hotloop — M2: per-call exact-key memo of the `table` closure
 
-## Shape
+## Counts verdict (2026-11-22, see [`overview.md`](overview.md))
+
+- **M1 (run-scoped `driver_response` memo): rejected.** The pi-path
+  exact-repeat share is `R = 0.0%` — 897,452 calls on jpeg `sta`,
+  every key bitwise-unique. A run-scoped memo scores zero hits;
+  the code below is kept only as the rejected design record.
+- **M2 (per-call `table` memo): shipped.** Intra-call `table(c)`
+  repeats are 21.6% of `table` evals on jpeg `sta`/`power` and
+  21.8% on ibex — `table(total)` ×3, `table(total ± 5%)` ×2–3, and
+  the final `lumped(ceff)` re-evaluate points the same call already
+  read.
+
+## M2 shape
+
+`dmp.rs`:
 
 ```rust
-// analysis.rs — module scope, next to Context
+pub fn memo_table<'a>(
+    entries: &'a RefCell<Vec<(u64, f64, f64)>>,
+    table: DriverTable<'a>,
+) -> impl Fn(f64) -> (f64, f64) + 'a {
+    move |c| {
+        let bits = c.to_bits();
+        let mut e = entries.borrow_mut();
+        if let Some(&(_, d, s)) = e.iter().find(|e| e.0 == bits) {
+            return (d, s);
+        }
+        let (d, s) = table(c);
+        e.push((bits, d, s));
+        (d, s)
+    }
+}
+```
+
+`driver_response`'s pi branch wraps its `table` closure in
+`memo_table`; `solve_dmp` and `driver_waveform_slew` share the one
+wrapped closure, so the dedupe covers `is_lumped_bailout` in both
+plus `residual(hi)` and the `rd_of` slopes.
+
+- **Key**: `c.to_bits()` — bitwise exact; `-0.0`/`NaN` keep
+  distinct keys matching the pure function's own behavior. No
+  quantization (spec bar).
+- **Container**: `RefCell<Vec>` with linear scan, not `HashMap` —
+  ~22 distinct `c` per call (24.9M evals / 897k calls), so a scan
+  of ≤ ~40 `u64` compares beats a SipHash lookup that costs about
+  as much as the `eval_2d` it saves.
+- **Scope**: created per `driver_response` call — the counts show
+  cross-call bitwise repeats are zero, so a wider scope buys
+  nothing. No shared-mutable state crosses rayon threads (each
+  call owns its `RefCell`; the memo is never aliased across
+  threads).
+- **Bit-identity**: `table` is a pure function of `c` (two
+  `eval_2d` lookups of immutable `NldmTable`s at fixed `in_slew`);
+  a hit returns the stored pair — not a recomputation — so every
+  consumer sees bitwise the same values regardless of hit/miss
+  pattern, thread, or `RAYON_NUM_THREADS`.
+
+## Rejected: M1 — run-scoped exact-key memo of `driver_response`
+
+`R = 0.0%` in the counts. The repeat pools the design hypothesised
+(partition classes re-issuing identical queries, `slew_eval`
+sharing eval's keys, `driver_input_slew` upstream reuse) do not
+exist bitwise: `slew_max`/`slew_min` at a pin differ almost
+everywhere, so `(net, pol, tables, in_slew.to_bits())` never
+collides — 897k calls, 897k unique keys on jpeg. Kept for the
+record:
+
+<details>
+<summary>M1 design (not shipped)</summary>
+
+```rust
 thread_local! {
     static DRV_MEMO: RefCell<HashMap<DrvKey, (f32, f32)>> = RefCell::new(HashMap::new());
 }
@@ -14,89 +81,19 @@ struct DrvKey {
     epoch: u64,
     net: u32,
     pol: u8,
-    in_slew: u32,       // in_slew.to_bits()
-    delay_table: usize, // `delay_table as *const NldmTable as usize`
+    in_slew: u32,
+    delay_table: usize,
     slew_table: usize,
 }
 ```
 
-`Context` gains `memo_epoch: u64`, filled at every construction
-site with `DRV_MEMO_EPOCH.fetch_add(1, Ordering::Relaxed)` — one
-site in `prepare_sta` plus the `Context { .. }` literals in tests
-(~7, all mechanical). `driver_response` becomes:
+`Context` would gain `memo_epoch` from `DRV_MEMO_EPOCH.fetch_add`;
+`driver_response` would key → lookup → miss-compute → insert.
+Bit-identical by construction, thread-local, ~100 B/entry. Dead
+because the hit count is zero — the epoch/pointer-key design was
+never exercised.
 
-1. build `key` (cheap: two pointer casts + `to_bits`);
-2. `DRV_MEMO.with(|m| m.borrow().get(&key).copied())` → hit:
-   return the stored `(delay, slew)` pair;
-3. miss: run the **unchanged** existing body, `insert`, return.
-
-No signature change; all five call sites benefit
-(`propagate_slew`, `propagate_clock`, `eval_sta` incl. every
-partition class, `slew_eval`, `driver_input_slew`).
-
-## Why the key is complete
-
-Within one `Context` lifetime the result depends only on:
-
-- `pi_models[net][pol]` / `net_wire_loads[net]` — built once in
-  `prepare_sta`, immutable afterwards (covered by `net`+`pol`);
-- `parasitics`, `lib` pin caps, `sdc` output loads — immutable
-  inputs to the run (reached through `net`/`pol` and the table
-  pointers);
-- `delay_table`/`slew_table` contents — keyed by pointer identity;
-  `NldmTable`s live in `lib` for the run's duration, so pointer ⇒
-  contents;
-- `in_slew` — keyed bitwise via `to_bits()`; `-0.0`/`NaN` are
-  distinct keys, matching the function's own behavior on them.
-
-The `epoch` field makes the cache scoped exactly to one `Context`:
-a second `prepare_sta` (dual-corner hold run, `sta_pin_slews`
-after `run_sta`, sequential tests) gets a fresh epoch, so a
-recycled `NldmTable` heap address can never alias a stale entry.
-Without it, correctness would rest on allocator addresses not
-being reused — rejected.
-
-## Bit-identity argument
-
-`driver_response` is a pure function of its key within an epoch
-(no mutable input: the walks mutate `state`, never the tables,
-pi models, or loads it reads). A hit returns the exact `f32` pair
-the miss path computed — not a recomputation, not an
-approximation — so every downstream consumer sees bitwise the
-same values regardless of hit/miss pattern, thread, or thread
-count. `RAYON_NUM_THREADS` 1/4/10 equivalence holds by
-construction and is verified empirically
-([`verification.md`](verification.md)).
-
-## Threading
-
-`thread_local!` per rayon worker — `timing.rs`'s `PHASES` uses the
-same pattern. Each worker caches only what it computed; a key
-queried on two workers is computed twice and stored twice —
-**identical bitwise result either way**, no shared-mutable state
-crosses threads (spec: "thread-local or per-level-scoped — no
-cross-thread shared cache that serializes"). `Mutex`/`DashMap`/
-`map_init` rejected: the first serializes, the last forfeits
-cross-level and cross-walk hits (the largest repeat pool: eval
-classes and `driver_input_slew` recursion live across levels).
-
-Memory: ≈ 100 B/entry (40 B key + 8 B value + map overhead) per
-worker. A jpeg run's unique-key count lands in the counts run;
-expected ≤ a few ×10⁵ entries → tens of MB worst case, acceptable
-on the measurement machine. If the counts show a much larger
-unique set, add a soft insert cap — record the decision.
-
-## M2 — per-call `table` memo (conditional companion)
-
-Inside `driver_response`, replace the `table` closure with a
-`c.to_bits()`-keyed memo (`HashMap<u64, (f64, f64)>` local to the
-call — single-threaded, no sync). Dedupes `is_lumped_bailout`'s
-`table(total)` + `delay_slope(total)` evaluated by both
-`solve_dmp` and `driver_waveform_slew`, `residual(hi)`, and the
-`rd_of` slope re-evaluation — all bitwise-identical since
-`table(c)` is pure. Small win (`eval_2d` is cheap); implement only
-if [`counts.md`](counts.md) shows the intra-call repeat share or
-`eval_2d` site cost warrants it.
+</details>
 
 ## Explicitly not candidates
 
@@ -105,9 +102,11 @@ if [`counts.md`](counts.md) shows the intra-call repeat share or
 - **Brent bracket tightening or wider closed-form coverage in
   `rc_crossing`** — returns a different f64 (the approximation,
   not the root, is what's stored); `cmp`-dirty `--json`. The
-  bisection share is recorded as residual instead.
+  measured 43.7% Brent share is recorded as residual instead.
 - **Caching `solve_dmp`/`driver_waveform_slew` separately** —
   `driver_response`-level keys cover both (plus the lumped path)
-  with strictly less code.
+  with strictly less code; moot anyway with `R = 0`.
+- **M4 `eval_2d` hardening** — ~6% leaf share in `sample`, below
+  the ~20% gate.
 - **`Rc`/`Arc` table handles or interning** — pointer identity is
   sufficient and zero-cost.

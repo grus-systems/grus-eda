@@ -778,10 +778,14 @@ impl Context<'_> {
         };
         match &self.pi_models[net.0 as usize] {
             Some(pi) => {
-                let table = |c: f64| {
+                let raw = |c: f64| {
                     let (d, s) = lumped(c as f32);
                     (d as f64, s as f64)
                 };
+                // Per-call memo: `solve_dmp` and `driver_waveform_slew` re-read
+                // the same table points (bailout, slope and `hi` evaluations).
+                let memo = std::cell::RefCell::new(Vec::with_capacity(48));
+                let table = super::dmp::memo_table(&memo, &raw);
                 let r = solve_dmp(&pi[pol], RD_SCALE, &table);
                 let wave_slew = driver_waveform_slew(&pi[pol], &r, &table);
                 (r.delay as f32, wave_slew as f32)
