@@ -630,6 +630,12 @@ tolerances, probe evidence — is in
   `e4-topology`.
 - Probe note: guide parasitics halve the placement-estimate gap to routed
   truth on gcd (median per-net C diff vs RCX: 27.6% vs 44.2%).
+- **Closed 2026-11-22**: criteria 1–3 pass; criterion 4 closed as named
+  residual — the remaining e2e error is route-path topology divergence vs
+  OpenROAD's GRT (gcd total max 232.75 ps; picorv32 named high-fanout
+  dead-detour class), not emission, parasitics (~0 median), or engine
+  (≤74 ps). The delegation path (our guides → `read_guides` →
+  `detailed_route`) is the recorded use case. See `docs/status.md` E4.
 - Sizing: ~6–8 tickets (M). Ticket sketch in `design/order.md`.
 
 ### E5. Clock tree synthesis
