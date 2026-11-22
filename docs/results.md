@@ -5989,3 +5989,94 @@ draining and showed inflated `power.*` reps (picorv32 `sta.slew.walk`
 (`/tmp/perf-slewonly-power2.log`) agreed with the tabled log within ±15%
 (jpeg `power` 880 vs 1030), so the table uses the second full-matrix run
 — min-bounds consistent, no regression hid.
+
+### 2026-11-22 — perf-legal-passes: incremental extrema + argmin slide (v0.3.5)
+
+`place.legal.pass1/2/3` keep their ordered serial structure but stop
+rescanning incident nets: one shared `NetExtrema` cache is built once
+inside `place.legal.pre` and maintained exactly across all accepted
+moves (insert-into-top-2; full rescan only when a moved pin held a
+maintained slot — `LegalizeResult.refine_extrema_rebuilds` = 191 /
+6,389 / 13,347 / 9,895 / 37,630 rescan-nets on gcd / picorv32 / aes /
+ibex / jpeg; passes 2/3 evaluations now cost O(moved pins) instead of
+O(net degree). Pass 3's median-of-other-pins candidate is replaced by
+the exact site-grid argmin of the convex piecewise-linear span sum
+(limits + `snap_down`/`snap_up` of each per-net kink `dx = o_lo - c_lo`
+and `dx = o_hi - c_hi`) — the one deliberate semantic change; pass 1's
+band index is rekeyed `(width, x, mi, cell)` so collection scans
+same-width entries only. Design: `kurena/tasks/perf-legal-passes/design/`.
+
+**Before/after wall** — median (min–max) ms, REPS=5, M4 mini:
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `place` — gcd | 10 (10–260) | 10 (0–10) | ×1.0 |
+| `place` — picorv32 | 350 (350–360) | 320 (310–320) | ×1.09 |
+| `place` — aes | 380 (370–380) | 370 (370–370) | ×1.03 |
+| `place` — ibex | 560 (560–560) | 480 (480–490) | ×1.17 |
+| `place` — jpeg | 2170 (2150–2180) | 1560 (1550–1610) | ×1.39 |
+
+**Phase** (jpeg `place`, median ms): `pass1` 250.5 → 250.6, `pass2`
+334.4 → 28.2, `pass3` 357.8 → 28.4, `abacus` 22.4 → 22.5, `resync`
+6.9 → 6.9, `pre` 4.8 → 5.4 (now includes the one-time extrema build
+that previously ran 4× inside pass1), `verify` 3.3 → 3.3. `Legalization`
+elapsed line: 987 → 348 ms.
+
+**HPWL per design** (`final_hpwl` dbu, before → after, Δ%): gcd
+4,395,223 → 4,368,029 (−0.62%); picorv32 212,135,994 → 210,965,952
+(−0.55%); aes 333,486,044 → 332,026,306 (−0.44%); ibex 413,760,839 →
+412,479,824 (−0.31%); jpeg 1,018,912,430 → 1,015,606,273 (−0.32%) —
+every design improved (the argmin candidate set weakly dominates the
+old 3-point sample per cell). OpenROAD golden gaps all still ≤5%
+(gated by the E2 tests): gcd −3.6%, picorv32 +4.3%, aes −1.2%, ibex
+−1.5%, jpeg −1.6% vs `*.reference.json` `placed_hpwl_dbu`.
+
+**Achieved vs. ceiling**: the plan's ×1.3 ceiling was set off the
+v0.3.2 tabled jpeg `place` of 4,190 ms → ~3.2 s. The same-session
+before here is 2,170 ms — that table was taken on a busier machine
+(every untouched phase, `place.gp.*` and the non-`place` cells alike,
+measures ~2× faster today: `sta.placement.jpeg` 1,070 ms now vs 2,060
+in the perf-slewonly-power entry). Against the honest before, `place`
+improved ×1.39 (jpeg) — ahead of the ceiling. Residual, named: (1)
+`place.gp.*` untouched — ~73% of the new jpeg `place` wall
+(density 515 / wl 347 / step 200 / init 79); (2) `pass1` is now the
+dominant serial legal phase (251 ms) — its evaluations were already
+extrema-cached since F5 (`evaluate_trial_swap_ro`), so the remaining
+cost is candidate volume and accepts, not net scans; (3)
+`resync`+`pre`+`verify`+`abacus` tail ~38 ms; (4) the 37,630 rebuilds
+are dominated by 2-pin nets, whose every moved pin is extremal by
+definition — rescan frequency there is inherent, but each rescan is a
+2-pin scan.
+
+**Equivalence**: `verify_legality` + all committed E2 goldens green
+(`cargo test --workspace` 343+3, 2 ignored; clippy `-D warnings`;
+`cargo test --release -p grus-core sta` 188, 2 ignored). Passes
+1/2 + the pass-3 evaluator proven bit-identical, not assumed:
+temporarily restoring the old median-of-other-pins candidate on top of
+the new code made all five `--out-def`s `cmp`-clean against the
+pre-change `/tmp/<d>.before.def` — the entire out-def divergence is
+the enlarged candidate set. Determinism: 2× jpeg + picorv32 `cmp`
+clean, `RAYON_NUM_THREADS=1` jpeg `cmp` clean. Fail-proof: (a) dropping
+the `lo[1]`/`hi[1]` insert branches →
+`test_incremental_extrema_matches_full_rebuild` red → restored (the
+`v <= lo[1].val` variant is value-neutral by design — a tied value is
+already covered — and correctly stayed green); (b) dropping the `hi`
+membership check → same test red → restored; (c) dropping `snap_up`
+from the kink candidates → `test_pass3_candidates_hit_site_argmin` red
+(spans=[(1189,2581,33,46),(-1036,291,-848,-838)] cand 2755 vs brute
+2750) → restored; (d) `surviving_extremum_owner` fed `0` instead of
+the sliding cell → `test_picorv32_place_and_legalize` red at the 5%
+golden gate (+5.27%) → restored.
+
+**What was run**: before — the five `place` commands of
+`kurena/tasks/perf-profile/measure.sh` run by hand on the pre-change
+v0.3.4 release binary, `GRUS_PHASE_TIMING=1`, 5 reps each into
+`/tmp/perf-legal-before.log` (`/tmp/<d>.before.def` kept), on an idle
+machine. After — `REPS=5 sh kurena/tasks/perf-profile/measure.sh
+/tmp/perf-legal-passes.log`, the full matrix on the v0.3.5 binary on
+the same idle machine; the non-`place` cells double as the
+no-regression check (all within noise of the slew-ticket binaries at
+this machine's current speed — `sta.placement.jpeg` 1,070 ms).
+`refine_extrema_rebuilds` was read from a temporary `eprintln`
+(removed after recording; the committed `LegalizeResult` field holds
+the value). Raw logs not committed; the driver is.

@@ -13,6 +13,9 @@ pub struct LegalizeResult {
     pub final_hpwl_dbu: i64,
     /// Full net rescans done by pass 1 trial evaluations, summed over all rounds.
     pub pass1_eval_fallbacks: usize,
+    /// Full extrema rescans done while maintaining the shared per-net extrema cache
+    /// across accepted moves, summed over the whole refinement block.
+    pub refine_extrema_rebuilds: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -411,6 +414,114 @@ fn surviving_extremum_pos(top: &[Extremum; 2], moved: &[(PinId, i32, i32)]) -> O
     }
 }
 
+// The `(net, pin, geom)` entries of `cell` on `net`; `cell_pin_nets` groups are sorted
+// by (net, pin), so the group is a binary-searched contiguous slice.
+fn cell_pins_on_net(
+    group: &[(usize, PinId, PinGeom)],
+    net: usize,
+) -> &[(usize, PinId, PinGeom)] {
+    let lo = group.partition_point(|e| (e.0, e.1.0) < (net, 0));
+    let mut hi = lo;
+    while hi < group.len() && group[hi].0 == net {
+        hi += 1;
+    }
+    &group[lo..hi]
+}
+
+// Extremum over the net's pins not owned by `excl1`/`excl2` (pass the same cell twice for
+// single-cell exclusion), or None when both top-2 pins are excluded — caller rescans.
+// A primary I/O pin's owner is u32::MAX, which must never be passed as an exclusion.
+#[inline(always)]
+fn surviving_extremum_owner(
+    geom: &PinGeomCache,
+    top: &[Extremum; 2],
+    excl1: u32,
+    excl2: u32,
+) -> Option<i32> {
+    let owner = |e: &Extremum| geom.pins[e.pin.0 as usize].owner;
+    if owner(&top[0]) != excl1 && owner(&top[0]) != excl2 {
+        Some(top[0].val)
+    } else if owner(&top[1]) != excl1 && owner(&top[1]) != excl2 {
+        Some(top[1].val)
+    } else {
+        None
+    }
+}
+
+// Full-scan lo/hi x-extrema over `net`'s pins not owned by either cell; the fallback for
+// `surviving_extremum_owner` returning None. `pin_cells == None` (I/O pins) never matches
+// a cell exclusion. Returns (i32::MAX, i32::MIN) when no pin survives.
+fn net_other_x_extrema(
+    db: &DesignDb,
+    pin_x: &[i32],
+    net: usize,
+    excl1: u32,
+    excl2: u32,
+) -> (i32, i32) {
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for &pin in db.net_pins(NetId(net as u32)) {
+        let owner = db.pin_cells[pin.0 as usize];
+        if owner == Some(CellId(excl1)) || owner == Some(CellId(excl2)) {
+            continue;
+        }
+        let px = pin_x[pin.0 as usize];
+        lo = lo.min(px);
+        hi = hi.max(px);
+    }
+    (lo, hi)
+}
+
+// Exact incremental `NetExtrema` maintenance after a move has been committed to `db`.
+// `moved` is `(pin, new_x, new_y)` for every moved pin of `net`; `move_y = false` marks
+// an x-only move (passes 2/3 never touch y). A moved pin occupying a maintained top-2
+// slot on any affected axis forces a full rescan of the net — a non-extremal moved pin
+// only inserts its new value into the top-2. Returns true on a rescan.
+fn update_net_extrema(
+    db: &DesignDb,
+    geom: &PinGeomCache,
+    net_ext: &mut [NetExtrema],
+    net: usize,
+    moved: &[(PinId, i32, i32)],
+    move_y: bool,
+) -> bool {
+    let ext = &net_ext[net];
+    if ext.pin_count < 2 {
+        return false;
+    }
+    let axes = if move_y { 2 } else { 1 };
+    for a in 0..axes {
+        for s in 0..2 {
+            let (lp, hp) = (ext.lo[a][s].pin, ext.hi[a][s].pin);
+            if moved.iter().any(|&(p, _, _)| p == lp || p == hp) {
+                net_ext[net] = build_net_extrema_fast(db, geom, net);
+                return true;
+            }
+        }
+    }
+    let ext = &mut net_ext[net];
+    for a in 0..axes {
+        for &(pin, px, py) in moved {
+            let v = if a == 0 { px } else { py };
+            let e = Extremum { val: v, pin };
+            let lo = &mut ext.lo[a];
+            if v < lo[0].val {
+                lo[1] = lo[0];
+                lo[0] = e;
+            } else if v < lo[1].val {
+                lo[1] = e;
+            }
+            let hi = &mut ext.hi[a];
+            if v > hi[0].val {
+                hi[1] = hi[0];
+                hi[0] = e;
+            } else if v > hi[1].val {
+                hi[1] = e;
+            }
+        }
+    }
+    false
+}
+
 // Pins of cells `c1` and `c2` on `net`. Those are the only pins a trial swap moves.
 #[cfg(test)]
 fn moved_pins_on_net(db: &DesignDb, net: usize, c1: usize, c2: usize, moved: &mut Vec<PinId>) {
@@ -619,8 +730,9 @@ fn exchange_cells(db: &mut DesignDb, c1: usize, c2: usize) {
 
 const SWAP_MAX_DX_DBU: i32 = 25_000;
 
-// (x_dbu, movable index, cell): sorted, so the x window is a binary-searched range.
-type BandEntry = (i32, usize, usize);
+// (width, x_dbu, movable index, cell): sorted, so a same-width x window is a
+// binary-searched range.
+type BandEntry = (i32, i32, usize, usize);
 
 // Invariant: at the start of every pass 1 round each movable cell sits on a sub-row y.
 // Abacus writes sub-row y, pass 1 swaps exchange positions (y stays a sub-row y), and
@@ -658,6 +770,11 @@ fn equal_width_swap_pass(
 ) -> usize {
     let geom = PinGeomCache::new(design_db, tech_db);
     let cell_pin_nets = build_cell_pin_nets(design_db, &geom, design_db.num_cells());
+    let n_nets = design_db.num_nets();
+    let mut net_ext: Vec<NetExtrema> = (0..n_nets)
+        .map(|net| build_net_extrema_fast(design_db, &geom, net))
+        .collect();
+    let mut rebuilds = 0usize;
     equal_width_swap_pass_fast(
         design_db,
         tech_db,
@@ -667,6 +784,8 @@ fn equal_width_swap_pass(
         cell_w_dbu,
         cell_nets,
         band_ys,
+        &mut net_ext,
+        &mut rebuilds,
     )
 }
 
@@ -716,31 +835,22 @@ fn equal_width_swap_pass_fast(
     cell_w_dbu: &[i32],
     cell_nets: &[Vec<usize>],
     band_ys: &[i32],
+    net_ext: &mut [NetExtrema],
+    extrema_rebuilds: &mut usize,
 ) -> usize {
     let max_dy = 4 * tech_db.site_height_dbu;
 
     let mut bands: Vec<Vec<BandEntry>> = vec![Vec::new(); band_ys.len()];
     for (mi, &c) in movable_cells.iter().enumerate() {
         let b = band_of(band_ys, design_db.cell_y_dbu[c]);
-        bands[b].push((design_db.cell_x_dbu[c], mi, c));
+        bands[b].push((cell_w_dbu[c], design_db.cell_x_dbu[c], mi, c));
     }
     for band in &mut bands {
         band.sort_unstable();
     }
 
-    // Extrema of every net at the committed positions. Rebuilt for a pair's incident nets on accept.
-    let n_nets = design_db.num_nets();
-    let mut net_ext: Vec<NetExtrema> = if n_nets < 1024 {
-        (0..n_nets)
-            .map(|net| build_net_extrema_fast(design_db, geom, net))
-            .collect()
-    } else {
-        (0..n_nets)
-            .into_par_iter()
-            .map(|net| build_net_extrema_fast(design_db, geom, net))
-            .collect()
-    };
     let mut eval = Pass1Eval::default();
+    let mut moved_buf: Vec<(PinId, i32, i32)> = Vec::new();
 
     let mut candidates: Vec<(usize, usize)> = Vec::new();
     let mut incident: Vec<usize> = Vec::new();
@@ -755,10 +865,18 @@ fn equal_width_swap_pass_fast(
         let band_lo = band_ys.partition_point(|&by| by < y1.saturating_sub(max_dy));
         let band_hi = band_ys.partition_point(|&by| by <= y1.saturating_add(max_dy));
         for band in &bands[band_lo..band_hi] {
-            let lo = band.partition_point(|e| e.0 < x1.saturating_sub(SWAP_MAX_DX_DBU));
-            let hi = band.partition_point(|e| e.0 <= x1.saturating_add(SWAP_MAX_DX_DBU));
-            for &(_, mi2, c2) in &band[lo..hi] {
-                if mi2 > i && cell_w_dbu[c2] == w1 {
+            let lo = band
+                .partition_point(|e| *e < (w1, x1.saturating_sub(SWAP_MAX_DX_DBU), 0, 0));
+            let hi = band.partition_point(|e| {
+                *e <= (
+                    w1,
+                    x1.saturating_add(SWAP_MAX_DX_DBU),
+                    usize::MAX,
+                    usize::MAX,
+                )
+            });
+            for &(_, _, mi2, c2) in &band[lo..hi] {
+                if mi2 > i {
                     candidates.push((mi2, c2));
                 }
             }
@@ -783,26 +901,76 @@ fn equal_width_swap_pass_fast(
             let o2 = design_db.cell_orient[c2];
 
             let (hpwl_before, hpwl_after) = evaluate_trial_swap_ro(
-                design_db, geom, &net_ext, p1, p2, c1, x1, y1, o1, c2, x2, y2, o2, &mut eval,
+                design_db, geom, net_ext, p1, p2, c1, x1, y1, o1, c2, x2, y2, o2, &mut eval,
             );
 
             if hpwl_after < hpwl_before {
                 exchange_cells(design_db, c1, c2);
                 let b1 = band_of(band_ys, y1);
                 let b2 = band_of(band_ys, y2);
-                band_remove(&mut bands[b1], (x1, i, c1));
-                band_remove(&mut bands[b2], (x2, mi2, c2));
-                band_insert(&mut bands[b2], (x2, i, c1));
-                band_insert(&mut bands[b1], (x1, mi2, c2));
+                band_remove(&mut bands[b1], (w1, x1, i, c1));
+                band_remove(&mut bands[b2], (w1, x2, mi2, c2));
+                band_insert(&mut bands[b2], (w1, x2, i, c1));
+                band_insert(&mut bands[b1], (w1, x1, mi2, c2));
                 merge_sorted_nets(&cell_nets[c1], &cell_nets[c2], &mut incident);
                 for &n in &incident {
-                    net_ext[n] = build_net_extrema_fast(design_db, geom, n);
+                    moved_buf.clear();
+                    for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[c1], n) {
+                        let (px, py) = geom.pin_pos(design_db, pin);
+                        moved_buf.push((pin, px, py));
+                    }
+                    for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[c2], n) {
+                        let (px, py) = geom.pin_pos(design_db, pin);
+                        moved_buf.push((pin, px, py));
+                    }
+                    *extrema_rebuilds += update_net_extrema(
+                        design_db, geom, net_ext, n, &moved_buf, true,
+                    ) as usize;
                 }
                 break;
             }
         }
     }
     eval.fallbacks
+}
+
+// Sum over `net_spans` of `o_hi.max(c_hi+dx) - o_lo.min(c_lo+dx)`, the incident nets'
+// x-HPWL with the sliding cell shifted by `dx`. Spans with `o_lo > o_hi` are constant
+// terms (the cell owns every pin of the net) and contribute `c_hi - c_lo`.
+fn eval_x_span(net_spans: &[(i32, i32, i32, i32)], dx: i32) -> i64 {
+    net_spans
+        .iter()
+        .map(|&(o_lo, o_hi, c_lo, c_hi)| (o_hi.max(c_hi + dx) - o_lo.min(c_lo + dx)) as i64)
+        .sum()
+}
+
+// The site-grid argmin candidate set for the pass-3 slide. `eval_x_span` is a sum of
+// convex piecewise-linear terms whose only kinks sit at `dx = o_lo - c_lo` and
+// `dx = o_hi - c_hi` per net, so the minimizing region's endpoints are kinks; evaluating
+// both site-grid neighbours of every kink target plus the hard limits finds the exact
+// site optimum (`test_pass3_candidates_hit_site_argmin` brute-forces this).
+fn push_slide_candidates(
+    out: &mut Vec<i32>,
+    net_spans: &[(i32, i32, i32, i32)],
+    orig_x: i32,
+    left_limit: i32,
+    right_limit: i32,
+    orig_x_dbu: i32,
+    step_x_dbu: i32,
+) {
+    out.push(left_limit);
+    out.push(right_limit);
+    for &(o_lo, o_hi, c_lo, c_hi) in net_spans {
+        if o_lo > o_hi {
+            continue;
+        }
+        for t in [orig_x + (o_lo - c_lo), orig_x + (o_hi - c_hi)] {
+            out.push(snap_down(t, orig_x_dbu, step_x_dbu).clamp(left_limit, right_limit));
+            out.push(snap_up(t, orig_x_dbu, step_x_dbu).clamp(left_limit, right_limit));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
 }
 
 pub fn legalize_placement(
@@ -1162,11 +1330,26 @@ pub fn legalize_placement(
 
     let pin_geom = PinGeomCache::new(design_db, tech_db);
     let cell_pin_nets = build_cell_pin_nets(design_db, &pin_geom, num_cells);
+    // One shared per-net extrema cache for the whole refinement block, kept exact across
+    // every accepted move in passes 1-3 (insert into top-2; full rescan only when a moved
+    // pin held a maintained slot). Replaces the per-round rebuild pass 1 used to do.
+    let n_nets = design_db.num_nets();
+    let mut net_ext: Vec<NetExtrema> = if n_nets < 1024 {
+        (0..n_nets)
+            .map(|net| build_net_extrema_fast(design_db, &pin_geom, net))
+            .collect()
+    } else {
+        (0..n_nets)
+            .into_par_iter()
+            .map(|net| build_net_extrema_fast(design_db, &pin_geom, net))
+            .collect()
+    };
     drop(t_pre);
 
     let mut pass1_eval_fallbacks = 0usize;
+    let mut refine_extrema_rebuilds = 0usize;
     let mut incident_buf: Vec<usize> = Vec::new();
-    let mut other_xs_buf: Vec<i32> = Vec::new();
+    let mut moved_buf: Vec<(PinId, i32, i32)> = Vec::new();
     let mut net_spans_buf: Vec<(i32, i32, i32, i32)> = Vec::new();
     let mut candidates_buf: Vec<i32> = Vec::new();
     for _round in 0..4 {
@@ -1181,6 +1364,8 @@ pub fn legalize_placement(
             &cell_w_dbu,
             &cell_nets,
             &band_ys,
+            &mut net_ext,
+            &mut refine_extrema_rebuilds,
         );
         drop(p1);
 
@@ -1245,39 +1430,66 @@ pub fn legalize_placement(
 
                 let dxa = new_xa - xa;
                 let dxb = new_xb - xb;
-                let ca_id = CellId(ca as u32);
-                let cb_id = CellId(cb as u32);
+                let (ca_u32, cb_u32) = (ca as u32, cb as u32);
                 let mut hpwl_x_before = 0i64;
                 let mut hpwl_x_after = 0i64;
                 for &n in &incident_buf {
-                    let pins = design_db.net_pins(NetId(n as u32));
-                    if pins.len() <= 1 {
+                    let ext = &net_ext[n];
+                    if ext.pin_count <= 1 {
                         continue;
                     }
-                    let (mut min_b, mut max_b) = (i32::MAX, i32::MIN);
-                    let (mut min_a, mut max_a) = (i32::MAX, i32::MIN);
-                    for &pin in pins {
-                        let px = pin_x[pin.0 as usize];
-                        min_b = min_b.min(px);
-                        max_b = max_b.max(px);
-                        let owner = design_db.pin_cells[pin.0 as usize];
-                        let px_a = if owner == Some(ca_id) {
-                            px + dxa
-                        } else if owner == Some(cb_id) {
-                            px + dxb
-                        } else {
-                            px
-                        };
-                        min_a = min_a.min(px_a);
-                        max_a = max_a.max(px_a);
+                    hpwl_x_before += (ext.hi[0][0].val - ext.lo[0][0].val) as i64;
+
+                    // Only the two cells' own pins move, so the after-extrema are the
+                    // surviving unmoved top-2 folded with the moved pins' new x.
+                    moved_buf.clear();
+                    for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[ca], n) {
+                        moved_buf.push((pin, pin_x[pin.0 as usize] + dxa, 0));
                     }
-                    hpwl_x_before += (max_b - min_b) as i64;
+                    for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[cb], n) {
+                        moved_buf.push((pin, pin_x[pin.0 as usize] + dxb, 0));
+                    }
+
+                    let (mut min_a, mut max_a) = if moved_buf.len() < ext.pin_count {
+                        match (
+                            surviving_extremum_owner(&pin_geom, &ext.lo[0], ca_u32, cb_u32),
+                            surviving_extremum_owner(&pin_geom, &ext.hi[0], ca_u32, cb_u32),
+                        ) {
+                            (Some(l), Some(h)) => (l, h),
+                            _ => {
+                                net_other_x_extrema(design_db, &pin_x, n, ca_u32, cb_u32)
+                            }
+                        }
+                    } else {
+                        (i32::MAX, i32::MIN)
+                    };
+                    for &(_, px, _) in &moved_buf {
+                        min_a = min_a.min(px);
+                        max_a = max_a.max(px);
+                    }
                     hpwl_x_after += (max_a - min_a) as i64;
                 }
 
                 if hpwl_x_after < hpwl_x_before {
                     design_db.cell_x_dbu[ca] = new_xa;
                     design_db.cell_x_dbu[cb] = new_xb;
+                    for &n in &incident_buf {
+                        moved_buf.clear();
+                        for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[ca], n) {
+                            moved_buf.push((pin, pin_x[pin.0 as usize] + dxa, 0));
+                        }
+                        for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[cb], n) {
+                            moved_buf.push((pin, pin_x[pin.0 as usize] + dxb, 0));
+                        }
+                        refine_extrema_rebuilds += update_net_extrema(
+                            design_db,
+                            &pin_geom,
+                            &mut net_ext,
+                            n,
+                            &moved_buf,
+                            false,
+                        ) as usize;
+                    }
                     refresh_cell_pin_x(design_db, &cell_pin_nets, &mut pin_x, ca);
                     refresh_cell_pin_x(design_db, &cell_pin_nets, &mut pin_x, cb);
                     sr.cells.swap(j, j + 1);
@@ -1315,71 +1527,58 @@ pub fn legalize_placement(
                     continue;
                 }
 
-                // Collect non-cell x positions + per-net (other_lo, other_hi, c_lo, c_hi) in one scan
-                // so candidates evaluate without rescanning any net (y coordinates do not change).
-                other_xs_buf.clear();
+                // Per-net (other_lo, other_hi, c_lo, c_hi) from the extrema cache plus
+                // the cell's own pin group — no scan of the net's other pins (y
+                // coordinates do not change).
                 net_spans_buf.clear();
-                let c_id = CellId(c as u32);
+                let c_u32 = c as u32;
                 for &net in incident {
-                    let pins = design_db.net_pins(NetId(net as u32));
-                    if pins.len() <= 1 {
+                    let ext = &net_ext[net];
+                    if ext.pin_count <= 1 {
                         continue;
                     }
-                    let (mut o_lo, mut o_hi) = (i32::MAX, i32::MIN);
+                    let group = cell_pins_on_net(&cell_pin_nets[c], net);
                     let (mut c_lo, mut c_hi) = (i32::MAX, i32::MIN);
-                    for &pin in pins {
+                    for &(_, pin, _) in group {
                         let px = pin_x[pin.0 as usize];
-                        if design_db.pin_cells[pin.0 as usize] == Some(c_id) {
-                            c_lo = c_lo.min(px);
-                            c_hi = c_hi.max(px);
-                        } else {
-                            other_xs_buf.push(px);
-                            o_lo = o_lo.min(px);
-                            o_hi = o_hi.max(px);
+                        c_lo = c_lo.min(px);
+                        c_hi = c_hi.max(px);
+                    }
+                    let (o_lo, o_hi) = match (
+                        surviving_extremum_owner(&pin_geom, &ext.lo[0], c_u32, c_u32),
+                        surviving_extremum_owner(&pin_geom, &ext.hi[0], c_u32, c_u32),
+                    ) {
+                        (Some(l), Some(h)) => (l, h),
+                        _ => {
+                            if group.len() == ext.pin_count {
+                                (i32::MAX, i32::MIN)
+                            } else {
+                                net_other_x_extrema(design_db, &pin_x, net, c_u32, c_u32)
+                            }
                         }
-                    }
-                    if c_lo <= c_hi {
-                        net_spans_buf.push((o_lo, o_hi, c_lo, c_hi));
-                    }
+                    };
+                    net_spans_buf.push((o_lo, o_hi, c_lo, c_hi));
                 }
 
                 candidates_buf.clear();
-                candidates_buf.push(left_limit);
-                candidates_buf.push(right_limit);
-                if !other_xs_buf.is_empty() {
-                    let med_idx = other_xs_buf.len() / 2;
-                    other_xs_buf.select_nth_unstable(med_idx);
-                    let med = other_xs_buf[med_idx];
-                    let snapped = snap_to_site(
-                        med - wc / 2,
-                        sr.orig_x_dbu,
-                        sr.step_x_dbu,
-                        left_limit,
-                        right_limit,
-                    );
-                    candidates_buf.push(snapped);
-                }
-
-                candidates_buf.sort_unstable();
-                candidates_buf.dedup();
-
-                let eval_x_span = |dx: i32| -> i64 {
-                    net_spans_buf
-                        .iter()
-                        .map(|&(o_lo, o_hi, c_lo, c_hi)| {
-                            (o_hi.max(c_hi + dx) - o_lo.min(c_lo + dx)) as i64
-                        })
-                        .sum()
-                };
+                push_slide_candidates(
+                    &mut candidates_buf,
+                    &net_spans_buf,
+                    orig_x,
+                    left_limit,
+                    right_limit,
+                    sr.orig_x_dbu,
+                    sr.step_x_dbu,
+                );
 
                 let mut best_x = orig_x;
-                let mut best_span = eval_x_span(0);
+                let mut best_span = eval_x_span(&net_spans_buf, 0);
 
                 for &cand_x in &candidates_buf {
                     if cand_x == orig_x {
                         continue;
                     }
-                    let h = eval_x_span(cand_x - orig_x);
+                    let h = eval_x_span(&net_spans_buf, cand_x - orig_x);
                     if h < best_span {
                         best_span = h;
                         best_x = cand_x;
@@ -1387,6 +1586,21 @@ pub fn legalize_placement(
                 }
                 if best_x != orig_x {
                     design_db.cell_x_dbu[c] = best_x;
+                    let dx = best_x - orig_x;
+                    for &net in incident {
+                        moved_buf.clear();
+                        for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[c], net) {
+                            moved_buf.push((pin, pin_x[pin.0 as usize] + dx, 0));
+                        }
+                        refine_extrema_rebuilds += update_net_extrema(
+                            design_db,
+                            &pin_geom,
+                            &mut net_ext,
+                            net,
+                            &moved_buf,
+                            false,
+                        ) as usize;
+                    }
                     refresh_cell_pin_x(design_db, &cell_pin_nets, &mut pin_x, c);
                 }
             }
@@ -1435,6 +1649,7 @@ pub fn legalize_placement(
         post_abacus_hpwl_dbu,
         final_hpwl_dbu,
         pass1_eval_fallbacks,
+        refine_extrema_rebuilds,
     })
 }
 
@@ -1986,6 +2201,134 @@ mod tests {
             .map(|&n| net_hpwl_dbu(&db, &tech_db, n))
             .sum();
         assert_eq!(full_after, 1000);
+    }
+
+    #[test]
+    fn test_incremental_extrema_matches_full_rebuild() {
+        // Gate on `update_net_extrema`: random scripted moves (x-only slides in the
+        // passes-2/3 shape and pair exchanges with orientation flips in the pass-1
+        // shape), then after every move the maintained cache must match a full
+        // rebuild on all 8 slot values and on cached_hpwl. Pin tags are not
+        // asserted — multi-way value ties may sit a different pin in the slots.
+        let tech_db = pass1_tech();
+        let mut total_rebuilds = 0usize;
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut db = random_pass1_db(&mut rng);
+            let geom = PinGeomCache::new(&db, &tech_db);
+            let cell_pin_nets = build_cell_pin_nets(&db, &geom, db.num_cells());
+            let mut net_ext: Vec<NetExtrema> = (0..db.num_nets())
+                .map(|n| build_net_extrema_fast(&db, &geom, n))
+                .collect();
+            let n_cells = db.num_cells();
+            let mut moved: Vec<(PinId, i32, i32)> = Vec::new();
+            for step in 0..40 {
+                let c1 = rng.below(n_cells as u64) as usize;
+                let mut c2 = c1;
+                let move_y = step % 2 == 0;
+                if move_y {
+                    c2 = (c1 + 1 + rng.below((n_cells - 1) as u64) as usize) % n_cells;
+                    exchange_cells(&mut db, c1, c2);
+                } else {
+                    db.cell_x_dbu[c1] = 100 * rng.below(8) as i32;
+                }
+                for n in incident_nets(&db, c1, c2) {
+                    moved.clear();
+                    for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[c1], n) {
+                        let (px, py) = geom.pin_pos(&db, pin);
+                        moved.push((pin, px, py));
+                    }
+                    if c2 != c1 {
+                        for &(_, pin, _) in cell_pins_on_net(&cell_pin_nets[c2], n) {
+                            let (px, py) = geom.pin_pos(&db, pin);
+                            moved.push((pin, px, py));
+                        }
+                    }
+                    total_rebuilds += update_net_extrema(
+                        &db, &geom, &mut net_ext, n, &moved, move_y,
+                    ) as usize;
+                }
+                for (n, kept) in net_ext.iter().enumerate() {
+                    let fresh = build_net_extrema(&db, &tech_db, n);
+                    for a in 0..2 {
+                        for s in 0..2 {
+                            assert_eq!(
+                                kept.lo[a][s].val, fresh.lo[a][s].val,
+                                "lo[{a}][{s}] net {n} step {step}"
+                            );
+                            assert_eq!(
+                                kept.hi[a][s].val, fresh.hi[a][s].val,
+                                "hi[{a}][{s}] net {n} step {step}"
+                            );
+                        }
+                    }
+                    assert_eq!(cached_hpwl(kept), cached_hpwl(&fresh), "hpwl net {n}");
+                }
+            }
+        }
+        assert!(
+            total_rebuilds > 0,
+            "random moves must exercise the full-rescan branch"
+        );
+    }
+
+    #[test]
+    fn test_pass3_candidates_hit_site_argmin() {
+        // Random span lists (including constant `o_lo > o_hi` terms) on a site grid:
+        // the minimum over the candidate set must equal the brute-force minimum over
+        // every site in [left_limit, right_limit]. This test fails if a needed
+        // candidate (e.g. snap_up) is dropped.
+        let mut rng = Rng(0xC0FF_EE01);
+        let mut candidates = Vec::new();
+        for _ in 0..10_000 {
+            let step = 10 * (1 + rng.below(4)) as i32;
+            let orig_x_dbu = step * rng.below(3) as i32;
+            let left_limit = orig_x_dbu + step * rng.below(5) as i32;
+            let right_limit = left_limit + step * rng.below(40) as i32;
+            let site_span = ((right_limit - left_limit) / step + 1) as u64;
+            let orig_x = left_limit + step * rng.below(site_span) as i32;
+            let n_nets = 1 + rng.below(6) as usize;
+            let spans: Vec<(i32, i32, i32, i32)> = (0..n_nets)
+                .map(|_| {
+                    let c_lo = rng.below(2_000) as i32 - 1_000;
+                    let c_hi = c_lo + rng.below(200) as i32;
+                    if rng.below(6) == 0 {
+                        (i32::MAX, i32::MIN, c_lo, c_hi)
+                    } else {
+                        let o_lo = rng.below(4_000) as i32 - 2_000;
+                        let o_hi = o_lo + rng.below(2_000) as i32;
+                        (o_lo, o_hi, c_lo, c_hi)
+                    }
+                })
+                .collect();
+
+            candidates.clear();
+            push_slide_candidates(
+                &mut candidates,
+                &spans,
+                orig_x,
+                left_limit,
+                right_limit,
+                orig_x_dbu,
+                step,
+            );
+            let cand_min = candidates
+                .iter()
+                .map(|&x| eval_x_span(&spans, x - orig_x))
+                .min()
+                .unwrap();
+
+            let mut brute_min = i64::MAX;
+            let mut x = left_limit;
+            while x <= right_limit {
+                brute_min = brute_min.min(eval_x_span(&spans, x - orig_x));
+                x += step;
+            }
+            assert_eq!(
+                cand_min, brute_min,
+                "spans={spans:?} grid=({orig_x_dbu},{step}) limits=({left_limit},{right_limit}) orig={orig_x}"
+            );
+        }
     }
 
     #[test]
