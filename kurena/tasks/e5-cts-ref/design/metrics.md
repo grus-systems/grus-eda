@@ -13,7 +13,7 @@ aborts on an unmatched line rather than defaulting.
   "cts_buf_list": ["sky130_fd_sc_hd__clkbuf_8",
                    "sky130_fd_sc_hd__clkbuf_4",
                    "sky130_fd_sc_hd__clkbuf_2"],
-  "cts_wire_unit": 20,
+  "cts_wire_unit": 20000,
   "inserted_instances": 0,
   "tree_buffers": {"sky130_fd_sc_hd__clkbuf_16": 0},
   "dummy_loads": {"sky130_fd_sc_hd__clkbuf_4": 0},
@@ -36,24 +36,24 @@ aborts on an unmatched line rather than defaulting.
 
 | field | source |
 |---|---|
-| `design`, `clock` | script arg; `report_clock_skew` table's clock column (assert equal) |
-| `cts_root_buf`, `cts_buf_list`, `cts_wire_unit` | `report_cts_config` block in `cts.log` |
+| `design`, `clock` | script arg; `report_clock_skew` table's clock header and `CTS-0007` clock-net binding (assert equal) |
+| `cts_root_buf` | `CTS-0050` "Root buffer is …" log line — probed: `report_cts_config` reports `-root_buf: undefined` (command args do not persist into the config state) |
+| `cts_buf_list`, `cts_wire_unit` | `report_cts_config` block in `cts.log` — probed: `-wire_unit` emits the internal DBU value (`20000` for the `-wire_unit 20` arg); recorded as emitted |
 | `inserted_instances` | odb census — insts absent from the pre-CTS snapshot |
-| `tree_buffers` | per-master histogram of inserted insts minus `dummy_loads`, cross-checked against `report_cts` buffer counts |
-| `dummy_loads` | TritonCTS log/`report_cts` dummy count per cell type; DEF cross-check: inserted clkbuf whose output net has ≤ 1 ITerm |
+| `tree_buffers` | `report_cts` "Cells used" per-master counts; cross-check: census insts with output-net fanout > 1 |
+| `dummy_loads` | `report_cts` "Dummys used" per cell type; DEF cross-check: inserted inst whose output net has ≤ 1 ITerm (agreed exactly on both designs — note picorv32 dummies include `clkinv`/`bufinv`/`inv` cells, not only `clkbuf`) |
 | `clock_subnets` | `report_cts` |
-| `sinks` | `report_cts` (cross-check: `all_registers` `is_clock` pins — 35 on gcd) |
-| `tree_depth` | `report_cts` max-level line |
-| `avg_sink_wirelength_um` | `report_cts`/TritonCTS log (P-CTS: 120.66) |
-| `clock_net_wirelength_um` | `report_cts` total wirelength if the table carries it; else per-clock-net HPWL via `getTermBBox` in the census Tcl — `*_basis` records which |
-| `skew_setup_ns`, `skew_hold_ns` | `report_clock_skew -setup/-hold` table max-`Skew` column; `worst_clock_skew` line is the cross-check |
-| `latency_max_ns`, `latency_min_ns` | `report_clock_skew` table's per-pin `Latency` column, max and min (insertion-delay anchor) |
+| `sinks` | `report_cts` (cross-check: `all_registers` `is_clock` pins — 35 on gcd, 1,597 on picorv32) |
+| `tree_depth` | `CTS-0102` "Path depth min - max" (`report_cts` carries no depth line; `CTS-0017` "Max level" is the same number) |
+| `avg_sink_wirelength_um` | `CTS-0101` "Average sink wire length" log line (P-CTS: 120.66) |
+| `clock_net_wirelength_um` | `report_cts` carries no wirelength → per-clock-net HPWL via `getTermBBox` in the census Tcl, over every net attached to an inserted instance (covers the root net via the root buffer's input pin); `*_basis` records `hpwl` |
+| `skew_setup_ns`, `skew_hold_ns` | `worst_clock_skew -setup/-hold` Tcl return value (signed source−target latency of the worst pair); the `report_clock_skew -digits 6` table skew line is the cross-check |
+| `latency_max_ns`, `latency_min_ns` | per-pin propagated `arrival_max_rise` on `all_registers` `is_clock` pins collected in step A — probed: `report_clock_skew` prints only the worst skew pair, no per-pin table; rise edge only (fall arrivals sit a half-period out) |
 | `def_components`, `def_signal_nets` | census scalars (sanity: `inserted_instances` + placed components) |
 
-If `worst_clock_skew` returns the value in Tcl (probe first —
-`set x [worst_clock_skew -setup]`), prefer it for `skew_*` and keep the
-report table as cross-check; record which surface won in
-`docs/results.md`.
+Probed on 2026-11-22: `worst_clock_skew -setup/-hold` returns the skew
+value in Tcl (−0.0013728185 ns on gcd); it is the `skew_*` source and
+the report table is the cross-check, recorded in `docs/results.md`.
 
 ## P-CTS scoping numbers to confirm or correct
 
