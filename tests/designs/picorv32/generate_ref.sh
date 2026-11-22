@@ -3,6 +3,8 @@
 # Generates picorv32.synth.v, picorv32.synth.json, picorv32.floorplan.def, picorv32.placed.def,
 # picorv32.routed.spef (OpenROAD's placement estimate), picorv32.routed.def, picorv32.drc.rpt,
 # picorv32.rcx.spef (routed extraction), picorv32.guide (OpenROAD global_route -guide_file),
+# picorv32.guide.caps.txt (estimate_parasitics -global_routing on that guide; the
+# ~5 MB picorv32.guide.spef stays gitignored),
 # picorv32.orient.def, picorv32.orient.pins.txt,
 # picorv32.util65.def, picorv32.gcell_usage.txt, picorv32.reference.json and
 # picorv32.sta.reference.json using LibreLane, OpenROAD, and OpenSTA inside the
@@ -171,6 +173,25 @@ set_global_routing_layer_adjustment met2-met5 0.20
 global_route -guide_file /work/tests/designs/picorv32/picorv32.guide -congestion_iterations 100
 exit
 EOF
+
+# 5d. Guide-parasitics golden: read_guides on the committed picorv32.guide, then
+#     estimate_parasitics -global_routing. The SPEF is regenerated here but
+#     gitignored (size); the caps table is the assertion input for the
+#     guide-parasitics tests.
+openroad -no_init -no_splash << 'EOF'
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/picorv32/picorv32.placed.def
+read_sdc /work/tests/designs/picorv32/picorv32.sdc
+set_wire_rc -layer met2
+read_guides /work/tests/designs/picorv32/picorv32.guide
+estimate_parasitics -global_routing -spef_file /work/tests/designs/picorv32/picorv32.guide.spef
+exit
+EOF
+
+python3 /work/tests/designs/guide_caps.py extract \
+    "${SCRIPT_DIR}/picorv32.guide.spef" "${SCRIPT_DIR}/picorv32.guide.caps.txt"
 
 # The Tcl below is fed to openroad on stdin, where the interactive shell treats `!` as
 # history expansion. Write negations as `== 0`, never `![...]`.

@@ -471,6 +471,7 @@ fn add_component(
         db.pin_offset_x_dbu.push(mpin.offset_x_dbu);
         db.pin_offset_y_dbu.push(mpin.offset_y_dbu);
         db.pin_io_layer.push(None);
+        db.pin_io_rects.push(Vec::new());
         db.pin_is_driver.push(is_driver);
         db.cell_pin_ids.push(pin_id);
     }
@@ -497,6 +498,7 @@ fn add_pin(
     let mut layer = None;
     let mut layer_off_x = 0;
     let mut layer_off_y = 0;
+    let mut io_rects = Vec::new();
     let mut is_special = false;
     for attr in split_attributes(attributes, line) {
         let (keyword, args) = attr?;
@@ -537,6 +539,12 @@ fn add_pin(
                 let y2: i32 = number(y2, "pin LAYER y2", line)?;
                 layer_off_x = (x1 + x2) / 2;
                 layer_off_y = (y1 + y2) / 2;
+                if let Some(l) = layer {
+                    io_rects.push((
+                        l,
+                        RectDbu::new(x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)),
+                    ));
+                }
             }
             "PLACED" | "FIXED" | "COVER" => {
                 let [px, py, o] = args else {
@@ -567,6 +575,19 @@ fn add_pin(
     db.pin_offset_x_dbu.push(x + layer_off_x);
     db.pin_offset_y_dbu.push(y + layer_off_y);
     db.pin_io_layer.push(layer);
+    // DEF `+ LAYER` rects are relative to the `+ PLACED` point; store the
+    // absolute shapes OpenDB keeps on the bterm.
+    db.pin_io_rects.push(
+        io_rects
+            .into_iter()
+            .map(|(l, r)| {
+                (
+                    l,
+                    RectDbu::new(r.xl + x, r.yl + y, r.xh + x, r.yh + y),
+                )
+            })
+            .collect(),
+    );
     db.pin_is_driver.push(is_driver);
 
     if !is_special {

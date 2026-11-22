@@ -86,6 +86,10 @@ pub struct DesignDb {
     pub pin_offset_x_dbu: Vec<i32>, // relative to cell (or absolute for I/O port)
     pub pin_offset_y_dbu: Vec<i32>,
     pub pin_io_layer: Vec<Option<LayerId>>, // DEF `+ LAYER` of primary I/O pins; None for instance pins
+    /// Absolute `(layer, rect)` shapes of primary I/O ports, in PINS record
+    /// order. Guide parasitics reproduce OpenROAD's bterm pin boxes from
+    /// these; instance pins stay empty (their shapes live in `MacroPin`).
+    pub pin_io_rects: Vec<Vec<(LayerId, RectDbu)>>,
     pub pin_is_driver: Vec<bool>,
     pub io_pins: Vec<PinId>, // indices of primary I/O ports (where pin_cells[p] == None)
 

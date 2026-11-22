@@ -9,6 +9,7 @@ pub use analysis::{
     merge_corner_reports, run_sta, run_sta_quiet, sta_pin_slews,
 };
 pub use parasitics::{
-    NetParasitics, WireRc, estimate_placement_parasitics, spef_parasitics, write_spef,
+    NetParasitics, WireRc, estimate_guide_parasitics, estimate_placement_parasitics,
+    spef_parasitics, write_spef,
 };
 pub use sdc::{Sdc, load_sdc, parse_sdc};

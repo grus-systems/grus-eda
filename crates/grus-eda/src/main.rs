@@ -238,6 +238,7 @@ enum ParasiticsMode {
     None,
     Placement,
     Spef,
+    Guide,
 }
 
 #[derive(Args, Debug)]
@@ -279,6 +280,14 @@ struct StaArgs {
 
     #[arg(long, help = "Path to extracted SPEF (.spef) file")]
     spef: Option<PathBuf>,
+
+    #[arg(
+        long,
+        requires = "parasitics",
+        help = "Path to a route guide file (OpenROAD global_route -guide_file format) \
+                for --parasitics guide. Default: derive guides internally via route_design"
+    )]
+    guide: Option<PathBuf>,
 
     #[arg(
         long,
@@ -791,14 +800,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Sta(args) => {
-            let mode = match (args.parasitics, &args.spef) {
-                (None | Some(ParasiticsMode::None), None) => "zero wire",
-                (Some(ParasiticsMode::Placement), None) => "placement RC",
-                (None | Some(ParasiticsMode::Spef), Some(_)) => "SPEF",
-                (parasitics, spef) => anyhow::bail!(
-                    "unsupported --parasitics {:?} with --spef {:?}",
+            let mode = match (args.parasitics, &args.spef, &args.guide) {
+                (None | Some(ParasiticsMode::None), None, None) => "zero wire",
+                (Some(ParasiticsMode::Placement), None, None) => "placement RC",
+                (None | Some(ParasiticsMode::Spef), Some(_), None) => "SPEF",
+                (Some(ParasiticsMode::Guide), None, _) => "guide RC",
+                (parasitics, spef, _) => anyhow::bail!(
+                    "unsupported --parasitics {:?} with --spef {:?} and --guide {:?}",
                     parasitics,
-                    spef
+                    spef,
+                    args.guide
                 ),
             };
             let lib_db = {
@@ -843,6 +854,41 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         let _p = grus_core::timing::phase("sta.parasitics");
                         let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
                         Ok(Some(grus_core::sta::estimate_placement_parasitics(d, &tech_db, rc)))
+                    }
+                    ("guide RC", _) => {
+                        let _p = grus_core::timing::phase("sta.parasitics");
+                        match &args.guide {
+                            Some(guide_path) => {
+                                let grid = grus_core::congestion::GCellGrid::build(
+                                    d, &tech_db, None, None,
+                                );
+                                let parsed = grus_core::congestion::parse_guides(
+                                    &std::fs::read_to_string(guide_path)?,
+                                    &tech_db,
+                                )?;
+                                let net_boxes =
+                                    grus_core::congestion::resolve_guide_nets(d, &parsed)?;
+                                Ok(Some(grus_core::sta::estimate_guide_parasitics(
+                                    d, &tech_db, &grid, &net_boxes,
+                                )))
+                            }
+                            None => {
+                                // Our guide -> our RC: route internally and feed
+                                // build_guides' boxes through the same builder.
+                                let routed = grus_core::congestion::route_design(
+                                    d, &tech_db, None, None,
+                                );
+                                let guides =
+                                    grus_core::congestion::build_guides(d, &tech_db, &routed);
+                                let net_boxes: Vec<_> = guides
+                                    .iter()
+                                    .map(|g| (g.net, g.boxes.clone()))
+                                    .collect();
+                                Ok(Some(grus_core::sta::estimate_guide_parasitics(
+                                    d, &tech_db, &routed.grid, &net_boxes,
+                                )))
+                            }
+                        }
                     }
                     (_, Some(spef_path)) => {
                         let spef = {

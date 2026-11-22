@@ -252,6 +252,33 @@ pub fn write_guides(
     Ok(())
 }
 
+/// Resolves parsed guide net names to `NetId`s. Names match on the same
+/// token `write_guides` emits (`guide_net_name`: raw DEF spelling when
+/// `net_def_spellings` is populated, else `escape_guide_name`). A guide
+/// net with no match in the design is an error, never a skip; nets absent
+/// from the guide simply contribute no entry. `parsed` order is preserved.
+pub fn resolve_guide_nets(
+    design_db: &DesignDb,
+    parsed: &[(String, Vec<GuideBox>)],
+) -> anyhow::Result<Vec<(NetId, Vec<GuideBox>)>> {
+    let mut by_name: std::collections::HashMap<String, NetId> =
+        std::collections::HashMap::with_capacity(design_db.num_nets());
+    for n in 0..design_db.num_nets() {
+        let net = NetId(n as u32);
+        if by_name.insert(guide_net_name(design_db, net), net).is_some() {
+            bail!("guide: two design nets emit the same guide name");
+        }
+    }
+    let mut out = Vec::with_capacity(parsed.len());
+    for (name, boxes) in parsed {
+        match by_name.get(name.as_str()) {
+            Some(&net) => out.push((net, boxes.clone())),
+            None => bail!("guide net `{name}` not found in design"),
+        }
+    }
+    Ok(out)
+}
+
 /// Parses the same format back (comparison tests + round-trip checks).
 /// Returns `(net_name, boxes)` in file order; unknown layer names and
 /// malformed lines are errors, never skips.
@@ -376,6 +403,7 @@ mod tests {
                 offset_x_frac: false,
                 offset_y_frac: false,
                 layer: Some(LayerId(0)), // li1
+                rects: Vec::new(),
             });
         }
         t.rebuild_maps();

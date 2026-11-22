@@ -589,7 +589,15 @@ tolerances, probe evidence — is in
   OpenROAD-format guides with weighted overlap `0.975` gcd / `0.960`
   picorv32 and box deltas `+2.4%` / `-6.2%`; `read_guides` +
   `estimate_parasitics -global_routing` accept our guide in the pinned
-  image. Guide parasitics and the end-to-end `sta` criterion remain open.
+  image.
+- Progress 2026-11-22 (`v0.3.10`, ticket `e4-guide-parasitics`): the guide
+  parasitics criterion is met — `sta --parasitics guide [--guide <file>]`
+  builds `NetRcTree`s reproducing `estimate_parasitics -global_routing`'s
+  per-net `*D_NET` totals: **269/269 gcd + 6744/6744 picorv32 nets** within
+  `max(5%, 1 fF)` (max rel diff 0.11%). The read-back direction (our
+  guides → OpenROAD `estimate_parasitics`) is recorded at 98.1%/98.4% —
+  its residual is guide coverage, not the RC model. The end-to-end `sta`
+  criterion remains open.
 - Probe note: guide parasitics halve the placement-estimate gap to routed
   truth on gcd (median per-net C diff vs RCX: 27.6% vs 44.2%).
 - Sizing: ~6–8 tickets (M). Ticket sketch in `design/order.md`.

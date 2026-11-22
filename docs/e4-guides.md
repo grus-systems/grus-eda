@@ -129,3 +129,99 @@ See `crates/grus-core/src/congestion/guide.rs`: `GuideBox`, `NetGuide`,
   snapping — a detailed-router concern, out of scope here.
 - Measured numbers, the criteria evaluation and the read-back record live in
   `docs/results.md`.
+
+---
+
+## 10. Guide-Based Parasitics (E4 ticket 2, probed 2026-11-22)
+
+`estimate_parasitics -global_routing -spef_file` on a guide file: the model
+measured off `gcd.guide` and confirmed against OpenROAD
+`est/MakeWireParasitics.cpp` + `grt/GlobalRouter.cpp` (BSD source, pinned
+revision — read to explain the measured numbers, not copied). Per-net
+`*D_NET` totals on gcd are reproduced exactly by the rule below
+(`_000_`-`_003_`, `req_msg[0]` verified to the last printed digit).
+
+**Segments.** Each box maps to `GSegment`s in file order on its layer
+(`boxToGlobalRouting`): first covered cell index `xl/tile`, last
+`xh/tile - 1` (raw-DBU floor — a box ending mid-cell drops that cell,
+tile-aligned or not; a box wholly inside one cell gives `x0 > x1` and is
+dropped). Single covered cell → one zero-length same-layer segment; 1×N
+strip → chain of center→center segments (`tile` apart); a box covering
+multiple cells in *both* dims emits **no** segments. Segment endpoints
+are tile centers `idx*tile + tile/2` (+die origin), never the
+die-edge-clamped midpoint.
+
+**updateVias** then rewrites consecutive pairs once: a zero-length seg on
+layer `L` adjacent (same point) to a seg on `L+1` becomes an `L→L+1` via;
+symmetrically a trailing via below the previous seg's layer is raised.
+This is what turns `li1`/`met1` stub pairs into real `mcon`/`via1` vias;
+a stub box not adjacent to an `L+1` segment stays a same-layer
+zero-length segment → self-loop resistor (still charged the cut-layer R
+above it, electrically dead).
+
+**Nodes** are `(x, y, layer)` RoutePts = covered (cell, layer) pairs at
+tile centers. Wire segs: `R = r_layer · len`, cap split half/half on the
+endpoints (pi model). Via segs: `R` = the LEF `RESISTANCE` of the cut
+layer above `min(init, final)` (mcon 9.3 Ω, via1 4.5 Ω, via2/via3 3.41 Ω,
+via4 0.38 Ω on sky130). `mergeSegments` (colinear degree-2 merges) only
+changes node granularity, not totals.
+
+**Pin attach** (`makeParasiticsToPin` + `Pin::findOnGridPositions`):
+pin `pt` = ll-corner of the pin's last routing-layer geometry box
+(every routing-layer LEF/DEF box, transformed by the instance's
+placement and orientation — all eight orientations corner-wise).
+`conn_layer` = the pin's highest routing layer, or for pad/macro
+die-edge pins the highest layer matching the edge direction (test
+designs have none). `grid_pt` = majority vote over the on-grid
+positions of the pin's *connection-layer box middles* — each box's
+middle maps to its covered GCell's center (`Grid::getPositionOnGrid`,
+index clamped; first candidate wins ties) — and a pin overlapping a
+single track on its layer re-snaps `grid_pt` onto that track
+(`pinOverlapsWithSingleTrack`: span ≤ 3 pitches and exactly one covered
+track). This per-box vote — not "the cell containing `pt`" — is what
+the picorv32 comparison required: it is the difference between a pin
+attaching to a nearby route node and a far island hop (root-caused on
+`_02629_` and `_00007_` in `docs/results.md`). Look up the node at
+`(grid_pt, conn+1)` first: if present, attach with `R =
+via_above(conn) + r_{conn+1} · Manhattan(pt, grid_pt)` on layer
+`conn+1`; else `(grid_pt, conn)` with `R = r_conn · Manhattan`, no via;
+else the pin node is left dangling (`EST-0026`, no resistor and no
+cap). The pin-wire cap splits half to the pin node, half to the grid
+node.
+
+**`*D_NET` total = Σ segment caps + Σ pin-wire caps** — the pin-node
+halves are counted in the total but not printed under `*CAP` (measured:
+gcd `*D_NET` Σ 0.7397 pF vs `*CAP` Σ 0.5978 pF; the difference is exactly
+the pin-wire caps). `set_wire_rc -layer` is ignored for guide
+parasitics — met2 vs met4 SPEFs are byte-identical; every box charges
+its own layer's LEF RC (`R = RPERSQ/width`, `C = CPERSQDIST·width +
+2·EDGECAPACITANCE`, the `WireRc::from_layer` formula).
+
+Our `estimate_guide_parasitics` reproduces this on `NetRcTree`: one leaf
+node per pin (driver's pin node is the root), covered (cell, layer)
+nodes with wire links between adjacent covered cells on the same layer
+(pitch length), via links per the updateVias rule, pin edges as above.
+Pin geometry comes from `MacroPin.rects` (LEF PORT boxes) and
+`DesignDb.pin_io_rects` (DEF PINS `+ LAYER` rects absolutized with the
+`+ PLACED` origin) so `pt`/`grid_pt`/`conn` match OpenROAD per box.
+Pins in the partial die-edge strip resolve to the last full tile. A pin
+whose cell has no node on `conn`/`conn+1` mirrors `EST-0026`: it
+attaches to the net's nearest node in the driver's component
+(Manhattan), carrying no cap — our tree needs a path to the driver
+where OpenROAD leaves the pin dangling.
+
+**Disconnected islands.** OpenROAD's segment graph is not always
+connected — a stub box that never pairs into an `L+1` segment stays a
+self-loop island, and whole detour branches can end up in a second
+component (gcd `_132_`: 118 route nodes, two components; OpenROAD's
+own SPEF writes island nodes with self-loop resistors). Our
+`NetRcTree` is a single BFS tree, so after the driver-rooted BFS each
+remaining component links in through a `1e-6` kΩ stub-resistor edge to
+the nearest tree node — electrically transparent for Elmore, and it
+keeps every node's cap inside the emitted SPEF so `Σ*CAP ==
+total_wire_cap_pf` round-trips through `parse_spef`/`spef_parasitics`.
+Pins attached by OpenROAD to island nodes land on those same nodes;
+the pin resistor rides the island's stub link. Note `spef_parasitics`
+still *rejects* OpenROAD's own guide SPEF on such nets (a
+`Missing route` pin bail — pre-existing strictness, unchanged here);
+our emitted SPEF is always connected and reads back fine.
