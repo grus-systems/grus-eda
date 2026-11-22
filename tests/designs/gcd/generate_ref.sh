@@ -4,7 +4,8 @@
 # gcd.routed.spef (placement estimate), gcd.routed.def, gcd.drc.rpt, gcd.rcx.spef (routed extraction),
 # gcd.guide (OpenROAD global_route -guide_file), gcd.guide.spef + gcd.guide.caps.txt
 # (estimate_parasitics -global_routing on that guide), gcd.orient.def, gcd.orient.pins.txt,
-# gcd.reference.json, and gcd.sta.reference.json using LibreLane,
+# gcd.reference.json, gcd.sta.reference.json, and gcd.guide.sta.reference.json (step 9c:
+# OpenSTA endpoints on three guide-parasitics modes) using LibreLane,
 # Yosys, OpenROAD, and OpenSTA inside the canonical container ghcr.io/librelane/librelane:3.0.16.
 
 set -euo pipefail
@@ -915,5 +916,137 @@ puts "Appended routed_spef mode to gcd.sta.reference.json"
 exit
 EOF
 openroad -no_init -no_splash "${RUN_DIR}/dump_sta_routed_ref.tcl"
+
+# 9c. Guide-parasitics STA golden (gcd.guide.sta.reference.json): OpenSTA
+#     per-endpoint values on three guide-parasitics modes, one openroad process
+#     each so every read_spef/estimate_parasitics starts from a clean parasitics
+#     state (the 9b precedent):
+#       guide_spef          read_spef gcd.guide.spef — OpenROAD's own guide ->
+#                           its -global_routing RC. The criterion-4 gate
+#                           reference.
+#       guide_ours_spef     read_spef gcd.guide.ours.spef — our guide -> our RC
+#                           -> our write_spef; ours-vs-this is the pure
+#                           STA-engine residual, and read_spef accepting the
+#                           file is the write_spef interop check.
+#       guide_ours_readback read_guides runs/guide-check/gcd.ours.guide +
+#                           estimate_parasitics -global_routing — our guide ->
+#                           OpenROAD's RC in memory; vs guide_spef it isolates
+#                           guide topology, vs guide_ours_spef it isolates the
+#                           RC model (incl. EST-0026 treatment).
+#     Consumes generate_guide_ours_spef.sh outputs — fails loudly without them.
+if [ ! -f "${SCRIPT_DIR}/gcd.guide.spef" ]; then
+    echo "Error: missing ${SCRIPT_DIR}/gcd.guide.spef (step 5d output)." >&2
+    exit 1
+fi
+for f in "${SCRIPT_DIR}/gcd.guide.ours.spef" \
+         "${SCRIPT_DIR}/runs/guide-check/gcd.ours.guide"; do
+    if [ ! -f "${f}" ]; then
+        echo "Error: missing ${f} — run tests/designs/generate_guide_ours_spef.sh gcd first." >&2
+        exit 1
+    fi
+done
+
+cat << 'EOF' > "${RUN_DIR}/dump_guide_sta_spef.tcl"
+source /work/tests/designs/gcd/runs/canonical/collect_endpoints.tcl
+
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+
+read_spef /work/tests/designs/gcd/gcd.guide.spef
+set gs_wns_max [format "%.6f" [sta::worst_slack -max]]
+set gs_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set gs_wns_min [format "%.6f" [sta::worst_slack -min]]
+set gs_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set gs_endpoints [collect_endpoints_json]
+
+set fp [open "/work/tests/designs/gcd/gcd.guide.sta.reference.json" "w"]
+puts $fp "{"
+puts $fp "  \"design\": \"gcd\","
+puts $fp "  \"guide_spef\": {"
+puts $fp "    \"wns_max_ns\": $gs_wns_max,"
+puts $fp "    \"tns_max_ns\": $gs_tns_max,"
+puts $fp "    \"wns_min_ns\": $gs_wns_min,"
+puts $fp "    \"tns_min_ns\": $gs_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $gs_endpoints
+puts $fp "    \]"
+puts $fp "  },"
+close $fp
+puts "Wrote guide_spef block of gcd.guide.sta.reference.json"
+exit
+EOF
+openroad -no_init -no_splash "${RUN_DIR}/dump_guide_sta_spef.tcl"
+
+cat << 'EOF' > "${RUN_DIR}/dump_guide_sta_ours_spef.tcl"
+source /work/tests/designs/gcd/runs/canonical/collect_endpoints.tcl
+
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+
+read_spef /work/tests/designs/gcd/gcd.guide.ours.spef
+set gos_wns_max [format "%.6f" [sta::worst_slack -max]]
+set gos_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set gos_wns_min [format "%.6f" [sta::worst_slack -min]]
+set gos_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set gos_endpoints [collect_endpoints_json]
+
+set fp [open "/work/tests/designs/gcd/gcd.guide.sta.reference.json" "a"]
+puts $fp "  \"guide_ours_spef\": {"
+puts $fp "    \"wns_max_ns\": $gos_wns_max,"
+puts $fp "    \"tns_max_ns\": $gos_tns_max,"
+puts $fp "    \"wns_min_ns\": $gos_wns_min,"
+puts $fp "    \"tns_min_ns\": $gos_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $gos_endpoints
+puts $fp "    \]"
+puts $fp "  },"
+close $fp
+puts "Appended guide_ours_spef block to gcd.guide.sta.reference.json"
+exit
+EOF
+openroad -no_init -no_splash "${RUN_DIR}/dump_guide_sta_ours_spef.tcl"
+
+cat << 'EOF' > "${RUN_DIR}/dump_guide_sta_ours_readback.tcl"
+source /work/tests/designs/gcd/runs/canonical/collect_endpoints.tcl
+
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+
+set_wire_rc -layer met2
+read_guides /work/tests/designs/gcd/runs/guide-check/gcd.ours.guide
+estimate_parasitics -global_routing
+set gor_wns_max [format "%.6f" [sta::worst_slack -max]]
+set gor_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set gor_wns_min [format "%.6f" [sta::worst_slack -min]]
+set gor_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set gor_endpoints [collect_endpoints_json]
+
+set fp [open "/work/tests/designs/gcd/gcd.guide.sta.reference.json" "a"]
+puts $fp "  \"guide_ours_readback\": {"
+puts $fp "    \"wns_max_ns\": $gor_wns_max,"
+puts $fp "    \"tns_max_ns\": $gor_tns_max,"
+puts $fp "    \"wns_min_ns\": $gor_wns_min,"
+puts $fp "    \"tns_min_ns\": $gor_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $gor_endpoints
+puts $fp "    \]"
+puts $fp "  }"
+puts $fp "}"
+close $fp
+puts "Appended guide_ours_readback block to gcd.guide.sta.reference.json"
+exit
+EOF
+openroad -no_init -no_splash "${RUN_DIR}/dump_guide_sta_ours_readback.tcl" 2>&1 | tee "${SCRIPT_DIR}/runs/guide-check/guide_ours_readback.log"
+est0026_count=$(grep -c "EST-0026" "${SCRIPT_DIR}/runs/guide-check/guide_ours_readback.log" || true)
+echo "guide_ours_readback EST-0026 warnings: ${est0026_count}"
 
 echo "==> Successfully generated all gcd reference artifacts!"

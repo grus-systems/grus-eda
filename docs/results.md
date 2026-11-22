@@ -6661,3 +6661,139 @@ round-trip, determinism, resolver, and the synthetic-fixture unit
 tests); `cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --release -p grus-core sta`.
 Direction (b) is recorded-not-gated per the design.
+
+### 2026-11-22 — e4-sta-e2e: end-to-end STA on our guide parasitics (v0.3.11)
+
+E4 criterion 4 measured: our `route --guide-out` guide →
+`estimate_guide_parasitics` → `write_spef` → our `sta --spef`, vs OpenSTA on
+the `read_guides`-driven `estimate_parasitics -global_routing` SPEF
+(`guide_spef` block of the step-9c golden). **Verdict: the criterion is NOT
+met on either design** — the strict gcd bound misses by ~40x and the
+picorv32 floors by ~50x. The residual decomposes into two named causes
+below; there is no unexplained loosening.
+
+**Probe conditions.** Pinned image `ghcr.io/librelane/librelane:3.0.16`;
+the three `openroad` invocations of `generate_ref.sh` step 9c per design
+(one process each for `guide_spef`, `guide_ours_spef`,
+`guide_ours_readback`, all on `<d>.placed.def` + `<d>.sdc`, parasitic state
+clean per block). Ours: `tests/designs/generate_guide_ours_spef.sh` —
+release `target/release/grus-eda route --guide-out` +
+`sta --parasitics guide --guide --spef-out`; the emitted SPEF's
+`*VERSION` records `"0.3.11"`. `EST-0026` counts on `guide_ours_readback`
+from the step-9c logs: **gcd 11, picorv32 249** (unchanged from e4-2).
+`read_spef` accepted both `<d>.guide.ours.spef` files verbatim in OpenSTA —
+the `guide_ours_spef` golden blocks were emitted off them with no parse
+error, so `write_spef` interop holds on both designs.
+
+**Gate numbers (our `sta --spef <d>.guide.ours.spef` vs `guide_spef`).**
+Endpoint counts match the golden on both designs (53 / 1,798, asserted).
+
+- gcd, criterion bound `max(5 ps, 1%)` on every endpoint field: **0/53
+  endpoints inside** (the loosest endpoint still has one field out).
+  Max rel diff per field: `max_arr` 12.1%, `max_req` 1.2%, `max_slack`
+  7.4%, `max_slew` 21.2%, `min_arr` 8.2%, `min_req` 2.0%, `min_slack`
+  5.5%, `min_slew` 17.4%. WNS ours `1.623116` vs ref `1.685118` ns
+  (−62.0 ps); TNS `0.000000` both; hold WNS `0.490214` vs `0.485524`.
+- picorv32, status.md floors (arrival 6 ps / slack 40 ps / slew 10% /
+  TNS 2.5%): **94/1,798 endpoints inside (5.2%)**. Max rel diff per
+  field: `max_arr` 51.8%, `max_req` 0.79%, `max_slack` 155x, `max_slew`
+  148%, `min_arr` 26.3%, `min_req` 68.5%, `min_slack` 25.3%, `min_slew`
+  234%. WNS ours `−2.005210` vs ref `−0.029591` ns; TNS `−110.459305`
+  vs `−0.055549` ns; hold WNS `0.419025` vs `0.470473`.
+
+Worst-5 by absolute `max_arr` diff (ps), gcd: `_403_/D` +239.4,
+`_409_/D` +238.5, `_405_/D` +238.3, `_404_/D` +238.1, `_395_/D` +237.7.
+Worst-5 by absolute `max_slack` diff: `_403_/D` −180.7, `_409_/D` −179.7,
+`_404_/D` −179.5, `_405_/D` −179.5, `_398_/D` −179.0.
+picorv32 `max_arr`: `_10850_/D` +2144.2, `_10874_/D` +2143.6,
+`_10871_/D` +2143.6, `_10863_/D` +2143.0, `_10865_/D` +2142.9.
+`max_slack`: `_10850_/D` −2146.8, `_10874_/D` −2146.1, `_10871_/D`
+−2146.0, `_10863_/D` −2145.6, `_10865_/D` −2145.6.
+
+**Decomposition** (from `test_<d>_guide_sta_decomposition`, max-path
+arrival error in ps; `arr_f`/`slk_f`/`any_f` = endpoints failing
+arrival / slack / any field at the strict bound):
+
+| axis | gcd med | gcd max | gcd any_f/53 | picorv32 med | picorv32 max | picorv32 any_f/1798 |
+|---|---|---|---|---|---|---|
+| topology: `guide_ours_readback − guide_spef` (e4-1) | +65.5 | +250.8 | 49 | +522.8 | +668.7 | 1506 |
+| parasitics: `guide_ours_spef − guide_ours_readback` (e4-2) | +201.7 | +341.3 | 51 | +1408.0 | +2742.2 | 1779 |
+| engine: our sta − `guide_ours_spef` | +0.82 | +7.3 | 0 | +16.7 | +55.7 | 675 |
+| **total: our sta − `guide_spef` (the gate)** | +133.0 | +239.4 | 51 | +895.2 | +2144.2 | 1687 |
+
+**Attribution (per the design's three-axis rule).**
+
+- **parasitics axis — dominant on both designs.** OpenROAD's
+  `-global_routing` model leaves unpaired guide-stub components as
+  electrically dead islands (self-loop resistors in its SPEF; island
+  caps and pins carry no wire delay and do not load the driver's path).
+  Our `NetRcTree` must be one tree, so `estimate_guide_parasitics`
+  links each disconnected component into the driver tree through a
+  `SPEF_STUB_RES_KOHM` (1e-6 kΩ) edge — electrically transparent as a
+  resistor, but it makes the whole island subtree's real wire RC part
+  of the Elmore path (gcd `_132_`-type detours land +300 ps). Per-net
+  total capacitance on the same guide is exact (e4-2 gate), so this is
+  connectivity semantics, not the RC equations. Scale check: OpenROAD's
+  own `gcd.guide.spef` has 152 island nets / 325 self-loop resistors;
+  `estimate_parasitics -global_routing` on our `gcd.ours.guide` writes
+  212 / 1,389 — our guide yields ~4.3x more unpaired stubs, which both
+  widens this axis and is why it does not show up in the e4-2 cap gate.
+- **topology axis — e4-1 residual.** Guide coverage: `EST-0026` warned
+  pins (gcd 11, picorv32 249) carry no wire RC in OpenROAD's read-back
+  model at all, and our guides' surplus stubs (above) and met1/met2-only
+  strips shift where the parasitic load sits. gcd's `resp_val` port
+  (−250.8 ps) and picorv32's contiguous `_108xx_` `dfxtp_2` register
+  bank (+2.1 ns, driven off `mem_rdata`-adjacent mux cones) are the
+  extremes.
+- **engine axis — inside the recorded band.** gcd ≤ 7.3 ps (0 field
+  failures at strict). picorv32 ≤ 55.7 ps: 32 contiguous
+  `_10752_-_10783_` `dfxtp_2` endpoints drift ~55 ps through one shared
+  upstream stage — each D pin sits on its own small net, so this is the
+  documented E3.5 driver `Rd`/Ceff residual (the routed-SPEF 40 ps
+  slack floor; worst stage cases ~90-124 ps) amplified by guide nets'
+  larger RC, not a new guide-specific mechanism. Bounded by
+  `PICORV32_GUIDE_ENGINE` (slack_abs 0.07).
+
+**Bound widening (named cause, per §7.5).** The strict criterion is
+kept as the measured verdict above; the tests guard the measured
+residual: `Tol::GCD_GUIDE` `arr_abs 0.25 / slack_abs 0.20 / slew_rel
+0.25`, `Tol::PICORV32_GUIDE` `arr_abs 2.2 / slack_abs 2.2 / slew_rel
+2.5 / tns_abs 111.0` (new `tns_abs_ns` field — reference TNS is
+−0.056 ns so no rel bound is expressible), `PICORV32_GUIDE_ENGINE` as
+above. These floors are regression guards, not passes; the criterion
+remains open on the two named causes (guide-quality + island-faithful
+parasitics).
+
+**Fail-proof (§7.7).** (i) `spef_parasitics` node caps ×2 → both
+`test_gcd_guide_sta_matches_opensta` and
+`test_gcd_guide_spef_engine_residual` **red** (`resp_val` arr 2.06 vs
+1.65), restored. (ii) `spef_parasitics` resistors ×2 stayed **green**
+on gcd — recorded, not hidden: guide-net R is small enough that the
+named-cause floors swallow an R-scale mutation (engine axis moved only
+0.82 → 2.6 ps median). Same class of finding as e4-2's 1 fF-floor
+mutation.
+
+**Runtime** (release build, `GRUS_PHASE_TIMING`; `sta --parasitics
+guide` = parasitics phase inside the whole-run elapsed):
+gcd `sta.parasitics` 1.00 ms of 14.41 ms; `sta --spef`:
+`sta.spef.read` 0.96 + `sta.parasitics` 0.74 ms of 14.93 ms.
+picorv32 `sta.parasitics` 30.88 ms of 167.62 ms; `sta --spef`:
+`sta.spef.read` 28.53 + `sta.parasitics` 6.56 ms of 177.51 ms.
+
+**Artifacts.** Committed (< 1 MB): `gcd.guide.ours.spef` (241 KB),
+`gcd.guide.sta.reference.json` (36 KB), `generate_guide_ours_spef.sh`,
+step 9c of both `generate_ref.sh`. Regenerated-not-committed (>
+1 MB, gitignored): `picorv32.guide.ours.spef` (8.75 MB),
+`picorv32.guide.spef` (6.42 MB), `picorv32.guide.sta.reference.json`
+(1.23 MB) — reproduce via `generate_guide_ours_spef.sh picorv32` +
+`generate_ref.sh` in the pinned image. `git diff` on all previously
+committed goldens is empty after the full reruns.
+
+**What was run (§7.9).** `generate_guide_ours_spef.sh` on both designs
+(release build; final rerun after the 0.3.11 bump — RC byte-identical
+to the 0.3.10 emission, verified by unchanged decomposition numbers);
+full `generate_ref.sh` (all steps incl. 9c) on both designs inside the
+pinned image; `cargo test -p grus-core guide` (21 tests: both gates,
+both engine residuals, both decompositions, plus e4-2 cap gates);
+`sta --spef --json` on both designs for the worst-5 tables;
+`GRUS_PHASE_TIMING` runs above; the two fail-proof mutations above.
