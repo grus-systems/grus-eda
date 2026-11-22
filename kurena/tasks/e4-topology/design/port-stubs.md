@@ -76,8 +76,15 @@ stay; only the group's contents change):
   style tail. Never emit the `≥S` rungs descending and never place them
   before the below-`S` rungs at an end cell — both orders were checked
   against the pairing algebra and leave a dead sub-island.
-- **unbound** pin cells: unchanged (`[accesses ∪ {met1}]` ascending,
-  inherent residual — no strip exists to anchor a rung).
+- **unbound** pin cells: ~~unchanged (`[accesses ∪ {met1}]` ascending,
+  inherent residual — no strip exists to anchor a rung).~~
+  **Amended in implementation** (see `docs/results.md` 2026-11-22
+  e4-topology): unbound cells emit a contiguous
+  `min(accesses, met1)..=max(accesses)+1` rung stack — OpenROAD covers a
+  pin cell through `conn+1` (probed on picorv32's uncovered io cells: a
+  `met3` port emits `li1..met4`). This is what eliminated the 22
+  picorv32 uncovered-port dead `*P`s; the `access+1` top rung anchors
+  the stack to the connectivity layer even with no route strip.
 
 ## Coverage notes / residual cases
 
@@ -93,8 +100,11 @@ stay; only the group's contents change):
   residual per net (expected: cells where the route covers the pos cell
   but not the voted cell, or genuinely uncovered cells — the same class
   the reference's own 7 dead `*P`s carry).
-- Unbound port cells stay dead by construction (no strip to anchor to —
-  re-routing would be required; out of scope, record per net).
+- ~~Unbound port cells stay dead by construction (no strip to anchor to —
+  re-routing would be required; out of scope, record per net).~~
+  **Amended**: superseded by the `access+1` rung-stack rule above —
+  unbound cells self-anchor by climbing one layer past the access, so
+  dead `*P` = 0 was reached without re-routing.
 - Box delta: +`max(high) − S` boxes per bound high-access cell (gcd ~tens
   of ports; picorv32 ~hundreds of port cells) — inside the ±15% gate.
 

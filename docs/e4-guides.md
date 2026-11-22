@@ -85,17 +85,35 @@ indices into **one** strip rect spanning the union of the endpoint GCells:
 - V run `y = a..=b` on column `x` → `[x_bounds(x).0, y_bounds(a).0, x_bounds(x).1,
   y_bounds(b+1).1]` on `met2`.
 
-## 6. Pin-Access Stubs
+## 6. Pin-Access Stubs (rung stacks)
 
-Per pin of the net, one stub rect = the pin's GCell rect, emitted on:
+Per pin GCell of the net, one contiguous **rung stack** of zero-length
+same-cell boxes is emitted. The access layers are:
 
-1. the pin's **access layer**:
-   - instance pin → `MacroPin.layer` (the first LEF PORT layer; `li1` for
-     `sky130_fd_sc_hd` cells),
-   - I/O pin → `pin_io_layer` (the DEF `+ LAYER`; `met2`/`met3` under
-     `place_pins -hor_layers met3 -ver_layers met2`), falling back to `met1`
-     when absent;
-2. **`met1`** — the stack stub from the access layer into the routing band.
+- instance pin → `MacroPin.layer` (the first LEF PORT layer; `li1` for
+  `sky130_fd_sc_hd` cells),
+- I/O pin → `pin_io_layer` (the DEF `+ LAYER`; `met2`/`met3` under
+  `place_pins -hor_layers met3 -ver_layers met2`), falling back to `met1`
+  when absent.
+
+Which layers the stack covers depends on whether a route strip covers the
+cell (§7 carries the ordering rules, which are semantic for `updateVias`
+pairing):
+
+- **bound** to a strip on layer `S`: the stack spans
+  `min(accesses)..=S` when every access sits below `S`, or
+  `min(accesses below S, met1, S)..=max(accesses)` when an access sits
+  at/above `S` (the `met1` fill keeps the `met1`↔`met2` bridge at cells
+  that are also H/V junctions);
+- **unbound** (no strip coverage): the stack climbs
+  `min(accesses, met1)..=max(accesses)+1` — OpenROAD covers a pin cell
+  through `conn+1`, measured on picorv32's uncovered io cells (a `met3`
+  port emits `li1..met4`). This keeps a `*P` port off a dead island even
+  with no route coverage.
+
+Non-pin GCells covered by both an H and a V run also get a **bend
+via-stack** (`met1` then `met2`, consecutive) so the bend's two layer
+subtrees stay connected.
 
 Stub boxes dedup across pins sharing a GCell. A net whose pins all sit in one
 GCell produces no segments; its block still carries the stubs. Nets with

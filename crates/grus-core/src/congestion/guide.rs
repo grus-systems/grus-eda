@@ -160,10 +160,11 @@ pub fn build_guides(
         }
 
         // A pin cell binds to the highest strip covering it — met2 when
-        // a V run covers it, else met1. Its stub chain climbs the access
-        // layers strictly below the strip's layer, so every stub pairs
-        // into the wire (OpenROAD convention: a met1-covered pin emits
-        // only its access stub — the strip itself is the met1 rung).
+        // a V run covers it, else met1. Its rung stack anchors on the
+        // strip's layer `S` (the rung that shares the wire's node), so
+        // the stack pairs into the wire (OpenROAD convention: a
+        // met1-covered pin emits only its access stub — the strip itself
+        // is the met1 rung).
         let covered = |runs: &[(usize, Vec<(usize, usize)>)], key: usize, coord: usize| {
             runs.iter()
                 .find(|(k, _)| *k == key)
@@ -186,8 +187,9 @@ pub fn build_guides(
         // at/above the covering strip chain into the wire node —
         // `updateVias` pairs a zls only upward, so the stack anchors on
         // the strip layer `S` (the rung that shares the wire's node).
-        // Unbound cells keep the accesses+met1 group: no strip exists
-        // to anchor rungs (dead islands — the recorded residual).
+        // Unbound cells self-anchor: the stack climbs one layer past
+        // the highest access (`conn+1` coverage, probed on OpenROAD's
+        // own guides), which is what keeps `*P` ports off dead islands.
         let cover_layer = |i: usize| {
             if bound_to_v[i] {
                 met2.map(|l| l.0)
