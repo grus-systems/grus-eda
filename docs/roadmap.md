@@ -570,7 +570,10 @@ full scoping — inputs/outputs, reusable modules by name, per-metric
 tolerances, probe evidence — is in
 `kurena/tasks/next-stage-scoping/design/`; probe outputs are logged in
 `docs/results.md` (2026-11-22 "next-stage-scoping"). Recommended order is
-**E4 → E5 → E8**, with E6/E7 behind a decision gate.
+**E4 → E5 → E8**, with E6/E7 behind a decision gate. Update 2026-11-23:
+the gate is lifted — E6/E7 are authorized; **E9** (reporting/usability
+surface, from the first large-design run's feedback
+`docs/history/run-2026-11-22-large-design.md`) joins as a small stage.
 
 ### E4. Global routing → route guides + guide-based parasitics
 
@@ -680,20 +683,41 @@ tolerances, probe evidence — is in
   a sparse DC solve (new dependency).
 - Sizing: ~4–6 tickets (M).
 
-### E6/E7 — decision-gated, not scheduled
+### E9. Reporting / usability surface
+
+- In: existing `sta` engine + JSON. Out: actionable reports — no new
+  timing semantics.
+- Source: `docs/history/run-2026-11-22-large-design.md` (first
+  large-design exercise, ~132k cells, multiple async domains).
+- Items in value order:
+  1. `sta --paths N` / `critical_paths` JSON — worst-N
+     startpoint→endpoint traces with cell/pin names and per-arc
+     delays (the blocker for acting on a deep-slack outlier).
+  2. Per-clock-domain WNS/TNS/violation summary.
+  3. Slack histogram over endpoints.
+  4. `--top` ergonomics — suffix match on the hierarchy separator /
+     single-top auto-accept instead of the exact `$paramod$…` name.
+  5. SDC examples doc — single clock, N async clocks +
+     `set_clock_groups`, FF clock-enable gating.
+- Sizing: ~3 small tickets (`ux-sta-paths`, `ux-sta-summary`,
+  `ux-top-sdc`).
+
+### E6/E7 — authorized 2026-11-23
 
 - **E6 detailed routing** is a TritonRoute-class build (LEF `VIA`/`SPACING`
   and DEF `VIAS`/`NONDEFAULTRULES` parse, signal-net wire storage, DRC-aware
   maze routing) — ~15+ tickets (XL), an order of magnitude beyond any prior
-  stage, and the README lists detailed routing and DRC as out of scope. That
-  scope line stays untouched here; this entry names the tension for a user
-  decision. The delegation path is measured, not hypothetical: P-GR showed
-  `read_guides` + `detailed_route` on a foreign guide file produces a clean
-  routed DEF (0 DRC) on gcd, so after E4 lands our guides can drive
-  OpenROAD's own DRT. Re-evaluate then.
-- **E7 DRC** only exists once something emits routed shapes — paired with E6
-  (0 violations on gcd under Magic `drc style drc(full)`, which P-DRC
-  confirmed reads foreign routed DEFs in this image), or as a LEF-rule
-  subset checker on the committed `gcd.routed.def`/`picorv32.routed.def`
-  matching Magic's per-rule `drc listall why` counts exactly (~4 tickets as
-  a subset checker).
+  stage. The README's out-of-scope line needs updating when it lands. The
+  delegation path is measured, not hypothetical: P-GR showed `read_guides`
+  + `detailed_route` on a foreign guide file produces a clean routed DEF
+  (0 DRC) on gcd, so our guides already drive OpenROAD's own DRT — native
+  E6 is the replacement, not the enabler. Suggested first ticket:
+  reference generation (`detailed_route` on our guide + Magic/OpenROAD
+  DRC goldens on gcd), matching the per-stage pattern.
+- **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
+  under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
+  routed DEFs in this image), or independently as a LEF-rule subset
+  checker on the committed `gcd.routed.def`/`picorv32.routed.def`
+  matching Magic's per-rule `drc listall why` counts exactly (~4 tickets
+  as a subset checker). The subset-checker shape does not depend on E6
+  and can run first.
