@@ -347,6 +347,7 @@ fn parse_layer(
 ) -> Result<()> {
     let layer_name = required_word(lexer, "LAYER name")?.to_string();
     let mut is_routing = false;
+    let mut is_cut = false;
     let mut dir = LayerDir::Horizontal;
     let mut pitch_x_um = None;
     let mut pitch_y_um = None;
@@ -354,6 +355,7 @@ fn parse_layer(
     let mut offset_y_um = None;
     let mut width_um = None;
     let mut res_per_sq = 0.0f32;
+    let mut cut_res_ohm = None;
     let mut cap_per_sq_um = 0.0f32;
     let mut edge_cap_per_um = 0.0f32;
     let mut closed = false;
@@ -365,10 +367,12 @@ fn parse_layer(
                 closed = true;
                 break;
             } else if w.eq_ignore_ascii_case("TYPE") {
-                if let Some(t) = lexer.next_word()
-                    && t.eq_ignore_ascii_case("ROUTING")
-                {
-                    is_routing = true;
+                if let Some(t) = lexer.next_word() {
+                    if t.eq_ignore_ascii_case("ROUTING") {
+                        is_routing = true;
+                    } else if t.eq_ignore_ascii_case("CUT") {
+                        is_cut = true;
+                    }
                 }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("DIRECTION") {
@@ -404,10 +408,14 @@ fn parse_layer(
                 width_um = Some(required_f32(lexer, "LAYER WIDTH")?);
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("RESISTANCE") {
-                if let Some(r_kw) = lexer.next_word()
-                    && r_kw.eq_ignore_ascii_case("RPERSQ")
-                {
-                    res_per_sq = required_f32(lexer, "LAYER RESISTANCE RPERSQ")?;
+                if let Some(r_kw) = lexer.next_word() {
+                    if r_kw.eq_ignore_ascii_case("RPERSQ") {
+                        res_per_sq = required_f32(lexer, "LAYER RESISTANCE RPERSQ")?;
+                    } else if let Ok(r) = r_kw.parse::<f32>() {
+                        // A bare `RESISTANCE <ohms> ;` is the per-cut value on
+                        // CUT layers — the via resistance guide parasitics read.
+                        cut_res_ohm = Some(r);
+                    }
                 }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("CAPACITANCE") {
@@ -427,6 +435,16 @@ fn parse_layer(
     }
     if !closed {
         bail!("LEF: LAYER {layer_name} is not terminated by END {layer_name} (truncated file?)");
+    }
+
+    if is_cut
+        && let Some(res) = cut_res_ohm
+        && !tech_db.routing_layers.is_empty()
+    {
+        // The cut layer sits above the routing layer parsed just before it;
+        // `load_tech_db` resolves these into `via_res_ohm_above`.
+        let below = tech_db.routing_layers.len() - 1;
+        tech_db.cut_res_above.push((below as u8, res));
     }
 
     if is_routing {
@@ -718,6 +736,7 @@ fn parse_pin(
         bail!("LEF: PIN {pin_name} is not terminated by END {pin_name} (truncated file?)");
     }
 
+    let pin_rects = local_pin_rects.clone();
     if !local_pin_rects.is_empty() {
         merge_connected_obs(&mut local_pin_rects);
         pin_obs_rects.extend(local_pin_rects);
@@ -735,6 +754,7 @@ fn parse_pin(
         offset_x_frac,
         offset_y_frac,
         layer: pin_layer,
+        rects: pin_rects,
     });
 
     Ok(())
@@ -822,6 +842,15 @@ pub fn load_tech_db(
     let mut tech_db = TechDb::new();
     let mut report = parse_lef(tlef_path, &mut tech_db, interner)?;
     report.merge(&parse_lef(lef_path, &mut tech_db, interner)?);
+    // The first cut layer above a routing layer is the via between it and
+    // the next routing layer; later cuts between the same pair stack higher.
+    tech_db.via_res_ohm_above = vec![0.0; tech_db.routing_layers.len()];
+    for (below, res) in std::mem::take(&mut tech_db.cut_res_above) {
+        let slot = &mut tech_db.via_res_ohm_above[below as usize];
+        if *slot == 0.0 {
+            *slot = res;
+        }
+    }
     tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
     Ok((tech_db, report))

@@ -70,6 +70,11 @@ pub struct MacroPin {
     pub offset_x_frac: bool,
     pub offset_y_frac: bool,
     pub layer: Option<LayerId>,
+    /// Routing-layer pin shapes in file order, macro coordinates. Guide
+    /// parasitics need the per-rect middles (OpenROAD's on-grid vote) and
+    /// the last rect's lower-left corner (its pin position).
+    #[serde(default)]
+    pub rects: Vec<(LayerId, RectDbu)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -92,6 +97,16 @@ pub struct TechDb {
     pub site_height_dbu: i32,
     pub strings: StringInterner,
     pub routing_layers: Vec<RoutingLayer>,
+    /// Via resistance (ohms) of the cut layer above each routing layer —
+    /// `via_res_ohm_above[k]` is the cut layer between routing layers `k`
+    /// and `k+1` in LEF stack order, 0 when none exists (top layer). Guide
+    /// parasitics need it; OpenROAD reads it off `dbTechLayer::getUpperLayer`.
+    #[serde(default)]
+    pub via_res_ohm_above: Vec<f32>,
+    /// Transient parse state: (routing layer index below, RESISTANCE ohms)
+    /// per CUT layer, finalized into `via_res_ohm_above` by `load_tech_db`.
+    #[serde(skip)]
+    pub cut_res_above: Vec<(u8, f32)>,
     pub macros: Vec<MacroDef>,
     pub macro_pins: Vec<MacroPin>,
     #[serde(skip)]

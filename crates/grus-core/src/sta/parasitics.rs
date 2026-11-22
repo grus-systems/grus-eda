@@ -1,10 +1,12 @@
 use super::dmp::PiModel;
+use crate::congestion::gcell::GCellGrid;
+use crate::congestion::guide::GuideBox;
 use crate::congestion::rsmt::Pt;
-use crate::design_db::DesignDb;
-use crate::interner::{NetId, PinDir, PinId};
+use crate::design_db::{DesignDb, Orient};
+use crate::interner::{LayerId, NetId, PinDir, PinId};
 use crate::lib_db::LibDb;
 use crate::readers::spef::{Spef, SpefNet, unescape_spef_name};
-use crate::tech_db::TechDb;
+use crate::tech_db::{LayerDir, RectDbu, TechDb};
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -367,6 +369,644 @@ fn spef_net_tree(
         wire_cap_pf: wire_cap,
         pin_node,
         total_wire_cap_pf: total,
+    })
+}
+
+/// One guide route segment between two `(x, y, layer)` grid points, as
+/// OpenROAD's `boxToGlobalRouting`/`updateVias` produce it: endpoints at
+/// tile centers, zero-length segments as via candidates.
+struct GSeg {
+    x0: i32,
+    y0: i32,
+    l0: u8,
+    x1: i32,
+    y1: i32,
+    l1: u8,
+}
+
+impl GSeg {
+    fn is_via(&self) -> bool {
+        self.x0 == self.x1 && self.y0 == self.y1
+    }
+    fn init_pt(&self) -> (i32, i32) {
+        (self.x0, self.y0)
+    }
+    fn final_pt(&self) -> (i32, i32) {
+        (self.x1, self.y1)
+    }
+}
+
+/// Route-point graph of one guide net: nodes keyed by `(x, y, layer)`
+/// (pin leaves intern by position only), half-split caps per node,
+/// resistor edges as `(neighbor, kohm)` adjacency.
+#[derive(Default)]
+struct RouteGraph {
+    node_of: HashMap<(i32, i32, u8), usize>,
+    pt: Vec<(i32, i32)>,
+    cap: Vec<f32>,
+    adj: Vec<Vec<(usize, f32)>>,
+}
+
+impl RouteGraph {
+    fn intern(&mut self, x: i32, y: i32, l: u8) -> usize {
+        *self.node_of.entry((x, y, l)).or_insert_with(|| {
+            self.pt.push((x, y));
+            self.cap.push(0.0);
+            self.adj.push(Vec::new());
+            self.pt.len() - 1
+        })
+    }
+
+    /// Pin leaves never merge with a RoutePt at the same coordinates —
+    /// OpenROAD keeps a named node per pin — so they index by position.
+    fn intern_pos(&mut self, x: i32, y: i32) -> usize {
+        self.pt.push((x, y));
+        self.cap.push(0.0);
+        self.adj.push(Vec::new());
+        self.pt.len() - 1
+    }
+
+    fn edge(&mut self, a: usize, b: usize, r: f32) {
+        if a != b {
+            self.adj[a].push((b, r));
+            self.adj[b].push((a, r));
+        }
+    }
+}
+
+/// The node a pin attaches to: `(grid_pt, conn+1)` first (the cut via is
+/// lumped into the returned via R), then `(grid_pt, conn)`.
+fn pin_node_lookup(
+    g: &RouteGraph,
+    num_layers: usize,
+    via_kohm: &[f32],
+    gx: i32,
+    gy: i32,
+    conn: LayerId,
+) -> Option<(usize, u8, f32)> {
+    let above = LayerId(conn.0 + 1);
+    if (above.0 as usize) < num_layers
+        && let Some(&node) = g.node_of.get(&(gx, gy, above.0))
+    {
+        return Some((
+            node,
+            above.0,
+            via_kohm.get(conn.0 as usize).copied().unwrap_or(0.0),
+        ));
+    }
+    g.node_of
+        .get(&(gx, gy, conn.0))
+        .map(|&node| (node, conn.0, 0.0))
+}
+
+/// Which die edge a pin sits on, OpenROAD `Pin::PinEdge`.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum PinEdge {
+    None,
+    North,
+    South,
+    East,
+    West,
+}
+
+/// Everything `makeParasiticsToPin` needs about one pin: `pt` is the
+/// lower-left corner of the pin's last routing-layer box, `grid_pt` the
+/// on-grid position OpenROAD computes in `findPins`, `conn` its connection
+/// layer.
+#[derive(Copy, Clone)]
+struct PinAttach {
+    px: i32,
+    py: i32,
+    gx: i32,
+    gy: i32,
+    conn: LayerId,
+}
+
+/// A macro-coord pin box placed at `(cx, cy)` under `orient`, corner-wise
+/// with `DesignDb::pin_pos_dbu`'s point transform.
+fn place_rect(r: RectDbu, w: i32, h: i32, o: Orient, cx: i32, cy: i32) -> RectDbu {
+    let t = |x: i32, y: i32| match o {
+        Orient::N => (cx + x, cy + y),
+        Orient::S => (cx + w - x, cy + h - y),
+        Orient::W => (cx + h - y, cy + x),
+        Orient::E => (cx + y, cy + w - x),
+        Orient::FN => (cx + w - x, cy + y),
+        Orient::FS => (cx + x, cy + h - y),
+        Orient::FW => (cx + y, cy + x),
+        Orient::FE => (cx + h - y, cy + w - x),
+    };
+    let (ax, ay) = t(r.xl, r.yl);
+    let (bx, by) = t(r.xh, r.yh);
+    RectDbu::new(ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
+}
+
+/// Absolute routing-layer shapes of a pin in file order — OpenDB's
+/// `pin.getBoxes()`. Instance pins transform `MacroPin::rects`; I/O ports
+/// carry their PINS record rects directly.
+fn pin_rects_dbu(design: &DesignDb, tech: &TechDb, pin: PinId) -> Vec<(LayerId, RectDbu)> {
+    let p = pin.0 as usize;
+    match design.pin_cells[p] {
+        None => design.pin_io_rects[p].clone(),
+        Some(cell) => {
+            let c = cell.0 as usize;
+            let mac = &tech.macros[design.cell_macros[c].0 as usize];
+            design.pin_macro_pins[p]
+                .map(|mp| {
+                    tech.macro_pins[mp.0 as usize]
+                        .rects
+                        .iter()
+                        .map(|&(l, r)| {
+                            (
+                                l,
+                                place_rect(
+                                    r,
+                                    mac.width_dbu,
+                                    mac.height_dbu,
+                                    design.cell_orient[c],
+                                    design.cell_x_dbu[c],
+                                    design.cell_y_dbu[c],
+                                ),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// `Pin::determineEdge`: every box votes for its nearest die edge; ties go
+/// to the first of N, S, E, W like `std::max` on the initializer list.
+fn pin_edge(rects: &[(LayerId, RectDbu)], die: &RectDbu) -> PinEdge {
+    let mut votes = [0; 4];
+    for (_, r) in rects {
+        let d = [
+            die.yh - r.yh,
+            r.yl - die.yl,
+            die.xh - r.xh,
+            r.xl - die.xl,
+        ];
+        let m = d.iter().min().copied().unwrap();
+        let idx = if d[0] == m {
+            0
+        } else if d[1] == m {
+            1
+        } else if d[2] == m {
+            2
+        } else {
+            3
+        };
+        votes[idx] += 1;
+    }
+    match votes.iter().position(|&v| v == *votes.iter().max().unwrap_or(&0)) {
+        Some(0) if votes[0] > 0 => PinEdge::North,
+        Some(1) => PinEdge::South,
+        Some(2) => PinEdge::East,
+        Some(3) => PinEdge::West,
+        _ => PinEdge::None,
+    }
+}
+
+/// `Pin::connection_layer`: regular pins use their highest routing layer;
+/// edge pins prefer the highest layer whose direction matches the edge.
+fn pin_conn_layer(rects: &[(LayerId, RectDbu)], edge: PinEdge, tech: &TechDb) -> Option<LayerId> {
+    let top = || rects.iter().map(|&(l, _)| l).max_by_key(|l| l.0);
+    if edge == PinEdge::None {
+        return top();
+    }
+    let dir = match edge {
+        PinEdge::North | PinEdge::South => LayerDir::Vertical,
+        _ => LayerDir::Horizontal,
+    };
+    rects
+        .iter()
+        .filter(|&&(l, _)| tech.routing_layers[l.0 as usize].dir == dir)
+        .map(|&(l, _)| l)
+        .max_by_key(|l| l.0)
+        .or_else(top)
+}
+
+/// `Grid::getPositionOnGrid`: the covered GCell's center.
+fn on_grid_center(grid: &GCellGrid, x: i32, y: i32) -> (i32, i32) {
+    (
+        grid.origin_x_dbu + grid.gcell_x(x) as i32 * grid.gcell_w_dbu + grid.gcell_w_dbu / 2,
+        grid.origin_y_dbu + grid.gcell_y(y) as i32 * grid.gcell_h_dbu + grid.gcell_h_dbu / 2,
+    )
+}
+
+/// `pinOverlapsWithSingleTrack`: a pin spanning at most three pitches of
+/// its connection layer snaps its on-grid position onto the single
+/// covered track. Returns the track-snapped position, if the rule fires.
+fn single_track_snap(
+    conn_rects: &[RectDbu],
+    dir: LayerDir,
+    track_loc: i32,
+    track_pitch: i32,
+    pos_on_grid: (i32, i32),
+) -> Option<(i32, i32)> {
+    if track_pitch <= 0 {
+        return None;
+    }
+    let (min, max) = if dir == LayerDir::Horizontal {
+        (
+            conn_rects.iter().map(|r| r.yl).min()?,
+            conn_rects.iter().map(|r| r.yh).max()?,
+        )
+    } else {
+        (
+            conn_rects.iter().map(|r| r.xl).min()?,
+            conn_rects.iter().map(|r| r.xh).max()?,
+        )
+    };
+    if (max - min) as f32 / track_pitch as f32 > 3.0 {
+        return None;
+    }
+    let track = |back: i32| {
+        ((max - track_loc) as f32 / track_pitch as f32 - back as f32).floor() as i32 * track_pitch
+            + track_loc
+    };
+    let (t1, t2) = (track(0), track(1));
+    let inside = |t: i32| t >= min && t <= max;
+    if inside(t1) && inside(t2) {
+        return None;
+    }
+    let strict = |t: i32| t > min && t < max;
+    let t = if strict(t1) {
+        Some(t1)
+    } else if strict(t2) {
+        Some(t2)
+    } else {
+        None
+    }?;
+    Some(if dir == LayerDir::Horizontal {
+        (pos_on_grid.0, t)
+    } else {
+        (t, pos_on_grid.1)
+    })
+}
+
+/// `findOnGridPositions` + `computePinPositionOnGrid` without access
+/// points: each connection-layer box middle votes for its GCell center
+/// (first box wins ties); pad/macro edge pins would snap to the instance
+/// edge on oversized boxes but are not modeled (test designs have none).
+/// A single-track pin re-snaps onto the covered track along the layer's
+/// preferred direction.
+fn pin_attach(design: &DesignDb, tech: &TechDb, grid: &GCellGrid, pin: PinId, met1: LayerId) -> PinAttach {
+    let p = pin.0 as usize;
+    let rects = pin_rects_dbu(design, tech, pin);
+    let (px, py) = rects
+        .last()
+        .map(|&(_, r)| (r.xl, r.yl))
+        .unwrap_or_else(|| design.pin_pos_dbu(pin, tech));
+    let edge = if design.pin_cells[p].is_none() {
+        pin_edge(&rects, &design.die_area)
+    } else {
+        PinEdge::None
+    };
+    let conn = pin_conn_layer(&rects, edge, tech)
+        .or_else(|| {
+            design.pin_io_layer[p].or_else(|| {
+                design.pin_macro_pins[p].and_then(|mp| tech.macro_pins[mp.0 as usize].layer)
+            })
+        })
+        .unwrap_or(met1);
+    let conn_rects: Vec<RectDbu> = rects
+        .iter()
+        .filter(|&&(l, _)| l == conn)
+        .map(|&(_, r)| r)
+        .collect();
+    let tile = grid.gcell_w_dbu.min(grid.gcell_h_dbu);
+    let mut votes: Vec<(i32, i32)> = Vec::with_capacity(conn_rects.len());
+    let mut pos_on_grid = on_grid_center(grid, px, py);
+    for r in &conn_rects {
+        let (mx, my) = ((r.xl + r.xh) / 2, (r.yl + r.yh) / 2);
+        // Edge pins with a box longer than a tile snap to the box side
+        // nearest the die edge before cell lookup.
+        let pos = match edge {
+            PinEdge::None => (mx, my),
+            _ if r.width().max(r.height()) >= tile => match edge {
+                PinEdge::North => (mx, r.yh),
+                PinEdge::South => (mx, r.yl),
+                PinEdge::East => (r.xh, my),
+                PinEdge::West => (r.xl, my),
+                PinEdge::None => unreachable!(),
+            },
+            _ => (mx, my),
+        };
+        pos_on_grid = on_grid_center(grid, pos.0, pos.1);
+        votes.push(pos_on_grid);
+    }
+    let mut grid_pt = votes.first().copied().unwrap_or(pos_on_grid);
+    let mut best = -1i32;
+    for &v in &votes {
+        let eq = votes.iter().filter(|&&q| q == v).count() as i32;
+        if eq > best {
+            grid_pt = v;
+            best = eq;
+        }
+    }
+    let dir = tech.routing_layers[conn.0 as usize].dir;
+    let track = design.tracks.iter().find(|tg| {
+        tg.is_vertical_tracks == (dir == LayerDir::Vertical) && tg.layers.contains(&conn)
+    });
+    if let Some(tg) = track
+        && let Some(tp) =
+            single_track_snap(&conn_rects, dir, tg.start_dbu, tg.step_dbu, pos_on_grid)
+    {
+        let snapped = on_grid_center(grid, tp.0, tp.1);
+        let moved = match dir {
+            LayerDir::Horizontal => snapped.1 != grid_pt.1,
+            LayerDir::Vertical => snapped.0 != grid_pt.0,
+        };
+        if snapped != grid_pt && moved {
+            grid_pt = snapped;
+        }
+    }
+    PinAttach {
+        px,
+        py,
+        gx: grid_pt.0,
+        gy: grid_pt.1,
+        conn,
+    }
+}
+
+/// Nearest route node to `(px, py)` by Manhattan distance, optionally
+/// restricted to the driver's reachable component.
+fn nearest_route_node(
+    g: &RouteGraph,
+    route_nodes: usize,
+    reached: Option<&[bool]>,
+    px: i32,
+    py: i32,
+) -> usize {
+    (0..route_nodes)
+        .filter(|&v| reached.is_none_or(|r| r[v]))
+        .min_by_key(|&v| {
+            let (nx, ny) = g.pt[v];
+            (nx - px).abs() + (ny - py).abs()
+        })
+        .expect("route nodes exist")
+}
+
+/// Builds one `NetRcTree` per net from route-guide boxes — the E4.4
+/// estimator (`estimate_parasitics -global_routing` analogue). `None` for
+/// nets without a driver, with < 2 pins, or whose boxes emit no route
+/// nodes; semantics in `docs/e4-guides.md` §10. `grid` maps box rects
+/// back to covered GCells — `GCellGrid::build` for parsed guides,
+/// `routed.grid` when the caller routed internally. `net_boxes` carries
+/// only nets that have boxes; the result indexes all `num_nets()`.
+pub fn estimate_guide_parasitics(
+    design: &DesignDb,
+    tech: &TechDb,
+    grid: &GCellGrid,
+    net_boxes: &[(NetId, Vec<GuideBox>)],
+) -> NetParasitics {
+    let dbu = tech.dbu_per_micron as f32;
+    let layer_rc: Vec<WireRc> = tech
+        .routing_layers
+        .iter()
+        .map(|l| {
+            let width_um = l.width_dbu as f32 / dbu;
+            WireRc {
+                r_kohm_per_um: l.res_per_sq / width_um / 1000.0,
+                c_pf_per_um: l.cap_per_sq_um * width_um + 2.0 * l.edge_cap_per_um,
+            }
+        })
+        .collect();
+    let via_kohm: Vec<f32> = tech
+        .via_res_ohm_above
+        .iter()
+        .map(|r| r / 1000.0)
+        .collect();
+
+    let mut nets = vec![None; design.num_nets()];
+    for (net, boxes) in net_boxes {
+        nets[net.0 as usize] = guide_net_tree(design, tech, grid, &layer_rc, &via_kohm, *net, boxes);
+    }
+    NetParasitics {
+        nets,
+        pd_check_failed_nets: 0,
+    }
+}
+
+fn guide_net_tree(
+    design: &DesignDb,
+    tech: &TechDb,
+    grid: &GCellGrid,
+    layer_rc: &[WireRc],
+    via_kohm: &[f32],
+    net: NetId,
+    boxes: &[GuideBox],
+) -> Option<NetRcTree> {
+    design.net_driver(net)?;
+    let pins = design.net_pins(net);
+    if pins.len() < 2 || grid.gcell_w_dbu <= 0 || grid.gcell_h_dbu <= 0 {
+        return None;
+    }
+    let dbu = tech.dbu_per_micron as f32;
+    let tw = grid.gcell_w_dbu;
+    let th = grid.gcell_h_dbu;
+
+    // boxToGlobalRouting: segment endpoints are tile centers computed
+    // 0-anchored (`tile*(xMin/tile) + tile/2`), the high end one cell in
+    // (`tile*(xMax/tile) - tile/2`); a box covering more than one cell in
+    // both dims emits nothing.
+    let mut segs: Vec<GSeg> = Vec::new();
+    for b in boxes {
+        let l = b.layer.0;
+        let mut x0 = tw * (b.rect.xl / tw) + tw / 2;
+        let mut y0 = th * (b.rect.yl / th) + th / 2;
+        let x1 = tw * (b.rect.xh / tw) - tw / 2;
+        let y1 = th * (b.rect.yh / th) - th / 2;
+        if x0 == x1 && y0 == y1 {
+            segs.push(GSeg { x0, y0, l0: l, x1, y1, l1: l });
+        }
+        while y0 == y1 && x0 + tw <= x1 {
+            segs.push(GSeg { x0, y0, l0: l, x1: x0 + tw, y1: y0, l1: l });
+            x0 += tw;
+        }
+        while x0 == x1 && y0 + th <= y1 {
+            segs.push(GSeg { x0, y0, l0: l, x1: x0, y1: y0 + th, l1: l });
+            y0 += th;
+        }
+    }
+
+    // updateVias: one forward pass over consecutive pairs; a zero-length
+    // segment adjacent to a wire one layer up becomes a via.
+    for i in 0..segs.len().saturating_sub(1) {
+        let (head, tail) = segs.split_at_mut(i + 1);
+        let s1 = &mut head[i];
+        let s2 = &mut tail[0];
+        if s1.is_via()
+            && s1.l0 + 1 == s2.l0
+            && (s1.init_pt() == s2.init_pt() || s1.init_pt() == s2.final_pt())
+        {
+            s1.l1 = s2.l0;
+        } else if s2.is_via()
+            && s2.l0 + 1 == s1.l0
+            && (s2.init_pt() == s1.init_pt() || s2.init_pt() == s1.final_pt())
+        {
+            s2.l0 = s1.l1;
+        }
+    }
+
+    // Graph nodes keyed by RoutePt (x, y, layer); pin leaves are extra nodes.
+    let mut g = RouteGraph::default();
+    for s in &segs {
+        let a = g.intern(s.x0, s.y0, s.l0);
+        let b = g.intern(s.x1, s.y1, s.l1);
+        if s.is_via() {
+            // Cut-layer resistance above the lower endpoint layer; a
+            // same-layer zero-length segment is a self-loop (R only).
+            let r = via_kohm
+                .get(s.l0.min(s.l1) as usize)
+                .copied()
+                .unwrap_or(0.0);
+            g.edge(a, b, r);
+        } else {
+            let len_um = (s.x0.abs_diff(s.x1) + s.y0.abs_diff(s.y1)) as f32 / dbu;
+            let rc = &layer_rc[s.l0 as usize];
+            let cap = rc.c_pf_per_um * len_um;
+            g.cap[a] += cap / 2.0;
+            g.cap[b] += cap / 2.0;
+            g.edge(a, b, rc.r_kohm_per_um * len_um);
+        }
+    }
+    if g.pt.is_empty() {
+        return None;
+    }
+    let route_nodes = g.pt.len();
+
+    // Pin attachment (makeParasiticsToPin): the node at the pin's on-grid
+    // position on conn+1 is preferred — the cut via is lumped into the edge
+    // R — then the node on conn. The pin wire runs the Manhattan distance
+    // pin position → grid point on the chosen layer.
+    let met1 = LayerId((tech.routing_layers.len() > 1) as u8);
+    let pin_locs: Vec<PinAttach> = pins
+        .iter()
+        .map(|&pin| pin_attach(design, tech, grid, pin, met1))
+        .collect();
+    // The driver's seed component is where the tree starts; pins whose
+    // lookup misses a node entirely fall back to its nearest node.
+    let seed = {
+        let loc = pin_locs[0];
+        pin_node_lookup(&g, layer_rc.len(), via_kohm, loc.gx, loc.gy, loc.conn)
+            .map(|(node, _, _)| node)
+            .unwrap_or_else(|| nearest_route_node(&g, route_nodes, None, loc.px, loc.py))
+    };
+    let mut reached = vec![false; route_nodes];
+    let mut stack = vec![seed];
+    reached[seed] = true;
+    while let Some(u) = stack.pop() {
+        for &(v, _) in &g.adj[u] {
+            if v < route_nodes && !reached[v] {
+                reached[v] = true;
+                stack.push(v);
+            }
+        }
+    }
+
+    let mut pin_leaf = Vec::with_capacity(pins.len());
+    for loc in &pin_locs {
+        let (px, py, gx, gy, conn) = (loc.px, loc.py, loc.gx, loc.gy, loc.conn);
+        let hit = pin_node_lookup(&g, layer_rc.len(), via_kohm, gx, gy, conn);
+        // The pin resistor always lands on the looked-up node — OpenROAD
+        // attaches it there even when that node sits on a disconnected
+        // stub island; the island links into the tree afterwards.
+        let (cap_node, wire_layer, via_r, edge_target) = match hit {
+            Some((node, layer, via)) => (node, layer, via, node),
+            None => {
+                let t = nearest_route_node(&g, route_nodes, Some(&reached), px, py);
+                (t, conn.0, 0.0, t)
+            }
+        };
+        let dist_um = ((px - gx).abs() + (py - gy).abs()) as f32 / dbu;
+        let rc = &layer_rc[wire_layer as usize];
+        // EST-0026 mirror: OpenROAD charges no pin wire when the pin cell
+        // carries no node on conn/conn+1 — the edge is topology only, so
+        // it adds no cap to the total.
+        let cap = if hit.is_some() {
+            rc.c_pf_per_um * dist_um
+        } else {
+            0.0
+        };
+        let leaf = g.intern_pos(px, py);
+        g.cap[leaf] += cap / 2.0;
+        g.cap[cap_node] += cap / 2.0;
+        g.edge(leaf, edge_target, rc.r_kohm_per_um * dist_um + via_r);
+        pin_leaf.push(leaf);
+    }
+
+    // BFS spanning tree from the driver pin leaf — the same shape the
+    // SPEF path builds. OpenROAD's segment graph can be genuinely
+    // disconnected (a stub box that never pairs into a via stays a
+    // self-loop island, and whole detour branches can detach; its SPEF
+    // writes those nodes anyway, which is what `*D_NET` parity is
+    // measured on). A `NetRcTree` must be a single tree, so each
+    // remaining component links in through a stub-resistor edge
+    // (`SPEF_STUB_RES_KOHM`, electrically transparent) to the nearest
+    // node already in the tree — preserving every node's cap through
+    // `write_spef` without changing delays.
+    let root = pin_leaf[0];
+    let mut tree_of = vec![u32::MAX; g.pt.len()];
+    let mut order = vec![root];
+    tree_of[root] = 0;
+    let mut parent = vec![0u32];
+    let mut edge_r = vec![0.0f32];
+    let mut wire_cap = vec![g.cap[root]];
+    let mut head = 0;
+    while order.len() < g.pt.len() {
+        while head < order.len() {
+            let u = order[head];
+            let u_node = head;
+            head += 1;
+            for &(v, r) in &g.adj[u] {
+                if tree_of[v] != u32::MAX {
+                    continue;
+                }
+                tree_of[v] = order.len() as u32;
+                order.push(v);
+                parent.push(u_node as u32);
+                edge_r.push(r);
+                wire_cap.push(g.cap[v]);
+            }
+        }
+        if order.len() == g.pt.len() {
+            break;
+        }
+        let v = (0..g.pt.len())
+            .find(|&v| tree_of[v] == u32::MAX)
+            .expect("fewer nodes than order length");
+        let (px, py) = g.pt[v];
+        let &u = order
+            .iter()
+            .min_by_key(|&&w| {
+                let (nx, ny) = g.pt[w];
+                (nx - px).abs() + (ny - py).abs()
+            })
+            .expect("non-empty tree");
+        tree_of[v] = order.len() as u32;
+        order.push(v);
+        parent.push(tree_of[u]);
+        edge_r.push(SPEF_STUB_RES_KOHM);
+        wire_cap.push(g.cap[v]);
+    }
+    let mut pin_node = Vec::with_capacity(pins.len());
+    for (i, &leaf) in pin_leaf.iter().enumerate() {
+        assert!(
+            tree_of[leaf] != u32::MAX,
+            "guide net {}: pin {i} is not connected to the driver",
+            design.strings.resolve(design.net_names[net.0 as usize]),
+        );
+        pin_node.push(tree_of[leaf]);
+    }
+    Some(NetRcTree {
+        parent,
+        edge_r_kohm: edge_r,
+        wire_cap_pf: wire_cap,
+        pin_node,
+        total_wire_cap_pf: g.cap.iter().sum(),
     })
 }
 
@@ -1122,6 +1762,529 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ---- E4.4 guide-parasitics fixtures ----
+
+    use crate::congestion::guide::{parse_guides, resolve_guide_nets};
+    use crate::design_db::PlacementStatus;
+    use crate::interner::{CellId, LibPinId, MacroId, MacroPinId};
+    use crate::tech_db::{MacroClass, MacroDef, MacroPin, RoutingLayer};
+
+    /// Three routing layers on a 100-DBU GCell grid (dbu 1000): li1 is
+    /// vertical, met1 horizontal, met2 vertical. Via resistance above
+    /// li1 is 9.3 ohm (mcon), above met1 4.5 ohm (via1). Unit RC uses
+    /// round numbers so hand-computed expectations stay readable.
+    fn guide_tech() -> TechDb {
+        let mut t = TechDb {
+            dbu_per_micron: 1000,
+            ..Default::default()
+        };
+        for (name, dir, res) in [
+            ("li1", LayerDir::Vertical, 1.0f32),
+            ("met1", LayerDir::Horizontal, 0.5),
+            ("met2", LayerDir::Vertical, 0.25),
+        ] {
+            let sym = t.strings.intern(name);
+            t.routing_layers.push(RoutingLayer {
+                name: sym,
+                dir,
+                pitch_dbu: 100,
+                width_dbu: 100,
+                offset_dbu: 0,
+                res_per_sq: res,
+                cap_per_sq_um: 0.001,
+                edge_cap_per_um: 5e-5,
+            });
+        }
+        t.via_res_ohm_above = vec![9.3, 4.5, 0.0];
+        let mac_sym = t.strings.intern("cell");
+        t.macros.push(MacroDef {
+            name: mac_sym,
+            class: MacroClass::Core,
+            width_dbu: 60,
+            height_dbu: 40,
+            pin_offset: 0,
+            pin_count: 2,
+            obs_rects: Vec::new(),
+            pin_obs_rects: Vec::new(),
+        });
+        // Pin A is an li1 box (10,10,20,20), pin B (30,10,40,20), in
+        // macro coords; `pt` is each box's lower-left corner.
+        for (pname, xl) in [("A", 10), ("B", 30)] {
+            let sym = t.strings.intern(pname);
+            t.macro_pins.push(MacroPin {
+                name: sym,
+                dir: PinDir::Input,
+                is_power: false,
+                offset_x_dbu: xl + 5,
+                offset_y_dbu: 15,
+                offset_x_frac: false,
+                offset_y_frac: false,
+                layer: Some(LayerId(0)),
+                rects: vec![(LayerId(0), RectDbu::new(xl, 10, xl + 10, 20))],
+            });
+        }
+        t.rebuild_maps();
+        t
+    }
+
+    /// Five cells of `guide_tech`'s macro on a 400x300 die (4x3 tiles of
+    /// 100 DBU): c0@(0,0), c1@(200,0), c2@(0,200), c3@(100,100),
+    /// c4@(300,200), each with pins A (PinId 2c) and B (PinId 2c+1).
+    /// Nets: n0 = c0:A -> c1:B (straight run), n1 = c0:B -> c2:B
+    /// (vertical run), n2 = c3:A -> c3:B (same GCell), n3 = c4:A (one
+    /// pin), n4 = c1:A -> c4:B.
+    fn guide_design() -> (DesignDb, GCellGrid) {
+        let mut d = DesignDb {
+            die_area: RectDbu::new(0, 0, 400, 300),
+            ..Default::default()
+        };
+        let net_syms: Vec<_> = ["n0", "n1", "n2", "n3", "n4"]
+            .iter()
+            .map(|s| d.strings.intern(s))
+            .collect();
+        d.net_names = net_syms;
+        d.net_pin_offsets = vec![0, 2, 4, 6, 7, 9];
+        // pin ids: A of cell c = 2c, B = 2c+1.
+        d.net_pin_ids = vec![
+            PinId(0),
+            PinId(3), // n0: c0:A -> c1:B
+            PinId(1),
+            PinId(5), // n1: c0:B -> c2:B
+            PinId(6),
+            PinId(7), // n2: c3:A -> c3:B
+            PinId(8), // n3: c4:A alone
+            PinId(2),
+            PinId(9), // n4: c1:A -> c4:B
+        ];
+        for (i, (cx, cy)) in [(0, 0), (200, 0), (0, 200), (100, 100), (300, 200)]
+            .iter()
+            .enumerate()
+        {
+            let sym = d.strings.intern(&format!("c{i}"));
+            d.cell_names.push(sym);
+            d.cell_macros.push(MacroId(0));
+            d.cell_lib_ids.push(None);
+            d.cell_status.push(PlacementStatus::Placed);
+            d.cell_orient.push(Orient::N);
+            d.cell_x_dbu.push(*cx);
+            d.cell_y_dbu.push(*cy);
+            d.cell_pin_offsets.push((2 * i) as u32);
+            d.cell_pin_ids.push(PinId((2 * i) as u32));
+            d.cell_pin_ids.push(PinId((2 * i + 1) as u32));
+        }
+        d.cell_pin_offsets.push(10);
+        for i in 0..10 {
+            let pname = if i % 2 == 0 { "A" } else { "B" };
+            let sym = d.strings.intern(pname);
+            d.pin_names.push(sym);
+            d.pin_dirs.push(PinDir::Input);
+            d.pin_lib_pins.push(None::<LibPinId>);
+            d.pin_cells.push(Some(CellId((i / 2) as u32)));
+            d.pin_macro_pins.push(Some(MacroPinId((i % 2) as u32)));
+            d.pin_offset_x_dbu.push(if i % 2 == 0 { 15 } else { 35 });
+            d.pin_offset_y_dbu.push(15);
+            d.pin_io_layer.push(None);
+            d.pin_io_rects.push(Vec::new());
+        }
+        // net -> pins: n0 [0,3], n1 [1,5], n2 [6,7], n3 [8], n4 [2,9].
+        let net_of = [0usize, 1, 4, 0, 99, 1, 2, 2, 3, 4];
+        d.pin_nets = net_of
+            .iter()
+            .map(|&n| (n != 99).then_some(NetId(n as u32)))
+            .collect();
+        // drivers: first pin of each net.
+        d.pin_is_driver = vec![true, true, true, false, false, false, true, false, true, false];
+        d.io_pins = Vec::new();
+        let grid = GCellGrid {
+            origin_x_dbu: 0,
+            origin_y_dbu: 0,
+            gcell_w_dbu: 100,
+            gcell_h_dbu: 100,
+            nx: 4,
+            ny: 3,
+            h_cap: vec![0.0; 9],
+            h_raw_cap: vec![0.0; 9],
+            h_demand: vec![0.0; 9],
+            v_cap: vec![0.0; 8],
+            v_raw_cap: vec![0.0; 8],
+            v_demand: vec![0.0; 8],
+            layer_raw_edge_tracks: Vec::new(),
+            layer_orig_edge_tracks: Vec::new(),
+            layer_derated_edge_tracks: Vec::new(),
+        };
+        (d, grid)
+    }
+
+    fn guide_box(layer: u8, xl: i32, yl: i32, xh: i32, yh: i32) -> GuideBox {
+        GuideBox {
+            layer: LayerId(layer),
+            rect: RectDbu::new(xl, yl, xh, yh),
+        }
+    }
+
+    fn sorted_edge_r(tree: &NetRcTree) -> Vec<f32> {
+        let mut rs: Vec<f32> = tree.edge_r_kohm[1..].to_vec();
+        rs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        rs
+    }
+
+    /// A straight 3-cell strip on met1 between two li1 stubs: pins attach
+    /// through the cut via (9.3 ohm) plus a met1 pin wire from `pt` to the
+    /// tile-center grid point.
+    #[test]
+    fn test_guide_straight_strip_rc() {
+        let (design, grid) = guide_design();
+        let tech = guide_tech();
+        let boxes = vec![(
+            NetId(0),
+            vec![
+                guide_box(0, 0, 0, 100, 100),   // li1 stub at (50,50)
+                guide_box(1, 0, 0, 300, 100),   // met1 wire (50,50)-(250,50)
+                guide_box(0, 200, 0, 300, 100), // li1 stub at (250,50)
+            ],
+        )];
+        let p = estimate_guide_parasitics(&design, &tech, &grid, &boxes);
+        let tree = p.net(NetId(0)).expect("n0 tree");
+        // 5 route nodes + 2 pin leaves; a stub pairs into the wire as a via.
+        assert_eq!(tree.parent.len(), 7);
+        assert_eq!(tree.pin_node.len(), 2);
+        // met1: r = 0.5/0.1/1000 = 0.005 kohm/um; li1 stub->met1 via 9.3 ohm.
+        // Pin wires ride conn+1 = met1: c0:A pt (10,10) is 0.08 um from
+        // (50,50); c1:B pt (230,10) is 0.06 um from (250,50).
+        let expect = [0.0005f32, 0.0005, 0.0093, 0.0093, 0.0096, 0.0097];
+        for (r, e) in sorted_edge_r(tree).iter().zip(expect) {
+            assert!((r - e).abs() < 1e-6, "edge R {r} != {e}");
+        }
+        // c/um = 0.001*0.1 + 2*5e-5 = 2e-4 pF/um: met1 wire 2*0.1 um and
+        // pin wires 0.08+0.06 um -> 4e-5 + 2.8e-5 = 6.8e-5 pF total.
+        assert!(
+            (tree.total_wire_cap_pf - 6.8e-5).abs() < 1e-9,
+            "total cap {}",
+            tree.total_wire_cap_pf
+        );
+    }
+
+    /// A met2 vertical run between met1 stubs: the layer-pair links are
+    /// via1 resistors (4.5 ohm), and a trailing li1 stub that pairs with
+    /// nothing stays a self-loop island — it must not break the tree.
+    #[test]
+    fn test_guide_via_transition() {
+        let (design, grid) = guide_design();
+        let tech = guide_tech();
+        let boxes = vec![(
+            NetId(1),
+            vec![
+                guide_box(0, 0, 0, 100, 100),   // li1 stub (50,50)
+                guide_box(1, 0, 0, 100, 100),   // met1 stub (50,50)
+                guide_box(2, 0, 0, 100, 300),   // met2 wire (50,50)-(50,250)
+                guide_box(1, 0, 200, 100, 300), // met1 stub (50,250)
+                guide_box(0, 0, 200, 100, 300), // li1 stub (50,250) -> island
+            ],
+        )];
+        let p = estimate_guide_parasitics(&design, &tech, &grid, &boxes);
+        let tree = p.net(NetId(1)).expect("n1 tree");
+        // 7 route nodes (li1(50,50), m1(50,50), m2(50,50), m2(50,150),
+        // m2(50,250), m1(50,250), li1(50,250)) + 2 pin leaves; the
+        // disconnected li1(50,250) island links in through a 1e-6 kohm
+        // stub edge.
+        assert_eq!(tree.parent.len(), 9);
+        let rs = sorted_edge_r(tree);
+        // met2: r = 0.25/0.1/1000 = 0.0025 kohm/um; 2 x 0.1 um links.
+        // Vias: li1->m1 at (50,50) 9.3 ohm; m1->m2 twice at 4.5 ohm.
+        // Pin wires on met1: c0:B pt (30,10) -> 0.06 um; c2:B pt (30,210)
+        // -> 0.06 um, each plus the 9.3 ohm cut.
+        let expect = [1e-6f32, 0.00025, 0.00025, 0.0045, 0.0045, 0.0093, 0.0096, 0.0096];
+        assert_eq!(rs.len(), expect.len());
+        for (r, e) in rs.iter().zip(expect) {
+            assert!((r - e).abs() < 1e-6, "edge R {r} != {e} (all: {rs:?})");
+        }
+        // met2 wire 0.2 um + met1 pin wires 0.12 um -> 4e-5 + 2.4e-5.
+        assert!(
+            (tree.total_wire_cap_pf - 6.4e-5).abs() < 1e-9,
+            "total cap {}",
+            tree.total_wire_cap_pf
+        );
+    }
+
+    /// Both pins in one GCell: stub boxes only, no route — the tree must
+    /// still connect driver and sink (through the met1 stub node).
+    #[test]
+    fn test_guide_pin_pair_one_gcell() {
+        let (design, grid) = guide_design();
+        let tech = guide_tech();
+        let boxes = vec![(
+            NetId(2),
+            vec![
+                guide_box(0, 100, 100, 200, 200), // li1 stub (150,150)
+                guide_box(1, 100, 100, 200, 200), // met1 stub (150,150)
+            ],
+        )];
+        let p = estimate_guide_parasitics(&design, &tech, &grid, &boxes);
+        let tree = p.net(NetId(2)).expect("n2 tree");
+        // 2 route nodes + 2 pin leaves; distinct pin leaves even though
+        // both attach to the same met1 node.
+        assert_eq!(tree.parent.len(), 4);
+        assert_ne!(tree.pin_node[0], tree.pin_node[1]);
+        // c3:A pt (110,110) -> 0.08 um; c3:B pt (130,110) -> 0.06 um.
+        let expect = [0.0093f32, 0.0096, 0.0097];
+        for (r, e) in sorted_edge_r(tree).iter().zip(expect) {
+            assert!((r - e).abs() < 1e-6, "edge R {r} != {e}");
+        }
+        assert!(
+            (tree.total_wire_cap_pf - 2.8e-5).abs() < 1e-9,
+            "total cap {}",
+            tree.total_wire_cap_pf
+        );
+    }
+
+    /// Usable-net filter: < 2 pins, no boxes, or boxes that emit no route
+    /// nodes (a 2D blob) all yield `None`.
+    #[test]
+    fn test_guide_skips() {
+        let (design, grid) = guide_design();
+        let tech = guide_tech();
+        let boxes = vec![
+            (NetId(3), vec![guide_box(1, 300, 200, 400, 300)]),
+            (NetId(4), vec![]),
+        ];
+        let p = estimate_guide_parasitics(&design, &tech, &grid, &boxes);
+        assert!(p.net(NetId(3)).is_none(), "1-pin net must be skipped");
+        assert!(p.net(NetId(4)).is_none(), "no boxes must be skipped");
+        let blob = vec![(NetId(4), vec![guide_box(1, 0, 0, 200, 200)])];
+        let p = estimate_guide_parasitics(&design, &tech, &grid, &blob);
+        assert!(
+            p.net(NetId(4)).is_none(),
+            "a box covering >1 cell in both dims emits no route nodes"
+        );
+    }
+
+    /// `resolve_guide_nets` maps raw DEF spellings (including escapes)
+    /// and bare names; an unknown guide net is a hard error.
+    #[test]
+    fn test_resolve_guide_nets() {
+        let (mut design, _) = guide_design();
+        let esc = design.strings.intern("net\\[0\\]");
+        // n1 is spelled `net\[0\]` in the DEF; the rest keep their names.
+        design.net_def_spellings = vec![
+            design.net_names[0],
+            esc,
+            design.net_names[2],
+            design.net_names[3],
+            design.net_names[4],
+        ];
+        let tech = guide_tech();
+        let parsed = parse_guides("n0\n(\n0 0 100 100 met1\n)\n", &tech).unwrap();
+        let resolved = resolve_guide_nets(&design, &parsed).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, NetId(0));
+        let parsed = parse_guides("net\\[0\\]\n(\n0 0 100 100 met1\n)\n", &tech).unwrap();
+        // `net\[0\]` is n1's DEF spelling in the fixture.
+        let resolved = resolve_guide_nets(&design, &parsed).unwrap();
+        assert_eq!(resolved[0].0, NetId(1));
+        let parsed = parse_guides("ghost\n(\n0 0 100 100 met1\n)\n", &tech).unwrap();
+        assert!(
+            resolve_guide_nets(&design, &parsed).is_err(),
+            "unknown guide net must error, not skip"
+        );
+    }
+
+    /// Guide-parasitics SPEF round-trip: `write_spef` on the guide model
+    /// must re-read through `parse_spef`/`spef_parasitics` into the same
+    /// per-net totals and pin coverage — the `sta --spef` consumer path.
+    #[test]
+    fn test_guide_parasitics_spef_round_trip() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("gcd");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design = parse_def(
+            &dir.join("gcd.placed.def"),
+            &tech,
+            Some(&lib),
+        )
+        .expect("DEF");
+        let grid = GCellGrid::build(&design, &tech, None, None);
+        let parsed =
+            parse_guides(&std::fs::read_to_string(dir.join("gcd.guide")).unwrap(), &tech).unwrap();
+        let net_boxes = resolve_guide_nets(&design, &parsed).unwrap();
+        let parasitics = estimate_guide_parasitics(&design, &tech, &grid, &net_boxes);
+        let text = write_spef(&design, &lib, &parasitics).expect("write_spef");
+        let spef = parse_spef(&text).expect("parse_spef");
+        let reparsed = spef_parasitics(&design, &spef).expect("spef_parasitics");
+
+        let (mut nets, mut worst_cap, mut worst_ns) = (0usize, 0.0f64, 0.0f64);
+        for n in 0..design.num_nets() {
+            let net = NetId(n as u32);
+            let (a, b) = (parasitics.net(net), reparsed.net(net));
+            assert_eq!(
+                a.is_some(),
+                b.is_some(),
+                "net {}: tree presence differs after SPEF round-trip",
+                design.strings.resolve(design.net_names[n])
+            );
+            let (Some(a), Some(b)) = (a, b) else { continue };
+            nets += 1;
+            worst_cap = worst_cap.max((a.total_wire_cap_pf - b.total_wire_cap_pf).abs() as f64);
+            let pins = design.net_pins(net);
+            let caps = vec![1.0f32; pins.len()];
+            for (&x, &y) in a.elmore_ns(&caps).iter().zip(&b.elmore_ns(&caps)) {
+                worst_ns = worst_ns.max((x as f64 - y as f64).abs());
+            }
+        }
+        println!(
+            "gcd guide SPEF round-trip: {nets} nets, worst cap diff {worst_cap:.3e} pF, \
+             worst Elmore diff {worst_ns:.3e} ns"
+        );
+        assert!(worst_cap < 1e-6, "cap drifted by {worst_cap} pF");
+        assert!(worst_ns < 1e-9, "Elmore drifted by {worst_ns} ns");
+    }
+
+    /// Direction (a) gate: our guide-RC model on OpenROAD's committed
+    /// guide must reproduce `estimate_parasitics -global_routing`'s
+    /// per-net `*D_NET` totals within `max(5%, 1 fF)`. Names normalize by
+    /// stripping backslashes — the caps file keeps the raw DEF spelling
+    /// and both files escape bus brackets differently.
+    fn guide_caps_match(design_name: &str) {
+        let lib_dir = sky130_hd();
+        let dir = design_dir(design_name);
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design = parse_def(
+            &crate::test_support::require(dir.join(format!("{design_name}.placed.def"))),
+            &tech,
+            Some(&lib),
+        )
+        .expect("DEF");
+        let grid = GCellGrid::build(&design, &tech, None, None);
+        let guide_text = std::fs::read_to_string(crate::test_support::require(
+            dir.join(format!("{design_name}.guide")),
+        ))
+        .unwrap();
+        let parsed = parse_guides(&guide_text, &tech).unwrap();
+        let net_boxes = resolve_guide_nets(&design, &parsed).unwrap();
+        let parasitics = estimate_guide_parasitics(&design, &tech, &grid, &net_boxes);
+        // our name -> cap, names unescaped like the caps-file join key.
+        let mut ours: BTreeMap<String, f32> = BTreeMap::new();
+        for n in 0..design.num_nets() {
+            let net = NetId(n as u32);
+            if let Some(t) = parasitics.net(net) {
+                let name = crate::congestion::guide::guide_net_name(&design, net)
+                    .replace('\\', "");
+                ours.insert(name, t.total_wire_cap_pf);
+            }
+        }
+        let caps_text = std::fs::read_to_string(crate::test_support::require(
+            dir.join(format!("{design_name}.guide.caps.txt")),
+        ))
+        .unwrap();
+        let mut refs: BTreeMap<String, f64> = BTreeMap::new();
+        for line in caps_text.lines() {
+            let (name, cap) = line.split_once('\t').expect("caps line");
+            refs.insert(name.replace('\\', ""), cap.parse().unwrap());
+        }
+
+        let (mut compared, mut inside, mut missing) = (0usize, 0usize, 0usize);
+        let (mut sum_ours, mut sum_ref) = (0.0f64, 0.0f64);
+        let mut rels: Vec<f64> = Vec::new();
+        let mut worst: Vec<(String, f64, f64, f64)> = Vec::new();
+        for (name, &ref_cap) in &refs {
+            compared += 1;
+            let Some(&our_cap) = ours.get(name) else {
+                missing += 1;
+                worst.push((name.clone(), f64::INFINITY, ref_cap, 0.0));
+                continue;
+            };
+            sum_ours += our_cap as f64;
+            sum_ref += ref_cap;
+            let diff = (our_cap as f64 - ref_cap).abs();
+            let rel = diff / ref_cap;
+            rels.push(rel);
+            if diff <= (0.05 * ref_cap).max(1e-3) {
+                inside += 1;
+            }
+            worst.push((name.clone(), rel, ref_cap, our_cap as f64));
+        }
+        rels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        worst.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let n = rels.len();
+        let (med, p90) = (rels[n / 2], rels[(0.9 * (n - 1) as f64) as usize]);
+        println!(
+            "{design_name}: {compared} reference nets, {missing} missing on our side, \
+             {inside}/{compared} within max(5%, 1 fF)\n  sum ours {sum_ours:.6} pF, \
+             sum ref {sum_ref:.6} pF, rel diff median {med:.2e} p90 {p90:.2e} max {:.2e}",
+            rels[n - 1]
+        );
+        println!("  worst 5:");
+        for (name, rel, rc, oc) in worst.iter().take(5) {
+            println!("    {name}: ours {oc:.6} ref {rc:.6} rel {rel:.2e}");
+        }
+        assert_eq!(missing, 0, "{design_name}: reference nets with no tree");
+        assert_eq!(
+            inside, compared,
+            "{design_name}: {} nets outside max(5%, 1 fF)",
+            compared - inside
+        );
+    }
+
+    #[test]
+    fn test_gcd_guide_parasitics_match_openroad() {
+        guide_caps_match("gcd");
+    }
+
+    #[test]
+    fn test_picorv32_guide_parasitics_match_openroad() {
+        guide_caps_match("picorv32");
+    }
+
+    /// The builder is deterministic: two runs produce bit-identical
+    /// per-net totals (ordering/HashMap nondeterminism guard).
+    #[test]
+    fn test_guide_parasitics_deterministic() {
+        let lib_dir = sky130_hd();
+        let dir = design_dir("gcd");
+        let lib =
+            load_liberty(&lib_dir.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib")).expect("Liberty");
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(
+            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
+            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
+            &mut interner,
+        )
+        .expect("LEF")
+        .0;
+        let design = parse_def(&dir.join("gcd.placed.def"), &tech, Some(&lib)).expect("DEF");
+        let grid = GCellGrid::build(&design, &tech, None, None);
+        let parsed =
+            parse_guides(&std::fs::read_to_string(dir.join("gcd.guide")).unwrap(), &tech).unwrap();
+        let net_boxes = resolve_guide_nets(&design, &parsed).unwrap();
+        let a = estimate_guide_parasitics(&design, &tech, &grid, &net_boxes);
+        let b = estimate_guide_parasitics(&design, &tech, &grid, &net_boxes);
+        for n in 0..design.num_nets() {
+            let net = NetId(n as u32);
+            assert_eq!(
+                a.net(net).map(|t| t.total_wire_cap_pf),
+                b.net(net).map(|t| t.total_wire_cap_pf),
+                "net {n} differs between runs"
+            );
         }
     }
 }

@@ -6512,3 +6512,152 @@ inside the pinned image; `cargo run -p grus-eda -- route` on both placed
 DEFs; `bash tests/designs/gcd/check_guide_readback.sh`; `cargo test -p
 grus-core guide::`; workspace `cargo test`, `clippy -D warnings`, and the
 release STA regression on the final tree.
+
+### 2026-11-22 — e4-guide-parasitics: guide-SPEF shape probe
+
+Probe per `kurena/tasks/e4-guide-parasitics/design/probe.md`, pinned image
+`ghcr.io/librelane/librelane:3.0.16` (OpenROAD rev dcf36133), Tcl under
+`tests/designs/gcd/runs/probes/` (gitignored): `read_liberty` + `read_lef`
+×2 + `read_def gcd.placed.def` + `read_sdc` + `set_wire_rc -layer met2`
+(and a `-layer met4` twin) + `read_guides gcd.guide` +
+`estimate_parasitics -global_routing -spef_file`, run once per layer
+variant.
+
+- **Q1**: nodes are synthetic `net:idx` per (x,y,layer) RoutePt at GCell
+  centers; pin nodes are `inst:pin` names. Box count ≠ node count — a
+  single-cell box is a zero-length via segment, a strip is center-to-center
+  links.
+- **Q2**: caps are per node, segment cap split half/half (pi); `*D_NET`
+  total = Σ*CAP + the pin-node halves (`*CAP` omits pin nodes — total =
+  wire + pin-wire cap).
+- **Q3**: wire length = GCell-center distance (`tile` per covered edge) —
+  verified: all wire resistors are exact multiples `R·pitch` (met2 wire
+  6900 DBU → 0.00616071 kΩ).
+- **Q4**: `set_wire_rc -layer` is ignored — met2 and met4 runs emit
+  byte-identical SPEFs; each box charges its own layer's LEF RC.
+- **Q5**: via = cut-layer resistance of the layer above
+  `min(init_layer, final_layer)`: mcon 9.30 Ω (li1↔met1), via1 4.50 Ω
+  (met1↔met2), via2/via3 3.41 Ω, via4 0.38 Ω — the `RESISTANCE` values on
+  the cut `LAYER` blocks in the techlef. A stub box not adjacent to an
+  `L+1` segment stays a same-layer zero-length segment → self-loop
+  resistor (e.g. `_000_:6 _000_:6 0.0093`).
+- **Q6**: pin attach — pin `pt` is the ll-corner of its last
+  routing-layer geometry box, `grid_pt` the GCell-center (clamped to the
+  grid). Node lookup prefers `(cell, conn+1)` and lumps the cut via into
+  `R = via + r·Manhattan(pt, grid_pt)`; else `(cell, conn)` without via.
+  Stub `li1` boxes carry cap only through their via conversion — a lone
+  stub self-loop adds R, no C.
+- **Q7** (`EST-0026`): warned pins still get `*CONN` entries but stay
+  dangling (no resistor, no cap) — measured on our e4-1 read-back SPEF.
+- **Q8** `_000_` decomposition (5 boxes: li1+met1 stubs at both ends,
+  met2 strip across two GCells): met2 wire 6.9 µm → 0.53744 fF; pin
+  `_289_:X` wire met1 3.655 µm → 0.30977 fF; pin `_411_:D` wire met1
+  1.225 µm → 0.10381 fF; total 0.9510 fF = the `*D_NET` 0.0009510 pF
+  exactly. Resistors: mcon 0.0093 + via1 0.0045 + wire 0.00616071 +
+  via1 0.0045 + li1 self-loop 0.0093; pin edges 0.0125634 = 9.3 + 3.2634
+  (`r_met1·3.655µm`) and 0.0103937 = 9.3 + 1.0937.
+- **Q9**: coverage is `xl/tile .. xh/tile − 1` — a box ending mid-cell
+  drops that cell (die-edge partial rows/cols are never covered; OpenROAD
+  clamps pins there to the last full tile), and a 2D box covering >1 cell
+  in both dims emits nothing (gcd has 2 such boxes).
+
+Resolved rule written to `docs/e4-guides.md` §10. Where SPEF arithmetic
+was ambiguous (pin `pt`, coverage edges), the pinned OpenROAD source
+(`est/MakeWireParasitics.cpp`, `grt/GlobalRouter.cpp` `boxToGlobalRouting`,
+`updateVias`, `mergeSegments`, `makeParasiticsToPin`, `Pin` constructors)
+was read to explain the measured values — not copied (AGENTS §3).
+
+### 2026-11-22 — e4-guide-parasitics: (a) gate + (b) read-back
+
+`estimate_guide_parasitics` implements the probed rule
+(`docs/e4-guides.md` §10): per-box `GSegment` conversion, `updateVias`
+stub pairing, `(x,y,layer)` RoutePt graph, per-layer LEF RC, pin attach
+with per-connection-layer-box-middle majority-vote `grid_pt`,
+single-track snap, `(grid_pt, conn+1)`→`(grid_pt, conn)` node lookup,
+and stub-edge linking for OpenROAD's genuinely disconnected island
+nodes. Pin geometry is per-rect (`MacroPin.rects`,
+`DesignDb.pin_io_rects`) so `pt`/`grid_pt`/`conn` match OpenROAD.
+
+**Direction (a) — our model on their guides (the gate).**
+`parse_guides` on the committed guide → `resolve_guide_nets` →
+`estimate_guide_parasitics`; per-net `total_wire_cap_pf` vs the
+`generate_ref.sh` step-5d `<d>.guide.caps.txt` goldens (`read_guides` +
+`estimate_parasitics -global_routing -spef_file` in the pinned image).
+Names join after stripping backslashes (SPEF names keep raw DEF
+spellings; OpenROAD escapes bus brackets differently).
+
+| design | nets | within max(5%,1fF) | median | p90 | max | Σ ours (pF) | Σ ref (pF) |
+|---|---|---|---|---|---|---|---|
+| gcd | 269 | **269/269 (100%)** | 7.1e-7 | 2.5e-6 | 4.5e-6 | 0.739681 | 0.739681 |
+| picorv32 | 6744 | **6744/6744 (100%)** | 8.6e-7 | 2.7e-6 | 1.1e-3 | 33.226101 | 33.226137 |
+
+Worst-5 picorv32 (all far inside the bound — max rel diff is 0.11%):
+`_02634_` 1.14e-3, `reg_pc[2]` 8.9e-4, `clk` 2.0e-5, `_02631_` 5.3e-6,
+`mem_addr[30]` 4.9e-6. gcd is exact at SPEF print precision (max rel
+diff 4.5e-6 = 6-significant-digit rounding). **Gate verdict: PASS.**
+
+Root-caused residuals during development (all fixed, recorded per
+§7.5): two systematic classes — (i) pin `grid_pt` was the cell
+containing `pt` instead of the per-box-middle majority vote, which on
+picorv32 `_02629_` moved 5 pins' attach points and on `_00007_` missed
+node lookups for 257 pins (~78 fF lost); (ii) island-cap loss — stub
+boxes that never pair into a via and detached detour branches form
+components the driver's BFS can't reach (gcd `_132_`: 108/118 route
+nodes unreached; `*D_NET` stayed exact but the emitted SPEF dropped
+0.031 pF) — fixed by attaching pin edges to the true looked-up node
+and linking each remaining component into the tree through a
+`1e-6` kΩ stub edge.
+
+**Direction (b) — their model on our guides (recorded, not gated).**
+`grus-eda route --guide-out runs/guide-check/<d>.ours.guide` →
+`check_guide_readback.sh` (both designs — the new picorv32 script
+mirrors gcd's) → `guide_caps.py diff` vs the (a) reference caps:
+
+| design | nets | within max(5%,1fF) | median | p90 | max | Σ ours (pF) | Σ ref (pF) |
+|---|---|---|---|---|---|---|---|
+| gcd | 269 | 264/269 (98.1%) | 0.00% | 0.30% | 87.0% | 0.721823 | 0.739681 |
+| picorv32 | 6744 | 6637/6744 (98.4%) | 0.00% | 0.00% | 130.8% | 32.396901 | 33.226137 |
+
+Worst-5: gcd `_155_` 9.1%, `_132_` 7.8%, `_126_` 5.5%,
+`dpath.a_lt_b$in1[2]` 19.3%, `clk` 4.9%; picorv32 `_02790_` 13.0%,
+`_00007_` 11.7%, `_00012_` 11.5%, `_00013_` 7.6%, `_00008_` 4.8%.
+Residual is guide topology, not parasitics: our guides carry ~6% fewer
+boxes than OpenROAD's (59494 vs 63427 on picorv32 — the e4-1 coverage
+gap), and `EST-0026` "Missing route to pin" warnings (gcd 11,
+picorv32 249) mark pins whose GCell our guide does not cover — those
+pins get no pin-wire resistor/cap in OpenROAD's model, the dominant
+per-net divergence. Both `read_guides` runs accepted our files;
+warnings counted, none fatal.
+
+**CLI record** (gcd, debug build):
+`sta --parasitics guide --guide gcd.guide --spef-out g.spef` →
+endpoints=53, wns=1.652927 ns, elapsed 41 ms; `sta --spef g.spef`
+re-reads it with identical wns (1.652927/0.490271 — round-trip exact);
+`sta --parasitics guide` (internal route, no `--guide`) → wns=1.623116,
+elapsed 37 ms. `power --parasitics guide` bails with
+"unsupported --parasitics Guide ..." as designed.
+`spef_parasitics` on OpenROAD's own `gcd.guide.spef` bails on
+`_057_`'s island pin — pre-existing reader strictness, recorded, not
+changed.
+
+**Fail-proof (§7.7)**: two mutations — (i) charging every pin an extra
+0.1 µm of layer-0 cap stayed **green** on both tests: a real finding —
+the `max(5%, 1 fF)` bound's 1 fF floor swallows per-pin stub-cap
+errors of that size (max added ≈ 0.07 fF/net); recorded rather than
+hidden. (ii) doubling wire-segment capacitance turned both gate tests
+**red** (269/269 → 0, 6744 → 0 inside the bound), then restored.
+
+**Runtime** (debug build, `GRUS_PHASE_TIMING`): gcd `sta.parasitics`
+is under the 41 ms total; picorv32 `sta.parasitics` = 253 ms of a
+606 ms `sta --parasitics guide --guide picorv32.guide` run
+(endpoints=1798, wns=-2.308059 ns).
+
+**What was run (§7.9)**: `generate_ref.sh` step 5d on both designs in
+the pinned image (the caps goldens — `git diff` empty on rerun);
+`guide_caps.py extract`/`diff` for both directions;
+`route --guide-out` + both `check_guide_readback.sh` in the pinned
+image; cargo tests `guide` (15 tests incl. both gates, SPEF
+round-trip, determinism, resolver, and the synthetic-fixture unit
+tests); `cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --release -p grus-core sta`.
+Direction (b) is recorded-not-gated per the design.

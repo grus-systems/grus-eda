@@ -2,7 +2,8 @@
 # Reproduction script for gcd reference artifacts in grus-eda.
 # Generates gcd.synth.v, gcd.synth.json, gcd.floorplan.def, gcd.placed.def,
 # gcd.routed.spef (placement estimate), gcd.routed.def, gcd.drc.rpt, gcd.rcx.spef (routed extraction),
-# gcd.guide (OpenROAD global_route -guide_file), gcd.orient.def, gcd.orient.pins.txt,
+# gcd.guide (OpenROAD global_route -guide_file), gcd.guide.spef + gcd.guide.caps.txt
+# (estimate_parasitics -global_routing on that guide), gcd.orient.def, gcd.orient.pins.txt,
 # gcd.reference.json, and gcd.sta.reference.json using LibreLane,
 # Yosys, OpenROAD, and OpenSTA inside the canonical container ghcr.io/librelane/librelane:3.0.16.
 
@@ -169,6 +170,25 @@ set_global_routing_layer_adjustment met2-met5 0.20
 global_route -guide_file /work/tests/designs/gcd/gcd.guide -congestion_iterations 100
 exit
 EOF
+
+# 5d. Guide-parasitics golden: read_guides on the committed gcd.guide, then
+#     estimate_parasitics -global_routing. The SPEF is committed evidence
+#     (and a ready --spef input); the caps table is the assertion input
+#     for the guide-parasitics tests.
+openroad -no_init -no_splash << 'EOF'
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+set_wire_rc -layer met2
+read_guides /work/tests/designs/gcd/gcd.guide
+estimate_parasitics -global_routing -spef_file /work/tests/designs/gcd/gcd.guide.spef
+exit
+EOF
+
+python3 /work/tests/designs/guide_caps.py extract \
+    "${SCRIPT_DIR}/gcd.guide.spef" "${SCRIPT_DIR}/gcd.guide.caps.txt"
 
 # The Tcl below is fed to openroad on stdin, where the interactive shell treats `!` as
 # history expansion. Write negations as `== 0`, never `![...]`.
