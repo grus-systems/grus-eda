@@ -30,6 +30,10 @@ tests/designs/picorv32/picorv32.cts.def
 tests/designs/picorv32/picorv32.cts.ours.def
 tests/designs/picorv32/picorv32.cts.ours.report.json
 
+# e6-drt-ref routed DEFs (regenerate via tests/designs/generate_drt_ref.sh)
+tests/designs/gcd/gcd.drt.*.def
+tests/designs/picorv32/picorv32.drt.*.def
+
 # aes generated artifacts over 1 MB (regenerate with tests/designs/aes/generate_ref.sh)
 tests/designs/aes/aes.synth.v
 tests/designs/aes/aes.synth.json

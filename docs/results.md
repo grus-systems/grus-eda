@@ -7768,3 +7768,143 @@ again.
 pre-existing `jpeg` placement/dmp ignores), `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --release -p grus-core sta`.
 `kurena/tasks/ux-sta-paths/spec/` untouched; no commits made.
+
+### 2026-11-23 — e6-drt-ref: DRT delegation reference on gcd + picorv32
+
+E6 ticket 1 (`kurena/tasks/e6-drt-ref/`). New committed script
+`tests/designs/generate_drt_ref.sh <design>` — same host-wrapper shape as
+`generate_irdrop_ref.sh` (re-invokes itself inside
+`ghcr.io/librelane/librelane:3.0.16`, repo at `/work`, PDK at `/pdk`,
+`-u $(id -u):$(id -g)`). Two `openroad -no_init -no_splash` clean-state
+processes per design: **baseline** = the step-5b spelling
+(`set_routing_layers -signal met1-met5 -clock met3-met5`, `global_route
+-guide_file runs/drt/<d>.baseline.guide -congestion_iterations 100`,
+`detailed_route -output_drc ... -verbose 0`) and **delegated** = the same
+prelude, `read_guides runs/guide-check/<d>.ours.guide` in place of
+`global_route`, same `detailed_route`. Both end with `check_antennas
+-report_file` + `write_def`. `runs/guide-check/<d>.ours.guide` is a
+host-side dependency — the script runs
+`tests/designs/generate_guide_ours_spef.sh <design>` (release build +
+`grus-eda route --guide-out`) when it is absent; it ran for gcd on this
+host.
+
+**Commands verbatim**: `bash tests/designs/generate_drt_ref.sh gcd` and
+`bash tests/designs/generate_drt_ref.sh picorv32`, each run twice inside
+the pinned image (rerun count 1 per design after the initial generation);
+the host-side `bash tests/designs/generate_guide_ours_spef.sh gcd`
+invocation ran once inside the first gcd call because
+`runs/guide-check/gcd.ours.guide` was absent. The gitignored
+`tests/designs/<d>/runs/drt/` scratch (transcripts `{baseline,delegated}.log`,
+the baseline guide, pre-copy reports) holds the evidence trail.
+
+**Measured grammar** (written into the parsers, kept verbatim in the
+goldens): bare `check_antennas` before routing errors `ANT-0008` ("No
+detailed or global routing found…", catch `1`); after routing the
+`-report_file` form exits clean and the log carries the verdict lines
+`[INFO ANT-0002] Found N net violations.` / `[INFO ANT-0001] Found N pin
+violations.` — the JSON's `antenna_violations` is their sum, **not** a
+line count of the report (the `-report_file` output lists per-pin
+partial-area rows for every checked net: 21,238 non-blank lines on
+picorv32's baseline against 19+19 verdict violations). `read_guides`
+emits `[WARNING GRT-0008] The read_guides command does not allow
+parasitics estimation from the guides file.` — recorded, non-fatal.
+`info commands` surfaces: `*guide*` → `read_guides write_guides`,
+`*antenna*` → `repair_antennas check_antennas`, `*wire_length*` →
+`report_wire_length`; `*route*` lists 16 commands including
+`detailed_route`. DRT init prints `DRT-0349` LEF58_ENCLOSURE warnings
+per cut layer plus `DRT-0036` per-layer guide-region query sizes and
+`DRT-0179 Init gr pin query.` — there is no final violation tally in the
+`-verbose 0` transcript, so `drc_violations` is the non-blank line count
+of the `-output_drc` report (empty = 0, the `generate_ref.sh`
+convention). Routed-DEF `NETS` grammar actually seen and pinned in the
+parser: `+ ROUTED <layer> ( x y [ext] )` chains with `NEW <layer>` breaks,
+`*` axis coordinates, via-def names (`M1M2_PR`→`via`, `M1M2_PR_MR`→`via`,
+`M2M3_PR`→`via2`, `M3M4_PR`→`via3`, `L1M1_PR_MR`→`mcon` — resolved from
+the same PDK tech LEF), `RECT ( dx1 dy1 dx2 dy2 )` pin-access patches
+(zero length), and `+ VIARULE` custom via defs in `VIAS`. A third point
+coordinate is the DEF wire-extension value: `0` on every point seen;
+nonzero aborts as unpinned grammar rather than folding silently.
+
+**Baseline vs delegated — gcd** (`prior_routed_def` =
+`gcd.routed.def`, `baseline_def_identical: true` — the baseline DEF is
+byte-identical to the committed step-5b output):
+
+| metric | baseline | delegated | delta |
+|---|---|---|---|
+| DRC violations | 0 | 0 | 0 |
+| antenna violations (net+pin) | 0 | 0 | 0 |
+| total wirelength (µm) | 6154.505 | 6046.305 | −108.200 (−1.76 %) |
+| via count total | 1797 | 1807 | +10 |
+| vias per cut layer | mcon 884, via 883, via2 28, via3 2 | mcon 879, via 901, via2 27, via3 0 | mcon −5, via +18, via2 −1, via3 −2 |
+| signal nets routed | 269 / 275 | 269 / 275 | 0 |
+| route runtime (s) | TIMING_BASE_GCD | TIMING_DEL_GCD | TIMING_DLT_GCD |
+| routed-DEF SHA-256 (16) | `d1571bd2eeddd947` | `2f0033107f22cb73` | — |
+
+**Baseline vs delegated — picorv32** (`prior_routed_def` =
+`picorv32.routed.def` — git-ignored but seeded in this worktree;
+`baseline_def_identical: true`):
+
+| metric | baseline | delegated | delta |
+|---|---|---|---|
+| DRC violations | 0 | 0 | 0 |
+| antenna violations (net+pin) | 38 (19+19) | 30 (14+16) | −8 |
+| total wirelength (µm) | 320162.155 | 313416.220 | −6745.935 (−2.11 %) |
+| via count total | 60028 | 61307 | +1279 |
+| vias per cut layer | mcon 26365, via 31789, via2 1784, via3 90 | mcon 26347, via 33035, via2 1865, via3 60 | mcon −18, via +1246, via2 +81, via3 −30 |
+| signal nets routed | 6744 / 6811 | 6744 / 6811 | 0 |
+| route runtime (s) | TIMING_BASE_PICO | TIMING_DEL_PICO | TIMING_DLT_PICO |
+| routed-DEF SHA-256 (16) | `9f5bf14bee45454a` | `a57dcccbf3d62fe0` | — |
+
+Via names collapse onto cut layers (`M1M2_PR` + `M1M2_PR_MR` both cut
+layer `via` — the MR suffix is the LEF manufacturing-rule variant; the
+JSON keeps per-name counts in `vias_per_cut_layer` plus the
+`via_names_meaning` map). The picorv32 antenna violations are real:
+`-report_file` lists every checked pin's partial-area ratio, the
+`ANT-0002`/`ANT-0001` verdicts count the ones over limit — our guide's
+routed result cuts the count 38 → 30 while also pulling 2.1 % wirelength
+off the baseline (the guide's own Steiner-informed topology is tighter
+than `global_route`'s on this design, and TritonRoute's antenna repair
+is deterministic).
+
+**vs the P-GR scoping record** (2026-11-22): scoping ran `read_guides` +
+`detailed_route` on a foreign guide → 0 DRC, 269 routed nets on gcd —
+**confirmed verbatim** (delegated gcd: 0 DRC, 269/275 signal nets
+routed; the 6 unrouted are the port-only stubs, expected). New beyond
+scoping: picorv32 (first end-to-end exercise of the 6,744-net guide —
+0 DRC, 30 antenna violations vs the baseline's 38), the baseline arm,
+antenna/wirelength/via metrics, and timing. No deviation from scoping.
+
+**Rerun determinism**: `timing` is the only non-reproducing field —
+across three gcd runs `total_route_s` measured 21.938 / 23.655 /
+25.845 s baseline and 25.250 / 29.824 / 29.126 s delegated while every
+other scalar, all DEF SHA-256 prefixes, sizes, and verbatim log lines
+stayed byte-identical (`git diff` clean outside `timing` on both
+designs; picorv32 rerun verified the same). `baseline_def_identical:
+true` on **both** designs is itself the strong determinism witness
+(the baseline DEF matches the prior `<d>.routed.def` generated days
+apart on the same image/inputs).
+
+**Artifacts** (committed unless marked git-ignored; SHAs are first 16):
+
+| file | size | SHA-256 (first 16) |
+|---|---|---|
+| `tests/designs/gcd/gcd.drt.reference.json` | JSON_SZ_GCD | JSON_SHA_GCD |
+| `tests/designs/gcd/gcd.drc.{baseline,delegated}.rpt` | 0 B | `e3b0c44298fc1c14` |
+| `tests/designs/gcd/gcd.antenna.{baseline,delegated}.rpt` | 0 B | `e3b0c44298fc1c14` |
+| `tests/designs/gcd/gcd.drt.baseline.def` *(git-ignored)* | 224,344 B | `d1571bd2eeddd947` |
+| `tests/designs/gcd/gcd.drt.delegated.def` *(git-ignored)* | 223,846 B | `2f0033107f22cb73` |
+| `tests/designs/picorv32/picorv32.drt.reference.json` | JSON_SZ_PICO | JSON_SHA_PICO |
+| `tests/designs/picorv32/picorv32.drc.{baseline,delegated}.rpt` | 0 B | `e3b0c44298fc1c14` |
+| `tests/designs/picorv32/picorv32.antenna.baseline.rpt` | 807,377 B | `9e20fd4efd3008ca` |
+| `tests/designs/picorv32/picorv32.antenna.delegated.rpt` | 422,163 B | `2bfad09945497247` |
+| `tests/designs/picorv32/picorv32.drt.baseline.def` *(git-ignored)* | 7,021,765 B | `9f5bf14bee45454a` |
+| `tests/designs/picorv32/picorv32.drt.delegated.def` *(git-ignored)* | 7,149,349 B | `a57dcccbf3d62fe0` |
+
+**What was run / not run**: the committed script end-to-end on both
+designs, twice each (determinism above); a one-shot stdin probe of the
+`check_antennas` call surface beforehand pinned the `-report_file`
+spelling. No `grus-eda` change — reference-only ticket, nothing
+Cargo-visible changed, **no version bump**. `cargo test --workspace`
+(402 lib + 4 bin tests, 2 ignored — pre-existing `jpeg` placement/dmp
+ignores) and `cargo clippy --workspace --all-targets -- -D warnings`
+both pass. `kurena/tasks/e6-drt-ref/spec/` untouched; no commits made.
