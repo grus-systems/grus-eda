@@ -7159,3 +7159,111 @@ ticket); no Cargo-visible change, so no version bump. Rust gates
 ran clean (`cargo test --workspace` 383 pass, `cargo clippy
 --workspace --all-targets -D warnings` 0 warnings) — trivially, as
 no Rust file changed.
+
+### 2026-11-22 — e5-insert-api: DesignDb netlist-mutation API (v0.4.0)
+
+E5 ticket 2 (`kurena/tasks/e5-insert-api/`): `DesignDb` was append-once
+at read time; this adds the mutation surface `e5-cts-tree` (and any
+future buffering/repair stage) builds on. All five methods live in
+`crates/grus-core/src/design_db.rs` under one `impl` block with rustdoc
+invariants I1–I6:
+
+- `insert_cell(name, macro, tech, lib) -> Result<CellId>`: appends one
+  cell row (`PlacementStatus::Unplaced`, `(0,0)`, `N`) plus one `PinId`
+  per macro pin — dirs/`pin_is_driver` from `TechDb`, `cell_lib_ids`/
+  `pin_lib_pins` resolved by name when `Some(&LibDb)` (the CTS STA pass
+  needs them). Duplicate cell names and bad `MacroId`s are refused.
+- `create_net(name) -> Result<NetId>`: appends an empty CSR segment;
+  keeps `net_def_spellings` either empty or full-length (I6).
+- `connect_pin(pin, net)` / `disconnect_pin(pin)`: infallible index
+  ops (panic on out-of-range IDs like the existing accessors).
+  `connect_pin` disconnects from the old net first, inserts drivers at
+  the destination segment start and sinks at its end, then shifts
+  every later `net_pin_offsets` entry — in-place `Vec::insert`/`remove`
+  per call, not a full CSR rebuild (recorded cost policy: O(net total
+  members) per op, fine at E5 scale). `disconnect_pin` re-normalizes a
+  shrunk segment the way the reader normalizes a parsed one: if the
+  first remaining member is not a driver but a later one is, it moves
+  to index 0.
+- `insert_buffer_on_net(net, buffer_macro, name, new_net_name) ->
+  Result<(CellId, NetId)>`: the CTS-shaped convenience — the original
+  driver stays on `net`, every original sink moves in order to the new
+  net, buffer `A` joins `net`, buffer `X` drives the new net, power
+  pins stay unconnected.
+
+**Invariants asserted** (`assert_db_invariants`, run after every
+mutation step in every test): I1 SoA/CSR lengths + monotone offsets,
+I2 `cell_pin_ids` partition + `pin_cells` both directions, I3
+`net_pin_ids` partition + `pin_nets` both directions, I4 driver-first
+(`seg[0]` is a driver whenever the segment has one), I5 `io_pins`
+sorted ⊆ `{pin_cells == None}` ports, I6 `net_def_spellings` empty or
+full-length.
+
+**Spec correction recorded in `design/api.md`**: I5 as drafted claimed
+`io_pins` is *exactly* the `pin_cells == None` pins. gcd's DEF carries
+`+ SPECIAL` `VGND`/`VPWR` ports — `add_pin` gives them
+`pin_cells == None` but excludes them from `io_pins`, so the invariant
+is subset-sorted, not equality. Consequence: `write_def_full` emits
+only `io_pins`, so a re-parsed DB drops those 2 ports — the roundtrip
+test asserts `num_pins - 2` explicitly (pre-existing emission
+limitation, not part of this API).
+
+**Tests** (`design_db::tests`, all new, all passing):
+
+- `test_connect_disconnect_unit`: hand-built 2-net DB; create-net
+  segment shape, sink-at-end/driver-at-start insertion, second-driver
+  removal re-normalization, cross-net moves, no-ops, duplicate-name
+  refusal.
+- `test_insert_buffers_on_clk_net`: two `sky130_fd_sc_hd__clkbuf_16`
+  inserts on gcd's `clk` (port driver + 35 sinks) — `clkbuf_0_clk`
+  splits `clk`, `clkbuf_1_clk` splits `clknet_0_clk`. Deltas per
+  insert: +1 cell, +6 pins (A/X signal + 4 power), +1 net. Asserts
+  `PIN/clk` stays driver-first on `clk`, `buf/X` drives each fanout
+  net with the 35 sinks in original order, `pin_nets`/`net_pins`
+  agree both ways, `io_pins` untouched, power pins unconnected,
+  Liberty cell/pin IDs resolved.
+- `test_mutation_def_roundtrip`: the same two inserts; inserted cells
+  seeded at their anchor net's driver position, then
+  `legalize_placement` + `verify_legality` (both end `Placed`),
+  `write_def_full` to a temp file, `parse_def` re-read — no writer
+  workaround needed. Asserts equal cell/net counts, `num_pins - 2`
+  (the dropped `+ SPECIAL` ports), net membership equality by
+  `inst/pin` name across all 271 nets, cell pin-set equality across
+  all 386 cells, and matching drivers on `clk`/`clknet_0_clk`/
+  `clknet_1_clk`.
+- `test_untouched_net_emission_identical`: emits DEF before/after the
+  two inserts; the `PINS` block, every component line, and every net
+  line except the mutated `clk` are byte-identical. Control net
+  `ctrl.state.out[1]` (3 pins) keeps identical member-pin positions
+  and HPWL; guide parasitics are a pure function of member-pin
+  shapes/positions, so they are unchanged too.
+
+**Fail-proof**: corrupting `connect_pin` to insert drivers at the
+segment end (`net_pin_offsets[n + 1]` for both branches) turned
+`test_connect_disconnect_unit` red immediately (`net_pins` read back
+`[PinId(2), PinId(3)]` instead of driver-first `[PinId(3), PinId(2)]`);
+the gcd tests stayed green there only because their drivers connect to
+fresh empty nets where start == end — the unit test is the I4 tripwire.
+Restored, all green again.
+
+**What was run**: `cargo test --workspace` — 384 `grus-core` + 3
+`grus-eda` tests pass, 0 failures; `cargo clippy --workspace
+--all-targets -- -D warnings` clean. Caveat: this worktree (like the
+main checkout on this host) was missing the gitignored picorv32
+guide-parasitics artifacts, so the first workspace run failed 3
+pre-existing STA tests on missing files — not a code regression.
+Regenerated on-host: `tests/designs/generate_guide_ours_spef.sh
+picorv32` (`picorv32.guide.ours.spef` + `runs/guide-check/
+picorv32.ours.guide`), then `generate_ref.sh` steps **5d** and **9c**
+only, verbatim-extracted into `runs/gen_guide_goldens.sh` and run in
+`ghcr.io/librelane/librelane:3.0.16` (Docker on this Mac, PDK from
+`~/.ciel`) producing `picorv32.guide.spef` and
+`picorv32.guide.sta.reference.json`. All outputs are gitignored — no
+repo-visible artifact. After that the workspace run above is fully
+green.
+
+**Surface for `e5-cts-tree`**: `insert_buffer_on_net` per tree node;
+`insert_cell`+`connect_pin` for anything else (e.g. attaching a tree
+root); inserted cells arrive `Unplaced` — seed at a sensible position
+then `legalize_placement`; `write_def_full` emits the mutated design
+without hooks.
