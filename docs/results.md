@@ -7155,4 +7155,7 @@ implementation bug was caught and fixed before the recorded runs:
 taking `latency_max` over both edges mixed the half-period fall
 arrival (2.86 ns) into the insertion delay — rise-edge only now.
 No consumer test reads these goldens yet (that is the next E5
-ticket); no Cargo-visible change, so no version bump.
+ticket); no Cargo-visible change, so no version bump. Rust gates
+ran clean (`cargo test --workspace` 383 pass, `cargo clippy
+--workspace --all-targets -D warnings` 0 warnings) — trivially, as
+no Rust file changed.
