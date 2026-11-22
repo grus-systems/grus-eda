@@ -443,6 +443,7 @@ mod tests {
     use super::*;
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
+    use crate::RectDbu;
     use crate::readers::lef::load_tech_db;
     use crate::test_support::{design_dir, sky130_hd};
 
@@ -469,6 +470,37 @@ mod tests {
                 y: (grid.ny - 1) as u16
             }
         );
+    }
+
+    /// The `special_wire_rects` compatibility view must yield exactly the
+    /// union of `pdn_nets` wire rects (same multiset — count and contents).
+    #[test]
+    fn test_special_wire_rects_view() {
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        let def_path = design_dir("gcd").join("gcd.placed.def");
+        for p in [&tlef_path, &lef_path, &def_path] {
+            if !p.is_file() {
+                panic!("required file missing at {p:?}");
+            }
+        }
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
+
+        let mut view: Vec<_> = db.special_wire_rects().collect();
+        let mut union: Vec<_> = db
+            .pdn_nets
+            .iter()
+            .flat_map(|n| n.wire_rects.iter().copied())
+            .collect();
+        let key = |&(l, r): &(LayerId, RectDbu)| (l.0, r.xl, r.yl, r.xh, r.yh);
+        view.sort_by_key(key);
+        union.sort_by_key(key);
+        assert_eq!(view, union);
+        assert!(!view.is_empty(), "gcd SPECIALNETS produced no wire rects");
     }
 
     #[test]

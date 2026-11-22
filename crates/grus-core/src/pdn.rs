@@ -640,6 +640,112 @@ END DESIGN
         }
     }
 
+    /// Per-element golden check: deserialize the committed PDNSim voltage
+    /// CSVs and compare — not just row counts. `(Instance, Terminal)` sets
+    /// must equal our attach table's pin set, and each pin's `pin_pos_dbu`
+    /// must sit within 1 DBU of the CSV's X/Y (µm * dbu_per_micron).
+    /// (Project lesson 5: compare per element, not only the total.)
+    #[test]
+    fn test_gcd_attach_matches_embedded_csv() {
+        let (tech, db) = load_design("gcd", "gcd.placed.def");
+        let dbu = db.dbu_per_micron as f64;
+
+        for name in ["VPWR", "VGND"] {
+            let net = db.pdn_net(name).expect(name);
+            let (graph, _) = check_net(&db, &tech, net);
+            let csv_path = require(
+                design_dir("gcd")
+                    .join(format!("gcd.irdrop.voltage.{}.embedded.csv", name.to_lowercase())),
+            );
+            let text = std::fs::read_to_string(&csv_path).unwrap();
+
+            // CSV rows: Instance,Terminal,Layer,X location,Y location,Voltage.
+            let mut csv_terms: BTreeMap<(String, String), (f64, f64)> = BTreeMap::new();
+            for (n, l) in text.lines().enumerate() {
+                if n == 0 {
+                    assert_eq!(
+                        l, "Instance,Terminal,Layer,X location,Y location,Voltage",
+                        "{name} CSV header"
+                    );
+                    continue;
+                }
+                let f: Vec<&str> = l.split(',').collect();
+                assert_eq!(f.len(), 6, "{name} CSV row {n}: {l}");
+                csv_terms.insert(
+                    (f[0].to_string(), f[1].to_string()),
+                    (f[3].parse().unwrap(), f[4].parse().unwrap()),
+                );
+            }
+
+            // Our attach set, as (instance, terminal) names.
+            let mut ours: BTreeMap<(String, String), Vec<(i32, i32)>> = BTreeMap::new();
+            for &(p, _node) in &graph.attachments {
+                let cell = db.pin_cells[p.0 as usize].expect("attached pin on a cell");
+                let inst = db.strings.resolve(db.cell_names[cell.0 as usize]);
+                let term = db.strings.resolve(db.pin_names[p.0 as usize]);
+                ours.entry((inst.to_string(), term.to_string()))
+                    .or_default()
+                    .push(db.pin_pos_dbu(p, &tech));
+            }
+            let ours_set: BTreeSet<_> = ours.keys().cloned().collect();
+            let csv_set: BTreeSet<_> = csv_terms.keys().cloned().collect();
+            assert_eq!(
+                ours_set, csv_set,
+                "{name}: (instance, terminal) sets differ (ours-only {:?}, csv-only {:?})",
+                ours_set.difference(&csv_set).take(5).collect::<Vec<_>>(),
+                csv_set.difference(&ours_set).take(5).collect::<Vec<_>>()
+            );
+
+            // Each CSV coordinate must sit within 1 DBU of a pin position.
+            for ((inst, term), (x_um, y_um)) in &csv_terms {
+                let positions = &ours[&(inst.clone(), term.clone())];
+                let (cx, cy) = (x_um * dbu, y_um * dbu);
+                assert!(
+                    positions.iter().any(|&(px, py)| {
+                        (px as f64 - cx).abs() <= 1.0 && (py as f64 - cy).abs() <= 1.0
+                    }),
+                    "{name}: {inst}/{term} csv=({x_um},{y_um})um vs ours {positions:?} dbu"
+                );
+            }
+        }
+    }
+
+    /// Orientation coverage: `gcd.orient.def` places cells under every
+    /// orient so `orient_rect`'s W/E/FW/FE arms run inside pin attach.
+    /// Assert the attach accounting invariants (every attachable conn pin is
+    /// attached-or-unattached exactly once) rather than golden counts — the
+    /// fixture's rotations move pins off rails by construction.
+    #[test]
+    fn test_gcd_orient_fixture_attach() {
+        let (tech, db) = load_design("gcd", "gcd.orient.def");
+        let orients_used: BTreeSet<u8> =
+            db.cell_orient.iter().map(|o| *o as u8).collect();
+        assert!(
+            orients_used.contains(&(crate::design_db::Orient::W as u8))
+                && orients_used.contains(&(crate::design_db::Orient::FE as u8)),
+            "orient fixture lost W/FE coverage: {orients_used:?}"
+        );
+        for name in ["VPWR", "VGND"] {
+            let net = db.pdn_net(name).expect(name);
+            let (graph, c) = check_net(&db, &tech, net);
+            println!("gcd.orient {name} census: {c:?}");
+            let attached: BTreeSet<u32> = graph
+                .attachments
+                .iter()
+                .map(|&(p, _)| p.0)
+                .collect();
+            let unattached: BTreeSet<u32> =
+                graph.unattached_pins.iter().map(|&p| p.0).collect();
+            assert!(attached.is_disjoint(&unattached));
+            // Every attachable pin gets exactly one verdict.
+            assert_eq!(
+                attached.len() + unattached.len(),
+                c.attachable_pins as usize,
+                "{name}: attach verdicts do not partition attachable pins"
+            );
+        }
+    }
+
     /// picorv32 census: 10,205 attached terminals per rail per the reference
     /// voltage CSV row counts.
     #[test]

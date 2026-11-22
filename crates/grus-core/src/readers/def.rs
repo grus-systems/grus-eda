@@ -875,9 +875,11 @@ fn parse_special_wire(
                         })?;
                         i += 3;
                     }
-                    other => bail!(
-                        "DEF line {line}: unknown wire attribute `+ {other}` in SPECIALNETS net {net_name}"
-                    ),
+                    // Anything else is a new `+` statement inside the same
+                    // net record (a repeated `+ ROUTED`/`+ FIXED`/..., or a
+                    // net-level attribute like `+ USE`): hand it back to the
+                    // dispatcher, which owns that keyword set and its errors.
+                    _ => return Ok(i),
                 }
             }
             _ => {
@@ -1024,7 +1026,21 @@ fn add_special_net(
                         use_kind = Some(new_use);
                         i += 1;
                     }
-                    "ROUTED" | "FIXED" | "COVER" | "SHIELD" | "TRUNK" => {
+                    "SHIELD" => {
+                        // `+ SHIELD shieldNetName` prefixes the same wire
+                        // body; the shield metal belongs to this net.
+                        rest.get(i).copied().with_context(|| {
+                            format!("DEF line {line}: SPECIALNETS net {net_name} `+ SHIELD` needs a shield net name")
+                        })?;
+                        i += 1;
+                        while matches!(rest.get(i), Some(&"+"))
+                            && matches!(rest.get(i + 1), Some(&("SHAPE" | "MASK" | "STYLE")))
+                        {
+                            i += 3;
+                        }
+                        i = parse_special_wire(tech_db, def_vias, &mut sink, rest, i, line)?;
+                    }
+                    "ROUTED" | "FIXED" | "COVER" | "TRUNK" => {
                         i = parse_special_wire(tech_db, def_vias, &mut sink, rest, i, line)?;
                     }
                     // Attributes the model does not read; `SUBNET` is not one —
@@ -2517,6 +2533,72 @@ END DESIGN
             "NEW met2 0 + SHAPE STRIPE ( 1000 0 )",
         ));
         assert!(msg.contains("one-point"), "{msg}");
+    }
+
+    /// `- VPWR ( * VPWR )` wildcard conn plus wire statements used by the
+    /// recurring-statement and SHIELD tests. met1 only.
+    const SPECIAL_DEF: &str = r#"VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN sp ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 2000 2000 ) ;
+ROW ROW_0 unithd 0 0 N DO 1 BY 1 STEP 460 2720 ;
+COMPONENTS 1 ;
+- u1 INV + PLACED ( 0 0 ) N ;
+END COMPONENTS
+PINS 1 ;
+- VPWR + NET VPWR + SPECIAL + DIRECTION INOUT + USE POWER
+  + PORT
+    + LAYER met1 ( -50 -50 ) ( 50 50 )
+    + PLACED ( 100 1800 ) N ;
+END PINS
+SPECIALNETS 1 ;
+- VPWR ( PIN VPWR ) ( * VPWR ) + USE POWER
+  + ROUTED met1 100 + SHAPE FOLLOWPIN ( 0 0 ) ( 2000 0 )
+  + FIXED met1 200 + SHAPE STRIPE ( 1000 0 ) ( 1000 2000 )
+  + SHIELD sig1 met1 100 + SHAPE STRIPE ( 0 100 ) ( 2000 100 )
+  + USE POWER
+  ;
+END SPECIALNETS
+END DESIGN
+"#;
+
+    /// A second `+ ROUTED`/`+ FIXED` statement inside one net record, plus a
+    /// net-level `+ USE` after the wires, must re-dispatch instead of
+    /// erroring as an unknown wire attribute.
+    #[test]
+    fn test_special_wire_recurrent_statements() {
+        let db = parse_def_bytes(SPECIAL_DEF.as_bytes(), &mini_tech(), None)
+            .expect("recurring wire statements must parse");
+        let net = db.pdn_net("VPWR").expect("VPWR");
+        assert_eq!(net.use_kind, Some(PdnUse::Power));
+        // ROUTED + FIXED + SHIELD bodies = three wire rects.
+        assert_eq!(net.wire_rects.len(), 3);
+    }
+
+    /// `+ SHIELD` consumes its shield-net name, then carries the same wire
+    /// body — it must not parse the name as a layer.
+    #[test]
+    fn test_special_wire_shield_parses() {
+        let db = parse_def_bytes(SPECIAL_DEF.as_bytes(), &mini_tech(), None)
+            .expect("SHIELD wire must parse");
+        let net = db.pdn_net("VPWR").expect("VPWR");
+        let rects = net
+            .wire_rects
+            .iter()
+            .map(|(_, r)| (r.xl, r.yl, r.xh, r.yh))
+            .collect::<Vec<_>>();
+        // The shield stripe: met1 width 100 around y=100.
+        assert!(rects.contains(&(0, 50, 2000, 150)), "shield rect missing: {rects:?}");
+    }
+
+    /// An odd word in the connection list errors loudly.
+    #[test]
+    fn test_special_net_malformed_conn_fails() {
+        let def = SPECIAL_DEF.replace("( PIN VPWR ) ( * VPWR )", "( PIN VPWR ) ODDWORD");
+        let err = mini_def_error(&def);
+        assert!(err.contains("malformed connection"), "{err}");
     }
 
     #[test]

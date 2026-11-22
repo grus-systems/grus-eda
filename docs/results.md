@@ -7816,3 +7816,25 @@ Restored; all green again.
 --workspace --all-targets -- -D warnings` (clean), `cargo test -p grus-core
 --lib pdn::tests` (5/5). `kurena/tasks/e8-pdn-parse/spec/` untouched; no
 commits made.
+
+**Card #34 follow-ups** (same ticket, reviewer-flagged mediums/low):
+`parse_special_wire`'s `+` arm now returns to the `add_special_net`
+dispatcher for any keyword outside the wire-attribute set — repeated
+`+ ROUTED`/`+ FIXED`/`+ COVER`/`+ TRUNK` statements and trailing
+net-level attributes (`+ USE`, `+ SOURCE`, ...) inside one net record
+parse instead of erroring. `+ SHIELD` consumes its shield-net name
+(plus optional leading `+ SHAPE`/`+ MASK`/`+ STYLE` triples) and parses
+the same wire body — the shield metal counts as this net's geometry.
+Golden depth restored: `test_gcd_attach_matches_embedded_csv`
+deserializes both `*.embedded.csv` files and asserts `(instance,
+terminal)` set equality plus `pin_pos_dbu` within 1 DBU of every CSV
+X/Y (all 384 rows per rail pass); `test_gcd_orient_fixture_attach`
+runs attach on `gcd.orient.def` asserting W/FE orientations are
+present and attach verdicts partition the attachable pin set;
+`test_special_wire_rects_view` proves the accessor's multiset equals
+the `pdn_nets` union; `test_special_wire_recurrent_statements`,
+`test_special_wire_shield_parses`, and
+`test_special_net_malformed_conn_fails` cover the parser fixes.
+Re-verified: `cargo test --workspace` (430 lib + 4 bin, 2 pre-existing
+ignores) and `cargo clippy --workspace --all-targets -- -D warnings`
+clean.
