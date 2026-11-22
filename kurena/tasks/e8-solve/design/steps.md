@@ -18,7 +18,8 @@ versioning rule.
    `SolveSummary`, `VoltageRow`, and report structs from `api.md`.
    Workspace compiles before solving logic lands.
 3. **Current injection.** Implement `sink_currents_a`: power length and
-   finite/nonnegative validation, per-cell sink counts, even splitting,
+   finite validation (negative allowed — see `model.md` correction),
+   per-cell sink counts, even splitting,
    `I = P / current_scale_v`. Add unit tests for split, invalid input,
    and `uninjected_power_w`.
 4. **Reduced matrix assembly.** Implement node→free-index map, resistor

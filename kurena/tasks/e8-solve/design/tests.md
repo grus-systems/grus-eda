@@ -22,16 +22,21 @@ require}`. Missing PDK/design/reference input remains a loud failure.
    intentional because the values are assigned, not factored.
 4. **Zero-power uniform map** (acceptance sanity): pass an all-zero
    `sink_currents` vector. Assert every node and every sink voltage is
-   exactly `source_voltage_v`, `average_drop_v == 0`,
-   `worst_drop_v == 0`, `total_current_a == 0`, and `residual_inf == 0`.
-   Run once as POWER and once as GROUND.
+   `source_voltage_v` within `1e-12` V (correction: the direct solve
+   returns `vs` plus Cholesky rounding noise — measured max deviation
+   7.1e-15 V — so exact equality over-claims; `total_current_a == 0`
+   stays exact because no current is stamped),
+   `|average_drop_v| <= 1e-12`, `worst_drop_v <= 1e-12`,
+   and `residual_inf <= 1e-12`. Run once as POWER and once as GROUND.
 5. **Parallel-resistor stamping.** A two-node source/free mesh with two
    parallel `R`s must produce the same voltage as one `R/2` resistor.
    This guards the `BTreeMap` accumulation rule.
-6. **Input validation.** `sink_currents` wrong length, negative,
-   NaN/infinite; `source_voltage_v` NaN; `current_scale_v <= 0`; and a
-   mesh with no sources all return `Err`. A mesh with a dangling free
-   node reports `validate()` violations before factorization.
+6. **Input validation.** `sink_currents` wrong length, NaN/infinite;
+   `source_voltage_v` NaN; `current_scale_v <= 0`; and a
+   mesh with no sources all return `Err`. (Correction: negative
+   currents are accepted — see `model.md`; the test asserts a negative
+   current *succeeds*.) A mesh with a dangling free node reports
+   `validate()` violations before factorization.
 7. **Deterministic rows.** Call `voltage_rows` twice on a fixture solve
    and assert equality of instance/terminal/layer/x/y/node sequence;
    write a CSV twice and compare bytes.

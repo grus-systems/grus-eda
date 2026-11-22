@@ -194,7 +194,12 @@ The public solve returns an error on:
 - `mesh.net != net.name` where a `PdnNet` is passed;
 - non-empty `mesh.validate()`;
 - power vector length not equal to `db.num_cells()`;
-- non-finite or negative power/current;
+- non-finite power/current (correction: *negative* is legal — the
+  measured N7 feed contains ~-2.4e-11 W totals on picorv32
+  `sky130_fd_sc_hd__o211a_2` instances because sky130 Liberty
+  `internal_power` tables carry negative energies; the signed current
+  is injected as-is, matching what an OpenSTA `report_power -instances`
+  feed would produce);
 - non-finite `source_voltage_v` or `current_scale_v <= 0`;
 - sink pin with no owning cell;
 - CSC/factorization failure.

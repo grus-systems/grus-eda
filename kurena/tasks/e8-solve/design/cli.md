@@ -150,7 +150,8 @@ The command errors before writing artifacts on:
 - reference JSON missing the current design's PDN net or embedded block;
 - invalid/non-positive current scale;
 - mesh validation violations;
-- non-finite/negative instance power;
+- non-finite instance power (negative is legal — Liberty
+  internal-power artifact, counted and reported on stderr);
 - sink-pin/cell mapping mismatch;
 - Cholesky failure;
 - output path or JSON serialization failure.

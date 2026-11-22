@@ -433,6 +433,10 @@ pub fn census(db: &DesignDb, tech_db: &TechDb) -> Vec<PdnCensus> {
 pub mod mesh;
 pub use mesh::*;
 
+/// Sparse DC solve over the mesh: current injection, voltage map, CSV (E8 ticket 4).
+pub mod solve;
+pub use solve::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
