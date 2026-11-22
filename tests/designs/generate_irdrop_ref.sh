@@ -27,10 +27,12 @@
 # analyze_power_grid carries -allow_reuse state) sources inst_power.tcl and
 # re-measures both nets; step C2 (a third process) annotates every instance to
 # 0.0 and re-measures. Step D (python3 heredoc) assembles
-# <design>.irdrop.reference.json and names/copies the committed voltage CSVs —
+# <design>.irdrop.reference.json, names/copies the committed voltage CSVs —
 # one file per net when the two conventions' maps are byte-identical, two when
-# they differ. Every value is emitted by the Tcl/python itself; nothing is
-# hand-written.
+# they differ — and publishes the step-B feed as
+# <design>.irdrop.inst_power.tcl (the e2e decomposition's reference-power
+# input; its size/SHA-256 land in `inst_power_feed`). Every value is emitted
+# by the Tcl/python itself; nothing is hand-written.
 #
 # No LibreLane flow is re-run; only the design's own DEF/SDC and the public
 # Sky130 PDK are read. For picorv32 the placed DEF is git-ignored — run
@@ -663,6 +665,17 @@ for n in pdn_nets:
           f"sta worst_drop={sta_metrics['worst_drop_v']:.4e} "
           f"delta={delta['worst_drop_v']:.4e} maps_identical={identical}")
 
+# -- publish the step-B per-instance feed as a committed golden input: the
+#    e2e decomposition re-solves our mesh on this exact file, so its size and
+#    SHA-256 are recorded beside the coverage/total checks.
+feed_bytes = open(f"{run}/inst_power.tcl", "rb").read()
+feed_name = f"{design}.irdrop.inst_power.tcl"
+shutil.copyfile(f"{run}/inst_power.tcl", f"{outdir}/{feed_name}")
+inst_power_feed = dict(step_a["inst_power_feed"])
+inst_power_feed["feed_file"] = feed_name
+inst_power_feed["feed_size_bytes"] = len(feed_bytes)
+inst_power_feed["feed_sha256_16"] = hashlib.sha256(feed_bytes).hexdigest()[:16]
+
 out = {
     "design": design,
     "input_def": f"{design}.placed.def",
@@ -675,7 +688,7 @@ out = {
     # an external per-instance estimator maps onto the embedded path.
     "convention_mirrored": "embedded",
     "conventions": ["embedded", "sta_per_instance"],
-    "inst_power_feed": step_a["inst_power_feed"],
+    "inst_power_feed": inst_power_feed,
     "nets": nets_json,
 }
 path = f"{outdir}/{design}.irdrop.reference.json"

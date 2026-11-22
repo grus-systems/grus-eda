@@ -8485,3 +8485,166 @@ the release build. `solve_with_sink_currents` now takes an explicit
 `SymbolId(N)` debug text. `elapsed_ms` is documented and now measures
 only the solve call (assembly + Cholesky); previously it also covered
 mesh build, row generation and CSV output.
+
+### 2026-11-23 — e8-e2e: IR-drop end-to-end gate vs PDNSim embedded goldens
+
+E8 ticket 5 (`kurena/tasks/e8-e2e/`). `crates/grus-core/tests/irdrop.rs` is
+the stage gate: `test_irdrop_matches_reference` recomputes each rail's
+voltage map in the same no-annotation regime `generate_irdrop_ref.sh`
+measures (default activity, no parasitics, N7 per-instance `P/V` feed,
+embedded `supply_voltage_v` clamps, rail-to-rail `current_scale_v`),
+byte-checks the committed ours CSVs, asserts the `(Instance, Terminal)`
+row set is identical before any value comparison, and applies the
+roadmap bounds. `test_irdrop_reference_power_axis` re-solves each mesh
+on the committed OpenSTA per-instance feed and prints the
+estimator/mesh/total decomposition. Comparison is on absolute node
+voltage for both nets — the CSV `Voltage` column is the node's
+potential, so `VPWR` deviation is a positive drop below `1.8 V` and
+`VGND` deviation is a positive bounce above `0 V` (the reference JSON
+keeps the golden wording `worst_drop_v` for both; `drop_semantics`
+carries the physics).
+
+**New committed artifacts** (`generate_irdrop_ref.sh` step D now
+publishes the step-B feed; `inst_power_feed` gained `feed_file`,
+`feed_size_bytes`, `feed_sha256_16`):
+
+| file | rows | size | sha256[:16] |
+|---|---|---|---|
+| `gcd/gcd.irdrop.inst_power.tcl` | 384 | 24,875 B | `6b689a4746ba7c6a` |
+| `picorv32/picorv32.irdrop.inst_power.tcl` | 10,205 | 661,749 B | `c0d51b42032583b9` |
+
+**Commands run**:
+
+```
+bash tests/designs/generate_irdrop_ref.sh gcd        # inside ghcr.io/librelane/librelane:3.0.16
+bash tests/designs/generate_irdrop_ref.sh picorv32   # same
+# each run twice end-to-end on 2026-11-23; run 2 `git diff` empty
+# against run 1 (feed SHAs above match `shasum -a 256` on the files;
+# the voltage CSVs and all other golden blocks byte-reproduced)
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p grus-core --test irdrop -- --nocapture
+```
+
+**Gate** (`test_irdrop_matches_reference`; per-pin bound
+`max(5% |V_ref|, 1 mV)`, scalar worst bound `max(5% |ref worst|, 5 mV)`;
+committed ours CSVs were only compared, not regenerated — the in-test
+`write_voltage_csv` byte-check reproduces all four):
+
+| design | net | rows / set | max \|dV\| | median \|dV\| | P99 \|dV\| | over strict | worst dev (ours / ref / delta / tol) | avg dev delta | power delta |
+|---|---|---|---|---|---|---|---|---|---|
+| gcd | VPWR | 384 / identical | 5.409e-4 | 1.413e-4 | 5.409e-4 | 0 | 1.807e-4 / 5.91e-4 / -4.103e-4 / 5.0e-3 | -1.578e-4 | -7.550e-4 |
+| gcd | VGND | 384 / identical | 5.011e-4 | 1.279e-4 | 5.011e-4 | 0 | 2.250e-4 / 5.59e-4 / -3.340e-4 / 5.0e-3 | -1.434e-4 | -7.550e-4 |
+| picorv32 | VPWR | 10,205 / identical | 3.667e-3 | 7.912e-5 | 1.531e-3 | 0 | 8.018e-4 / 4.30e-3 / -3.498e-3 / 5.0e-3 | -1.023e-4 | -6.272e-3 |
+| picorv32 | VGND | 10,205 / identical | 3.164e-3 | 7.469e-5 | 1.196e-3 | **146** | 7.210e-4 / 3.61e-3 / -2.889e-3 / 5.0e-3 | -9.410e-5 | -6.272e-3 |
+
+Verdict: gcd PASS on both bounds. picorv32 meets the scalar
+`max(5%, 5 mV)` bound on both rails and the per-pin bound on VPWR; VGND
+has **146/10,205 rows over the strict `max(5%, 1 mV)` rule** (max
+3.164 mV) and is gated by the named floor
+`PICORV32_VGND_PIN_FLOOR_V = 0.0032` in `irdrop.rs` — the axis below
+names the cause **power estimator**, not mesh/solver.
+
+**Top-5 deviation pins** (signed `dV = ours − ref`; coords from the
+golden row):
+
+gcd VPWR:
+
+| instance | terminal | x | y | ours V | ref V | dV |
+|---|---|---|---|---|---|---|
+| TAP_TAPCELL_ROW_23_132 | VPWR | 83.03 | 73.746 | 1.799950 | 1.799409 | +5.409e-4 |
+| _195_ | VPWR | 79.81 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 |
+| PHY_EDGE_ROW_22_Right_22 | VPWR | 85.33 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 |
+| PHY_EDGE_ROW_23_Right_23 | VPWR | 85.33 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 |
+| _200_ | VPWR | 77.51 | 73.44 | 1.799950 | 1.799415 | +5.349e-4 |
+
+gcd VGND:
+
+| instance | terminal | x | y | ours V | ref V | dV |
+|---|---|---|---|---|---|---|
+| PHY_EDGE_ROW_11_Right_11 | VGND | 85.33 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 |
+| PHY_EDGE_ROW_12_Right_12 | VGND | 85.33 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 |
+| TAP_TAPCELL_ROW_11_96 | VGND | 83.03 | 43.228 | 5.686e-5 | 5.58e-4 | -5.011e-4 |
+| _214_ | VGND | 81.65 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 |
+| _213_ | VGND | 77.05 | 43.52 | 5.686e-5 | 5.41e-4 | -4.841e-4 |
+
+picorv32 VPWR:
+
+| instance | terminal | x | y | ours V | ref V | dV |
+|---|---|---|---|---|---|---|
+| _11410_ | VPWR | 400.43 | 258.40 | 1.799496 | 1.795829 | +3.667e-3 |
+| _07527_ | VPWR | 437.23 | 258.40 | 1.799386 | 1.795733 | +3.653e-3 |
+| _05997_ | VPWR | 419.75 | 258.40 | 1.799420 | 1.795768 | +3.652e-3 |
+| _07611_ | VPWR | 449.19 | 258.40 | 1.799366 | 1.795716 | +3.650e-3 |
+| _11145_ | VPWR | 448.73 | 258.40 | 1.799366 | 1.795716 | +3.650e-3 |
+
+picorv32 VGND:
+
+| instance | terminal | x | y | ours V | ref V | dV |
+|---|---|---|---|---|---|---|
+| _07611_ | VGND | 449.19 | 255.68 | 4.211e-4 | 3.585e-3 | -3.164e-3 |
+| _07526_ | VGND | 433.78 | 255.68 | 3.994e-4 | 3.562e-3 | -3.163e-3 |
+| _11112_ | VGND | 434.01 | 255.68 | 3.994e-4 | 3.562e-3 | -3.163e-3 |
+| _05890_ | VGND | 419.75 | 255.68 | 3.690e-4 | 3.530e-3 | -3.161e-3 |
+| TAP_TAPCELL_ROW_90_2001 | VGND | 456.55 | 255.971 | 4.350e-4 | 3.596e-3 | -3.161e-3 |
+
+**Reference-power decomposition** (`test_irdrop_reference_power_axis` —
+same `PdnMesh`, clamps, `current_scale_v`, and sink splitting; only the
+per-instance feed differs. `estimator = |V(refpwr) − V(n7)|`,
+`mesh = |V(refpwr) − V(golden)|`, `total = |V(n7) − V(golden)|`; feed
+totals: gcd N7 `2.849576e-4 W` vs feed `1.036152e-3 W` (+72.5 %),
+picorv32 `8.127580e-3 W` vs `1.439582e-2 W` (+43.5 %)):
+
+| design | net | axis | max \|dV\| | median \|dV\| | P99 \|dV\| | over strict |
+|---|---|---|---|---|---|---|
+| gcd | VPWR | estimator | 4.916e-4 | 1.429e-4 | 4.916e-4 | 0 |
+| gcd | VPWR | mesh | 1.276e-4 | 1.264e-5 | 1.007e-4 | 0 |
+| gcd | VGND | estimator | 5.256e-4 | 1.316e-4 | 5.256e-4 | 0 |
+| gcd | VGND | mesh | 1.415e-4 | 1.300e-5 | 1.112e-4 | 0 |
+| picorv32 | VPWR | estimator | 3.488e-3 | 7.725e-5 | 1.451e-3 | 0 |
+| picorv32 | VPWR | mesh | 6.941e-4 | 1.037e-5 | 1.558e-4 | 0 |
+| picorv32 | VGND | estimator | 3.094e-3 | 7.523e-5 | 1.110e-3 | 146 |
+| picorv32 | VGND | mesh | 5.053e-4 | 8.736e-6 | 1.560e-4 | 0 |
+
+Scalar drop/bounce on the three maps:
+
+| design | net | n7 worst | refpwr worst | golden worst | est | mesh | total |
+|---|---|---|---|---|---|---|---|
+| gcd | VPWR | 1.807e-4 | 5.627e-4 | 5.91e-4 | +3.820e-4 | -2.832e-5 | -4.103e-4 |
+| gcd | VGND | 2.250e-4 | 6.212e-4 | 5.59e-4 | +3.962e-4 | +6.216e-5 | -3.340e-4 |
+| picorv32 | VPWR | 8.018e-4 | 4.137e-3 | 4.30e-3 | +3.335e-3 | -1.628e-4 | -3.498e-3 |
+| picorv32 | VGND | 7.210e-4 | 3.544e-3 | 3.61e-3 | +2.823e-3 | -6.610e-5 | -2.889e-3 |
+
+Named residual: **power estimator** on all four nets. With the
+reference's own per-instance feed our mesh/solver reproduces the golden
+map inside the strict per-pin bound everywhere (mesh axis max 0.13–0.69
+mV, all under the 1 mV floor) and the worst scalars within 0.03–0.17 mV.
+picorv32 VGND's 146 over-strict rows are almost entirely the estimator
+axis (estimator max 3.094 mV of the 3.164 mV total); the
+`embedded.total_power_w` print (`1.44e-2`) vs `inst_feed_total_w`
+(`1.439582e-2`) differ only by the report's rounding (~4e-6 W), so no
+material embedded-feed provenance gap is claimed — the mesh residual is
+the small model difference itself.
+
+**Fail-proof**: mutating the gate's golden lookup so GROUND nets read
+the `sta_per_instance` CSV (`nets.VGND.conventions.sta_per_instance.
+csv_file`) turned `test_irdrop_matches_reference` red exactly where
+expected — `gcd VGND: 10 of 384 pins over per-pin bound (max |dV|
+1.060e-3)`, `picorv32 VGND: 73 of 10205 pins over per-pin bound (max
+|dV| 6.767e-3)` — while both VPWR nets stayed green. Restored; both
+tests green again.
+
+**Checks run**: `cargo test --workspace` (456 lib + 2 irdrop + 6 bin
+passed, 2 pre-existing jpeg ignores; 112.32 s lib + 1.34 s irdrop),
+`cargo clippy --workspace --all-targets -- -D warnings` (clean),
+`cargo test -p grus-core --test irdrop -- --nocapture` (2/2, ~1.3 s —
+the dominant cost is the picorv32 slew/power reload per test).
+`generate_irdrop_ref.sh` ran end-to-end twice per design on
+2026-11-23 inside `ghcr.io/librelane/librelane:3.0.16`; run 2 reproduced
+all artifacts byte-for-byte (`git diff` clean against run 1). The
+committed ours CSVs were *not* regenerated — the in-test byte
+comparison asserts `write_voltage_csv` reproduces them (no production
+change landed, so a fresh `grus-eda irdrop` run is not required).
+Version stays `0.7.4`: the ticket adds a test-only harness and
+generated verification artifacts — no `grus-core` API or `grus-eda`
+CLI surface changed, and `Cargo.lock` is untouched.

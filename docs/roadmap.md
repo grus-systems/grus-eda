@@ -722,12 +722,27 @@ surface, from the first large-design run's feedback
   `*.irdrop.voltage.ours.<net>.csv` — first five columns verbatim-equal
   to the golden row set on all four nets — plus a summary JSON with
   ‖GV−I‖∞ (≤ 1.7e-14 A abs / ≤ 2.3e-16 rel), worst/avg drop and bounce,
-  and deltas vs the golden scalars. Per-pin and worst-drop deltas sit
-  inside the done-when tolerances on both designs; the residual gap is
-  the N7↔OpenSTA estimator feed (-72.5 % total on gcd, -43.5 % on
+  and deltas vs the golden scalars. Worst-drop deltas and the loose
+  per-pin bound sit inside tolerance on both designs; the strict
+  `max(5%, 1 mV)` per-pin claim was superseded by the e8-e2e gate below
+  (picorv32 VGND does not meet it). The residual gap is the
+  N7↔OpenSTA estimator feed (-72.5 % total on gcd, -43.5 % on
   picorv32), quantified in `docs/results.md` 2026-11-23.
-- Remaining: nothing structural — E8's engine is complete; tighter
-  drop agreement tracks the N7 estimator, not the solver.
+- Progress 2026-11-23 (ticket `e8-e2e`): **done with named residual** —
+  `crates/grus-core/tests/irdrop.rs` gates our maps against the
+  `embedded` goldens on both designs and rails. gcd passes both
+  done-when bounds (per-pin max |dV| 5.4e-4 / 5.0e-4 V, worst-drop
+  deltas −4.1e-4 / −3.3e-4 V). picorv32 meets the `max(5%, 5 mV)`
+  worst-drop/bounce bound on both rails and the strict per-pin bound on
+  VPWR; **VGND keeps a named 3.2 mV floor** (146/10,205 rows over the
+  strict `max(5%, 1 mV)` rule, max 3.164 mV) decomposed by the
+  newly-committed `<d>.irdrop.inst_power.tcl` feed: on OpenSTA's
+  per-instance powers our mesh/solver lands inside the strict bound
+  everywhere (mesh axis max 0.13–0.69 mV), so the residual is the
+  **N7 power estimator**, not the engine. See `docs/results.md`.
+- Remaining: nothing structural — E8's engine is complete and its
+  mesh/solver axis verified; tighter drop agreement tracks the N7
+  estimator, not the solver.
 - Sizing: ~4–6 tickets (M).
 
 ### E9. Reporting / usability surface

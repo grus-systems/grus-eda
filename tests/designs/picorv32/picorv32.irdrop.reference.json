@@ -15,7 +15,10 @@
     "report_rows": 10205,
     "applied": 10205,
     "design_report_total_w": 0.01439564,
-    "inst_feed_total_w": 0.014395822580204685
+    "inst_feed_total_w": 0.014395822580204685,
+    "feed_file": "picorv32.irdrop.inst_power.tcl",
+    "feed_size_bytes": 661749,
+    "feed_sha256_16": "c0d51b42032583b9"
   },
   "nets": {
     "VGND": {
