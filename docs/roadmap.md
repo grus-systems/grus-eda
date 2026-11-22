@@ -741,6 +741,16 @@ surface, from the first large-design run's feedback
   E6 is the replacement, not the enabler. Suggested first ticket:
   reference generation (`detailed_route` on our guide + Magic/OpenROAD
   DRC goldens on gcd), matching the per-stage pattern.
+- Progress 2026-11-23 (ticket `e6-drt-ref`): delegation reference
+  committed — `tests/designs/generate_drt_ref.sh <design>` runs the
+  baseline (`global_route` → `detailed_route`) and the delegated
+  variant (`read_guides <d>.ours.guide` → `detailed_route`) in the
+  pinned image and emits `<d>.drt.reference.json`. Both designs route
+  0-DRC on both variants; the baseline DEF is byte-identical to the
+  prior `<d>.routed.def` on gcd **and** picorv32. Delegated deltas:
+  gcd −1.76% wirelength / +10 vias / 0 antenna; picorv32 −2.11%
+  wirelength / +1,279 vias / antenna 38 → 30. JSON byte-reproduces on
+  rerun outside the `timing` block. See `docs/results.md` 2026-11-23.
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset
