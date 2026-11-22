@@ -11,7 +11,9 @@ cargo build --release
 REPS=5 sh kurena/tasks/perf-profile/measure.sh /tmp/perf-slewonly-power.log
 ```
 
-The committed script runs the full 45-cell matrix. Run it whole —
+The committed script runs the full 38-cell matrix (7 base cells × 5
+designs + gated `sta.spef_rcx` on gcd/picorv32 + gated `power.vcd` on
+gcd). Run it whole —
 the `sta` cells double as a no-regression check on the shared
 `prepare_sta`/`eval_seed_state` refactor, and the run is the honest
 "what was run" for `docs/results.md`. If only the `power` cells are

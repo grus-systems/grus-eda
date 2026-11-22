@@ -2295,11 +2295,7 @@ pub fn sta_pin_slews(
     parasitics: Option<&NetParasitics>,
 ) -> Result<Vec<PinSlew>> {
     let prepared = prepare_sta(design, lib, sdc, parasitics, true)?;
-    let state = if uncovered_borrow(&prepared) {
-        eval_state_full(&prepared)?
-    } else {
-        slew_eval(&prepared)
-    };
+    let state = slew_eval_state(&prepared)?;
     Ok(state
         .iter()
         .map(|s| PinSlew {
@@ -3538,6 +3534,18 @@ fn slew_eval(prepared: &StaPrepared) -> Vec<PinTimingState> {
     }
     drop(t_walk);
     state
+}
+
+/// `sta_pin_slews`'s state choice: the [`slew_eval`] replay, or the full eval
+/// tail ([`eval_state_full`]) when an uncovered `latch_borrow` edge makes a
+/// slew arrival-coupled. Shared with the parity test, which compares the
+/// returned state's `slew_min` field by field.
+fn slew_eval_state(prepared: &StaPrepared) -> Result<Vec<PinTimingState>> {
+    if uncovered_borrow(prepared) {
+        eval_state_full(prepared)
+    } else {
+        Ok(slew_eval(prepared))
+    }
 }
 
 /// Sort endpoint entries by pin name and reduce them to the report plus the
@@ -10001,11 +10009,7 @@ mod tests {
         let (_report, full, _pol) =
             run_sta_detail(design, lib, sdc, parasitics, false).expect("full STA");
         let prepared = prepare_sta(design, lib, sdc, parasitics, true).expect("prepare");
-        let replay = if uncovered_borrow(&prepared) {
-            eval_state_full(&prepared).expect("full-state fallback")
-        } else {
-            slew_eval(&prepared)
-        };
+        let replay = slew_eval_state(&prepared).expect("slew state");
         let fast = sta_pin_slews(design, lib, sdc, parasitics).expect("slew-only STA");
         assert_eq!(full.len(), fast.len(), "{label}: pin count");
         for (i, ((s, p), r)) in full.iter().zip(&fast).zip(&replay).enumerate() {

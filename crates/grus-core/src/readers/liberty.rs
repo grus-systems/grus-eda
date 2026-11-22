@@ -2179,6 +2179,101 @@ library (t) {
     }
 
     #[test]
+    fn test_seq_ff_vars_and_bare_next_state() {
+        let text = r#"
+library (t) {
+  cell (c) {
+    ff ("IQ", "IQ_N") {
+      clocked_on : "CLK";
+      next_state : "D";
+    }
+    pin (CLK) { direction : input; }
+    pin (D)   { direction : input; }
+    pin (Q)   { direction : output; }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        let cell = &db.cells[0];
+        assert!(cell.is_sequential);
+        let seq = cell.seq.as_ref().expect("seq");
+        assert_eq!(db.strings.resolve(seq.state_var), "IQ");
+        assert_eq!(
+            seq.state_var_n.map(|s| db.strings.resolve(s)),
+            Some("IQ_N")
+        );
+        assert_eq!(seq.data_pin.map(|s| db.strings.resolve(s)), Some("D"));
+    }
+
+    #[test]
+    fn test_seq_latch_single_var_data_in() {
+        let text = r#"
+library (t) {
+  cell (c) {
+    latch ("IQ") {
+      enable : "GATE";
+      data_in : "D";
+    }
+    pin (GATE) { direction : input; }
+    pin (D)    { direction : input; }
+    pin (Q)    { direction : output; }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        let cell = &db.cells[0];
+        assert!(cell.is_latch);
+        let seq = cell.seq.as_ref().expect("seq");
+        assert_eq!(db.strings.resolve(seq.state_var), "IQ");
+        assert_eq!(seq.state_var_n, None);
+        assert_eq!(seq.data_pin.map(|s| db.strings.resolve(s)), Some("D"));
+    }
+
+    #[test]
+    fn test_seq_expression_next_state_rejected() {
+        let text = r#"
+library (t) {
+  cell (c) {
+    ff ("IQ", "IQ_N") {
+      clocked_on : "CLK";
+      next_state : "(D&!SCE) | (SCD&SCE)";
+    }
+    pin (CLK) { direction : input; }
+    pin (D)   { direction : input; }
+    pin (Q)   { direction : output; }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        let cell = &db.cells[0];
+        assert!(cell.is_sequential);
+        let seq = cell.seq.as_ref().expect("seq");
+        assert_eq!(seq.data_pin, None);
+    }
+
+    #[test]
+    fn test_seq_group_next_state_is_skipped() {
+        let text = r#"
+library (t) {
+  cell (c) {
+    ff ("IQ", "IQ_N") {
+      next_state ("D") { clocked_on : "CLK"; }
+    }
+    pin (CLK) { direction : input; }
+    pin (D)   { direction : input; }
+    pin (Q)   { direction : output; }
+  }
+}
+"#;
+        let db = parse_liberty_bytes(text.as_bytes()).expect("parse failed");
+        let cell = &db.cells[0];
+        assert!(cell.is_sequential);
+        let seq = cell.seq.as_ref().expect("seq");
+        assert_eq!(db.strings.resolve(seq.state_var), "IQ");
+        assert_eq!(seq.data_pin, None);
+    }
+
+    #[test]
     fn test_liberty_without_library_body_is_an_error() {
         assert!(parse_liberty_bytes(b"").is_err());
         assert!(parse_liberty_bytes(b"library (foo);").is_err());

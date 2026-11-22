@@ -11,7 +11,9 @@ cargo build --release
 REPS=5 sh kurena/tasks/perf-profile/measure.sh /tmp/perf-legal-passes.log
 ```
 
-The committed script runs the full 45-cell matrix. Run it whole on the
+The committed script runs the full 38-cell matrix (7 base cells × 5
+designs + gated `sta.spef_rcx` on gcd/picorv32 + gated `power.vcd` on
+gcd). Run it whole on the
 post-change binary — it is the honest "what was run" and the
 `sta`/`power`/`congestion` cells double as a no-regression check (they
 should be unchanged within noise; the ticket touches only

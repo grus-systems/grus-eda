@@ -54,9 +54,13 @@ probe, then `name.clone()` / `format!("{name}:{s}")`.
 Whitespace in IEEE 1481 is ASCII space/tab; `split_ascii_whitespace`
 skips the Unicode table per byte. Deliberate note: inside a *token*,
 non-ASCII whitespace now stays part of the word instead of splitting —
-on such input the line fails later (numeric parse or field count) at
-the same line number, never silently. All committed SPEF and every
-error test are ASCII. Record the note in `docs/results.md`.
+a merged token still hits the same-line rejects when the count lands on
+a wrong arity, but it can also produce a *valid-shaped* entry whose
+node name carries the non-ASCII byte (`*CAP 1 a\u{a0}b 0.5` parses as a
+ground cap on the merged name instead of erroring) — a format-invalid
+input surfacing as a dangling node name that matches nothing else in
+the file, not a silent corruption of a real net. All committed SPEF and
+every error test are ASCII. Record the note in `docs/results.md`.
 
 ## S4 — `f32` fields via `fast-float`
 
@@ -67,7 +71,8 @@ on jpeg). Add `fast-float2` (the maintained continuation of the mature
 `f32::from_str` and `fast_float` agree on every SPEF literal shape
 (sign, digits, `.`, `e±`); both accept `inf`/`nan` spellings, so no
 acceptance change on anything the format or tests produce. The
-`unit_scale` parse (line 29) can share it — cold anyway.
+`unit_scale` parse keeps std `parse` — once per `*_UNIT` header line,
+it never shows in a profile.
 
 ## S5 — Hot maps on `xxh3`
 
