@@ -536,8 +536,13 @@ commitments): ~~`perf-par-slew`~~ **done** (per-level `par_iter`, jpeg
 `power` placement RC jpeg 2170 → 1030 ms, ×1.5–2.5 across the five
 designs; `power.slews` now nests `sta.slew.seeds|walk` and skips the
 pulse-width-only `sta.prepare.clock.*` block — `docs/results.md`
-2026-11-22 perf-slewonly-power entry); `perf-legal-passes` (algorithmic;
-serial ordered-move passes are 44% of `place`), then the parser tickets
+2026-11-22 perf-slewonly-power entry); ~~`perf-legal-passes`~~ **done**
+(shared incremental `NetExtrema` cache + exact site-grid argmin slide —
+jpeg `place` 2170 → 1560 ms on the same-session baseline, `pass2`/`pass3`
+~×12, `pass1` flat; HPWL improved 0.3–0.6% on all five designs —
+`docs/results.md` 2026-11-22 perf-legal-passes entry; `place.gp.*` is
+now ~73% of the `place` wall and the dominant remaining phase), then
+the parser tickets
 `perf-spef-parse`, `perf-def-parse`, `perf-vcd-parse` — and
 `sta.eval.walk`/`sta.slew.walk` is the co-dominant phase on both `sta`
 and `power` after these two tickets (the shared DMP-dominated inner
