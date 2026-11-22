@@ -19,9 +19,11 @@ nets); `cong.load` and `sta.load.def` both wrap this function.
     179–183).
   - a third `Word` inside the parens (`( a b c )`) → `bail!("DEF line
     {line}: connection of net {net_name} must be `( component pin )`")`
-    — identical to the `[comp, pin]` pattern fail (line 763–766). The
-    bail terminates the parse either way, so not consuming the rest of
-    the group is equivalent.
+    — identical to the `[comp, pin]` pattern fail (line 763–766).
+    (Implemented slightly more faithful than this draft: extra words
+    drain to the `)`, and a `)` before the second word also takes the
+    "must be" bail, so both message **and line** match the old
+    collected-`Vec` behavior on multi-line groups.)
 - **Statement buffers in counted sections**: `for_each_record`
   (lines 259–293) calls `read_statement` (line 157) per `-` record.
   Add `read_statement_into(lexer, &mut Vec<&'a str>)` (same loop, fills

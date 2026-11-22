@@ -32,11 +32,12 @@ Two allocations per mapped token today: `format!("*{index}")` for the map
 probe, then `name.clone()` / `format!("{name}:{s}")`.
 
 - Rekey `name_map` `HashMap<String, String>` (line 65, insert at 148) to
-  `HashMap<u32, String>` keyed by the `*N` index digits — same digits are
-  already validated by `is_name_map_index` (lines 41–45). On resolve,
-  `*12:3` splits at `:`; the index part parses to `u32` only when it is
-  all digits — a non-numeric `*x` token must fall through to the
-  unescape path **exactly as today** (today's `map.get` simply misses).
+  a `FastMap` keyed by the `*N` index **slice of the input text**
+  (`&token[..end]` up to `:`) — the same lookup semantics as the string
+  key for every input, including indices too large for `u32` (the u32
+  rekey from the first draft had a >2^32 corner the slice key does not).
+  On resolve, `*12:3` probes `*12` with no allocation; a miss or a
+  non-`*` token falls through to the unescape path exactly as today.
   Keep `is_name_map_index`'s semantics for the *section* test
   (`*PORTS`/`*I` are not indices).
 - `unescape_spef_name` (`String`, line 24, also used by
@@ -60,8 +61,9 @@ error test are ASCII. Record the note in `docs/results.md`.
 ## S4 — `f32` fields via `fast-float`
 
 `tokens[2].parse::<f32>()` per `*D_NET`/`*CAP`/`*RES` line (~0.7M calls
-on jpeg). Add `fast-float` (mature, permissively licensed; justify in
-the commit message per AGENTS §1): `fast_float::parse::<f32, _>(tok)`.
+on jpeg). Add `fast-float2` (the maintained continuation of the mature
+`fast-float` parser, same API; justify in the commit message per AGENTS
+§1): `fast_float2::parse::<f32, _>(tok)`.
 `f32::from_str` and `fast_float` agree on every SPEF literal shape
 (sign, digits, `.`, `e±`); both accept `inf`/`nan` spellings, so no
 acceptance change on anything the format or tests produce. The

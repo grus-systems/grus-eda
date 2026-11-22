@@ -61,7 +61,8 @@ per the acceptance table format.
 Mechanical scan/tokenize work in the three serial readers: per-line and
 per-group `Vec`/`String` churn removed (reused scratch, `Cow` unescape,
 `get_mut`-first map access, precomputed VCD bit names), NAME_MAP rekeyed
-to u32, `fast-float` for SPEF numerics, `xxh3` on the per-line hash
+to the `*N` digit-slice `&str` (see `spef.md` §S2 — not u32),
+`fast-float2` for SPEF numerics, `xxh3` on the per-line hash
 maps (`owner`, `decls`, `activity`, connection name→id). No format-
 semantics changes; `split_ascii_whitespace` note: <one line>.
 Design: `kurena/tasks/perf-parsers/design/`.

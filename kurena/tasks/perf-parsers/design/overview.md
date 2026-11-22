@@ -21,8 +21,9 @@ SipHash-map lookups on short keys inside the per-line loop, and per-edge
 
 All changes stay inside the three reader files plus docs/version:
 
-- **SPEF** (`spef.md`): no per-line `Vec`, `u32`-keyed NAME_MAP,
-  `Cow`-based unescape/`resolve`, ASCII whitespace split, `fast-float`
+- **SPEF** (`spef.md`): no per-line `Vec`, NAME_MAP keyed by the `*N`
+  digit-slice `&str` (§S2 — refined from the u32 sketch),
+  `Cow`-based unescape/`resolve`, ASCII whitespace split, `fast-float2`
   for the numeric fields, xxh3 for the hot `owner`/`name_map` maps.
 - **DEF** (`def.md`): scratch-buffer statements in record loops, inline
   `( comp pin )` group reader in NETS (no `Vec`), `Cow` unescape for
@@ -75,8 +76,9 @@ at the boundary where one exists (see `vcd.md` §V5).
 - `crates/grus-core/src/readers/spef.rs`
 - `crates/grus-core/src/readers/def.rs`
 - `crates/grus-core/src/readers/vcd.rs`
-- `crates/grus-core/Cargo.toml` (add `fast-float`)
-- `Cargo.toml` (workspace `fast-float` dep + `[workspace.package]` patch bump)
+- `crates/grus-core/Cargo.toml` (add `fast-float2` — the maintained
+  `fast-float` continuation, same API)
+- `Cargo.toml` (workspace `fast-float2` dep + `[workspace.package]` patch bump)
 - `Cargo.lock`
 - `docs/results.md`
 - `docs/roadmap.md`
