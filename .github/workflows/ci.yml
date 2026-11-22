@@ -43,9 +43,26 @@ jobs:
           mise exec docker-cli@latest colima@latest lima@latest -- colima status >/dev/null 2>&1 \
             || mise exec docker-cli@latest colima@latest lima@latest -- colima start --memory 12 --cpu 8
 
+      # Gate on the LAST file the script writes (step 9c's STA golden), not an
+      # early one: a run that dies before 9c still leaves rcx.spef behind, and
+      # skipping then would never regenerate the guide artifacts.
       - name: Generate picorv32 reference inputs
-        if: ${{ hashFiles('tests/designs/picorv32/picorv32.rcx.spef') == '' }}
-        run: tests/designs/picorv32/generate_ref.sh
+        if: ${{ hashFiles('tests/designs/picorv32/picorv32.guide.sta.reference.json') == '' }}
+        run: |
+          if [ -f tests/designs/picorv32/picorv32.placed.def ] && [ ! -f tests/designs/picorv32/picorv32.guide.ours.spef ]; then
+            tests/designs/generate_guide_ours_spef.sh picorv32
+          fi
+          tests/designs/picorv32/generate_ref.sh || {
+            # Step 9c reads our own guide outputs (host-side
+            # generate_guide_ours_spef.sh), which need picorv32.placed.def —
+            # produced by this same script. A cold run reaches the 9c
+            # missing-input gate with placed.def in place; emit the ours-side
+            # artifacts, then rerun the same script to completion. If
+            # placed.def is absent the failure was mid-flow — do not retry.
+            test -f tests/designs/picorv32/picorv32.placed.def
+            tests/designs/generate_guide_ours_spef.sh picorv32
+            tests/designs/picorv32/generate_ref.sh
+          }
 
       # The picorv32 CTS DEF is gitignored but test_picorv32_cts_decomposition
       # requires it; the script's two committed goldens must byte-reproduce —
@@ -106,6 +123,9 @@ jobs:
             tests/designs/picorv32/picorv32.sta.reference.json
             tests/designs/picorv32/picorv32.util65.def
             tests/designs/picorv32/picorv32.cts.def
+            tests/designs/picorv32/picorv32.guide.spef
+            tests/designs/picorv32/picorv32.guide.ours.spef
+            tests/designs/picorv32/picorv32.guide.sta.reference.json
             tests/designs/picorv32/pins_routed.txt
             tests/designs/aes/aes.synth.v
             tests/designs/aes/aes.synth.json
