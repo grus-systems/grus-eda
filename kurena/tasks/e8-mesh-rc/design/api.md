@@ -21,6 +21,13 @@ pub struct PdnMesh {
     pub sinks: Vec<MeshSink>,
     /// Node indices under the top-level PIN's io-rect intersections.
     pub sources: Vec<u32>,
+    /// Sinks whose pin offered >1 candidate node — recorded at build;
+    /// a bare `PdnMesh` cannot re-derive the candidate sets, so
+    /// `census()` reads the stored count. (As-implemented addition:
+    /// the design left `MeshCensus::multi_node_sinks` storage
+    /// unspecified and `census()` must be self-consistent.)
+    #[serde(default)]
+    pub multi_node_sinks: u32,
 }
 
 pub struct MeshNode {
@@ -113,8 +120,16 @@ impl PdnMesh {
 conn expansion, source pins and the attach set are reused verbatim,
 then its own feature pass adds the finer geometry. Private parents'
 items are reached via `use super::{…}` (`expand_conns`,
-`is_attachable`, `rects_intersect`, `rect_contains_point`,
-`UnionFind`) — no signature or visibility changes in `pdn.rs`.
+`rects_intersect`, `rect_contains_point`, `UnionFind`) — no signature
+or visibility changes in `pdn.rs`.
+
+Two `validate()` refinements landed in implementation: `dangling`
+via-end nodes are reported `UnreachableNode` even though the via
+resistor keeps them BFS-reachable (a stub endpoint on no metal is a
+defect — `test_synthetic_dangling_via` asserts it), and the
+reachability BFS is skipped when the mesh has no sources (`NoSources`
+already carries the verdict; reporting every node unreachable would
+only add noise).
 
 ## `pdn.rs` diff (mechanical)
 
