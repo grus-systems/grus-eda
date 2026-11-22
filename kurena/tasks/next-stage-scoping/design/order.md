@@ -35,8 +35,10 @@ E4 global routing ──> E5 CTS ──> E8 IR drop ──> [gate] E6 detailed r
 
 - Independent of both routing stages (IR drop reads the PDN, not signal
   routes) and of a smaller build: via parsing + resistor mesh + sparse solve.
-- Gated by P-IRD: scheduled only if the image exposes a PDNSim reference;
-  otherwise documented as deferred.
+- P-IRD resolved the gate: PDNSim ships in the pinned image
+  (`analyze_power_grid`/`check_power_grid`/`set_pdnsim_*`), so E8 is
+  schedulable with a measured reference (gcd VPWR: worst drop 0.591 mV,
+  per-instance voltage CSV via `-voltage_file`).
 
 ### E6/E7 at the end, behind a decision gate
 
@@ -44,13 +46,15 @@ E4 global routing ──> E5 CTS ──> E8 IR drop ──> [gate] E6 detailed r
   signal-net wire storage, rule-aware maze routing) is an order of magnitude
   larger than anything done so far, and `README.md` still lists detailed
   routing and DRC as out of scope — pursuing it is a scope decision for the
-  user, not an implicit extension of the estimation pipeline. Recommend:
-  re-evaluate after E4 lands, when guide quality is measured and our guides
-  can potentially be handed to OpenROAD's own `detailed_route` (a usable
-  flow without writing a DRT).
-- E7 only checks what E6 emits (paired) or shrinks to a LEF-subset checker
-  whose reference (Magic `drc` on DEF) P-DRC may rule out — in that case it
-  is paired-with-E6 or deferred, and says so in the roadmap.
+  user, not an implicit extension of the estimation pipeline. P-GR removed
+  the "potentially": `read_guides` + `detailed_route` on a foreign guide file
+  produces a routed DEF with 0 DRC on gcd — once E4 emits guides, OpenROAD's
+  own DRT is a usable flow without writing a DRT. Recommend: re-evaluate
+  after E4 lands, when guide quality is measured.
+- E7 only checks what E6 emits (paired) or shrinks to a LEF-subset checker on
+  the committed routed DEFs; P-DRC confirmed its reference exists (Magic
+  8.3.623 `def read` + `drc count total` → 0 errors on `gcd.routed.def`), so
+  the standalone scoping stays viable either way.
 
 ## Rough sizing (repo convention: 1 ticket ≈ 1 commit ≈ 50–150 lines)
 

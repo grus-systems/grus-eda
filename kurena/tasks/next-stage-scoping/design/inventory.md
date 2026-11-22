@@ -4,7 +4,9 @@ Per stage: what it consumes and emits, the repo modules it reuses (by name),
 what is missing, and the reference-tool command that produces its numbers.
 
 All reference commands run inside `ghcr.io/librelane/librelane:3.0.16`
-(`openroad` / `sta`; `magic` availability is probed — see `probes.md`).
+(`openroad` / `sta`; `magic` 8.3.623 and `klayout` are present — P-DRC).
+Probe outcomes from 2026-11-22 are marked **[P-xx ✓]** / **[P-xx ✗]** per
+command surface; full numbers in `docs/results.md`.
 
 ---
 
@@ -40,8 +42,11 @@ guide-level parasitics instead of the placement PD-tree estimate.
   granularity, via allowance between layers for parasitics.
 - **Reference commands**: `global_route -guide_file <file> [-allow_congestion]`
   (already used in `generate_ref.sh` step 5b), `estimate_parasitics
-  -global_routing -spef_file <file>` (guide-based RC — availability flagged
-  for probe P-GR), the `dbGCellGrid` usage queries already exercised by E1.
+  -global_routing -spef_file <file>` **[P-GR ✓ — exists; emits 269-net SPEF on
+  gcd]**, `read_guides` / `write_guides` **[P-GR ✓ — read-back guides feed
+  both `-global_routing` parasitics and `detailed_route`; the `GRT-0008`
+  warning text is stale]**, the `dbGCellGrid` usage queries already exercised
+  by E1.
 
 ## E5 — Clock tree synthesis
 
@@ -65,11 +70,13 @@ score the result.
 - **Missing**: DesignDb cell/net insertion (nothing mutates a netlist today),
   the clock-net decomposition into buffer-driven segments, a balance-driven
   tree constructor, post-insertion placement of new cells.
-- **Reference commands**: `clock_tree_synthesis` (TritonCTS — probe the image
-  for flag surface: `-buf_list`, `-root_buf`, `-wire_unit`,
-  `-sink_clustering_*`, `-post_cts_disable`), `repair_clock_nets`,
-  `estimate_parasitics -placement`, `report_clock_skew -setup/-hold`,
-  `report_clock_tree`-family reports — all inside the pinned `openroad`/`sta`.
+- **Reference commands**: `clock_tree_synthesis -root_buf -buf_list
+  -wire_unit` **[P-CTS ✓ — ran on gcd: 5 `clkbuf_16` + 3 dummies, 35 sinks,
+  depth 2]**, `repair_clock_nets` **[P-CTS ✓]**, `estimate_parasitics
+  -placement` (needs `set_wire_rc` first — `EST-0018`), `report_clock_skew
+  -setup/-hold` + `worst_clock_skew -setup/-hold` + `report_cts` +
+  `report_cts_config` **[P-CTS ✓]**; `report_clock_tree` **[P-CTS ✗ — absent]**
+  — all inside the pinned `openroad`/`sta`.
 
 ## E6 — Detailed routing
 
@@ -90,7 +97,9 @@ vias) in a routed DEF. TritonRoute-class work.
 - **Reference commands**: `detailed_route -output_drc <rpt>` + `write_def`
   (used in step 5b), then `extract_parasitics` / `write_spef` for the
   parasitic consequence. Metrics: total wirelength, via count, DRC violation
-  count (0 on gcd/picorv32), routed-SPEF STA agreement.
+  count (0 on gcd/picorv32), routed-SPEF STA agreement. **[P-GR ✓ —
+  `detailed_route` accepts `read_guides` input: our guide files can drive the
+  reference DRT directly.]**
 
 ## E7 — DRC
 
@@ -105,9 +114,10 @@ vias) in a routed DEF. TritonRoute-class work.
   (spacing tables, min area, enclosure) whose canonical expression is Magic's
   tech file, not LEF.
 - **Reference commands**: `detailed_route -output_drc` (DRT's internal check —
-  only validates DRT's own routes), Magic `drc` (probe whether the image's
-  magic can `def read` a routed DEF with the sky130A magicrc; see P-DRC),
-  `check_antennas` for the antenna subset.
+  only validates DRT's own routes), Magic `drc` **[P-DRC ✓ — Magic 8.3.623
+  `def read`s a routed DEF and `drc style drc(full)` + `drc count total`
+  reports 0 errors on `gcd.routed.def`; needs `-e PDK_ROOT=/pdk` for the
+  magicrc]**, `check_antennas` for the antenna subset.
 - **Note**: meaningless as a standalone stage until something emits shapes —
   either it pairs with E6 (check our own routes) or it shrinks to a LEF-rule
   subset checker on committed `gcd.routed.def`/`picorv32.routed.def`.
@@ -130,6 +140,8 @@ vias) in a routed DEF. TritonRoute-class work.
   (new dependency — e.g. `sprs`, or a small Jacobi/CG kernel), current-source
   attachment of instances to grid nodes.
 - **Reference commands**: PDNSim inside OpenROAD — `analyze_power_grid` /
-  `check_power_grid` (probe P-IRD: whether the pinned image ships `psm`; if
-  not, this stage has no usable reference in the container and stays deferred
-  by discipline).
+  `check_power_grid` **[P-IRD ✓ — both present along with
+  `set_pdnsim_net_voltage`/`set_pdnsim_source_settings`/
+  `set_pdnsim_inst_power`; on `gcd.placed.def` (`VPWR`/`VGND` nets):
+  worst-case IR drop 0.591 mV, average 0.223 mV, per-instance voltage CSV via
+  `-voltage_file`]**.

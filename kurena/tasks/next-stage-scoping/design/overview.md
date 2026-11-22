@@ -5,6 +5,13 @@ Doc-only scoping ticket. Map the remaining pipeline from the current state
 give each a measurable done-when against the reference tool, order them by
 dependency, and size them. No code changes.
 
+**Status 2026-11-22**: all four probes ran (`docs/results.md`
+"next-stage-scoping"); `done-when.md`, `inventory.md` and `order.md` carry the
+measured numbers. No stage lost its reference — P-IRD found PDNSim in the
+image, P-DRC found Magic reading foreign routed DEFs, and P-GR confirmed both
+`estimate_parasitics -global_routing` and `read_guides`-driven parasitics +
+detailed routing.
+
 ## Deliverables
 
 1. `kurena/tasks/next-stage-scoping/design/` — this design set (finalized with

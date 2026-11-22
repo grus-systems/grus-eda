@@ -6333,3 +6333,94 @@ idle M4 mini, same session. Count instrumentation was a temporary
 patch (kept at `/tmp/dmp-counters.patch`), run once on jpeg
 `sta`/`power` + ibex `sta`, then reverted. Raw logs not committed;
 the driver is.
+
+### 2026-11-22 — next-stage-scoping: reference-surface probes for E4–E8 (doc-only)
+
+Four container probes (P-GR, P-CTS, P-IRD, P-DRC) inside
+`ghcr.io/librelane/librelane:3.0.16` to pin the done-when criteria of the
+candidate next stages — same invocation pattern as
+`tests/designs/gcd/generate_ref.sh` (`docker run --rm -i -v $REPO:/work -v
+$HOME/.ciel:/pdk`, `openroad -no_init -no_splash` reading Tcl on stdin; `docker
+run` needs `-i` or stdin is closed). Scripts and scratch output under
+`tests/designs/gcd/runs/probes/` (gitignored). No design/golden changes.
+
+**P-GR — global-routing surface (gcd.placed.def)**: `global_route -guide_file`
++ `set_wire_rc -layer met2` + `estimate_parasitics -global_routing -spef_file`.
+
+- Guide format: per-net block `net` / `(` / `xlo ylo xhi yhi layer` / `)` in
+  DBU, layer names verbatim — 269 nets, 1953 boxes (li1 719, met1 867, met2
+  332, met3 32, met4 3). The li1/met1 boxes are pin-access stubs.
+- `estimate_parasitics -global_routing -spef_file` exists and emits a normal
+  SPEF. Per-net `*D_NET` total capacitance, gcd: guide SPEF 0.7397 pF total,
+  placement SPEF (`gcd.routed.spef`) 0.4406 pF, routed RCX (`gcd.rcx.spef`)
+  0.8962 pF. Guide-vs-RCX per-net relative diff: median 27.6%, p90 111.6%,
+  max 340% (worst rows are sub-fF nets: guide ~1 fF vs RCX ~0.3 fF — within a
+  ~1 fF absolute band); 80.3% of nets within `max(5%, 1fF)`. Placed-vs-RCX:
+  median 44.2%, p90 57.3% (uniform underestimate).
+- `info commands *guide*` → `read_guides write_guides`. **Read-back works**:
+  `read_guides gcd.probe.guide` warns `GRT-0008 "does not allow parasitics
+  estimation from the guides file"` but the warning is stale — a 1-net guide
+  file produces a 1-net guide SPEF with the same `_000_` cap as the full run
+  (0.0009510 pF), so `estimate_parasitics -global_routing` consumes the read
+  guides.
+- `read_guides` + `detailed_route -output_drc` on the foreign guide file →
+  routed DEF (269 nets routed), **0 DRC violations** — the E4-guides →
+  OpenROAD-DRT delegation path is real, which is what gates E6.
+- `estimate_parasitics -help` → `STA-0562` (no `-help` surface); long Tcl
+  lines split across stdin with `\` do **not** continue — write one line.
+
+**P-CTS — TritonCTS surface + gcd clock numbers**: `info commands` →
+`clock_tree_synthesis worst_clock_skew report_clock_skew
+report_clock_skew_metric report_cts report_cts_config reset_cts_config
+configure_cts_characterization set_cts_config`; `report_clock_tree` does not
+exist. Ran `clock_tree_synthesis -root_buf sky130_fd_sc_hd__clkbuf_16
+-buf_list "sky130_fd_sc_hd__clkbuf_8 sky130_fd_sc_hd__clkbuf_4
+sky130_fd_sc_hd__clkbuf_2" -wire_unit 20` (the sky130hd defaults from
+`/pdk/sky130A/libs.tech/openlane/sky130_fd_sc_hd/config.tcl` +
+`cts.tcl` in the image) + `repair_clock_nets` + `estimate_parasitics
+-placement` on `gcd.placed.def`/`gcd.sdc`:
+
+- Inserted 5 `clkbuf_16` (5 clock subnets), 3 dummy loads (`clkbuf_4`×1,
+  `clkbuf_8`×2), 35 sinks, tree depth 2, avg sink wirelength 120.66 µm.
+- `report_clock_skew -setup/-hold`: skew ≈ 0 ps; clock-pin latency ≈ 0.31 ns
+  (insertion delay anchor for the E5 tolerance). `repair_clock_nets` used max
+  wire length 3241 µm default.
+- `estimate_parasitics` requires `set_wire_rc` first (`EST-0018` zero wire
+  cap otherwise).
+
+**P-IRD — PDNSim availability + gcd VPWR numbers**: `info commands` →
+`analyze_power_grid check_power_grid set_pdnsim_net_voltage
+set_pdnsim_source_settings set_pdnsim_inst_power` (no `*psm*`/`*irdrop*`
+commands). Power nets in `gcd.placed.def` are `VPWR`/`VGND` (an initial
+`-net VDD` probe failed `PSM-0028` — kept as the lookup miss it was).
+`analyze_power_grid -net VPWR` on `gcd.placed.def`:
+
+- Total power 1.04 mW, supply 1.80 V, average voltage 1.80 V, average IR drop
+  0.223 mV, **worst-case IR drop 0.591 mV** (0.03%).
+- `-voltage_file` emits a per-instance CSV
+  (`Instance,Terminal,Layer,X location,Y location,Voltage`, 384+ rows) — the
+  per-node map for the E8 map criterion. `-outfile` is not a flag
+  (`STA-0562`). `check_power_grid` reports PDN connectivity ("All shapes on
+  net VPWR are connected").
+- Decision: E8 is schedulable — a usable reference exists in the container.
+
+**P-DRC — independent checker on a routed DEF**: `which` → Magic 8.3.623 and
+KLayout are both in the image. `magic -dnull -noconsole -rcfile
+/pdk/sky130A/libs.tech/magic/sky130A.magicrc` needs `PDK_ROOT=/pdk` exported
+(the magicrc does `tech load $PDK_ROOT/.../sky130A.tech`). Script: `lef read`
+(tlef + cell lef) → `def read gcd.routed.def` (269 nets, 384 subcells read)
+→ `load gcd` → `select top cell` → `drc euclidean on` → `drc style drc(full)`
+→ `drc check` → `drc count total`.
+
+- Result: **0 DRC errors** on the committed `gcd.routed.def` (consistent with
+  the committed empty `gcd.drc.rpt`); per-rule breakdown surface is
+  `drc listall why`. Decision: the E7 standalone scoping keeps its
+  independent reference — Magic reads foreign routed DEFs in this image.
+
+**What was run**: the four probe scripts above, once each, on
+`gcd.placed.def`/`gcd.routed.def`/`gcd.sdc` in the pinned image; host-side
+per-net SPEF comparison with python3. Probe artifacts (guide, SPEFs, CTS DEF,
+routed DEF, voltage CSV) are under the gitignored
+`tests/designs/gcd/runs/probes/` and can be regenerated from
+`p_gr.tcl`/`p_gr_readback.tcl`/`p_gr_tiny.tcl`/`p_gr_drt.tcl`/`p_cts.tcl`/
+`p_ird*.tcl`/`p_drc.tcl` there.
