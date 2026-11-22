@@ -92,9 +92,11 @@ impl RegisterCheck {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PinTimingState {
-    arrival_max: [f32; 2],
-    arrival_min: [f32; 2],
+pub(crate) struct PinTimingState {
+    /// `pub(crate)` for the cts tests' clock-latency collection; every
+    /// other field stays module-private.
+    pub(crate) arrival_max: [f32; 2],
+    pub(crate) arrival_min: [f32; 2],
     /// Arrival extremes referenced to the delay edge (`set_max_delay`/
     /// `set_min_delay` checks report these as their data arrival). Identical
     /// to `arrival_*` for port and flop launches; a launch through a latch's
@@ -2362,8 +2364,9 @@ fn run_sta_inner(
 }
 
 /// [`run_sta`] that also returns the per-pin timing state (the tests compare it pin by pin).
+/// `pub(crate)` so the `cts` tests can read propagated clock-pin arrivals on a CTS DEF.
 #[cfg(test)]
-fn run_sta_with_state(
+pub(crate) fn run_sta_with_state(
     design: &DesignDb,
     lib: &LibDb,
     sdc: &Sdc,

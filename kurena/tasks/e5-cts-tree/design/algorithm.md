@@ -8,10 +8,11 @@ public surface (`api.md`) and tests; `tree.rs` holds the constructor.
 ```rust
 struct ClockRoot {
     clock_name: String,   // `Clock::name` ("core_clk")
-    port_pin: PinId,      // the io pin named `Clock::port`
     root_net: NetId,      // net driven by that port
     driver_pin: PinId,    // `net_driver(root_net)`
 }
+// `port_pin` dropped at implementation — the driver lookup supersedes
+// it (a port-driven root carries the port pin as its driver).
 ```
 
 For each `clock` in `sdc.clocks` with `clock.port.is_some()` (design
@@ -52,7 +53,7 @@ levels); §Limitations names this.
 
 ## 3. Partition — count-equalized median bisection
 
-`partition(loads: &[(PinId, (i32, i32))], max_loads: usize) -> Vec<Vec<PinId>>`
+`partition(loads: &[(PinId, (i32, i32))], max_loads: usize) -> Vec<Vec<(PinId, (i32, i32))>>`
 
 - `g = ceil(n / max_loads)`. If `g <= 1`, return the single group.
 - Else recursively split into `floor(g/2)` + `ceil(g/2)` groups: sort the
@@ -158,12 +159,16 @@ loop:
   the loads it drives (level 0: mean of sink pin positions; upper
   levels: mean of child-buffer seed positions). Status stays `Unplaced`
   until legalization — `pin_pos_dbu` resolves positions regardless.
-- Legalize: snapshot pre-existing `PlacementStatus::Placed` `Core`/
-  `CoreTie` cells → set `Fixed`; build
+- Legalize: snapshot every non-inserted `Placed`/`Unplaced` cell → set
+  `Fixed` (regardless of macro class — `Fixed`/`Cover` are the only
+  statuses Abacus buckets as row obstacles, so a `Placed` welltap or
+  spacer left unpinned would be neither movable nor obstacle); build
   `gp_x_um/gp_y_um = cell_*_dbu / dbu_per_um` for all cells;
-  `legalize_placement(&mut db, tech, &gp_x, &gp_y)` (it self-verifies);
-  restore `Placed` on the snapshot. Only the inserted buffers are
-  movable — Abacus drops them into free sub-row gaps near the seeds.
+  `legalize_placement(&mut db, tech, &gp_x, &gp_y)` (it self-verifies —
+  under the pinned statuses, so `run_cts` re-runs `verify_legality`
+  after the restore); restore each cell's original status. Only the
+  inserted buffers are movable — Abacus drops them into free sub-row
+  gaps near the seeds.
 - Why pin-and-place (the acceptance needs it literally): with all cells
   movable, Abacus may shift pre-existing cells → component lines would
   differ and control-net HPWL would move. Pinned, the emitted DEF's

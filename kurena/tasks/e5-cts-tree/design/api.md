@@ -41,17 +41,21 @@ pub fn run_cts(
 Internal to `tree.rs`:
 
 ```rust
-struct ClockRoot { clock_name: String, port_pin: PinId,
+// `port_pin` from the draft was dropped — the driver lookup makes it
+// redundant (a driverless root is refused, a port-driven root carries
+// the port as its driver) — no other consumer surfaced.
+struct ClockRoot { clock_name: String,
                    root_net: NetId, driver_pin: PinId }
 fn clock_roots(db: &DesignDb, sdc: &Sdc) -> Result<Vec<ClockRoot>>;
 fn partition(loads: &[(PinId, (i32, i32))], max_loads: usize)
     -> Vec<Vec<(PinId, (i32, i32))>>;
-fn pick_buffer(group: &[(PinId, (i32, i32))], db, tech, lib, cfg)
+fn pick_buffer(group: &[(PinId, (i32, i32))], db, tech, lib,
+               buf_list: &[String], c_pf_per_um: f32)
     -> String;                    // macro name from cfg.buf_list
 fn buffer_signal_pins(db: &DesignDb, cell: CellId, tech: &TechDb)
     -> (PinId /*in*/, PinId /*out*/);   // non-power Input/Output scan
 fn legalize_inserted_only(db: &mut DesignDb, tech: &TechDb,
-                          inserted: &[CellId]) -> Result<()>;
+                          inserted: &HashSet<CellId>) -> Result<()>;
 ```
 
 `lib.rs` gains `pub mod cts;` next to `pub mod power;`.

@@ -66,6 +66,10 @@ enum Commands {
     /// N7: Power estimation from VCD or SAIF switching activity (leakage + switching + internal)
     #[command(name = "power")]
     Power(PowerArgs),
+
+    /// E5: Clock-tree synthesis — balanced buffer tree + legalized CTS DEF
+    #[command(name = "cts")]
+    Cts(CtsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -364,6 +368,30 @@ struct PowerArgs {
 
     #[arg(long, help = "Write the power report as JSON to this path")]
     json: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct CtsArgs {
+    #[arg(long, help = "Path to technology LEF (.tlef) file")]
+    tlef: PathBuf,
+
+    #[arg(long, help = "Path to standard cell LEF (.lef) file")]
+    lef: PathBuf,
+
+    #[arg(long, help = "Path to Liberty (.lib) file")]
+    lib: PathBuf,
+
+    #[arg(long, help = "Path to placed DEF (.def) file")]
+    def: PathBuf,
+
+    #[arg(long, help = "Path to SDC (.sdc) timing constraints file")]
+    sdc: PathBuf,
+
+    #[arg(long, help = "Path to output CTS DEF (.def) file")]
+    def_out: PathBuf,
+
+    #[arg(long, help = "Write the buffer census report as JSON to this path")]
+    report: Option<PathBuf>,
 }
 
 /// Shared load path of the `congestion` and `route` arms: tech + placed DEF
@@ -1144,6 +1172,60 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 grus_core::timing::print_report();
             }
         }
+        Commands::Cts(args) => {
+            let mut interner = grus_core::interner::StringInterner::new();
+            let tech_db = {
+                let _p = grus_core::timing::phase("cts.load.lef");
+                load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
+            };
+            let lib_db = {
+                let _p = grus_core::timing::phase("cts.load.liberty");
+                grus_core::readers::load_liberty(&args.lib)?
+            };
+            let mut design = {
+                let _p = grus_core::timing::phase("cts.load.def");
+                grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
+            };
+            let sdc = {
+                let _p = grus_core::timing::phase("cts.load.sdc");
+                grus_core::sta::load_sdc(&args.sdc)?
+            };
+            let t0 = std::time::Instant::now();
+            let report = {
+                let _p = grus_core::timing::phase("cts.tree");
+                grus_core::cts::run_cts(
+                    &mut design,
+                    &tech_db,
+                    &lib_db,
+                    &sdc,
+                    &grus_core::cts::CtsConfig::default(),
+                )?
+            };
+            let elapsed_cts = t0.elapsed().as_secs_f64() * 1000.0;
+            {
+                let _p = grus_core::timing::phase("cts.write.def");
+                grus_core::readers::write_def_full(&design, &tech_db, &args.def_out)?;
+            }
+            println!(
+                "CTS: design={}, clock={}, buffers={}, depth={}, sinks={}, clock-net HPWL={:.3} um, wrote {:?} ({:.2} ms)",
+                report.design,
+                report.clock,
+                report.inserted_instances,
+                report.tree_depth,
+                report.sinks,
+                report.clock_net_wirelength_um,
+                args.def_out,
+                elapsed_cts,
+            );
+            if let Some(path) = &args.report {
+                let json = serde_json::to_string_pretty(&report)?;
+                std::fs::write(path, json)?;
+                println!("Wrote CTS report JSON to {:?}", path);
+            }
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
+            }
+        }
     }
     Ok(())
 }
@@ -1579,5 +1661,97 @@ mod tests {
         assert!(err.is_err(), "--strict must fail when cells were skipped");
 
         let _ = std::fs::remove_file(&json_path);
+    }
+
+    /// E5: `cts` parses, runs on gcd.placed.def, and the emitted DEF
+    /// re-parses and legalizes; `--report` JSON carries the census.
+    #[test]
+    fn cli_cts_parse_and_gcd_e2e() {
+        let full = [
+            "grus-eda",
+            "cts",
+            "--tlef",
+            "a",
+            "--lef",
+            "b",
+            "--lib",
+            "c",
+            "--def",
+            "d",
+            "--sdc",
+            "e",
+            "--def-out",
+            "f",
+        ];
+        assert!(Cli::try_parse_from(full).is_ok());
+        for drop in ["--tlef", "--lef", "--lib", "--def", "--sdc", "--def-out"] {
+            let argv: Vec<&str> = full
+                .chunks(2)
+                .skip(1)
+                .flat_map(|kv| {
+                    if kv[0] == drop {
+                        Vec::new()
+                    } else {
+                        kv.to_vec()
+                    }
+                })
+                .collect();
+            let mut argv = argv;
+            argv.insert(0, "grus-eda");
+            argv.insert(1, "cts");
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "cts without {drop} must fail"
+            );
+        }
+
+        let hd = sky130_hd();
+        let lib = require(hd.join("lib/sky130_fd_sc_hd__tt_025C_1v80.lib"));
+        let tlef = require(hd.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef = require(hd.join("lef/sky130_fd_sc_hd.lef"));
+        let gcd = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/designs/gcd");
+        let out_def = std::env::temp_dir().join("grus_cli_test_cts_gcd.def");
+        let report_path = std::env::temp_dir().join("grus_cli_test_cts_gcd.json");
+
+        run(Cli::try_parse_from([
+            "grus-eda",
+            "cts",
+            "--tlef",
+            tlef.to_str().unwrap(),
+            "--lef",
+            lef.to_str().unwrap(),
+            "--lib",
+            lib.to_str().unwrap(),
+            "--def",
+            gcd.join("gcd.placed.def").to_str().unwrap(),
+            "--sdc",
+            gcd.join("gcd.cts.sdc").to_str().unwrap(),
+            "--def-out",
+            out_def.to_str().unwrap(),
+            "--report",
+            report_path.to_str().unwrap(),
+        ])
+        .unwrap())
+        .expect("cts must succeed");
+
+        // The emitted DEF re-parses and passes legality.
+        let mut interner = grus_core::interner::StringInterner::new();
+        let (tech_db, _) =
+            grus_core::readers::load_tech_db(&tlef, &lef, &mut interner).expect("tech DB reload");
+        let db2 =
+            grus_core::readers::parse_def(&out_def, &tech_db, None).expect("re-parse CTS DEF");
+        grus_core::placement::verify_legality(&db2, &tech_db).expect("CTS DEF passes legality");
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).expect("report JSON"))
+                .expect("report JSON parses");
+        assert_eq!(report["design"].as_str().unwrap(), "gcd");
+        assert_eq!(report["sinks"].as_u64().unwrap(), 35);
+        assert_eq!(report["tree_depth"].as_u64().unwrap(), 2);
+        assert!(report["inserted_instances"].as_u64().unwrap() > 0);
+        assert!(report["clock_net_wirelength_um"].as_f64().unwrap() > 0.0);
+
+        let _ = std::fs::remove_file(&out_def);
+        let _ = std::fs::remove_file(&report_path);
     }
 }

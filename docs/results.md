@@ -7292,3 +7292,97 @@ duplicate `new_net_name`) and bails on multi-driver nets instead of
 letting moved drivers displace `buf_out` at index 0. Rustdoc's
 `pin_*` column count corrected thirteen → eleven (matching the
 eleven per-pin SoA columns; `api.md` amended identically).
+
+### 2026-11-23 — e5-cts-tree: the clock-tree constructor (v0.5.0)
+
+E5 ticket 3 (`kurena/tasks/e5-cts-tree/`): `grus-eda cts` builds a
+depth-balanced buffer tree on each design clock's root net, legalizes only
+the inserted cells, and emits a CTS DEF plus a census report. Algorithm and
+schema: `docs/e5-cts.md`; constructor in `crates/grus-core/src/cts/`.
+
+**Measured census vs the committed TritonCTS references**
+(`run_cts` report JSON vs `<d>.cts.reference.json`; reference tree buffers
+exclude its dummy loads, which this stage does not build — see
+`docs/e5-cts.md` §3):
+
+| Field | gcd ref | gcd ours | picorv32 ref | picorv32 ours |
+|---|---|---|---|---|
+| `sinks` | 35 | **35** | 1,597 | **1,597** |
+| `tree_depth` | 2 | **2** | 4 | **4** |
+| tree buffers (`clock_subnets`) | 5 | **6** | 197 | **230** |
+| `inserted_instances` | 8 (5 + 3 dummy) | 6 | 253 (197 + 56 dummy) | 230 |
+| per-type | `clkbuf_16` ×5 | `clkbuf_16` ×1 + `clkbuf_8` ×5 | `clkbuf_8` ×68 + `clkbuf_16` ×129 | `clkbuf_16` ×1 + `clkbuf_8` ×229 |
+| `clock_net_wirelength_um` | 370.244 | 428.107 | 12,749.174 | 16,260.659 |
+| `avg_sink_wirelength_um` | 120.66 | 18.307 | 756.54 | 16.734 |
+| `def_components` | 392 | 390 | 10,458 | 10,435 |
+| `def_signal_nets` | 274 | 275 | 7,008 | 7,041 |
+
+Same league on depth and census class (tree buffers, not
+per-sink; ours groups ~7–8 loads/buffer vs the reference's ~7/8.1). The
+reference's dummy loads have no counterpart yet. `avg_sink_wirelength_um`
+is a *different quantity* (ours: mean sink→leaf-buffer Manhattan; theirs:
+TritonCTS's `CTS-0101` internal metric) — recorded, not equated. Our
+clock-net HPWL runs ~16%/28% higher: buffers seed at group centroids and
+drop into free gaps, no trunk-topology optimization.
+
+**Propagated-clock STA on our CTS DEFs** (informational — the strict
+`max(5 ps, 1%)` endpoint comparison is `e5-cts-e2e`):
+
+- gcd: all 35 clock pins reached; insertion delay (propagated `arrival_max`
+  rise) 0.3039–0.3061 ns, spread **2.2 ps**; reference latency
+  0.313195–0.314567 ns / skew −0.0014 ns on its own DEF. `wns_max 1.3406`,
+  `wns_min 0.4927`.
+- picorv32: all 1,597 clock pins reached; 0.7315–0.8021 ns, spread
+  **70.6 ps**; reference 0.7573–0.7935 / skew −0.0342. `wns_max −1.7676`
+  matches the reference's own `cts_placement_rc` golden `−1.779235`
+  (pre-existing design slack, not a CTS regression); `wns_min 0.4049`.
+- `unreached_endpoints=106` on picorv32 equals the placed-design STA
+  baseline (pre-existing unmodelled arcs — counted skips, not new).
+
+**Mutation boundary**: `test_cts_untouched_def_identical` — the PINS
+block, all 384 component lines, and all 268 non-`clk` net lines of the
+emitted DEF are byte-identical; control net `ctrl.state.out[1]` member
+positions and HPWL unchanged. `test_cts_def_roundtrip_{gcd,picorv32}` —
+emitted DEFs re-parse, `verify_legality` accepts, every pre-existing cell
+keeps status and position (pin-and-place legalization; statuses restored
+even on failure).
+
+**Fail-proof**: mutating `partition` to one-group-per-sink loops the
+level construction forever (the load count never shrinks — itself proof
+the fanout split is load-bearing; the suite was killed, not failed). The
+recorded mutation collapses `partition` to a single group:
+`test_cts_tree_structure_gcd` and `test_cts_census_picorv32` go red on
+`depth 1` immediately; restored, all green.
+
+**Coverage caveat** (tests.md T7): a root net driven by a *cell* pin
+(internal/generated clock) is accepted by `clock_roots` but untested —
+no cheap fixture; the code path is reviewed-only, not exercised
+(§7.4). Multi-root construction across two distinct clock nets is
+likewise reviewed-only: the committed SDCs carry a single clock each,
+and the dedup test shares one net.
+
+**Design-doc refinements** (allowed, recorded here): `ClockRoot` dropped
+the `port_pin` field (the driver lookup supersedes it);
+`legalize_inserted_only` takes `&HashSet<CellId>` and pins *every*
+non-inserted `Placed`/`Unplaced` cell regardless of macro class —
+`Fixed`/`Cover` are the only statuses Abacus buckets as obstacles, so a
+`Placed` welltap left unpinned could be silently overlapped.
+`api.md`/`algorithm.md` amended identically. `spec/` untouched.
+
+**What was run**: `cargo test --workspace` — **393 grus-core + 4
+grus-eda tests pass, 0 failures** (9 new `cts::` tests + 1 new CLI test);
+`cargo clippy --workspace --all-targets -- -D warnings` — clean. The
+worktree was missing the gitignored picorv32 guide-parasitics artifacts
+(same gap the e5-insert-api run hit): regenerated on-host —
+`tests/designs/generate_guide_ours_spef.sh picorv32` for
+`picorv32.guide.ours.spef`, then `generate_ref.sh` steps **5d** and **9c**
+only, verbatim-extracted (`runs/canonical/*.tcl` +
+`runs/gen_guide_missing.sh`) inside `ghcr.io/librelane/librelane:3.0.16`
+producing `picorv32.guide.spef` and `picorv32.guide.sta.reference.json`.
+All outputs gitignored — no repo-visible artifact. The optional heavy
+`cargo test --release -p grus-core sta` regression was **not** run.
+
+**Version note**: `0.4.0 → 0.5.0` **minor**, per the ticket's explicit
+"version bumped (minor)" instruction; under AGENTS.md §5's 0.x rule a
+feature addition would be a patch — the deviation is recorded, not silent
+(same disposition as the `0.3.13 → 0.4.0` bump).

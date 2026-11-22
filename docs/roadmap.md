@@ -650,6 +650,13 @@ tolerances, probe evidence — is in
   `repair_clock_nets`): skew within `max(25 ps, 25%)` (gcd reference ≈ 0 ps),
   max insertion delay within 15% (reference ≈ 0.31 ns), propagated-clock STA
   on the TritonCTS DEF vs ours within `max(5 ps, 1%)` per endpoint.
+- Progress: ticket 1 `e5-cts-ref` committed the TritonCTS goldens; ticket 2
+  `e5-insert-api` landed the `DesignDb` mutation API; ticket 3 `e5-cts-tree`
+  (`v0.5.0`) landed the depth-balanced constructor — `grus-eda cts` emits
+  legal CTS DEFs in the TritonCTS census league (gcd 6/depth 2, picorv32
+  230/depth 4) with informational propagated-STA readings; see
+  `docs/e5-cts.md`. Remaining: dummy-load repair and the strict e2e
+  comparison (`e5-cts-e2e`).
 - Sizing: ~6–8 tickets (M–L).
 
 ### E8. IR drop (power-grid analysis)
