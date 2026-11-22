@@ -90,18 +90,10 @@ pub fn expand_via(via: &PdnVia, tech: &TechDb) -> Result<Vec<(DrcLayer, RectDbu)
 /// source order; `Unplaced` cells contribute nothing.
 pub fn assemble(db: &DesignDb, tech: &TechDb) -> Result<DrcDesign> {
     let mut routing: Vec<LayerShapes> = (0..tech.routing_layers.len())
-        .map(|_| LayerShapes {
-            rects: Vec::new(),
-            by_x: Vec::new(),
-            max_xh: Vec::new(),
-        })
+        .map(|_| LayerShapes::new())
         .collect();
     let mut cut: Vec<LayerShapes> = (0..tech.cut_layers.len())
-        .map(|_| LayerShapes {
-            rects: Vec::new(),
-            by_x: Vec::new(),
-            max_xh: Vec::new(),
-        })
+        .map(|_| LayerShapes::new())
         .collect();
 
     let push = |routing: &mut Vec<LayerShapes>,
@@ -408,11 +400,7 @@ END DESIGN
     /// not count.
     #[test]
     fn test_iter_overlapping_strict() {
-        let mut l = LayerShapes {
-            rects: vec![],
-            by_x: vec![],
-            max_xh: vec![],
-        };
+        let mut l = LayerShapes::new();
         for r in [
             RectDbu::new(0, 0, 100, 100),
             RectDbu::new(100, 0, 150, 100), // touches A on the x=100 edge only
@@ -442,11 +430,7 @@ END DESIGN
     /// the probe is not a hit even though the scan starts before it.
     #[test]
     fn test_iter_overlapping_wide_and_left_rects() {
-        let mut l = LayerShapes {
-            rects: vec![],
-            by_x: vec![],
-            max_xh: vec![],
-        };
+        let mut l = LayerShapes::new();
         for r in [
             RectDbu::new(5, 0, 100, 100), // wide — reaches past the probe
             RectDbu::new(6, 0, 7, 100),   // fully left of the probe

@@ -627,6 +627,10 @@ fn add_def_via(
                 };
                 let r: u32 = number(r, "VIAS ROWCOL rows", line)?;
                 let c: u32 = number(c, "VIAS ROWCOL cols", line)?;
+                // 0 rows/cols yields an empty or inverted cut array.
+                if r == 0 || c == 0 {
+                    bail!("DEF line {line}: VIAS via {via_name} `+ ROWCOL` must be positive");
+                }
                 rowcol = (r, c);
             }
             "CUTSIZE" => {
@@ -664,13 +668,20 @@ fn add_def_via(
                     bail!("DEF line {line}: VIAS via {via_name} `+ ENCLOSURE` needs four numbers");
                 };
                 // OpenDB semantics: `(botX, botY, topX, topY)` symmetric
-                // overhangs on the cut array.
-                enclosure = (
+                // overhangs on the cut array. Negative overhangs invert
+                // the metal rect — the grammar's nonNegative check.
+                let enc = (
                     number::<i32>(a, "VIAS ENCLOSURE", line)?,
                     number::<i32>(b, "VIAS ENCLOSURE", line)?,
                     number::<i32>(c, "VIAS ENCLOSURE", line)?,
                     number::<i32>(d, "VIAS ENCLOSURE", line)?,
                 );
+                if enc.0 < 0 || enc.1 < 0 || enc.2 < 0 || enc.3 < 0 {
+                    bail!(
+                        "DEF line {line}: VIAS via {via_name} `+ ENCLOSURE` must not be negative"
+                    );
+                }
+                enclosure = enc;
             }
             "VIA" => {
                 let [lef_name] = args else {
@@ -1202,13 +1213,33 @@ fn parse_net_wire(
                 i = j;
             }
             "VIRTUAL" => {
-                // `VIRTUAL ( x y )` — a virtual connection point; it
-                // emits no shape and is not a wire vertex, so the path
-                // continues from the previous real point.
+                // `VIRTUAL ( x y )` — a virtual connection point. OpenDB
+                // stores it as a flagged vertex: the wire path still runs
+                // through it, so the segment up to the virtual point is
+                // real metal (a wire ending here is not a one-point stub).
                 let (x, y, j) = read_wire_point(sink, rest, i + 1, net_name, line)?;
+                i = j;
+                if have_point {
+                    let rect = if py == y {
+                        RectDbu::new(px.min(x) - half, y - half, px.max(x) + half, y + half)
+                    } else if px == x {
+                        RectDbu::new(x - half, py.min(y) - half, x + half, py.max(y) + half)
+                    } else {
+                        RectDbu::new(
+                            px.min(x) - half,
+                            py.min(y) - half,
+                            px.max(x) + half,
+                            py.max(y) + half,
+                        )
+                    };
+                    sink.wire_rects.push((lid, rect));
+                    emitted = true;
+                }
+                px = x;
+                py = y;
+                have_point = true;
                 sink.last_x = x;
                 sink.last_y = y;
-                i = j;
             }
             // Point modifiers the model does not read: `TAPER` (full-width
             // taper is the default) takes no argument, the rest take one.
@@ -3173,8 +3204,9 @@ END DESIGN
         assert_eq!(a.net_geoms, b.net_geoms);
     }
 
-    /// `+ COVER` wires and `VIRTUAL` points parse without emitting extra
-    /// shapes; `+ SHIELD` and net attributes are consumed.
+    /// `+ COVER` wires and `VIRTUAL` points parse — VIRTUAL is a flagged
+    /// vertex, so metal up to it is retained; `+ SHIELD` and net
+    /// attributes are consumed.
     #[test]
     fn test_nets_cover_virtual_and_attributes() {
         let def = NETS_DEF.replace(
@@ -3183,12 +3215,14 @@ END DESIGN
         );
         let db = parse_def_bytes(def.as_bytes(), &pdn_tech(), None).expect("must parse");
         let n1 = db.net_geom(NetId(0)).expect("n1 geom");
-        // VIRTUAL leaves no vertex: the met1 wire is one (0,0)-(1000,0)
-        // segment; the met2 wire is unchanged.
+        // VIRTUAL marks a flagged vertex, so the met1 wire paints two
+        // segments (0,0)-(400,0) and (400,0)-(1000,0) — the same union
+        // metal as one straight run; the met2 wire is unchanged.
         assert_eq!(
             n1.wire_rects,
             vec![
-                (layer_id(&pdn_tech(), "met1"), RectDbu::new(-70, -70, 1070, 70)),
+                (layer_id(&pdn_tech(), "met1"), RectDbu::new(-70, -70, 470, 70)),
+                (layer_id(&pdn_tech(), "met1"), RectDbu::new(330, -70, 1070, 70)),
                 (layer_id(&pdn_tech(), "met2"), RectDbu::new(430, -70, 570, 570)),
             ]
         );

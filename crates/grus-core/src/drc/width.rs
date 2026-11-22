@@ -374,26 +374,21 @@ END LIBRARY
     }
 
     fn design_with(m1_rects: &[RectDbu], cut_rects: &[RectDbu]) -> DrcDesign {
-        let shapes = |rs: &[RectDbu], src: ShapeSrc| LayerShapes {
-            rects: rs
-                .iter()
-                .map(|&r| ShapeRect {
-                    rect: r,
-                    src,
-                    net: None,
-                })
-                .collect(),
-            by_x: vec![],
-            max_xh: vec![],
+        let shapes = |rs: &[RectDbu], src: ShapeSrc| {
+            LayerShapes::from_rects(
+                rs.iter()
+                    .map(|&r| ShapeRect {
+                        rect: r,
+                        src,
+                        net: None,
+                    })
+                    .collect(),
+            )
         };
         DrcDesign {
             routing: vec![
                 shapes(m1_rects, ShapeSrc::SignalWire),
-                LayerShapes {
-                    rects: vec![],
-                    by_x: vec![],
-                    max_xh: vec![],
-                },
+                LayerShapes::new(),
             ],
             cut: vec![shapes(cut_rects, ShapeSrc::Via)],
         }

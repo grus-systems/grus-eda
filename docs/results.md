@@ -8764,3 +8764,20 @@ Unmutated control: 0.
 check both designs). Version `0.8.0 → 0.9.0`: `PdnVia.geom` is a
 required field on a public struct (breaking for literal construction;
 0.x minor per AGENTS §5).
+
+**Card-#45 follow-ups** (2026-11-23, same commit): `+ ROWCOL` now
+requires positive rows/cols and `+ ENCLOSURE` rejects negative values —
+both produced inverted cut-array/metal rects silently before; a
+`VIRTUAL` wire point is a flagged vertex in OpenDB's model, so the wire
+segment up to it is now emitted (previously a wire ending at VIRTUAL
+dropped its real metal and bailed as a one-point stub —
+`test_nets_cover_virtual_and_attributes` updated to the two-segment
+expectation); `LayerShapes::{by_x,max_xh}` are private with
+`new`/`from_rects` constructors so a hand-built value can no longer
+carry a dead overlap index; the mutation test asserts `all.len() == 1`
+(no other rule fires) and pins the violation's net (`VGND`), and the
+golden-join test also asserts each implemented rule is classified
+`lef_expressible` in `magic_rules_checked`. Re-run:
+`cargo test -p grus-core --test drc` 5/5, `cargo test -p grus-core
+--lib` 483, `cargo clippy --workspace --all-targets -- -D warnings`
+clean.

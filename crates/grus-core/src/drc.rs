@@ -43,19 +43,34 @@ pub struct ShapeRect {
 }
 
 /// Shapes on one layer, insertion order plus a sorted index into them.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LayerShapes {
     pub rects: Vec<ShapeRect>,
     /// `rects` indices sorted by `rect.xl` (stable — `sort_by_key`).
-    pub by_x: Vec<u32>,
+    /// Private: a hand-rolled value with an empty index would make
+    /// `iter_overlapping` silently return nothing — construction must
+    /// go through `new`/`from_rects`/`push`/`finish`.
+    by_x: Vec<u32>,
     /// Prefix max of `rect.xh` over `by_x` order. Non-decreasing by
     /// construction — this is what makes the overlap binary search
     /// sound (an `xh` predicate over `by_x` itself is not monotone:
     /// a wide early rect sits before narrow ones).
-    pub max_xh: Vec<i32>,
+    max_xh: Vec<i32>,
 }
 
 impl LayerShapes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Finished shapes — the index is built here, so the result can
+    /// never carry a dead index.
+    pub fn from_rects(rects: Vec<ShapeRect>) -> Self {
+        let mut s = LayerShapes::new();
+        s.rects = rects;
+        s.finish()
+    }
+
     fn push(&mut self, s: ShapeRect) {
         self.rects.push(s);
     }

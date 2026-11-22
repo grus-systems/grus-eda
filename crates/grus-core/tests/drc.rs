@@ -222,6 +222,12 @@ fn test_width_rules_join_golden() {
                 "{name}: golden names lack `{}`",
                 r.rule_name
             );
+            assert_eq!(
+                l.golden["magic_rules_checked"]["classification"][r.rule_name],
+                "lef_expressible",
+                "{name}: `{}` is not lef_expressible in the golden taxonomy",
+                r.rule_name
+            );
         }
         let per_rule = l.golden["magic_per_rule"]
             .as_object()
@@ -265,8 +271,14 @@ fn test_width_mutation_met1() {
     let all = check_width(&drc, &tech);
     let v: Vec<&Violation> = all.iter().filter(|v| v.rule == "met1.1").collect();
     assert_eq!(v.len(), 1, "exactly one met1.1 violation, got {v:?}");
+    assert_eq!(all.len(), 1, "no other rule may fire, got {all:?}");
     assert_eq!(v[0].measured_dbu, 100);
     assert_eq!(v[0].bound_dbu, 140);
+    assert_eq!(
+        v[0].net.map(|n| db.strings.resolve(n).to_string()),
+        Some("VGND".to_string()),
+        "the violated stripe is the first NEW met1 of VGND"
+    );
     let met1 = tech.layer_by_name[&tech.strings.get("met1").unwrap()];
     assert_eq!(v[0].layer, DrcLayer::Routing(met1));
 }
