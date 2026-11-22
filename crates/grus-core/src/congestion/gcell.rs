@@ -204,21 +204,11 @@ impl GCellGrid {
                                 Orient::S => {
                                     (cx + w - r.xh, cy + h - r.yh, cx + w - r.xl, cy + h - r.yl)
                                 }
-                                Orient::W => {
-                                    (cx + h - r.yh, cy + r.xl, cx + h - r.yl, cy + r.xh)
-                                }
-                                Orient::E => {
-                                    (cx + r.yl, cy + w - r.xh, cx + r.yh, cy + w - r.xl)
-                                }
-                                Orient::FN => {
-                                    (cx + w - r.xh, cy + r.yl, cx + w - r.xl, cy + r.yh)
-                                }
-                                Orient::FS => {
-                                    (cx + r.xl, cy + h - r.yh, cx + r.xh, cy + h - r.yl)
-                                }
-                                Orient::FW => {
-                                    (cx + r.yl, cy + r.xl, cx + r.yh, cy + r.xh)
-                                }
+                                Orient::W => (cx + h - r.yh, cy + r.xl, cx + h - r.yl, cy + r.xh),
+                                Orient::E => (cx + r.yl, cy + w - r.xh, cx + r.yh, cy + w - r.xl),
+                                Orient::FN => (cx + w - r.xh, cy + r.yl, cx + w - r.xl, cy + r.yh),
+                                Orient::FS => (cx + r.xl, cy + h - r.yh, cx + r.xh, cy + h - r.yl),
+                                Orient::FW => (cx + r.yl, cy + r.xl, cx + r.yh, cy + r.xh),
                                 Orient::FE => {
                                     (cx + h - r.yh, cy + w - r.xh, cx + h - r.yl, cy + w - r.xl)
                                 }
@@ -238,9 +228,10 @@ impl GCellGrid {
             if layer.dir == LayerDir::Horizontal {
                 // Horizontal routing across horizontal boundary edges (nx - 1 edges per row)
                 let mut raw_tracks_y = vec![0u32; ny];
-                let tg_opt = design_db.tracks.iter().find(|tg| {
-                    !tg.is_vertical_tracks && tg.layers.contains(&layer_id)
-                });
+                let tg_opt = design_db
+                    .tracks
+                    .iter()
+                    .find(|tg| !tg.is_vertical_tracks && tg.layers.contains(&layer_id));
 
                 for (y, raw_track) in raw_tracks_y.iter_mut().enumerate() {
                     let (y0, y1) = grid.y_bounds(y, die_yh);
@@ -335,9 +326,10 @@ impl GCellGrid {
             } else {
                 // Vertical routing across vertical boundary edges (ny - 1 edges per col)
                 let mut raw_tracks_x = vec![0u32; nx];
-                let tg_opt = design_db.tracks.iter().find(|tg| {
-                    tg.is_vertical_tracks && tg.layers.contains(&layer_id)
-                });
+                let tg_opt = design_db
+                    .tracks
+                    .iter()
+                    .find(|tg| tg.is_vertical_tracks && tg.layers.contains(&layer_id));
 
                 for (x, raw_track) in raw_tracks_x.iter_mut().enumerate() {
                     let (x0, x1) = grid.x_bounds(x, die_xh);
@@ -462,10 +454,10 @@ impl GCellGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
+    use crate::test_support::{design_dir, sky130_hd};
 
     #[test]
     fn test_gcell_grid_coordinate_clamping() {
@@ -483,10 +475,13 @@ mod tests {
         assert_eq!(p_neg, GPoint { x: 0, y: 0 });
 
         let p_far = grid.gcell_xy(50000, 50000);
-        assert_eq!(p_far, GPoint {
-            x: (grid.nx - 1) as u16,
-            y: (grid.ny - 1) as u16
-        });
+        assert_eq!(
+            p_far,
+            GPoint {
+                x: (grid.nx - 1) as u16,
+                y: (grid.ny - 1) as u16
+            }
+        );
     }
 
     #[test]
@@ -507,10 +502,10 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+            .expect("Failed to load TechDb")
+            .0;
 
-        let design_db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
@@ -523,16 +518,42 @@ mod tests {
         // 1. Grid dimensions & tile size
         assert_eq!(grid.nx, ref_json["gcell_nx"].as_u64().unwrap() as usize);
         assert_eq!(grid.ny, ref_json["gcell_ny"].as_u64().unwrap() as usize);
-        assert_eq!(grid.gcell_w_dbu, ref_json["gcell_tile_size_dbu"].as_i64().unwrap() as i32);
-        assert_eq!(grid.gcell_h_dbu, ref_json["gcell_tile_size_dbu"].as_i64().unwrap() as i32);
+        assert_eq!(
+            grid.gcell_w_dbu,
+            ref_json["gcell_tile_size_dbu"].as_i64().unwrap() as i32
+        );
+        assert_eq!(
+            grid.gcell_h_dbu,
+            ref_json["gcell_tile_size_dbu"].as_i64().unwrap() as i32
+        );
 
         // 2. Raw track capacity: exact equality for all 5 routing layers (met1..met5)
         let ref_raw = ref_json["gcell_raw_edge_tracks"].as_array().unwrap();
-        assert_eq!(grid.layer_raw_edge_tracks[1], ref_raw[0].as_u64().unwrap() as u32, "met1 raw edge tracks");
-        assert_eq!(grid.layer_raw_edge_tracks[2], ref_raw[1].as_u64().unwrap() as u32, "met2 raw edge tracks");
-        assert_eq!(grid.layer_raw_edge_tracks[3], ref_raw[2].as_u64().unwrap() as u32, "met3 raw edge tracks");
-        assert_eq!(grid.layer_raw_edge_tracks[4], ref_raw[3].as_u64().unwrap() as u32, "met4 raw edge tracks");
-        assert_eq!(grid.layer_raw_edge_tracks[5], ref_raw[4].as_u64().unwrap() as u32, "met5 raw edge tracks");
+        assert_eq!(
+            grid.layer_raw_edge_tracks[1],
+            ref_raw[0].as_u64().unwrap() as u32,
+            "met1 raw edge tracks"
+        );
+        assert_eq!(
+            grid.layer_raw_edge_tracks[2],
+            ref_raw[1].as_u64().unwrap() as u32,
+            "met2 raw edge tracks"
+        );
+        assert_eq!(
+            grid.layer_raw_edge_tracks[3],
+            ref_raw[2].as_u64().unwrap() as u32,
+            "met3 raw edge tracks"
+        );
+        assert_eq!(
+            grid.layer_raw_edge_tracks[4],
+            ref_raw[3].as_u64().unwrap() as u32,
+            "met4 raw edge tracks"
+        );
+        assert_eq!(
+            grid.layer_raw_edge_tracks[5],
+            ref_raw[4].as_u64().unwrap() as u32,
+            "met5 raw edge tracks"
+        );
 
         println!("grid raw: {:?}", &grid.layer_raw_edge_tracks[1..=5]);
         println!("grid orig: {:?}", &grid.layer_orig_edge_tracks[1..=5]);
@@ -543,28 +564,72 @@ mod tests {
         let ref_derated = ref_json["gcell_derated_edge_tracks"].as_array().unwrap();
 
         // met2..met5 exact equality to the integer
-        assert_eq!(grid.layer_orig_edge_tracks[2], ref_orig[1].as_u64().unwrap() as u32, "met2 orig edge tracks");
-        assert_eq!(grid.layer_derated_edge_tracks[2], ref_derated[1].as_u64().unwrap() as u32, "met2 derated edge tracks");
+        assert_eq!(
+            grid.layer_orig_edge_tracks[2],
+            ref_orig[1].as_u64().unwrap() as u32,
+            "met2 orig edge tracks"
+        );
+        assert_eq!(
+            grid.layer_derated_edge_tracks[2],
+            ref_derated[1].as_u64().unwrap() as u32,
+            "met2 derated edge tracks"
+        );
 
-        assert_eq!(grid.layer_orig_edge_tracks[3], ref_orig[2].as_u64().unwrap() as u32, "met3 orig edge tracks");
-        assert_eq!(grid.layer_derated_edge_tracks[3], ref_derated[2].as_u64().unwrap() as u32, "met3 derated edge tracks");
+        assert_eq!(
+            grid.layer_orig_edge_tracks[3],
+            ref_orig[2].as_u64().unwrap() as u32,
+            "met3 orig edge tracks"
+        );
+        assert_eq!(
+            grid.layer_derated_edge_tracks[3],
+            ref_derated[2].as_u64().unwrap() as u32,
+            "met3 derated edge tracks"
+        );
 
-        assert_eq!(grid.layer_orig_edge_tracks[4], ref_orig[3].as_u64().unwrap() as u32, "met4 orig edge tracks");
-        assert_eq!(grid.layer_derated_edge_tracks[4], ref_derated[3].as_u64().unwrap() as u32, "met4 derated edge tracks");
+        assert_eq!(
+            grid.layer_orig_edge_tracks[4],
+            ref_orig[3].as_u64().unwrap() as u32,
+            "met4 orig edge tracks"
+        );
+        assert_eq!(
+            grid.layer_derated_edge_tracks[4],
+            ref_derated[3].as_u64().unwrap() as u32,
+            "met4 derated edge tracks"
+        );
 
-        assert_eq!(grid.layer_orig_edge_tracks[5], ref_orig[4].as_u64().unwrap() as u32, "met5 orig edge tracks");
-        assert_eq!(grid.layer_derated_edge_tracks[5], ref_derated[4].as_u64().unwrap() as u32, "met5 derated edge tracks");
+        assert_eq!(
+            grid.layer_orig_edge_tracks[5],
+            ref_orig[4].as_u64().unwrap() as u32,
+            "met5 orig edge tracks"
+        );
+        assert_eq!(
+            grid.layer_derated_edge_tracks[5],
+            ref_derated[4].as_u64().unwrap() as u32,
+            "met5 derated edge tracks"
+        );
 
         // met1: our merged internal jumpers and PG pins yield 2748 / 1843 vs OpenROAD's 2705 / 1815
-        assert_eq!(grid.layer_orig_edge_tracks[1], 2748, "met1 orig edge tracks");
-        assert_eq!(grid.layer_derated_edge_tracks[1], 1843, "met1 derated edge tracks");
+        assert_eq!(
+            grid.layer_orig_edge_tracks[1], 2748,
+            "met1 orig edge tracks"
+        );
+        assert_eq!(
+            grid.layer_derated_edge_tracks[1], 1843,
+            "met1 derated edge tracks"
+        );
 
         // Total derated capacity across all 5 layers within 1% of OpenROAD (6344 vs 6316 = 0.44%)
         let our_total_derated: u32 = grid.layer_derated_edge_tracks.iter().sum();
         let ref_total_derated: u32 = ref_derated.iter().map(|v| v.as_u64().unwrap() as u32).sum();
         assert_eq!(our_total_derated, 6344);
         assert_eq!(ref_total_derated, 6316);
-        let pct_diff = ((our_total_derated as f64 - ref_total_derated as f64).abs() / ref_total_derated as f64) * 100.0;
-        assert!(pct_diff < 1.0, "Total derated capacity diff {:.2}% must be < 1.0%", pct_diff);
+        let pct_diff = ((our_total_derated as f64 - ref_total_derated as f64).abs()
+            / ref_total_derated as f64)
+            * 100.0;
+        assert!(
+            pct_diff < 1.0,
+            "Total derated capacity diff {:.2}% must be < 1.0%",
+            pct_diff
+        );
     }
 }

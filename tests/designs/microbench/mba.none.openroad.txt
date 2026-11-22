@@ -1,0 +1,55 @@
+unannotated    43
+ACTP clk 1.00000e+08 0.500 clock
+ACTP a 5.00000e+06 0.500 input
+ACTP b 5.00000e+06 0.500 input
+ACTP y 1.00000e+07 0.500 propagated
+ACTP yc 6.25000e+06 0.625 propagated
+ACTP qd 5.00000e+06 0.500 propagated
+ACTP q0 0.00000e+00 0.000 unknown
+ACTP q1 0.00000e+00 0.000 unknown
+ACTP yh 0.00000e+00 0.000 constant
+ACTP yl 0.00000e+00 0.000 constant
+ACTI u_and/A 5.00000e+06 0.500 propagated
+ACTI u_and/B 5.00000e+06 0.500 propagated
+ACTI u_and/X 5.00000e+06 0.250 propagated
+ACTI u_inv/A 5.00000e+06 0.500 propagated
+ACTI u_inv/Y 5.00000e+06 0.500 propagated
+ACTI u_or/A 5.00000e+06 0.250 propagated
+ACTI u_or/B 5.00000e+06 0.500 propagated
+ACTI u_or/X 6.25000e+06 0.625 propagated
+ACTI u_xor/A 5.00000e+06 0.500 propagated
+ACTI u_xor/B 5.00000e+06 0.500 propagated
+ACTI u_xor/X 1.00000e+07 0.500 propagated
+ACTI u_df/D 5.00000e+06 0.500 propagated
+ACTI u_df/CLK 1.00000e+08 0.500 clock
+ACTI u_df/Q 5.00000e+06 0.500 propagated
+ACTI u_f0/D 0.00000e+00 0.000 unknown
+ACTI u_f0/CLK 1.00000e+08 0.500 clock
+ACTI u_f0/Q 0.00000e+00 0.000 unknown
+ACTI u_i0/A 0.00000e+00 0.000 unknown
+ACTI u_i0/Y 0.00000e+00 0.000 unknown
+ACTI u_f1/D 0.00000e+00 0.000 unknown
+ACTI u_f1/CLK 1.00000e+08 0.500 clock
+ACTI u_f1/Q 0.00000e+00 0.000 unknown
+ACTI u_x1/A 0.00000e+00 0.000 unknown
+ACTI u_x1/B 0.00000e+00 0.000 unknown
+ACTI u_x1/X 0.00000e+00 0.000 unknown
+ACTI u_c/HI 0.00000e+00 0.000 constant
+ACTI u_c/LO 0.00000e+00 0.000 constant
+ACTI u_bh/A 0.00000e+00 0.000 constant
+ACTI u_bh/X 0.00000e+00 0.000 constant
+ACTI u_bl/A 0.00000e+00 0.000 constant
+ACTI u_bl/X 0.00000e+00 0.000 constant
+ACTI u_flt/A 5.00000e+06 0.500 input
+ACTI u_flt/X 5.00000e+06 0.500 propagated
+Group                    Internal    Switching      Leakage        Total
+                            Power        Power        Power        Power (Watts)
+------------------------------------------------------------------------
+Sequential           6.218178e-06 4.050000e-07 2.453692e-11 6.623202e-06  80.7%
+Combinational        2.413420e-07 1.341279e-06 3.129771e-11 1.582652e-06  19.3%
+Clock                0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00   0.0%
+Macro                0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00   0.0%
+Pad                  0.000000e+00 0.000000e+00 0.000000e+00 0.000000e+00   0.0%
+------------------------------------------------------------------------
+Total                6.459519e-06 1.746279e-06 5.583464e-11 8.205853e-06 100.0%
+                            78.7%        21.3%         0.0%

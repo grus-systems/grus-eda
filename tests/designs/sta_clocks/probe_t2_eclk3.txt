@@ -1,0 +1,28 @@
+warning: `/var/empty/.tclsh-history' is not writable.
+openroad> <y130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+1
+openroad> <f/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef, created 14 layers, 25 vias
+openroad> <0A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+[WARNING ODB-0220] WARNING (LEFPARS-2008): NOWIREEXTENSIONATPIN statement is obsolete in version 5.6 or later.
+The NOWIREEXTENSIONATPIN statement will be ignored. See file /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef at line 2.
+
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef, created 437 library cells
+openroad> read_def /work/tests/designs/sta_clocks/two_clock.def
+[INFO ODB-0127] Reading DEF file: /work/tests/designs/sta_clocks/two_clock.def
+[INFO ODB-0128] Design: sta_clocks
+[INFO ODB-0130]     Created 5 pins.
+[INFO ODB-0131]     Created 8 components and 54 component-terminals.
+[INFO ODB-0133]     Created 11 nets and 22 connections.
+[INFO ODB-0134] Finished DEF file: /work/tests/designs/sta_clocks/two_clock.def
+openroad> 
+openroad> puts "=== scenario t2_eclk3.sdc ==="
+=== scenario t2_eclk3.sdc ===
+openroad> <work/tests/designs/sta_clocks/t2_eclk3.sdc} err]} {
+...>     puts "SDC error: $err"
+...>     exit 0
+...> }
+[ERROR STA-0421] -from/-to must be used together.
+SDC error: Error: t2_eclk3.sdc, 12 STA-0421
+unable to write history to `/var/empty/.tclsh-history'
+

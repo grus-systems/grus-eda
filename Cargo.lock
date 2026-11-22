@@ -162,11 +162,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
+name = "fast-float2"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6e8948ce679d00a02a94739ea185595dca7118ed04feb991127e443bd3d761f"
+
+[[package]]
 name = "grus-core"
-version = "0.1.72"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "bincode",
+ "fast-float2",
  "memmap2",
  "rayon",
  "rustfft",
@@ -177,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "grus-eda"
-version = "0.1.72"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "clap",

@@ -1,0 +1,12 @@
+create_clock -period 2.0 [get_ports clk1]
+create_clock -period 1.0 [get_ports clk2]
+set_input_delay -min 0.1 -clock clk1 [get_ports d_in]
+set_input_delay -max 0.7 -clock clk1 [get_ports d_in]
+set_output_delay -min 0.1 -clock clk1 [get_ports ya]
+set_output_delay -max 0.7 -clock clk1 [get_ports ya]
+set_output_delay -min 0.1 -clock clk2 [get_ports yb]
+set_output_delay -max 0.7 -clock clk2 [get_ports yb]
+set_input_transition 0.1 [get_ports d_in]
+set_load 0.05 [get_ports ya]
+set_load 0.05 [get_ports yb]
+set_false_path -to clk2

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/grus-core", "crates/grus-eda"]
 
 [workspace.package]
-version = "0.1.72"
+version = "0.3.8"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -11,6 +11,7 @@ license = "Apache-2.0"
 anyhow = "1"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+fast-float2 = "0.2.4"
 memmap2 = "0.9"
 rayon = "1"
 rustfft = "6"

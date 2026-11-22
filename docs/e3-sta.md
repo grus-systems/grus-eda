@@ -161,7 +161,11 @@ To ensure `grus-eda sta` and OpenSTA evaluate the exact same boundary conditions
 - `set_input_delay <delay_ns> [-clock <clk>] <port_pattern_or_all_inputs>`
 - `set_output_delay <delay_ns> [-clock <clk>] <port_pattern_or_all_outputs>`
 - `set_input_transition <slew_ns> <port_pattern_or_all_inputs>` (or `set_driving_cell -lib_cell <cell> -pin <pin>`)
-- `set_load [-pin_load] <cap_pf> <port_pattern_or_all_outputs>`
+- `set_load [-pin_load] <cap_pf> <port_pattern_or_all_outputs>`; `[get_nets <names>]` annotates the
+  net's *wire* capacitance (replaces the parasitic term in the lumped model, last-wins per net;
+  counted unresolved under `--spef` parasitics). Pin/cell/cone object sets and
+  `-min`/`-max`/`-rise`/`-fall`/`-subtract_pin_load` are counted in `sdc_ignored_commands`;
+  `set_fanout_load <n> <objects>` parses and is counted (inert in OpenSTA, `STA-0461`).
 - `set_clock_uncertainty [-setup|-hold] <unc_ns> [get_clocks <clk>]` (no flag sets both; the clock list is validated but the design has a single clock)
 
 #### Dual Polarity Propagation & OpenSTA Worst-Slew Merge Rule (`propagate.rs`)
@@ -212,12 +216,23 @@ generic text above disagree, this section wins.
 2. **Net load is per transition.** For an output pin `y` driving net `e` with transition `pol`:
    `load(e, RISE) = Σ_sinks cap_rise + port_load`, `load(e, FALL) = Σ_sinks cap_fall + port_load`,
    where `port_load` is the SDC `set_load` value on any primary-output port on `e` (0.05 pF in gcd).
+   A `set_load [get_nets e]` annotation replaces the wire-capacitance term of `load(e, pol)`
+   (measured override, not sum — `docs/results.md` 2026-11-19, `ld_*` scenarios).
    Check: `_384_/Q` rise load `0.008223 = 0.001689 + 0.001614 + 0.002495 + 0.002425`; fall
-   `0.007406`. Zero-wire mode adds no wire cap, no wire delay, and sink slew = driver slew.
+   `0.007406`. A *tristate* driver pin stays on its net's load — OpenSTA counts the
+   driver's own pin capacitance for the arcs driving it too (`report_net z1` shows
+   `u_ebuf/Z tristate 0.002260` inside the net's 0.003934 pF total; `docs/results.md`
+   2026-11-21 `check_arcs` entry). Zero-wire mode adds no wire cap, no wire delay, and
+   sink slew = driver slew.
 3. **Ideal clock.** The clock net is not propagated. Every register `CLK` pin has
    `arrival = 0.0` (rise edge at t=0) and **`slew = 0.0`** for both max and min, even though
    `set_input_transition 0.15 [all_inputs]` matches `clk`. Only `RisingEdge` arcs are used
-   for `dfxtp`; `min_pulse_width` and other non-delay arcs are ignored.
+   for `dfxtp`; `min_pulse_width` is a separate evaluated check family (`v0.1.93`,
+   `StaReport::pulse_width_checks`, measured OpenSTA semantics in `docs/results.md`
+   2026-11-19) and `three_state_*` enable/disable arcs propagate as delay arcs
+   (`v0.2.11`, `docs/results.md` 2026-11-21). The remaining recognised check arcs —
+   `non_seq_*`, `preserve`, async `Clear`/`Preset`, and `min_pulse_width` off the
+   clock network — are deferred and counted.
    `set_propagated_clock` switches to the propagated mode (`v0.1.60`, roadmap R2): a separate
    pass walks clock nets through combinational arcs and computes arrival/slew per transition
    at every consumer clock pin, tracking the clock-edge index parity so inverting paths pick

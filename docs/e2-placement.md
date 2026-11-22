@@ -243,6 +243,8 @@ pub struct LegalizeResult {
     pub pre_legal_hpwl_dbu: i64,
     pub post_abacus_hpwl_dbu: i64,
     pub final_hpwl_dbu: i64,
+    pub pass1_eval_fallbacks: usize,      // full net rescans by pass 1 trial evals
+    pub refine_extrema_rebuilds: usize,   // full rescans by the shared extrema cache
 }
 
 pub fn legalize_placement(
@@ -283,11 +285,11 @@ pub fn legalize_placement(
    - Commit cell $i$ to the candidate sub-row that yields the minimum quadratic displacement cost $\Delta = (x_i^{\text{legal}} - x_i^{\text{gp}})^2 + (y_{\text{row}} - y_i^{\text{gp}})^2$ (where $x_i^{\text{legal}} = c_{\text{last}}.\text{x\_dbu} + c_{\text{last}}.\text{width\_dbu} - w_i$).
    - Unpack clusters in each sub-row left-to-right, setting `cell_x_dbu[c]`, `cell_y_dbu[c] = sub_row.orig_y_dbu`, `cell_orient[c] = sub_row.orient`, and `cell_status[c] = PlacementStatus::Placed`.
 4. **Post-Abacus Local Detailed Placement Refinement (4 Rounds)**:
-   - Because odd rows have `Orient::FS` (vertical pin flip) and fixed tapcells split rows into multiple sub-rows, run 4 deterministic passes over the legalized sub-rows using exact integer DBU net bounding boxes (`design_db.pin_pos_dbu(pin, tech_db)`):
-     1. **Equal-Width Cell Swaps**: For pairs of movable cells $(c_1, c_2)$ with identical width (`w[c_1] == w[c_2]`) within $\pm 4$ rows and $\pm 25\,000\text{ DBU}$ horizontally, swap their positions/orientations if the incident nets' exact DBU HPWL strictly decreases ($\Delta\text{HPWL} < 0$).
+   - Because odd rows have `Orient::FS` (vertical pin flip) and fixed tapcells split rows into multiple sub-rows, run 4 deterministic passes over the legalized sub-rows using exact integer DBU net bounding boxes (`design_db.pin_pos_dbu(pin, tech_db)`). One shared per-net `NetExtrema` cache (the two smallest and two largest pin coordinates per axis, each tagged with its pin) is built once after Abacus and maintained exactly across every accepted move — a moved pin inserts its new coordinate into the top-2, and only a moved pin that held a maintained slot triggers a full rescan of that net — so the passes evaluate incident nets in O(moved pins) instead of O(net degree):
+     1. **Equal-Width Cell Swaps**: For pairs of movable cells $(c_1, c_2)$ with identical width (`w[c_1] == w[c_2]`) within $\pm 4$ rows and $\pm 25\,000\text{ DBU}$ horizontally, swap their positions/orientations if the incident nets' exact DBU HPWL strictly decreases ($\Delta\text{HPWL} < 0$). The per-band index is keyed `(width, x_dbu, movable index, cell)`, so the candidate window scans same-width entries only.
      2. **Adjacent Sub-Row Cell Swaps**: In each `SubRow` with $k \ge 2$ cells, test swapping adjacent cells `(cells[j], cells[j + 1])` within their combined span (`new_xb = xa`, `new_xa = xa + wb` when `new_xa + wa <= xb + wb`), keeping the swap if incident nets' exact DBU HPWL strictly decreases.
      3. **Single-Cell Optimal Site Sliding**:
-        - Within its current `SubRow`, slide cell $c_j$ inside its non-overlapping site bounds `[left_limit, right_limit]` to the site (testing `left_limit`, `right_limit`, and the median $x$ of cell $c_j$'s connected pins snapped to site) that minimizes incident nets' exact DBU HPWL.
+        - Within its current `SubRow`, slide cell $c_j$ inside its non-overlapping site bounds `[left_limit, right_limit]` to the site minimizing the incident nets' x-HPWL sum $f(dx) = \sum_n (\max(o_{hi}, c_{hi} + dx) - \min(o_{lo}, c_{lo} + dx))$ over the spans `(other_lo, other_hi, c_lo, c_hi)` of each incident net. `f` is a sum of convex piecewise-linear terms whose only kinks sit at $dx = o_{lo} - c_{lo}$ and $dx = o_{hi} - c_{hi}$, so the candidate set — `left_limit`, `right_limit`, and `snap_down`/`snap_up` of each kink target — contains the exact site-grid argmin (brute-force-gated by `test_pass3_candidates_hit_site_argmin`).
 5. **Self-Verification (`verify_legality`) & CLI (`grus-eda place`)**:
    - Before returning `LegalizeResult`, verify that all movable cells have `PlacementStatus::Placed`, lie on valid `PlacementRow` $y$-coordinates and site-grid $x$-coordinates with matching `row.orient`, stay within row `[orig_x_dbu, orig_x_dbu + num_x * step_x_dbu]`, and have zero overlaps with any other movable or fixed cell.
    - Wire up `grus-eda place` in `crates/grus-eda/src/main.rs`:

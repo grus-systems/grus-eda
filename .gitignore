@@ -2,6 +2,8 @@
 /out
 *.odb
 *.vcd
+# microbench activity fixtures are authored inputs, not generated dumps.
+!tests/designs/microbench/*.vcd
 .DS_Store
 tests/designs/pdk
 tests/designs/gcd/runs
@@ -52,3 +54,4 @@ tests/designs/ibex/ibex.util65.def
 tests/designs/ibex/ibex.routed.spef
 tests/designs/ibex/ibex.sta.reference.json
 tests/designs/*/pins_*.txt
+.kurena/

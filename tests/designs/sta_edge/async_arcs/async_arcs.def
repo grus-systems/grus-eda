@@ -1,0 +1,52 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN async_arcs ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 20000 20000 ) ;
+ROW ROW_0 unithd 0 0 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_1 unithd 0 2720 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_2 unithd 0 5440 N DO 43 BY 1 STEP 460 2720 ;
+ROW ROW_3 unithd 0 8160 N DO 43 BY 1 STEP 460 2720 ;
+TRACKS X 170 DO 100 STEP 340 LAYER met1 ;
+TRACKS Y 140 DO 100 STEP 340 LAYER met2 ;
+COMPONENTS 14 ;
+- u_clkb sky130_fd_sc_hd__clkbuf_2 + PLACED ( 460 0 ) N ;
+- u_rst sky130_fd_sc_hd__clkbuf_2 + PLACED ( 460 2720 ) N ;
+- u_set sky130_fd_sc_hd__clkbuf_2 + PLACED ( 460 5440 ) N ;
+- u_ff0 sky130_fd_sc_hd__dfrtp_1 + PLACED ( 2300 0 ) N ;
+- u_ff2 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 11960 0 ) N ;
+- u_fp sky130_fd_sc_hd__dfstp_1 + PLACED ( 2300 2720 ) N ;
+- u_fbp sky130_fd_sc_hd__dfbbp_1 + PLACED ( 2300 5440 ) N ;
+- u_fbn sky130_fd_sc_hd__dfbbn_1 + PLACED ( 2300 8160 ) N ;
+- u_ar sky130_fd_sc_hd__dfrtp_1 + PLACED ( 460 10880 ) N ;
+- u_ap sky130_fd_sc_hd__dfstp_1 + PLACED ( 10120 10880 ) N ;
+- u_aq sky130_fd_sc_hd__dfrbp_1 + PLACED ( 460 13600 ) N ;
+- u_ds sky130_fd_sc_hd__dfxtp_1 + PLACED ( 11500 13600 ) N ;
+- u_dp sky130_fd_sc_hd__dfxtp_1 + PLACED ( 460 16320 ) N ;
+- u_dq sky130_fd_sc_hd__dfxtp_1 + PLACED ( 8280 16320 ) N ;
+END COMPONENTS
+PINS 6 ;
+- clk + NET clk + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 0 ) N ;
+- aclk + NET aclk + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 2720 ) N ;
+- rst_n + NET rst + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 5440 ) N ;
+- set_n + NET snet + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 8160 ) N ;
+- d_in + NET din + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 10880 ) N ;
+- y + NET y + DIRECTION OUTPUT + USE SIGNAL + LAYER met1 ( -70 -70 ) ( 70 70 ) + PLACED ( 0 13600 ) N ;
+END PINS
+NETS 13 ;
+- clk ( PIN clk ) ( u_clkb A ) + USE SIGNAL ;
+- c1 ( u_clkb X ) ( u_ff0 CLK ) ( u_fp CLK ) ( u_fbp CLK ) ( u_fbn CLK_N ) ( u_ff2 CLK ) ( u_ds CLK ) ( u_dp CLK ) ( u_dq CLK ) + USE SIGNAL ;
+- aclk ( PIN aclk ) ( u_ar CLK ) ( u_ap CLK ) ( u_aq CLK ) + USE SIGNAL ;
+- rst ( PIN rst_n ) ( u_rst A ) + USE SIGNAL ;
+- rst_b ( u_rst X ) ( u_ff0 RESET_B ) ( u_fbp RESET_B ) ( u_fbn RESET_B ) ( u_ar RESET_B ) ( u_aq RESET_B ) + USE SIGNAL ;
+- snet ( PIN set_n ) ( u_set A ) + USE SIGNAL ;
+- set_b ( u_set X ) ( u_fp SET_B ) ( u_fbp SET_B ) ( u_fbn SET_B ) ( u_ap SET_B ) + USE SIGNAL ;
+- din ( PIN d_in ) ( u_ff0 D ) ( u_fp D ) ( u_fbp D ) ( u_fbn D ) ( u_ar D ) ( u_ap D ) ( u_aq D ) + USE SIGNAL ;
+- d1 ( u_ff0 Q ) ( u_ff2 D ) + USE SIGNAL ;
+- a1 ( u_ar Q ) ( u_ds D ) + USE SIGNAL ;
+- a2 ( u_ap Q ) ( u_dp D ) + USE SIGNAL ;
+- a3 ( u_aq Q_N ) ( u_dq D ) + USE SIGNAL ;
+- y ( u_ff2 Q ) ( PIN y ) + USE SIGNAL ;
+END NETS
+END DESIGN

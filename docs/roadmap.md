@@ -88,30 +88,39 @@ The items below close these gaps, in the order proposed at the end.
 - Done when: on a public design with a buffered clock tree, setup and hold WNS/TNS and the
   per-endpoint arrival match OpenSTA within the default tolerance.
 
-### R3. Hold with propagated clocks
+### R3. Hold with propagated clocks — Done
 
-- Ideal-clock hold analysis exists (`arrival_min`, hold and removal constraints, hold
-  uncertainty, `wns_min`/`tns_min`) and is checked on the five benchmark designs. What is
-  left is the propagated-clock case: the min-path launch must use the early clock arrival
-  and slew, not the late ones.
-- Report the hold violation count next to WNS/TNS.
-- Done when: a fixture with a real hold violation (ideal clock and propagated clock) matches
-  OpenSTA on the violation count, worst hold slack and per-endpoint min arrival. This item
-  is part of R2's acceptance and is listed separately because it needs its own fixture.
+- Fixture `sta_edge/hold_violation/` (`hold.def` + `ideal.sdc` + `propagated.sdc`):
+  2 of 4 endpoints hold-violate in both modes, matched at `Tol::STRICT` by
+  `test_sta_edge_hold_violation_{ideal,propagated}` (`analysis.rs` — v0.1.61,
+  `docs/results.md` 2026-11-17 "R3").
+- `StaReport::hold_violations` is printed by `grus-eda sta` next to WNS/TNS
+  (`main.rs`) and serialised in `--json`; `compare_sta_edge` asserts the counts
+  exactly when the golden carries them.
+- Residual note kept verbatim: the propagated source-slew fix seeds the clock
+  port's `set_input_transition` (not `set_clock_transition`) into the propagated
+  network — measured in the same entry.
 
-### R4. Clock gating
+### R4. Clock gating — Done
 
-- R4a, combinational gates: AND/NAND/OR/NOR gates on the clock path, with the setup and
-  hold edges that match each gate's polarity. Today only a positive-unate `and2` is
-  matched, with fixed edge timing.
-- R4b, latch-based integrated clock-gating cells (`sky130_fd_sc_hd__dlclkp`): clock
-  propagation from `CLK` to `GCLK`, and the enable-pin checks. Today a latch cell
-  intercepts the arc and its output is treated as a half-period-delayed latch launch.
-- The `dlxtn` + `and2` gate in `ibex` is already handled for endpoints
-  ([`history/step4/10-latch-and-clock-gating.md`](history/step4/10-latch-and-clock-gating.md)).
-- Done when: for each of R4a and R4b there is a public design or a small fixture where all
-  endpoints (the gating checks and the gated registers) match OpenSTA on max/min arrival,
-  required time, slack and slew within the default tolerance.
+- Fixture `sta_edge/clock_gate/` covers `and2`/`or2`/`nand2`/`nor2` plus the
+  `dlclkp` integrated clock-gating cell, with `dfrtn` flops behind the
+  inverting gates so both edge polarities are exercised — STRICT in ideal and
+  propagated (`test_sta_edge_clock_gate_{ideal,propagated}`, v0.1.66,
+  `docs/results.md` 2026-11-17 "Roadmap R4").
+- The measured rule: gate kind comes from the output pin's Liberty `function`
+  (AND/NAND = rising check, OR/NOR = falling, both edges swapped); muxes and
+  partial functions are rejected by `gate_kind`, locked by
+  `test_gate_kind_classifies_liberty_functions`. `dlclkp`'s GATE check is an
+  ordinary register check and `CLK -> GCLK` uses the combinational arc.
+- Residuals: cells without a Liberty `function` keep the positive-unate AND
+  guess (they cannot be classified); `gating_enables` checks get no CRPR
+  credit under derate (pessimistic, recorded in the R7 entry); the four
+  `CrossDomain` deferrals in `docs/multi-clock.md` §2 are unrelated —
+  resolved in v0.2.12 (`xdomain-deferrals`). Ideal-mode clock-network
+  inversion is no longer open —
+  `ideal_clock_parity` has tracked edge phase through cell-driven clock nets
+  since v0.1.71 (same-day follow-up entry).
 
 ### R5. Latches
 
@@ -125,17 +134,37 @@ The items below close these gaps, in the order proposed at the end.
 - Restriction recorded in `docs/results.md`: latch loops are *not* phase-iterated —
   a `D -> Q` cycle is a combinational cycle and levelisation rejects it as an error,
   matching the tool's honest-failure rule instead of inventing a fixed point.
-- Remaining skip counts: `min_pulse_width` arcs and `Clear`/`Preset` arcs (OpenSTA
-  3.0.16 does not propagate them, R6) are counted in `latch_arcs_dropped`.
+- Remaining skip counts: deferred check arcs (`non_seq_*` etc.) and `Clear`/`Preset`
+  arcs (OpenSTA 3.0.16 does not propagate them, R6) are counted in
+  `latch_arcs_dropped`/`recognized_check_arcs`. `min_pulse_width` arcs left the
+  deferred set when they became evaluated checks in `v0.1.93` (N3).
 
-### R6. Asynchronous arcs
+### R6. Asynchronous arcs — Done (already matching, re-measured)
 
-- Rising recovery and removal checks are already collected. What is missing: propagation
-  through `Clear`/`Preset` arcs (`RESET_B -> Q`, `SET_B -> Q`), and the falling
-  recovery/removal variants where a cell needs them.
-- Done when: a design with asynchronous resets matches OpenSTA on the async check pins and
-  on every downstream endpoint reached through a `Clear`/`Preset` arc, within the default
-  tolerance.
+- Re-measured on `sta_edge/async_arcs` (`docs/results.md` 2026-11-21): OpenSTA
+  3.0.16 does **not** propagate `Clear`/`Preset` arcs into timed paths. The
+  unclocked-`CLK` discriminators `u_ar`/`u_ap`/`u_aq` carry raw arrivals on
+  `Q`/`Q_N` but no clock tag, so `find_timing_paths -to u_d*/D` returns zero
+  paths and disabling `u_ff0`'s `CLK -> Q` arc leaves `u_ff2/D` pathless.
+  `report_checks -unconstrained` names no unclocked endpoints at all; OpenSTA
+  emits no warning for them. Keeping `Clear`/`Preset` in
+  `recognized_check_arcs` is the matching behaviour — propagating would
+  diverge.
+- Check coverage now spans every async check shape in `sky130_fd_sc_hd`:
+  `dfrtp`/`dfstp`/`dfrbp`/`dfbbp`/`dfbbn` flop variants (rising and falling
+  recovery/removal, dual async pins) in this fixture at STRICT
+  (`test_sta_edge_async_arcs_{ideal,propagated}`), `dfrtn` in
+  `async_fall*`/`clock_gate`, `dlrt*`/`dlrb*` latches in `latch_borrow`;
+  `sdf*` scan cells are family-equivalent supersets (`SCD`/`SCE` pins extra).
+- Named residuals: `non_seq_*` arcs on `dfbb*`/`sdfbb*` stay deferred —
+  measured on `sta_edge/check_arcs` (`docs/results.md` 2026-11-21): OpenSTA
+  3.0.16 has no data-check report surface at all (`report_check_types
+  -data_setup` → STA-0562 "not a known keyword or flag",
+  `find_timing_paths -path_delay non_seq_setup` → STA-0510), and each
+  `SET_B`/`RESET_B` pin reports exactly one path — the recovery/removal
+  check, not a `non_seq` row. The deferral is parity, not a gap. `preserve`
+  stays unmeasurable (zero arcs in `sky130_fd_sc_hd`), so the re-measurement
+  clause stands for it alone.
 
 ### R7. Timing derate (with CRPR)
 
@@ -197,3 +226,338 @@ The items below close these gaps, in the order proposed at the end.
 
 R10 runs alongside every step. For a design with an integrated clock-gating cell, R4b
 comes before R2.
+
+## Candidate next work items
+
+The R0–R10 items above closed the gaps found on plain flip-flop and
+moderately-featured public designs. Exercising the tool further on
+realistic gate-level netlists surfaced the following generic EDA gaps.
+Each was re-verified on the public designs and `sta_edge` fixtures before
+being listed; none depends on any private design or number. They are
+candidates, not commitments — order and scope are open.
+
+### N1. Unreached-endpoint diagnostics — done
+
+- `SkipReport` now carries `skipped_endpoints`: one `SkippedEndpoint`
+  (`pin`, `kind`, `reason`, `related`) per `incomplete_checks` +
+  `unreached_endpoints` skip, serialized in the `--json` report and printed
+  by the `sta` skip summary.
+- Reasons: `incomplete_check` (missing clock pin or late/early arc, `related`
+  names the missing piece), `no_clock` (`related` = the unreached clock pin,
+  propagated clock only), `no_path`, `untimed_driver` (the net driver is a
+  cell with no Liberty mapping or no timing arcs — constants such as `conb`,
+  taps, fillers; `related` = the driver pin), and `no_constraint_table`
+  (pin reached but no arrived transition had a usable NLDM constraint table).
+- Verified on public designs: every unreached endpoint across `ibex` (7),
+  `jpeg` (1) and `picorv32` propagated (106) is an `untimed_driver` case —
+  output ports and one `ibex` check pin tied to constant `conb_1` cells.
+  `cargo test` covers both the `check` and `output_port` kinds.
+
+### N2. SDC subset coverage vs. stock flows — partially done
+
+Done (`8f5eccc`, `44131bd`):
+
+- `set_units`: `-time ns` / `-capacitance pF` and the unit keys the model
+  never reads are accepted; a `-time`/`-capacitance` in another unit is an
+  error rather than a silent rescale.
+- `set_timing_derate`: `-early` and `-late` may share one command and apply
+  to both corners.
+- `remove_from_collection`: ports subtract through `PortSel::Except`
+  (predicate bases record exclusions), clocks and name lists by name.
+- Criterion met: `tests/designs/gcd/gcd.write_sdc` — unchanged `write_sdc`
+  output from OpenSTA on `gcd.propagated.sdc` — parses with zero ignored
+  commands (`parses_stock_write_sdc_unchanged`). Stock `write_sdc` resolves
+  collections to per-object `[get_ports {...}]` rules and expands derate per
+  corner, so it never emits the constructs below; those come from
+  hand/flow-written constraint SDCs.
+
+Done since (`0711785`, `32abb45`, exception application):
+
+- `set_false_path` / `set_multicycle_path` with `get_cells`,
+  `all_registers`, `get_ports`, `all_inputs`, `all_outputs`, `get_pins`
+  and bare-name/`instance/pin` selectors, resolved after design load.
+  STA runs once per exception
+  signature class (prepare/eval split; slew stays unfiltered) and
+  endpoint reports are composed — false paths drop covered launch classes,
+  multicycles shift required times by the OpenSTA-measured formulas
+  (`docs/timing-exceptions.md`, `tests/designs/sta_exceptions/`).
+  Unsupported qualifiers (`-through`, `-rise`, clock selectors, …) and
+  `-both` are counted in `ignored_commands`; latch-D/clock-gate multicycle
+  endpoints are counted in `unsupported_multicycle_endpoints`.
+
+Done since (path-delay checks, `docs/path-delays.md`):
+
+- `set_max_delay`/`set_min_delay` with the same `-from`/`-to` selector set:
+  delay coverage joins the exception signature so covered sources land in
+  their own eval class; at a delay-covered endpoint the clock check's
+  candidate is kept (its ordinary arrival and slew) with only the
+  required time replaced by the capture-anchored delay requirement —
+  measured precedence false_path > delay > multicycle, file-order
+  last-wins within a kind. An earlier per-pin delay domain
+  (`delay_max`/`delay_launch_max`) was retired on 2026-11-19 when the
+  diverging-winner fixture falsified its pairing (`docs/path-delays.md`
+  section 5). Output-port `-to` endpoints compose with the edge-referenced
+  formulas (`req = N - output_delay_max - unc_setup`, `req = N -
+  output_delay_min + unc_hold`; measured 2026-11-19, `mdo_*`/`pmo_*`).
+  Unsupported qualifiers and out-of-model endpoints (clock gates, latch-D,
+  async checks) are counted, never silently applied
+  (`unsupported_path_delay_endpoints`).
+
+Done since (load selectors, `docs/results.md` 2026-11-19 entry):
+
+- `set_load <pf> [get_nets {...}]` applies the OpenSTA-measured
+  semantics: the annotation replaces the net's *wire* capacitance in the
+  lumped load (last-wins per net, partial apply with one
+  `unresolved_load_selectors` count per missing name). Measured against
+  OpenSTA goldens at STRICT (`ld_net`, `ld_nets`, `ld_portnet`,
+  `ld_last`, `ld_badnet`). Under `--spef` distributed parasitics the
+  annotation is counted unresolved rather than approximated.
+- `set_load` on `get_pins`/`get_cells`/`all_fanouts`/`all_fanins`/
+  `get_clocks` object sets and the `-min`/`-max`/`-rise`/`-fall`/
+  `-subtract_pin_load` qualifiers no longer abort the parse; each is
+  counted in `sdc_ignored_commands["set_load"]` (OpenSTA rejects the
+  pin/cell objects outright — `STA-0100` — and does not know the cone
+  commands at all).
+- `set_fanout_load <n> <objects>` parses and is counted in
+  `sdc_ignored_commands`; OpenSTA accepts it but warns it is unsupported
+  (`STA-0461`) and applies nothing, so the count is `is_clean`-exempt
+  like the `set_max_*` design rules.
+
+Remaining:
+
+- Multi-clock SDC (`docs/multi-clock.md`): OpenSTA's two-clock rules are
+  measured on the committed `sta_clocks` fixture (2026-11-19) and the
+  implementation ran as a five-ticket sequence (`mc-model` → `mc-eval` →
+  `mc-xdomain` → `mc-selectors` → `mc-golden`), now complete: `mc-model`
+  (the clock table, v0.2.0), `mc-eval` (domain tagging + same-domain
+  pairing, v0.2.1), `mc-xdomain` (cross-domain min-gap edge pairing +
+  inter-clock uncertainty, v0.2.2), `mc-selectors` (clock-object
+  selectors, `set_clock_groups`, `create_clock -waveform`, v0.2.5) and
+  `mc-golden` (probe promoted to `two_clock.reference.json`, v0.2.6).
+  All 52 golden `sta_clocks` scenarios match OpenSTA at strict
+  tolerance with `cross_domain == 0`, and `docs/path-delays.md`
+  section 5 has no open items left. `xdomain-deferrals` (v0.2.12)
+  resolved the four parked `CrossDomain` corners in
+  `docs/multi-clock.md` §2: undeclared-launch zero masks keep an
+  edge-0 clk->Q launch (ordinary checks dropped like OpenSTA's
+  `t2_u1`, named `UndeclaredLaunch` skips; `-to` delay checks
+  evaluate per `t2_u2`), latch-D foreign launches borrow through the
+  latch's own window (`t2_xlat`/`t2_xlat2`), and hold pairing is
+  capture-edge-driven inside the measured `pair_window` bound
+  (`t2_lcm`/`t2_lcm2`). The only surviving deferral is the defensive
+  no-pair-in-window `CrossDomain` — unreachable on the measured
+  grids.
+
+### N3. Check arcs: `min_pulse_width` and friends — DONE (`v0.1.74`)
+
+- Flop-heavy designs left a non-trivial share of arcs in
+  `unsupported_arcs[Other]` — `ibex` zero-wire reported `Other=3601`
+  (~7% of arcs) plus `Clear=1655`/`Preset=9`, so `--strict` could never
+  pass. These are check arcs (pulse width, `non_seq_*`), not
+  data-propagation arcs.
+- `TimingType` now names every `sky130_fd_sc_hd` check arc
+  (`min_pulse_width`, `non_seq_setup/hold_*`, `three_state_*`, `preserve`)
+  and `SkipReport::recognized_check_arcs` counts them per type on every
+  cell kind, latches included (a latch's pulse-width check no longer lands
+  in `latch_arcs_dropped`). They are exempt from `--strict` via `is_clean`
+  because they add endpoints outside the reported set rather than altering
+  an arrival or slack; `unsupported_arcs` and `latch_arcs_dropped` still
+  fail strict, and the CLI summary lists deferred arcs even on a clean run
+  ("skipped: none affecting reported timing").
+- `ibex` then reported `recognized_check_arcs[Clear=1655, MinPulseWidth=3602,
+  Preset=9]` with `unsupported_arcs`/`latch_arcs_dropped` empty;
+  `sta_edge/non_dlxtn_latch --strict` passes.
+- `min_pulse_width` is evaluated as of `v0.1.93` (see `docs/results.md`
+  2026-11-19 entry): `StaReport::pulse_width_checks` carries one row per
+  (check pin, high/low) with OpenSTA's measured semantics — widths between
+  consecutive opposite clock edges on the propagated network, the
+  early/late pair producing the smaller width, period wrap behind inverting
+  cells, constraint table at the check pin's own slew, and slack that never
+  enters ordinary WNS/TNS. Only arcs on clock-network pins produce rows
+  (`dfrtn`'s RESET_B arc emits none). Verified at strict tolerance against
+  `sta_edge/min_pulse_width` goldens (ideal, propagated+derated, violating);
+  `merge_corner_reports` merges rows by `(pin, edge)` min slack.
+- `three_state_enable`/`three_state_disable` are evaluated as of `v0.2.11`
+  (see `docs/results.md` 2026-11-21): OpenSTA propagates both as delay arcs
+  firing on the sense-declared source edge, both destination transitions —
+  `Z1`/`0Z` merge into dst rise, `Z0`/`1Z` into dst fall — and counts the
+  tristate driver pin's own capacitance on the net load. Verified at strict
+  tolerance against `sta_edge/check_arcs` goldens (ideal, propagated,
+  `te_slow` discriminator).
+- Still deferred: `non_seq_*`, `preserve`, and async
+  `Clear`/`Preset` stay counted in `recognized_check_arcs` — measured:
+  OpenSTA 3.0.16 reports no `non_seq`/`preserve` rows on any surface
+  (`report_check_types` rejects `-data_setup`/`-data_hold`, no per-pin
+  extra rows) and does not propagate `Clear`/`Preset` (R6). A
+  `min_pulse_width` arc whose pin is not on the clock network (e.g.
+  `dfrtn` `RESET_B`) emits no check row — matching OpenSTA — and counts
+  into `recognized_check_arcs[MinPulseWidth]` instead (ibex: 1664).
+
+### N4. SPEF write-out — DONE (v0.1.75)
+
+- `sta --spef-out <path>` serializes the parasitics used by the run
+  (placement RC, or the loaded `--spef` for SPEF-to-SPEF transcoding)
+  as IEEE 1481 SPEF: literal names, `*PORTS`, `*D_NET`/`*CONN`/`*CAP`/
+  `*RES`, `*R_UNIT 1 KOHM` for bit-exact resistance round-trip,
+  wire-only caps (`PIN_CAP NONE`).
+- Compatibility details measured against OpenSTA 3.0.16 / OpenROAD
+  3.0.16 `write_spef` output: the header must carry the full keyword
+  block (`*DIVIDER`, `*BUS_DELIMITER`, `*L_UNIT`, ...); `$` and `/` in
+  names need backslash escapes while `[`/`]` stay raw (bus-bit syntax
+  resolves to the literal DEF net name — escaping them makes OpenSTA
+  report "net not found" for every `name[N]` net).
+- Verified: emitted gcd/ibex SPEFs parse in OpenROAD with zero
+  warnings; OpenSTA slack on our SPEF agrees with our placement-RC STA
+  within ~0.1% (gcd WNS 1.664237 vs 1.665178 ns; ibex WNS -14.417081 vs
+  -14.411448 ns — OpenSTA's own delay engine on identical parasitics).
+  `test_write_spef_round_trip_{parasitics,sta}` lock the internal
+  round-trip (per-pin Elmore < 1e-9 ns; endpoint report identical).
+
+### N5. Netlist ingest + floorplan generation — DONE (v0.1.76)
+
+- `grus-eda floorplan` reads a gate-level netlist (Yosys JSON or
+  Verilog; the existing E0 readers already dedupe Yosys wire bits by
+  bit id, so the alias gotcha is handled) plus a floorplan spec and
+  emits a complete floorplan DEF: `--utilization` (default 0.60) or
+  `--die-area xl,yl,xh,yh` (microns), `--margin-um` (default 10),
+  `--site` (default: tech LEF site). Rows alternate N/FS at site
+  pitch; inputs go on the left edge, outputs on the right, names
+  sorted naturally so buses read in order.
+- `readers/def.rs::write_def_full` serializes a whole DesignDb (no
+  template): header, DIEAREA, ROWs, COMPONENTS, PINS, NETS. TRACKS/
+  GCELLGRID/VIAS/SPECIALNETS are omitted — they constrain detailed
+  routing/power, which the database does not model. Names go through
+  `escape_def_name`, which escapes only the lexer delimiters and `\`
+  itself; `[N]` bus-bit syntax stays literal so external readers see
+  the same names OpenROAD-flow-scripts emits. The DEF lexer was
+  extended to treat `\x` as an escaped character inside a word so
+  names containing `(`, `)`, `;`, `#`, or whitespace round-trip.
+- Verified: `gcd.synth.json` -> floorplan DEF -> `place` converges
+  (233 cells, 24 rows) -> `sta` reports the same 53 endpoints as the
+  DEF-fed path (setup wns 1.757771, zero violations). OpenROAD
+  `read_def` accepts the emitted DEFs with matching counts — gcd
+  (54 pins, 233 components, 269 nets), aes (388 pins, 8780
+  components, 9039 nets), ibex (264 pins, 11979 components, 12137
+  nets). `aes.synth.v` -> 8780 cells / 9039 nets round-trips through
+  `parse_def`. `floorplan::tests` lock the DEF round-trip
+  connectivity, edge assignment, and bad-spec rejection;
+  `readers::def::tests::test_escaped_names_roundtrip_through_lexer`
+  locks name escaping through the lexer.
+
+### N6. Multi-corner analysis — DONE
+
+- `sta --lib-hold <lib>` runs setup checks against `--lib` and hold checks
+  against `--lib-hold`, then merges the two reports into one worst-case
+  `StaReport` (`merge_corner_reports`). The DEF is parsed once per library so
+  `cell_lib_ids` resolve against the right `LibDb`; placement parasitics are
+  recomputed per design view.
+- Verified on `gcd.placed.def` with `ss_100C_1v60` (setup) + `ff_100C_1v95`
+  (hold): OpenROAD gives setup WNS -0.46 (ss) and hold WNS 0.31 (ff); ours
+  gives -0.730449 and 0.311508. The hold slack matches to ~0.5%; the setup
+  gap is the same STA-vs-OpenSTA divergence seen in single-corner runs.
+- `run_sta_quiet` suppresses duplicate skip warnings on the second corner run.
+- Endpoint sets must match across corners or the merge bails — different
+  Liberty coverage would silently drop checks.
+
+### N7. Power reporting (new stage, scope-gated)
+
+- VCD/SAIF-driven power estimation checked against OpenROAD
+  `report_power` within a stated tolerance. Largest item; only if power
+  estimation is in scope for the project.
+- **Status (2026-11-19)**: VCD and SAIF paths implemented and
+  formula-validated against a clocked micro-benchmark. `--saif` reads
+  `TC` aggregates and reconstructs the per-net edge counts (`--vcd`
+  counts minus clk's one fall outside the truncated `[10,1990]` SAIF
+  window), matching OpenROAD `read_saif` + `report_power` within ~0.4%
+  total on the committed golden (`mb.saif.reference.json`); OpenSTA SAIF
+  field semantics were measured in-container (docs/results.md). On `gcd`
+  the earlier "statistical propagation vs exact counts" gap turned out
+  to be mostly VCD-reader corruption (same-named `pin_signals` folding,
+  dropped short `b` writes) — with the reader fixes and the AP1–AP4
+  propagated model, `report_power` lands within ~2% of OpenSTA on every
+  group under the same VCD seeds (`docs/results.md` 2026-11-22); the
+  named residuals are the zero-wire-parasitics switching term and the
+  state-weighted `when` leakage attribution. `when`-conditional
+  `internal_power`
+  and `leakage_power` blocks now evaluate at the measured OpenSTA model
+  — marginal `P(when)` products, related-pin activity apportioning,
+  half-weight x/z edges — verified at ~1e-7% on the `mbw` ebufn fixture
+  in both VCD and SAIF paths (docs/results.md 2026-11-19); only
+  inexpressible `when` forms remain counted. Statistical activity
+  propagation is sequenced AP1–AP4 on the `mba` fixture: **AP1 done**
+  (v0.2.14 — `resolve_activity` skeleton + measured seed defaults,
+  `grus-eda power` runs without annotation); **AP2 done** (v0.2.15 —
+  bounded Liberty `function` evaluator, Kahn-ordered combinational
+  propagation with `Default`-taints, pin-namespaced annotation; the
+  golden's surviving divergent set is the 13-pin AP3 residual)
+  (v0.2.16 — constant marking is 3-valued absorptive; the stored
+  constant marginal is the measured 0.0 — cp.def probe); **AP3 done**
+  (v0.2.17 — sequential data-pin propagation: `ff.next_state` /
+  `latch.data_in` parsed into `LibCell::seq`, Q copies the D net's
+  `{P, d}` verbatim (origin `propagated`), resolution iterates to a
+  fixed point, leftover `Default` nets become `unknown {0,0}` and
+  taint; all 12 `mba` sessions match the golden per-pin and
+  `EXPECTED_DIVERGENT` is empty); **AP4 done** (v0.3.0 —
+  `ActivityOverrides::pins` per-pin `-pins` overrides and the native
+  `user` origin (also emitted by `-input_ports`), `dead_user_entries`,
+  `pins`≡`input_ports` equivalence pinned on the golden; two VCD
+  reader bugs the pin-namespace comparison exposed — flat-name
+  `pin_signals` folding and dropped short `b` writes — fixed, and the
+  gcd `report_power` gap narrowed to within ~2% on every group).
+  Remaining named residuals: the per-pin/per-net annotation gap
+  (`s_full` `y`), the `unknown`-net `prob_one: Some(0.0)` /
+  `when`-literal semantics note (OpenSTA's own `when` weight on
+  `unknown` unmeasured), the unmeasured precedence choices
+  (`user`-vs-dump, `-pins`-vs-`-input_ports`, duplicate `-pins`
+  last-wins), OpenSTA counting `user` under its `input N` split where
+  we report `user N` per net, and the zero-wire parasitics switching
+  plus state-weighted `when` leakage residuals on gcd. See
+  `docs/results.md` 2026-11-22 and
+  `kurena/tasks/ap4-activity-precedence/design/`.
+
+### N8. Performance (measured baseline — 2026-11-22, v0.3.2)
+
+Not a correctness item; a speed track. `GRUS_PHASE_TIMING=1` emits
+stderr phase timers at the whole-pass boundaries of `sta`, `power`,
+`place`, `congestion` (off by default, zero-cost gate). The committed
+matrix (`kurena/tasks/perf-profile/measure.sh`, 5 warm-cache reps on the
+M4 mini) is logged in `docs/results.md` 2026-11-22. Measured, the
+dominant phase is `sta.prepare.clock.slew` — a *serial* Kahn-level slew
+propagation (`propagate_slew`) at 77–81% of `sta` wall on the three
+largest designs and ~94% of `power` wall via `sta_pin_slews`; `sample`
+puts ~80% of main-thread samples inside `sta::dmp`
+(`rc_crossing`/`fit_ramp_duration`/`solve_dmp_with`). Candidate
+follow-on tickets, in measured order (details + Amdahl ceilings in
+`kurena/tasks/perf-profile/design/plan.md` — candidates, not
+commitments): ~~`perf-par-slew`~~ **done** (per-level `par_iter`, jpeg
+`sta` placement RC 6.0 s → 2.06 s, `sta.prepare.clock.slew` phase
+×5.4 — `docs/results.md` 2026-11-22 perf-par-slew entry);
+~~`perf-slewonly-power`~~ **done** (slew-only `sta_pin_slews` —
+`power` placement RC jpeg 2170 → 1030 ms, ×1.5–2.5 across the five
+designs; `power.slews` now nests `sta.slew.seeds|walk` and skips the
+pulse-width-only `sta.prepare.clock.*` block — `docs/results.md`
+2026-11-22 perf-slewonly-power entry); ~~`perf-legal-passes`~~ **done**
+(shared incremental `NetExtrema` cache + exact site-grid argmin slide —
+jpeg `place` 2170 → 1560 ms on the same-session baseline, `pass2`/`pass3`
+~×12, `pass1` flat; HPWL improved 0.3–0.6% on all five designs —
+`docs/results.md` 2026-11-22 perf-legal-passes entry; `place.gp.*` is
+now ~73% of the `place` wall and the dominant remaining phase), then
+~~the parser tickets
+`perf-spef-parse`, `perf-def-parse`, `perf-vcd-parse`~~ **done** —
+landed together as `perf-parsers` (allocation-free scans in all three
+readers: `sta.spef.read` ×1.34–1.39, `*.load.def`/`cong.load` ~×1.2,
+`power.activity.load` ×1.52; jpeg `sta.spef` cell wall 1650 → 1380 ms,
+`power.vcd.gcd` 440 → 290 ms — `docs/results.md` 2026-11-22
+perf-parsers entry), and
+~~`perf-dmp-hotloop`~~ **done** (per-call `to_bits()`-keyed memo of
+the DMP `table` closure — instrumented counts first: 0.0% cross-call
+`driver_response` exact repeats killed the run-scoped memo, 21.6%
+intra-call `table(c)` repeats chose the mechanism, 43.7%
+`rc_crossing` Brent share named residual; jpeg `sta.placement`
+1290 → 1090 ms, `power.placement` 740 → 630 ms, `cmp`-clean
+throughout — `docs/results.md` 2026-11-22 perf-dmp-hotloop entry).
+`sta.prepare.clock.slew` / `sta.eval.walk` remain the co-dominant
+phases on `sta` and `power` (the shared DMP inner loop, now minus
+the `eval_2d` redundancy). Every optimization ticket lands only with
+a bit-identical-or-tolerance-named fast path and a `docs/results.md`
+number, per the usual discipline.

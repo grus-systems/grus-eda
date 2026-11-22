@@ -1,7 +1,7 @@
 use crate::design_db::DesignDb;
 use crate::placement::density::DensitySolver;
 use crate::placement::wirelength::{
-    compute_hpwl_um, compute_wa_wirelength_and_grad, WaWirelengthPrecomp,
+    WaWirelengthPrecomp, compute_hpwl_um, compute_wa_wirelength_and_grad,
 };
 use crate::tech_db::TechDb;
 
@@ -242,6 +242,7 @@ pub fn run_nesterov_placement(
     config: &NesterovConfig,
 ) -> NesterovResult {
     let dbu_per_um = design_db.dbu_per_micron.max(1) as f32;
+    let t_init = crate::timing::phase("place.gp.init");
     let wl_precomp = WaWirelengthPrecomp::new(design_db, tech_db);
     let mut density_solver = DensitySolver::new(
         design_db,
@@ -290,6 +291,7 @@ pub fn run_nesterov_placement(
         (core_xl, core_xh, core_yl, core_yh),
         60,
     );
+    drop(t_init);
 
     // Small deterministic perturbation to movable cells
     for c in 0..num_cells {
@@ -317,8 +319,10 @@ pub fn run_nesterov_placement(
     // Initial force and overflow evaluation
     let mut force_x = vec![0.0f32; num_cells];
     let mut force_y = vec![0.0f32; num_cells];
-    let (init_tau, _) =
-        density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y);
+    let (init_tau, _) = {
+        let _d = crate::timing::phase("place.gp.density");
+        density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y)
+    };
 
     let gamma_0 = base_gamma * 10.0f32.powf(2.0 * (init_tau - 0.10));
 
@@ -326,17 +330,20 @@ pub fn run_nesterov_placement(
     let mut dummy_pin_gy = vec![0.0f32; num_pins];
     let mut wl_gx = vec![0.0f32; num_cells];
     let mut wl_gy = vec![0.0f32; num_cells];
-    compute_wa_wirelength_and_grad(
-        design_db,
-        &wl_precomp,
-        &v_x,
-        &v_y,
-        gamma_0,
-        &mut dummy_pin_gx,
-        &mut dummy_pin_gy,
-        &mut wl_gx,
-        &mut wl_gy,
-    );
+    {
+        let _w = crate::timing::phase("place.gp.wl");
+        compute_wa_wirelength_and_grad(
+            design_db,
+            &wl_precomp,
+            &v_x,
+            &v_y,
+            gamma_0,
+            &mut dummy_pin_gx,
+            &mut dummy_pin_gy,
+            &mut wl_gx,
+            &mut wl_gy,
+        );
+    }
 
     let norm_wl = l1_norm_f64(&wl_gx, &wl_gy);
     let norm_force = l1_norm_f64(&force_x, &force_y);
@@ -346,8 +353,7 @@ pub fn run_nesterov_placement(
     let mut pin_cnt = vec![0.0f32; num_cells];
     let mut cell_area = vec![0.0f32; num_cells];
     for c in 0..num_cells {
-        pin_cnt[c] =
-            (design_db.cell_pin_offsets[c + 1] - design_db.cell_pin_offsets[c]) as f32;
+        pin_cnt[c] = (design_db.cell_pin_offsets[c + 1] - design_db.cell_pin_offsets[c]) as f32;
         cell_area[c] = density_solver.cell_w_um[c] * density_solver.cell_h_um[c];
     }
 
@@ -367,25 +373,30 @@ pub fn run_nesterov_placement(
 
     for k in 0..config.max_iters {
         let tau_k = if k > 0 {
-            let (t, _) =
-                density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y);
+            let (t, _) = {
+                let _d = crate::timing::phase("place.gp.density");
+                density_solver.compute_density_and_forces(&v_x, &v_y, &mut force_x, &mut force_y)
+            };
             final_overflow = t;
             if t <= config.stop_overflow {
                 converged = true;
                 break;
             }
             let gamma_k = base_gamma * 10.0f32.powf(2.0 * (t - 0.10));
-            compute_wa_wirelength_and_grad(
-                design_db,
-                &wl_precomp,
-                &v_x,
-                &v_y,
-                gamma_k,
-                &mut dummy_pin_gx,
-                &mut dummy_pin_gy,
-                &mut wl_gx,
-                &mut wl_gy,
-            );
+            {
+                let _w = crate::timing::phase("place.gp.wl");
+                compute_wa_wirelength_and_grad(
+                    design_db,
+                    &wl_precomp,
+                    &v_x,
+                    &v_y,
+                    gamma_k,
+                    &mut dummy_pin_gx,
+                    &mut dummy_pin_gy,
+                    &mut wl_gx,
+                    &mut wl_gy,
+                );
+            }
             t
         } else {
             final_overflow = init_tau;
@@ -396,6 +407,7 @@ pub fn run_nesterov_placement(
             init_tau
         };
 
+        let _step = crate::timing::phase("place.gp.step");
         // Compute preconditioned gradient g_k
         let mut g_inf = 1e-6f32;
         for c in 0..num_cells {
@@ -463,8 +475,10 @@ pub fn run_nesterov_placement(
     // The loop exits without a stop check after its last step, so the overflow
     // it last saw belongs to v, not to the returned u.
     if !converged {
-        let (tau_u, _) =
-            density_solver.compute_density_and_forces(&u_x, &u_y, &mut force_x, &mut force_y);
+        let (tau_u, _) = {
+            let _d = crate::timing::phase("place.gp.density");
+            density_solver.compute_density_and_forces(&u_x, &u_y, &mut force_x, &mut force_y)
+        };
         final_overflow = tau_u;
         converged = tau_u <= config.stop_overflow;
     }
@@ -486,11 +500,11 @@ pub fn run_nesterov_placement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
     use crate::design_db::PlacementStatus;
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
+    use crate::test_support::{design_dir, sky130_hd};
 
     #[test]
     fn test_gcd_nesterov_global_placement() {
@@ -499,25 +513,38 @@ mod tests {
         let floorplan_def_path = design_dir("gcd").join("gcd.floorplan.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !floorplan_def_path.exists() {
-            panic!("Required test files missing: tlef={:?}, lef={:?}, def={:?}",
-                   tlef_path, lef_path, floorplan_def_path);
+            panic!(
+                "Required test files missing: tlef={:?}, lef={:?}, def={:?}",
+                tlef_path, lef_path, floorplan_def_path
+            );
         }
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let design_db = parse_def(&floorplan_def_path, &tech_db, None)
-            .expect("Failed to parse floorplan DEF");
+            .expect("Failed to load TechDb")
+            .0;
+        let design_db =
+            parse_def(&floorplan_def_path, &tech_db, None).expect("Failed to parse floorplan DEF");
 
         let config = NesterovConfig::default();
         let t0 = std::time::Instant::now();
         let res = run_nesterov_placement(&design_db, &tech_db, &config);
         let elapsed = t0.elapsed();
 
-        let status = if res.converged { "converged" } else { "did not converge" };
+        let status = if res.converged {
+            "converged"
+        } else {
+            "did not converge"
+        };
         println!(
             "Nesterov placement {} in {} iters, time: {:?}, init_ovf: {:.4}, final_ovf: {:.4}, init_hpwl: {:.2} um, final_hpwl: {:.2} um",
-            status, res.iterations, elapsed, res.initial_overflow, res.final_overflow, res.initial_hpwl_um, res.final_hpwl_um
+            status,
+            res.iterations,
+            elapsed,
+            res.initial_overflow,
+            res.final_overflow,
+            res.initial_hpwl_um,
+            res.final_hpwl_um
         );
 
         // 1. CG initial placement yields ~0.40 initial overflow on gcd; GP drives it <= 0.10
@@ -542,10 +569,24 @@ mod tests {
 
         // 3. Core bounds check
         let dbu_per_um = design_db.dbu_per_micron as f32;
-        let core_xl = design_db.rows.iter().map(|r| r.orig_x_dbu).min().unwrap() as f32 / dbu_per_um;
-        let core_xh = design_db.rows.iter().map(|r| r.orig_x_dbu + r.num_x * r.step_x_dbu).max().unwrap() as f32 / dbu_per_um;
-        let core_yl = design_db.rows.iter().map(|r| r.orig_y_dbu).min().unwrap() as f32 / dbu_per_um;
-        let core_yh = design_db.rows.iter().map(|r| r.orig_y_dbu + tech_db.site_height_dbu).max().unwrap() as f32 / dbu_per_um;
+        let core_xl =
+            design_db.rows.iter().map(|r| r.orig_x_dbu).min().unwrap() as f32 / dbu_per_um;
+        let core_xh = design_db
+            .rows
+            .iter()
+            .map(|r| r.orig_x_dbu + r.num_x * r.step_x_dbu)
+            .max()
+            .unwrap() as f32
+            / dbu_per_um;
+        let core_yl =
+            design_db.rows.iter().map(|r| r.orig_y_dbu).min().unwrap() as f32 / dbu_per_um;
+        let core_yh = design_db
+            .rows
+            .iter()
+            .map(|r| r.orig_y_dbu + tech_db.site_height_dbu)
+            .max()
+            .unwrap() as f32
+            / dbu_per_um;
 
         let num_cells = design_db.num_cells();
         let wl_precomp = WaWirelengthPrecomp::new(&design_db, &tech_db);
@@ -564,12 +605,20 @@ mod tests {
                 assert!(
                     x >= core_xl - 1e-4 && x + w <= core_xh + 1e-4,
                     "Movable cell {} X out of bounds: x={}, w={}, core=[{}, {}]",
-                    c, x, w, core_xl, core_xh
+                    c,
+                    x,
+                    w,
+                    core_xl,
+                    core_xh
                 );
                 assert!(
                     y >= core_yl - 1e-4 && y + h <= core_yh + 1e-4,
                     "Movable cell {} Y out of bounds: y={}, h={}, core=[{}, {}]",
-                    c, y, h, core_yl, core_yh
+                    c,
+                    y,
+                    h,
+                    core_yl,
+                    core_yh
                 );
             } else if design_db.cell_status[c] == PlacementStatus::Fixed {
                 // Fixed cells must remain exactly at their initial coordinates
@@ -578,12 +627,16 @@ mod tests {
                 assert!(
                     (x - orig_x).abs() < 1e-5,
                     "Fixed cell {} X changed from {} to {}",
-                    c, orig_x, x
+                    c,
+                    orig_x,
+                    x
                 );
                 assert!(
                     (y - orig_y).abs() < 1e-5,
                     "Fixed cell {} Y changed from {} to {}",
-                    c, orig_y, y
+                    c,
+                    orig_y,
+                    y
                 );
             }
         }
@@ -688,7 +741,10 @@ mod tests {
         };
         let res = run_nesterov_placement(&design_db, &tech_db, &config);
 
-        assert!(!res.converged, "run that hit max_iters must not report convergence");
+        assert!(
+            !res.converged,
+            "run that hit max_iters must not report convergence"
+        );
         assert_eq!(res.iterations, 3, "3 gradient steps were executed");
         assert_eq!(res.cell_x_um.len(), design_db.num_cells());
         assert!(res.final_overflow.is_finite() && res.final_overflow >= 0.0);

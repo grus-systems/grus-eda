@@ -1,0 +1,277 @@
+warning: `/var/empty/.tclsh-history' is not writable.
+openroad> <y130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+1
+openroad> <f/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef, created 14 layers, 25 vias
+openroad> <0A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+[WARNING ODB-0220] WARNING (LEFPARS-2008): NOWIREEXTENSIONATPIN statement is obsolete in version 5.6 or later.
+The NOWIREEXTENSIONATPIN statement will be ignored. See file /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef at line 2.
+
+[INFO ODB-0227] LEF file: /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef, created 437 library cells
+openroad> read_def /work/tests/designs/sta_clocks/two_clock.def
+[INFO ODB-0127] Reading DEF file: /work/tests/designs/sta_clocks/two_clock.def
+[INFO ODB-0128] Design: sta_clocks
+[INFO ODB-0130]     Created 5 pins.
+[INFO ODB-0131]     Created 8 components and 54 component-terminals.
+[INFO ODB-0133]     Created 11 nets and 22 connections.
+[INFO ODB-0134] Finished DEF file: /work/tests/designs/sta_clocks/two_clock.def
+openroad> 
+openroad> puts "=== scenario t2_nsto.sdc ==="
+=== scenario t2_nsto.sdc ===
+openroad> </work/tests/designs/sta_clocks/t2_nsto.sdc} err]} {
+...>     puts "SDC error: $err"
+...>     exit 0
+...> }
+openroad> <endpoint_path_count 1 -group_path_count 100000 ==="
+=== report_checks -path_delay max -format full -endpoint_path_count 1 -group_path_count 100000 ===
+openroad> <ull -endpoint_path_count 1 -group_path_count 100000
+Startpoint: u_fb0 (rising edge-triggered flip-flop clocked by clk2)
+Endpoint: u_fy (rising edge-triggered flip-flop clocked by clk1)
+Path Group: clk1
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   1.00    1.00   clock clk2 (rise edge)
+   0.00    1.00   clock network delay (ideal)
+   0.00    1.00 ^ u_fb0/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.28    1.28 v u_fb0/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    1.28 v u_fy/D (sky130_fd_sc_hd__dfxtp_1)
+           1.28   data arrival time
+
+   2.00    2.00   clock clk1 (rise edge)
+   0.00    2.00   clock network delay (ideal)
+   0.00    2.00   clock reconvergence pessimism
+           2.00 ^ u_fy/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.11    1.89   library setup time
+           1.89   data required time
+---------------------------------------------------------
+           1.89   data required time
+          -1.28   data arrival time
+---------------------------------------------------------
+           0.61   slack (MET)
+
+
+Startpoint: u_fa1 (rising edge-triggered flip-flop clocked by clk1)
+Endpoint: ya (output port clocked by clk1)
+Path Group: clk1
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00 ^ u_fa1/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.59    0.59 ^ u_fa1/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    0.59 ^ ya (out)
+           0.59   data arrival time
+
+   2.00    2.00   clock clk1 (rise edge)
+   0.00    2.00   clock network delay (ideal)
+   0.00    2.00   clock reconvergence pessimism
+  -0.70    1.30   output external delay
+           1.30   data required time
+---------------------------------------------------------
+           1.30   data required time
+          -0.59   data arrival time
+---------------------------------------------------------
+           0.71   slack (MET)
+
+
+Startpoint: d_in (input port clocked by clk1)
+Endpoint: u_fa0 (rising edge-triggered flip-flop clocked by clk1)
+Path Group: clk1
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.70    0.70 v input external delay
+   0.00    0.70 v d_in (in)
+   0.00    0.70 v u_fa0/D (sky130_fd_sc_hd__dfxtp_1)
+           0.70   data arrival time
+
+   2.00    2.00   clock clk1 (rise edge)
+   0.00    2.00   clock network delay (ideal)
+   0.00    2.00   clock reconvergence pessimism
+           2.00 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.15    1.85   library setup time
+           1.85   data required time
+---------------------------------------------------------
+           1.85   data required time
+          -0.70   data arrival time
+---------------------------------------------------------
+           1.15   slack (MET)
+
+
+Startpoint: u_fa0 (rising edge-triggered flip-flop clocked by clk1)
+Endpoint: u_fa1 (rising edge-triggered flip-flop clocked by clk1)
+Path Group: clk1
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.28    0.28 v u_fa0/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    0.28 v u_fa1/D (sky130_fd_sc_hd__dfxtp_1)
+           0.28   data arrival time
+
+   2.00    2.00   clock clk1 (rise edge)
+   0.00    2.00   clock network delay (ideal)
+   0.00    2.00   clock reconvergence pessimism
+           2.00 ^ u_fa1/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.11    1.89   library setup time
+           1.89   data required time
+---------------------------------------------------------
+           1.89   data required time
+          -0.28   data arrival time
+---------------------------------------------------------
+           1.61   slack (MET)
+
+
+openroad> <endpoint_path_count 1 -group_path_count 100000 ==="
+=== report_checks -path_delay min -format full -endpoint_path_count 1 -group_path_count 100000 ===
+openroad> <ull -endpoint_path_count 1 -group_path_count 100000
+Startpoint: d_in (input port clocked by clk1)
+Endpoint: u_fa0 (rising edge-triggered flip-flop clocked by clk1)
+Path Group: clk1
+Path Type: min
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.10    0.10 ^ input external delay
+   0.00    0.10 ^ d_in (in)
+   0.00    0.10 ^ u_fa0/D (sky130_fd_sc_hd__dfxtp_1)
+           0.10   data arrival time
+
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00   clock reconvergence pessimism
+           0.00 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.05   -0.05   library hold time
+          -0.05   data required time
+---------------------------------------------------------
+          -0.05   data required time
+          -0.10   data arrival time
+---------------------------------------------------------
+           0.15   slack (MET)
+
+
+Startpoint: u_fa0 (rising edge-triggered flip-flop clocked by clk1)
+Endpoint: u_fa1 (rising edge-triggered flip-flop clocked by clk1)
+Path Group: clk1
+Path Type: min
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00 ^ u_fa0/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.29    0.29 ^ u_fa0/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    0.29 ^ u_fa1/D (sky130_fd_sc_hd__dfxtp_1)
+           0.29   data arrival time
+
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00   clock reconvergence pessimism
+           0.00 ^ u_fa1/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.04   -0.04   library hold time
+          -0.04   data required time
+---------------------------------------------------------
+          -0.04   data required time
+          -0.29   data arrival time
+---------------------------------------------------------
+           0.32   slack (MET)
+
+
+Startpoint: u_fb0 (rising edge-triggered flip-flop clocked by clk2)
+Endpoint: u_fy (rising edge-triggered flip-flop clocked by clk1)
+Path Group: clk1
+Path Type: min
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock clk2 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00 ^ u_fb0/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.29    0.29 ^ u_fb0/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    0.29 ^ u_fy/D (sky130_fd_sc_hd__dfxtp_1)
+           0.29   data arrival time
+
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00   clock reconvergence pessimism
+           0.00 ^ u_fy/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.04   -0.04   library hold time
+          -0.04   data required time
+---------------------------------------------------------
+          -0.04   data required time
+          -0.29   data arrival time
+---------------------------------------------------------
+           0.32   slack (MET)
+
+
+Startpoint: u_fa1 (rising edge-triggered flip-flop clocked by clk1)
+Endpoint: ya (output port clocked by clk1)
+Path Group: clk1
+Path Type: min
+
+  Delay    Time   Description
+---------------------------------------------------------
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00 ^ u_fa1/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.44    0.44 v u_fa1/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    0.44 v ya (out)
+           0.44   data arrival time
+
+   0.00    0.00   clock clk1 (rise edge)
+   0.00    0.00   clock network delay (ideal)
+   0.00    0.00   clock reconvergence pessimism
+  -0.10   -0.10   output external delay
+          -0.10   data required time
+---------------------------------------------------------
+          -0.10   data required time
+          -0.44   data arrival time
+---------------------------------------------------------
+           0.54   slack (MET)
+
+
+openroad> puts "=== report_checks -unconstrained ==="
+=== report_checks -unconstrained ===
+openroad> report_checks -unconstrained
+Startpoint: u_fb0 (rising edge-triggered flip-flop clocked by clk2)
+Endpoint: u_fy (rising edge-triggered flip-flop clocked by clk1)
+Path Group: clk1
+Path Type: max
+
+  Delay    Time   Description
+---------------------------------------------------------
+   1.00    1.00   clock clk2 (rise edge)
+   0.00    1.00   clock network delay (ideal)
+   0.00    1.00 ^ u_fb0/CLK (sky130_fd_sc_hd__dfxtp_1)
+   0.28    1.28 v u_fb0/Q (sky130_fd_sc_hd__dfxtp_1)
+   0.00    1.28 v u_fy/D (sky130_fd_sc_hd__dfxtp_1)
+           1.28   data arrival time
+
+   2.00    2.00   clock clk1 (rise edge)
+   0.00    2.00   clock network delay (ideal)
+   0.00    2.00   clock reconvergence pessimism
+           2.00 ^ u_fy/CLK (sky130_fd_sc_hd__dfxtp_1)
+  -0.11    1.89   library setup time
+           1.89   data required time
+---------------------------------------------------------
+           1.89   data required time
+          -1.28   data arrival time
+---------------------------------------------------------
+           0.61   slack (MET)
+
+
+openroad> exit
+unable to write history to `/var/empty/.tclsh-history'
+

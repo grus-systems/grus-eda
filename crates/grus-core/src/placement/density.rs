@@ -1,11 +1,11 @@
-use std::f32::consts::PI;
-use std::fmt;
-use std::sync::Arc;
+use crate::design_db::{DesignDb, Orient, PlacementStatus};
+use crate::tech_db::{MacroClass, TechDb};
 use rayon::prelude::*;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
-use crate::design_db::{DesignDb, Orient, PlacementStatus};
-use crate::tech_db::{MacroClass, TechDb};
+use std::f32::consts::PI;
+use std::fmt;
+use std::sync::Arc;
 
 /// Reusable FFT plans, trigonometric tables, and scratch grids for `DensitySolver`.
 #[derive(Clone)]
@@ -24,7 +24,9 @@ struct PoissonWorkspace {
 
 impl fmt::Debug for PoissonWorkspace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PoissonWorkspace").field("m", &self.m).finish_non_exhaustive()
+        f.debug_struct("PoissonWorkspace")
+            .field("m", &self.m)
+            .finish_non_exhaustive()
     }
 }
 
@@ -472,14 +474,14 @@ impl DensitySolver {
                 continue;
             }
 
-            let u_min = (((x0 - core_xl_um) / bin_w_um).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let u_max = (((x1 - core_xl_um) / bin_w_um).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let v_min = (((y0 - core_yl_um) / bin_h_um).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let v_max = (((y1 - core_yl_um) / bin_h_um).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
+            let u_min =
+                (((x0 - core_xl_um) / bin_w_um).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let u_max =
+                (((x1 - core_xl_um) / bin_w_um).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let v_min =
+                (((y0 - core_yl_um) / bin_h_um).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let v_max =
+                (((y1 - core_yl_um) / bin_h_um).floor() as isize).clamp(0, m as isize - 1) as usize;
 
             for v in v_min..=v_max {
                 let by0 = core_yl_um + v as f32 * bin_h_um;
@@ -558,28 +560,35 @@ impl DensitySolver {
         let wu_base = PI / (m as f32 * self.bin_w_um);
         let wv_base = PI / (m as f32 * self.bin_h_um);
 
-        let eval_freq_row = |v: usize, a_row: &[f32], p_row: &mut [f32], x_row: &mut [f32], y_row: &mut [f32]| {
-            let wv = v as f32 * wv_base;
-            let wv2 = wv * wv;
-            for u in 0..m {
-                if u == 0 && v == 0 {
-                    p_row[u] = 0.0;
-                    x_row[u] = 0.0;
-                    y_row[u] = 0.0;
-                } else {
-                    let wu = u as f32 * wu_base;
-                    let denom = wu * wu + wv2;
-                    let p = a_row[u] / denom;
-                    p_row[u] = p;
-                    x_row[u] = wu * p;
-                    y_row[u] = wv * p;
+        let eval_freq_row =
+            |v: usize, a_row: &[f32], p_row: &mut [f32], x_row: &mut [f32], y_row: &mut [f32]| {
+                let wv = v as f32 * wv_base;
+                let wv2 = wv * wv;
+                for u in 0..m {
+                    if u == 0 && v == 0 {
+                        p_row[u] = 0.0;
+                        x_row[u] = 0.0;
+                        y_row[u] = 0.0;
+                    } else {
+                        let wu = u as f32 * wu_base;
+                        let denom = wu * wu + wv2;
+                        let p = a_row[u] / denom;
+                        p_row[u] = p;
+                        x_row[u] = wu * p;
+                        y_row[u] = wv * p;
+                    }
                 }
-            }
-        };
+            };
         if m < 64 {
             for v in 0..m {
                 let s = v * m;
-                eval_freq_row(v, &a[s..s + m], &mut phi_hat[s..s + m], &mut ex_hat[s..s + m], &mut ey_hat[s..s + m]);
+                eval_freq_row(
+                    v,
+                    &a[s..s + m],
+                    &mut phi_hat[s..s + m],
+                    &mut ex_hat[s..s + m],
+                    &mut ey_hat[s..s + m],
+                );
             }
         } else {
             a.par_chunks_exact(m)
@@ -674,14 +683,14 @@ impl DensitySolver {
                 continue;
             }
 
-            let u_min = (((x0_clip - core_xl) / bin_w).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let u_max = (((x1_clip - core_xl) / bin_w).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let v_min = (((y0_clip - core_yl) / bin_h).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let v_max = (((y1_clip - core_yl) / bin_h).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
+            let u_min =
+                (((x0_clip - core_xl) / bin_w).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let u_max =
+                (((x1_clip - core_xl) / bin_w).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let v_min =
+                (((y0_clip - core_yl) / bin_h).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let v_max =
+                (((y1_clip - core_yl) / bin_h).floor() as isize).clamp(0, m as isize - 1) as usize;
 
             for v in v_min..=v_max {
                 let by0 = core_yl + v as f32 * bin_h;
@@ -722,7 +731,12 @@ impl DensitySolver {
         // 3. Compute charge rho(u, v) = (movable_area + target_density * fixed_area) / A_b - rho_bar
         let inv_bin_area = 1.0f32 / bin_area;
         let mut sum_raw_rho = 0.0f64;
-        for ((rho, &movable), &fixed) in self.rho.iter_mut().zip(&self.movable_area).zip(&self.fixed_area) {
+        for ((rho, &movable), &fixed) in self
+            .rho
+            .iter_mut()
+            .zip(&self.movable_area)
+            .zip(&self.fixed_area)
+        {
             let raw = (movable + target_density * fixed) * inv_bin_area;
             *rho = raw;
             sum_raw_rho += raw as f64;
@@ -764,14 +778,14 @@ impl DensitySolver {
                 return;
             }
 
-            let u_min = (((x0_clip - core_xl) / bin_w).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let u_max = (((x1_clip - core_xl) / bin_w).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let v_min = (((y0_clip - core_yl) / bin_h).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
-            let v_max = (((y1_clip - core_yl) / bin_h).floor() as isize)
-                .clamp(0, m as isize - 1) as usize;
+            let u_min =
+                (((x0_clip - core_xl) / bin_w).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let u_max =
+                (((x1_clip - core_xl) / bin_w).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let v_min =
+                (((y0_clip - core_yl) / bin_h).floor() as isize).clamp(0, m as isize - 1) as usize;
+            let v_max =
+                (((y1_clip - core_yl) / bin_h).floor() as isize).clamp(0, m as isize - 1) as usize;
 
             let mut fx = 0.0f32;
             let mut fy = 0.0f32;
@@ -826,10 +840,10 @@ impl DensitySolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, sky130_hd};
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
     use crate::readers::lef::load_tech_db;
+    use crate::test_support::{design_dir, sky130_hd};
 
     #[test]
     fn test_dct1d_idct1d_roundtrip() {
@@ -855,7 +869,10 @@ mod tests {
             assert!(
                 diff < 1e-5,
                 "DCT/IDCT roundtrip mismatch at index {}: orig={}, recon={}, diff={}",
-                i, x[i], x_recon[i], diff
+                i,
+                x[i],
+                x_recon[i],
+                diff
             );
         }
     }
@@ -865,14 +882,8 @@ mod tests {
         let m = 64;
         let bin_w = PI / (m as f32);
         let bin_h = PI / (m as f32);
-        let mut solver = DensitySolver::new_empty(
-            m,
-            0.0,
-            0.0,
-            m as f32 * bin_w,
-            m as f32 * bin_h,
-            0.60,
-        );
+        let mut solver =
+            DensitySolver::new_empty(m, 0.0, 0.0, m as f32 * bin_w, m as f32 * bin_h, 0.60);
 
         let wu1 = PI / (m as f32 * bin_w);
         let wv2 = 2.0 * PI / (m as f32 * bin_h);
@@ -917,21 +928,33 @@ mod tests {
                 assert!(
                     err_phi < 1e-4,
                     "phi mismatch at ({}, {}): expected={}, actual={}, err={}",
-                    u, v, expected_phi, actual_phi, err_phi
+                    u,
+                    v,
+                    expected_phi,
+                    actual_phi,
+                    err_phi
                 );
 
                 let err_ex = (actual_ex - expected_ex).abs();
                 assert!(
                     err_ex < 1e-4,
                     "e_x mismatch at ({}, {}): expected={}, actual={}, err={}",
-                    u, v, expected_ex, actual_ex, err_ex
+                    u,
+                    v,
+                    expected_ex,
+                    actual_ex,
+                    err_ex
                 );
 
                 let err_ey = (actual_ey - expected_ey).abs();
                 assert!(
                     err_ey < 1e-4,
                     "e_y mismatch at ({}, {}): expected={}, actual={}, err={}",
-                    u, v, expected_ey, actual_ey, err_ey
+                    u,
+                    v,
+                    expected_ey,
+                    actual_ey,
+                    err_ey
                 );
             }
         }
@@ -960,8 +983,16 @@ mod tests {
             sum_ex2 += solver.e_x[i] as f64;
             sum_ey2 += solver.e_y[i] as f64;
         }
-        assert!(sum_ex2.abs() < 1e-3, "Net Ex on mode (2, 2) must sum to 0, got {}", sum_ex2);
-        assert!(sum_ey2.abs() < 1e-3, "Net Ey on mode (2, 2) must sum to 0, got {}", sum_ey2);
+        assert!(
+            sum_ex2.abs() < 1e-3,
+            "Net Ex on mode (2, 2) must sum to 0, got {}",
+            sum_ex2
+        );
+        assert!(
+            sum_ey2.abs() < 1e-3,
+            "Net Ey on mode (2, 2) must sum to 0, got {}",
+            sum_ey2
+        );
     }
 
     #[test]
@@ -971,27 +1002,48 @@ mod tests {
         let def_path = design_dir("gcd").join("gcd.placed.def");
 
         if !tlef_path.exists() || !lef_path.exists() || !def_path.exists() {
-            panic!("Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
-                   tlef_path, lef_path, def_path);
+            panic!(
+                "Required integration test files missing: tlef={:?}, lef={:?}, def={:?}",
+                tlef_path, lef_path, def_path
+            );
         }
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
-        let design_db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+            .expect("Failed to load TechDb")
+            .0;
+        let design_db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         let mut solver = DensitySolver::new(&design_db, &tech_db, 0.60, Some(64));
 
         // 1. Verify core bounds from rows match (5.52, 10.88) to (86.02, 89.76) um
-        assert!((solver.core_xl_um - 5.52).abs() < 1e-3, "core_xl mismatch: {}", solver.core_xl_um);
-        assert!((solver.core_yl_um - 10.88).abs() < 1e-3, "core_yl mismatch: {}", solver.core_yl_um);
-        assert!((solver.core_xh_um - 86.02).abs() < 1e-3, "core_xh mismatch: {}", solver.core_xh_um);
-        assert!((solver.core_yh_um - 89.76).abs() < 1e-3, "core_yh mismatch: {}", solver.core_yh_um);
+        assert!(
+            (solver.core_xl_um - 5.52).abs() < 1e-3,
+            "core_xl mismatch: {}",
+            solver.core_xl_um
+        );
+        assert!(
+            (solver.core_yl_um - 10.88).abs() < 1e-3,
+            "core_yl mismatch: {}",
+            solver.core_yl_um
+        );
+        assert!(
+            (solver.core_xh_um - 86.02).abs() < 1e-3,
+            "core_xh mismatch: {}",
+            solver.core_xh_um
+        );
+        assert!(
+            (solver.core_yh_um - 89.76).abs() < 1e-3,
+            "core_yh mismatch: {}",
+            solver.core_yh_um
+        );
 
         // 2. Movable cells count is 233
         let movable_count = solver.movable_cell_mask.iter().filter(|&&b| b).count();
-        assert_eq!(movable_count, 233, "Movable cell count must equal 233 logic instances");
+        assert_eq!(
+            movable_count, 233,
+            "Movable cell count must equal 233 logic instances"
+        );
 
         // 3. Test placed DEF density & forces
         let num_cells = design_db.num_cells();
@@ -1031,7 +1083,10 @@ mod tests {
 
         // Also test default grid sizing (None -> M = 16 on gcd)
         let mut solver_16 = DensitySolver::new(&design_db, &tech_db, 0.60, None);
-        assert_eq!(solver_16.m, 16, "Default grid sizing for gcd must choose M = 16");
+        assert_eq!(
+            solver_16.m, 16,
+            "Default grid sizing for gcd must choose M = 16"
+        );
         let mut force_x_16 = vec![0.0f32; num_cells];
         let mut force_y_16 = vec![0.0f32; num_cells];
         let (tau_placed_16, _) = solver_16.compute_density_and_forces(
@@ -1053,7 +1108,9 @@ mod tests {
         assert!(
             rel_diff < 1e-4,
             "Mass conservation failed: sum_movable_area={}, total_movable_area={}, rel_diff={}",
-            sum_movable_area, solver.total_movable_area_um2, rel_diff
+            sum_movable_area,
+            solver.total_movable_area_um2,
+            rel_diff
         );
 
         // 4. Clustered center test
@@ -1099,19 +1156,26 @@ mod tests {
                 assert!(
                     force_x[c] < 0.0,
                     "Cell {} left of center (cx={}) must have negative Fx (repelled left), got {}",
-                    c, cell_cx, force_x[c]
+                    c,
+                    cell_cx,
+                    force_x[c]
                 );
                 left_count += 1;
             } else if cell_cx > x_center + 0.01 {
                 assert!(
                     force_x[c] > 0.0,
                     "Cell {} right of center (cx={}) must have positive Fx (repelled right), got {}",
-                    c, cell_cx, force_x[c]
+                    c,
+                    cell_cx,
+                    force_x[c]
                 );
                 right_count += 1;
             }
         }
-        assert!(left_count > 0 && right_count > 0, "Must have cells on both left and right of center");
+        assert!(
+            left_count > 0 && right_count > 0,
+            "Must have cells on both left and right of center"
+        );
     }
 
     #[test]
@@ -1138,7 +1202,12 @@ mod tests {
         let mut buf = vec![Complex::new(0.0f32, 0.0f32); m];
         let mut a = vec![0.0f32; m * m];
         for v in 0..m {
-            dct1d(&solver.rho[v * m..(v + 1) * m], &mut a[v * m..(v + 1) * m], &*fft_fwd, &mut buf);
+            dct1d(
+                &solver.rho[v * m..(v + 1) * m],
+                &mut a[v * m..(v + 1) * m],
+                &*fft_fwd,
+                &mut buf,
+            );
         }
         let (mut col_in, mut col_out) = (vec![0.0f32; m], vec![0.0f32; m]);
         for u in 0..m {
@@ -1165,7 +1234,12 @@ mod tests {
         }
         let mut phi_ref = vec![0.0f32; m * m];
         for v in 0..m {
-            idct1d(&phi_hat[v * m..(v + 1) * m], &mut phi_ref[v * m..(v + 1) * m], &*fft_inv, &mut buf);
+            idct1d(
+                &phi_hat[v * m..(v + 1) * m],
+                &mut phi_ref[v * m..(v + 1) * m],
+                &*fft_inv,
+                &mut buf,
+            );
         }
         for u in 0..m {
             for v in 0..m {
@@ -1183,6 +1257,10 @@ mod tests {
             .zip(&phi_ref)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_err < 1e-5, "Parallel Poisson phi max error too large: {}", max_err);
+        assert!(
+            max_err < 1e-5,
+            "Parallel Poisson phi max error too large: {}",
+            max_err
+        );
     }
 }

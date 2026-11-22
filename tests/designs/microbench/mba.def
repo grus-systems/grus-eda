@@ -1,0 +1,87 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN mba ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 10000 10000 ) ;
+ROW ROW_0 unithd 0 0 N DO 1 BY 1 STEP 460 0 ;
+TRACKS X 10 DO 10 STEP 1000 LAYER li1 ;
+TRACKS Y 10 DO 10 STEP 1000 LAYER li1 ;
+COMPONENTS 13 ;
+    - u_and sky130_fd_sc_hd__and2_1 + PLACED ( 2000 2000 ) N ;
+    - u_inv sky130_fd_sc_hd__inv_1 + PLACED ( 2000 4000 ) N ;
+    - u_or sky130_fd_sc_hd__or2_1 + PLACED ( 4000 3000 ) N ;
+    - u_xor sky130_fd_sc_hd__xor2_1 + PLACED ( 4000 5000 ) N ;
+    - u_df sky130_fd_sc_hd__dfxtp_1 + PLACED ( 2000 6000 ) N ;
+    - u_f0 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 6000 2000 ) N ;
+    - u_i0 sky130_fd_sc_hd__inv_1 + PLACED ( 7000 3000 ) N ;
+    - u_f1 sky130_fd_sc_hd__dfxtp_1 + PLACED ( 6000 4000 ) N ;
+    - u_x1 sky130_fd_sc_hd__xor2_1 + PLACED ( 7000 5000 ) N ;
+    - u_c sky130_fd_sc_hd__conb_1 + PLACED ( 2000 8000 ) N ;
+    - u_bh sky130_fd_sc_hd__buf_1 + PLACED ( 4000 8000 ) N ;
+    - u_bl sky130_fd_sc_hd__buf_1 + PLACED ( 4000 8600 ) N ;
+    - u_flt sky130_fd_sc_hd__buf_1 + PLACED ( 6000 8000 ) N ;
+END COMPONENTS
+PINS 10 ;
+    - clk + NET clk + DIRECTION INPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 140 140 ) N ;
+    - a + NET a + DIRECTION INPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 140 280 ) N ;
+    - b + NET b + DIRECTION INPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 140 420 ) N ;
+    - y + NET y + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 9860 1400 ) N ;
+    - yc + NET n_or + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 9860 2800 ) N ;
+    - qd + NET q + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 9860 4200 ) N ;
+    - q0 + NET n_q0 + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 9860 5600 ) N ;
+    - q1 + NET n_q1 + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 9860 7000 ) N ;
+    - yh + NET n_bh + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 9860 8400 ) N ;
+    - yl + NET n_bl + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER met1 ( -140 -140 ) ( 140 140 )
+        + PLACED ( 9860 9800 ) N ;
+END PINS
+NETS 18 ;
+    - clk ( PIN clk ) ( u_df CLK ) ( u_f0 CLK ) ( u_f1 CLK ) + USE SIGNAL ;
+    - a ( PIN a ) ( u_and A ) ( u_xor A ) ( u_df D ) + USE SIGNAL ;
+    - b ( PIN b ) ( u_and B ) ( u_xor B ) ( u_inv A ) + USE SIGNAL ;
+    - n_and ( u_and X ) ( u_or A ) + USE SIGNAL ;
+    - n_inv ( u_inv Y ) ( u_or B ) + USE SIGNAL ;
+    - n_or ( u_or X ) ( PIN yc ) + USE SIGNAL ;
+    - y ( u_xor X ) ( PIN y ) + USE SIGNAL ;
+    - q ( u_df Q ) ( PIN qd ) + USE SIGNAL ;
+    - n_q0 ( u_f0 Q ) ( PIN q0 ) ( u_i0 A ) ( u_x1 A ) + USE SIGNAL ;
+    - n_q0n ( u_i0 Y ) ( u_f0 D ) + USE SIGNAL ;
+    - n_q1 ( u_f1 Q ) ( PIN q1 ) ( u_x1 B ) + USE SIGNAL ;
+    - n_c1d ( u_x1 X ) ( u_f1 D ) + USE SIGNAL ;
+    - n_hi ( u_c HI ) ( u_bh A ) + USE SIGNAL ;
+    - n_lo ( u_c LO ) ( u_bl A ) + USE SIGNAL ;
+    - n_bh ( u_bh X ) ( PIN yh ) + USE SIGNAL ;
+    - n_bl ( u_bl X ) ( PIN yl ) + USE SIGNAL ;
+    - n_float ( u_flt A ) + USE SIGNAL ;
+    - n_flt ( u_flt X ) + USE SIGNAL ;
+END NETS
+END DESIGN

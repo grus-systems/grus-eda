@@ -1,0 +1,3129 @@
+{
+  "s_full": {
+    "activity": {
+      "a": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "vcd"
+      },
+      "b": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "vcd"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 4050000.0,
+        "prob": 0.44,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 4050000.0,
+        "prob": 0.44,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 4920000.0,
+        "prob": 0.552,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 6000000.0,
+        "prob": 0.47,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 3000000.0,
+        "prob": 0.25,
+        "source": "vcd"
+      },
+      "yc": {
+        "density": 4920000.0,
+        "prob": 0.552,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 39,
+      "vcd": 4
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 1.825601e-07,
+        "leakage_w": 3.343431e-11,
+        "switching_w": 9.02162e-07,
+        "total_w": 1.084755e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.173855e-06,
+        "leakage_w": 2.453556e-11,
+        "switching_w": 2.43e-07,
+        "total_w": 6.416879e-06
+      },
+      "total": {
+        "internal_w": 6.356414e-06,
+        "leakage_w": 5.796988e-11,
+        "switching_w": 1.145162e-06,
+        "total_w": 7.501634e-06
+      }
+    }
+  },
+  "s_global": {
+    "activity": {
+      "a": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "b": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "q1": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "qd": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_and/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_and/B": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_and/X": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_df/Q": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_f0/Q": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_f1/Q": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_flt/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_flt/X": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_i0/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_i0/Y": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_inv/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_inv/Y": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_or/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_or/B": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_or/X": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_x1/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_x1/B": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_x1/X": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_xor/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_xor/B": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "u_xor/X": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "y": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "yc": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "global"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 43
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 4.878488e-07,
+        "leakage_w": 3.063112e-11,
+        "switching_w": 1.724522e-06,
+        "total_w": 2.212402e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.770686e-06,
+        "leakage_w": 2.525808e-11,
+        "switching_w": 2.615376e-06,
+        "total_w": 9.386088e-06
+      },
+      "total": {
+        "internal_w": 7.258535e-06,
+        "leakage_w": 5.588921e-11,
+        "switching_w": 4.339899e-06,
+        "total_w": 1.159849e-05
+      }
+    }
+  },
+  "s_global_density": {
+    "activity": {
+      "a": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "b": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "q1": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "qd": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_and/A": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_and/B": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_and/X": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_df/Q": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_f0/Q": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_f1/Q": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_flt/A": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_flt/X": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_i0/A": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_i0/Y": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_inv/A": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_inv/Y": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_or/A": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_or/B": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_or/X": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_x1/A": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_x1/B": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_x1/X": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_xor/A": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_xor/B": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "u_xor/X": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "y": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "yc": {
+        "density": 30000000.0,
+        "prob": 0.35,
+        "source": "global"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 43
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 1.463546e-06,
+        "leakage_w": 3.081326e-11,
+        "switching_w": 5.173567e-06,
+        "total_w": 6.637144e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 8.09732e-06,
+        "leakage_w": 2.519621e-11,
+        "switching_w": 7.846129e-06,
+        "total_w": 1.594347e-05
+      },
+      "total": {
+        "internal_w": 9.560865e-06,
+        "leakage_w": 5.600947e-11,
+        "switching_w": 1.301969e-05,
+        "total_w": 2.258062e-05
+      }
+    }
+  },
+  "s_input": {
+    "activity": {
+      "a": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "input"
+      },
+      "b": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "input"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 8000000.0,
+        "prob": 0.16,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 10000000.0,
+        "prob": 0.6,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 8000000.0,
+        "prob": 0.16,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 10000000.0,
+        "prob": 0.6,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 11600000.0,
+        "prob": 0.664,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 20000000.0,
+        "prob": 0.48,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 20000000.0,
+        "prob": 0.48,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 11600000.0,
+        "prob": 0.664,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 43
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 4.547207e-07,
+        "leakage_w": 3.10476e-11,
+        "switching_w": 2.604659e-06,
+        "total_w": 3.059411e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.328986e-06,
+        "leakage_w": 2.451766e-11,
+        "switching_w": 8.1e-07,
+        "total_w": 7.139011e-06
+      },
+      "total": {
+        "internal_w": 6.783707e-06,
+        "leakage_w": 5.556526e-11,
+        "switching_w": 3.414659e-06,
+        "total_w": 1.019842e-05
+      }
+    }
+  },
+  "s_input_ports": {
+    "activity": {
+      "a": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "user"
+      },
+      "b": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "user"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 8000000.0,
+        "prob": 0.16,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 10000000.0,
+        "prob": 0.6,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 8000000.0,
+        "prob": 0.16,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 10000000.0,
+        "prob": 0.6,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 11600000.0,
+        "prob": 0.664,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 10000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 20000000.0,
+        "prob": 0.48,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 20000000.0,
+        "prob": 0.48,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 11600000.0,
+        "prob": 0.664,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "input": 2,
+      "unannotated": 41
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 4.13439e-07,
+        "leakage_w": 3.10476e-11,
+        "switching_w": 2.604659e-06,
+        "total_w": 3.018129e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.328986e-06,
+        "leakage_w": 2.451766e-11,
+        "switching_w": 8.1e-07,
+        "total_w": 7.139011e-06
+      },
+      "total": {
+        "internal_w": 6.742425e-06,
+        "leakage_w": 5.556526e-11,
+        "switching_w": 3.414659e-06,
+        "total_w": 1.015714e-05
+      }
+    }
+  },
+  "s_none": {
+    "activity": {
+      "a": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "b": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 5000000.0,
+        "prob": 0.25,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 5000000.0,
+        "prob": 0.25,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 6250000.0,
+        "prob": 0.625,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 10000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 10000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 6250000.0,
+        "prob": 0.625,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 43
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 2.41342e-07,
+        "leakage_w": 3.129771e-11,
+        "switching_w": 1.341279e-06,
+        "total_w": 1.582652e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.218178e-06,
+        "leakage_w": 2.453692e-11,
+        "switching_w": 4.05e-07,
+        "total_w": 6.623202e-06
+      },
+      "total": {
+        "internal_w": 6.459519e-06,
+        "leakage_w": 5.583464e-11,
+        "switching_w": 1.746279e-06,
+        "total_w": 8.205853e-06
+      }
+    }
+  },
+  "s_p40": {
+    "activity": {
+      "a": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "b": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "clk": {
+        "density": 50000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 2500000.0,
+        "prob": 0.25,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 50000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 50000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 50000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 2500000.0,
+        "prob": 0.25,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 3125000.0,
+        "prob": 0.625,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 2500000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 3125000.0,
+        "prob": 0.625,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 43
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 1.20671e-07,
+        "leakage_w": 3.129771e-11,
+        "switching_w": 6.706395e-07,
+        "total_w": 7.913417e-07
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 3.109089e-06,
+        "leakage_w": 2.453692e-11,
+        "switching_w": 2.025e-07,
+        "total_w": 3.311613e-06
+      },
+      "total": {
+        "internal_w": 3.22976e-06,
+        "leakage_w": 5.583464e-11,
+        "switching_w": 8.731395e-07,
+        "total_w": 4.102955e-06
+      }
+    }
+  },
+  "s_partial": {
+    "activity": {
+      "a": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "vcd"
+      },
+      "b": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "vcd"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 4050000.0,
+        "prob": 0.44,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 4050000.0,
+        "prob": 0.44,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 4920000.0,
+        "prob": 0.552,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 6000000.0,
+        "prob": 0.47,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 6000000.0,
+        "prob": 0.47,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 4920000.0,
+        "prob": 0.552,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 40,
+      "vcd": 3
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 1.825601e-07,
+        "leakage_w": 3.343431e-11,
+        "switching_w": 9.02162e-07,
+        "total_w": 1.084755e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.173855e-06,
+        "leakage_w": 2.453556e-11,
+        "switching_w": 2.43e-07,
+        "total_w": 6.416879e-06
+      },
+      "total": {
+        "internal_w": 6.356414e-06,
+        "leakage_w": 5.796988e-11,
+        "switching_w": 1.145162e-06,
+        "total_w": 7.501634e-06
+      }
+    }
+  },
+  "s_partial2": {
+    "activity": {
+      "a": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "b": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 1000000.0,
+        "prob": 0.8,
+        "source": "vcd"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 1000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 1500000.0,
+        "prob": 0.9,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 10000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 10000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 1500000.0,
+        "prob": 0.9,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 42,
+      "vcd": 1
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 1.581141e-07,
+        "leakage_w": 2.98148e-11,
+        "switching_w": 9.465303e-07,
+        "total_w": 1.104674e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.218178e-06,
+        "leakage_w": 2.453692e-11,
+        "switching_w": 4.05e-07,
+        "total_w": 6.623202e-06
+      },
+      "total": {
+        "internal_w": 6.376291e-06,
+        "leakage_w": 5.435173e-11,
+        "switching_w": 1.35153e-06,
+        "total_w": 7.727876e-06
+      }
+    }
+  },
+  "s_ports": {
+    "activity": {
+      "a": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "vcd"
+      },
+      "b": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "vcd"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 4050000.0,
+        "prob": 0.44,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 4050000.0,
+        "prob": 0.44,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 4920000.0,
+        "prob": 0.552,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 3000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 6000000.0,
+        "prob": 0.47,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 6000000.0,
+        "prob": 0.47,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 4920000.0,
+        "prob": 0.552,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 40,
+      "vcd": 3
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 1.825601e-07,
+        "leakage_w": 3.343431e-11,
+        "switching_w": 9.02162e-07,
+        "total_w": 1.084755e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.173855e-06,
+        "leakage_w": 2.453556e-11,
+        "switching_w": 2.43e-07,
+        "total_w": 6.416879e-06
+      },
+      "total": {
+        "internal_w": 6.356414e-06,
+        "leakage_w": 5.796988e-11,
+        "switching_w": 1.145162e-06,
+        "total_w": 7.501634e-06
+      }
+    }
+  },
+  "s_ports_a2x": {
+    "activity": {
+      "a": {
+        "density": 6000000.0,
+        "prob": 0.55,
+        "source": "vcd"
+      },
+      "b": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "vcd"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 6000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 6000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 6450000.0,
+        "prob": 0.44,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 6000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 6000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 6450000.0,
+        "prob": 0.44,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 6840000.0,
+        "prob": 0.552,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 6000000.0,
+        "prob": 0.55,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 9000000.0,
+        "prob": 0.47,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 9000000.0,
+        "prob": 0.47,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 6840000.0,
+        "prob": 0.552,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 40,
+      "vcd": 3
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 2.47926e-07,
+        "leakage_w": 3.343431e-11,
+        "switching_w": 1.306681e-06,
+        "total_w": 1.554641e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.24034e-06,
+        "leakage_w": 2.453556e-11,
+        "switching_w": 4.86e-07,
+        "total_w": 6.726364e-06
+      },
+      "total": {
+        "internal_w": 6.488266e-06,
+        "leakage_w": 5.796988e-11,
+        "switching_w": 1.792681e-06,
+        "total_w": 8.281005e-06
+      }
+    }
+  },
+  "s_xz": {
+    "activity": {
+      "a": {
+        "density": 3000000.0,
+        "prob": 0.4,
+        "source": "vcd"
+      },
+      "b": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "vcd"
+      },
+      "clk": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "q0": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "q1": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "qd": {
+        "density": 3000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_and/A": {
+        "density": 3000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_and/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_and/X": {
+        "density": 3600000.0,
+        "prob": 0.32,
+        "source": "propagated"
+      },
+      "u_bh/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bh/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_bl/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/HI": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_c/LO": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "u_df/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_df/D": {
+        "density": 3000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_df/Q": {
+        "density": 3000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_f0/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f0/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f0/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/CLK": {
+        "density": 100000000.0,
+        "prob": 0.5,
+        "source": "clock"
+      },
+      "u_f1/D": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_f1/Q": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_flt/A": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "input"
+      },
+      "u_flt/X": {
+        "density": 5000000.0,
+        "prob": 0.5,
+        "source": "propagated"
+      },
+      "u_i0/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_i0/Y": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_inv/A": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_inv/Y": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/A": {
+        "density": 3600000.0,
+        "prob": 0.32,
+        "source": "propagated"
+      },
+      "u_or/B": {
+        "density": 3000000.0,
+        "prob": 0.2,
+        "source": "propagated"
+      },
+      "u_or/X": {
+        "density": 4920000.0,
+        "prob": 0.456,
+        "source": "propagated"
+      },
+      "u_x1/A": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/B": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_x1/X": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "unknown"
+      },
+      "u_xor/A": {
+        "density": 3000000.0,
+        "prob": 0.4,
+        "source": "propagated"
+      },
+      "u_xor/B": {
+        "density": 3000000.0,
+        "prob": 0.8,
+        "source": "propagated"
+      },
+      "u_xor/X": {
+        "density": 6000000.0,
+        "prob": 0.56,
+        "source": "propagated"
+      },
+      "y": {
+        "density": 6000000.0,
+        "prob": 0.56,
+        "source": "propagated"
+      },
+      "yc": {
+        "density": 4920000.0,
+        "prob": 0.456,
+        "source": "propagated"
+      },
+      "yh": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      },
+      "yl": {
+        "density": 0.0,
+        "prob": 0.0,
+        "source": "constant"
+      }
+    },
+    "annotation": {
+      "unannotated": 40,
+      "vcd": 3
+    },
+    "groups": {
+      "Clock": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Combinational": {
+        "internal_w": 1.779665e-07,
+        "leakage_w": 3.442374e-11,
+        "switching_w": 9.010371e-07,
+        "total_w": 1.079038e-06
+      },
+      "Macro": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Pad": {
+        "internal_w": 0.0,
+        "leakage_w": 0.0,
+        "switching_w": 0.0,
+        "total_w": 0.0
+      },
+      "Sequential": {
+        "internal_w": 6.173855e-06,
+        "leakage_w": 2.451766e-11,
+        "switching_w": 2.43e-07,
+        "total_w": 6.416879e-06
+      },
+      "total": {
+        "internal_w": 6.351821e-06,
+        "leakage_w": 5.894141e-11,
+        "switching_w": 1.144037e-06,
+        "total_w": 7.495918e-06
+      }
+    }
+  }
+}

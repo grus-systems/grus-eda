@@ -10,7 +10,11 @@ fn find_interval_unclamped(axis: &[f32], val: f32) -> (usize, f32) {
     }
     let fraction = |i: usize| {
         let denom = axis[i + 1] - axis[i];
-        if denom.abs() > 1e-12 { (val - axis[i]) / denom } else { 0.0 }
+        if denom.abs() > 1e-12 {
+            (val - axis[i]) / denom
+        } else {
+            0.0
+        }
     };
     if val <= axis[0] {
         return (0, fraction(0));
@@ -43,7 +47,11 @@ pub fn eval_nldm_delay_or_slew(table: &NldmTable, in_slew_ns: f32, out_cap_pf: f
     eval_2d(table, x, y)
 }
 
-pub fn eval_nldm_constraint(table: &NldmTable, constrained_slew_ns: f32, related_slew_ns: f32) -> f32 {
+pub fn eval_nldm_constraint(
+    table: &NldmTable,
+    constrained_slew_ns: f32,
+    related_slew_ns: f32,
+) -> f32 {
     let (x, y) = match (table.var1, table.var2) {
         (TableAxisVar::RelatedPinTransition, TableAxisVar::ConstrainedPinTransition) => {
             (related_slew_ns, constrained_slew_ns)

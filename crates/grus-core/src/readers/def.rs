@@ -3,11 +3,15 @@ use crate::interner::{CellId, LibPinId, MacroPinId, NetId, PinDir, PinId};
 use crate::lib_db::LibDb;
 use crate::tech_db::{RectDbu, TechDb};
 use anyhow::{Context, Result, anyhow, bail};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::str::FromStr;
+use xxhash_rust::xxh3::Xxh3DefaultBuilder;
+
+type FastMap<K, V> = HashMap<K, V, Xxh3DefaultBuilder>;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum DefToken<'a> {
@@ -26,7 +30,11 @@ pub(crate) struct DefLexer<'a> {
 
 impl<'a> DefLexer<'a> {
     pub fn new(input: &'a str) -> Self {
-        Self { input, pos: 0, line: 1 }
+        Self {
+            input,
+            pos: 0,
+            line: 1,
+        }
     }
 
     /// One-based line of the read position, for error messages. Counted incrementally:
@@ -70,6 +78,13 @@ impl<'a> DefLexer<'a> {
             let start = self.pos;
             while self.pos < len {
                 let c = bytes[self.pos];
+                if c == b'\\' && self.pos + 1 < len {
+                    // An escaped character belongs to the name even when it
+                    // is a delimiter; unescape_def_name strips the backslash
+                    // once the full word is known.
+                    self.pos += 2;
+                    continue;
+                }
                 if c.is_ascii_whitespace() || c == b';' || c == b'(' || c == b')' || c == b'#' {
                     break;
                 }
@@ -83,6 +98,14 @@ impl<'a> DefLexer<'a> {
 }
 
 pub fn unescape_def_name(s: &str) -> String {
+    unescape_def_name_cow(s).into_owned()
+}
+
+/// Borrowed when the name has no `\` to strip — the common case on real DEFs.
+fn unescape_def_name_cow(s: &str) -> Cow<'_, str> {
+    if !s.contains('\\') {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -93,6 +116,23 @@ pub fn unescape_def_name(s: &str) -> String {
         } else {
             out.push(c);
         }
+    }
+    Cow::Owned(out)
+}
+
+/// Inverse of `unescape_def_name`: prefixes characters that would delimit
+/// a DEF word with `\`. Only the escape character, ASCII whitespace, `;`,
+/// `(`, `)`, and `#` (a comment opener in this lexer) need escaping.
+/// Everything else — including `[N]` bus-bit syntax and `$`/`/` — is written
+/// literally so external DEF readers see the same names OpenROAD-flow-scripts
+/// emits for synthesized netlists.
+pub fn escape_def_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' || c.is_ascii_whitespace() || matches!(c, ';' | '(' | ')' | '#') {
+            out.push('\\');
+        }
+        out.push(c);
     }
     out
 }
@@ -128,9 +168,16 @@ pub fn orient_str(o: Orient) -> &'static str {
 /// coordinates whose position is fixed by the statement shape.
 fn read_statement<'a>(lexer: &mut DefLexer<'a>) -> Result<Vec<&'a str>> {
     let mut words = Vec::new();
+    read_statement_into(lexer, &mut words)?;
+    Ok(words)
+}
+
+/// `read_statement` into a caller-owned buffer, so counted sections can reuse
+/// one allocation across every record.
+fn read_statement_into<'a>(lexer: &mut DefLexer<'a>, words: &mut Vec<&'a str>) -> Result<()> {
     loop {
         match lexer.next_token() {
-            DefToken::Semi => return Ok(words),
+            DefToken::Semi => return Ok(()),
             DefToken::Word(w) => words.push(w),
             DefToken::LParen | DefToken::RParen => {}
             DefToken::Eof => bail!(
@@ -148,7 +195,50 @@ fn read_group<'a>(lexer: &mut DefLexer<'a>) -> Result<Vec<&'a str>> {
         match lexer.next_token() {
             DefToken::RParen => return Ok(words),
             DefToken::Word(w) => words.push(w),
-            other => bail!("DEF line {}: unexpected {other:?} inside `( ... )`", lexer.line()),
+            other => bail!(
+                "DEF line {}: unexpected {other:?} inside `( ... )`",
+                lexer.line()
+            ),
+        }
+    }
+}
+
+/// A NETS `( component pin )` group whose `(` has already been consumed — the
+/// inline form of `read_group` + the two-word check, with no `Vec`.
+fn read_conn_group<'a>(lexer: &mut DefLexer<'a>, net_name: &str) -> Result<(&'a str, &'a str)> {
+    let not_conn =
+        |line: usize| anyhow!("DEF line {line}: connection of net {net_name} must be `( component pin )`");
+    // A `)` before the second word is a wrong-shape group, not an unexpected
+    // token — same reject the collected-`Vec` destructure produced, at the
+    // same line (the `)` position).
+    let comp = match lexer.next_token() {
+        DefToken::Word(w) => w,
+        DefToken::RParen => return Err(not_conn(lexer.line())),
+        other => bail!(
+            "DEF line {}: unexpected {other:?} inside `( ... )`",
+            lexer.line()
+        ),
+    };
+    let pin = match lexer.next_token() {
+        DefToken::Word(w) => w,
+        DefToken::RParen => return Err(not_conn(lexer.line())),
+        other => bail!(
+            "DEF line {}: unexpected {other:?} inside `( ... )`",
+            lexer.line()
+        ),
+    };
+    // Extra words drain to the `)` so the reject reports at the same line the
+    // old two-word destructure of the collected group did.
+    let mut extra = false;
+    loop {
+        match lexer.next_token() {
+            DefToken::RParen if !extra => return Ok((comp, pin)),
+            DefToken::RParen => return Err(not_conn(lexer.line())),
+            DefToken::Word(_) => extra = true,
+            other => bail!(
+                "DEF line {}: unexpected {other:?} inside `( ... )`",
+                lexer.line()
+            ),
         }
     }
 }
@@ -168,24 +258,40 @@ fn axis(word: &str, section: &str, line: usize) -> Result<bool> {
 }
 
 /// Splits `+ KEYWORD args...` attributes; the args of each keyword run up to the next `+`.
-fn split_attributes<'w, 'a>(
-    words: &'w [&'a str],
+/// Iterator form: one attribute per step, no `Vec`, same rejects as the old
+/// collecting version.
+fn split_attributes<'w, 'a>(words: &'w [&'a str], line: usize) -> AttrIter<'w, 'a> {
+    AttrIter { rest: words, line }
+}
+
+struct AttrIter<'w, 'a> {
+    rest: &'w [&'a str],
     line: usize,
-) -> Result<Vec<(&'a str, &'w [&'a str])>> {
-    let mut out = Vec::new();
-    let mut rest = words;
-    while let Some((&first, tail)) = rest.split_first() {
+}
+
+impl<'w, 'a> Iterator for AttrIter<'w, 'a> {
+    type Item = Result<(&'a str, &'w [&'a str])>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (&first, tail) = self.rest.split_first()?;
         if first != "+" {
-            bail!("DEF line {line}: expected `+` before `{first}`");
+            self.rest = &[];
+            return Some(Err(anyhow!(
+                "DEF line {}: expected `+` before `{first}`",
+                self.line
+            )));
         }
         let Some((&keyword, after)) = tail.split_first() else {
-            bail!("DEF line {line}: `+` without an attribute keyword");
+            self.rest = &[];
+            return Some(Err(anyhow!(
+                "DEF line {}: `+` without an attribute keyword",
+                self.line
+            )));
         };
         let end = after.iter().position(|&w| w == "+").unwrap_or(after.len());
-        out.push((keyword, &after[..end]));
-        rest = &after[end..];
+        self.rest = &after[end..];
+        Some(Ok((keyword, &after[..end])))
     }
-    Ok(out)
 }
 
 /// Consumes the name that follows an `END` and checks that it closes `section`.
@@ -215,7 +321,9 @@ fn skip_section(lexer: &mut DefLexer, section: &str) -> Result<()> {
     loop {
         match lexer.next_token() {
             DefToken::Word("END") => return end_section(lexer, section),
-            DefToken::Eof => bail!("DEF: {section} is not terminated by `END {section}` (truncated file?)"),
+            DefToken::Eof => {
+                bail!("DEF: {section} is not terminated by `END {section}` (truncated file?)")
+            }
             _ => {}
         }
     }
@@ -230,10 +338,13 @@ fn for_each_record<'a>(
 ) -> Result<()> {
     let declared = section_count(lexer, section)?;
     let mut found = 0;
+    // One scratch buffer for every `- ...;` record of the section.
+    let mut words: Vec<&'a str> = Vec::new();
     loop {
         match lexer.next_token() {
             DefToken::Word("-") => {
-                let words = read_statement(lexer)?;
+                words.clear();
+                read_statement_into(lexer, &mut words)?;
                 entry(&words, lexer.line())?;
                 found += 1;
             }
@@ -241,7 +352,9 @@ fn for_each_record<'a>(
                 end_section(lexer, section)?;
                 break;
             }
-            DefToken::Eof => bail!("DEF: {section} is not terminated by `END {section}` (truncated file?)"),
+            DefToken::Eof => {
+                bail!("DEF: {section} is not terminated by `END {section}` (truncated file?)")
+            }
             other => bail!(
                 "DEF line {}: unexpected {other:?} in {section}; records start with `-`",
                 lexer.line()
@@ -261,20 +374,21 @@ fn add_component(
     db: &mut DesignDb,
     tech_db: &TechDb,
     lib_db: Option<&LibDb>,
-    cell_name_to_id: &mut HashMap<String, CellId>,
+    cell_name_to_id: &mut FastMap<String, CellId>,
     words: &[&str],
     line: usize,
 ) -> Result<()> {
     let [inst, macro_name, attributes @ ..] = words else {
         bail!("DEF line {line}: component record needs an instance name and a macro name");
     };
-    let inst_token = unescape_def_name(inst);
+    let inst_token = unescape_def_name_cow(inst);
 
     let mut status = PlacementStatus::Unplaced;
     let mut x = 0;
     let mut y = 0;
     let mut orient = Orient::N;
-    for (keyword, args) in split_attributes(attributes, line)? {
+    for attr in split_attributes(attributes, line) {
+        let (keyword, args) = attr?;
         match keyword {
             "PLACED" | "FIXED" | "COVER" => {
                 let [px, py, o] = args else {
@@ -319,8 +433,8 @@ fn add_component(
     });
 
     let cell_id = CellId(db.cell_names.len() as u32);
-    cell_name_to_id.insert(inst_token.clone(), cell_id);
     db.cell_names.push(db.strings.intern(&inst_token));
+    cell_name_to_id.insert(inst_token.into_owned(), cell_id);
     db.cell_macros.push(macro_id);
     db.cell_lib_ids.push(lib_cell_id);
     db.cell_status.push(status);
@@ -366,14 +480,14 @@ fn add_component(
 
 fn add_pin(
     db: &mut DesignDb,
-    io_pin_name_to_id: &mut HashMap<String, PinId>,
+    io_pin_name_to_id: &mut FastMap<String, PinId>,
     words: &[&str],
     line: usize,
 ) -> Result<()> {
     let [name, attributes @ ..] = words else {
         bail!("DEF line {line}: PINS record without a pin name");
     };
-    let pin_name = unescape_def_name(name);
+    let pin_name = unescape_def_name_cow(name);
 
     let mut dir = PinDir::Inout;
     let mut x = 0;
@@ -381,7 +495,8 @@ fn add_pin(
     let mut layer_off_x = 0;
     let mut layer_off_y = 0;
     let mut is_special = false;
-    for (keyword, args) in split_attributes(attributes, line)? {
+    for attr in split_attributes(attributes, line) {
+        let (keyword, args) = attr?;
         match keyword {
             "SPECIAL" => is_special = true,
             "DIRECTION" => {
@@ -390,14 +505,18 @@ fn add_pin(
                         "INPUT" => PinDir::Input,
                         "OUTPUT" => PinDir::Output,
                         "INOUT" => PinDir::Inout,
-                        other => bail!("DEF line {line}: pin {pin_name} has unsupported DIRECTION `{other}`"),
+                        other => bail!(
+                            "DEF line {line}: pin {pin_name} has unsupported DIRECTION `{other}`"
+                        ),
                     },
                     _ => bail!("DEF line {line}: pin {pin_name} DIRECTION takes one value"),
                 };
             }
             "LAYER" => {
                 let [_, x1, y1, x2, y2] = args else {
-                    bail!("DEF line {line}: pin {pin_name} `+ LAYER` needs `layer ( x1 y1 ) ( x2 y2 )`");
+                    bail!(
+                        "DEF line {line}: pin {pin_name} `+ LAYER` needs `layer ( x1 y1 ) ( x2 y2 )`"
+                    );
                 };
                 let x1: i32 = number(x1, "pin LAYER x1", line)?;
                 let y1: i32 = number(y1, "pin LAYER y1", line)?;
@@ -437,18 +556,13 @@ fn add_pin(
     db.pin_is_driver.push(is_driver);
 
     if !is_special {
-        io_pin_name_to_id.insert(pin_name, pin_id);
+        io_pin_name_to_id.insert(pin_name.into_owned(), pin_id);
         db.io_pins.push(pin_id);
     }
     Ok(())
 }
 
-fn add_special_net(
-    db: &mut DesignDb,
-    tech_db: &TechDb,
-    words: &[&str],
-    line: usize,
-) -> Result<()> {
+fn add_special_net(db: &mut DesignDb, tech_db: &TechDb, words: &[&str], line: usize) -> Result<()> {
     // Wire segments: `ROUTED|NEW layer width ( x1 y1 ) ( x2 y2 )`, where `*` repeats the previous coordinate.
     let mut last_x = 0;
     let mut last_y = 0;
@@ -474,16 +588,26 @@ fn add_special_net(
                         continue;
                     }
                     if i + 3 < words.len() {
-                        let is_c1 = words[i] == "*" || words[i].parse::<i32>().is_ok();
-                        let is_c2 = words[i + 1] == "*" || words[i + 1].parse::<i32>().is_ok();
-                        let is_c3 = words[i + 2] == "*" || words[i + 2].parse::<i32>().is_ok();
-                        let is_c4 = words[i + 3] == "*" || words[i + 3].parse::<i32>().is_ok();
-
-                        if is_c1 && is_c2 && is_c3 && is_c4 {
-                            let x1 = if words[i] == "*" { last_x } else { number(words[i], "SPECIALNETS x", line)? };
-                            let y1 = if words[i + 1] == "*" { last_y } else { number(words[i + 1], "SPECIALNETS y", line)? };
-                            let x2 = if words[i + 2] == "*" { x1 } else { number(words[i + 2], "SPECIALNETS x", line)? };
-                            let y2 = if words[i + 3] == "*" { y1 } else { number(words[i + 3], "SPECIALNETS y", line)? };
+                        // One parse per candidate coordinate: `None` probes out,
+                        // `Some(None)` is `*` (repeat the previous coordinate).
+                        let coord = |w: &str| -> Option<Option<i32>> {
+                            if w == "*" {
+                                Some(None)
+                            } else {
+                                w.parse::<i32>().ok().map(Some)
+                            }
+                        };
+                        let probes = (
+                            coord(words[i]),
+                            coord(words[i + 1]),
+                            coord(words[i + 2]),
+                            coord(words[i + 3]),
+                        );
+                        if let (Some(x1), Some(y1), Some(x2), Some(y2)) = probes {
+                            let x1 = x1.unwrap_or(last_x);
+                            let y1 = y1.unwrap_or(last_y);
+                            let x2 = x2.unwrap_or(x1);
+                            let y2 = y2.unwrap_or(y1);
 
                             last_x = x2;
                             last_y = y2;
@@ -518,11 +642,7 @@ fn add_special_net(
     Ok(())
 }
 
-pub fn parse_def_bytes(
-    bytes: &[u8],
-    tech_db: &TechDb,
-    lib_db: Option<&LibDb>,
-) -> Result<DesignDb> {
+pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -> Result<DesignDb> {
     let text = std::str::from_utf8(bytes).context("DEF is not valid UTF-8")?;
     let mut lexer = DefLexer::new(text);
     let mut db = DesignDb::new();
@@ -533,8 +653,8 @@ pub fn parse_def_bytes(
         1000
     };
 
-    let mut cell_name_to_id: HashMap<String, CellId> = HashMap::new();
-    let mut io_pin_name_to_id: HashMap<String, PinId> = HashMap::new();
+    let mut cell_name_to_id: FastMap<String, CellId> = FastMap::default();
+    let mut io_pin_name_to_id: FastMap<String, PinId> = FastMap::default();
     let mut saw_end_design = false;
 
     loop {
@@ -553,7 +673,10 @@ pub fn parse_def_bytes(
                 ["DISTANCE", "MICRONS", dbu] => {
                     db.dbu_per_micron = number(dbu, "UNITS MICRONS", lexer.line())?;
                 }
-                _ => bail!("DEF line {}: UNITS must be `UNITS DISTANCE MICRONS <dbu> ;`", lexer.line()),
+                _ => bail!(
+                    "DEF line {}: UNITS must be `UNITS DISTANCE MICRONS <dbu> ;`",
+                    lexer.line()
+                ),
             },
             // Header statements. The database takes names as written and the technology from
             // the LEF, so these describe conventions it does not need.
@@ -576,8 +699,20 @@ pub fn parse_def_bytes(
                 // ROW name site orig_x orig_y orient DO num_x BY num_y STEP step_x step_y
                 let words = read_statement(&mut lexer)?;
                 let line = lexer.line();
-                let [name, site, orig_x, orig_y, orient, "DO", num_x, "BY", num_y, "STEP", step_x, step_y] =
-                    words.as_slice()
+                let [
+                    name,
+                    site,
+                    orig_x,
+                    orig_y,
+                    orient,
+                    "DO",
+                    num_x,
+                    "BY",
+                    num_y,
+                    "STEP",
+                    step_x,
+                    step_y,
+                ] = words.as_slice()
                 else {
                     bail!(
                         "DEF line {line}: ROW must be `ROW name site x y orient DO n BY m STEP sx sy ;` ({} words given)",
@@ -607,7 +742,9 @@ pub fn parse_def_bytes(
                             (dir, start, num, step, layers)
                         }
                         [dir, start, "DO", num, "STEP", step] => (dir, start, num, step, &[]),
-                        _ => bail!("DEF line {line}: TRACKS must be `TRACKS X|Y start DO n STEP step [LAYER ...] ;`"),
+                        _ => bail!(
+                            "DEF line {line}: TRACKS must be `TRACKS X|Y start DO n STEP step [LAYER ...] ;`"
+                        ),
                     };
                 let mut layers = Vec::new();
                 for lname in layer_names {
@@ -633,7 +770,9 @@ pub fn parse_def_bytes(
                 let words = read_statement(&mut lexer)?;
                 let line = lexer.line();
                 let [dir, start, "DO", num, "STEP", step] = words.as_slice() else {
-                    bail!("DEF line {line}: GCELLGRID must be `GCELLGRID X|Y start DO n STEP step ;`");
+                    bail!(
+                        "DEF line {line}: GCELLGRID must be `GCELLGRID X|Y start DO n STEP step ;`"
+                    );
                 };
                 db.gcell_grids.push(GCellGridDef {
                     is_x: axis(dir, "GCELLGRID", line)?,
@@ -671,7 +810,7 @@ pub fn parse_def_bytes(
                     match lexer.next_token() {
                         DefToken::Word("-") => {
                             let net_name = match lexer.next_token() {
-                                DefToken::Word(w) => unescape_def_name(w),
+                                DefToken::Word(w) => unescape_def_name_cow(w).into_owned(),
                                 other => bail!(
                                     "DEF line {}: expected a net name after `-`, found {other:?}",
                                     lexer.line()
@@ -693,28 +832,25 @@ pub fn parse_def_bytes(
                                         read_group(&mut lexer)?;
                                     }
                                     DefToken::LParen => {
-                                        let group = read_group(&mut lexer)?;
+                                        let (comp, pin) = read_conn_group(&mut lexer, &net_name)?;
                                         let line = lexer.line();
-                                        let [comp, pin] = group.as_slice() else {
-                                            bail!("DEF line {line}: connection of net {net_name} must be `( component pin )`");
-                                        };
-                                        if *comp == "PIN" {
-                                            let pname = unescape_def_name(pin);
-                                            let &pid = io_pin_name_to_id.get(&pname).with_context(|| {
+                                        if comp == "PIN" {
+                                            let pname = unescape_def_name_cow(pin);
+                                            let &pid = io_pin_name_to_id.get(pname.as_ref()).with_context(|| {
                                                 format!("DEF line {line}: net {net_name} connects to PIN {pname}, which PINS does not define")
                                             })?;
                                             current_pins.push(pid);
                                             db.pin_nets[pid.0 as usize] = Some(net_id);
                                         } else {
-                                            let iname = unescape_def_name(comp);
-                                            let &cid = cell_name_to_id.get(&iname).with_context(|| {
+                                            let iname = unescape_def_name_cow(comp);
+                                            let &cid = cell_name_to_id.get(iname.as_ref()).with_context(|| {
                                                 format!("DEF line {line}: net {net_name} connects to component {iname}, which COMPONENTS does not define")
                                             })?;
                                             let pid = db
                                                 .cell_pins(cid)
                                                 .iter()
                                                 .copied()
-                                                .find(|&pid| db.strings.resolve(db.pin_names[pid.0 as usize]) == *pin)
+                                                .find(|&pid| db.strings.resolve(db.pin_names[pid.0 as usize]) == pin)
                                                 .with_context(|| {
                                                     format!("DEF line {line}: net {net_name} connects to {iname}/{pin}, which the macro does not have")
                                                 })?;
@@ -735,7 +871,9 @@ pub fn parse_def_bytes(
                             end_section(&mut lexer, "NETS")?;
                             break;
                         }
-                        DefToken::Eof => bail!("DEF: NETS is not terminated by `END NETS` (truncated file?)"),
+                        DefToken::Eof => {
+                            bail!("DEF: NETS is not terminated by `END NETS` (truncated file?)")
+                        }
                         other => bail!(
                             "DEF line {}: unexpected {other:?} in NETS; records start with `-`",
                             lexer.line()
@@ -764,7 +902,8 @@ pub fn parse_def_bytes(
                     db.net_pin_offsets.push(offset);
 
                     // Invariant: driver pin placed first
-                    if let Some(drv_pos) = pins.iter().position(|&p| db.pin_is_driver[p.0 as usize]) {
+                    if let Some(drv_pos) = pins.iter().position(|&p| db.pin_is_driver[p.0 as usize])
+                    {
                         pins.swap(0, drv_pos);
                     }
                     db.net_pin_ids.extend(pins);
@@ -772,9 +911,15 @@ pub fn parse_def_bytes(
                 db.net_pin_offsets.push(db.net_pin_ids.len() as u32);
             }
             DefToken::Word(keyword) => {
-                bail!("DEF line {}: unknown section or statement `{keyword}`", lexer.line())
+                bail!(
+                    "DEF line {}: unknown section or statement `{keyword}`",
+                    lexer.line()
+                )
             }
-            other => bail!("DEF line {}: unexpected {other:?} at top level", lexer.line()),
+            other => bail!(
+                "DEF line {}: unexpected {other:?} at top level",
+                lexer.line()
+            ),
         }
     }
 
@@ -784,13 +929,9 @@ pub fn parse_def_bytes(
     Ok(db)
 }
 
-pub fn parse_def(
-    path: &Path,
-    tech_db: &TechDb,
-    lib_db: Option<&LibDb>,
-) -> Result<DesignDb> {
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open DEF file at {:?}", path))?;
+pub fn parse_def(path: &Path, tech_db: &TechDb, lib_db: Option<&LibDb>) -> Result<DesignDb> {
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open DEF file at {:?}", path))?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
     parse_def_bytes(&contents, tech_db, lib_db)
@@ -832,7 +973,9 @@ pub fn write_def(
     for c in 0..db.num_cells() {
         let name = db.strings.resolve(db.cell_names[c]);
         let macro_id = db.cell_macros[c];
-        let macro_name = tech_db.strings.resolve(tech_db.macros[macro_id.0 as usize].name);
+        let macro_name = tech_db
+            .strings
+            .resolve(tech_db.macros[macro_id.0 as usize].name);
 
         let status = match db.cell_status[c] {
             PlacementStatus::Placed => "PLACED",
@@ -864,12 +1007,120 @@ pub fn write_def(
     Ok(())
 }
 
+/// Serializes a complete DEF — header, DIEAREA, ROWs, COMPONENTS, PINS, NETS —
+/// with no template. Used by floorplan generation where no DEF exists yet.
+/// TRACKS/GCELLGRID/VIAS/SPECIALNETS are omitted: they constrain detailed
+/// routing and power, which this database does not model.
+pub fn write_def_full(db: &DesignDb, tech_db: &TechDb, out_def_path: &Path) -> Result<()> {
+    let name = |sym: crate::interner::SymbolId| escape_def_name(db.strings.resolve(sym));
+    let mut out = String::with_capacity(1 << 20);
+    out.push_str("VERSION 5.8 ;\nDIVIDERCHAR \"/\" ;\nBUSBITCHARS \"[]\" ;\n");
+    out.push_str(&format!("DESIGN {} ;\n", escape_def_name(&db.design_name)));
+    out.push_str(&format!("UNITS DISTANCE MICRONS {} ;\n", db.dbu_per_micron));
+    out.push_str(&format!(
+        "DIEAREA ( {} {} ) ( {} {} ) ;\n",
+        db.die_area.xl, db.die_area.yl, db.die_area.xh, db.die_area.yh
+    ));
+    for (i, r) in db.rows.iter().enumerate() {
+        out.push_str(&format!(
+            "ROW ROW_{} {} {} {} {} DO {} BY 1 STEP {} 0 ;\n",
+            i,
+            name(r.site_name),
+            r.orig_x_dbu,
+            r.orig_y_dbu,
+            orient_str(r.orient),
+            r.num_x,
+            r.step_x_dbu
+        ));
+    }
+
+    out.push_str(&format!("COMPONENTS {} ;\n", db.num_cells()));
+    for c in 0..db.num_cells() {
+        let macro_name = tech_db
+            .strings
+            .resolve(tech_db.macros[db.cell_macros[c].0 as usize].name);
+        match db.cell_status[c] {
+            PlacementStatus::Unplaced => {
+                out.push_str(&format!(
+                    "    - {} {} + UNPLACED ;\n",
+                    name(db.cell_names[c]),
+                    escape_def_name(macro_name)
+                ));
+            }
+            status => {
+                out.push_str(&format!(
+                    "    - {} {} + {} ( {} {} ) {} ;\n",
+                    name(db.cell_names[c]),
+                    escape_def_name(macro_name),
+                    match status {
+                        PlacementStatus::Placed => "PLACED",
+                        PlacementStatus::Fixed => "FIXED",
+                        PlacementStatus::Cover => "COVER",
+                        PlacementStatus::Unplaced => unreachable!(),
+                    },
+                    db.cell_x_dbu[c],
+                    db.cell_y_dbu[c],
+                    orient_str(db.cell_orient[c])
+                ));
+            }
+        }
+    }
+    out.push_str("END COMPONENTS\n");
+
+    out.push_str(&format!("PINS {} ;\n", db.io_pins.len()));
+    for &pin in &db.io_pins {
+        let p = pin.0 as usize;
+        let mut line = format!("    - {}", name(db.pin_names[p]));
+        if let Some(net) = db.pin_nets[p] {
+            line.push_str(&format!(" + NET {}", name(db.net_names[net.0 as usize])));
+        }
+        line.push_str(&format!(
+            " + DIRECTION {} + USE SIGNAL + PORT + PLACED ( {} {} ) N ;\n",
+            match db.pin_dirs[p] {
+                PinDir::Input => "INPUT",
+                PinDir::Output => "OUTPUT",
+                PinDir::Inout | PinDir::Internal => "INOUT",
+            },
+            db.pin_offset_x_dbu[p],
+            db.pin_offset_y_dbu[p]
+        ));
+        out.push_str(&line);
+    }
+    out.push_str("END PINS\n");
+
+    out.push_str(&format!("NETS {} ;\n", db.num_nets()));
+    for n in 0..db.num_nets() {
+        let mut line = format!("    - {}", name(db.net_names[n]));
+        let start = db.net_pin_offsets[n] as usize;
+        let end = db.net_pin_offsets[n + 1] as usize;
+        for &pin in &db.net_pin_ids[start..end] {
+            let p = pin.0 as usize;
+            match db.pin_cells[p] {
+                Some(cell) => line.push_str(&format!(
+                    " ( {} {} )",
+                    name(db.cell_names[cell.0 as usize]),
+                    name(db.pin_names[p])
+                )),
+                None => line.push_str(&format!(" ( PIN {} )", name(db.pin_names[p]))),
+            }
+        }
+        line.push_str(" + USE SIGNAL ;\n");
+        out.push_str(&line);
+    }
+    out.push_str("END NETS\nEND DESIGN\n");
+
+    let mut file = File::create(out_def_path)
+        .with_context(|| format!("Failed to create DEF at {:?}", out_def_path))?;
+    file.write_all(out.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{design_dir, require, sky130_hd};
     use crate::interner::StringInterner;
     use crate::readers::lef::{load_tech_db, parse_lef_bytes};
+    use crate::test_support::{design_dir, require, sky130_hd};
 
     #[test]
     fn test_gcd_placed_def() {
@@ -889,10 +1140,10 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+            .expect("Failed to load TechDb")
+            .0;
 
-        let db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+        let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         let ref_path = design_dir("gcd").join("gcd.reference.json");
         let ref_bytes = std::fs::read(&ref_path)
@@ -901,24 +1152,45 @@ mod tests {
             .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["instances"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["instances"].as_u64().unwrap() as usize
+        );
         assert_eq!(db.num_rows(), ref_json["rows"].as_u64().unwrap() as usize);
-        assert_eq!(db.tracks.len(), ref_json["def_tracks_statements"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["bterms_signal"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["def_inst_pins"].as_u64().unwrap() as usize);
-        assert_eq!(db.net_pin_ids.len(), ref_json["connected_net_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.tracks.len(),
+            ref_json["def_tracks_statements"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["bterms_signal"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["def_inst_pins"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.net_pin_ids.len(),
+            ref_json["connected_net_pins"].as_u64().unwrap() as usize
+        );
 
         let hpwl = db.compute_hpwl_dbu(&tech_db);
-        assert_eq!(hpwl, ref_json["placed_hpwl_dbu"].as_i64().unwrap(), "HPWL must equal OpenROAD getTermBBox sum");
+        assert_eq!(
+            hpwl,
+            ref_json["placed_hpwl_dbu"].as_i64().unwrap(),
+            "HPWL must equal OpenROAD getTermBBox sum"
+        );
 
         // Verify write_def roundtrip and re-parse
         let tmp_dir = std::env::temp_dir();
         let out_def_path = tmp_dir.join("grus_gcd_placed_roundtrip.def");
-        write_def(&db, &tech_db, &def_path, &out_def_path)
-            .expect("Failed to write DEF template");
-        let db_roundtrip = parse_def(&out_def_path, &tech_db, None)
-            .expect("Failed to re-parse written DEF");
+        write_def(&db, &tech_db, &def_path, &out_def_path).expect("Failed to write DEF template");
+        let db_roundtrip =
+            parse_def(&out_def_path, &tech_db, None).expect("Failed to re-parse written DEF");
         assert_eq!(db_roundtrip.num_cells(), db.num_cells());
         assert_eq!(db_roundtrip.num_nets(), db.num_nets());
         assert_eq!(db_roundtrip.compute_hpwl_dbu(&tech_db), hpwl);
@@ -935,7 +1207,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e))
+            .0;
         let db = parse_def(&gcd_dir.join("gcd.orient.def"), &tech_db, None)
             .expect("Failed to parse gcd.orient.def");
 
@@ -961,11 +1234,19 @@ mod tests {
             assert_eq!(ours.get(f[0]), Some(&want), "pin {}", f[0]);
             checked += 1;
         }
-        assert_eq!(checked, ours.len(), "golden file must cover every signal instance pin");
+        assert_eq!(
+            checked,
+            ours.len(),
+            "golden file must cover every signal instance pin"
+        );
 
         let ref_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(gcd_dir.join("gcd.reference.json")).unwrap()).unwrap();
-        assert_eq!(db.compute_hpwl_dbu(&tech_db), ref_json["orient_hpwl_dbu"].as_i64().unwrap());
+            serde_json::from_slice(&std::fs::read(gcd_dir.join("gcd.reference.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            db.compute_hpwl_dbu(&tech_db),
+            ref_json["orient_hpwl_dbu"].as_i64().unwrap()
+        );
     }
 
     #[test]
@@ -976,33 +1257,55 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+            .expect("Failed to load TechDb")
+            .0;
 
-        let db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+        let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         let ref_path = require(design_dir("aes").join("aes.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read aes.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["instances"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["instances"].as_u64().unwrap() as usize
+        );
         assert_eq!(db.num_rows(), ref_json["rows"].as_u64().unwrap() as usize);
-        assert_eq!(db.tracks.len(), ref_json["def_tracks_statements"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["bterms_signal"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["def_inst_pins"].as_u64().unwrap() as usize);
-        assert_eq!(db.net_pin_ids.len(), ref_json["connected_net_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.tracks.len(),
+            ref_json["def_tracks_statements"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["bterms_signal"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["def_inst_pins"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.net_pin_ids.len(),
+            ref_json["connected_net_pins"].as_u64().unwrap() as usize
+        );
 
         let hpwl = db.compute_hpwl_dbu(&tech_db);
-        assert_eq!(hpwl, ref_json["placed_hpwl_dbu"].as_i64().unwrap(), "HPWL must equal OpenROAD getTermBBox sum");
+        assert_eq!(
+            hpwl,
+            ref_json["placed_hpwl_dbu"].as_i64().unwrap(),
+            "HPWL must equal OpenROAD getTermBBox sum"
+        );
 
         let tmp_dir = std::env::temp_dir();
         let out_def_path = tmp_dir.join("grus_aes_placed_roundtrip.def");
-        write_def(&db, &tech_db, &def_path, &out_def_path)
-            .expect("Failed to write DEF template");
-        let db_roundtrip = parse_def(&out_def_path, &tech_db, None)
-            .expect("Failed to re-parse written DEF");
+        write_def(&db, &tech_db, &def_path, &out_def_path).expect("Failed to write DEF template");
+        let db_roundtrip =
+            parse_def(&out_def_path, &tech_db, None).expect("Failed to re-parse written DEF");
         assert_eq!(db_roundtrip.num_cells(), db.num_cells());
         assert_eq!(db_roundtrip.num_nets(), db.num_nets());
         assert_eq!(db_roundtrip.compute_hpwl_dbu(&tech_db), hpwl);
@@ -1019,7 +1322,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e))
+            .0;
         let db = parse_def(&require(aes_dir.join("aes.orient.def")), &tech_db, None)
             .expect("Failed to parse aes.orient.def");
 
@@ -1045,11 +1349,20 @@ mod tests {
             assert_eq!(ours.get(f[0]), Some(&want), "pin {}", f[0]);
             checked += 1;
         }
-        assert_eq!(checked, ours.len(), "golden file must cover every signal instance pin");
+        assert_eq!(
+            checked,
+            ours.len(),
+            "golden file must cover every signal instance pin"
+        );
 
-        let ref_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(require(aes_dir.join("aes.reference.json"))).unwrap()).unwrap();
-        assert_eq!(db.compute_hpwl_dbu(&tech_db), ref_json["orient_hpwl_dbu"].as_i64().unwrap());
+        let ref_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(require(aes_dir.join("aes.reference.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.compute_hpwl_dbu(&tech_db),
+            ref_json["orient_hpwl_dbu"].as_i64().unwrap()
+        );
     }
 
     #[test]
@@ -1060,33 +1373,55 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+            .expect("Failed to load TechDb")
+            .0;
 
-        let db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+        let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         let ref_path = require(design_dir("jpeg").join("jpeg.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read jpeg.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["instances"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["instances"].as_u64().unwrap() as usize
+        );
         assert_eq!(db.num_rows(), ref_json["rows"].as_u64().unwrap() as usize);
-        assert_eq!(db.tracks.len(), ref_json["def_tracks_statements"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["bterms_signal"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["def_inst_pins"].as_u64().unwrap() as usize);
-        assert_eq!(db.net_pin_ids.len(), ref_json["connected_net_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.tracks.len(),
+            ref_json["def_tracks_statements"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["bterms_signal"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["def_inst_pins"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.net_pin_ids.len(),
+            ref_json["connected_net_pins"].as_u64().unwrap() as usize
+        );
 
         let hpwl = db.compute_hpwl_dbu(&tech_db);
-        assert_eq!(hpwl, ref_json["placed_hpwl_dbu"].as_i64().unwrap(), "HPWL must equal OpenROAD getTermBBox sum");
+        assert_eq!(
+            hpwl,
+            ref_json["placed_hpwl_dbu"].as_i64().unwrap(),
+            "HPWL must equal OpenROAD getTermBBox sum"
+        );
 
         let tmp_dir = std::env::temp_dir();
         let out_def_path = tmp_dir.join("grus_jpeg_placed_roundtrip.def");
-        write_def(&db, &tech_db, &def_path, &out_def_path)
-            .expect("Failed to write DEF template");
-        let db_roundtrip = parse_def(&out_def_path, &tech_db, None)
-            .expect("Failed to re-parse written DEF");
+        write_def(&db, &tech_db, &def_path, &out_def_path).expect("Failed to write DEF template");
+        let db_roundtrip =
+            parse_def(&out_def_path, &tech_db, None).expect("Failed to re-parse written DEF");
         assert_eq!(db_roundtrip.num_cells(), db.num_cells());
         assert_eq!(db_roundtrip.num_nets(), db.num_nets());
         assert_eq!(db_roundtrip.compute_hpwl_dbu(&tech_db), hpwl);
@@ -1103,7 +1438,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e))
+            .0;
         let db = parse_def(&require(jpeg_dir.join("jpeg.orient.def")), &tech_db, None)
             .expect("Failed to parse jpeg.orient.def");
 
@@ -1129,11 +1465,20 @@ mod tests {
             assert_eq!(ours.get(f[0]), Some(&want), "pin {}", f[0]);
             checked += 1;
         }
-        assert_eq!(checked, ours.len(), "golden file must cover every signal instance pin");
+        assert_eq!(
+            checked,
+            ours.len(),
+            "golden file must cover every signal instance pin"
+        );
 
-        let ref_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(require(jpeg_dir.join("jpeg.reference.json"))).unwrap()).unwrap();
-        assert_eq!(db.compute_hpwl_dbu(&tech_db), ref_json["orient_hpwl_dbu"].as_i64().unwrap());
+        let ref_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(require(jpeg_dir.join("jpeg.reference.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.compute_hpwl_dbu(&tech_db),
+            ref_json["orient_hpwl_dbu"].as_i64().unwrap()
+        );
     }
 
     #[test]
@@ -1144,33 +1489,55 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .expect("Failed to load TechDb");
+            .expect("Failed to load TechDb")
+            .0;
 
-        let db = parse_def(&def_path, &tech_db, None)
-            .expect("Failed to parse placed DEF");
+        let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
 
         let ref_path = require(design_dir("ibex").join("ibex.reference.json"));
-        let ref_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&ref_path).expect("read ibex.reference.json"))
-            .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
+        let ref_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ref_path).expect("read ibex.reference.json"))
+                .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", ref_path, e));
 
         assert_eq!(db.design_name, ref_json["design"].as_str().unwrap());
-        assert_eq!(db.num_cells(), ref_json["instances"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.num_cells(),
+            ref_json["instances"].as_u64().unwrap() as usize
+        );
         assert_eq!(db.num_rows(), ref_json["rows"].as_u64().unwrap() as usize);
-        assert_eq!(db.tracks.len(), ref_json["def_tracks_statements"].as_u64().unwrap() as usize);
-        assert_eq!(db.num_nets(), ref_json["signal_nets"].as_u64().unwrap() as usize);
-        assert_eq!(db.io_pins.len(), ref_json["bterms_signal"].as_u64().unwrap() as usize);
-        assert_eq!(db.cell_pin_ids.len(), ref_json["def_inst_pins"].as_u64().unwrap() as usize);
-        assert_eq!(db.net_pin_ids.len(), ref_json["connected_net_pins"].as_u64().unwrap() as usize);
+        assert_eq!(
+            db.tracks.len(),
+            ref_json["def_tracks_statements"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.num_nets(),
+            ref_json["signal_nets"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.io_pins.len(),
+            ref_json["bterms_signal"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.cell_pin_ids.len(),
+            ref_json["def_inst_pins"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            db.net_pin_ids.len(),
+            ref_json["connected_net_pins"].as_u64().unwrap() as usize
+        );
 
         let hpwl = db.compute_hpwl_dbu(&tech_db);
-        assert_eq!(hpwl, ref_json["placed_hpwl_dbu"].as_i64().unwrap(), "HPWL must equal OpenROAD getTermBBox sum");
+        assert_eq!(
+            hpwl,
+            ref_json["placed_hpwl_dbu"].as_i64().unwrap(),
+            "HPWL must equal OpenROAD getTermBBox sum"
+        );
 
         let tmp_dir = std::env::temp_dir();
         let out_def_path = tmp_dir.join("grus_ibex_placed_roundtrip.def");
-        write_def(&db, &tech_db, &def_path, &out_def_path)
-            .expect("Failed to write DEF template");
-        let db_roundtrip = parse_def(&out_def_path, &tech_db, None)
-            .expect("Failed to re-parse written DEF");
+        write_def(&db, &tech_db, &def_path, &out_def_path).expect("Failed to write DEF template");
+        let db_roundtrip =
+            parse_def(&out_def_path, &tech_db, None).expect("Failed to re-parse written DEF");
         assert_eq!(db_roundtrip.num_cells(), db.num_cells());
         assert_eq!(db_roundtrip.num_nets(), db.num_nets());
         assert_eq!(db_roundtrip.compute_hpwl_dbu(&tech_db), hpwl);
@@ -1187,7 +1554,8 @@ mod tests {
 
         let mut interner = StringInterner::new();
         let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
-            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e));
+            .unwrap_or_else(|e| panic!("Failed to load PDK LEF under {:?}: {}", sky130_hd(), e))
+            .0;
         let db = parse_def(&require(ibex_dir.join("ibex.orient.def")), &tech_db, None)
             .expect("Failed to parse ibex.orient.def");
 
@@ -1213,11 +1581,20 @@ mod tests {
             assert_eq!(ours.get(f[0]), Some(&want), "pin {}", f[0]);
             checked += 1;
         }
-        assert_eq!(checked, ours.len(), "golden file must cover every signal instance pin");
+        assert_eq!(
+            checked,
+            ours.len(),
+            "golden file must cover every signal instance pin"
+        );
 
-        let ref_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(require(ibex_dir.join("ibex.reference.json"))).unwrap()).unwrap();
-        assert_eq!(db.compute_hpwl_dbu(&tech_db), ref_json["orient_hpwl_dbu"].as_i64().unwrap());
+        let ref_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(require(ibex_dir.join("ibex.reference.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.compute_hpwl_dbu(&tech_db),
+            ref_json["orient_hpwl_dbu"].as_i64().unwrap()
+        );
     }
 
     const MINI_LEF: &str = r#"
@@ -1298,7 +1675,8 @@ END DESIGN
 
     #[test]
     fn test_mini_def_parses_every_section() {
-        let db = parse_def_bytes(MINI_DEF.as_bytes(), &mini_tech(), None).expect("mini DEF must parse");
+        let db =
+            parse_def_bytes(MINI_DEF.as_bytes(), &mini_tech(), None).expect("mini DEF must parse");
         assert_eq!(db.design_name, "top");
         assert_eq!(db.die_area, RectDbu::new(0, 0, 4600, 2720));
         assert_eq!(db.num_rows(), 1);
@@ -1325,7 +1703,10 @@ END DESIGN
 
     #[test]
     fn test_truncated_row_is_an_error() {
-        let msg = mini_def_error(&MINI_DEF.replace("ROW ROW_0 unithd 0 0 N DO 10 BY 1 STEP 460 2720 ;", "ROW ROW_0 unithd 0 0 N ;"));
+        let msg = mini_def_error(&MINI_DEF.replace(
+            "ROW ROW_0 unithd 0 0 N DO 10 BY 1 STEP 460 2720 ;",
+            "ROW ROW_0 unithd 0 0 N ;",
+        ));
         assert!(msg.contains("ROW must be"), "{msg}");
     }
 
@@ -1337,7 +1718,9 @@ END DESIGN
 
     #[test]
     fn test_unknown_component_attribute_is_an_error() {
-        let msg = mini_def_error(&MINI_DEF.replace("+ PLACED ( 460 0 ) N ;", "+ PLACED ( 460 0 ) N + BOGUS 1 ;"));
+        let msg = mini_def_error(
+            &MINI_DEF.replace("+ PLACED ( 460 0 ) N ;", "+ PLACED ( 460 0 ) N + BOGUS 1 ;"),
+        );
         assert!(msg.contains("BOGUS"), "{msg}");
     }
 
@@ -1371,6 +1754,26 @@ END DESIGN
         assert!(msg.contains("u1/Q"), "{msg}");
     }
 
+    /// A `( component pin )` group that is not exactly two words is rejected
+    /// with the same message and line the collected-group destructure produced.
+    #[test]
+    fn test_connection_group_with_extra_word_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 A extra )"));
+        assert!(msg.contains("must be `( component pin )`"), "{msg}");
+    }
+
+    #[test]
+    fn test_connection_group_with_one_word_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 )"));
+        assert!(msg.contains("must be `( component pin )`"), "{msg}");
+    }
+
+    #[test]
+    fn test_connection_group_unterminated_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 ;"));
+        assert!(msg.contains("unexpected Semi inside `( ... )`"), "{msg}");
+    }
+
     /// `NONDEFAULTRULES` only constrains detailed routing, which the timing database does not
     /// read; the stock LibreLane DEF emits it and must parse.
     #[test]
@@ -1379,7 +1782,41 @@ END DESIGN
             "COMPONENTS 1 ;",
             "NONDEFAULTRULES\n  - abc\nEND NONDEFAULTRULES\nCOMPONENTS 1 ;",
         );
-        parse_def_bytes(def.as_bytes(), &mini_tech(), None).expect("DEF with NONDEFAULTRULES must parse");
+        parse_def_bytes(def.as_bytes(), &mini_tech(), None)
+            .expect("DEF with NONDEFAULTRULES must parse");
+    }
+
+    /// Every name written by `escape_def_name` must come back unchanged
+    /// after the lexer splits words and `unescape_def_name` strips escapes.
+    /// `[`/`]` stay literal so `name[N]` bus-bit syntax survives, matching
+    /// what OpenROAD-flow-scripts emits for synthesized netlists.
+    #[test]
+    fn test_escaped_names_roundtrip_through_lexer() {
+        for raw in [
+            "a(b)",
+            "a;b",
+            "a#b",
+            "a b",
+            "a\\b",
+            "name[0]",
+            "req_msg[3]",
+            "dpath.a$in0",
+            "x+y,z",
+        ] {
+            let esc = escape_def_name(raw);
+            let def = MINI_DEF.replace(
+                "- n1 ( PIN clk ) ( u1 A ) + USE SIGNAL ;",
+                &format!("- {esc} ( PIN clk ) ( u1 A ) + USE SIGNAL ;"),
+            );
+            let db = parse_def_bytes(def.as_bytes(), &mini_tech(), None).unwrap_or_else(|e| {
+                panic!("DEF with escaped name {esc:?} (raw {raw:?}) failed: {e:#}")
+            });
+            assert_eq!(
+                db.strings.resolve(db.net_names[0]),
+                raw,
+                "net name {raw:?} did not round-trip"
+            );
+        }
     }
 
     /// Every truncation of the mini DEF must return `Ok` or `Err` without panicking, and only the
@@ -1387,7 +1824,8 @@ END DESIGN
     #[test]
     fn test_every_truncation_of_mini_def_is_rejected_or_parsed_without_panic() {
         let tech = mini_tech();
-        let trailer_end = MINI_DEF.find("END DESIGN").expect("fixture has END DESIGN") + "END DESIGN".len();
+        let trailer_end =
+            MINI_DEF.find("END DESIGN").expect("fixture has END DESIGN") + "END DESIGN".len();
         for n in 0..=MINI_DEF.len() {
             let result = parse_def_bytes(&MINI_DEF.as_bytes()[..n], &tech, None);
             if n < trailer_end {
