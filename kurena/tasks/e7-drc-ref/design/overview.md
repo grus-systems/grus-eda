@@ -73,9 +73,10 @@ violations, `sanity.md`), not just the 0-count golden.
   `picorv32.drc.rpt` exist in seeded worktrees. If either input is
   absent the script fails loudly naming the producer
   (`generate_ref.sh` step 7); a clean run commits the JSON.
-- **`runtime_s` is the named varying field.** Acceptance allows one
-  varying metadata field; per-step runtimes go there and the byte-repro
-  check diffs everything else.
+- **Runtime stays out of the golden entirely.** Per-step seconds go to
+  the gitignored `runs/drc/runtime.json` (+ a `DRC-RUNTIME` stdout
+  line), so the JSON byte-reproduces outright — stronger than the
+  "one varying field" allowance.
 - **No version bump.** Nothing Cargo-visible changes; the goldens have
   no consumer test yet (that is the subset-checker ticket). Stated in
   the commit + `docs/results.md` per acceptance. `cargo test

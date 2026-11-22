@@ -26,7 +26,7 @@ rejected:
 Algorithm (python3 heredoc, step D):
 
 1. Parse the input DEF `NETS` section. Collect each net's routing
-   statements (`+ ROUTED <layer> ( ... ) ...`, `+ NEW <layer> ( ... )`).
+   statements (`+ ROUTED <layer> ( ... ) ...`, `NEW <layer> ( ... )`).
    Skip nets whose statements carry `NONDEFAULTRULE` (non-default
    widths break the offset math).
 2. Choose `net_a`: the first signal net carrying a **horizontal**
@@ -41,11 +41,12 @@ Algorithm (python3 heredoc, step D):
    (expected; the parse pins it).
 4. Choose `net_b`: the first other signal net. Append to `net_b`'s
    statement list (before its terminating `;`) one disjoint wire path
-   — `+ NEW` is the same grammar `detailed_route` emits, so every
+   — `NEW` is the same grammar `detailed_route` emits (a bare
+   continuation keyword, not a `+` statement), so every
    DEF reader that accepts the input accepts the mutation:
 
    ```
-   + NEW met2 ( x1  y+W+gap ) ( x1+len  y+W+gap )
+      NEW met2 ( x1  y+W+gap ) ( x1+len  y+W+gap )
    ```
 
    where `W = WIDTH` (both wires default width; edges sit
@@ -59,7 +60,7 @@ Algorithm (python3 heredoc, step D):
    except the one inserted statement — diff-able evidence); print the
    `DRC-MUTATION` summary line with every parameter.
 
-Contingency: if Magic's DEF reader rejects or ignores the `+ NEW`
+Contingency: if Magic's DEF reader rejects or ignores the `NEW`
 statement (transcript shows the shape unread), substitute `+ RECT
 met2 ( llx lly ) ( urx ury )` with the same edge gap — record which
 statement form was used in `mutation.name`/`docs/results.md`.

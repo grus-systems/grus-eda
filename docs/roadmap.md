@@ -734,3 +734,12 @@ surface, from the first large-design run's feedback
   matching Magic's per-rule `drc listall why` counts exactly (~4 tickets
   as a subset checker). The subset-checker shape does not depend on E6
   and can run first.
+- **`e7-drc-ref` landed 2026-11-23** (reference-only): committed
+  `tests/designs/generate_drc_ref.sh` + `<d>.drc.reference.json` on
+  gcd/picorv32 — Magic 8.3.623 `drc(full)` counts, `check_antennas`,
+  the DRT report, a `met2.2` sanity control, and the 278-statement deck
+  taxonomy (`docs/e7-drc.md`). Two corrections vs the P-DRC scoping
+  probe: the clean deck is **not** zero (305 merged nwell violations
+  inside the cell masters on gcd — the probe counted before
+  `drc catchup`), and `drc listall why` bbox fragments ≠ `drc count
+  total` merged regions.

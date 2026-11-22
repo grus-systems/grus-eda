@@ -37,8 +37,9 @@ Then fix what the loud failures find, in order of likelihood:
 ## 3. Byte-reproducibility check
 
 Re-run the same command; `git diff` every committed artifact.
-`runtime_s` is the named varying field — everything else must
-byte-reproduce. Record the rerun count in `docs/results.md` (§7.1:
+per-step seconds go to the gitignored `runtime.json`
+(+ `DRC-RUNTIME` line), so the committed JSON byte-reproduces
+outright. Record the rerun count in `docs/results.md` (§7.1:
 the committed script, run as written, produces the golden).
 
 ## 4. picorv32
@@ -92,8 +93,8 @@ acceptance item.
 | Acceptance item | Where handled |
 |---|---|
 | `generate_drc_ref.sh` runs in the pinned image, emits `<d>.drc.reference.json` (gcd + picorv32-if-present): Magic total + per-rule, version, DRT count, antenna count — all script-emitted | `script.md` steps A–E; `golden.md` |
-| Magic per-rule breakdown (`drc listall why`), not just total | step C `DRCREF-WHY`; `magic_per_rule` + `magic_listall_why_count` |
+| Magic per-rule breakdown (`drc listall why`), not just total | step C `DRCREF-WHY`; `magic_per_rule` + `magic_listall_*` |
 | Sanity control: named mutation → nonzero Magic DRC + named violated rule | `sanity.md`; `sanity_control` block; step-D assertions |
 | Rule-category taxonomy committed (LEF-expressible vs antenna vs Magic-only) | `taxonomy.md`; `magic_rules_checked` + `docs/e7-drc.md` |
-| Rerun byte-reproduces the JSON (or varying metadata named) | `runtime_s` named field; steps 3 |
+| Rerun byte-reproduces the JSON (or varying metadata named) | no varying field in the golden; steps 3 |
 | `docs/results.md`: commands verbatim, counts, taxonomy summary, runtime; `cargo test` + `clippy` pass; no-bump stated | steps 6–7 |
