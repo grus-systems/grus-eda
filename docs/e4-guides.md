@@ -14,8 +14,9 @@ and the STA end-to-end path are later tickets.
 | **E4.1** | Guide topology vs OpenROAD | `global_route -guide_file <d>.guide` on `<d>.placed.def` (step 5c of `generate_ref.sh`) | Per-net guide-box overlap share ≥ 0.70 on `gcd` and `picorv32` (box-weighted over reference boxes; provisional bound — see `docs/results.md`) |
 | **E4.2** | Guide wirelength proxy | same | Total guide-box count within 15% of the reference on each design, with the per-net deltas examined (not only the total) |
 | **E4.3** | OpenROAD round-trip | `read_guides <ours>` + `estimate_parasitics -global_routing` (`check_guide_readback.sh`) | `read_guides` accepts the emitted file in the pinned container; any error is a failure |
+| **E4.4** | End-to-end STA | `sta --spef <d>.guide.ours.spef` vs OpenSTA `read_guides` + `estimate_parasitics -global_routing` golden (step 9c of `generate_ref.sh`) | Every endpoint's arrival/slack within `max(5 ps, 1%)` on gcd; picorv32 follows the routed-SPEF floors in `docs/status.md` — **measured, not met** (see `docs/results.md` `e4-sta-e2e`) |
 
-Both bounds of E4.1/E4.2 are provisional per `kurena/tasks/next-stage-scoping/design/done-when.md`.
+The E4.1/E4.2 bounds are provisional per `kurena/tasks/next-stage-scoping/design/done-when.md`.
 
 ---
 
@@ -217,11 +218,43 @@ component (gcd `_132_`: 118 route nodes, two components; OpenROAD's
 own SPEF writes island nodes with self-loop resistors). Our
 `NetRcTree` is a single BFS tree, so after the driver-rooted BFS each
 remaining component links in through a `1e-6` kΩ stub-resistor edge to
-the nearest tree node — electrically transparent for Elmore, and it
-keeps every node's cap inside the emitted SPEF so `Σ*CAP ==
-total_wire_cap_pf` round-trips through `parse_spef`/`spef_parasitics`.
+the nearest tree node — transparent as a resistor, and it keeps every
+node's cap inside the emitted SPEF so `Σ*CAP == total_wire_cap_pf`
+round-trips through `parse_spef`/`spef_parasitics`. It is **not**
+electrically transparent for timing: the edge makes the island
+subtree's real wire RC part of the driver-rooted Elmore path, where
+OpenROAD's island pins see no wire delay and island caps never load
+the driver's path. Measured on gcd as the dominant e2e residual
+(+202 ps median / +341 ps max on the parasitics axis — §11).
 Pins attached by OpenROAD to island nodes land on those same nodes;
 the pin resistor rides the island's stub link. Note `spef_parasitics`
 still *rejects* OpenROAD's own guide SPEF on such nets (a
 `Missing route` pin bail — pre-existing strictness, unchanged here);
 our emitted SPEF is always connected and reads back fine.
+
+## 11. End-to-End Guide STA Golden (E4 ticket 3, measured 2026-11-22)
+
+Step 9c of each `generate_ref.sh` emits `<d>.guide.sta.reference.json`
+with three OpenSTA endpoint blocks on `<d>.placed.def` + `<d>.sdc` —
+one `openroad` process each so every `read_spef`/`estimate_parasitics`
+starts clean:
+
+- `guide_spef` — `read_spef <d>.guide.spef` (OpenROAD's guide → its
+  `-global_routing` RC). The criterion-4 **gate** reference:
+  `test_<d>_guide_sta_matches_opensta` compares our
+  `sta --spef <d>.guide.ours.spef` consumer path against it.
+- `guide_ours_spef` — OpenSTA `read_spef` on our
+  `<d>.guide.ours.spef`. Ours-vs-this is the pure STA-engine residual
+  (`test_<d>_guide_spef_engine_residual`, asserted), and the block's
+  existence is the `write_spef` interop check.
+- `guide_ours_readback` — `read_guides runs/guide-check/<d>.ours.guide`
+  + `estimate_parasitics -global_routing`. Diagnostic only: vs
+  `guide_spef` it isolates guide topology (e4-1), vs `guide_ours_spef`
+  the RC model (e4-2). `test_<d>_guide_sta_decomposition` prints the
+  four-row axis table (`topology` / `parasitics` / `engine` / `total`);
+  only the two asserted tests gate, the decomposition rows and the
+  named-cause `*_GUIDE` floors are regression guards.
+
+Our side regenerates via `tests/designs/generate_guide_ours_spef.sh`
+(release binary; `*VERSION` stamped from the workspace version).
+Verdict and named-cause numbers: `docs/results.md` `e4-sta-e2e`.

@@ -598,6 +598,15 @@ tolerances, probe evidence — is in
   guides → OpenROAD `estimate_parasitics`) is recorded at 98.1%/98.4% —
   its residual is guide coverage, not the RC model. The end-to-end `sta`
   criterion remains open.
+- Progress 2026-11-22 (`v0.3.11`, ticket `e4-sta-e2e`): criterion 4
+  measured end to end — **not met** (gcd 0/53, picorv32 94/1,798 endpoints
+  inside bound). The decomposition names both causes: the
+  `SPEF_STUB_RES_KOHM` island-link lands OpenROAD-dead island RC on the
+  Elmore path (parasitics axis, +202 ps / +1,408 ps median) and guide
+  coverage is the topology axis (+65 ps / +523 ps); the STA engine stays
+  inside the recorded band. Remaining open item: guide-quality
+  improvements (met3–met5 band, stub coverage) and island-faithful
+  parasitics — not the e2e harness. See `docs/results.md` `e4-sta-e2e`.
 - Probe note: guide parasitics halve the placement-estimate gap to routed
   truth on gcd (median per-net C diff vs RCX: 27.6% vs 44.2%).
 - Sizing: ~6–8 tickets (M). Ticket sketch in `design/order.md`.
