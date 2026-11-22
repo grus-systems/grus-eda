@@ -255,7 +255,7 @@ fn truncated_axis(base: i32, off: i32, frac: bool, mirrored: bool) -> i32 {
 /// invariants the readers establish at parse time:
 ///
 /// - **I1 — SoA lengths.** All seven `cell_*` columns have length
-///   `num_cells()`; all thirteen `pin_*` columns (including
+///   `num_cells()`; all eleven `pin_*` columns (including
 ///   `pin_io_rects`) have length `num_pins()`. `cell_pin_offsets` and
 ///   `net_pin_offsets` have length `num_cells()+1`/`num_nets()+1`, are
 ///   nondecreasing, start at 0, and end at `cell_pin_ids.len()`/
@@ -467,11 +467,15 @@ impl DesignDb {
     /// driver produces `new_net = {buf_out}` — legal output, no special
     /// case. Returns the inserted cell and the new net.
     ///
-    /// Errors when `net` has no driver (nothing to anchor the split) or
-    /// when `buffer_macro` does not have exactly one non-power `Input`
-    /// pin and one non-power `Output` pin — the `is_power` test is
-    /// load-bearing: `clkbuf_*` power pins are `DIRECTION INOUT` in LEF
-    /// and would pass a direction-only filter.
+    /// Errors when `net` has no driver (nothing to anchor the split),
+    /// when it has more than one driver pin (which driver keeps the
+    /// original net is ambiguous — connect the extra drivers explicitly
+    /// first), or when `buffer_macro` does not have exactly one
+    /// non-power `Input` pin and one non-power `Output` pin — the
+    /// `is_power` test is load-bearing: `clkbuf_*` power pins are
+    /// `DIRECTION INOUT` in LEF and would pass a direction-only filter.
+    /// Both names are validated before any mutation, so a failure
+    /// leaves the design untouched.
     pub fn insert_buffer_on_net(
         &mut self,
         net: NetId,
@@ -481,13 +485,41 @@ impl DesignDb {
         tech_db: &TechDb,
         lib_db: Option<&LibDb>,
     ) -> Result<(CellId, NetId)> {
-        let driver = self.net_driver(net).with_context(|| {
-            format!(
+        let drivers: Vec<PinId> = self
+            .net_pins(net)
+            .iter()
+            .copied()
+            .filter(|&p| self.pin_is_driver[p.0 as usize])
+            .collect();
+        match drivers.as_slice() {
+            [] => bail!(
                 "insert_buffer_on_net: net {} `{}` has no driver",
                 net.0,
                 self.strings.resolve(self.net_names[net.0 as usize])
-            )
-        })?;
+            ),
+            [_] => {}
+            _ => bail!(
+                "insert_buffer_on_net: net {} `{}` has {} driver pins; only single-driver nets are supported",
+                net.0,
+                self.strings.resolve(self.net_names[net.0 as usize]),
+                drivers.len()
+            ),
+        }
+        let driver = drivers[0];
+        if self
+            .cell_names
+            .iter()
+            .any(|&s| self.strings.resolve(s) == name)
+        {
+            bail!("insert_buffer_on_net: cell name `{name}` already exists");
+        }
+        if self
+            .net_names
+            .iter()
+            .any(|&s| self.strings.resolve(s) == new_net_name)
+        {
+            bail!("insert_buffer_on_net: net name `{new_net_name}` already exists");
+        }
         let mac = tech_db
             .macros
             .get(buffer_macro.0 as usize)

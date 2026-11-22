@@ -7267,3 +7267,28 @@ green.
 root); inserted cells arrive `Unplaced` — seed at a sensible position
 then `legalize_placement`; `write_def_full` emits the mutated design
 without hooks.
+
+**Coverage caveat** (tests.md, recorded here per the design): tests
+exercise DEF-sourced designs only. Verilog/Yosys-JSON–sourced
+`DesignDb`s share the same CSR invariants (their readers build
+driver-first CSR the same way), but mutation on them is untested —
+stated, not claimed.
+
+**Version note** (steps.md, named discrepancy): the workspace moved
+`0.3.13 → 0.4.0` **minor**, per the acceptance's explicit "minor —
+new API surface" instruction. AGENTS.md §5's 0.x rule would have this
+a **patch** ("features and bug fixes bump `patch`; breaking changes
+bump `minor`") — the API is additive, not breaking. Minor was taken
+as specified; the deviation from the house rule is recorded, not
+silent.
+
+**Card #32 review follow-ups** (local fixup commit): the I3
+fail-proof tests.md also specified was run — dropping
+`pin_nets[p] = Some(net)` from `connect_pin` turns all four mutation
+tests red (`pin_nets`/`net_pin_ids` disagree:
+`right: Some(NetId(181))`), restored green. `insert_buffer_on_net`
+now pre-validates both names before mutating (no orphan cell on a
+duplicate `new_net_name`) and bails on multi-driver nets instead of
+letting moved drivers displace `buf_out` at index 0. Rustdoc's
+`pin_*` column count corrected thirteen → eleven (matching the
+eleven per-pin SoA columns; `api.md` amended identically).

@@ -10,7 +10,7 @@ names the offending name/id.
 ## Invariants (to document in rustdoc on each method)
 
 - **I1 — SoA lengths.** All seven `cell_*` columns have length
-  `num_cells()`; all thirteen `pin_*` columns (including
+  `num_cells()`; all eleven `pin_*` columns (including
   `pin_io_rects`) have length `num_pins()`. `cell_pin_offsets` and
   `net_pin_offsets` have length `num_cells()+1`/`num_nets()+1`, are
   nondecreasing, start at 0, and end at `cell_pin_ids.len()`/
