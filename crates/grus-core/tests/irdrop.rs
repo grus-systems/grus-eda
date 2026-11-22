@@ -352,7 +352,6 @@ fn solve_net(
 struct CsvRow {
     instance: String,
     terminal: String,
-    #[allow(dead_code)]
     layer: String,
     x_um: f64,
     y_um: f64,
@@ -522,6 +521,7 @@ fn check_row_sets(ours: &RowMap, reference: &RowMap) -> Result<(), String> {
 struct Deviation {
     instance: String,
     terminal: String,
+    layer: String,
     x_um: f64,
     y_um: f64,
     ours_v: f64,
@@ -538,6 +538,7 @@ struct MapStats {
     median_abs_v: f64,
     p99_abs_v: f64,
     over_tolerance: usize,
+    over_strict: usize,
     top5: Vec<Deviation>,
 }
 
@@ -561,6 +562,7 @@ fn deviations(left: &RowMap, right: &RowMap, pin_floor_v: f64) -> Vec<Deviation>
             Deviation {
                 instance: key.0.clone(),
                 terminal: key.1.clone(),
+                layer: r.layer.clone(),
                 x_um: r.x_um,
                 y_um: r.y_um,
                 ours_v: o.voltage_v,
@@ -599,21 +601,28 @@ fn map_stats(devs: &[Deviation]) -> MapStats {
         median_abs_v: median,
         p99_abs_v: p99,
         over_tolerance: devs.iter().filter(|d| d.delta_v.abs() > d.tolerance_v).count(),
+        // The strict 1 mV rule is what a named floor relaxes; keeping the
+        // strict count alongside over_tol shows what the floor absorbed.
+        over_strict: devs
+            .iter()
+            .filter(|d| d.delta_v.abs() > (0.05 * d.reference_v.abs()).max(0.001))
+            .count(),
         top5: top,
     }
 }
 
-fn print_stats(ctx: &str, semantics: &str, stats: &MapStats) {
+fn print_stats(ctx: &str, semantics: &str, left: &str, right: &str, stats: &MapStats) {
     println!(
-        "{ctx} ({semantics}): rows={} over_tol={} max={:.3e} mean={:.3e} median={:.3e} p99={:.3e}",
-        stats.rows, stats.over_tolerance, stats.max_abs_v, stats.mean_abs_v,
-        stats.median_abs_v, stats.p99_abs_v
+        "{ctx} ({semantics}): rows={} over_tol={} over_strict={} max={:.3e} \
+         mean={:.3e} median={:.3e} p99={:.3e}",
+        stats.rows, stats.over_tolerance, stats.over_strict, stats.max_abs_v,
+        stats.mean_abs_v, stats.median_abs_v, stats.p99_abs_v
     );
     println!("  top5:");
     for d in &stats.top5 {
         print!(
-            "    {} {} {:.4} {:.4} ours={:.6e} ref={:.6e} delta={:+.3e} tol={:.3e}",
-            d.instance, d.terminal, d.x_um, d.y_um, d.ours_v, d.reference_v,
+            "    {} {} {} {:.4} {:.4} {left}={:.6e} {right}={:.6e} delta={:+.3e} bound={:.3e}",
+            d.instance, d.terminal, d.layer, d.x_um, d.y_um, d.ours_v, d.reference_v,
             d.delta_v, d.tolerance_v
         );
         if d.coord_note {
@@ -716,7 +725,7 @@ fn test_irdrop_matches_reference() {
             let floor = pin_floor_v(design_name, ns.use_kind);
             let devs = deviations(&our_rows, &ref_rows, floor);
             let stats = map_stats(&devs);
-            print_stats(&ctx, &semantics, &stats);
+            print_stats(&ctx, &semantics, "ours", "ref", &stats);
             let worst_tol = (0.05 * ref_worst.abs()).max(0.005);
             print_scalars(&semantics, &ns.solve, ref_worst, ref_avg, ref_power, worst_tol);
 
@@ -787,9 +796,18 @@ fn test_irdrop_reference_power_axis() {
             let mesh_ax = map_stats(&deviations(&rp_rows, &ref_rows, 0.001));
             let tot = map_stats(&deviations(&n7_rows, &ref_rows, 0.001));
 
-            print_stats(&format!("{ctx} axis=estimator (refpwr − n7)"), &semantics, &est);
-            print_stats(&format!("{ctx} axis=mesh (refpwr − golden)"), &semantics, &mesh_ax);
-            print_stats(&format!("{ctx} axis=total (n7 − golden)"), &semantics, &tot);
+            print_stats(
+                &format!("{ctx} axis=estimator (refpwr − n7)"),
+                &semantics, "refpwr", "n7", &est,
+            );
+            print_stats(
+                &format!("{ctx} axis=mesh (refpwr − golden)"),
+                &semantics, "refpwr", "golden", &mesh_ax,
+            );
+            print_stats(
+                &format!("{ctx} axis=total (n7 − golden)"),
+                &semantics, "n7", "golden", &tot,
+            );
 
             let s_n7 = &n7.solve.summary;
             let s_rp = &rp.solve.summary;

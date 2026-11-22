@@ -5332,7 +5332,7 @@ measured residuals (`(ours − golden)/golden`, temp-instrumented run
 of the committed test; `Clock` rows are all-zero):
 
 | session | Seq int | Seq sw | Seq leak | Comb int | Comb sw | Comb leak | total |
-|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|-
 | `s_none` | 0 | 0 | 0 | +0.113% | −0.096% | 0 | −0.012% |
 | `s_input` | 0 | 0 | 0 | +0.188% | −0.090% | 0 | −0.015% |
 | `s_input_ports` | 0 | 0 | 0 | +0.206% | −0.090% | 0 | −0.015% |
@@ -6587,7 +6587,7 @@ Names join after stripping backslashes (SPEF names keep raw DEF
 spellings; OpenROAD escapes bus brackets differently).
 
 | design | nets | within max(5%,1fF) | median | p90 | max | Σ ours (pF) | Σ ref (pF) |
-|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|-
 | gcd | 269 | **269/269 (100%)** | 7.1e-7 | 2.5e-6 | 4.5e-6 | 0.739681 | 0.739681 |
 | picorv32 | 6744 | **6744/6744 (100%)** | 8.6e-7 | 2.7e-6 | 1.1e-3 | 33.226101 | 33.226137 |
 
@@ -6614,7 +6614,7 @@ and linking each remaining component into the tree through a
 mirrors gcd's) → `guide_caps.py diff` vs the (a) reference caps:
 
 | design | nets | within max(5%,1fF) | median | p90 | max | Σ ours (pF) | Σ ref (pF) |
-|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|-
 | gcd | 269 | 264/269 (98.1%) | 0.00% | 0.30% | 87.0% | 0.721823 | 0.739681 |
 | picorv32 | 6744 | 6637/6744 (98.4%) | 0.00% | 0.00% | 130.8% | 32.396901 | 33.226137 |
 
@@ -8550,43 +8550,43 @@ golden row):
 
 gcd VPWR:
 
-| instance | terminal | x | y | ours V | ref V | dV |
-|---|---|---|---|---|---|---|
-| TAP_TAPCELL_ROW_23_132 | VPWR | 83.03 | 73.746 | 1.799950 | 1.799409 | +5.409e-4 |
-| _195_ | VPWR | 79.81 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 |
-| PHY_EDGE_ROW_22_Right_22 | VPWR | 85.33 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 |
-| PHY_EDGE_ROW_23_Right_23 | VPWR | 85.33 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 |
-| _200_ | VPWR | 77.51 | 73.44 | 1.799950 | 1.799415 | +5.349e-4 |
+| instance | terminal | x | y | ours V | ref V | dV | bound |
+|---|---|---|---|---|---|---|----|
+| TAP_TAPCELL_ROW_23_132 | VPWR | 83.03 | 73.746 | 1.799950 | 1.799409 | +5.409e-4 | 8.997e-2 |
+| _195_ | VPWR | 79.81 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 | 8.997e-2 |
+| PHY_EDGE_ROW_22_Right_22 | VPWR | 85.33 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 | 8.997e-2 |
+| PHY_EDGE_ROW_23_Right_23 | VPWR | 85.33 | 73.44 | 1.799950 | 1.799409 | +5.409e-4 | 8.997e-2 |
+| _200_ | VPWR | 77.51 | 73.44 | 1.799950 | 1.799415 | +5.349e-4 | 8.997e-2 |
 
 gcd VGND:
 
-| instance | terminal | x | y | ours V | ref V | dV |
-|---|---|---|---|---|---|---|
-| PHY_EDGE_ROW_11_Right_11 | VGND | 85.33 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 |
-| PHY_EDGE_ROW_12_Right_12 | VGND | 85.33 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 |
-| TAP_TAPCELL_ROW_11_96 | VGND | 83.03 | 43.228 | 5.686e-5 | 5.58e-4 | -5.011e-4 |
-| _214_ | VGND | 81.65 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 |
-| _213_ | VGND | 77.05 | 43.52 | 5.686e-5 | 5.41e-4 | -4.841e-4 |
+| instance | terminal | x | y | ours V | ref V | dV | bound |
+|---|---|---|---|---|---|---|----|
+| PHY_EDGE_ROW_11_Right_11 | VGND | 85.33 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 | 1.000e-3 |
+| PHY_EDGE_ROW_12_Right_12 | VGND | 85.33 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 | 1.000e-3 |
+| TAP_TAPCELL_ROW_11_96 | VGND | 83.03 | 43.228 | 5.686e-5 | 5.58e-4 | -5.011e-4 | 1.000e-3 |
+| _214_ | VGND | 81.65 | 43.52 | 5.686e-5 | 5.58e-4 | -5.011e-4 | 1.000e-3 |
+| _213_ | VGND | 77.05 | 43.52 | 5.686e-5 | 5.41e-4 | -4.841e-4 | 1.000e-3 |
 
 picorv32 VPWR:
 
-| instance | terminal | x | y | ours V | ref V | dV |
-|---|---|---|---|---|---|---|
-| _11410_ | VPWR | 400.43 | 258.40 | 1.799496 | 1.795829 | +3.667e-3 |
-| _07527_ | VPWR | 437.23 | 258.40 | 1.799386 | 1.795733 | +3.653e-3 |
-| _05997_ | VPWR | 419.75 | 258.40 | 1.799420 | 1.795768 | +3.652e-3 |
-| _07611_ | VPWR | 449.19 | 258.40 | 1.799366 | 1.795716 | +3.650e-3 |
-| _11145_ | VPWR | 448.73 | 258.40 | 1.799366 | 1.795716 | +3.650e-3 |
+| instance | terminal | x | y | ours V | ref V | dV | bound |
+|---|---|---|---|---|---|---|----|
+| _11410_ | VPWR | 400.43 | 258.40 | 1.799496 | 1.795829 | +3.667e-3 | 8.979e-2 |
+| _07527_ | VPWR | 437.23 | 258.40 | 1.799386 | 1.795733 | +3.653e-3 | 8.979e-2 |
+| _05997_ | VPWR | 419.75 | 258.40 | 1.799420 | 1.795768 | +3.652e-3 | 8.979e-2 |
+| _07611_ | VPWR | 449.19 | 258.40 | 1.799366 | 1.795716 | +3.650e-3 | 8.979e-2 |
+| _11145_ | VPWR | 448.73 | 258.40 | 1.799366 | 1.795716 | +3.650e-3 | 8.979e-2 |
 
 picorv32 VGND:
 
-| instance | terminal | x | y | ours V | ref V | dV |
-|---|---|---|---|---|---|---|
-| _07611_ | VGND | 449.19 | 255.68 | 4.211e-4 | 3.585e-3 | -3.164e-3 |
-| _07526_ | VGND | 433.78 | 255.68 | 3.994e-4 | 3.562e-3 | -3.163e-3 |
-| _11112_ | VGND | 434.01 | 255.68 | 3.994e-4 | 3.562e-3 | -3.163e-3 |
-| _05890_ | VGND | 419.75 | 255.68 | 3.690e-4 | 3.530e-3 | -3.161e-3 |
-| TAP_TAPCELL_ROW_90_2001 | VGND | 456.55 | 255.971 | 4.350e-4 | 3.596e-3 | -3.161e-3 |
+| instance | terminal | x | y | ours V | ref V | dV | bound |
+|---|---|---|---|---|---|---|----|
+| _07611_ | VGND | 449.19 | 255.68 | 4.211e-4 | 3.585e-3 | -3.164e-3 | 3.200e-3 |
+| _07526_ | VGND | 433.78 | 255.68 | 3.994e-4 | 3.562e-3 | -3.163e-3 | 3.200e-3 |
+| _11112_ | VGND | 434.01 | 255.68 | 3.994e-4 | 3.562e-3 | -3.163e-3 | 3.200e-3 |
+| _05890_ | VGND | 419.75 | 255.68 | 3.690e-4 | 3.530e-3 | -3.161e-3 | 3.200e-3 |
+| TAP_TAPCELL_ROW_90_2001 | VGND | 456.55 | 255.971 | 4.350e-4 | 3.596e-3 | -3.161e-3 | 3.200e-3 |
 
 **Reference-power decomposition** (`test_irdrop_reference_power_axis` —
 same `PdnMesh`, clamps, `current_scale_v`, and sink splitting; only the
@@ -8609,7 +8609,7 @@ picorv32 `8.127580e-3 W` vs `1.439582e-2 W` (+43.5 %)):
 Scalar drop/bounce on the three maps:
 
 | design | net | n7 worst | refpwr worst | golden worst | est | mesh | total |
-|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|-
 | gcd | VPWR | 1.807e-4 | 5.627e-4 | 5.91e-4 | +3.820e-4 | -2.832e-5 | -4.103e-4 |
 | gcd | VGND | 2.250e-4 | 6.212e-4 | 5.59e-4 | +3.962e-4 | +6.216e-5 | -3.340e-4 |
 | picorv32 | VPWR | 8.018e-4 | 4.137e-3 | 4.30e-3 | +3.335e-3 | -1.628e-4 | -3.498e-3 |
@@ -8648,3 +8648,13 @@ change landed, so a fresh `grus-eda irdrop` run is not required).
 Version stays `0.7.4`: the ticket adds a test-only harness and
 generated verification artifacts — no `grus-core` API or `grus-eda`
 CLI surface changed, and `Cargo.lock` is untouched.
+
+**Card-#44 follow-ups** (2026-11-23): the four top-5 tables gained the
+`bound` column the design contract lists (values from the test's
+`bound=` printout); `print_stats` now prints `over_strict` on the gate
+line itself so picorv32 VGND's 146 strict-over rows are visible without
+the diagnostic test; axis prints carry per-map labels (`refpwr`/`n7`/
+`golden`) instead of `ours`/`ref`; and `CsvRow.layer` lost its
+`#[allow(dead_code)]` — it rides into `Deviation` and prints in the
+top-5 rows. `cargo test -p grus-core --test irdrop` 2/2 green,
+`cargo clippy -p grus-core --tests -D warnings` clean.
