@@ -7920,3 +7920,96 @@ no schema or reference-format change.
 - `cargo test -p grus-eda -- cli_end_to_end_gcd_flow_and_validation` — 1 passed (0.80 s).
 - `cargo test --workspace` — 402 grus-core lib + 6 grus-eda bin tests passed, 2 ignored (pre-existing `jpeg` placement/dmp ignores).
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+### 2026-11-23 — e7-drc-ref: Magic/OpenROAD DRC reference goldens on gcd + picorv32 (reference-only)
+
+E7 ticket 1 (`kurena/tasks/e7-drc-ref/`). New committed script
+`tests/designs/generate_drc_ref.sh <design> <routed-def>` — same
+host-wrapper shape as `generate_cts_ref.sh`/`generate_irdrop_ref.sh`
+(re-invokes inside `ghcr.io/librelane/librelane:3.0.16`, repo at `/work`,
+PDK at `/pdk`). Five steps: A `check_antennas -verbose` on the input
+routed DEF; B `-output_drc` DRT-report discovery (e6 `runs/drt/*.drc*.rpt`
+→ `<d>.drc.rpt`; if none, the verbatim generate_ref.sh step-5b route is
+re-run into `runs/drc/` and the re-routed DEF's SHA decides
+`regenerated_identical` vs `regenerated_divergent` — never silently);
+C Magic full deck (`lef read` tlef+cell lef → `def read` → `load` →
+`select top cell` → `drc euclidean on` → `drc style drc(full)` →
+`drc check` → `drc catchup` → `drc count` + `drc count total` +
+`drc listall why`); D the `add_spacing_probe_wire` sanity control (one
+`NEW` `met2` segment on a different signal net at 0.03 µm edge gap,
+then the identical Magic sequence); E assembly into
+`<design>.drc.reference.json`.
+
+**Commands verbatim**: `bash tests/designs/generate_drc_ref.sh gcd
+tests/designs/gcd/gcd.routed.def` and `bash
+tests/designs/generate_drc_ref.sh picorv32
+tests/designs/picorv32/picorv32.routed.def`. gcd run end-to-end twice
+after the final parser fix (byte-identical JSON both times); picorv32
+run three times total (byte-identical). picorv32's input is
+gitignored — regenerate via `tests/designs/picorv32/generate_ref.sh`
+step 5b. One named deterministic divergence: `drt_report_*` says
+`existing` while the gitignored `picorv32.drc.rpt` is on disk; a fresh
+tree takes the regen path and records `regenerated_*` (same count 0).
+
+**Correction to the 2026-11-22 P-DRC probe**: its "0 DRC errors on
+`gcd.routed.def`" was premature — the probe ran `drc count total`
+without `drc catchup`, while `drc check` is still running
+asynchronously. With `catchup`, the hierarchy-wide count is **305** on
+gcd (flat top-level `drc count` = 0; all errors sit inside the
+sky130_fd_sc_hd masters' nwell geometry). `drc count`/`drc count
+total` return `""` and print `Total DRC errors found: N`; the two
+totals are different surfaces (flat vs hierarchical merged regions) and
+neither equals the `drc listall why` bbox-fragment sum (426 on gcd) —
+all three are recorded separately.
+
+**Measured** (all script-emitted; see `docs/e7-drc.md` §§1–4):
+
+| surface | gcd | picorv32 |
+|---|---|---|
+| `magic_total` (`drc count total`, merged regions) | 305 | 8049 |
+| `magic_count_flat` (`drc count`, top-level only) | 0 | 0 |
+| `magic_listall_bbox_total` | 426 | 11082 |
+| clean per-rule bboxes | nwell.4: 300, nwell.2a: 120, nwell.1: 6 | nwell.4: 8084, nwell.2a: 2756, nwell.1: 242 |
+| `drt_drc_count` | 0 (`regenerated_identical`, sha `e3b0c44298fc1c14`) | 0 (`existing` rpt, sha `e3b0c44298fc1c14`) |
+| `antenna_violations` (net / pin) | 0 / 0 | 19 / 19 (side-area ratio 400 limits on met1/met2) |
+| broken DEF `magic_total` | 307 (+2 regions) | 8051 |
+| `new_rules_vs_clean` | `Metal2 spacing < 0.14um (met2.2)` | same |
+| `violated_rules_in_checked_deck` | true | true |
+
+Grammar pinned along the way: `check_antennas -verbose` prints one
+`Net:` block per violating net with `(VIOLATED)` on the failing
+`Required ratio` line and returns the net count as its Tcl result;
+`quit -force` is not a Magic exit form (plain `exit`); the image has no
+`awk` (all parsing is python3); two `sky130A.tech` `why` strings carry
+unclosed quotes (`rect_only *mimcap`/`*mimcap2`), which the per-logical-
+line extractor survives; `drc listall why` alternates
+`{why-string} {bbox-list}`. Taxonomy: 278 `drc`-section statements,
+239 unique names — 195 `lef_expressible`, 34 `magic_only`, 10
+`unclassified` (reviewed as magic_only in `docs/e7-drc.md` §3), 0
+`antenna` (antenna checks are not in the `drc` deck).
+
+**Runtime** (`runs/drc/runtime.json`, kept out of the golden for byte
+reproduction): gcd ≈ 22 s total (19 s of it the DRT regen); picorv32
+≈ 105 s (61 s antenna check, ~20 s each Magic pass).
+
+**Artifacts** (all committed):
+
+| file | size | SHA-256 (first 16) |
+|---|---|---|
+| `tests/designs/generate_drc_ref.sh` | 32,918 B | `—` (script, not a golden) |
+| `tests/designs/gcd/gcd.drc.reference.json` | 37,036 B | `4c740c2d3256f2b1` |
+| `tests/designs/picorv32/picorv32.drc.reference.json` | 50,731 B | `42c10b28836eb8f2` |
+
+Evidence trail (gitignored): `tests/designs/<d>/runs/drc/` —
+`antenna.log`, `magic_clean.log`, `magic_broken.log`,
+`mutation.json`, `<d>.drc.broken.def`, `<d>.drc.regen.rpt` +
+`gcd.routed.regen.def` (gcd regen path), `runtime.json`.
+
+**What was run**: the committed script end-to-end on both designs
+(gcd ×5 successful runs, picorv32 ×4 across the parser iterations — the
+last two runs of each byte-identical), plus `bash -n` after every
+edit. Nothing Cargo-visible changed; **no version bump** (reference-only).
+`kurena/tasks/e7-drc-ref/spec/` untouched; no commits made. `cargo test
+--workspace` passed (402 lib + 4 bin tests, 2 ignored — pre-existing
+jpeg placement/dmp ignores); `cargo clippy --workspace --all-targets --
+-D warnings` passed clean.
