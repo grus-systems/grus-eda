@@ -8057,7 +8057,7 @@ rects for the gcell blockage consumer. Public/additive API → workspace
 version `0.7.0`.
 
 **Ours**: `cargo test -p grus-core --lib pdn::tests -- --nocapture` —
-5 tests, `finished in 0.69s` (debug build; includes both designs' LEF+DEF
+7 tests, `finished in 0.69s` (debug build; includes both designs' LEF+DEF
 loads and graph construction).
 
 | metric | reference (`*.irdrop.reference.json` / embedded CSV) | ours (`PdnCensus`) | diff | pass? |
@@ -8078,14 +8078,14 @@ subset whose macro pin layer exists in the net's wire layers.
 
 **Fail-proof**: deleted the via-edge union in `pdn::build_graph`
 (`(Some(a), Some(b)) => nuf.union(a, b)` → `(Some(_a), Some(_b)) => {}`).
-All 5 `pdn::tests` went red (golden censuses, synthetic connectivity,
+All 7 `pdn::tests` went red (golden censuses, synthetic connectivity,
 unattached-pin, fail-proof tests) — every net's nodes split per layer.
 Restored; all green again.
 
 **Checks run**: `cargo test --workspace` (424 lib + 4 bin tests, 2 ignored
 — pre-existing `jpeg` ignores; `finished in 248.69s`), `cargo clippy
 --workspace --all-targets -- -D warnings` (clean), `cargo test -p grus-core
---lib pdn::tests` (5/5). `kurena/tasks/e8-pdn-parse/spec/` untouched; no
+--lib pdn::tests` (7/7). `kurena/tasks/e8-pdn-parse/spec/` untouched; no
 commits made.
 
 **Card #34 follow-ups** (same ticket, reviewer-flagged mediums/low):
