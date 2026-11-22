@@ -33,6 +33,12 @@ pub struct PdnMesh {
     /// candidate sets, so `census()` reads the stored count.
     #[serde(default)]
     pub multi_node_sinks: u32,
+    /// Resistor runs dropped because both endpoints resolved to the same
+    /// node (the run is metal inside one merged junction — a G-matrix
+    /// stamp of `a == b` is a silent no-op, so it is counted and skipped
+    /// instead). Recorded at build like `multi_node_sinks`.
+    #[serde(default)]
+    pub self_loop_resistors: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +88,8 @@ pub struct MeshCensus {
     pub multi_node_sinks: u32,
     /// Via endpoints that landed on no rect.
     pub dangling_via_ends: u32,
+    /// Resistor runs dropped at build (`a == b` after node merge).
+    pub self_loop_resistors: u32,
     /// Nodes with no resistor at all.
     pub isolated_nodes: u32,
     pub min_r_ohms: f32,
@@ -97,6 +105,7 @@ pub enum MeshViolation {
     DanglingSource { node: u32 },
     NoSources,
     UnreachableNode { node: u32 },
+    ResistorEndpointOutOfRange { resistor: u32 },
 }
 
 /// One junction piece: a merged feature interval on a wire rect's major
@@ -306,6 +315,7 @@ pub fn build_mesh(db: &DesignDb, tech_db: &TechDb, net: &PdnNet) -> Result<PdnMe
     // center-to-center `L` (junction metal is real — each piece's
     // half-length belongs to the adjacent run), `R = RPERSQ × L / W`.
     let mut resistors: Vec<MeshResistor> = Vec::new();
+    let mut self_loops = 0u32;
     for (i, plist) in rect_pieces.iter().enumerate() {
         let (l, r) = net.wire_rects[i];
         let res_per_sq = tech_db.routing_layers[l.0 as usize].res_per_sq;
@@ -315,9 +325,14 @@ pub fn build_mesh(db: &DesignDb, tech_db: &TechDb, net: &PdnNet) -> Result<PdnMe
             let (qlo, qhi) = major_span(major_x[i], &pieces[pair[1] as usize].dbu);
             let len =
                 (qlo as i64 + qhi as i64 - plo as i64 - phi as i64).abs() as f32 * 0.5;
+            let (a, b) = (piece_node[pair[0] as usize], piece_node[pair[1] as usize]);
+            if a == b {
+                self_loops += 1;
+                continue;
+            }
             resistors.push(MeshResistor {
-                a: piece_node[pair[0] as usize],
-                b: piece_node[pair[1] as usize],
+                a,
+                b,
                 r_ohms: res_per_sq * len / w,
                 kind: ResistorKind::Wire { rect: i as u32 },
             });
@@ -361,6 +376,10 @@ pub fn build_mesh(db: &DesignDb, tech_db: &TechDb, net: &PdnNet) -> Result<PdnMe
             }
         };
         let (a, b) = (end(via.lower), end(via.upper));
+        if a == b {
+            self_loops += 1;
+            continue;
+        }
         resistors.push(MeshResistor {
             a,
             b,
@@ -408,6 +427,7 @@ pub fn build_mesh(db: &DesignDb, tech_db: &TechDb, net: &PdnNet) -> Result<PdnMe
         sinks,
         sources,
         multi_node_sinks,
+        self_loop_resistors: self_loops,
     })
 }
 
@@ -451,6 +471,11 @@ impl PdnMesh {
                 v.push(MeshViolation::NonPositiveResistance {
                     resistor: i as u32,
                     r_ohms: r.r_ohms,
+                });
+            }
+            if r.a >= n || r.b >= n {
+                v.push(MeshViolation::ResistorEndpointOutOfRange {
+                    resistor: i as u32,
                 });
             }
         }
@@ -534,6 +559,7 @@ impl PdnMesh {
             sinks: self.sinks.len() as u32,
             multi_node_sinks: self.multi_node_sinks,
             dangling_via_ends: self.nodes.iter().filter(|n| n.dangling).count() as u32,
+            self_loop_resistors: self.self_loop_resistors,
             isolated_nodes: degree.iter().filter(|&&d| d == 0).count() as u32,
             min_r_ohms: if self.resistors.is_empty() {
                 0.0
@@ -812,6 +838,62 @@ mod tests {
             .collect();
         assert_eq!(unreach.len(), 3, "{v:?}");
         assert!(mesh.sinks.iter().all(|s| unreach.contains(&s.node)));
+    }
+
+    /// A second met1 wire overlapping the rail at (1200,-50)-(1700,50):
+    /// the model's defining behavior — same-layer rects that overlap
+    /// merge into one junction node — which neither committed design
+    /// exercises (on gcd/picorv32 every rect's pieces are already its
+    /// nodes). The overlap-rect piece unions into the [1200,1700]
+    /// junction, the rail splits into runs 500/400/450/550 at W=100,
+    /// and one met1 node owns both rects' overlap pieces.
+    #[test]
+    fn test_same_layer_overlap_merges_junction() {
+        let def = PDN_DEF.replacen(
+            "  NEW met2 0 + SHAPE STRIPE ( 1000 0 ) via12_inst\n  ;",
+            "  NEW met2 0 + SHAPE STRIPE ( 1000 0 ) via12_inst\n  NEW met1 100 + SHAPE STRIPE ( 1200 0 ) ( 1700 0 )\n  ;",
+            1,
+        );
+        assert_ne!(def, PDN_DEF, "overlap NEW statement not inserted");
+        let (tech, db) = pdn_design_from(PDN_LEF, &def);
+        let net = db.pdn_net("VPWR").unwrap();
+        let (mesh, c) = check_mesh(&db, &tech, net).unwrap();
+        // 5 met1 pieces (overlap junction unions the overlap wire's
+        // piece) + 3 met2 nodes; wire runs 4 (rail) + 0 + 2 (stripe).
+        assert_eq!(c.nodes, 8, "{c:?}");
+        assert_eq!(c.wire_resistors, 6, "{c:?}");
+        assert_eq!(c.via_resistors, 1);
+        assert_eq!(c.sinks, 2);
+        assert_eq!(c.source_nodes, 1);
+        assert_eq!(c.dangling_via_ends, 0);
+        assert!(mesh.validate().is_empty(), "{:?}", mesh.validate());
+        // Exactly one multi-piece node: the [1200,1700] junction holding
+        // both the rail's and the overlap wire's pieces on met1.
+        let shared: Vec<&MeshNode> = mesh
+            .nodes
+            .iter()
+            .filter(|n| n.layer == LayerId(0) && n.rects.len() > 1)
+            .collect();
+        assert_eq!(shared.len(), 1, "one merged met1 junction expected");
+        assert!(
+            shared[0]
+                .rects
+                .iter()
+                .all(|r| r.xl == 1200 && r.xh == 1700 && r.yl == -50 && r.yh == 50)
+        );
+        // Rail wire runs: 500 (u1→u2) / 400 (u2→via) / 450 (via→junction)
+        // / 550 (junction→end) — the un-merged 1000 run splits at 1700.
+        let met1_r = tech.routing_layers[0].res_per_sq;
+        let mut lens: Vec<f32> = mesh
+            .resistors
+            .iter()
+            .filter_map(|r| match r.kind {
+                ResistorKind::Wire { rect: 0 } => Some(r.r_ohms / met1_r * 100.0),
+                _ => None,
+            })
+            .collect();
+        lens.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(lens, vec![400.0, 450.0, 500.0, 550.0]);
     }
 
     /// Golden census for gcd: sinks == the reference CSV row count, the

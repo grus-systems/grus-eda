@@ -8321,4 +8321,22 @@ needs. `PDN_LEF` gained `RESISTANCE RPERSQ` on `met1`/`met2`.
 pre-existing jpeg ignores; `finished in 112.56s`), `cargo clippy
 --workspace --all-targets -- -D warnings` (clean), `cargo test -p
 grus-core --lib pdn::mesh` (9/9). `kurena/tasks/e8-mesh-rc/spec/`
-untouched; no commits made.
+untouched.
+
+**Card-#41 follow-ups** (dev `4ba911d`+): the review's one medium —
+the same-layer-overlap merge (`overlap_pairs → containing_piece →
+uf.union`) fired on zero tested inputs, so the model's core novel logic
+was unverified — is now covered by
+`test_same_layer_overlap_merges_junction`: a `NEW met1` wire overlapping
+the fixture rail at (1200,-50)-(1700,50) asserts the shared junction
+node (one met1 node owns both rects' overlap pieces), census
+8 nodes / 6 wire / 1 via, and rail run arithmetic 500/400/450/550 at
+W=100 (the un-merged 1000 run splits at the junction). Fail-proof
+observed: replacing `uf.union(pa, pb)` with `uf.union(pa, pa)` turns
+the test red (nodes 8→9, junction split); restored green. Lows fixed:
+(a) self-loop resistors (`a == b` after node merge) are now skipped and
+counted — `PdnMesh::self_loop_resistors` surfaced through `census()` —
+instead of silently no-op stamping; (b) `validate()` now bounds-checks
+resistor endpoints (`ResistorEndpointOutOfRange`) instead of quietly
+skipping them in BFS. `cargo test -p grus-core --lib pdn::` 17/17 green,
+grus-core clippy clean.
