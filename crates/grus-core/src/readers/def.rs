@@ -1,6 +1,6 @@
 use crate::design_db::{
-    DesignDb, GCellGridDef, Orient, PdnConn, PdnNet, PdnUse, PdnVia, PlacementRow, PlacementStatus,
-    TrackGrid,
+    DesignDb, GCellGridDef, GeneratedViaGeom, NetGeom, Orient, PdnConn, PdnNet, PdnUse, PdnVia,
+    PlacementRow, PlacementStatus, TrackGrid, ViaGeom,
 };
 use crate::interner::{
     CellId, LayerId, LibPinId, MacroPinId, NetId, PinDir, PinId, StringInterner, SymbolId,
@@ -173,75 +173,29 @@ pub fn orient_str(o: Orient) -> &'static str {
 /// coordinates whose position is fixed by the statement shape.
 fn read_statement<'a>(lexer: &mut DefLexer<'a>) -> Result<Vec<&'a str>> {
     let mut words = Vec::new();
-    read_statement_into(lexer, &mut words)?;
+    read_statement_into(lexer, &mut words, false)?;
     Ok(words)
 }
 
 /// `read_statement` into a caller-owned buffer, so counted sections can reuse
-/// one allocation across every record.
-fn read_statement_into<'a>(lexer: &mut DefLexer<'a>, words: &mut Vec<&'a str>) -> Result<()> {
+/// one allocation across every record. `keep_parens` emits `(`/`)` as words —
+/// NETS needs them because routed-wire point groups are meaningful
+/// (`( x y z )` carries an ignorable third coordinate that flat tokens
+/// cannot be disambiguated from the next point's `x`).
+fn read_statement_into<'a>(
+    lexer: &mut DefLexer<'a>,
+    words: &mut Vec<&'a str>,
+    keep_parens: bool,
+) -> Result<()> {
     loop {
         match lexer.next_token() {
             DefToken::Semi => return Ok(()),
             DefToken::Word(w) => words.push(w),
+            DefToken::LParen if keep_parens => words.push("("),
+            DefToken::RParen if keep_parens => words.push(")"),
             DefToken::LParen | DefToken::RParen => {}
             DefToken::Eof => bail!(
                 "DEF line {}: statement is not terminated by `;` (truncated file?)",
-                lexer.line()
-            ),
-        }
-    }
-}
-
-/// Words inside a `( ... )` group whose `(` has already been consumed.
-fn read_group<'a>(lexer: &mut DefLexer<'a>) -> Result<Vec<&'a str>> {
-    let mut words = Vec::new();
-    loop {
-        match lexer.next_token() {
-            DefToken::RParen => return Ok(words),
-            DefToken::Word(w) => words.push(w),
-            other => bail!(
-                "DEF line {}: unexpected {other:?} inside `( ... )`",
-                lexer.line()
-            ),
-        }
-    }
-}
-
-/// A NETS `( component pin )` group whose `(` has already been consumed — the
-/// inline form of `read_group` + the two-word check, with no `Vec`.
-fn read_conn_group<'a>(lexer: &mut DefLexer<'a>, net_name: &str) -> Result<(&'a str, &'a str)> {
-    let not_conn =
-        |line: usize| anyhow!("DEF line {line}: connection of net {net_name} must be `( component pin )`");
-    // A `)` before the second word is a wrong-shape group, not an unexpected
-    // token — same reject the collected-`Vec` destructure produced, at the
-    // same line (the `)` position).
-    let comp = match lexer.next_token() {
-        DefToken::Word(w) => w,
-        DefToken::RParen => return Err(not_conn(lexer.line())),
-        other => bail!(
-            "DEF line {}: unexpected {other:?} inside `( ... )`",
-            lexer.line()
-        ),
-    };
-    let pin = match lexer.next_token() {
-        DefToken::Word(w) => w,
-        DefToken::RParen => return Err(not_conn(lexer.line())),
-        other => bail!(
-            "DEF line {}: unexpected {other:?} inside `( ... )`",
-            lexer.line()
-        ),
-    };
-    // Extra words drain to the `)` so the reject reports at the same line the
-    // old two-word destructure of the collected group did.
-    let mut extra = false;
-    loop {
-        match lexer.next_token() {
-            DefToken::RParen if !extra => return Ok((comp, pin)),
-            DefToken::RParen => return Err(not_conn(lexer.line())),
-            DefToken::Word(_) => extra = true,
-            other => bail!(
-                "DEF line {}: unexpected {other:?} inside `( ... )`",
                 lexer.line()
             ),
         }
@@ -320,26 +274,13 @@ fn section_count(lexer: &mut DefLexer, section: &str) -> Result<usize> {
     }
 }
 
-/// Skips a section the database does not model, through its `END <section>`.
-/// Every token is skipped by design, so there is no content to validate.
-fn skip_section(lexer: &mut DefLexer, section: &str) -> Result<()> {
-    loop {
-        match lexer.next_token() {
-            DefToken::Word("END") => return end_section(lexer, section),
-            DefToken::Eof => {
-                bail!("DEF: {section} is not terminated by `END {section}` (truncated file?)")
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Runs `entry` on each `- ...;` record of a counted section, through its `END <section>`,
 /// and checks the record count against the header.
 fn for_each_record<'a>(
     lexer: &mut DefLexer<'a>,
     section: &str,
     mut entry: impl FnMut(&[&'a str], usize) -> Result<()>,
+    keep_parens: bool,
 ) -> Result<()> {
     let declared = section_count(lexer, section)?;
     let mut found = 0;
@@ -349,7 +290,7 @@ fn for_each_record<'a>(
         match lexer.next_token() {
             DefToken::Word("-") => {
                 words.clear();
-                read_statement_into(lexer, &mut words)?;
+                read_statement_into(lexer, &mut words, keep_parens)?;
                 entry(&words, lexer.line())?;
                 found += 1;
             }
@@ -611,6 +552,7 @@ enum DefVia {
         upper: LayerId,
         cut: SymbolId,
         cut_count: u32,
+        geom: GeneratedViaGeom,
     },
     /// `+ VIA <lefViaName>` — the name interned in `db.strings`; resolved
     /// through `tech_db.via_by_name` when SPECIALNETS references it (a name
@@ -636,7 +578,10 @@ fn add_def_via(
 
     let mut viarule = false;
     let mut layers: Option<(LayerId, SymbolId, LayerId)> = None;
-    let mut cut_count = 1u32;
+    let mut cut_size: Option<(i32, i32)> = None;
+    let mut cut_spacing = (0i32, 0i32);
+    let mut enclosure = (0i32, 0i32, 0i32, 0i32);
+    let mut rowcol = (1u32, 1u32);
     let mut fixed: Option<SymbolId> = None;
     let mut inline = false;
     for attr in split_attributes(attributes, line) {
@@ -682,30 +627,38 @@ fn add_def_via(
                 };
                 let r: u32 = number(r, "VIAS ROWCOL rows", line)?;
                 let c: u32 = number(c, "VIAS ROWCOL cols", line)?;
-                cut_count = r * c;
+                rowcol = (r, c);
             }
             "CUTSIZE" => {
                 let [x, y] = args else {
                     bail!("DEF line {line}: VIAS via {via_name} `+ CUTSIZE` needs two numbers");
                 };
-                number::<i32>(x, "VIAS CUTSIZE x", line)?;
-                number::<i32>(y, "VIAS CUTSIZE y", line)?;
+                cut_size = Some((
+                    number::<i32>(x, "VIAS CUTSIZE x", line)?,
+                    number::<i32>(y, "VIAS CUTSIZE y", line)?,
+                ));
             }
             "CUTSPACING" => {
                 let [x, y] = args else {
                     bail!("DEF line {line}: VIAS via {via_name} `+ CUTSPACING` needs two numbers");
                 };
-                number::<i32>(x, "VIAS CUTSPACING x", line)?;
-                number::<i32>(y, "VIAS CUTSPACING y", line)?;
+                cut_spacing = (
+                    number::<i32>(x, "VIAS CUTSPACING x", line)?,
+                    number::<i32>(y, "VIAS CUTSPACING y", line)?,
+                );
             }
             "ENCLOSURE" => {
                 let [a, b, c, d] = args else {
                     bail!("DEF line {line}: VIAS via {via_name} `+ ENCLOSURE` needs four numbers");
                 };
-                number::<i32>(a, "VIAS ENCLOSURE", line)?;
-                number::<i32>(b, "VIAS ENCLOSURE", line)?;
-                number::<i32>(c, "VIAS ENCLOSURE", line)?;
-                number::<i32>(d, "VIAS ENCLOSURE", line)?;
+                // OpenDB semantics: `(botX, botY, topX, topY)` symmetric
+                // overhangs on the cut array.
+                enclosure = (
+                    number::<i32>(a, "VIAS ENCLOSURE", line)?,
+                    number::<i32>(b, "VIAS ENCLOSURE", line)?,
+                    number::<i32>(c, "VIAS ENCLOSURE", line)?,
+                    number::<i32>(d, "VIAS ENCLOSURE", line)?,
+                );
             }
             "VIA" => {
                 let [lef_name] = args else {
@@ -724,6 +677,11 @@ fn add_def_via(
         if !viarule {
             bail!("DEF line {line}: VIAS via {via_name} has `+ LAYERS` without `+ VIARULE`");
         }
+        // Cut geometry cannot be derived from `+ VIARULE` alone — the
+        // model does not read via rules — so `+ CUTSIZE` is required.
+        let Some((cut_w, cut_h)) = cut_size else {
+            bail!("DEF line {line}: VIAS via {via_name} `+ VIARULE` generated via has no `+ CUTSIZE`");
+        };
         let (lo, hi) = if lower.0 <= upper.0 {
             (lower, upper)
         } else {
@@ -733,7 +691,19 @@ fn add_def_via(
             lower: lo,
             upper: hi,
             cut,
-            cut_count,
+            cut_count: rowcol.0 * rowcol.1,
+            geom: GeneratedViaGeom {
+                cut_w_dbu: cut_w,
+                cut_h_dbu: cut_h,
+                rows: rowcol.0,
+                cols: rowcol.1,
+                cut_spacing_x_dbu: cut_spacing.0,
+                cut_spacing_y_dbu: cut_spacing.1,
+                enc_bot_x_dbu: enclosure.0,
+                enc_bot_y_dbu: enclosure.1,
+                enc_top_x_dbu: enclosure.2,
+                enc_top_y_dbu: enclosure.3,
+            },
         }
     } else if viarule {
         // The grammar requires `+ LAYERS` on a generated via.
@@ -748,21 +718,21 @@ fn add_def_via(
     Ok((via_name, via))
 }
 
-/// Resolves a SPECIALNETS via name to `(lower, upper, cut, cut_count)`:
+/// Resolves a DEF via name to `(lower, upper, cut, cut_count, geom)`:
 /// the DEF `VIAS` map first, then LEF `VIA` definitions. Name-pattern
 /// heuristics are never consulted — a renamed via resolves by its declared
-/// layer triple.
+/// layer triple. Shared by SPECIALNETS and NETS wire statements.
 fn resolve_def_via(
     tech_db: &TechDb,
     def_vias: &DefViaMap,
     name: &str,
     net_name: &str,
     line: usize,
-) -> Result<(LayerId, LayerId, SymbolId, u32)> {
-    let from_lef = |sym: SymbolId| -> Option<(LayerId, LayerId, SymbolId, u32)> {
+) -> Result<(LayerId, LayerId, SymbolId, u32, ViaGeom)> {
+    let from_lef = |sym: SymbolId| -> Option<(LayerId, LayerId, SymbolId, u32, ViaGeom)> {
         tech_db.via_by_name.get(&sym).map(|&i| {
             let vd = &tech_db.via_defs[i as usize];
-            (vd.lower, vd.upper, vd.cut, vd.cut_count)
+            (vd.lower, vd.upper, vd.cut, vd.cut_count, ViaGeom::Lef(i))
         })
     };
     match def_vias.get(name) {
@@ -771,17 +741,24 @@ fn resolve_def_via(
             upper,
             cut,
             cut_count,
-        }) => Ok((*lower, *upper, *cut, *cut_count)),
+            geom,
+        }) => Ok((
+            *lower,
+            *upper,
+            *cut,
+            *cut_count,
+            ViaGeom::Generated(geom.clone()),
+        )),
         Some(DefVia::Inline) => bail!(
-            "DEF line {line}: SPECIALNETS net {net_name} uses via {name}, which defines no resolvable layer stack"
+            "DEF line {line}: net {net_name} uses via {name}, which defines no resolvable layer stack"
         ),
         Some(DefVia::Fixed(lef_sym)) => from_lef(*lef_sym).with_context(|| {
-            format!("DEF line {line}: SPECIALNETS net {net_name} uses via {name}, which the LEF does not define")
+            format!("DEF line {line}: net {net_name} uses via {name}, which the LEF does not define")
         }),
         None => {
             let sym = tech_db.strings.get(name);
             sym.and_then(from_lef).with_context(|| {
-                format!("DEF line {line}: SPECIALNETS net {net_name} uses via {name}, which neither the VIAS section nor the LEF defines")
+                format!("DEF line {line}: net {net_name} uses via {name}, which neither the VIAS section nor the LEF defines")
             })
         }
     }
@@ -804,13 +781,13 @@ fn parse_pdn_use(word: &str, net_name: &str, line: usize) -> Result<PdnUse> {
 
 /// A point coordinate: a number, or `*` repeating the same axis' previous
 /// value (`repeat`).
-fn special_coord(word: Option<&&str>, repeat: i32, net_name: &str, line: usize) -> Result<i32> {
+fn wire_coord(word: Option<&&str>, repeat: i32, net_name: &str, line: usize) -> Result<i32> {
     match word {
         Some(&"*") => Ok(repeat),
         Some(&w) => w
             .parse::<i32>()
-            .map_err(|_| anyhow!("DEF line {line}: SPECIALNETS net {net_name} coordinate `{w}` is not a number")),
-        None => bail!("DEF line {line}: SPECIALNETS net {net_name} wire statement ends mid-point"),
+            .map_err(|_| anyhow!("DEF line {line}: net {net_name} coordinate `{w}` is not a number")),
+        None => bail!("DEF line {line}: net {net_name} wire statement ends mid-point"),
     }
 }
 
@@ -884,19 +861,22 @@ fn parse_special_wire(
             }
             _ => {
                 // First point of a record: `x y`.
-                let x1 = special_coord(rest.get(i), sink.last_x, net_name, line)?;
-                let y1 = special_coord(rest.get(i + 1), sink.last_y, net_name, line)?;
+                let x1 = wire_coord(rest.get(i), sink.last_x, net_name, line)?;
+                let y1 = wire_coord(rest.get(i + 1), sink.last_y, net_name, line)?;
                 i += 2;
                 match rest.get(i) {
                     Some(&w2) if is_coord(w2) => {
                         // A second point — a wire segment. `*` repeats the
                         // same axis' previous coordinate (x1/y1 here).
-                        let x2 = special_coord(rest.get(i), x1, net_name, line)?;
-                        let y2 = special_coord(rest.get(i + 1), y1, net_name, line)?;
+                        let x2 = wire_coord(rest.get(i), x1, net_name, line)?;
+                        let y2 = wire_coord(rest.get(i + 1), y1, net_name, line)?;
                         i += 2;
                         sink.last_x = x2;
                         sink.last_y = y2;
                         if width > 0 {
+                            // Perpendicular expansion only — PDN mesh and
+                            // attach semantics pin this flush form; NETS
+                            // wires use square caps (see parse_net_wire).
                             let half = width / 2;
                             let rect = if y1 == y2 {
                                 RectDbu::new(x1.min(x2), y1 - half, x1.max(x2), y1 + half)
@@ -919,11 +899,11 @@ fn parse_special_wire(
                         sink.last_x = x1;
                         sink.last_y = y1;
                         i += 1;
-                        let (lower, upper, cut, cut_count) =
+                        let (lower, upper, cut, cut_count, geom) =
                             resolve_def_via(tech_db, def_vias, via_name, net_name, line)?;
                         if lid != lower && lid != upper {
                             bail!(
-                                "DEF line {line}: SPECIALNETS net {net_name} records via {via_name} on layer {lname}, which is neither of its endpoints"
+                                "DEF line {line}: net {net_name} records via {via_name} on layer {lname}, which is neither of its endpoints"
                             );
                         }
                         sink.vias.push(PdnVia {
@@ -932,6 +912,7 @@ fn parse_special_wire(
                             upper,
                             cut,
                             cut_count,
+                            geom,
                             x_dbu: x1,
                             y_dbu: y1,
                         });
@@ -1093,6 +1074,424 @@ fn add_special_net(
     Ok(())
 }
 
+/// Reads one wire point: `( x y [z] )` or a bare `x y` pair. OpenROAD's
+/// defout emits a third parenthesized coordinate (`0` in every committed
+/// input) — it is read and ignored; the model is 2-D. Returns
+/// `(x, y, next_index)` where `*` resolves against `sink.last_*`.
+fn read_wire_point(
+    sink: &WireSink,
+    rest: &[&str],
+    mut i: usize,
+    net_name: &str,
+    line: usize,
+) -> Result<(i32, i32, usize)> {
+    if rest.get(i) == Some(&"(") {
+        i += 1;
+        let mut coords: Vec<&str> = Vec::new();
+        while i < rest.len() && rest[i] != ")" {
+            if !is_coord(rest[i]) {
+                bail!("DEF line {line}: net {net_name} wire point contains `{}`, which is not a coordinate", rest[i]);
+            }
+            coords.push(rest[i]);
+            i += 1;
+        }
+        if rest.get(i) != Some(&")") {
+            bail!("DEF line {line}: net {net_name} wire point is not closed by `)`");
+        }
+        i += 1;
+        if coords.len() < 2 {
+            bail!("DEF line {line}: net {net_name} wire point needs at least x and y");
+        }
+        let x = wire_coord(coords.first(), sink.last_x, net_name, line)?;
+        let y = wire_coord(coords.get(1), sink.last_y, net_name, line)?;
+        Ok((x, y, i))
+    } else {
+        let x = wire_coord(rest.get(i), sink.last_x, net_name, line)?;
+        let y = wire_coord(rest.get(i + 1), sink.last_y, net_name, line)?;
+        Ok((x, y, i + 2))
+    }
+}
+
+/// The body of a `ROUTED`/`NEW`/`FIXED`/`COVER`/`PLACED` wire statement in
+/// a regular `NETS` record, `i` pointing at `<layerName>`. Regular-net
+/// paths carry no width token — expansion uses the LEF layer `WIDTH`.
+/// Returns the index of the next statement (a `NEW`/`ROUTED`/`+` word, or
+/// the end of the record).
+fn parse_net_wire(
+    tech_db: &TechDb,
+    def_vias: &DefViaMap,
+    sink: &mut WireSink,
+    rest: &[&str],
+    mut i: usize,
+    line: usize,
+    ndr: Option<&FastMap<u8, i32>>,
+) -> Result<usize> {
+    let net_name = sink.net_name;
+    let lname = rest.get(i).copied().with_context(|| {
+        format!("DEF line {line}: net {net_name} wire statement without a layer name")
+    })?;
+    i += 1;
+    let lid = tech_db
+        .strings
+        .get(lname)
+        .and_then(|s| tech_db.layer_by_name.get(&s))
+        .copied()
+        .with_context(|| {
+            format!("DEF line {line}: net {net_name} wire uses layer {lname}, which the LEF does not define as routing")
+        })?;
+    // LEF routing WIDTH is required by `parse_layer`, so it is never 0;
+    // `+ NONDEFAULTRULE` overrides it per layer.
+    let width = ndr
+        .and_then(|m| m.get(&lid.0))
+        .copied()
+        .unwrap_or(tech_db.routing_layers[lid.0 as usize].width_dbu);
+    let half = width / 2;
+
+    let mut have_point = false;
+    let mut emitted = false;
+    let (mut px, mut py) = (0, 0);
+    while let Some(&w) = rest.get(i) {
+        match w {
+            "+" | "NEW" | "ROUTED" => break,
+            ")" => bail!(
+                "DEF line {line}: net {net_name} wire on layer {lname} has an unbalanced `)`"
+            ),
+            "RECT" => {
+                // `pt RECT ( dx1 dy1 dx2 dy2 )` — offset from the preceding
+                // point; the delta already encodes the shape, no expansion.
+                if !have_point {
+                    bail!("DEF line {line}: net {net_name} wire on layer {lname} has `RECT` before any point");
+                }
+                let mut j = i + 1;
+                if rest.get(j) == Some(&"(") {
+                    j += 1;
+                }
+                let dx1: i32 = number(rest.get(j).copied().unwrap_or(""), "NETS RECT dx1", line)?;
+                let dy1: i32 = number(rest.get(j + 1).copied().unwrap_or(""), "NETS RECT dy1", line)?;
+                let dx2: i32 = number(rest.get(j + 2).copied().unwrap_or(""), "NETS RECT dx2", line)?;
+                let dy2: i32 = number(rest.get(j + 3).copied().unwrap_or(""), "NETS RECT dy2", line)?;
+                j += 4;
+                if rest.get(j) == Some(&")") {
+                    j += 1;
+                }
+                sink.wire_rects.push((
+                    lid,
+                    RectDbu::new(
+                        px + dx1.min(dx2),
+                        py + dy1.min(dy2),
+                        px + dx1.max(dx2),
+                        py + dy1.max(dy2),
+                    ),
+                ));
+                emitted = true;
+                i = j;
+            }
+            "VIRTUAL" => {
+                // `VIRTUAL ( x y )` — a virtual connection point; it
+                // emits no shape and is not a wire vertex, so the path
+                // continues from the previous real point.
+                let (x, y, j) = read_wire_point(sink, rest, i + 1, net_name, line)?;
+                sink.last_x = x;
+                sink.last_y = y;
+                i = j;
+            }
+            // Point modifiers the model does not read: `TAPER` (full-width
+            // taper is the default) takes no argument, the rest take one.
+            "TAPER" => i += 1,
+            "TAPERRULE" | "TAPERWIDTH" | "STYLE" | "MASK" => {
+                rest.get(i + 1).with_context(|| {
+                    format!("DEF line {line}: net {net_name} `{w}` needs an argument")
+                })?;
+                i += 2;
+            }
+            // These change the wire's shape or width; a design that uses
+            // them is outside this model, not a silent approximation.
+            "EXT" | "DESIGNRULEWIDTH" | "NONDEFAULTRULE" => bail!(
+                "DEF line {line}: net {net_name} wire statement has `{w}`, which alters geometry this model does not support"
+            ),
+            w if w == "(" || is_coord(w) => {
+                let (x, y, j) = read_wire_point(sink, rest, i, net_name, line)?;
+                i = j;
+                if have_point {
+                    // Square (extended) caps — the segment runs half its
+                    // width past both endpoints along the axis, so a
+                    // sub-width jog paints a full-width stub instead of a
+                    // narrow tab. Diagonals get the full-bbox expansion.
+                    let rect = if py == y {
+                        RectDbu::new(px.min(x) - half, y - half, px.max(x) + half, y + half)
+                    } else if px == x {
+                        RectDbu::new(x - half, py.min(y) - half, x + half, py.max(y) + half)
+                    } else {
+                        RectDbu::new(
+                            px.min(x) - half,
+                            py.min(y) - half,
+                            px.max(x) + half,
+                            py.max(y) + half,
+                        )
+                    };
+                    sink.wire_rects.push((lid, rect));
+                    emitted = true;
+                }
+                px = x;
+                py = y;
+                have_point = true;
+                sink.last_x = x;
+                sink.last_y = y;
+            }
+            via_name => {
+                if !have_point {
+                    bail!("DEF line {line}: net {net_name} records via {via_name} on layer {lname} with no preceding point");
+                }
+                i += 1;
+                let (lower, upper, cut, cut_count, geom) =
+                    resolve_def_via(tech_db, def_vias, via_name, net_name, line)?;
+                if lid != lower && lid != upper {
+                    bail!(
+                        "DEF line {line}: net {net_name} records via {via_name} on layer {lname}, which is neither of its endpoints"
+                    );
+                }
+                sink.vias.push(PdnVia {
+                    name: sink.interner.intern(&unescape_def_name_cow(via_name)),
+                    lower,
+                    upper,
+                    cut,
+                    cut_count,
+                    geom,
+                    x_dbu: px,
+                    y_dbu: py,
+                });
+                emitted = true;
+                // After a via name the path ends; the next word must open
+                // a new statement.
+                match rest.get(i) {
+                    None | Some(&"+" | &"NEW" | &"ROUTED") => break,
+                    Some(&bad) => bail!(
+                        "DEF line {line}: unexpected `{bad}` after via {via_name} in net {net_name}"
+                    ),
+                }
+            }
+        }
+    }
+    if !emitted {
+        bail!(
+            "DEF line {line}: net {net_name} has a one-point wire stub on layer {lname}"
+        );
+    }
+    Ok(i)
+}
+
+/// One `NONDEFAULTRULES` record: `- ruleName + LAYER l WIDTH w SPACING s ...`.
+/// Only `LAYER` `WIDTH`/`SPACING` sub-attributes are grammar-relevant to our
+/// wire geometry; anything else (VIARULE/USEVIA/MINCUTS/...) is rejected
+/// loudly rather than silently dropped.
+fn add_ndr(
+    tech_db: &TechDb,
+    ndr_widths: &mut FastMap<String, FastMap<u8, i32>>,
+    words: &[&str],
+    line: usize,
+) -> Result<()> {
+    let [name, rest @ ..] = words else {
+        bail!("DEF line {line}: NONDEFAULTRULES record without a rule name");
+    };
+    let mut widths: FastMap<u8, i32> = FastMap::default();
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] != "+" {
+            bail!("DEF line {line}: NONDEFAULTRULES {name} unexpected `{}`", rest[i]);
+        }
+        let kw = rest.get(i + 1).copied().with_context(|| {
+            format!("DEF line {line}: NONDEFAULTRULES {name} has `+` without a keyword")
+        })?;
+        i += 2;
+        match kw {
+            "LAYER" => {
+                let lname = rest.get(i).copied().with_context(|| {
+                    format!("DEF line {line}: NONDEFAULTRULES {name} `+ LAYER` needs a layer name")
+                })?;
+                let lid = tech_db
+                    .strings
+                    .get(lname)
+                    .and_then(|s| tech_db.layer_by_name.get(&s))
+                    .copied()
+                    .with_context(|| {
+                        format!("DEF line {line}: NONDEFAULTRULES {name} uses layer {lname}, which the LEF does not define as routing")
+                    })?;
+                i += 1;
+                while i < rest.len() && rest[i] != "+" {
+                    match rest[i] {
+                        "WIDTH" => {
+                            let w: i32 = number(
+                                rest.get(i + 1).copied().unwrap_or(""),
+                                "NONDEFAULTRULES LAYER WIDTH",
+                                line,
+                            )?;
+                            widths.insert(lid.0, w);
+                            i += 2;
+                        }
+                        // Spacing has no effect on painted wire width.
+                        "SPACING" => i += 2,
+                        other => bail!(
+                            "DEF line {line}: NONDEFAULTRULES {name} `+ LAYER {lname}` has unsupported attribute `{other}`"
+                        ),
+                    }
+                }
+            }
+            other => bail!(
+                "DEF line {line}: NONDEFAULTRULES {name} has unsupported attribute `+ {other}`"
+            ),
+        }
+    }
+    ndr_widths.insert(name.to_string(), widths);
+    Ok(())
+}
+
+/// Lookup tables `add_net` resolves names through: DEF `VIAS` records,
+/// `NONDEFAULTRULES` width overrides, and the component/PIN name maps.
+struct NetLookups<'a> {
+    def_vias: &'a DefViaMap,
+    ndr_widths: &'a FastMap<String, FastMap<u8, i32>>,
+    io_pins: &'a FastMap<String, PinId>,
+    cells: &'a FastMap<String, CellId>,
+}
+
+/// A `NETS` record: connectivity (same resolution the old token loop did,
+/// moved verbatim) plus routed geometry into `NetGeom`.
+fn add_net(
+    db: &mut DesignDb,
+    tech_db: &TechDb,
+    lookups: &NetLookups<'_>,
+    net_id: NetId,
+    words: &[&str],
+    line: usize,
+) -> Result<(Vec<PinId>, NetGeom)> {
+    let [name, rest @ ..] = words else {
+        bail!("DEF line {line}: NETS record without a net name");
+    };
+    let net_name = unescape_def_name_cow(name).into_owned();
+
+    // Connection groups `( comp pin )` up to the first `+`/`NEW`/`ROUTED`
+    // word — NETS records keep parens (wire point groups need them), so
+    // groups arrive as exactly four tokens `( comp pin )`.
+    let mut pins = Vec::new();
+    let mut i = 0;
+    while i < rest.len() && !matches!(rest[i], "+" | "NEW" | "ROUTED") {
+        if rest.get(i) != Some(&"(") || rest.get(i + 3) != Some(&")") {
+            bail!("DEF line {line}: connection of net {net_name} must be `( component pin )`");
+        }
+        let comp = rest[i + 1];
+        let pin = rest[i + 2];
+        if matches!(comp, "+" | "NEW" | "ROUTED") || matches!(pin, "+" | "NEW" | "ROUTED")
+            || matches!(comp, "(" | ")") || matches!(pin, "(" | ")")
+        {
+            bail!("DEF line {line}: connection of net {net_name} must be `( component pin )`");
+        }
+        if comp == "PIN" {
+            let pname = unescape_def_name_cow(pin);
+            let &pid = lookups.io_pins.get(pname.as_ref()).with_context(|| {
+                format!("DEF line {line}: net {net_name} connects to PIN {pname}, which PINS does not define")
+            })?;
+            pins.push(pid);
+            db.pin_nets[pid.0 as usize] = Some(net_id);
+        } else {
+            let iname = unescape_def_name_cow(comp);
+            let &cid = lookups.cells.get(iname.as_ref()).with_context(|| {
+                format!("DEF line {line}: net {net_name} connects to component {iname}, which COMPONENTS does not define")
+            })?;
+            let pid = db
+                .cell_pins(cid)
+                .iter()
+                .copied()
+                .find(|&pid| db.strings.resolve(db.pin_names[pid.0 as usize]) == pin)
+                .with_context(|| {
+                    format!("DEF line {line}: net {net_name} connects to {iname}/{pin}, which the macro does not have")
+                })?;
+            pins.push(pid);
+            db.pin_nets[pid.0 as usize] = Some(net_id);
+        }
+        i += 4;
+    }
+
+    let mut geom = NetGeom::default();
+    // `+ NONDEFAULTRULE name` applies to every wire statement after it.
+    let mut ndr: Option<&FastMap<u8, i32>> = None;
+    let mut sink = WireSink {
+        interner: &mut db.strings,
+        wire_rects: &mut geom.wire_rects,
+        vias: &mut geom.vias,
+        last_x: 0,
+        last_y: 0,
+        net_name: &net_name,
+    };
+
+    while i < rest.len() {
+        match rest[i] {
+            "+" => {
+                let kw = rest.get(i + 1).copied().with_context(|| {
+                    format!("DEF line {line}: net {net_name} has `+` without an attribute keyword")
+                })?;
+                i += 2;
+                match kw {
+                    "USE" => {
+                        let arg = rest.get(i).copied().with_context(|| {
+                            format!("DEF line {line}: net {net_name} `+ USE` needs a keyword")
+                        })?;
+                        parse_pdn_use(arg, &net_name, line)?;
+                        i += 1;
+                    }
+                    "ROUTED" | "FIXED" | "COVER" | "PLACED" => {
+                        i = parse_net_wire(tech_db, lookups.def_vias, &mut sink, rest, i, line, ndr)?;
+                    }
+                    "SHIELD" => {
+                        // Net-level shielding annotation; the shield metal
+                        // itself arrives as its own wire statements.
+                        rest.get(i).copied().with_context(|| {
+                            format!("DEF line {line}: net {net_name} `+ SHIELD` needs a shield net name")
+                        })?;
+                        i += 1;
+                    }
+                    "SUBNET" => bail!(
+                        "DEF line {line}: net {net_name} `+ SUBNET` is not supported"
+                    ),
+                    "NONDEFAULTRULE" => {
+                        let arg = rest.get(i).copied().with_context(|| {
+                            format!("DEF line {line}: net {net_name} `+ NONDEFAULTRULE` needs a rule name")
+                        })?;
+                        ndr = Some(lookups.ndr_widths.get(arg).with_context(|| {
+                            format!("DEF line {line}: net {net_name} `+ NONDEFAULTRULE {arg}` is not defined in NONDEFAULTRULES")
+                        })?);
+                        i += 1;
+                    }
+                    "EXT" | "DESIGNRULEWIDTH" => bail!(
+                        "DEF line {line}: net {net_name} `+ {kw}` alters wire geometry, which this model does not support"
+                    ),
+                    // Attributes with no geometry effect; arguments run to
+                    // the next `+`/`NEW`/`ROUTED` word.
+                    "TAPER" | "TAPERWIDTH" | "STYLE" | "MASK" | "SYNTHESIZED" | "PATTERN"
+                    | "SOURCE" | "ESTCAP" | "WEIGHT" | "ORIGINAL" | "PROPERTY" | "XTALK"
+                    | "VOLTAGE" | "FREQUENCY" | "FIXEDBUMP" => {
+                        while i < rest.len() && !matches!(rest[i], "+" | "NEW" | "ROUTED") {
+                            i += 1;
+                        }
+                    }
+                    other => bail!(
+                        "DEF line {line}: unknown NETS attribute `+ {other}` on net {net_name}"
+                    ),
+                }
+            }
+            // `NEW` is bare; a bare `ROUTED` is grammar-legal inside a
+            // record too, so both reach the wire parser.
+            "NEW" => {
+                i = parse_net_wire(tech_db, lookups.def_vias, &mut sink, rest, i + 1, line, ndr)?;
+            }
+            "ROUTED" => {
+                i = parse_net_wire(tech_db, lookups.def_vias, &mut sink, rest, i + 1, line, ndr)?;
+            }
+            other => bail!("DEF line {line}: unexpected `{other}` in net {net_name}"),
+        }
+    }
+    Ok((pins, geom))
+}
+
 pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -> Result<DesignDb> {
     let text = std::str::from_utf8(bytes).context("DEF is not valid UTF-8")?;
     let mut lexer = DefLexer::new(text);
@@ -1110,6 +1509,8 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
     // against it, so a DEF placing SPECIALNETS first errors on the unknown
     // via name — a named assumption (OpenROAD writers emit VIAS first).
     let mut def_vias: DefViaMap = FastMap::default();
+    // NONDEFAULTRULE name → `LayerId` → wire width override (DBU).
+    let mut ndr_widths: FastMap<String, FastMap<u8, i32>> = FastMap::default();
     let mut saw_end_design = false;
 
     loop {
@@ -1240,121 +1641,69 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
                 db.cell_pin_offsets.push(0);
                 for_each_record(&mut lexer, "COMPONENTS", |words, line| {
                     add_component(&mut db, tech_db, lib_db, &mut cell_name_to_id, words, line)
-                })?;
+                }, false)?;
             }
             DefToken::Word("PINS") => {
                 for_each_record(&mut lexer, "PINS", |words, line| {
                     add_pin(&mut db, tech_db, &mut io_pin_name_to_id, words, line)
-                })?;
+                }, false)?;
             }
             DefToken::Word("SPECIALNETS") => {
                 for_each_record(&mut lexer, "SPECIALNETS", |words, line| {
                     add_special_net(&mut db, tech_db, &def_vias, words, line)
-                })?;
+                }, false)?;
             }
-            // Non-default rules constrain detailed routing only, which no
-            // stage reads.
             DefToken::Word("VIAS") => {
                 for_each_record(&mut lexer, "VIAS", |words, line| {
                     let (name, via) = add_def_via(&mut db, tech_db, words, line)?;
                     def_vias.insert(name, via);
                     Ok(())
-                })?;
+                }, false)?;
             }
-            DefToken::Word("NONDEFAULTRULES") => skip_section(&mut lexer, "NONDEFAULTRULES")?,
+            // Non-default rules carry per-layer WIDTH overrides that wire
+            // expansion needs; other NDR attributes are rejected loudly.
+            DefToken::Word("NONDEFAULTRULES") => {
+                for_each_record(&mut lexer, "NONDEFAULTRULES", |words, line| {
+                    add_ndr(tech_db, &mut ndr_widths, words, line)
+                }, false)?;
+            }
             DefToken::Word("NETS") => {
-                let declared = section_count(&mut lexer, "NETS")?;
                 let mut net_pins_list: Vec<Vec<PinId>> = Vec::new();
                 let mut net_names_vec: Vec<String> = Vec::new();
                 let mut net_spellings_vec: Vec<String> = Vec::new();
+                let mut net_geoms_list: Vec<NetGeom> = Vec::new();
 
-                loop {
-                    match lexer.next_token() {
-                        DefToken::Word("-") => {
-                            let (net_name, spelling) = match lexer.next_token() {
-                                DefToken::Word(w) => {
-                                    (unescape_def_name_cow(w).into_owned(), w.to_string())
-                                }
-                                other => bail!(
-                                    "DEF line {}: expected a net name after `-`, found {other:?}",
-                                    lexer.line()
-                                ),
-                            };
-                            let net_id = NetId(net_names_vec.len() as u32);
-                            net_names_vec.push(net_name.clone());
-                            net_spellings_vec.push(spelling);
-                            let mut current_pins: Vec<PinId> = Vec::new();
-
-                            // Connections `( comp pin )` come first; then `+` attributes and routed
-                            // wiring follow. Those are not modeled, so they are skipped.
-                            let mut in_attributes = false;
-                            loop {
-                                match lexer.next_token() {
-                                    DefToken::Semi => break,
-                                    DefToken::Word("+") => in_attributes = true,
-                                    DefToken::Word(_) if in_attributes => {}
-                                    DefToken::LParen if in_attributes => {
-                                        read_group(&mut lexer)?;
-                                    }
-                                    DefToken::LParen => {
-                                        let (comp, pin) = read_conn_group(&mut lexer, &net_name)?;
-                                        let line = lexer.line();
-                                        if comp == "PIN" {
-                                            let pname = unescape_def_name_cow(pin);
-                                            let &pid = io_pin_name_to_id.get(pname.as_ref()).with_context(|| {
-                                                format!("DEF line {line}: net {net_name} connects to PIN {pname}, which PINS does not define")
-                                            })?;
-                                            current_pins.push(pid);
-                                            db.pin_nets[pid.0 as usize] = Some(net_id);
-                                        } else {
-                                            let iname = unescape_def_name_cow(comp);
-                                            let &cid = cell_name_to_id.get(iname.as_ref()).with_context(|| {
-                                                format!("DEF line {line}: net {net_name} connects to component {iname}, which COMPONENTS does not define")
-                                            })?;
-                                            let pid = db
-                                                .cell_pins(cid)
-                                                .iter()
-                                                .copied()
-                                                .find(|&pid| db.strings.resolve(db.pin_names[pid.0 as usize]) == pin)
-                                                .with_context(|| {
-                                                    format!("DEF line {line}: net {net_name} connects to {iname}/{pin}, which the macro does not have")
-                                                })?;
-                                            current_pins.push(pid);
-                                            db.pin_nets[pid.0 as usize] = Some(net_id);
-                                        }
-                                    }
-                                    other => bail!(
-                                        "DEF line {}: unexpected {other:?} in net {net_name}; connections must be `( component pin )`",
-                                        lexer.line()
-                                    ),
-                                }
-                            }
-
-                            net_pins_list.push(current_pins);
-                        }
-                        DefToken::Word("END") => {
-                            end_section(&mut lexer, "NETS")?;
-                            break;
-                        }
-                        DefToken::Eof => {
-                            bail!("DEF: NETS is not terminated by `END NETS` (truncated file?)")
-                        }
-                        other => bail!(
-                            "DEF line {}: unexpected {other:?} in NETS; records start with `-`",
-                            lexer.line()
-                        ),
-                    }
-                }
-                if declared != net_names_vec.len() {
-                    bail!(
-                        "DEF line {}: NETS header declares {declared} nets but {} were read (truncated or edited file?)",
-                        lexer.line(),
-                        net_names_vec.len()
-                    );
-                }
+                // NETS keeps parens: routed-wire points are `( x y [z] )`
+                // groups, and a `( x y 0 )` triple is ambiguous with the
+                // next point's `x` once parens are dropped.
+                for_each_record(&mut lexer, "NETS", |words, line| {
+                    let [name, ..] = words else {
+                        bail!("DEF line {line}: NETS record without a net name");
+                    };
+                    let net_id = NetId(net_names_vec.len() as u32);
+                    net_names_vec.push(unescape_def_name_cow(name).into_owned());
+                    net_spellings_vec.push(name.to_string());
+                    let (pins, geom) = add_net(
+                        &mut db,
+                        tech_db,
+                        &NetLookups {
+                            def_vias: &def_vias,
+                            ndr_widths: &ndr_widths,
+                            io_pins: &io_pin_name_to_id,
+                            cells: &cell_name_to_id,
+                        },
+                        net_id,
+                        words,
+                        line,
+                    )?;
+                    net_pins_list.push(pins);
+                    net_geoms_list.push(geom);
+                    Ok(())
+                }, true)?;
 
                 // Build Net SoA & CSR
                 let num_nets = net_names_vec.len();
+                db.net_geoms = net_geoms_list;
                 db.net_names.reserve(num_nets);
                 db.net_pin_offsets.reserve(num_nets + 1);
 
@@ -2238,20 +2587,30 @@ END DESIGN
 
     #[test]
     fn test_connection_group_unterminated_is_an_error() {
+        // `;` closes the statement inside the group, leaving `u1` as a
+        // dangling word — same reject as the one-word group.
         let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 ;"));
-        assert!(msg.contains("unexpected Semi inside `( ... )`"), "{msg}");
+        assert!(msg.contains("must be `( component pin )`"), "{msg}");
     }
 
-    /// `NONDEFAULTRULES` only constrains detailed routing, which the timing database does not
-    /// read; the stock LibreLane DEF emits it and must parse.
+    /// `NONDEFAULTRULES` `+ LAYER l WIDTH w` overrides the LEF routing
+    /// width for nets under `+ NONDEFAULTRULE`; `SPACING` is consumed but
+    /// has no geometry effect.
     #[test]
-    fn test_nondedefaultrules_is_skipped() {
-        let def = MINI_DEF.replace(
-            "COMPONENTS 1 ;",
-            "NONDEFAULTRULES\n  - abc\nEND NONDEFAULTRULES\nCOMPONENTS 1 ;",
+    fn test_nets_nondefaultrule_width_applies() {
+        let def = NETS_DEF
+            .replace(
+                "COMPONENTS 2 ;",
+                "NONDEFAULTRULES 1 ;\n  - wide + LAYER met1 WIDTH 200 SPACING 280 ;\nEND NONDEFAULTRULES\nCOMPONENTS 2 ;",
+            )
+            .replace("+ USE SIGNAL\n  + ROUTED met1", "+ USE SIGNAL + NONDEFAULTRULE wide\n  + ROUTED met1");
+        let db = parse_def_bytes(def.as_bytes(), &pdn_tech(), None).expect("must parse");
+        let n1 = db.net_geom(NetId(0)).expect("n1 geom");
+        assert_eq!(
+            n1.wire_rects[0].1,
+            RectDbu::new(-100, -100, 1100, 100),
+            "NDR met1 WIDTH 200 (half 100) replaces the LEF 140"
         );
-        parse_def_bytes(def.as_bytes(), &mini_tech(), None)
-            .expect("DEF with NONDEFAULTRULES must parse");
     }
 
     /// Every name written by `escape_def_name` must come back unchanged
@@ -2664,5 +3023,216 @@ END DESIGN
                 assert_eq!(via.upper.0, via.lower.0 + 1, "{vn} is not adjacent");
             }
         }
+    }
+
+    /// Two `NETS` records exercising every retained construct: `+ ROUTED`
+    /// paths with `*` coordinates, a LEF-via link, `+ FIXED`, and a `RECT`
+    /// stub. Runs on `PDN_LEF` (met1/2/3 at WIDTH 0.14 → half 70,
+    /// `stack_a` spans met1↔met2).
+    const NETS_DEF: &str = r#"VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN nets ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 100000 250000 ) ;
+ROW ROW_0 unithd 0 0 N DO 4 BY 1 STEP 460 2720 ;
+COMPONENTS 2 ;
+- u1 CELL + PLACED ( 0 0 ) N ;
+- u2 CELL + PLACED ( 500 0 ) N ;
+END COMPONENTS
+NETS 2 ;
+- n1 ( u1 VPWR ) + USE SIGNAL
+  + ROUTED met1 ( 0 0 ) ( 1000 0 )
+  NEW met1 ( 500 0 ) stack_a
+  NEW met2 ( 500 0 ) ( 500 500 )
+  ;
+- n2 ( u2 VPWR ) + FIXED met1 ( 0 100 ) ( * 200 ) ( 300 * )
+  NEW met3 ( 94530 245140 ) RECT ( -620 -150 0 150 )
+  ;
+END NETS
+END DESIGN
+"#;
+
+    #[test]
+    fn test_nets_routed_geometry_retained() {
+        let db = parse_def_bytes(NETS_DEF.as_bytes(), &pdn_tech(), None).expect("must parse");
+        assert_eq!(db.num_nets(), 2);
+        assert_eq!(db.net_geoms.len(), 2);
+
+        let (met1, met2, met3) = (
+            layer_id(&pdn_tech(), "met1"),
+            layer_id(&pdn_tech(), "met2"),
+            layer_id(&pdn_tech(), "met3"),
+        );
+        let n1 = db.net_geom(NetId(0)).expect("n1 geom");
+        assert_eq!(
+            n1.wire_rects,
+            vec![
+                // (0,0)-(1000,0) on met1, half-width 70, square caps.
+                (met1, RectDbu::new(-70, -70, 1070, 70)),
+                // (500,0)-(500,500) on met2.
+                (met2, RectDbu::new(430, -70, 570, 570)),
+            ]
+        );
+        assert_eq!(n1.vias.len(), 1);
+        let via = &n1.vias[0];
+        assert_eq!(db.strings.resolve(via.name), "stack_a");
+        assert_eq!(via.lower, met1);
+        assert_eq!(via.upper, met2);
+        assert_eq!((via.x_dbu, via.y_dbu), (500, 0));
+        assert!(matches!(via.geom, ViaGeom::Lef(_)));
+
+        let n2 = db.net_geom(NetId(1)).expect("n2 geom");
+        assert_eq!(
+            n2.wire_rects,
+            vec![
+                // (0,100)-(0,200) vertical.
+                (met1, RectDbu::new(-70, 30, 70, 270)),
+                // (0,200)-(300,200) horizontal.
+                (met1, RectDbu::new(-70, 130, 370, 270)),
+                // `pt RECT ( dx1 dy1 dx2 dy2 )` offset, un-expanded.
+                (met3, RectDbu::new(93910, 244990, 94530, 245290)),
+            ]
+        );
+        assert!(n2.vias.is_empty());
+
+        // Connectivity kept the old behavior: two pins, one per net.
+        assert_eq!(db.net_pins(NetId(0)).len(), 1);
+        assert_eq!(db.net_pins(NetId(1)).len(), 1);
+    }
+
+    /// A reparsed DEF must produce an identical `net_geoms` — emission is
+    /// fully input-determined.
+    #[test]
+    fn test_nets_geometry_is_deterministic() {
+        let tech = pdn_tech();
+        let a = parse_def_bytes(NETS_DEF.as_bytes(), &tech, None).expect("a");
+        let b = parse_def_bytes(NETS_DEF.as_bytes(), &tech, None).expect("b");
+        assert_eq!(a.net_geoms, b.net_geoms);
+    }
+
+    /// `+ COVER` wires and `VIRTUAL` points parse without emitting extra
+    /// shapes; `+ SHIELD` and net attributes are consumed.
+    #[test]
+    fn test_nets_cover_virtual_and_attributes() {
+        let def = NETS_DEF.replace(
+            "+ ROUTED met1 ( 0 0 ) ( 1000 0 )",
+            "+ COVER met1 ( 0 0 ) VIRTUAL ( 400 0 ) ( 1000 0 ) + WEIGHT 7 + ESTCAP 1.5",
+        );
+        let db = parse_def_bytes(def.as_bytes(), &pdn_tech(), None).expect("must parse");
+        let n1 = db.net_geom(NetId(0)).expect("n1 geom");
+        // VIRTUAL leaves no vertex: the met1 wire is one (0,0)-(1000,0)
+        // segment; the met2 wire is unchanged.
+        assert_eq!(
+            n1.wire_rects,
+            vec![
+                (layer_id(&pdn_tech(), "met1"), RectDbu::new(-70, -70, 1070, 70)),
+                (layer_id(&pdn_tech(), "met2"), RectDbu::new(430, -70, 570, 570)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nets_via_unknown_name_is_an_error() {
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "( 500 0 ) stack_a",
+            "( 500 0 ) no_such_via",
+        ));
+        assert!(msg.contains("no_such_via") && msg.contains("n1"), "{msg}");
+    }
+
+    #[test]
+    fn test_nets_via_on_foreign_layer_is_an_error() {
+        // `stack_a` spans met1↔met2; recording it on met3 is inconsistent.
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "NEW met1 ( 500 0 ) stack_a",
+            "NEW met3 ( 500 0 ) stack_a",
+        ));
+        assert!(msg.contains("met3") && msg.contains("neither of its endpoints"), "{msg}");
+    }
+
+    #[test]
+    fn test_nets_rect_before_point_is_an_error() {
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "NEW met3 ( 94530 245140 ) RECT ( -620 -150 0 150 )",
+            "NEW met3 RECT ( -620 -150 0 150 ) ( 94530 245140 )",
+        ));
+        assert!(msg.contains("RECT") && msg.contains("before any point"), "{msg}");
+    }
+
+    #[test]
+    fn test_nets_one_point_stub_is_an_error() {
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "NEW met2 ( 500 0 ) ( 500 500 )",
+            "NEW met2 ( 500 0 )",
+        ));
+        assert!(msg.contains("one-point"), "{msg}");
+    }
+
+    #[test]
+    fn test_nets_ext_is_an_error() {
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "+ ROUTED met1 ( 0 0 ) ( 1000 0 )",
+            "+ ROUTED met1 ( 0 0 ) ( 1000 0 ) + EXT 50",
+        ));
+        assert!(msg.contains("EXT"), "{msg}");
+    }
+
+    /// A net naming a rule `NONDEFAULTRULES` never defined errors loudly.
+    #[test]
+    fn test_nets_nondefaultrule_unknown_is_an_error() {
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "+ USE SIGNAL",
+            "+ USE SIGNAL + NONDEFAULTRULE wide",
+        ));
+        assert!(msg.contains("not defined in NONDEFAULTRULES"), "{msg}");
+    }
+
+    #[test]
+    fn test_nets_subnet_is_an_error() {
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "+ USE SIGNAL",
+            "+ USE SIGNAL + SUBNET n1_a ( u1 VPWR )",
+        ));
+        assert!(msg.contains("SUBNET"), "{msg}");
+    }
+
+    /// A `+ VIARULE` via cannot be expanded without `+ CUTSIZE` — this is
+    /// an unsupported-input error, not a lookup miss.
+    #[test]
+    fn test_generated_via_without_cutsize_is_an_error() {
+        let def = PDN_DEF.replace(
+            "- via12_inst + VIA stack_a ;",
+            "- via12_inst + VIARULE RULE + LAYERS met1 via12 met2 + ROWCOL 1 3 ;",
+        );
+        let msg = pdn_def_error(&def);
+        assert!(msg.contains("via12_inst") && msg.contains("CUTSIZE"), "{msg}");
+    }
+
+    /// Generated-via params are retained on `ViaGeom::Generated`.
+    #[test]
+    fn test_generated_via_params_retained() {
+        let def = PDN_DEF.replace(
+            "- via12_inst + VIA stack_a ;",
+            "- via12_inst + VIARULE RULE + CUTSIZE 150 150 + LAYERS met1 via12 met2 + CUTSPACING 170 170 + ENCLOSURE 85 165 55 85 + ROWCOL 1 3 ;",
+        );
+        let db = parse_def_bytes(def.as_bytes(), &pdn_tech(), None).expect("must parse");
+        let via = &db.pdn_nets[0].vias[0];
+        assert_eq!(via.cut_count, 3);
+        let ViaGeom::Generated(g) = &via.geom else {
+            panic!("expected Generated geom: {:?}", via.geom);
+        };
+        assert_eq!((g.cut_w_dbu, g.cut_h_dbu), (150, 150));
+        assert_eq!((g.rows, g.cols), (1, 3));
+        assert_eq!((g.cut_spacing_x_dbu, g.cut_spacing_y_dbu), (170, 170));
+        assert_eq!(
+            (
+                g.enc_bot_x_dbu,
+                g.enc_bot_y_dbu,
+                g.enc_top_x_dbu,
+                g.enc_top_y_dbu
+            ),
+            (85, 165, 55, 85)
+        );
     }
 }

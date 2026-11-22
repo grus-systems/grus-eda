@@ -64,14 +64,27 @@ violation carrying the rect. Strict `<` — a rect exactly at the bound
 passes (matches Magic's `width < %d` reading; the 140-wide met1 io
 port and 170 li1 cut rects must pass).
 
+**Source filter** — landed after real-DEF evidence: per-rect checking
+runs on `SignalWire`, `SpecialWire`, and `IoPort` (router-drawn
+shapes) plus `Via` cut rects on cut layers. `Via` *metal* rects and
+`MacroPin`/`MacroObs` never generate findings — via metal merges with
+its wire, and macro rects are LEF abstracts, not the fabricated GDS
+Magic measures.
+
+**Merge-relief** — the earlier draft assumed every shape independently
+meets bound on the clean designs; that assumption broke on real DEFs
+(sub-bound `RECT` stubs such as a 140×25 met2 stub, and — before the
+square-cap correction — jog caps). A sub-bound wire rect is relieved
+iff drawn metal on the same layer covers its entire perpendicular span
+and chains outward past its narrow extent — i.e., the narrow boundary
+pair dissolves into the union Magic measures. `MacroPin` counts as
+drawn metal for relief (pin abstracts understate GDS metal);
+`MacroObs` does not.
+
 Deliberate simplification vs Magic: Magic computes width on the merged
-per-layer polygon (a wire's union with via metals/pins can enlarge its
-"measured" width); we check each `ShapeRect` independently. On the
-clean routed DEFs every shape independently meets bound → both give 0.
-Known false-positive risk: a legitimately-merged shape that is
-sub-bound standalone — the source tag (`ShapeSrc`) exists so `results.md`
-can name the source class if the 0-gate ever fails. Recorded here so a
-later reviewer doesn't rediscover it.
+per-layer polygon; we check each `ShapeRect` and dissolve narrow
+boundary pairs via the relief walk — not a full union computation.
+Recorded here so a later reviewer doesn't rediscover it.
 
 ## Name-parity join (test-side)
 

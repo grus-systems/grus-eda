@@ -123,3 +123,98 @@ DRT regen, picorv32 ≈ 105 s). One named, deterministic divergence for a
 fresh tree: picorv32's `drt_report_*` fields encode `existing` while
 `picorv32.drc.rpt` (gitignored) is present; without it the script takes
 the regen path and records `regenerated_*` instead — same count (0).
+
+---
+
+# E7 ticket 2 (`e7-drc-geom`): geometry model + width family
+
+The LEF+DEF subset checker's geometry substrate and its first rule
+family. `drc::geom` assembles every shape Magic sees on each
+routing/cut layer; `drc::width` checks the 13 `lef_expressible` width
+rules and joins `magic_per_rule` by rule-name template.
+
+## 6. Shape sources and the DEF wire model
+
+Per-layer `LayerShapes` (routing layers indexed by `LayerId`, cut
+layers by `cut_layers` position) collect five source classes:
+
+| `ShapeSrc` | Source | Width-checked? |
+|---|---|---|
+| `SignalWire` | `NETS` `ROUTED`/`FIXED`/`COVER`/`PLACED`/`NEW` wire segments + `RECT` stubs | yes |
+| `SpecialWire` | `SPECIALNETS` wire segments | yes |
+| `Via` | cut rect + every LEF `VIA`/`VIAS` metal rect, placed at the via point | cuts yes; metals no |
+| `MacroPin` / `MacroObs` | placed component's macro `PIN`/`OBS` rects, orientation-transformed | no |
+| `IoPort` | top-level `PINS` `+ LAYER` rects | yes |
+
+Via resolution is the single `resolve_def_via` path SPECIALNETS already
+uses — `def_vias` (DEF `VIAS` records) first, then `TechDb::via_defs`
+(LEF `VIA`); unknown names error loudly. `+ VIARULE` generated vias
+expand deterministically from retained `CUTSIZE`/`ROWCOL`/`CUTSPACING`/
+`ENCLOSURE` (OpenDB symmetric-overhang reading, arithmetic-verified
+against `via2_3_1600_480_1_5_320_320`).
+
+**Wire expansion is square-capped.** A `pt pt` segment paints
+`[min−half, max+half]` along its axis — this is what OpenROAD/DRT
+actually emit: picorv32 carries sub-width jogs such as
+`NEW met1 ( 390670 213350 ) ( * 213360 )` that only stay DRC-clean if
+the endpoint extends half a width. Perpendicular (flush) expansion made
+that jog a real 140×10 notch and produced ~90 false `met1.1` findings;
+square caps reproduce Magic's 0 verdict exactly. `SPECIALNETS` keeps
+the pre-existing perpendicular expansion — `pdn.rs` mesh and attach
+semantics pin those rects — which can only under-report metal
+(conservative for merge-relief); unifying is a recorded divergence.
+`+ NONDEFAULTRULE name` applies the `NONDEFAULTRULES` `+ LAYER l
+WIDTH w` override; `EXT`/`DESIGNRULEWIDTH`/`SUBNET` bail loudly.
+
+## 7. Width family status
+
+| Family | Status |
+|---|---|
+| `width` | **implemented** — `drc::width`, 13 rules, 0 violations on both routed DEFs |
+| `spacing` | pending — the `LayerShapes::iter_overlapping` spatial index exists for it |
+| `enclosure` | pending |
+| `area` | pending |
+| `holes` | pending |
+| `magic_only` statements | out of scope per §3 (nwell-in-master etc. — the 305/8049 `magic_total` counts live here) |
+
+## 8. Rule bounds — LEF provenance
+
+Bounds are the **LEF** layer `WIDTH` / via-cut `WIDTH`, never the Magic
+techfile constant — where they diverge we check LEF, which is the
+documented claim boundary. `rule_name` is the verbatim
+`magic_rules_checked.names` template; the first `(id)` inside its
+parens is the `magic_per_rule` join key. Magic `%d` re-derived from
+`sky130A.tech` `drc` section (local PDK copy, pinned content):
+
+| `rule` | layer | LEF bound (DBU) | `rule_name` (verbatim) | Magic `%d` | divergence |
+|---|---|---|---|---|---|
+| `li.c1` | li1 | 170 | `Core local interconnect width < %d (li.c1)` | 140 | Magic checks a looser core-li bound; we check LEF 170 |
+| `li.1` | li1 | 170 | `Local interconnect width < %d (li.1)` | 170 | — |
+| `li.7` | li1 | 170 | `Local interconnect width < %d (li.7)` | 290 | Magic's fat-li context bound; collapses to the same li1 bound here |
+| `mcon.1` | mcon | 170 | `mcon.width < %d (mcon.1)` | 170 | — |
+| `met1.1` | met1 | 140 | `Metal1 width < %d (met1.1)` | 140 | — |
+| `met2.1` | met2 | 140 | `Metal2 width < %d (met2.1)` | 140 | — |
+| `met3.1` | met3 | 300 | `Metal3 width < %d (met3.1)` | 300 | — |
+| `met4.1` | met4 | 300 | `Metal4 width < %d (met4.1)` | 300 | — |
+| `met5.1` | met5 | 1600 | `Metal5 width < %d (met5.1)` | 1600 | — |
+| `via.1a` | via | 150 | `Via1 width < %d (via.1a + 2 * via.4a)` | 260 | Magic's bound is enclosure-augmented; we check the cut's LEF WIDTH |
+| `via2.1a` | via2 | 200 | `via2 width < %d (via2.1a + 2 * via2.4)` | 280 | same |
+| `via3.1` | via3 | 200 | `via3 width < %d (via3.1 + 2 * via3.4)` | 320 | same |
+| `via4.1` | via4 | 800 | `via4 width < %d (via4.1 + 2 * via4.4)` | 1180 | same |
+
+## 9. Check semantics vs Magic
+
+Magic measures width on the merged per-layer polygon; we check each
+`ShapeRect` (`min(w,h) < bound`, strict `<`) and then apply
+**merge-relief**: a sub-bound wire rect is not reported iff drawn metal
+on the same layer covers its entire perpendicular span and chains
+outward past its narrow extent — the narrow boundary pair dissolves
+into the union (what Magic does to `RECT` stubs and jog caps).
+`MacroPin` rects count as drawn metal for relief (pin abstracts
+understate GDS); `MacroObs` does not (not fabricated metal). Relief
+sources are `SignalWire`/`SpecialWire`/`Via`/`IoPort`/`MacroPin`.
+
+`li.c1`/`li.7` are statement-position rules in Magic (core-area and
+resist-li contexts); our model carries no per-statement position, so
+all three `li1` names share the LEF bound — a recorded collapse, fine
+for the zero gate since every real li1 shape meets the tightest bound.

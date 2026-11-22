@@ -65,24 +65,24 @@ Keep the deferred build verbatim; only the per-record body changes:
 }
 ```
 
-`read_statement_into` drops parens, so conn groups arrive as 2-word
-pairs — identical to `add_special_net`'s conn scan. Consequences:
+NETS records are read with `keep_parens` (wire point groups need the
+parens preserved — see the landed-corrections section), so conn groups
+arrive as exactly four tokens `( comp pin )`. Consequences:
 
-- Conn-pair scan stops at `+`, `NEW`, or `ROUTED` (same boundary set as
+- Conn-group scan stops at `+`, `NEW`, or `ROUTED` (same boundary set as
   `add_special_net`; component names colliding with keywords are already
-  excluded by DEF's reserved-word rule).
-- Each conn pair resolves exactly like today: `PIN name` →
-  `io_pin_name_to_id` + `pin_nets[pid]`; `comp pin` →
-  `cell_name_to_id` + macro-pin lookup by name — the lookup bodies move
-  into `add_net` unchanged (they are inline in the current loop, not a
-  helper). Driver-first ordering is **not** done at parse — it stays in
+  excluded by DEF's reserved-word rule). `add_net` asserts the `( … )`
+  shape explicitly and bails on any other group arity.
+- Each conn resolves exactly like before: `PIN name` → `io_pins` +
+  `pin_nets[pid]`; `comp pin` → `cells` + macro-pin lookup by name —
+  the lookups ride in `NetLookups` (cells, io_pins, def_vias, ndr
+  widths). Driver-first ordering is **not** done at parse — it stays in
   the section-end CSR build where `pin_is_driver` is already set.
 - Malformed conns keep the pinned error text —
   `test_connection_group_with_extra_word_is_an_error` and
-  `..._one_word_...` assert ``must be `( component pin )` ``; emit the
-  identical message from the pair-scan path. The unterminated-group case
-  (`( u1 ;`) dies inside `read_statement_into` with its own message —
-  adjust the test expectation only if the existing text changes.
+  `..._one_word_...` assert ``must be `( component pin )` ``; the
+  explicit paren check emits the identical message. The unterminated-group
+  case (`( u1 ;`) dies inside `read_statement_into` with its own message.
 - `net_geoms_list` is pushed once per record (empty `NetGeom` for
   unrouted nets) so it stays parallel with `net_names_vec`; the
   section-end block assigns it to `db.net_geoms` alongside the CSR
@@ -94,12 +94,13 @@ pairs — identical to `add_special_net`'s conn scan. Consequences:
 add_net(words, line):
   [name, rest @ ..] → net_name = unescape(name);
       push name → net_names_vec, raw spelling → net_spellings_vec
-  conn phase: for pairs while rest[i] ∉ {"+", "NEW", "ROUTED"}:
-      (comp pin) → resolve via io_pin_name_to_id / cell_name_to_id +
-                   macro-pin name match (current loop's bodies, verbatim);
+  conn phase: for `( comp pin )` 4-token groups while
+      rest[i] ∉ {"+", "NEW", "ROUTED"}:
+      resolve via io_pins / cells + macro-pin name match
+      (current loop's bodies, verbatim);
                    append PinId to current_pins → net_pins_list;
                    db.pin_nets[pid] = net_id
-      odd/leftover word → bail "malformed connection ... must be `( component pin )`"
+      non-`( comp pin )` group → bail "... must be `( component pin )`"
   then dispatch loop (mirrors add_special_net):
     "+"  → keyword dispatch:
         "USE"      → validate PdnUse set (SIGNAL/CLOCK/etc.; unknown → bail)
@@ -109,7 +110,9 @@ add_net(words, line):
                      their own NEW/+ ROUTED statements — the special-net
                      wire-body variant does not occur in NETS)
         "SUBNET"   → bail (geometry-aliased shape, never emitted by DRT)
-        "EXT"|"DESIGNRULEWIDTH"|"NONDEFAULTRULE" → bail (width-altering)
+        "NONDEFAULTRULE" → resolve name in NONDEFAULTRULES (bail when
+                         undefined); applies to wires after it
+        "EXT"|"DESIGNRULEWIDTH" → bail (width-altering)
         "TAPER"|"TAPERWIDTH"|"STYLE"|"MASK"|"SYNTHESIZED"|"PATTERN"|
         "SOURCE"|"ESTCAP"|"WEIGHT"|"ORIGINAL"|"PROPERTY"|"XTALK"|
         "VOLTAGE"|"FREQUENCY"|"FIXEDBUMP" → consume args, no geometry effect
@@ -136,7 +139,7 @@ layer_name → lid via tech_db.layer_by_name (unknown → bail)
 modifiers (loop, before first point):
     "TAPER"            → consume, no effect (full-width taper is default)
     "TAPERWIDTH"/"STYLE"/"MASK" → consume 1 arg, validate number/name
-    "EXT"/"DESIGNRULEWIDTH"/"NONDEFAULTRULE" → bail (change shape/width)
+    "EXT"/"DESIGNRULEWIDTH" → bail (change shape/width)
 element loop until "+", "NEW", "ROUTED", or end:
     "RECT"    → read 4 numbers (dx1 dy1 dx2 dy2) relative to prev point;
                 requires a preceding point in THIS statement → bail else;
@@ -144,7 +147,8 @@ element loop until "+", "NEW", "ROUTED", or end:
     "VIRTUAL" → consume point, update last_x/last_y, emits nothing
     coord pair (is_coord) → resolve `*` against sink.last_*, update sink;
                 if this statement already has a prev point → emit segment
-                (prev → cur) half-expanded by routing_layers[lid].width_dbu;
+                (prev → cur) half-expanded by routing_layers[lid].width_dbu
+                (or the `+ NONDEFAULTRULE` layer override, see below);
                 else it is the path start
     else      → word is a via name → resolve_def_via → push PdnVia
                 (lid ∈ {lower, upper} check same as special wires);
@@ -153,15 +157,38 @@ statement end with no second point and no via/RECT → bail "one-point
 wire stub" (same rule as special nets)
 ```
 
-Half-width expansion **copies `parse_special_wire` verbatim**, with
-`width = routing_layers[lid].width_dbu` in place of the statement's
-width field: horizontal `y1==y2` → `(min_x, y-half, max_x, y+half)`;
-vertical `x1==x2` → `(x-half, min_y, x+half, max_y)` — **flush ends,
-perpendicular expansion only** (DEF paths are FLUSH-capped; the wire
-does not extend past its endpoints). Diagonal segments get the same
-full-bbox expansion special wires already use (`min-half .. max+half`
-on both axes) — not a bail; mirror, don't "fix". `RECT` stubs emit
-their offset rect un-expanded (the delta already encodes the shape).
+**Corrections landed during implementation** (earlier draft assumed
+flush caps, two-token points, and a `NONDEFAULTRULE` bail — all three
+failed against real DEFs):
+
+- **Square (extended) caps, not flush.** The first draft claimed DEF
+  paths are FLUSH-capped. They are not: OpenROAD/DRT emit sub-width
+  jogs such as `NEW met1 ( 390670 213350 ) ( * 213360 )` (a 140×10
+  rect under perpendicular expansion) which Magic does not flag —
+  consistent only with a square-end paint that runs half the width past
+  each endpoint along the axis, making the jog a 140×150 stub that
+  merges into its neighbours. Horizontal `y1==y2` →
+  `(min_x-half, y-half, max_x+half, y+half)`; vertical
+  `x1==x2` → `(x-half, min_y-half, x+half, max_y+half)`. `SPECIALNETS`
+  wires keep the pre-existing perpendicular expansion — `pdn.rs` mesh
+  and attach semantics pin those rects, and a flush special wire can
+  only under-report metal (conservative for merge-relief); unifying
+  them is a recorded divergence, not an oversight. Diagonals keep the
+  full-bbox expansion. `RECT` stubs emit their offset rect un-expanded.
+- **Three-token points.** picorv32 wires carry `( x y 0 )` groups (a
+  reserved/layer coordinate always `0` in our corpus). A bare token
+  stream cannot distinguish the third value from the next point's `x`,
+  so `read_statement_into`/`for_each_record` gained a `keep_parens`
+  flag, NETS records keep `( )`, conn groups arrive as 4-token
+  `( comp pin )` groups, and wire points are parsed as
+  `( x y [z] )` with an optional ignored third coordinate.
+- **`NONDEFAULTRULE` is supported, not a bail.** `gcd.cts.def` (the
+  committed CTS fixture) puts `+ NONDEFAULTRULE CTS_NDR_0` on clock
+  nets. `NONDEFAULTRULES` records are now parsed: `+ LAYER l WIDTH w`
+  yields a per-layer wire-width override (`SPACING` consumed, other NDR
+  attributes still bail), and `+ NONDEFAULTRULE name` on a net applies
+  the override to every wire statement after it; an undefined name
+  errors loudly. `EXT`/`DESIGNRULEWIDTH` remain hard errors.
 
 Determinism: rects append in statement order inside the record; nets
 append in `NETS` order → `net_geoms` order is fully input-determined.

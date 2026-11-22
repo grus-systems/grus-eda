@@ -802,3 +802,13 @@ surface, from the first large-design run's feedback
   inside the cell masters on gcd — the probe counted before
   `drc catchup`), and `drc listall why` bbox fragments ≠ `drc count
   total` merged regions.
+- **`e7-drc-geom` landed 2026-11-23** (`v0.9.0`): the LEF+DEF geometry
+  substrate + first rule family — `NETS` routed-geometry retention
+  (square-cap wires, `( x y 0 )` points, `NONDEFAULTRULES` width
+  overrides), `drc::geom` per-layer shape assembly (signal/special
+  wires, via cut+metal, placed macro pin/obs, io ports), and
+  `drc::width` covering the 13 `lef_expressible` width rules — **0
+  violations on both routed DEFs** joined to the Magic goldens by
+  rule-name template; `NEW met1 100` mutation flags exactly `met1.1`;
+  `<`→`<=` fail-proof recorded in `docs/results.md`. Spacing,
+  enclosure, area and hole families remain pending.

@@ -83,10 +83,29 @@ pub struct MacroPin {
 pub struct CutLayer {
     pub name: SymbolId,
     pub above: LayerId,
+    /// `WIDTH` in DBU, 0 when the LEF omits it.
+    #[serde(default)]
+    pub width_dbu: i32,
 }
 
-/// A LEF `VIA` block, reduced to the layer triple + parallel cut count the
-/// PDN model needs; cut/bottom/top RECT geometry is not stored.
+/// Which coordinate space a `ViaLayerRect` lives on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViaRectLayer {
+    Routing(LayerId),
+    /// Index into `TechDb::cut_layers`.
+    Cut(u32),
+}
+
+/// One `RECT` of a LEF `VIA` block.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ViaLayerRect {
+    pub layer: ViaRectLayer,
+    /// Via-local coordinates, centered on the via origin (DBU).
+    pub rect: RectDbu,
+}
+
+/// A LEF `VIA` block: the layer triple + parallel cut count the PDN model
+/// needs, plus every `RECT` in group order for the DRC shape model.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ViaDef {
     pub name: SymbolId,
@@ -97,6 +116,11 @@ pub struct ViaDef {
     /// Parallel cuts — the total `RECT` count across the `VIA`'s cut-layer
     /// groups (DEF-generated vias carry the per-instance count in `+ ROWCOL`).
     pub cut_count: u32,
+    /// Every `RECT` in the `VIA` block, group order, min/max normalized,
+    /// µm → DBU by the same `.round()` pin rects use. Parallel cut rects
+    /// are all kept (mcon arrays have >1).
+    #[serde(default)]
+    pub rects: Vec<ViaLayerRect>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

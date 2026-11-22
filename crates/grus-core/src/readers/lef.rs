@@ -1,6 +1,7 @@
 use crate::interner::{LayerId, MacroId, PinDir, StringInterner};
 use crate::tech_db::{
     CutLayer, LayerDir, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer, TechDb, ViaDef,
+    ViaLayerRect, ViaRectLayer,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -448,9 +449,11 @@ fn parse_layer(
         let below = LayerId(tech_db.routing_layers.len() as u8 - 1);
         let cut_sym = interner.intern(&layer_name);
         let cut_idx = tech_db.cut_layers.len() as u32;
+        let dbu = tech_db.dbu_per_micron as f32;
         tech_db.cut_layers.push(CutLayer {
             name: cut_sym,
             above: below,
+            width_dbu: width_um.map(|w| (w * dbu).round() as i32).unwrap_or(0),
         });
         tech_db.cut_layer_by_name.insert(cut_sym, cut_idx);
         if let Some(res) = cut_res_ohm {
@@ -498,18 +501,23 @@ fn parse_layer(
 }
 
 /// A `VIA` block: `LAYER`/`RECT` groups plus attributes the model does not
-/// keep. Only the routing/cut classification and the cut-`RECT` count are
-/// recorded — DEF `+ VIA` records and `e8-mesh-rc` resistance lookup need
-/// nothing more.
+/// keep. Every `RECT` is retained in group order — the PDN model reads the
+/// cut count and layer stack; the DRC shape model places all of them.
 fn parse_via(
     lexer: &mut LefLexer,
     tech_db: &mut TechDb,
     interner: &mut StringInterner,
 ) -> Result<()> {
     let via_name = required_word(lexer, "VIA name")?.to_string();
-    // (name sym, routing layer, cut-layer index, RECT count) per LAYER group.
-    let mut groups: Vec<(crate::interner::SymbolId, Option<LayerId>, Option<u32>, u32)> =
-        Vec::new();
+    // (name sym, routing layer, cut-layer index, rects) per LAYER group.
+    struct ViaGroup {
+        name: crate::interner::SymbolId,
+        routing: Option<LayerId>,
+        cut: Option<u32>,
+        rects: Vec<RectDbu>,
+    }
+    let mut groups: Vec<ViaGroup> = Vec::new();
+    let dbu = tech_db.dbu_per_micron as f32;
     let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
@@ -529,7 +537,12 @@ fn parse_via(
                         lexer.line()
                     );
                 }
-                groups.push((lsym, routing, cut, 0));
+                groups.push(ViaGroup {
+                    name: lsym,
+                    routing,
+                    cut,
+                    rects: Vec::new(),
+                });
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("RECT") {
                 let Some(group) = groups.last_mut() else {
@@ -538,13 +551,20 @@ fn parse_via(
                         lexer.line()
                     );
                 };
-                // Geometry is validated but not stored — the model needs
-                // only the parallel cut count.
-                let _ = required_f32(lexer, "VIA RECT x1")?;
-                let _ = required_f32(lexer, "VIA RECT y1")?;
-                let _ = required_f32(lexer, "VIA RECT x2")?;
-                let _ = required_f32(lexer, "VIA RECT y2")?;
-                group.3 += 1;
+                let x1 = required_f32(lexer, "VIA RECT x1")?;
+                let y1 = required_f32(lexer, "VIA RECT y1")?;
+                let x2 = required_f32(lexer, "VIA RECT x2")?;
+                let y2 = required_f32(lexer, "VIA RECT y2")?;
+                let x1_dbu = (x1 * dbu).round() as i32;
+                let y1_dbu = (y1 * dbu).round() as i32;
+                let x2_dbu = (x2 * dbu).round() as i32;
+                let y2_dbu = (y2 * dbu).round() as i32;
+                group.rects.push(RectDbu::new(
+                    x1_dbu.min(x2_dbu),
+                    y1_dbu.min(y2_dbu),
+                    x1_dbu.max(x2_dbu),
+                    y1_dbu.max(y2_dbu),
+                ));
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("DEFAULT") || w.eq_ignore_ascii_case("TOPOFSTACKONLY")
             {
@@ -564,11 +584,11 @@ fn parse_via(
         // An empty `VIA name END name` block records nothing.
         return Ok(());
     }
-    let routing: Vec<LayerId> = groups.iter().filter_map(|g| g.1).collect();
+    let routing: Vec<LayerId> = groups.iter().filter_map(|g| g.routing).collect();
     let cuts: Vec<usize> = groups
         .iter()
         .enumerate()
-        .filter(|(_, g)| g.2.is_some())
+        .filter(|(_, g)| g.cut.is_some())
         .map(|(i, _)| i)
         .collect();
     if routing.len() < 2 || cuts.is_empty() {
@@ -579,13 +599,23 @@ fn parse_via(
     if tech_db.via_by_name.contains_key(&via_sym) {
         bail!("LEF: VIA {via_name} is defined more than once");
     }
+    let rects: Vec<ViaLayerRect> = groups
+        .iter()
+        .flat_map(|g| {
+            let layer = g
+                .routing
+                .map_or_else(|| ViaRectLayer::Cut(g.cut.unwrap()), ViaRectLayer::Routing);
+            g.rects.iter().map(move |&rect| ViaLayerRect { layer, rect })
+        })
+        .collect();
     let idx = tech_db.via_defs.len() as u32;
     tech_db.via_defs.push(ViaDef {
         name: via_sym,
         lower: *routing.iter().min_by_key(|l| l.0).unwrap(),
         upper: *routing.iter().max_by_key(|l| l.0).unwrap(),
-        cut: groups[cuts[0]].0,
-        cut_count: cuts.iter().map(|&i| groups[i].3).sum(),
+        cut: groups[cuts[0]].name,
+        cut_count: cuts.iter().map(|&i| groups[i].rects.len() as u32).sum(),
+        rects,
     });
     tech_db.via_by_name.insert(via_sym, idx);
     Ok(())
@@ -1617,5 +1647,58 @@ END xyzzy
         assert_eq!(vd.lower, layer("met4"));
         assert_eq!(vd.upper, layer("met5"));
         assert_eq!(tech_db.strings.resolve(vd.cut), "via4");
+    }
+
+    /// `VIA` rects are retained in group order with the right
+    /// `ViaRectLayer` discriminants; a multi-`RECT` cut group keeps every
+    /// parallel cut.
+    #[test]
+    fn test_via_rects_retained_in_group_order() {
+        let (interner, db) = parse_via_tlef();
+        let vd = &db.via_defs[0];
+        let met1 = db.layer_by_name[&interner.get("met1").unwrap()];
+        let met2 = db.layer_by_name[&interner.get("met2").unwrap()];
+        let cut = db.cut_layer_by_name[&interner.get("via12").unwrap()];
+
+        assert_eq!(vd.cut_count, 2);
+        assert_eq!(
+            vd.rects,
+            vec![
+                ViaLayerRect {
+                    layer: ViaRectLayer::Cut(cut),
+                    rect: RectDbu::new(-75, -75, 75, 75),
+                },
+                ViaLayerRect {
+                    layer: ViaRectLayer::Cut(cut),
+                    rect: RectDbu::new(-75, -75, 75, 75),
+                },
+                ViaLayerRect {
+                    layer: ViaRectLayer::Routing(met1),
+                    rect: RectDbu::new(-160, -130, 160, 130),
+                },
+                ViaLayerRect {
+                    layer: ViaRectLayer::Routing(met2),
+                    rect: RectDbu::new(-130, -160, 130, 160),
+                },
+            ]
+        );
+    }
+
+    /// A CUT layer's `WIDTH` is recorded in DBU; an omitted `WIDTH` is 0.
+    #[test]
+    fn test_cut_layer_width_recorded() {
+        let (_, db) = parse_via_tlef();
+        assert_eq!(db.cut_layers.len(), 1);
+        assert_eq!(db.cut_layers[0].width_dbu, 0);
+
+        let with_width = VIA_TLEF.replace(
+            "  RESISTANCE 15.0 ;",
+            "  RESISTANCE 15.0 ;\n  WIDTH 0.15 ;",
+        );
+        assert!(with_width.contains("WIDTH 0.15"));
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(with_width.as_bytes(), &mut db, &mut interner).unwrap();
+        assert_eq!(db.cut_layers[0].width_dbu, 150);
     }
 }
