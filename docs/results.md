@@ -6923,3 +6923,123 @@ both designs in the pinned image; `report_dcalc` lumped/pi probes on
 gcd/picorv32 guide SPEFs (`resp_val`, `mem_la_wdata[12]`/`[14]`,
 `alu_out[6]`, `mem_la_addr[4]`); the three fail-proof mutations above;
 self-loop census on emitted + read-back SPEFs (union-find over `*RES`).
+
+### 2026-11-22 — e4-topology: port rung stacks + bend via-stacks (v0.3.13)
+
+E4 ticket (`kurena/tasks/e4-topology/`): emission-side connectivity for
+the two residual classes named in `e4-guide-islands` — `*P` ports on
+dead islands and multi-node detour islands. Three emission changes in
+`build_guides`:
+
+- **Bound pin-cell rung stacks**: a pin cell covered by a strip emits
+  one contiguous ascending zero-length stack — `min(accesses)..S`
+  when every access sits below the strip layer `S` (the wire is the
+  `S` rung), else `min(accesses<S, met1, S)..=max(accesses)` so
+  at/above-strip accesses pair among themselves at the wire's node.
+- **Unbound pin-cell stacks climb to `max(accesses)+1`**: the conn+1
+  coverage OpenROAD gives port cells. Probe: picorv32's uncovered io
+  cells emit a contiguous `li1..met4` stack for a `met3` port in
+  `picorv32.guide` (e.g. `pcpi_valid`); ours now mirrors the rule
+  (clamped at the top routing layer). This was the dominant dead-`*P`
+  mechanism: 22 nets whose port cell sat outside every strip.
+- **Bend via-stacks**: a non-pin GCell covered by both an H and a V
+  run appends its rect on `met1` then `met2` consecutively — the
+  same-point pair bridges the junction the way OpenROAD covers a
+  turn cell. Bound pin cells are excluded (their rung stack bridges).
+  This was the dominant multi-node island class: a detour branch's
+  met1/met2 subtrees stayed disjoint at the bend.
+
+**Port coverage probe (how OpenROAD covers bterm cells).** Reading
+`picorv32.guide`: every `*P` pin cell carries a contiguous layer run
+min(access)..conn+1 — `pcpi_valid` (unbound, `met3` access) emits
+`li1,met1,met1,met2,met2,met3,met3,met4`; covered cells anchor the
+stack on the covering strip. The e4-topology emission reproduces
+this; reference still leaves 7/112 `*P` dead on gcd/picorv32 where
+the stack cannot chain back (recorded residual, theirs).
+
+**Island census** (`tests/designs/guide_islands.py`, union-find over
+non-self-loop `*RES`, unreachable from driver):
+
+| source | dead `*P` | dead comps | 1-node | multi-node | nets w/ multi | self-loops |
+|---|---|---|---|---|---|---|
+| gcd ours before | 12 | 297 | 171 | 126 | 71 | 284 |
+| gcd ours after | **0** | 171 | 171 | 0 | 0 | 382 |
+| gcd ref | 7 | 254 | 200 | 54 | 26 | 325 |
+| picorv32 ours before | 164 | 9,955 | 5,419 | 4,536 | 1,738 | 7,092 |
+| picorv32 ours after | **0** | 5,419 | 5,419 | 0 | 0 | 11,443 |
+| picorv32 ref | 112 | 8,528 | 6,031 | 2,497 | 657 | 9,875 |
+
+OpenROAD read-back of the emitted guides (`check_guide_readback.sh`,
+`read_guides` + `estimate_parasitics -global_routing` — accepted,
+E4.3 pass): dead `*P` = 0 on both; dead comps gcd 182 (174 1-node + 8
+multi in 8 nets), picorv32 5,665 (5,560 1-node + 105 multi in 105
+nets) — OpenROAD's own graph keeps those junctions dead (small
+round-trip residual); self-loops match ours exactly. Remaining
+in-process islands are all one-node unpaired stubs — the same class
+the reference carries (gcd 200, picorv32 6,031). Self-loop count
+rose (gcd 284→382, picorv32 7,092→11,443): new rungs that pair
+nothing stay self-loops, same convention as the reference's
+unpaired-run stacks.
+
+**e4-1 topology gates** (`guide_metrics`): gcd weighted share `0.975`
+(layer-aware `0.949`), boxes 1,953→2,065 `+5.7%`; picorv32 `0.960`
+(`0.912`), 63,427→64,158 `+1.2%` — inside `>=0.70` share and `±15%`
+count gates. **e4-2 cap gate**: 269/269 + 6,744/6,744 nets within
+`max(5%, 1 fF)` — unchanged (rungs are zero-length).
+
+**Decomposition re-measured** (`test_<d>_guide_sta_decomposition`,
+step-9c goldens regenerated; ps):
+
+| axis | gcd med | gcd p95 | gcd max | picorv32 med | picorv32 p95 | picorv32 max |
+|---|---|---|---|---|---|---|
+| topology (e4-1) | 130.70 | 210.32 | 210.60 | 893.16 | 1,517.83 | 2,223.41 |
+| parasitics (e4-2) | 0.005 | 22.59 | 80.87 | 0.01 | 435.21 | 927.56 |
+| engine | 1.46 | 3.33 | 6.60 | 7.00 | 15.91 | 74.46 |
+| total (gate) | 137.26 | 231.37 | 232.75 | 921.62 | 1,895.44 | 2,511.53 |
+
+**Criterion-4 verdict.** gcd: topology max `210.6 < 250.8` bound —
+the `resp_val` dead-`*P` extreme is gone (its port now chains to the
+driver through a met4 rung stack). **met** for gcd.
+picorv32: **named residual** — the fully-connected emission raised
+the topology axis (437/525/627 → 893/1,518/2,223 ps): our guide now
+bridges every strip junction, so high-fanout nets carry distributed
+RC where OpenROAD's guide leaves the detour branches dead (lumped).
+Per-net evidence (OpenSTA `report_checks -to _11316_/D` on both
+SPEFs): net `_00012_` (`_09979_/Q`, fanout 273) is 431 fF / 245 pins
+dead in the reference but fully live in ours — driver stage cap
+1.50 → 2.00 pF, delay 5.39 → 6.37 ns (+0.98 ns), output slew 7.34 →
+9.91 ns feeding +1.27 ns on the next stage = the 2.33 ns worst
+endpoint. The same class spans the `_0000x` decoder nets and the
+`_027xx_`/`_028xx_` register-file writeback buses (581 nets gained
+live wire vs the reference's dead-island model — the 1,175 fF
+delta). This is route-path/guide-coverage divergence, not an
+emission artifact: OpenROAD's guide keeps those branches dead on
+its own route. Engine axis stays in-band (74 ps max slack on the
+newly-live big RC trees; 0.75% arrival).
+
+**Floors.** `GCD_GUIDE` unchanged (`0.26` holds the 232.75 ps max).
+`PICORV32_GUIDE` `arr_abs`/`slack_abs` 2.2→2.6, `tns_abs` 111→135
+(measured max arr 2.512 / slack 2.516 / TNS 127.9 ns).
+`PICORV32_GUIDE_ENGINE` `slack_abs` 0.04→0.08 (measured 0.074 on the
+`_113xx_` cluster).
+
+**Fail-proof (§7.7).** Two mutations, both reverted after capture:
+(i) bend via-stack emission disabled →
+`test_guide_parasitics_no_dead_ports_or_multi_node_islands` **red**
+(gcd dead `*P` = 6) and `bend_pairs_bridge_strip_junction` **red**.
+(ii) unbound stub stack reverted to access+`met1` (non-contiguous) →
+census test **red** (picorv32 dead `*P` = 22, the measured
+intermediate state).
+
+**What was run.** `cargo test -p grus-core guide` (28 tests incl. the
+3 new: `bend_pairs_bridge_strip_junction`,
+`unbound_stub_climbs_above_io_layer`,
+`test_guide_parasitics_no_dead_ports_or_multi_node_islands`);
+`generate_guide_ours_spef.sh` on both designs (release build);
+`check_guide_readback.sh` on both designs; the three step-9c
+`dump_guide_sta_*.tcl` scripts on both designs in the pinned image
+(plus picorv32 step 5d `picorv32.guide.spef`); `guide_islands.py`
+census on committed/baseline/post/read-back SPEFs; OpenSTA
+`report_checks -to _11316_/D` on `picorv32.guide.spef` and
+`picorv32.guide.ours.spef` for the per-net evidence; the two
+fail-proof mutations above.

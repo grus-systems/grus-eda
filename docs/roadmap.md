@@ -615,6 +615,19 @@ tolerances, probe evidence — is in
   parasitics-axis median collapses +202/+1,408 ps → ~0; the e2e
   residual is now the e4-1 topology axis (gcd `resp_val` +250.8 ps,
   picorv32 `_108xx_` +627 ps). See `docs/results.md` `e4-guide-islands`.
+- Progress 2026-11-22 (`v0.3.13`, ticket `e4-topology`): emission-side
+  connectivity — bound pin cells emit contiguous rung stacks anchored on
+  the covering strip, unbound pin cells climb to access+1 (the conn+1
+  coverage OpenROAD gives port cells, probed on picorv32's io cells), and
+  every non-pin H∩V GCell emits a consecutive `met1`/`met2` bend pair.
+  Dead `*P` ports are **0** on both designs and all remaining dead
+  components are one-node stubs (multi-node islands eliminated; the
+  OpenROAD read-back keeps an 8/105-net residual). Criterion 4: gcd
+  topology max `210.6 < 250.8 ps` — the `resp_val` dead-port extreme is
+  gone. picorv32 is the named residual: fully-connected emission vs the
+  reference's dead detour islands on high-fanout nets (`_00012_`
+  fanout 273, +2.33 ns worst endpoint). See `docs/results.md`
+  `e4-topology`.
 - Probe note: guide parasitics halve the placement-estimate gap to routed
   truth on gcd (median per-net C diff vs RCX: 27.6% vs 44.2%).
 - Sizing: ~6–8 tickets (M). Ticket sketch in `design/order.md`.
