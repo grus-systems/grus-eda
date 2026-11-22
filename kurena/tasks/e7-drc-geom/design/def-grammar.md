@@ -185,7 +185,8 @@ failed against real DEFs):
 - **`NONDEFAULTRULE` is supported, not a bail.** `gcd.cts.def` (the
   committed CTS fixture) puts `+ NONDEFAULTRULE CTS_NDR_0` on clock
   nets. `NONDEFAULTRULES` records are now parsed: `+ LAYER l WIDTH w`
-  yields a per-layer wire-width override (`SPACING` consumed, other NDR
+  yields a per-layer wire-width override (`SPACING` consumed but its
+  argument is number-validated; `WIDTH` must be positive; other NDR
   attributes still bail), and `+ NONDEFAULTRULE name` on a net applies
   the override to every wire statement after it; an undefined name
   errors loudly. `EXT`/`DESIGNRULEWIDTH` remain hard errors.
@@ -199,13 +200,15 @@ append in `NETS` order → `net_geoms` order is fully input-determined.
 `ROWCOL` numbers and drops them. Now retain into `DefVia::Generated`'s
 new `geom: GeneratedViaGeom` (see `model.md`):
 
-- `CUTSIZE w h` — required for a `+ VIARULE` via → bail when absent.
+- `CUTSIZE w h` — required for a `+ VIARULE` via → bail when absent;
+  must be positive (a non-positive size paints an inverted cut).
   This is an explicit **unsupported-input error**, not a lookup: the
   geometry model cannot derive cut size from `+ VIARULE` (we do not
   model via-rule widths), and every committed DEF supplies it. A
   negative unit test asserts the bail.
 - `ROWCOL r c` — default `1 1`; `cut_count = r*c` (existing behavior).
-- `CUTSPACING x y` — default `0 0` (edge-to-edge).
+- `CUTSPACING x y` — default `0 0` (edge-to-edge); a negative value
+  would overlap cuts → bail.
 - `ENCLOSURE a b c d` — **OpenDB semantics: `(botX, botY, topX, topY)`
   symmetric overhangs** — verified against
   `via2_3_1600_480_1_5_320_320` (CUTSIZE 150, ROWCOL 1 5, CUTSPACING

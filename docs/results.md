@@ -8753,11 +8753,12 @@ Unmutated control: 0.
 - *Merge-relief.* The draft's "every shape independently meets bound"
   assumption failed on real `RECT` stubs (e.g. a 140×25 met2 stub);
   relief dissolves a narrow boundary pair only when same-layer drawn
-  metal covers the whole perpendicular span and chains past the narrow
-  extent — `MacroObs` excluded (not fabricated metal).
+  metal covers the whole perpendicular span and the chained union
+  spans `bound` on the narrow axis — `MacroObs` excluded (not
+  fabricated metal).
 
-**Checks run**: `cargo test --workspace` (479 lib + 5 drc + 2 irdrop +
-6 bin passed, 2 pre-existing jpeg ignores; lib 113.68 s),
+**Checks run**: `cargo test --workspace` (483 lib + 5 drc + 2 irdrop +
+6 bin passed, 2 pre-existing jpeg ignores; lib ~113 s),
 `cargo clippy --workspace --all-targets -- -D warnings` (clean),
 `cargo test -p grus-core --test drc` (5/5, ~1.1 s — parse + assemble +
 check both designs). Version `0.8.0 → 0.9.0`: `PdnVia.geom` is a

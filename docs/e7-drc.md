@@ -208,8 +208,9 @@ Magic measures width on the merged per-layer polygon; we check each
 `ShapeRect` (`min(w,h) < bound`, strict `<`) and then apply
 **merge-relief**: a sub-bound wire rect is not reported iff drawn metal
 on the same layer covers its entire perpendicular span and chains
-outward past its narrow extent — the narrow boundary pair dissolves
-into the union (what Magic does to `RECT` stubs and jog caps).
+outward until the union spans `bound` on the narrow axis — the narrow
+boundary pair dissolves into the union (what Magic does to `RECT`
+stubs and jog caps); a shorter reach is still a sub-bound corridor.
 `MacroPin` rects count as drawn metal for relief (pin abstracts
 understate GDS); `MacroObs` does not (not fabricated metal). Relief
 sources are `SignalWire`/`SpecialWire`/`Via`/`IoPort`/`MacroPin`.

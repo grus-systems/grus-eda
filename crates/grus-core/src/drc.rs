@@ -48,6 +48,11 @@ pub struct LayerShapes {
     pub rects: Vec<ShapeRect>,
     /// `rects` indices sorted by `rect.xl` (stable — `sort_by_key`).
     pub by_x: Vec<u32>,
+    /// Prefix max of `rect.xh` over `by_x` order. Non-decreasing by
+    /// construction — this is what makes the overlap binary search
+    /// sound (an `xh` predicate over `by_x` itself is not monotone:
+    /// a wide early rect sits before narrow ones).
+    pub max_xh: Vec<i32>,
 }
 
 impl LayerShapes {
@@ -58,6 +63,15 @@ impl LayerShapes {
     fn finish(mut self) -> Self {
         self.by_x = (0..self.rects.len() as u32).collect();
         self.by_x.sort_by_key(|&i| self.rects[i as usize].rect.xl);
+        let mut reach = i32::MIN;
+        self.max_xh = self
+            .by_x
+            .iter()
+            .map(|&i| {
+                reach = reach.max(self.rects[i as usize].rect.xh);
+                reach
+            })
+            .collect();
         self
     }
 
@@ -65,15 +79,19 @@ impl LayerShapes {
     /// overlapping, the `pdn.rs`/gcell convention. The query the future
     /// spacing family drives; `width` only needs `rects.iter()`.
     pub fn iter_overlapping(&self, probe: &RectDbu) -> impl Iterator<Item = &ShapeRect> {
-        // First index whose rect could reach `probe.xl`.
-        let start = self
-            .by_x
-            .partition_point(|&i| self.rects[i as usize].rect.xh <= probe.xl);
-        self.by_x[start..]
+        // Skip only positions whose prefix max ends left of the probe —
+        // those rects all end left of it too. Positions kept must still
+        // pass an `xh` re-check: a wide predecessor carries the prefix
+        // max forward, so a rect entirely left of `probe` can sit after
+        // `start`.
+        let start = self.max_xh.partition_point(|&mx| mx <= probe.xl);
+        self.by_x[start.min(self.by_x.len())..]
             .iter()
             .map(move |&i| &self.rects[i as usize])
             .take_while(move |s| s.rect.xl < probe.xh)
-            .filter(move |s| s.rect.yl < probe.yh && s.rect.yh > probe.yl)
+            .filter(move |s| {
+                s.rect.xh > probe.xl && s.rect.yl < probe.yh && s.rect.yh > probe.yl
+            })
     }
 }
 

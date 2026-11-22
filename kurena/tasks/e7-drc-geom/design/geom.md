@@ -40,6 +40,10 @@ pub struct LayerShapes {
     pub rects: Vec<ShapeRect>,
     /// `rects` indices sorted by `rect.xl` (stable — `sort_by_key`).
     pub by_x: Vec<u32>,
+    /// Prefix max of `rect.xh` over `by_x` order — non-decreasing, so a
+    /// binary search on it is sound (an `xh` predicate over `by_x` is
+    /// not monotone when a wide rect sits before narrow ones).
+    pub max_xh: Vec<i32>,
 }
 
 pub struct DrcDesign {
@@ -51,9 +55,14 @@ pub struct DrcDesign {
 ```
 
 `LayerShapes::iter_overlapping(probe) -> impl Iterator<Item =
-&ShapeRect>`: binary-search the first `by_x` entry whose `rect.xh >
-probe.xl`, walk forward while `rect.xl < probe.xh`, yield on
-y-overlap. Same strict-overlap convention as `pdn.rs`/gcell
+&ShapeRect>`: `partition_point` over `max_xh` for the first `by_x`
+position whose prefix max exceeds `probe.xl` (a sound lower bound —
+`xh <= probe.xl` over `by_x` directly is **not** monotone: a wide
+early rect precedes narrow ones, which is the bug this second array
+prevents); walk forward while `rect.xl < probe.xh`, yield on
+`rect.xh > probe.xl` and y-overlap (kept positions can still lie
+left of the probe when a wide predecessor carries the prefix max).
+Same strict-overlap convention as `pdn.rs`/gcell
 (`RectDbu::intersects`: touching edges are not overlapping). This is
 the query the future spacing family drives; width only needs
 `rects.iter()`.

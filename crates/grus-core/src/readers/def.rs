@@ -633,19 +633,31 @@ fn add_def_via(
                 let [x, y] = args else {
                     bail!("DEF line {line}: VIAS via {via_name} `+ CUTSIZE` needs two numbers");
                 };
-                cut_size = Some((
+                let (x, y) = (
                     number::<i32>(x, "VIAS CUTSIZE x", line)?,
                     number::<i32>(y, "VIAS CUTSIZE y", line)?,
-                ));
+                );
+                if x <= 0 || y <= 0 {
+                    bail!("DEF line {line}: VIAS via {via_name} `+ CUTSIZE` must be positive");
+                }
+                cut_size = Some((x, y));
             }
             "CUTSPACING" => {
                 let [x, y] = args else {
                     bail!("DEF line {line}: VIAS via {via_name} `+ CUTSPACING` needs two numbers");
                 };
-                cut_spacing = (
+                let (x, y) = (
                     number::<i32>(x, "VIAS CUTSPACING x", line)?,
                     number::<i32>(y, "VIAS CUTSPACING y", line)?,
                 );
+                // 0 is the edge-to-edge default; a negative spacing
+                // overlaps cuts, which the cut-array expansion cannot paint.
+                if x < 0 || y < 0 {
+                    bail!(
+                        "DEF line {line}: VIAS via {via_name} `+ CUTSPACING` must not be negative"
+                    );
+                }
+                cut_spacing = (x, y);
             }
             "ENCLOSURE" => {
                 let [a, b, c, d] = args else {
@@ -775,7 +787,7 @@ fn parse_pdn_use(word: &str, net_name: &str, line: usize) -> Result<PdnUse> {
         "SCAN" => PdnUse::Scan,
         "TIEOFF" => PdnUse::TieOff,
         "RING" => PdnUse::Ring,
-        other => bail!("DEF line {line}: SPECIALNETS net {net_name} has unknown `+ USE {other}`"),
+        other => bail!("DEF line {line}: net {net_name} has unknown `+ USE {other}`"),
     })
 }
 
@@ -1139,12 +1151,15 @@ fn parse_net_wire(
         .with_context(|| {
             format!("DEF line {line}: net {net_name} wire uses layer {lname}, which the LEF does not define as routing")
         })?;
-    // LEF routing WIDTH is required by `parse_layer`, so it is never 0;
-    // `+ NONDEFAULTRULE` overrides it per layer.
+    // LEF routing WIDTH is required by `parse_layer`; `+ NONDEFAULTRULE`
+    // overrides it per layer (its own parse rejects non-positive values).
     let width = ndr
         .and_then(|m| m.get(&lid.0))
         .copied()
         .unwrap_or(tech_db.routing_layers[lid.0 as usize].width_dbu);
+    if width <= 0 {
+        bail!("DEF line {line}: net {net_name} wire on layer {lname} has non-positive width {width}");
+    }
     let half = width / 2;
 
     let mut have_point = false;
@@ -1325,11 +1340,26 @@ fn add_ndr(
                                 "NONDEFAULTRULES LAYER WIDTH",
                                 line,
                             )?;
+                            // A non-positive width would paint an inverted
+                            // or degenerate wire rect.
+                            if w <= 0 {
+                                bail!(
+                                    "DEF line {line}: NONDEFAULTRULES {name} `+ LAYER {lname}` WIDTH must be positive"
+                                );
+                            }
                             widths.insert(lid.0, w);
                             i += 2;
                         }
-                        // Spacing has no effect on painted wire width.
-                        "SPACING" => i += 2,
+                        // Spacing has no effect on painted wire width, but
+                        // a missing/garbled value must not be swallowed.
+                        "SPACING" => {
+                            number::<i32>(
+                                rest.get(i + 1).copied().unwrap_or(""),
+                                "NONDEFAULTRULES LAYER SPACING",
+                                line,
+                            )?;
+                            i += 2;
+                        }
                         other => bail!(
                             "DEF line {line}: NONDEFAULTRULES {name} `+ LAYER {lname}` has unsupported attribute `{other}`"
                         ),
@@ -2611,6 +2641,38 @@ END DESIGN
             RectDbu::new(-100, -100, 1100, 100),
             "NDR met1 WIDTH 200 (half 100) replaces the LEF 140"
         );
+    }
+
+    /// A non-positive NDR width would paint an inverted wire rect —
+    /// rejected at parse; a `SPACING` without its value is not swallowed.
+    #[test]
+    fn test_ndr_rejects_bad_numbers() {
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "COMPONENTS 2 ;",
+            "NONDEFAULTRULES 1 ;\n  - bad + LAYER met1 WIDTH -5 SPACING 280 ;\nEND NONDEFAULTRULES\nCOMPONENTS 2 ;",
+        ));
+        assert!(msg.contains("WIDTH"), "{msg}");
+        let msg = pdn_def_error(&NETS_DEF.replace(
+            "COMPONENTS 2 ;",
+            "NONDEFAULTRULES 1 ;\n  - bad + LAYER met1 SPACING ;\nEND NONDEFAULTRULES\nCOMPONENTS 2 ;",
+        ));
+        assert!(msg.contains("SPACING"), "{msg}");
+    }
+
+    /// `+ CUTSIZE` must be positive and `+ CUTSPACING` non-negative —
+    /// a bad value would paint an inverted or overlapping cut array.
+    #[test]
+    fn test_def_via_rejects_bad_cut_geometry() {
+        let msg = pdn_def_error(&PDN_DEF.replace(
+            "- via12_inst + VIA stack_a ;",
+            "- via12_inst + VIARULE RULE + CUTSIZE 0 150 + LAYERS met1 via12 met2 ;",
+        ));
+        assert!(msg.contains("CUTSIZE"), "{msg}");
+        let msg = pdn_def_error(&PDN_DEF.replace(
+            "- via12_inst + VIA stack_a ;",
+            "- via12_inst + VIARULE RULE + CUTSIZE 150 150 + LAYERS met1 via12 met2 + CUTSPACING -10 170 ;",
+        ));
+        assert!(msg.contains("CUTSPACING"), "{msg}");
     }
 
     /// Every name written by `escape_def_name` must come back unchanged

@@ -76,9 +76,11 @@ meets bound on the clean designs; that assumption broke on real DEFs
 (sub-bound `RECT` stubs such as a 140×25 met2 stub, and — before the
 square-cap correction — jog caps). A sub-bound wire rect is relieved
 iff drawn metal on the same layer covers its entire perpendicular span
-and chains outward past its narrow extent — i.e., the narrow boundary
-pair dissolves into the union Magic measures. `MacroPin` counts as
-drawn metal for relief (pin abstracts understate GDS metal);
+and chains outward until the union itself spans `bound` on the narrow
+axis (reaching at least `bound` back from one of the rect's edges —
+mere extension leaves a sub-bound corridor) — i.e., the narrow
+boundary pair dissolves into the union Magic measures. `MacroPin`
+counts as drawn metal for relief (pin abstracts understate GDS metal);
 `MacroObs` does not.
 
 Deliberate simplification vs Magic: Magic computes width on the merged

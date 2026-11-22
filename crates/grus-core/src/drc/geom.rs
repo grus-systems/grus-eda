@@ -93,12 +93,14 @@ pub fn assemble(db: &DesignDb, tech: &TechDb) -> Result<DrcDesign> {
         .map(|_| LayerShapes {
             rects: Vec::new(),
             by_x: Vec::new(),
+            max_xh: Vec::new(),
         })
         .collect();
     let mut cut: Vec<LayerShapes> = (0..tech.cut_layers.len())
         .map(|_| LayerShapes {
             rects: Vec::new(),
             by_x: Vec::new(),
+            max_xh: Vec::new(),
         })
         .collect();
 
@@ -406,7 +408,11 @@ END DESIGN
     /// not count.
     #[test]
     fn test_iter_overlapping_strict() {
-        let mut l = LayerShapes { rects: vec![], by_x: vec![] };
+        let mut l = LayerShapes {
+            rects: vec![],
+            by_x: vec![],
+            max_xh: vec![],
+        };
         for r in [
             RectDbu::new(0, 0, 100, 100),
             RectDbu::new(100, 0, 150, 100), // touches A on the x=100 edge only
@@ -428,6 +434,36 @@ END DESIGN
             hits(RectDbu::new(40, 40, 101, 60)),
             vec![RectDbu::new(0, 0, 100, 100), RectDbu::new(100, 0, 150, 100)]
         );
+    }
+
+    /// Regression for the index monotone predicate: a wide rect sitting
+    /// before narrower ones in `xl` order must still be found (the
+    /// prefix-max-xh partition carries it), and a rect ending left of
+    /// the probe is not a hit even though the scan starts before it.
+    #[test]
+    fn test_iter_overlapping_wide_and_left_rects() {
+        let mut l = LayerShapes {
+            rects: vec![],
+            by_x: vec![],
+            max_xh: vec![],
+        };
+        for r in [
+            RectDbu::new(5, 0, 100, 100), // wide — reaches past the probe
+            RectDbu::new(6, 0, 7, 100),   // fully left of the probe
+            RectDbu::new(10, 0, 20, 100), // fully left of the probe
+        ] {
+            l.push(ShapeRect {
+                rect: r,
+                src: ShapeSrc::SignalWire,
+                net: None,
+            });
+        }
+        let l = l.finish();
+        let hits: Vec<RectDbu> = l
+            .iter_overlapping(&RectDbu::new(50, 20, 60, 40))
+            .map(|s| s.rect)
+            .collect();
+        assert_eq!(hits, vec![RectDbu::new(5, 0, 100, 100)]);
     }
 
     /// Every shape source lands on the right layer with the right tag:

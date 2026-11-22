@@ -153,11 +153,19 @@ enum Axis {
 /// boundary pair dissolves into the merged polygon iff drawn metal on
 /// the layer both (a) covers `r`'s entire perpendicular span — the union
 /// of member rects' projections clipped to `r`'s span — and (b) chains
-/// `r`'s narrow extent outward. Members join the chain when they overlap
-/// `r`'s perpendicular span (merge with `r` where they share it) and
-/// touch the growing narrow extent (abutment merges like overlap).
+/// `r`'s narrow extent outward far enough that the union itself spans
+/// `bound` — a shorter reach still leaves a sub-bound corridor. Members
+/// join the chain when they overlap `r`'s perpendicular span (merge
+/// with `r` where they share it) and touch the growing narrow extent
+/// (abutment merges like overlap).
 /// Runs only on the rare sub-bound wire path, so the O(n·k) walk is fine.
-fn chain_outreaches(rects: &[ShapeRect], r: &RectDbu, skip: &ShapeRect, axis: Axis) -> bool {
+fn chain_outreaches(
+    rects: &[ShapeRect],
+    r: &RectDbu,
+    skip: &ShapeRect,
+    axis: Axis,
+    bound: i32,
+) -> bool {
     let relief_src = |o: &ShapeRect| {
         !std::ptr::eq(o, skip)
             && matches!(
@@ -178,6 +186,7 @@ fn chain_outreaches(rects: &[ShapeRect], r: &RectDbu, skip: &ShapeRect, axis: Ax
         }
     };
     let ((mut lo, mut hi), (perp_lo, perp_hi)) = proj(r);
+    let (r_lo, r_hi) = (lo, hi);
     // Perp projections of every member, clipped to r's span.
     let mut covered: Vec<(i32, i32)> = Vec::new();
     loop {
@@ -200,7 +209,11 @@ fn chain_outreaches(rects: &[ShapeRect], r: &RectDbu, skip: &ShapeRect, axis: Ax
             break;
         }
     }
-    if !(lo < proj(r).0 .0 || hi > proj(r).0 .1) {
+    // The chained union must reach `bound` on the narrow axis measured
+    // back from one of r's edges — anything less is still a corridor
+    // Magic would flag (e.g. a 25-wide stub beside a 30-wide tab under
+    // a 140 bound merges into a 55-wide shape, not a clean dissolve).
+    if r_hi - lo < bound && hi - r_lo < bound {
         return false;
     }
     // The perpendicular span must be fully covered — an uncovered slice
@@ -286,19 +299,19 @@ pub fn check_width(design: &DrcDesign, tech: &TechDb) -> Vec<Violation> {
                     let r = s.rect;
                     // x-narrow: relieved iff the union of drawn metal that
                     // vertically contains r and touches r's x-extent chains
-                    // out past r in x — the narrow boundary pair dissolves
-                    // into the merged polygon, and since the union covers
-                    // r's whole y-span the other pair dissolves too.
-                    // Symmetric for y. Abutment counts as merge
-                    // (`<=`/`>=`), matching Magic. A rect with no sub-bound
-                    // axis is never relieved — it cannot reach here under
-                    // the strict `<` check.
+                    // out to `bound` in x — the narrow boundary pair
+                    // dissolves into a union that itself meets the bound,
+                    // and since the union covers r's whole y-span the
+                    // other pair dissolves too. Symmetric for y. Abutment
+                    // counts as merge (`<=`/`>=`), matching Magic. A rect
+                    // with no sub-bound axis is never relieved — it cannot
+                    // reach here under the strict `<` check.
                     let mut relieved = false;
                     if r.width() < bound {
-                        relieved = chain_outreaches(ls_rects, &r, s, Axis::X);
+                        relieved = chain_outreaches(ls_rects, &r, s, Axis::X, bound);
                     }
                     if !relieved && r.height() < bound {
-                        relieved = chain_outreaches(ls_rects, &r, s, Axis::Y);
+                        relieved = chain_outreaches(ls_rects, &r, s, Axis::Y, bound);
                     }
                     if relieved {
                         continue;
@@ -371,11 +384,16 @@ END LIBRARY
                 })
                 .collect(),
             by_x: vec![],
+            max_xh: vec![],
         };
         DrcDesign {
             routing: vec![
                 shapes(m1_rects, ShapeSrc::SignalWire),
-                LayerShapes { rects: vec![], by_x: vec![] },
+                LayerShapes {
+                    rects: vec![],
+                    by_x: vec![],
+                    max_xh: vec![],
+                },
             ],
             cut: vec![shapes(cut_rects, ShapeSrc::Via)],
         }
@@ -436,6 +454,24 @@ END LIBRARY
             }
         );
         assert_eq!(v[1].rect, tall_narrow);
+    }
+
+    /// Merge-relief dissolves a sub-bound rect only when the chained
+    /// union itself spans the bound on the narrow axis: a 25-wide stub
+    /// beside a 30-wide tab is a 55-wide corridor Magic still flags,
+    /// while the same stub beside a 150-wide body is absorbed.
+    #[test]
+    fn test_merge_relief_requires_bound_span() {
+        let tech = w_tech();
+        let stub = RectDbu::new(0, 0, 25, 50); // met1 bound 140
+        // Covers stub's whole y-span and abuts it, but reaches only 55.
+        let tab = RectDbu::new(25, -10, 55, 60);
+        let v = check_width(&design_with(&[stub, tab], &[]), &tech);
+        assert_eq!(v.len(), 2, "a 55-wide union is still sub-bound");
+        // A 150-wide body under the stub dissolves it.
+        let body = RectDbu::new(25, -50, 175, 100);
+        let v = check_width(&design_with(&[stub, body], &[]), &tech);
+        assert!(v.is_empty(), "a bound-spanning union absorbs the stub");
     }
 
     /// Cut-layer rules read the cut layer's `WIDTH` (`via` → 150) and
