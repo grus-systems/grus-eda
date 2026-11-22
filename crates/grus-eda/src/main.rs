@@ -307,6 +307,14 @@ struct StaArgs {
 
     #[arg(
         long,
+        default_value_t = 0,
+        help = "Trace the N worst-slack paths per corner (0 = off); printed on \
+                stdout and serialized as `critical_paths` in --json"
+    )]
+    paths: usize,
+
+    #[arg(
+        long,
         help = "Exit non-zero when any cell, arc, endpoint or SDC option was skipped"
     )]
     strict: bool,
@@ -955,17 +963,29 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             let report = match (&lib_hold_db, &design_hold, &parasitics_hold) {
                 (Some(hold_lib), Some(hold_design), Some(hold_parasitics)) => {
-                    let setup =
-                        grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?;
-                    let hold = grus_core::sta::run_sta_quiet(
+                    let setup = grus_core::sta::run_sta_with_paths(
+                        &design,
+                        &lib_db,
+                        &sdc,
+                        parasitics.as_ref(),
+                        args.paths,
+                    )?;
+                    let hold = grus_core::sta::run_sta_quiet_with_paths(
                         hold_design,
                         hold_lib,
                         &sdc,
                         Some(hold_parasitics),
+                        args.paths,
                     )?;
                     grus_core::sta::merge_corner_reports(setup, hold)?
                 }
-                _ => grus_core::sta::run_sta(&design, &lib_db, &sdc, parasitics.as_ref())?,
+                _ => grus_core::sta::run_sta_with_paths(
+                    &design,
+                    &lib_db,
+                    &sdc,
+                    parasitics.as_ref(),
+                    args.paths,
+                )?,
             };
             println!(
                 "STA ({}): endpoints={}, setup wns={:.6} tns={:.6} viol={}, hold wns={:.6} tns={:.6} viol={}, elapsed={:.2}ms",
@@ -992,6 +1012,45 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
             print_skip_summary(&report);
+            if !report.critical_paths.is_empty() {
+                println!("paths (worst {} per corner):", args.paths);
+                for (i, p) in report.critical_paths.iter().enumerate() {
+                    let corner = match p.corner {
+                        grus_core::sta::PathCorner::Max => "max",
+                        grus_core::sta::PathCorner::Min => "min",
+                    };
+                    let launch = p.startpoint_clock.as_deref().unwrap_or("-");
+                    let capture = p.capture_clock.as_deref().unwrap_or("-");
+                    println!(
+                        "  [{corner}] {}. {} -> {}   slack {:+.6}  ({launch} -> {capture})",
+                        i + 1,
+                        p.startpoint,
+                        p.endpoint,
+                        p.slack_ns,
+                    );
+                    for s in &p.stages {
+                        let edge = match s.edge {
+                            grus_core::sta::PathEdge::Clock => "clock",
+                            grus_core::sta::PathEdge::LatchOpen => "latch_open",
+                            grus_core::sta::PathEdge::Port => "port",
+                            grus_core::sta::PathEdge::Pin => "pin",
+                            grus_core::sta::PathEdge::CellArc => "cell_arc",
+                            grus_core::sta::PathEdge::Net => "net",
+                        };
+                        let t = match s.transition {
+                            grus_core::sta::PathTransition::Rise => "^",
+                            grus_core::sta::PathTransition::Fall => "v",
+                        };
+                        println!(
+                            "           {:.6} {:+.6} {:<9} {} {}",
+                            s.arrival_ns, s.delay_ns, edge, s.pin, t
+                        );
+                    }
+                    if let Some(note) = &p.note {
+                        println!("           note: {note}");
+                    }
+                }
+            }
             if let Some(path) = &args.json {
                 let _p = grus_core::timing::phase("sta.report.json");
                 let json = serde_json::to_string_pretty(&report)?;

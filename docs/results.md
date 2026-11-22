@@ -7684,3 +7684,87 @@ of the committed script now reproduce deterministically. Nothing else:
 no solver work, no version bump (reference-only, nothing
 Cargo-visible). `cargo test --workspace` and `cargo clippy --workspace
 --all-targets -- -D warnings` both pass.
+
+### 2026-11-23 — E9.1 — critical path traces (`sta --paths N`, v0.6.0)
+
+**Reference**: `tests/designs/gcd/generate_paths_ref.sh` run as committed in
+`ghcr.io/librelane/librelane:3.0.16` (Colima), inputs
+`tests/designs/gcd/{gcd.placed.def,gcd.sdc,gcd.routed.spef}` — the
+`placed_spef` parasitics of `gcd.sta.reference.json`. Flag surface probed via
+`sta -no_init -no_splash` `help report_checks` first; the committed command
+lines are
+
+```tcl
+report_checks -path_delay max -group_path_count 3 \
+    -unique_paths_to_endpoint -endpoint_path_count 1 \
+    -fields {slew cap fanout input_pins} -digits 6 -format full
+report_checks -path_delay min -group_path_count 3 \
+    -unique_paths_to_endpoint -endpoint_path_count 1 \
+    -fields {slew cap fanout input_pins} -digits 6 -format full
+```
+
+`-group_path_count 3 -unique_paths_to_endpoint` is the `collect_paths.sh`
+spelling for "3 worst paths with distinct endpoints"; `-endpoint_path_count 1`
+makes our one-trace-per-endpoint semantics explicit (OpenSTA's default is
+already 1). Outputs: `gcd.paths_max.txt` / `gcd.paths_min.txt` (3 paths each,
+committed; re-running the script reproduces them — verified by `git diff` on
+the second run).
+
+**Ours**: `cargo test -p grus-core --lib` —
+`test_gcd_critical_paths_vs_opensta` runs `run_sta_with_paths(.., 3)` on the
+same inputs and compares against both files; CLI smoke:
+`grus-eda sta --lib <tt lib> --tlef <nom tlef> --lef <hd lef>
+--def gcd.placed.def --sdc gcd.sdc --spef gcd.routed.spef --paths 3
+--json /tmp/gcd_paths.json` printed the same six traces on stdout and wrote
+`critical_paths` (6 entries) to JSON; `--paths 0` omits the key.
+
+| corner | ref endpoints | pin sequences | transitions | max stage-delay residual | max arrival residual | max slack residual |
+|---|---|---|---|---|---|---|
+| max | `resp_msg[15]`, `resp_msg[14]`, `resp_msg[13]` (output ports) | verbatim, all 3 | exact | 1.98 ps | 1.98 ps | +0.94 ps |
+| min | `_409_`, `_399_`, `_400_` (DFF `.../D` checks) | verbatim, all 3 | exact | 0.51 ps | 0.51 ps | +0.45 ps |
+
+Bound used: `max(5 ps, 1%)` per stage delay and arrival and per path
+slack — all six traces pass inside it (residuals above are the
+`{file}: max per-stage delay residual` lines the test prints). Endpoint
+naming: the reference's `Endpoint: <cell>` / `Endpoint: <port>` maps to our
+check pin `<cell>/D` / bare port name; path order matches the worst-N
+ranking in both corners.
+
+**Structural checks** (`test_critical_paths_structure_gcd`):
+`stages[0].edge` is an anchor kind, `cell_arc`/`net` alternate after the
+launch, `arrival_ns == prev + delay_ns` exactly along every trace, and each
+path's `slack_ns` equals its `endpoints[]` row slack — plus the JSON schema
+keys and the `--paths 0` absence rule.
+
+**Exception traces** (`test_critical_paths_exceptions`,
+`sta_exceptions/exceptions.def`): `md_basic.sdc` (partitioned class states)
+traces reconstruct end-to-end with row-equal slacks; `md_pin.sdc`
+(`-from [get_pins u_ff0/CLK]` — a launch-clock *source filter* per the
+measured `t2_mdx` semantics) keeps the `clock` anchor at `u_ff0/CLK`;
+`md_pinseg.sdc` (new fixture, `-from [get_pins u_ff0/Q]` — a true segment
+startpoint) opens the trace at `pin u_ff0/Q` with the
+`segment check ... -from pin` note; `sta_edge/latch_borrow/delay_allregs.sdc`
+produces latch `D->Q` borrow-through stages with an exact arrival chain.
+
+**Fail-proof**: corrupted `trace_path`'s predecessor pick — dropped the
+`TRACE_EPS_NS` window and inverted the corner argmax/argmin
+(`cand < *b` under `late`) so the *least* matching candidate wins. Result:
+`test_gcd_critical_paths_vs_opensta` red —
+
+```text
+assertion `left == right` failed: gcd.paths_max.txt resp_msg[15]: pin sequence
+  left:  ["_394_/CLK", "_394_/Q", "_273_/B", "_273_/Y", "_275_/A", "_275_/Y", "resp_msg[15]"]
+  right: ["_384_/CLK", "_384_/Q", "_211_/A_N", "_211_/X", "_227_/A", "_227_/X", "_229_/A2", "_229_/Y", "_230_/B1", "_230_/X", "_255_/A1", "_255_/X", "_270_/A1", "_270_/X", "_274_/A2", "_274_/Y", "_275_/B", "_275_/Y", "resp_msg[15]"]
+```
+
+— the corrupted walk picks the `_394_` launch instead of `_384_`. The milder
+corruption suggested in the design (first candidate wins, eps kept) stays
+green on gcd: the eps window already admits only the merged predecessor, so
+first-vs-best is indistinguishable there — the recorded corruption therefore
+removes the window too. Restored the argmax/argmin pick; the test is green
+again.
+
+**Checks run**: `cargo test --workspace` (402 lib + 4 bin tests, 2 ignored —
+pre-existing `jpeg` placement/dmp ignores), `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --release -p grus-core sta`.
+`kurena/tasks/ux-sta-paths/spec/` untouched; no commits made.
