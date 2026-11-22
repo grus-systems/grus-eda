@@ -17,6 +17,9 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
+use xxhash_rust::xxh3::Xxh3DefaultBuilder;
+
+type FastMap<K, V> = HashMap<K, V, Xxh3DefaultBuilder>;
 
 /// Edge counts and state durations for one dumped signal (or one bit of a
 /// vector signal).
@@ -120,6 +123,9 @@ struct SignalDecl {
     /// `$scope` nesting depth at declaration; Icarus reuses identifier codes in
     /// sibling scopes, so the shallowest declaration names the shared stream.
     depth: usize,
+    /// `signals` key per bit position — `name` for scalars, `name[left∓pos]`
+    /// for vectors — built once so the per-change path allocates nothing.
+    bit_names: Vec<String>,
 }
 
 /// Per-identifier waveform state: last value per bit, the timestamp it last
@@ -152,12 +158,12 @@ impl IdActivity {
 
 /// Header-parse state shared by `$var`/`$scope`/`$upscope` items.
 struct VcdHeaders {
-    decls: HashMap<String, SignalDecl>,
+    decls: FastMap<String, SignalDecl>,
     /// Every declaration in file order, including id-sharing ones shadowed
     /// out of `decls` — `pin_signals` emits an alias entry for each.
     decl_list: Vec<(String, SignalDecl)>,
     /// Per-identifier waveform state, one slot per bit.
-    activity: HashMap<String, IdActivity>,
+    activity: FastMap<String, IdActivity>,
     /// `$scope` name chain — `pin_signals` path prefix.
     scopes: Vec<String>,
     scope_depth: usize,
@@ -167,13 +173,16 @@ struct VcdHeaders {
 pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
     let timescale_s = parse_timescale(text)?;
     let mut headers = VcdHeaders {
-        decls: HashMap::new(),
+        decls: FastMap::default(),
         decl_list: Vec::new(),
-        activity: HashMap::new(),
+        activity: FastMap::default(),
         scopes: Vec::new(),
         scope_depth: 0,
     };
-    let mut signals: HashMap<String, SignalActivity> = HashMap::new();
+    // Fast hasher during the hot body scan; collected into the public field's
+    // declared `HashMap` (saif.rs builds `VcdActivity` literally, so the field
+    // type cannot change).
+    let mut signals: FastMap<String, SignalActivity> = FastMap::default();
     let mut first_ts: Option<u64> = None;
     let mut last_ts: u64 = 0;
 
@@ -313,7 +322,7 @@ pub fn parse_vcd(text: &str) -> Result<VcdActivity> {
         None => 0.0,
     };
     Ok(VcdActivity {
-        signals,
+        signals: signals.into_iter().collect(),
         pin_signals,
         duration_s,
         timescale_s,
@@ -399,12 +408,26 @@ fn parse_var_decl(item: &str, headers: &mut VcdHeaders) -> Result<()> {
     } else {
         format!("{}/{}", headers.scopes.join("/"), name)
     };
+    let bit_names = match range {
+        Some((left, right)) => (0..nbits)
+            .map(|pos| {
+                let bit_idx = if left >= right {
+                    left - pos as i64
+                } else {
+                    left + pos as i64
+                };
+                format!("{}[{}]", name, bit_idx)
+            })
+            .collect(),
+        None => vec![name.clone()],
+    };
     let decl = SignalDecl {
         name,
         path,
         range,
         nbits,
         depth: headers.scope_depth,
+        bit_names,
     };
     // Icarus reuses identifier codes across sibling scopes; value changes cannot
     // distinguish them, so one stream feeds whichever declaration we keep. The
@@ -476,14 +499,14 @@ fn unescape_vcd_name(name: &str) -> String {
 }
 
 /// Scalar change line: `<0|1|x|z|X|Z><id>` with no space before the id.
-fn parse_scalar_change(line: &str) -> Option<(char, &str)> {
-    let mut chars = line.chars();
-    let v = chars.next()?;
-    if !matches!(v, '0' | '1' | 'x' | 'X' | 'z' | 'Z') {
+fn parse_scalar_change(line: &str) -> Option<(u8, &str)> {
+    let bytes = line.as_bytes();
+    let v = *bytes.first()?;
+    if !matches!(v, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z') {
         return None;
     }
-    let id = chars.as_str();
-    if id.is_empty() || id.contains(char::is_whitespace) {
+    let id = &line[1..];
+    if id.is_empty() || id.bytes().any(|b| b.is_ascii_whitespace()) {
         return None;
     }
     Some((v, id))
@@ -492,7 +515,7 @@ fn parse_scalar_change(line: &str) -> Option<(char, &str)> {
 /// Vector change line: `b<bits> <id>` / `B<bits> <id>`.
 fn parse_vector_change(line: &str) -> Option<(&str, &str)> {
     let rest = line.strip_prefix(['b', 'B'])?;
-    let sp = rest.find(char::is_whitespace)?;
+    let sp = rest.bytes().position(|b| b.is_ascii_whitespace())?;
     let (bits, id) = rest.split_at(sp);
     let id = id.trim();
     if id.is_empty() || bits.is_empty() {
@@ -509,11 +532,16 @@ fn bit_state(c: u8) -> u8 {
     }
 }
 
-fn record_edge(name: &str, old: u8, new: u8, signals: &mut HashMap<String, SignalActivity>) {
+fn record_edge(name: &str, old: u8, new: u8, signals: &mut FastMap<String, SignalActivity>) {
     if old == new || old == 3 {
         return;
     }
-    let e = signals.entry(name.to_string()).or_default();
+    // `get_mut` hits on every edge after the first write; `entry` needs the
+    // owned key only on that first insert.
+    let e = match signals.get_mut(name) {
+        Some(e) => e,
+        None => signals.entry(name.to_string()).or_default(),
+    };
     if old == 2 || new == 2 {
         e.xtrans += 1;
     } else if old == 0 && new == 1 {
@@ -540,11 +568,11 @@ fn record_id_edge(act: &mut IdActivity, pos: usize, old: u8, new: u8) {
 }
 
 fn apply_change(
-    v: char,
+    v: u8,
     id: &str,
-    decls: &HashMap<String, SignalDecl>,
-    activity: &mut HashMap<String, IdActivity>,
-    signals: &mut HashMap<String, SignalActivity>,
+    decls: &FastMap<String, SignalDecl>,
+    activity: &mut FastMap<String, IdActivity>,
+    signals: &mut FastMap<String, SignalActivity>,
     cur_ts: u64,
 ) {
     let Some(decl) = decls.get(id) else {
@@ -553,66 +581,73 @@ fn apply_change(
     if decl.range.is_some() {
         return; // scalar write to a vector id is malformed
     }
-    let act = activity.entry(id.to_string()).or_default();
+    // Declared ids already hold an `IdActivity` (inserted in `parse_var_decl`),
+    // so `get_mut` hits essentially always; the `entry` fallback keeps the old
+    // `or_default` semantics for an id that somehow has none.
+    let act = match activity.get_mut(id) {
+        Some(act) => act,
+        None => activity.entry(id.to_string()).or_default(),
+    };
     if act.last.is_empty() {
         *act = IdActivity::with_bits(1);
     }
     let old = act.last[0];
     act.dur[0][old.min(2) as usize] += cur_ts.saturating_sub(act.since[0]);
     act.since[0] = cur_ts;
-    act.last[0] = bit_state(v as u8);
+    act.last[0] = bit_state(v);
     record_id_edge(act, 0, old, act.last[0]);
-    record_edge(&decl.name.clone(), old, act.last[0], signals);
+    record_edge(&decl.name, old, act.last[0], signals);
 }
 
 fn apply_vector_change(
     bits: &str,
     id: &str,
-    decls: &HashMap<String, SignalDecl>,
-    activity: &mut HashMap<String, IdActivity>,
-    signals: &mut HashMap<String, SignalActivity>,
+    decls: &FastMap<String, SignalDecl>,
+    activity: &mut FastMap<String, IdActivity>,
+    signals: &mut FastMap<String, SignalActivity>,
     cur_ts: u64,
 ) {
     let Some(decl) = decls.get(id) else {
         return;
     };
-    let Some((left, right)) = decl.range else {
+    if decl.range.is_none() {
         return; // vector write to a scalar id is malformed
-    };
+    }
     // A `b` value may print shorter than the declared width: the missing
     // high bits are the value's sign convention — x/z extend themselves
     // (`bx` is the all-x write), 0/1 left-extend with 0 (`b0`, and
     // leading-zero trims like `b100011111011010` on a 16-bit net).
     // Dropping them silently loses the transition AND stalls the state
     // (gcd.vcd's `resp_msg` writes `b0`/`bx` on idle).
-    let chars: Vec<u8> = if bits.len() < decl.nbits {
-        let pad = match bits.as_bytes()[0] {
+    if bits.len() > decl.nbits {
+        return;
+    }
+    let pad_len = decl.nbits - bits.len();
+    let bit_bytes = bits.as_bytes();
+    let pad = if pad_len > 0 {
+        match bit_bytes[0] {
             b'x' | b'X' => b'x',
             b'z' | b'Z' => b'z',
             _ => b'0',
-        };
-        let mut v = Vec::with_capacity(decl.nbits);
-        v.extend(std::iter::repeat_n(pad, decl.nbits - bits.len()));
-        v.extend_from_slice(bits.as_bytes());
-        v
+        }
     } else {
-        bits.bytes().collect()
+        0
     };
-    if chars.len() != decl.nbits {
-        return;
-    }
-    let act = activity.entry(id.to_string()).or_default();
+    let act = match activity.get_mut(id) {
+        Some(act) => act,
+        None => activity.entry(id.to_string()).or_default(),
+    };
     if act.last.len() != decl.nbits {
         *act = IdActivity::with_bits(decl.nbits);
     }
-    for (pos, &ch) in chars.iter().enumerate() {
-        // chars[0] is the leftmost = first index of the declared range; for an
+    for pos in 0..decl.nbits {
+        // bit 0 is the leftmost = first index of the declared range; for an
         // ascending range (`[0:3]`) indices increase with pos, for descending
-        // (`[3:0]`) they decrease.
-        let bit_idx = if left >= right {
-            left - pos as i64
+        // (`[3:0]`) they decrease — `bit_names` already applies the same rule.
+        let ch = if pos < pad_len {
+            pad
         } else {
-            left + pos as i64
+            bit_bytes[pos - pad_len]
         };
         let old = act.last[pos];
         let new = bit_state(ch);
@@ -621,7 +656,7 @@ fn apply_vector_change(
         act.last[pos] = new;
         if old != new {
             record_id_edge(act, pos, old, new);
-            record_edge(&format!("{}[{}]", decl.name, bit_idx), old, new, signals);
+            record_edge(&decl.bit_names[pos], old, new, signals);
         }
     }
 }

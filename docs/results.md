@@ -6080,3 +6080,103 @@ this machine's current speed — `sta.placement.jpeg` 1,070 ms).
 `refine_extrema_rebuilds` was read from a temporary `eprintln`
 (removed after recording; the committed `LegalizeResult` field holds
 the value). Raw logs not committed; the driver is.
+
+### 2026-11-22 — perf-parsers: allocation-free SPEF/DEF/VCD scans (v0.3.6)
+
+Mechanical scan/tokenize work in the three serial readers: per-line and
+per-group `Vec`/`String` churn removed (fixed 5-slot SPEF token buffer,
+inline DEF `read_conn_group`, one reused statement scratch per counted
+section, `Cow` unescape on both name paths, `get_mut`-first VCD map
+access, precomputed VCD bit names), SPEF NAME_MAP rekeyed to the `*N`
+digit-slice of the input line (zero-alloc probes — chosen over the
+u32 rekey so indices beyond `u32` keep exact semantics), `fast-float2`
+for SPEF `*D_NET`/`*CAP`/`*RES`/unit numerics, `xxh3` on the
+per-token/per-connection hash maps (SPEF `name_map`/`owner`, DEF
+`cell_name_to_id`/`io_pin_name_to_id`, VCD `decls`/`activity`/`signals`).
+No format-semantics changes; `split_ascii_whitespace` note: inside a
+SPEF token, non-ASCII whitespace now stays part of the word instead of
+splitting — such input still fails at the same line (numeric parse or
+field count), never silently; all committed SPEF and error tests are
+ASCII. Design: `kurena/tasks/perf-parsers/design/`.
+
+**Phase before/after** — median (min–max) ms, REPS=5, same M4 mini,
+both matrices in one session:
+
+| phase | cell | before | after | speedup |
+|---|---|---|---|---|
+| `sta.spef.read` | jpeg | 161 (159–165) | 115 (114–127) | ×1.39 |
+| `sta.spef.read` | picorv32 (rcx) | 81 (80–84) | 60 (59–64) | ×1.34 |
+| `sta.spef.read` | ibex | 44 (43–46) | 32 (31–37) | ×1.36 |
+| `sta.spef.read` | aes | 29 (29–31) | 21 (21–23) | ×1.36 |
+| `sta.spef.read` | picorv32 | 23 (22–24) | 17 (17–19) | ×1.34 |
+| `sta.spef.read` | gcd / gcd (rcx) | 1 / 2 | 1 / 1 (1–2) | — |
+| `sta.load.def` | jpeg `sta.placement` | 58 (58–60) | 49 (48–50) | ×1.19 |
+| `sta.load.def` | jpeg `sta.spef` | 60 (57–60) | 47 (47–48) | ×1.26 |
+| `sta.load.def` | jpeg `sta.zerowire` | 58 (58–60) | 50 (49–56) | ×1.17 |
+| `power.load.def` | jpeg `power.placement` | 58 (57–60) | 48 (47–52) | ×1.21 |
+| `power.load.def` | jpeg `power.zerowire` | 59 (58–59) | 47 (47–48) | ×1.26 |
+| `cong.load` | jpeg (LEF + DEF scope) | 59 (58–60) | 48 (47–51) | ×1.23 |
+| `power.activity.load` | `power.vcd.gcd` | 420 (418–445) | 276 (276–282) | ×1.52 |
+
+DEF parse on the other designs: `sta.load.def`/`power.load.def` aes
+12 → 10, ibex 16 → 13, picorv32 10 → 8 — uniform ~×1.2.
+
+**Cell wall** — same runs:
+
+| cell | before | after | speedup |
+|---|---|---|---|
+| `sta.spef.jpeg` | 1650 (1650–1670) | 1380 (1360–1380) | ×1.20 |
+| `sta.spef_rcx.picorv32` | 300 (300–310) | 260 (260–270) | ×1.15 |
+| `sta.placement.jpeg` | 1500 | 1320 (1280–1370) | ×1.14 |
+| `power.placement.jpeg` | 870 | 720 (710–740) | ×1.21 |
+| `power.vcd.gcd` | 440 (430–460) | 290 (290–300) | ×1.52 |
+| `congestion.jpeg` | 120 | 110 (100–110) | ×1.09 |
+
+Controls (untouched paths) flat within noise: `place.*` (jpeg
+1740 → 1600 is the 3940-ms before-outlier leaving the median; aes /
+picorv32 / gcd ×1.00, ibex ×0.96), `sta.zerowire.*`, `power.zerowire.*`,
+and every ≤ 50 ms cell.
+
+**Achieved vs. plan**: the plan estimated ~×2 per phase; achieved is
+×1.2–1.5 (×1.34–1.39 `sta.spef.read`, ~×1.2 `*.load.def` /
+`cong.load`, ×1.52 `power.activity.load`). Residuals, named: (1)
+`cong.load` keeps its untouched LEF share (LEF is out of file scope) —
+the DEF-side gain inside it matches `*.load.def`; (2) file read +
+UTF-8 validate (~few ms on 10–40 MB inputs; `memmap2` precedent in
+`lef.rs`); (3) `db.strings.intern` SipHash interner (out of file
+scope); (4) per-connection `cell_pins` pin-name match and per-cell
+`lib_pin` scan — O(few) structure lookups; (5) SPEF `ended`/`halves`
+owned-name clones and the per-net `nets` insert (output structure, not
+scan); (6) DEF `net_pins_list`/`current_pins`/`net_names_vec` per-net
+Vecs — result structure, not scanning; (7) VCD `FastMap→HashMap`
+boundary collect, `dur`/`sa` per-bit Vec traffic, and the closing
+scoped-signal pass.
+
+**Equivalence**: `cargo test --workspace` (346 + 3, 2 ignored),
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo test --release -p grus-core sta` (188, 2 ignored — the strict
+SPEF/DEF consumers). Identical-output proof, not just goldens:
+`cmp`-clean `--json` from the v0.3.5 vs v0.3.6 binaries for
+`sta.spef.jpeg`, `sta.spef_rcx.picorv32`, `sta.placement.jpeg`, and
+`sta.zerowire.jpeg`; `congestion.jpeg` and `power.vcd.gcd` stdout
+identical after stripping the inherently nondeterministic elapsed-ms
+field (all reported congestion / power numbers bit-identical).
+Error-path coverage: every line-numbered reject + truncation test
+green, plus three new DEF tests for the `( component pin )` group
+shapes no test covered — extra word, single word, unterminated.
+Fail-proof (per AGENTS §7): (a) SPEF `resolve` with the `:suffix`
+append dropped → `converts_units_and_resolves_the_name_map` red →
+restored; (b) DEF `read_conn_group` accepting `( comp pin extra )` →
+`test_connection_group_with_extra_word_is_an_error` (added for this —
+the 3-word group shape was untested) red → restored; (c) VCD
+`bits.len() != decl.nbits` early-return dropping short writes →
+`test_short_vector_writes_left_extend` red → restored.
+
+**What was run**: before — `REPS=5 sh
+kurena/tasks/perf-profile/measure.sh /tmp/perf-parsers-before.log`
+on the full matrix with a release binary built from the pre-change
+v0.3.5 tree; after — the identical command into
+`/tmp/perf-parsers-after.log` on the v0.3.6 binary, same idle M4
+mini, same session. Output-identity `cmp`s used the same two
+binaries (`/tmp/grus-eda.before` kept). Raw logs not committed; the
+driver is.

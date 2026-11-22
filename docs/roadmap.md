@@ -542,10 +542,15 @@ jpeg `place` 2170 → 1560 ms on the same-session baseline, `pass2`/`pass3`
 ~×12, `pass1` flat; HPWL improved 0.3–0.6% on all five designs —
 `docs/results.md` 2026-11-22 perf-legal-passes entry; `place.gp.*` is
 now ~73% of the `place` wall and the dominant remaining phase), then
-the parser tickets
-`perf-spef-parse`, `perf-def-parse`, `perf-vcd-parse` — and
+~~the parser tickets
+`perf-spef-parse`, `perf-def-parse`, `perf-vcd-parse`~~ **done** —
+landed together as `perf-parsers` (allocation-free scans in all three
+readers: `sta.spef.read` ×1.34–1.39, `*.load.def`/`cong.load` ~×1.2,
+`power.activity.load` ×1.52; jpeg `sta.spef` cell wall 1650 → 1380 ms,
+`power.vcd.gcd` 440 → 290 ms — `docs/results.md` 2026-11-22
+perf-parsers entry), and
 `sta.eval.walk`/`sta.slew.walk` is the co-dominant phase on both `sta`
-and `power` after these two tickets (the shared DMP-dominated inner
+and `power` after these tickets (the shared DMP-dominated inner
 loop). Every optimization ticket lands only with a
 bit-identical-or-tolerance-named fast path and a `docs/results.md`
 number, per the usual discipline.

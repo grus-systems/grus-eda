@@ -3,11 +3,15 @@ use crate::interner::{CellId, LibPinId, MacroPinId, NetId, PinDir, PinId};
 use crate::lib_db::LibDb;
 use crate::tech_db::{RectDbu, TechDb};
 use anyhow::{Context, Result, anyhow, bail};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::str::FromStr;
+use xxhash_rust::xxh3::Xxh3DefaultBuilder;
+
+type FastMap<K, V> = HashMap<K, V, Xxh3DefaultBuilder>;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum DefToken<'a> {
@@ -94,6 +98,14 @@ impl<'a> DefLexer<'a> {
 }
 
 pub fn unescape_def_name(s: &str) -> String {
+    unescape_def_name_cow(s).into_owned()
+}
+
+/// Borrowed when the name has no `\` to strip — the common case on real DEFs.
+fn unescape_def_name_cow(s: &str) -> Cow<'_, str> {
+    if !s.contains('\\') {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -105,7 +117,7 @@ pub fn unescape_def_name(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Inverse of `unescape_def_name`: prefixes characters that would delimit
@@ -156,9 +168,16 @@ pub fn orient_str(o: Orient) -> &'static str {
 /// coordinates whose position is fixed by the statement shape.
 fn read_statement<'a>(lexer: &mut DefLexer<'a>) -> Result<Vec<&'a str>> {
     let mut words = Vec::new();
+    read_statement_into(lexer, &mut words)?;
+    Ok(words)
+}
+
+/// `read_statement` into a caller-owned buffer, so counted sections can reuse
+/// one allocation across every record.
+fn read_statement_into<'a>(lexer: &mut DefLexer<'a>, words: &mut Vec<&'a str>) -> Result<()> {
     loop {
         match lexer.next_token() {
-            DefToken::Semi => return Ok(words),
+            DefToken::Semi => return Ok(()),
             DefToken::Word(w) => words.push(w),
             DefToken::LParen | DefToken::RParen => {}
             DefToken::Eof => bail!(
@@ -184,6 +203,46 @@ fn read_group<'a>(lexer: &mut DefLexer<'a>) -> Result<Vec<&'a str>> {
     }
 }
 
+/// A NETS `( component pin )` group whose `(` has already been consumed — the
+/// inline form of `read_group` + the two-word check, with no `Vec`.
+fn read_conn_group<'a>(lexer: &mut DefLexer<'a>, net_name: &str) -> Result<(&'a str, &'a str)> {
+    let not_conn =
+        |line: usize| anyhow!("DEF line {line}: connection of net {net_name} must be `( component pin )`");
+    // A `)` before the second word is a wrong-shape group, not an unexpected
+    // token — same reject the collected-`Vec` destructure produced, at the
+    // same line (the `)` position).
+    let comp = match lexer.next_token() {
+        DefToken::Word(w) => w,
+        DefToken::RParen => return Err(not_conn(lexer.line())),
+        other => bail!(
+            "DEF line {}: unexpected {other:?} inside `( ... )`",
+            lexer.line()
+        ),
+    };
+    let pin = match lexer.next_token() {
+        DefToken::Word(w) => w,
+        DefToken::RParen => return Err(not_conn(lexer.line())),
+        other => bail!(
+            "DEF line {}: unexpected {other:?} inside `( ... )`",
+            lexer.line()
+        ),
+    };
+    // Extra words drain to the `)` so the reject reports at the same line the
+    // old two-word destructure of the collected group did.
+    let mut extra = false;
+    loop {
+        match lexer.next_token() {
+            DefToken::RParen if !extra => return Ok((comp, pin)),
+            DefToken::RParen => return Err(not_conn(lexer.line())),
+            DefToken::Word(_) => extra = true,
+            other => bail!(
+                "DEF line {}: unexpected {other:?} inside `( ... )`",
+                lexer.line()
+            ),
+        }
+    }
+}
+
 fn number<T: FromStr>(word: &str, field: &str, line: usize) -> Result<T> {
     word.parse::<T>()
         .map_err(|_| anyhow!("DEF line {line}: {field} `{word}` is not a number"))
@@ -199,24 +258,40 @@ fn axis(word: &str, section: &str, line: usize) -> Result<bool> {
 }
 
 /// Splits `+ KEYWORD args...` attributes; the args of each keyword run up to the next `+`.
-fn split_attributes<'w, 'a>(
-    words: &'w [&'a str],
+/// Iterator form: one attribute per step, no `Vec`, same rejects as the old
+/// collecting version.
+fn split_attributes<'w, 'a>(words: &'w [&'a str], line: usize) -> AttrIter<'w, 'a> {
+    AttrIter { rest: words, line }
+}
+
+struct AttrIter<'w, 'a> {
+    rest: &'w [&'a str],
     line: usize,
-) -> Result<Vec<(&'a str, &'w [&'a str])>> {
-    let mut out = Vec::new();
-    let mut rest = words;
-    while let Some((&first, tail)) = rest.split_first() {
+}
+
+impl<'w, 'a> Iterator for AttrIter<'w, 'a> {
+    type Item = Result<(&'a str, &'w [&'a str])>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (&first, tail) = self.rest.split_first()?;
         if first != "+" {
-            bail!("DEF line {line}: expected `+` before `{first}`");
+            self.rest = &[];
+            return Some(Err(anyhow!(
+                "DEF line {}: expected `+` before `{first}`",
+                self.line
+            )));
         }
         let Some((&keyword, after)) = tail.split_first() else {
-            bail!("DEF line {line}: `+` without an attribute keyword");
+            self.rest = &[];
+            return Some(Err(anyhow!(
+                "DEF line {}: `+` without an attribute keyword",
+                self.line
+            )));
         };
         let end = after.iter().position(|&w| w == "+").unwrap_or(after.len());
-        out.push((keyword, &after[..end]));
-        rest = &after[end..];
+        self.rest = &after[end..];
+        Some(Ok((keyword, &after[..end])))
     }
-    Ok(out)
 }
 
 /// Consumes the name that follows an `END` and checks that it closes `section`.
@@ -263,10 +338,13 @@ fn for_each_record<'a>(
 ) -> Result<()> {
     let declared = section_count(lexer, section)?;
     let mut found = 0;
+    // One scratch buffer for every `- ...;` record of the section.
+    let mut words: Vec<&'a str> = Vec::new();
     loop {
         match lexer.next_token() {
             DefToken::Word("-") => {
-                let words = read_statement(lexer)?;
+                words.clear();
+                read_statement_into(lexer, &mut words)?;
                 entry(&words, lexer.line())?;
                 found += 1;
             }
@@ -296,20 +374,21 @@ fn add_component(
     db: &mut DesignDb,
     tech_db: &TechDb,
     lib_db: Option<&LibDb>,
-    cell_name_to_id: &mut HashMap<String, CellId>,
+    cell_name_to_id: &mut FastMap<String, CellId>,
     words: &[&str],
     line: usize,
 ) -> Result<()> {
     let [inst, macro_name, attributes @ ..] = words else {
         bail!("DEF line {line}: component record needs an instance name and a macro name");
     };
-    let inst_token = unescape_def_name(inst);
+    let inst_token = unescape_def_name_cow(inst);
 
     let mut status = PlacementStatus::Unplaced;
     let mut x = 0;
     let mut y = 0;
     let mut orient = Orient::N;
-    for (keyword, args) in split_attributes(attributes, line)? {
+    for attr in split_attributes(attributes, line) {
+        let (keyword, args) = attr?;
         match keyword {
             "PLACED" | "FIXED" | "COVER" => {
                 let [px, py, o] = args else {
@@ -354,8 +433,8 @@ fn add_component(
     });
 
     let cell_id = CellId(db.cell_names.len() as u32);
-    cell_name_to_id.insert(inst_token.clone(), cell_id);
     db.cell_names.push(db.strings.intern(&inst_token));
+    cell_name_to_id.insert(inst_token.into_owned(), cell_id);
     db.cell_macros.push(macro_id);
     db.cell_lib_ids.push(lib_cell_id);
     db.cell_status.push(status);
@@ -401,14 +480,14 @@ fn add_component(
 
 fn add_pin(
     db: &mut DesignDb,
-    io_pin_name_to_id: &mut HashMap<String, PinId>,
+    io_pin_name_to_id: &mut FastMap<String, PinId>,
     words: &[&str],
     line: usize,
 ) -> Result<()> {
     let [name, attributes @ ..] = words else {
         bail!("DEF line {line}: PINS record without a pin name");
     };
-    let pin_name = unescape_def_name(name);
+    let pin_name = unescape_def_name_cow(name);
 
     let mut dir = PinDir::Inout;
     let mut x = 0;
@@ -416,7 +495,8 @@ fn add_pin(
     let mut layer_off_x = 0;
     let mut layer_off_y = 0;
     let mut is_special = false;
-    for (keyword, args) in split_attributes(attributes, line)? {
+    for attr in split_attributes(attributes, line) {
+        let (keyword, args) = attr?;
         match keyword {
             "SPECIAL" => is_special = true,
             "DIRECTION" => {
@@ -476,7 +556,7 @@ fn add_pin(
     db.pin_is_driver.push(is_driver);
 
     if !is_special {
-        io_pin_name_to_id.insert(pin_name, pin_id);
+        io_pin_name_to_id.insert(pin_name.into_owned(), pin_id);
         db.io_pins.push(pin_id);
     }
     Ok(())
@@ -508,32 +588,26 @@ fn add_special_net(db: &mut DesignDb, tech_db: &TechDb, words: &[&str], line: us
                         continue;
                     }
                     if i + 3 < words.len() {
-                        let is_c1 = words[i] == "*" || words[i].parse::<i32>().is_ok();
-                        let is_c2 = words[i + 1] == "*" || words[i + 1].parse::<i32>().is_ok();
-                        let is_c3 = words[i + 2] == "*" || words[i + 2].parse::<i32>().is_ok();
-                        let is_c4 = words[i + 3] == "*" || words[i + 3].parse::<i32>().is_ok();
-
-                        if is_c1 && is_c2 && is_c3 && is_c4 {
-                            let x1 = if words[i] == "*" {
-                                last_x
+                        // One parse per candidate coordinate: `None` probes out,
+                        // `Some(None)` is `*` (repeat the previous coordinate).
+                        let coord = |w: &str| -> Option<Option<i32>> {
+                            if w == "*" {
+                                Some(None)
                             } else {
-                                number(words[i], "SPECIALNETS x", line)?
-                            };
-                            let y1 = if words[i + 1] == "*" {
-                                last_y
-                            } else {
-                                number(words[i + 1], "SPECIALNETS y", line)?
-                            };
-                            let x2 = if words[i + 2] == "*" {
-                                x1
-                            } else {
-                                number(words[i + 2], "SPECIALNETS x", line)?
-                            };
-                            let y2 = if words[i + 3] == "*" {
-                                y1
-                            } else {
-                                number(words[i + 3], "SPECIALNETS y", line)?
-                            };
+                                w.parse::<i32>().ok().map(Some)
+                            }
+                        };
+                        let probes = (
+                            coord(words[i]),
+                            coord(words[i + 1]),
+                            coord(words[i + 2]),
+                            coord(words[i + 3]),
+                        );
+                        if let (Some(x1), Some(y1), Some(x2), Some(y2)) = probes {
+                            let x1 = x1.unwrap_or(last_x);
+                            let y1 = y1.unwrap_or(last_y);
+                            let x2 = x2.unwrap_or(x1);
+                            let y2 = y2.unwrap_or(y1);
 
                             last_x = x2;
                             last_y = y2;
@@ -579,8 +653,8 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
         1000
     };
 
-    let mut cell_name_to_id: HashMap<String, CellId> = HashMap::new();
-    let mut io_pin_name_to_id: HashMap<String, PinId> = HashMap::new();
+    let mut cell_name_to_id: FastMap<String, CellId> = FastMap::default();
+    let mut io_pin_name_to_id: FastMap<String, PinId> = FastMap::default();
     let mut saw_end_design = false;
 
     loop {
@@ -736,7 +810,7 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
                     match lexer.next_token() {
                         DefToken::Word("-") => {
                             let net_name = match lexer.next_token() {
-                                DefToken::Word(w) => unescape_def_name(w),
+                                DefToken::Word(w) => unescape_def_name_cow(w).into_owned(),
                                 other => bail!(
                                     "DEF line {}: expected a net name after `-`, found {other:?}",
                                     lexer.line()
@@ -758,30 +832,25 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
                                         read_group(&mut lexer)?;
                                     }
                                     DefToken::LParen => {
-                                        let group = read_group(&mut lexer)?;
+                                        let (comp, pin) = read_conn_group(&mut lexer, &net_name)?;
                                         let line = lexer.line();
-                                        let [comp, pin] = group.as_slice() else {
-                                            bail!(
-                                                "DEF line {line}: connection of net {net_name} must be `( component pin )`"
-                                            );
-                                        };
-                                        if *comp == "PIN" {
-                                            let pname = unescape_def_name(pin);
-                                            let &pid = io_pin_name_to_id.get(&pname).with_context(|| {
+                                        if comp == "PIN" {
+                                            let pname = unescape_def_name_cow(pin);
+                                            let &pid = io_pin_name_to_id.get(pname.as_ref()).with_context(|| {
                                                 format!("DEF line {line}: net {net_name} connects to PIN {pname}, which PINS does not define")
                                             })?;
                                             current_pins.push(pid);
                                             db.pin_nets[pid.0 as usize] = Some(net_id);
                                         } else {
-                                            let iname = unescape_def_name(comp);
-                                            let &cid = cell_name_to_id.get(&iname).with_context(|| {
+                                            let iname = unescape_def_name_cow(comp);
+                                            let &cid = cell_name_to_id.get(iname.as_ref()).with_context(|| {
                                                 format!("DEF line {line}: net {net_name} connects to component {iname}, which COMPONENTS does not define")
                                             })?;
                                             let pid = db
                                                 .cell_pins(cid)
                                                 .iter()
                                                 .copied()
-                                                .find(|&pid| db.strings.resolve(db.pin_names[pid.0 as usize]) == *pin)
+                                                .find(|&pid| db.strings.resolve(db.pin_names[pid.0 as usize]) == pin)
                                                 .with_context(|| {
                                                     format!("DEF line {line}: net {net_name} connects to {iname}/{pin}, which the macro does not have")
                                                 })?;
@@ -1683,6 +1752,26 @@ END DESIGN
     fn test_net_to_unknown_macro_pin_is_an_error() {
         let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 Q )"));
         assert!(msg.contains("u1/Q"), "{msg}");
+    }
+
+    /// A `( component pin )` group that is not exactly two words is rejected
+    /// with the same message and line the collected-group destructure produced.
+    #[test]
+    fn test_connection_group_with_extra_word_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 A extra )"));
+        assert!(msg.contains("must be `( component pin )`"), "{msg}");
+    }
+
+    #[test]
+    fn test_connection_group_with_one_word_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 )"));
+        assert!(msg.contains("must be `( component pin )`"), "{msg}");
+    }
+
+    #[test]
+    fn test_connection_group_unterminated_is_an_error() {
+        let msg = mini_def_error(&MINI_DEF.replace("( u1 A )", "( u1 ;"));
+        assert!(msg.contains("unexpected Semi inside `( ... )`"), "{msg}");
     }
 
     /// `NONDEFAULTRULES` only constrains detailed routing, which the timing database does not
