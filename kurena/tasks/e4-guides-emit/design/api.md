@@ -74,6 +74,9 @@ per net, then flatten — same as today).
 ```rust
 // DesignDb pin SoA, indexed by PinId:
 pub pin_io_layer: Vec<Option<LayerId>>, // DEF `+ LAYER` of primary I/O pins; None for instance pins
+
+// DesignDb net SoA, indexed by NetId:
+pub net_def_spellings: Vec<SymbolId>, // raw NETS token per net; empty for non-DEF sources
 ```
 
 `add_pin` already parses `+ LAYER`; it currently keeps only the layer-rect
@@ -81,9 +84,15 @@ offset. It gains a `tech_db: &TechDb` parameter (its only call site in
 `parse_def` already has one in scope), resolves the `+ LAYER` name through
 `tech_db.layer_by_name`, and pushes `Some(LayerId)` for I/O pins, `None`
 otherwise. Unknown layer name → `bail!` like the other parse errors.
-`DesignDb` derives `Serialize`/`Deserialize`; the new field bumps any
+`DesignDb` derives `Serialize`/`Deserialize`; the new fields bump any
 cached encoding implicitly with the workspace version (no explicit
 migration — caches are versioned rebuilds).
+
+`net_def_spellings` records the NETS `- name` token before unescaping —
+`read_guides` matches net names verbatim, and OpenDB stores the DEF
+spelling (`ctrl.state.out\[1\]`, `req_msg[0]`), so emission must
+reproduce it (measured; `escape_def_name` alone mismatches both
+directions).
 
 ## `congestion/guide.rs` (new module)
 
@@ -127,7 +136,17 @@ pub fn parse_guides(
     text: &str,
     tech_db: &TechDb,
 ) -> anyhow::Result<Vec<(String, Vec<GuideBox>)>>;
+
+/// `escape_guide_name` escapes `[`/`]` on top of the DEF-word escapes;
+/// `guide_net_name` resolves the emitted spelling (raw DEF spelling when
+/// `net_def_spellings` is populated, `escape_guide_name` fallback).
+pub fn escape_guide_name(s: &str) -> String;
+pub fn guide_net_name(design_db: &DesignDb, net: NetId) -> String;
 ```
+
+`write_guides` sorts + dedups each net's boxes itself, so the
+(layer, yl, xl, xh, yh) order is the file's invariant regardless of
+caller order.
 
 `mod.rs` gains `pub mod guide;` and the glob re-export picks it up.
 

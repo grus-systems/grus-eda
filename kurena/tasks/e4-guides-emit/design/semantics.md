@@ -22,10 +22,14 @@ accepts the same file back (the `GRT-0008` "does not allow parasitics
 estimation" warning is stale — read-back guides feed both
 `estimate_parasitics -global_routing` and `detailed_route`).
 
-Net names are written as `escape_def_name(resolve(net_names[n]))` — the
-same escaped form the DEF `NETS` section uses, so `read_guides` can
-re-associate blocks to nets. (gcd/picorv32 names like `clk`, `_000_`,
-`net[7]` need no escapes; the escape path exists for bus/escaped names.)
+Net names are written with the **raw DEF spelling** (measured 2026-11-22:
+OpenDB stores net names verbatim — `ctrl.state.out\[1\]` keeps its
+backslashes, `req_msg[0]` stays bare — and `read_guides` matches on
+exactly that token; over- or under-escaping fails `GRT-0234 Cannot find
+net`). `DesignDb` therefore keeps `net_def_spellings`, the raw NETS token
+per net, and emission writes it verbatim. For non-DEF sources the field
+is empty and emission falls back to `escape_guide_name(net_names[n])`
+(DEF-word escapes plus `[`/`]`, which are bus delimiters in OpenDB).
 
 ## Grid → box geometry
 
@@ -85,7 +89,9 @@ Per pin of the net, one stub rect = the pin's GCell rect, emitted on:
 
 Stub boxes dedup across pins sharing a GCell. A net whose pins all sit in
 one GCell produces no segments; its block still carries the stubs. Nets
-with zero pins emit no block.
+with **fewer than 2 pins** emit no block — a lone port pin has nothing to
+connect (measured: picorv32's 67 `irq`/`pcpi_*` port-only nets carry no
+reference block; gcd's `_003_` — two pins in one GCell — does).
 
 ## Determinism
 

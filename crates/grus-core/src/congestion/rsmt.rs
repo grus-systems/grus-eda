@@ -723,35 +723,46 @@ pub fn decompose_net(
     build_net_rsmt(&pts)
 }
 
+/// Decomposes all nets into Steiner segments like `decompose_design_nets`,
+/// but returns the per-net CSR mapping as well.
+/// `net_seg_offsets[n]..net_seg_offsets[n+1]` slices `segments` for
+/// `NetId(n)`; nets whose pins share one GCell contribute zero segments.
+pub fn decompose_design_nets_indexed(
+    design_db: &DesignDb,
+    tech_db: &TechDb,
+    grid: &GCellGrid,
+) -> (Vec<SteinerSegment>, Vec<u32>) {
+    let n = design_db.net_names.len();
+    // Per-net collect before flattening keeps the ordering deterministic on
+    // both the serial and the rayon path.
+    let per_net: Vec<Vec<SteinerSegment>> = if n < 512 {
+        (0..n)
+            .map(|net_idx| decompose_net(design_db, tech_db, grid, NetId(net_idx as u32)))
+            .collect()
+    } else {
+        (0..n)
+            .into_par_iter()
+            .map(|net_idx| decompose_net(design_db, tech_db, grid, NetId(net_idx as u32)))
+            .collect()
+    };
+    let total: usize = per_net.iter().map(Vec::len).sum();
+    let mut all_segs = Vec::with_capacity(total);
+    let mut net_seg_offsets = Vec::with_capacity(n + 1);
+    net_seg_offsets.push(0);
+    for segs in per_net {
+        all_segs.extend(segs);
+        net_seg_offsets.push(all_segs.len() as u32);
+    }
+    (all_segs, net_seg_offsets)
+}
+
 /// Decomposes all nets in the design into rectilinear Steiner segments.
 pub fn decompose_design_nets(
     design_db: &DesignDb,
     tech_db: &TechDb,
     grid: &GCellGrid,
 ) -> Vec<SteinerSegment> {
-    let n = design_db.net_names.len();
-    if n < 512 {
-        let mut all_segs = Vec::new();
-        for net_idx in 0..n {
-            all_segs.extend(decompose_net(
-                design_db,
-                tech_db,
-                grid,
-                NetId(net_idx as u32),
-            ));
-        }
-        return all_segs;
-    }
-    let per_net: Vec<Vec<SteinerSegment>> = (0..n)
-        .into_par_iter()
-        .map(|net_idx| decompose_net(design_db, tech_db, grid, NetId(net_idx as u32)))
-        .collect();
-    let total: usize = per_net.iter().map(Vec::len).sum();
-    let mut all_segs = Vec::with_capacity(total);
-    for segs in per_net {
-        all_segs.extend(segs);
-    }
-    all_segs
+    decompose_design_nets_indexed(design_db, tech_db, grid).0
 }
 
 #[cfg(test)]

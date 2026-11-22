@@ -2,7 +2,8 @@
 # Reproduction script for gcd reference artifacts in grus-eda.
 # Generates gcd.synth.v, gcd.synth.json, gcd.floorplan.def, gcd.placed.def,
 # gcd.routed.spef (placement estimate), gcd.routed.def, gcd.drc.rpt, gcd.rcx.spef (routed extraction),
-# gcd.orient.def, gcd.orient.pins.txt, gcd.reference.json, and gcd.sta.reference.json using LibreLane,
+# gcd.guide (OpenROAD global_route -guide_file), gcd.orient.def, gcd.orient.pins.txt,
+# gcd.reference.json, and gcd.sta.reference.json using LibreLane,
 # Yosys, OpenROAD, and OpenSTA inside the canonical container ghcr.io/librelane/librelane:3.0.16.
 
 set -euo pipefail
@@ -151,6 +152,23 @@ if [ -s "${SCRIPT_DIR}/gcd.drc.rpt" ]; then
     exit 1
 fi
 echo "DRC violations: 0 (gcd.drc.rpt is empty)"
+
+# 5c. Committed route-guide golden: global_route -guide_file on gcd.placed.def with the
+#     same signal band and layer adjustments GCellGrid::build applies by default
+#     (met1 0.30, met2..met5 0.20). Step 5b's runs/canonical guide is untouched; this
+#     one is the comparison reference for our emitted guides.
+openroad -no_init -no_splash << 'EOF'
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/gcd/gcd.placed.def
+read_sdc /work/tests/designs/gcd/gcd.sdc
+set_routing_layers -signal met1-met5 -clock met3-met5
+set_global_routing_layer_adjustment met1 0.30
+set_global_routing_layer_adjustment met2-met5 0.20
+global_route -guide_file /work/tests/designs/gcd/gcd.guide -congestion_iterations 100
+exit
+EOF
 
 # The Tcl below is fed to openroad on stdin, where the interactive shell treats `!` as
 # history expansion. Write negations as `== 0`, never `![...]`.

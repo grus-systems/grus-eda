@@ -1,5 +1,5 @@
 use crate::congestion::gcell::{CongestionReport, GCellGrid, SteinerSegment};
-use crate::congestion::rsmt::decompose_design_nets;
+use crate::congestion::rsmt::decompose_design_nets_indexed;
 use crate::design_db::DesignDb;
 use crate::tech_db::TechDb;
 
@@ -62,11 +62,21 @@ enum RouteChoice {
     Zvhv(usize),
 }
 
+/// Output of the 3-pass router: the aggregate report plus the committed
+/// GCell-edge path per input segment.
+pub struct RouteOutput {
+    pub report: CongestionReport,
+    /// `segment_paths[i]` is the committed edge list of `segments[i]`;
+    /// empty when the segment degenerated (zero length) or was never
+    /// committed. Index-aligned with the `segments` argument.
+    pub segment_paths: Vec<Vec<GridEdge>>,
+}
+
 /// Routes rectilinear Steiner segments over the GCell grid using 3-pass congestion routing:
 /// - Pass 1: Probabilistic demand (RISA / uniform 50-50 L-split)
 /// - Pass 2: Congestion-aware L/Z pattern routing with rip-up and cost evaluation
 /// - Pass 3: Bounded-box maze rip-up and reroute (FastRoute expanding box Dijkstra)
-pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> CongestionReport {
+pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> RouteOutput {
     let nx = grid.nx;
     let ny = grid.ny;
     let edge_cols = nx.saturating_sub(1);
@@ -658,16 +668,57 @@ pub fn route_segments(grid: &mut GCellGrid, segments: &[SteinerSegment]) -> Cong
         .collect();
     drop(t_report);
 
-    CongestionReport {
-        nx,
-        ny,
-        total_overflow: total_overflow as f32,
-        max_edge_overflow,
-        top_05pct_overflow,
-        overflow_gcells,
-        gcell_usage_ratio,
-        h_usage_ratio,
-        v_usage_ratio,
+    RouteOutput {
+        report: CongestionReport {
+            nx,
+            ny,
+            total_overflow: total_overflow as f32,
+            max_edge_overflow,
+            top_05pct_overflow,
+            overflow_gcells,
+            gcell_usage_ratio,
+            h_usage_ratio,
+            v_usage_ratio,
+        },
+        segment_paths,
+    }
+}
+
+/// Everything `estimate_congestion` returns, plus the routed paths and the
+/// net they belong to — the guide emitter's input.
+pub struct RoutedDesign {
+    pub grid: GCellGrid,
+    pub report: CongestionReport,
+    /// Flat segment list, index-aligned with `segment_paths`.
+    pub segments: Vec<SteinerSegment>,
+    /// CSR offsets into `segments`/`segment_paths`:
+    /// net `NetId(n)` owns `net_seg_offsets[n]..net_seg_offsets[n+1]`;
+    /// length `design_db.num_nets() + 1`.
+    pub net_seg_offsets: Vec<u32>,
+    pub segment_paths: Vec<Vec<GridEdge>>,
+}
+
+/// Runs the full congestion pipeline: grid build, RSMT decomposition, and
+/// 3-pass routing, keeping the committed per-segment edge paths.
+pub fn route_design(
+    design_db: &DesignDb,
+    tech_db: &TechDb,
+    layer_adjustments: Option<&[f32]>,
+    gcell_tracks_override: Option<i32>,
+) -> RoutedDesign {
+    let t_grid = crate::timing::phase("cong.grid");
+    let mut grid = GCellGrid::build(design_db, tech_db, layer_adjustments, gcell_tracks_override);
+    drop(t_grid);
+    let t_decompose = crate::timing::phase("cong.decompose");
+    let (segments, net_seg_offsets) = decompose_design_nets_indexed(design_db, tech_db, &grid);
+    drop(t_decompose);
+    let out = route_segments(&mut grid, &segments);
+    RoutedDesign {
+        grid,
+        report: out.report,
+        segments,
+        net_seg_offsets,
+        segment_paths: out.segment_paths,
     }
 }
 
@@ -678,14 +729,8 @@ pub fn estimate_congestion(
     layer_adjustments: Option<&[f32]>,
     gcell_tracks_override: Option<i32>,
 ) -> (GCellGrid, CongestionReport) {
-    let t_grid = crate::timing::phase("cong.grid");
-    let mut grid = GCellGrid::build(design_db, tech_db, layer_adjustments, gcell_tracks_override);
-    drop(t_grid);
-    let t_decompose = crate::timing::phase("cong.decompose");
-    let segments = decompose_design_nets(design_db, tech_db, &grid);
-    drop(t_decompose);
-    let report = route_segments(&mut grid, &segments);
-    (grid, report)
+    let r = route_design(design_db, tech_db, layer_adjustments, gcell_tracks_override);
+    (r.grid, r.report)
 }
 
 #[cfg(test)]
@@ -734,7 +779,7 @@ mod tests {
             p2: GPoint { x: 2, y: 2 },
         };
 
-        let report = route_segments(&mut grid, &[s_h, s_v, s_2d]);
+        let report = route_segments(&mut grid, &[s_h, s_v, s_2d]).report;
 
         // Total demand across all edges must equal total wirelength (2 + 2 + 4 = 8)
         let total_demand: f32 =
