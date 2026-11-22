@@ -561,3 +561,76 @@ phases on `sta` and `power` (the shared DMP inner loop, now minus
 the `eval_2d` redundancy). Every optimization ticket lands only with
 a bit-identical-or-tolerance-named fast path and a `docs/results.md`
 number, per the usual discipline.
+
+## Candidate next stages (E4–E8, scoped 2026-11-22)
+
+The readers → placement → STA/power pipeline is complete; what is missing for
+a usable flow is routing, clock-tree, and sign-off-adjacent analyses. The
+full scoping — inputs/outputs, reusable modules by name, per-metric
+tolerances, probe evidence — is in
+`kurena/tasks/next-stage-scoping/design/`; probe outputs are logged in
+`docs/results.md` (2026-11-22 "next-stage-scoping"). Recommended order is
+**E4 → E5 → E8**, with E6/E7 behind a decision gate.
+
+### E4. Global routing → route guides + guide-based parasitics
+
+- In: `tlef` + `lef` + placed `def`. Out: OpenROAD-format guide file +
+  guide-based SPEF via the existing `--spef-out` path.
+- Reuses almost everything E1 built: `GCellGrid::build`, `decompose_net`
+  RSMT, `route_segments` (committed paths exist internally and are discarded
+  today), `NetRcTree`/`NetParasitics`, SPEF writer.
+- Done when (on `gcd.placed.def`, then `picorv32.placed.def`): per-net
+  guide-box overlap ≥ 0.70 vs `global_route -guide_file`; guide-box total
+  within 15%; our RC on OpenROAD's guides *and* our guides fed back via
+  `read_guides` agree with `estimate_parasitics -global_routing` SPEF within
+  `max(5%, 1 fF)` per net; end-to-end `sta` within `max(5 ps, 1%)`.
+- Probe note: guide parasitics halve the placement-estimate gap to routed
+  truth on gcd (median per-net C diff vs RCX: 27.6% vs 44.2%).
+- Sizing: ~6–8 tickets (M). Ticket sketch in `design/order.md`.
+
+### E5. Clock tree synthesis
+
+- In: placed `def` + `sdc` + `lib`/`lef`. Out: DEF with inserted clock
+  buffers + skew/insertion-delay report.
+- Reuses the Abacus legalizer, `write_def_full`, and the propagated-clock
+  STA mode (already matching OpenSTA) as the scoring path; the real new
+  infrastructure is `DesignDb` cell/net insertion — a mutation API every
+  future buffering/repair step needs.
+- Done when (on `gcd.placed.def`/`gcd.sdc` vs `clock_tree_synthesis` +
+  `repair_clock_nets`): skew within `max(25 ps, 25%)` (gcd reference ≈ 0 ps),
+  max insertion delay within 15% (reference ≈ 0.31 ns), propagated-clock STA
+  on the TritonCTS DEF vs ours within `max(5 ps, 1%)` per endpoint.
+- Sizing: ~6–8 tickets (M–L).
+
+### E8. IR drop (power-grid analysis)
+
+- In: `def` with `SPECIALNETS` PDN + per-instance power (N7). Out:
+  per-instance voltage map + worst drop.
+- Reference confirmed in the image (P-IRD): `analyze_power_grid -net VPWR` on
+  gcd reports worst IR drop 0.591 mV and emits a per-instance voltage CSV via
+  `-voltage_file`; `check_power_grid` verifies PDN connectivity.
+- Done when: worst drop within `max(5%, 5 mV)` and per-instance voltages
+  within `max(5%, 1 mV)` of the reference on `gcd.placed.def`; the
+  current-source convention (embedded estimate vs `set_pdnsim_inst_power`)
+  pinned by the golden ticket.
+- Missing: SPECIALNETS via extraction, LEF `VIA` resistance, resistor mesh,
+  a sparse DC solve (new dependency).
+- Sizing: ~4–6 tickets (M).
+
+### E6/E7 — decision-gated, not scheduled
+
+- **E6 detailed routing** is a TritonRoute-class build (LEF `VIA`/`SPACING`
+  and DEF `VIAS`/`NONDEFAULTRULES` parse, signal-net wire storage, DRC-aware
+  maze routing) — ~15+ tickets (XL), an order of magnitude beyond any prior
+  stage, and the README lists detailed routing and DRC as out of scope. That
+  scope line stays untouched here; this entry names the tension for a user
+  decision. The delegation path is measured, not hypothetical: P-GR showed
+  `read_guides` + `detailed_route` on a foreign guide file produces a clean
+  routed DEF (0 DRC) on gcd, so after E4 lands our guides can drive
+  OpenROAD's own DRT. Re-evaluate then.
+- **E7 DRC** only exists once something emits routed shapes — paired with E6
+  (0 violations on gcd under Magic `drc style drc(full)`, which P-DRC
+  confirmed reads foreign routed DEFs in this image), or as a LEF-rule
+  subset checker on the committed `gcd.routed.def`/`picorv32.routed.def`
+  matching Magic's per-rule `drc listall why` counts exactly (~4 tickets as
+  a subset checker).
