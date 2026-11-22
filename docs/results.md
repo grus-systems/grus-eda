@@ -7769,6 +7769,78 @@ pre-existing `jpeg` placement/dmp ignores), `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --release -p grus-core sta`.
 `kurena/tasks/ux-sta-paths/spec/` untouched; no commits made.
 
+### 2026-11-23 — E9.2/3 — per-domain slack summary + slack histogram (v0.6.1)
+
+`StaReport` gains `domains` (one row per `create_clock` plus a `clock:
+null` unattributed row when needed) and `slack_histogram` (five buckets
+on `worst_max_slack_ns` as a fraction of the capture period), both
+computed by a pure `summarize_domains(&endpoints, &clock_names)` fold;
+`Worst` carries `dom` (the `Sdc::clocks` row of the check that produced
+the candidate) so attribution rides the reported check through both the
+single-state and the partitioned compose paths. No reference tool
+involved — the numbers are folds of our own endpoint rows, and the
+tests re-derive them from `endpoints`.
+
+**Fixture** (`sta_clocks/two_clock.def` + `t2_selmc.sdc`, CLI run):
+8 endpoints, two populated domain rows, no unattributed row.
+
+```text
+STA (zero wire): endpoints=8, setup wns=-0.287329 tns=-0.287329 viol=1, hold wns=-1.851203 tns=-6.513370 viol=5, elapsed=0.72ms
+pulse-width checks: 12 (0 violating)
+domains:
+  clock        endpoints    wns_max    tns_max    wns_min    tns_min  v_setup  v_hold
+  cka                  4  +0.607976  +0.000000  -1.851203  -4.986837        0       3
+  ckb                  4  -0.287329  -0.287329  -0.851203  -1.526533        1       2
+slack histogram (share of capture period): <0: 1   0-20%: 0   20-50%: 1   >50%: 6   no_period: 0
+```
+
+`--json /tmp/t2_selmc.json`: `domains` 2 rows `cka`/`ckb` (membership
+`cka = {u_fa0/D, u_fa1/D, u_fy/D, ya}`, `ckb = {u_fb0/D, u_fb1/D,
+u_fx/D, yb}` — asserted in `test_domain_summary_two_clock`),
+`slack_histogram` 5 buckets summing to 8, `endpoints[]` rows carry no
+`domain_row`/`domain_period_ns` keys. `md_basic.sdc` on
+`sta_exceptions/exceptions.def` (the partitioned compose) yields one
+`core_clk` row over 5 endpoints, no `null` row — the `set_max_delay`
+rewrite keeps the replaced check's anchor. `t2_selmd.sdc` on the same
+DEF does emit a `(none)` row (`endpoints: 1`): the `set_max_delay
+-from [get_clocks cka]` internal-path leaf gets `dom = u8::MAX`.
+
+**Attribution rule** (documented in `docs/e9-reporting.md` §8): each
+endpoint lands in the `Sdc::clocks` row of its *reported* check —
+`clock_domain[clk]` for register/gate candidates, `out_row` of the
+last-producing anchored `-clock` entry for output ports (max preferred,
+the same last-group-wins rule the `EndpointReport` comment records for
+`t2_clkcor2`), delay-rewritten checks keep the replaced check's anchor,
+`req = N` leaves and unclocked captures are unattributed. Merge rule
+(`--lib-hold`): a merged max side keeps setup's `(domain_row, period)`,
+a min-only endpoint takes hold's with setup's as fallback; rows are
+recomputed from the merged `endpoints` with setup's clock names.
+
+**Fail-proof**: forced `domain_row = Some(0)` for every endpoint in
+`endpoint_report`. Result: `test_domain_summary_two_clock` red —
+
+```text
+assertion `left == right` failed: cka members
+  left: {"u_fa1/D", "u_fb0/D", "u_fb1/D", "u_fa0/D", "u_fy/D", "u_fx/D", "ya", "yb"}
+ right: {"u_fy/D", "u_fa0/D", "u_fa1/D", "ya"}
+```
+
+— all eight endpoints attributed to `cka`. `test_domain_summary_
+consistency` stayed green under the corruption **by design**: it
+recomputes over the same `domain_row` it checks, which is exactly why
+the fixture test hardcodes pin->domain membership. Restored; the test
+is green again.
+
+**Version**: `0.6.0 -> 0.6.1`, **patch** — additive JSON fields and
+stdout text only: no new CLI flag, no API signature change beyond
+private types, no `StaReport` consumer breaks (`v0.4.0`/`v0.5.0`/
+`v0.6.0` minors each added a command or flag; this ticket adds none).
+
+**Checks run**: `cargo test --workspace` — `grus-core` 406 passed / 2
+ignored, `grus-eda` 4 passed, doc-tests 0 (335 s); `cargo clippy
+--workspace --all-targets -- -D warnings` — clean. `kurena/tasks/
+ux-sta-summary/spec/` untouched; no commits made.
+
 ### 2026-11-23 — E9.4+E9.5 — `--top` suffix matching + SDC examples doc (v0.6.1)
 
 Ticket `ux-top-sdc` (review items 4+5 of
