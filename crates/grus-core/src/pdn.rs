@@ -429,6 +429,10 @@ pub fn census(db: &DesignDb, tech_db: &TechDb) -> Vec<PdnCensus> {
         .collect()
 }
 
+/// Resistor network over the extracted PDN geometry (E8 ticket 3).
+pub mod mesh;
+pub use mesh::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,7 +443,7 @@ mod tests {
 
     /// Two routing layers, one cut layer, a LEF `VIA` with a non-descriptive
     /// name, and a cell with a `met1` power pin.
-    const PDN_LEF: &str = r#"
+    pub(crate) const PDN_LEF: &str = r#"
 VERSION 5.8 ;
 UNITS
   DATABASE MICRONS 1000 ;
@@ -453,6 +457,7 @@ LAYER met1
   DIRECTION HORIZONTAL ;
   PITCH 0.34 ;
   WIDTH 0.14 ;
+  RESISTANCE RPERSQ 0.38 ;
 END met1
 LAYER via12
   TYPE CUT ;
@@ -463,6 +468,7 @@ LAYER met2
   DIRECTION VERTICAL ;
   PITCH 0.46 ;
   WIDTH 0.14 ;
+  RESISTANCE RPERSQ 0.25 ;
 END met2
 VIA stack_a
   LAYER via12 ;
@@ -489,7 +495,7 @@ END LIBRARY
 
     /// One met1 rail, one met2 stripe over the top-level pad, bridged by one
     /// `stack_a` via at (1000, 0). u1/u2 power pins touch the rail.
-    const PDN_DEF: &str = r#"VERSION 5.8 ;
+    pub(crate) const PDN_DEF: &str = r#"VERSION 5.8 ;
 DIVIDERCHAR "/" ;
 BUSBITCHARS "[]" ;
 DESIGN pdn ;
@@ -520,17 +526,31 @@ END SPECIALNETS
 END DESIGN
 "#;
 
-    fn pdn_design() -> (TechDb, DesignDb) {
+    pub(crate) fn pdn_design() -> (TechDb, DesignDb) {
+        pdn_design_from(PDN_LEF, PDN_DEF)
+    }
+
+    /// Same fixture with respelled LEF/DEF text — the renamed-via tests.
+    pub(crate) fn pdn_design_from(lef: &str, def: &str) -> (TechDb, DesignDb) {
         let mut interner = StringInterner::new();
         let mut tech = TechDb::new();
-        parse_lef_bytes(PDN_LEF.as_bytes(), &mut tech, &mut interner).expect("LEF");
+        parse_lef_bytes(lef.as_bytes(), &mut tech, &mut interner).expect("LEF");
+        // `via_res_ohm_above` is finalized by `load_tech_db`, which the
+        // fixture bypasses — fold `cut_res_above` the same way here.
+        tech.via_res_ohm_above = vec![0.0; tech.routing_layers.len()];
+        for (below, res) in std::mem::take(&mut tech.cut_res_above) {
+            let slot = &mut tech.via_res_ohm_above[below as usize];
+            if *slot == 0.0 {
+                *slot = res;
+            }
+        }
         tech.strings = interner.clone();
         tech.rebuild_maps();
-        let db = parse_def_bytes(PDN_DEF.as_bytes(), &tech, None).expect("DEF");
+        let db = parse_def_bytes(def.as_bytes(), &tech, None).expect("DEF");
         (tech, db)
     }
 
-    fn load_design(design: &str, def_file: &str) -> (TechDb, DesignDb) {
+    pub(crate) fn load_design(design: &str, def_file: &str) -> (TechDb, DesignDb) {
         let lib_dir = sky130_hd();
         let tlef = require(lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"));
         let lef = require(lib_dir.join("lef/sky130_fd_sc_hd.lef"));

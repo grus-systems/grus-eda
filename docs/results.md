@@ -8248,3 +8248,77 @@ Cargo-visible changed, **no version bump**. `cargo test --workspace`
 (402 lib + 4 bin tests, 2 ignored — pre-existing `jpeg` placement/dmp
 ignores) and `cargo clippy --workspace --all-targets -- -D warnings`
 both pass. `kurena/tasks/e6-drt-ref/spec/` untouched; no commits made.
+
+### 2026-11-23 — e8-mesh-rc: PDN resistor network (`PdnMesh`) + census
+
+E8 ticket 3 (`kurena/tasks/e8-mesh-rc/`). Turns each POWER/GROUND
+`PdnNet`'s geometry into the resistor network the DC solver consumes.
+New `pdn::mesh` module (`build_mesh` / `check_mesh` / `meshes`,
+`PdnMesh::validate` / `census`): per wire rect, feature intervals on the
+major axis (rect ends, same-layer overlap spans from the same sorted-x
+sweep `build_graph` runs, via landing points, pin-attach and source
+io-rect intersections) closed-union into junction pieces; pieces sharing
+an overlap span union into `MeshNode`s; consecutive pieces on a rect
+emit `R = res_per_sq × L / W` wire resistors (center-to-center `L`,
+rect minor extent `W`); each `PdnVia` emits one
+`via_res_ohm(cut, cut_count)` resistor. Sinks = the ticket-2 attach set
+verbatim (distinct `graph.attachments` pins, lowest-index candidate
+node); sources = every junction node under the top-level PIN's io-rect
+intersections. Resistance comes only from `TechDb` —
+`routing_layers[].res_per_sq` and `via_res_ohm_above` / `cut_count`, the
+same fields guide parasitics read; no second table. Public/additive API
+→ workspace version `0.7.1`.
+
+**No reference mesh exists**: PDNSim reports voltage scalars + CSV only,
+so the granularity is ours and the census is *recorded, not gated* —
+the `e8-e2e` ticket gates the solve's output.
+
+**Ours**: `cargo test -p grus-core --lib pdn::mesh -- --nocapture` —
+9 tests, `finished in 0.18s` (debug; includes both designs' LEF+DEF
+loads). picorv32 `check_mesh` ≈ 43 ms per net including graph rebuild.
+
+| metric | reference (`*.irdrop.reference.json` / DEF) | ours (`MeshCensus`) | diff | pass? |
+|---|---|---|---|---|
+| gcd VPWR sinks | 384 rows (`voltage.vpwr.embedded.csv`) | `sinks = 384`; sink PinId set == `attachments` pin set | 0 | PASS |
+| gcd VGND sinks | 384 rows | `sinks = 384`; set equal | 0 | PASS |
+| gcd VPWR mesh | — (recorded) | `nodes 244`, `wire_R 197`, `via_R 46`, `sources 2`, `R ∈ [0.1125, 5.630] Ω`, `violations 0` | n/a | recorded |
+| gcd VGND mesh | — (recorded) | `nodes 244`, `wire_R 197`, `via_R 46`, `sources 2`, `R ∈ [0.1125, 6.589] Ω`, `violations 0` | n/a | recorded |
+| gcd via R count | DEF `PdnVia` count 46 | `via_resistors = 46` | 0 | PASS |
+| picorv32 VPWR sinks | 10,205 rows | `sinks = 10,205` | 0 | PASS |
+| picorv32 VGND sinks | 10,205 rows | `sinks = 10,205` | 0 | PASS |
+| picorv32 VPWR mesh | — (recorded) | `nodes 5,468`, `wire_R 4,853`, `via_R 792`, `sources 6`, `R ∈ [0.1125, 16.35] Ω`, `violations 0` | n/a | recorded |
+| picorv32 VGND mesh | — (recorded) | `nodes 5,489`, `wire_R 4,874`, `via_R 792`, `sources 6`, `R ∈ [0.1125, 13.66] Ω`, `violations 0` | n/a | recorded |
+
+Synthetic fixture asserts exact shape (7 nodes / 5 wire + 1 via R /
+2 sinks / 1 source), per-element run arithmetic (`res_per_sq × L/W`,
+L = 500/400/1000 met1, 1800/200 met2), `stack_a` via R = 15.0 through
+the LEF `VIA` block — respelled to `zzz_noname` in LEF+DEF, same R
+(name parsing not load-bearing — the acceptance's renamed-via proof).
+
+**Fail-proof**: unit tests `test_failproof_zero_res_per_sq` (met1
+`RPERSQ` → 0: exactly the 3 met1 runs report `NonPositiveResistance`)
+and `test_failproof_removed_vias` (`vias.clear()`: the 3 rail nodes
+report `UnreachableNode`); `test_synthetic_dangling_via` moves the via
+off the rail → a `dangling` node plus 4 `UnreachableNode`s. Observed
+break on the real test: forced `res_per_sq = 0.0` in `build_mesh`'s
+wire loop → `test_gcd_mesh_census` red (VGND census `violations = 197`,
+every wire R at 0 Ω); restored, green again.
+
+**Deviations from the design API**: `PdnMesh` carries one additive
+`#[serde(default)] multi_node_sinks` field — a bare `PdnMesh` cannot
+re-derive per-pin candidate counts, so `census()` reads the recorded
+value (design left the storage unspecified). `validate()` also reports
+`dangling` via-end nodes as `UnreachableNode` (a stub via endpoint is a
+defect even though resistor-linked), and skips the BFS when the mesh
+has no sources (`NoSources` already carries the verdict).
+
+**Fixture note**: `pdn_design_from` (hoisted from `pdn_design`) now
+folds `cut_res_above` into `via_res_ohm_above` — `parse_lef_bytes`
+alone never runs `load_tech_db`'s finalization, which `via_res_ohm`
+needs. `PDN_LEF` gained `RESISTANCE RPERSQ` on `met1`/`met2`.
+
+**Checks run**: `cargo test --workspace` (443 lib + 6 bin, 2
+pre-existing jpeg ignores; `finished in 112.56s`), `cargo clippy
+--workspace --all-targets -- -D warnings` (clean), `cargo test -p
+grus-core --lib pdn::mesh` (9/9). `kurena/tasks/e8-mesh-rc/spec/`
+untouched; no commits made.

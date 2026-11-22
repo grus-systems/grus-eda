@@ -706,8 +706,15 @@ surface, from the first large-design run's feedback
   `check_power_grid` in `gcd.irdrop.reference.json`; picorv32 gives
   10,205 = 10,205 rows on both rails. `special_wire_rects()` keeps the gcell
   blockage view. See `docs/results.md` 2026-11-23.
-- Missing: resistor mesh, a sparse DC solve (new dependency), per-instance
-  current sources (N7 output).
+- Progress 2026-11-23 (ticket `e8-mesh-rc`): resistor network landed —
+  `pdn::mesh::PdnMesh` (junction-piece nodes, `RPERSQ × L/W` wire runs,
+  `via_res_ohm` stack links, sinks = the attach set, sources = the PIN's
+  io-rect nodes), `validate()` (finite+positive R, source-reachability
+  BFS) + `MeshCensus`. Both designs validate clean; census recorded in
+  `docs/results.md` (no PDNSim mesh golden exists — the e2e ticket gates
+  the solve).
+- Missing: a sparse DC solve (new dependency), per-instance current
+  sources (N7 output).
 - Sizing: ~4–6 tickets (M).
 
 ### E9. Reporting / usability surface
