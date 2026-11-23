@@ -1199,3 +1199,573 @@ fn test_via_edge_fixture() {
     );
     assert!(table.pairs[0].default.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Maze router
+// ---------------------------------------------------------------------------
+
+use grus_core::drt::maze::{
+    FailKind, MazeConfig, OccMode, overlap_census, route_digest, route_nets,
+};
+use grus_core::drt::graph::RouteGraphs;
+
+/// `load` + `load_guide` + `build_route_graphs` + `via_table` — the
+/// full router input bundle for one placed design.
+fn load_routed_inputs(
+    name: &str,
+) -> (
+    TechDb,
+    DesignDb,
+    Vec<LayerTracks>,
+    GuideJoin,
+    RouteGraphs,
+    ViaTable,
+) {
+    let (tech, db, tracks, _) = load(name);
+    let (_, join) = load_guide(&db, &tech, name);
+    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    let vias = via_table(&tech, &db).expect("via_table");
+    (tech, db, tracks, join, graphs, vias)
+}
+
+/// The maze fixture: met1 `HORIZONTAL` + met2 `VERTICAL` on one 6×6
+/// shared-crossing grid, `mv12` between them. `u0/A` is a met1 pin
+/// rect on crossing (1000,1000), `u1/B` a met2 pin on (4000,3000),
+/// `u2/C` a met1 rect holding no track at all (the `Unattachable`
+/// class), and `blk`'s macro `OBS` covers the direct met1 line at
+/// y=1000 between x 1500..2500.
+const MAZE_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+  SPACING 0.14 ;
+END met1
+LAYER via12
+  TYPE CUT ;
+  WIDTH 0.15 ;
+END via12
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+  SPACING 0.14 ;
+END met2
+MACRO CELL
+  CLASS CORE ;
+  SIZE 5.0 BY 5.0 ;
+  PIN A
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER met1 ;
+        RECT 0.9 0.9 1.1 1.1 ;
+    END
+  END A
+END CELL
+MACRO CELLB
+  CLASS CORE ;
+  SIZE 5.0 BY 5.0 ;
+  PIN B
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER met2 ;
+        RECT 3.9 2.9 4.1 3.1 ;
+    END
+  END B
+END CELLB
+MACRO CELLC
+  CLASS CORE ;
+  SIZE 5.0 BY 5.0 ;
+  PIN C
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER met1 ;
+        RECT 1.4 1.4 1.6 1.6 ;
+    END
+  END C
+END CELLC
+MACRO BLK
+  CLASS CORE ;
+  SIZE 5.0 BY 5.0 ;
+  OBS
+    LAYER met1 ;
+      RECT 1.5 0.9 2.5 1.1 ;
+  END
+END BLK
+VIA mv12
+  LAYER via12 ;
+    RECT -0.075 -0.075 0.075 0.075 ;
+  LAYER met1 ;
+    RECT -0.16 -0.13 0.16 0.13 ;
+  LAYER met2 ;
+    RECT -0.13 -0.16 0.13 0.16 ;
+END mv12
+END LIBRARY
+"#;
+
+const MAZE_DEF_HEAD: &str = r#"VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN d ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 5000 5000 ) ;
+ROW ROW_0 unithd 0 0 N DO 10 BY 1 STEP 460 2720 ;
+TRACKS X 0 DO 6 STEP 1000 LAYER met1 ;
+TRACKS Y 0 DO 6 STEP 1000 LAYER met1 ;
+TRACKS X 0 DO 6 STEP 1000 LAYER met2 ;
+TRACKS Y 0 DO 6 STEP 1000 LAYER met2 ;
+"#;
+
+const MAZE_DEF_TAIL: &str = r#"PINS 3 ;
+- io1 + NET n1 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 4000 1000 ) N ;
+- io2 + NET n2 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 1000 3000 ) N ;
+- io3 + NET n3 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 4000 4000 ) N ;
+END PINS
+NETS 3 ;
+- n1 ( PIN io1 ) ( u0 A ) + USE SIGNAL ;
+- n2 ( PIN io2 ) ( u1 B ) + USE SIGNAL ;
+- n3 ( PIN io3 ) ( u2 C ) + USE SIGNAL ;
+END NETS
+END DESIGN
+"#;
+
+fn maze_tech() -> TechDb {
+    let mut interner = StringInterner::new();
+    let mut tech = TechDb::new();
+    parse_lef_bytes(MAZE_LEF.as_bytes(), &mut tech, &mut interner).expect("fixture LEF parses");
+    tech.strings = interner.clone();
+    tech.rebuild_maps();
+    tech
+}
+
+fn maze_db(tech: &TechDb, with_blk: bool) -> DesignDb {
+    let comps = if with_blk {
+        "COMPONENTS 4 ;\n- u0 CELL + PLACED ( 0 0 ) N ;\n- u1 CELLB + PLACED ( 0 0 ) N ;\n- u2 CELLC + PLACED ( 0 0 ) N ;\n- blk BLK + PLACED ( 0 0 ) N ;\nEND COMPONENTS\n"
+    } else {
+        "COMPONENTS 3 ;\n- u0 CELL + PLACED ( 0 0 ) N ;\n- u1 CELLB + PLACED ( 0 0 ) N ;\n- u2 CELLC + PLACED ( 0 0 ) N ;\nEND COMPONENTS\n"
+    };
+    let text = format!("{MAZE_DEF_HEAD}{comps}{MAZE_DEF_TAIL}");
+    parse_def_bytes(text.as_bytes(), tech, None).expect("fixture DEF parses")
+}
+
+fn maze_guide(db: &DesignDb, tech: &TechDb, text: &str) -> GuideJoin {
+    let parsed = parse_guides(text, tech).expect("fixture guide parses");
+    join_guides(db, tech, &parsed).expect("fixture join")
+}
+
+/// The four acceptance cases on the hand-built design: straight met1
+/// route, forced met1→met2 via, detour around a macro `OBS` interval
+/// (control vs blocked), and named unroutable pins — `NoPath` from a
+/// disconnected region and `Unattachable` from a track-less rect —
+/// all returning inside the iteration cap.
+#[test]
+fn test_maze_cases() {
+    let tech = maze_tech();
+    let cfg = MazeConfig::default();
+
+    // Case 1 — straight route on one track.
+    let db = maze_db(&tech, false);
+    let tracks = layer_tracks(&db, &tech);
+    let join = maze_guide(&db, &tech, "n1\n(\n0 0 5000 2000 met1\n)\n");
+    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    let vias = via_table(&tech, &db).unwrap();
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+    assert_eq!(r.nets.len(), 1);
+    let n1 = &r.nets[0];
+    assert_eq!(
+        n1.wires,
+        vec![grus_core::drt::maze::WireSeg {
+            layer: LayerId(0),
+            x1: 1000,
+            y1: 1000,
+            x2: 4000,
+            y2: 1000
+        }],
+        "straight route must be a single merged met1 segment"
+    );
+    assert!(n1.vias.is_empty());
+    assert_eq!(n1.connected.len(), 2);
+    assert!(r.collisions.is_empty());
+    let control_wires = n1.wires.len();
+
+    // Case 2 — forced via transition: met1 io pin to a met2-only pin.
+    let join = maze_guide(
+        &db,
+        &tech,
+        "n2\n(\n0 0 5000 5000 met1\n0 0 5000 5000 met2\n)\n",
+    );
+    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+    let n2 = &r.nets[0];
+    assert_eq!(n2.connected.len(), 2);
+    assert_eq!(
+        n2.vias,
+        vec![grus_core::drt::maze::ViaPlace {
+            lower: LayerId(0),
+            x: 4000,
+            y: 3000
+        }],
+        "single cheapest via at the met2 pin's shared crossing"
+    );
+
+    // Case 3 — detour around the blocked interval: same n1 geometry
+    // as case 1 but the `blk` macro's OBS rect sits on the direct
+    // met1 line.
+    let db_blk = maze_db(&tech, true);
+    let tracks_blk = layer_tracks(&db_blk, &tech);
+    let join = maze_guide(&db_blk, &tech, "n1\n(\n0 0 5000 2000 met1\n)\n");
+    let graphs = build_route_graphs(&db_blk, &tech, &tracks_blk, &join);
+    let vias_blk = via_table(&tech, &db_blk).unwrap();
+    let r = route_nets(&db_blk, &tech, &tracks_blk, &graphs, &vias_blk, &cfg);
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+    let n1 = &r.nets[0];
+    assert_eq!(n1.connected.len(), 2);
+    assert!(
+        n1.wires.len() > control_wires,
+        "the OBS detour must jog ({control_wires} control vs {} routed)",
+        n1.wires.len()
+    );
+    // The emitted intervals — not trust — prove the detour: no met1
+    // wire may enter the OBS rect inflated by w/2 + s = 210.
+    let inflated = grus_core::tech_db::RectDbu::new(1500 - 210, 900 - 210, 2500 + 210, 1100 + 210);
+    for w in &n1.wires {
+        let hit = w.x1 < inflated.xh && w.x2 > inflated.xl && w.y1 < inflated.yh && w.y2 > inflated.yl;
+        assert!(!hit, "wire {w:?} enters the OBS spacing band");
+    }
+
+    // Case 4 — provably unroutable, both classes: n1's guide splits
+    // into two components (io reachable, u0/A `NoPath`), and u2/C's
+    // rect covers no track at all (`Unattachable`). Bounded by
+    // `max_iters` — the harness completing is the no-hang evidence.
+    let join = maze_guide(
+        &db,
+        &tech,
+        "n1\n(\n0 0 2000 2000 met1\n3500 500 4500 1500 met1\n)\nn3\n(\n0 0 5000 5000 met1\n)\n",
+    );
+    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert!(r.nets.is_empty(), "{:?}", r.nets);
+    assert_eq!(r.unrouted.len(), 2, "{:?}", r.unrouted);
+    let labels = |u: &grus_core::drt::maze::UnroutedNet| -> Vec<(String, FailKind)> {
+        u.failed
+            .iter()
+            .map(|&(p, k)| (pin_label(&db, p), k))
+            .collect()
+    };
+    assert_eq!(net_name(&db, r.unrouted[0].net), "n1");
+    assert_eq!(
+        labels(&r.unrouted[0]),
+        vec![("u0/A".to_string(), FailKind::NoPath)]
+    );
+    assert_eq!(net_name(&db, r.unrouted[1].net), "n3");
+    assert_eq!(
+        labels(&r.unrouted[1]),
+        vec![("u2/C".to_string(), FailKind::Unattachable)]
+    );
+}
+
+/// True when the net's guide boxes form a single component under
+/// same-layer / adjacent-layer 2D-overlap (the planning probe's union
+/// connectivity). `max_layer` bounds the box set (LayerId(2) = met2).
+fn guide_union_connected(boxes: &[GuideBox], max_layer: u8) -> bool {
+    let kept: Vec<usize> = (0..boxes.len())
+        .filter(|&i| boxes[i].layer.0 <= max_layer)
+        .collect();
+    if kept.is_empty() {
+        return false;
+    }
+    let mut parent: Vec<usize> = (0..kept.len()).collect();
+    fn find(p: &mut Vec<usize>, i: usize) -> usize {
+        let mut r = i;
+        while p[r] != r {
+            r = p[r];
+        }
+        let mut j = i;
+        while p[j] != r {
+            let n = p[j];
+            p[j] = r;
+            j = n;
+        }
+        r
+    }
+    for a in 0..kept.len() {
+        for b in a + 1..kept.len() {
+            let (ba, bb) = (&boxes[kept[a]], &boxes[kept[b]]);
+            if ba.layer.0.abs_diff(bb.layer.0) > 1 {
+                continue;
+            }
+            let r = (
+                ba.rect.xl < bb.rect.xh,
+                ba.rect.xh > bb.rect.xl,
+                ba.rect.yl < bb.rect.yh,
+                ba.rect.yh > bb.rect.yl,
+            );
+            if r.0 && r.1 && r.2 && r.3 {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent[ra] = rb;
+                }
+            }
+        }
+    }
+    (0..kept.len())
+        .map(|i| find(&mut parent, i))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        == 1
+}
+
+/// The connectivity census: every guided signal net either routes all
+/// member pins or lands in the unrouted report with every failed pin
+/// named (`FailKind`). Prints the counts `docs/results.md` records —
+/// guided, routed, pins connected, projection-attachment count,
+/// unrouted by name, collisions, iterations, wall-clock ms.
+#[test]
+fn test_maze_census() {
+    for name in ["gcd", "picorv32"] {
+        let (tech, db, tracks, join, graphs, vias) = load_routed_inputs(name);
+        let t0 = std::time::Instant::now();
+        let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+        let ms = t0.elapsed().as_millis();
+
+        let pins_connected: usize = r.nets.iter().map(|n| n.connected.len()).sum();
+        let projected: usize = r.nets.iter().map(|n| n.projected.len()).sum();
+        println!("== {name} maze census ==");
+        println!(
+            "{name}: guided={} routed={} pins_connected={pins_connected} projected={projected} unrouted={} collisions={} iterations={} ms={ms} digest={:#x}",
+            join.nets.len(),
+            r.nets.len(),
+            r.unrouted.len(),
+            r.collisions.len(),
+            r.iterations,
+            route_digest(&r),
+        );
+        for u in &r.unrouted {
+            let kinds: Vec<String> = u
+                .failed
+                .iter()
+                .map(|&(p, k)| format!("{}:{k:?}", pin_label(&db, p)))
+                .collect();
+            println!("  unrouted {} pins={kinds:?}", net_name(&db, u.net));
+        }
+
+        // Total accounting — no silent drops.
+        assert_eq!(
+            r.nets.len() + r.unrouted.len(),
+            join.nets.len(),
+            "{name}: nets + unrouted != guided"
+        );
+        // Every failure is a named pin with a kind.
+        for u in &r.unrouted {
+            assert!(!u.failed.is_empty(), "{name}: unnamed failure");
+        }
+        // Nonzero evidence.
+        assert!(!r.nets.is_empty(), "{name}: nothing routed");
+        assert!(
+            r.nets.iter().all(|n| !n.wires.is_empty()),
+            "{name}: routed net with no wires"
+        );
+
+        // Classify `NoPath` nets: the met3-bridge class has a
+        // disconnected {li1,met1,met2} box union that only the met3+
+        // boxes rejoin (the recorded met2–met3 crossing gap).
+        let mut unclassified = Vec::new();
+        for u in &r.unrouted {
+            let (_, boxes) = join
+                .nets
+                .iter()
+                .find(|(n, _)| *n == u.net)
+                .expect("unrouted net must be guided");
+            let bridged = !guide_union_connected(boxes, 2) && guide_union_connected(boxes, u8::MAX);
+            for (_, k) in &u.failed {
+                if *k == FailKind::NoPath && !bridged {
+                    unclassified.push(net_name(&db, u.net));
+                }
+            }
+            println!(
+                "  {} met3_bridge={bridged}",
+                net_name(&db, u.net)
+            );
+        }
+        assert!(
+            unclassified.is_empty(),
+            "{name}: NoPath nets outside the met3-bridge class: {unclassified:?}"
+        );
+    }
+}
+
+/// Occupancy fail-proof (AGENTS §7.7): identical inputs, `Enabled` vs
+/// `Disabled` — the outcomes must measurably differ somewhere (route
+/// digest or post-hoc collision census), else occupancy constrains
+/// nothing and the gate must go red.
+#[test]
+fn test_maze_occupancy() {
+    let (tech, db, tracks, _, graphs, vias) = load_routed_inputs("gcd");
+    let on = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+    let off = route_nets(
+        &db,
+        &tech,
+        &tracks,
+        &graphs,
+        &vias,
+        &MazeConfig {
+            occ: OccMode::Disabled,
+            ..MazeConfig::default()
+        },
+    );
+    let on_census = overlap_census(&on.nets, &tech, &tracks, &vias).len();
+    let off_census = overlap_census(&off.nets, &tech, &tracks, &vias).len();
+    println!(
+        "occupancy fail-proof: enabled digest={:#x} census={on_census} | disabled digest={:#x} census={off_census}",
+        route_digest(&on),
+        route_digest(&off),
+    );
+    assert!(
+        route_digest(&on) != route_digest(&off) || on_census != off_census,
+        "disabling occupancy changed nothing — occupancy constrains no route"
+    );
+}
+
+/// Determinism with nonzero evidence (§7.7): two full `route_nets`
+/// calls produce an identical `RouteDb` and identical digest on both
+/// designs.
+#[test]
+fn test_maze_determinism() {
+    for name in ["gcd", "picorv32"] {
+        let (tech, db, tracks, _, graphs, vias) = load_routed_inputs(name);
+        let cfg = MazeConfig::default();
+        let r1 = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+        let r2 = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+        assert!(!r1.nets.is_empty(), "{name}: empty route set proves nothing");
+        assert_ne!(route_digest(&r1), 0, "{name}: zero digest");
+        assert_eq!(r1, r2, "{name}: nondeterministic routes");
+        assert_eq!(route_digest(&r1), route_digest(&r2));
+    }
+}
+
+/// Temporary diagnosis for the gcd NoPath flood: routes each guided
+/// net standalone under `OccMode::Disabled` (foreign-Net checks off,
+/// `Obs` still blocking) and prints the first few failures with their
+/// attach-set sizes — separates Obs-walling from foreign occupancy.
+#[test]
+fn test_maze_debug_gcd() {
+    let (tech, db, tracks, join, graphs, vias) = load_routed_inputs("gcd");
+    let cfg = MazeConfig {
+        occ: OccMode::Disabled,
+        max_iters: 1,
+    };
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    println!(
+        "disabled+1iter: routed={} unrouted={}",
+        r.nets.len(),
+        r.unrouted.len()
+    );
+    for u in r.unrouted.iter().take(5) {
+        let g = graphs.nets.iter().find(|g| g.net == u.net).unwrap();
+        let sizes: Vec<usize> = g.pin_nodes.iter().map(|(_, s)| s.len()).collect();
+        println!(
+            "  {} nodes={} edges={} vedges={} attach_sizes={sizes:?} connected={} failed={}",
+            net_name(&db, u.net),
+            g.nodes.len(),
+            g.edges.len(),
+            g.via_edges.len(),
+            u.connected.len(),
+            u.failed.len(),
+        );
+    }
+    let cfg_on = MazeConfig {
+        occ: OccMode::Enabled,
+        max_iters: 1,
+    };
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg_on);
+    println!(
+        "enabled+1iter: routed={} unrouted={}",
+        r.nets.len(),
+        r.unrouted.len()
+    );
+
+    // Obs-blocking census: how many in-plane edges of each net are
+    // hard-blocked by macro OBS (+ unlinked pin shapes).
+    let stats = grus_core::drt::maze::debug_edge_stats(&db, &tech, &tracks, &graphs, &vias);
+    let total_e: usize = stats.iter().map(|s| s.1).sum();
+    let total_b: usize = stats.iter().map(|s| s.2).sum();
+    println!("obs-blocked in-plane edges: {total_b}/{total_e}");
+    for (net, edges, blocked, nodes) in stats.iter().take(10) {
+        println!(
+            "  {} nodes={nodes} edges={edges} obs_blocked={blocked}",
+            net_name(&db, NetId(*net))
+        );
+    }
+    let n0 = stats[0].0;
+    println!("--- net {} pin approach ---", net_name(&db, NetId(n0)));
+    println!(
+        "{}",
+        grus_core::drt::maze::debug_pin_approach(&db, &tech, &tracks, &graphs, &vias, n0)
+    );
+    for want in ["_010_", "_012_", "_038_", "clk"] {
+        let n = (0..db.num_nets() as u32)
+            .map(NetId)
+            .find(|&n| net_name(&db, n) == want)
+            .unwrap_or_else(|| panic!("{want}"));
+        println!("--- net {want} wave ---");
+        println!(
+            "{}",
+            grus_core::drt::maze::debug_net_wave(&db, &tech, &tracks, &graphs, &vias, n.0)
+        );
+    }
+
+    // Dump the failing pin's macro OBS vs pin rects on li1 (layer 0).
+    let p = (0..db.pin_names.len())
+        .map(|i| PinId(i as u32))
+        .find(|&p| pin_label(&db, p) == "_411_/D")
+        .expect("_411_/D");
+    let c = db.pin_cells[p.0 as usize].unwrap();
+    let mac = &tech.macros[db.cell_macros[c.0 as usize].0 as usize];
+    let (cx, cy) = (db.cell_x_dbu[c.0 as usize], db.cell_y_dbu[c.0 as usize]);
+    let o = db.cell_orient[c.0 as usize];
+    println!(
+        "_411_ macro {} at ({cx},{cy}) orient {o:?} obs_rects={} pin_obs={}",
+        tech.strings.resolve(mac.name),
+        mac.obs_rects.len(),
+        mac.pin_obs_rects.len()
+    );
+    for &(l, r) in &mac.obs_rects {
+        if l.0 == 0 {
+            let rr = DesignDb::orient_rect(r, mac.width_dbu, mac.height_dbu, o);
+            println!(
+                "  obs l{} [{},{},{},{}]",
+                l.0,
+                cx + rr.xl,
+                cy + rr.yl,
+                cx + rr.xh,
+                cy + rr.yh
+            );
+        }
+    }
+    let mp = db.pin_macro_pins[p.0 as usize].unwrap();
+    for &(l, r) in &tech.macro_pins[mp.0 as usize].rects {
+        let rr = DesignDb::orient_rect(r, mac.width_dbu, mac.height_dbu, o);
+        println!(
+            "  pin D l{} [{},{},{},{}]",
+            l.0,
+            cx + rr.xl,
+            cy + rr.yl,
+            cx + rr.xh,
+            cy + rr.yh
+        );
+    }
+}
