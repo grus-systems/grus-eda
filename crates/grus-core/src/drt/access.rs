@@ -145,7 +145,9 @@ pub fn access_points(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks]) -> Ac
                                 x,
                                 y,
                             });
-                            report.per_layer[lid.0 as usize] += 1;
+                            if let Some(c) = report.per_layer.get_mut(lid.0 as usize) {
+                                *c += 1;
+                            }
                             emitted += 1;
                         }
                     }

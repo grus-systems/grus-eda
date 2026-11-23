@@ -342,6 +342,12 @@ fn parse_tracks(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
                     ),
                 }
             }
+            if layers.is_empty() {
+                bail!(
+                    "LEF line {}: TRACKS LAYER requires at least one layer name",
+                    lexer.line()
+                );
+            }
         }
         other => bail!(
             "LEF line {}: TRACKS expects `;` or `LAYER <name>... ;`, found {other:?}",
@@ -2196,6 +2202,7 @@ END LIBRARY
             "TRACKS X 0.1 1 STEP 0.1 LAYER met1 ;",    // missing DO
             "TRACKS X abc DO 1 STEP 0.1 LAYER met1 ;", // non-numeric start
             "TRACKS X 0.1 DO 1 STEP 0.1 MASK 3 LAYER met1 ;", // MASK token
+            "TRACKS X 0.1 DO 1 STEP 0.1 LAYER ;",       // empty LAYER list
             "TRACKS Q 0.1 DO 1 STEP 0.1 LAYER met1 ;", // bad axis
         ] {
             let lef = format!("{TRACKS_LEF}{needle}\nEND LIBRARY\n");

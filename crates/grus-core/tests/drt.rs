@@ -111,7 +111,7 @@ fn print_findings(db: &DesignDb, report: &AccessReport) {
 #[test]
 fn test_track_census() {
     for name in ["gcd", "picorv32"] {
-        let (tech, db, tracks, _) = load(name);
+        let (tech, _, tracks, _) = load(name);
         println!("== {name} track census (layer dir tracks_x tracks_y) ==");
         for (i, layer) in tech.routing_layers.iter().enumerate() {
             println!(
@@ -146,7 +146,6 @@ fn test_track_census() {
             .map(|l| l.tracks_x.len() + l.tracks_y.len())
             .sum();
         println!("{name}: LEF-source track coords total = {lef_total} (grid is DEF-sourced)");
-        let _ = db;
     }
 }
 

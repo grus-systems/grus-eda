@@ -9125,3 +9125,12 @@ on-grid io port still emits points — a finding, not a void.
 regenerated). Version `0.12.0 → 0.12.1` (feature addition, patch on
 0.x). `LayerId`/`PinId` gained `Ord` for the layer-ordered emission.
 No commit per ticket instruction.
+
+**Card-#49 follow-ups on `dev`**: (1) `TRACKS ... LAYER ;` — the
+keyword with zero layer names now errors instead of silently
+widening to all layers; covered by a new malformed-record case in
+`test_tracks_malformed_errors`. (2) `test_track_census` drops the
+`let _ = db;` workaround for a plain `(_, _, tracks, _)` destructure.
+(3) `access_points` writes `per_layer` through `get_mut` so the
+index cannot outlive the `tracks.get` guard. `cargo test -p
+grus-core --lib readers::lef` 30/30, `--test drt` 4/4, clippy clean.
