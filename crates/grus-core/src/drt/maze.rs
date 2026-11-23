@@ -6,6 +6,7 @@
 //! claim boundary.
 
 use crate::design_db::{DesignDb, PlacementStatus};
+use crate::drc::geom::expand_via;
 use crate::drc::DrcLayer;
 use crate::drt::access::pin_shapes;
 use crate::drt::graph::{NetGraph, RouteGraphs};
@@ -445,14 +446,18 @@ impl Occupancy {
 
 /// Pre-marks every placed cell's macro `obs_rects` as `Obs` (the
 /// `drc::geom` source-4 convention: `{Placed, Fixed, Cover}` gate +
-/// `orient_rect` + translate, replicated for OBS only), and every
+/// `orient_rect` + translate, replicated for OBS only), every
 /// instance pin's shapes as `Pin(own_net)` — a pin's metal is free to
 /// its own net, soft-priced for foreign nets, and never a hard block
 /// (rip-up cannot move it; a landing wire is an emit-time DRC
-/// finding). Pins without a net get `Obs(u32::MAX)` — immovable
-/// blockage with no exempting host. io-port rects are not marked
-/// (recorded simplification — pin-access DRC is the emit/e2e tickets'
-/// job).
+/// finding) — and every PDN `SPECIALNETS` wire rect and via stack
+/// metal as `Obs(u32::MAX)`. Pins without a net and PDN metal get
+/// `Obs(u32::MAX)` — immovable blockage with no exempting host:
+/// signal routes must hold the `w/2 + s` band off the power grid.
+/// io-port rects mark as `Pin(own_net)` like instance pins — a
+/// foreign wire inside a port's spacing band is a real emit-time
+/// finding (the gcd `met3.2` `req_msg`/`resp_msg` class), so the
+/// band is priced even though it never hard-blocks.
 fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut Occupancy) {
     for c in 0..db.num_cells() {
         if !matches!(
@@ -474,13 +479,12 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
         }
     }
     for p in 0..db.pin_names.len() {
-        let Some(c) = db.pin_cells[p] else {
-            continue; // io-port rects unmarked (recorded above)
-        };
-        if !matches!(
-            db.cell_status[c.0 as usize],
-            PlacementStatus::Placed | PlacementStatus::Fixed | PlacementStatus::Cover
-        ) {
+        if let Some(c) = db.pin_cells[p]
+            && !matches!(
+                db.cell_status[c.0 as usize],
+                PlacementStatus::Placed | PlacementStatus::Fixed | PlacementStatus::Cover
+            )
+        {
             continue;
         }
         let pin = PinId(p as u32);
@@ -488,6 +492,25 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
         for (lid, r) in pin_shapes(db, tech, pin) {
             if (lid.0 as usize) < occ.lines_x.len() {
                 occ.rasterize(tracks, lid.0, &r, who, None);
+            }
+        }
+    }
+    // PDN stripes and via stacks: fixed metal every signal net must
+    // clear — the emit-time self-DRC measures spacing against these
+    // shapes, so the router has to price them.
+    for pdn in &db.pdn_nets {
+        for &(lid, r) in &pdn.wire_rects {
+            if (lid.0 as usize) < occ.lines_x.len() {
+                occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
+            }
+        }
+        for via in &pdn.vias {
+            for (dl, r) in expand_via(via, tech).expect("pdn via resolved at parse") {
+                if let DrcLayer::Routing(lid) = dl
+                    && (lid.0 as usize) < occ.lines_x.len()
+                {
+                    occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
+                }
             }
         }
     }
@@ -1450,6 +1473,44 @@ fn route_one_net(
                     .entry((rv.lower + 1, by))
                     .or_default()
                     .push((bx.min(rv.x), bx.max(rv.x)));
+            }
+        }
+    }
+    // Projected-pin access stubs: `project_attach` attaches at an
+    // in-region node within one track of the pin rect, but the pin's
+    // metal may not reach the shape committed at that node — paint
+    // the single-axis stub closing the gap (the node's x or y lies
+    // inside the rect's covered range by `project_attach`
+    // construction, so the stub is always axis-aligned).
+    for (pi, &(pin, _)) in g.pin_nodes.iter().enumerate() {
+        if !run.connected[pi] || !topo.projected[pi] {
+            continue;
+        }
+        'shapes: for &(lid, r) in &pin_shapes(db, tech, pin) {
+            for &v in &topo.attach[pi] {
+                if g.nodes[v as usize].layer != lid || !run.in_tree[v as usize] {
+                    continue;
+                }
+                let (x, y) = node_xy(g, tracks, v);
+                let (cx, cy) = (x.clamp(r.xl, r.xh), y.clamp(r.yl, r.yh));
+                if x == cx {
+                    if y != cy {
+                        vlines
+                            .entry((lid.0, x))
+                            .or_default()
+                            .push((cy.min(y), cy.max(y)));
+                    }
+                    break 'shapes;
+                }
+                if y == cy {
+                    hlines
+                        .entry((lid.0, y))
+                        .or_default()
+                        .push((cx.min(x), cx.max(x)));
+                    break 'shapes;
+                }
+                // This node is not adjacent to this shape — another
+                // of the pin's shapes produced it.
             }
         }
     }

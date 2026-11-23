@@ -1702,3 +1702,423 @@ fn maze_determinism(name: &str) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Routed DEF emission + self-DRC gate
+// ---------------------------------------------------------------------------
+
+use grus_core::drc::geom::assemble;
+use grus_core::drc::report::{Family, SubsetReport, run_all};
+use grus_core::drt::emit::{EmitReport, apply_routes, write_routed_def};
+use grus_core::drt::maze::RouteDb;
+
+/// Route `name` and apply the result into `db.net_geoms` — the shared
+/// emit leg (gcd routes in seconds; picorv32 legs live under
+/// `#[ignore]`).
+fn emit_leg(
+    name: &str,
+    cfg: &MazeConfig,
+) -> (TechDb, DesignDb, RouteDb, ViaTable, EmitReport) {
+    let (tech, mut db, tracks, _join, graphs, vias) = load_routed_inputs(name);
+    let route_db = route_nets(&db, &tech, &tracks, &graphs, &vias, cfg);
+    let report =
+        apply_routes(&mut db, &tech, &graphs, &route_db, &vias).expect("apply_routes");
+    (tech, db, route_db, vias, report)
+}
+
+fn tmp_def(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("grus-drt-emit-{}-{tag}.def", std::process::id()))
+}
+
+fn placed_def(name: &str) -> PathBuf {
+    require(design_dir(name).join(format!("{name}.placed.def")))
+}
+
+/// The gate sequence: write → re-parse → assemble → `run_all`. The
+/// re-parse (`db2`, not `db`) is deliberate — it forces the emitted
+/// text through `parse_net_wire`/`resolve_def_via`, so broken grammar
+/// or dropped conns surface as parse errors, not wrong geometry.
+fn self_drc(out: &Path, tech: &TechDb) -> (DesignDb, SubsetReport) {
+    let db2 = parse_def(out, tech, None).expect("emitted DEF re-parses");
+    let drc = assemble(&db2, tech).expect("assemble");
+    let report = run_all(&drc, tech, &db2.strings);
+    (db2, report)
+}
+
+fn findings_total(report: &SubsetReport) -> usize {
+    report.rules.iter().map(|o| o.findings.len()).sum()
+}
+
+fn print_gate(name: &str, report: &SubsetReport) {
+    println!("{name} self_drc findings_total={}", findings_total(report));
+    for o in &report.rules {
+        if o.findings.is_empty() {
+            continue;
+        }
+        println!(
+            "  rule={} layer={} candidates={} findings={}",
+            o.rule,
+            o.layer.as_deref().unwrap_or("-"),
+            o.candidates,
+            o.findings.len()
+        );
+        for f in &o.findings {
+            println!("    {f:?}");
+        }
+    }
+}
+
+/// Wire/via totals across all nets — the gate's non-vacuity evidence.
+fn geom_totals(db: &DesignDb) -> (usize, usize) {
+    (
+        db.net_geoms.iter().map(|g| g.wire_rects.len()).sum(),
+        db.net_geoms.iter().map(|g| g.vias.len()).sum(),
+    )
+}
+
+/// The structural census vs `<d>.drt.reference.json` — informational
+/// signed deltas against the delegated (same-guide) variant, baseline
+/// as context. Asserts stay on the non-vacuity properties: emitted
+/// cut names are real tech cut layers, totals are nonzero, and both
+/// reference variants carry a mappable via census.
+fn print_emit_census(name: &str, tech: &TechDb, db: &DesignDb, report: &EmitReport) {
+    let cut_names: std::collections::BTreeSet<String> = tech
+        .cut_layers
+        .iter()
+        .map(|c| tech.strings.resolve(c.name).to_string())
+        .collect();
+    let refj = load_drt_ref(name);
+    let by_cut = |variant: &str| -> BTreeMap<String, u64> {
+        let v = &refj["variants"][variant];
+        let census = v["vias_per_cut_layer"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name}: variants.{variant}.vias_per_cut_layer missing"));
+        let meaning = v["via_names_meaning"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name}: variants.{variant}.via_names_meaning missing"));
+        let mut out = BTreeMap::new();
+        for (via_name, count) in census {
+            let cut = meaning
+                .get(via_name)
+                .and_then(|m| m.as_str())
+                .unwrap_or("<unknown>");
+            *out.entry(cut.to_string()).or_default() += count.as_u64().unwrap();
+        }
+        out
+    };
+    let delegated = by_cut("delegated");
+    let baseline = by_cut("baseline");
+
+    let um = report.wire_length_dbu as f64 / db.dbu_per_micron.max(1) as f64;
+    let wl = |v: &serde_json::Value| {
+        v["total_wirelength_um"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{name}: total_wirelength_um missing"))
+    };
+    let del_wl = wl(&refj["variants"]["delegated"]);
+    let base_wl = wl(&refj["variants"]["baseline"]);
+    println!("== {name} emit census ==");
+    println!(
+        "wirelength_um ours={um:.3} delegated={del_wl:.3} delta={:+.3} baseline={base_wl:.3}",
+        um - del_wl
+    );
+    let mut cuts: std::collections::BTreeSet<String> =
+        report.vias_per_cut.keys().cloned().collect();
+    cuts.extend(delegated.keys().cloned());
+    cuts.extend(baseline.keys().cloned());
+    for cut in &cuts {
+        let ours = report.vias_per_cut.get(cut).copied().unwrap_or(0) as i64;
+        let del = delegated.get(cut).copied();
+        let base = baseline.get(cut).copied();
+        println!(
+            "via.{cut:<6} ours={ours} delegated={} delta={} baseline={}",
+            del.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            del.map(|v| format!("{:+}", ours - v as i64))
+                .unwrap_or_else(|| "-".into()),
+            base.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+        );
+    }
+    assert!(!report.vias_per_cut.is_empty(), "{name}: no vias emitted");
+    for cut in report.vias_per_cut.keys() {
+        assert!(
+            cut_names.contains(cut),
+            "{name}: emitted cut name {cut} is not a tech cut layer"
+        );
+    }
+    assert!(
+        cuts.iter().filter(|c| cut_names.contains(*c)).count() >= 3,
+        "{name}: reference census maps to <3 real cut layers: {cuts:?}"
+    );
+}
+
+/// Route → emit → write → re-parse → `run_all` on `name` — the shared
+/// body of the gcd/picorv32 gate tests.
+fn emit_gate(name: &str) {
+    let (tech, db, _route_db, _vias, report) = emit_leg(name, &MazeConfig::default());
+    let (rects, vias) = geom_totals(&db);
+    println!(
+        "{name}: routed={} unrouted={} wire_rects={rects} vias={vias} wirelength_dbu={}",
+        report.routed,
+        report.unrouted.len(),
+        report.wire_length_dbu
+    );
+    for n in &report.unrouted {
+        println!("  unrouted {n}");
+    }
+    assert!(rects > 0 && vias > 0, "{name}: empty emission — vacuous gate");
+    print_emit_census(name, &tech, &db, &report);
+
+    let out = tmp_def(&format!("{name}-gate"));
+    write_routed_def(&db, &tech, &placed_def(name), &out).expect("write routed DEF");
+    let (db2, drc_report) = self_drc(&out, &tech);
+    print_gate(name, &drc_report);
+
+    // Non-vacuity: every checked family actually saw candidates — a
+    // gate that checks nothing proves nothing.
+    for family in [
+        Family::Width,
+        Family::Spacing,
+        Family::Enclosure,
+        Family::Area,
+    ] {
+        let candidates: usize = drc_report
+            .rules
+            .iter()
+            .filter(|o| o.family == family)
+            .map(|o| o.candidates)
+            .sum();
+        assert!(candidates > 0, "{name}: {family:?} family checked nothing");
+    }
+    // Determinism: a second `run_all` over the same assembled design
+    // repeats the report verbatim.
+    let drc2 = assemble(&db2, &tech).expect("assemble");
+    assert_eq!(drc_report, run_all(&drc2, &tech, &db2.strings));
+
+    let firing: Vec<String> = drc_report
+        .rules
+        .iter()
+        .filter(|o| !o.findings.is_empty())
+        .map(|o| format!("{}:{}", o.rule, o.findings.len()))
+        .collect();
+    assert!(
+        firing.is_empty(),
+        "{name}: self-DRC findings on our emitted DEF: {firing:?}"
+    );
+}
+
+/// The byte-stable roundtrip — the acceptance's write → parse → write
+/// → identical. `out2` uses `out1` as its own template, exercising the
+/// fixed point rather than only the placed template.
+#[test]
+fn test_emit_roundtrip_gcd() {
+    let (tech, db, route_db, _vias, report) = emit_leg("gcd", &MazeConfig::default());
+    assert_eq!(report.routed, route_db.nets.len());
+    assert!(report.unrouted.is_empty(), "{:?}", report.unrouted);
+    assert!(report.wire_length_dbu > 0);
+    let (rects, vias) = geom_totals(&db);
+    assert!(rects > 0 && vias > 0);
+
+    let out1 = tmp_def("gcd-rt1");
+    let out2 = tmp_def("gcd-rt2");
+    write_routed_def(&db, &tech, &placed_def("gcd"), &out1).expect("write out1");
+    let db2 = parse_def(&out1, &tech, None).expect("re-parse out1");
+    assert_eq!(
+        db2.net_geoms, db.net_geoms,
+        "re-parsed net_geoms differ from applied geometry"
+    );
+    write_routed_def(&db2, &tech, &out1, &out2).expect("write out2");
+    assert_eq!(
+        std::fs::read(&out1).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "write → parse → write is not byte-stable"
+    );
+}
+
+/// The acceptance gate: `run_all` reports zero findings across all 50
+/// subset rules on our own emitted DEF — the same bar `tests/drc.rs`
+/// puts on TritonRoute's. This is our 50-rule lef-expressible subset
+/// on our DEF; the full Magic deck check belongs to `e6-drt-e2e`.
+#[test]
+fn test_emit_selfdrc_gcd() {
+    emit_gate("gcd");
+}
+
+/// Ignored for wall clock (`route_nets` ≈ 135 min release) — run
+/// detached with `--ignored --nocapture`; the unrouted names print
+/// per net (picorv32's met3-bridge `NoPath` class).
+#[test]
+#[ignore]
+fn test_emit_selfdrc_picorv32() {
+    emit_gate("picorv32");
+}
+
+/// The fail-proof (AGENTS §7.7): the gate must go red on deliberately
+/// broken input. Arm A stretches one `wire_rect` onto a foreign
+/// neighbour — emit→parse→`run_all` must report the spacing violation
+/// the emitted text describes. Arm B routes with `OccMode::Disabled`
+/// (`test_maze_occupancy` proves thousands of track collisions) — the
+/// overlapping geometry must reach the checker through our emitted
+/// text.
+#[test]
+fn test_emit_fail_proof() {
+    // Arm A — injected geometry. The subset checker models spacing as
+    // a positive gap in (0, bound): `axis_gap` clamps overlaps to
+    // (0,0), which reads as edge-abutting `touching_ok` — a same-layer
+    // short is connectivity-check territory, not this subset's. The
+    // injected defect is therefore a positive sub-bound gap, the
+    // class the spacing rules measure.
+    let (tech, mut db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let met1 = tech.layer_by_name[&tech.strings.get("met1").unwrap()];
+    let bound = tech.routing_layers[met1.0 as usize].min_spacing_dbu();
+    let mut hit = None;
+    'scan: for (ai, ga) in db.net_geoms.iter().enumerate() {
+        for (aj, &(lid, ra)) in ga.wire_rects.iter().enumerate() {
+            if lid != met1 {
+                continue;
+            }
+            for gb in db.net_geoms.iter().skip(ai + 1) {
+                for &(blid, rb) in &gb.wire_rects {
+                    if blid != lid {
+                        continue;
+                    }
+                    if rb.yl < ra.yh && ra.yl < rb.yh && rb.xl - ra.xh >= bound {
+                        hit = Some((ai, aj, rb.xl));
+                        break 'scan;
+                    }
+                }
+            }
+        }
+    }
+    let (ai, aj, foreign_xl) =
+        hit.expect("no clean foreign-net met1 pair to inject against");
+    println!(
+        "injected: net {} rect {:?} xh -> {} (gap 1 < bound {bound})",
+        net_name(&db, NetId(ai as u32)),
+        db.net_geoms[ai].wire_rects[aj],
+        foreign_xl - 1
+    );
+    db.net_geoms[ai].wire_rects[aj].1.xh = foreign_xl - 1;
+    let out = tmp_def("gcd-fp-injected");
+    write_routed_def(&db, &tech, &placed_def("gcd"), &out).expect("write");
+    let (_db2, drc_report) = self_drc(&out, &tech);
+    print_gate("gcd(injected)", &drc_report);
+    let spacing_hits: Vec<&str> = drc_report
+        .rules
+        .iter()
+        .filter(|o| o.family == Family::Spacing && !o.findings.is_empty())
+        .map(|o| o.rule)
+        .collect();
+    assert!(
+        !spacing_hits.is_empty(),
+        "injected overlap produced no spacing finding — the gate is vacuous"
+    );
+
+    // Arm B — occupancy disabled.
+    let (tech, db, route_db, _vias, _rep) = emit_leg(
+        "gcd",
+        &MazeConfig {
+            occ: OccMode::Disabled,
+            ..MazeConfig::default()
+        },
+    );
+    assert!(!route_db.nets.is_empty());
+    let out = tmp_def("gcd-fp-occ");
+    write_routed_def(&db, &tech, &placed_def("gcd"), &out).expect("write");
+    let (_db2, drc_report) = self_drc(&out, &tech);
+    print_gate("gcd(occ=disabled)", &drc_report);
+    assert!(
+        findings_total(&drc_report) >= 1,
+        "occupancy-disabled emit must produce DRC findings — the gate is vacuous"
+    );
+}
+
+/// Determinism with nonzero evidence (§7.7): two full route+emit
+/// passes produce identical `RouteDb`s, identical `net_geoms`, and
+/// identical emitted bytes.
+#[test]
+fn test_emit_determinism() {
+    let cfg = MazeConfig::default();
+    let (tech, db1, r1, _v1, rep1) = emit_leg("gcd", &cfg);
+    let (_t, db2, r2, _v2, rep2) = emit_leg("gcd", &cfg);
+    assert!(!r1.nets.is_empty());
+    assert_eq!(r1, r2, "nondeterministic routes");
+    assert_eq!(rep1.wire_length_dbu, rep2.wire_length_dbu);
+    assert_eq!(rep1.vias_per_cut, rep2.vias_per_cut);
+    assert_eq!(db1.net_geoms, db2.net_geoms);
+
+    let out1 = tmp_def("gcd-det1");
+    let out2 = tmp_def("gcd-det2");
+    let placed = placed_def("gcd");
+    write_routed_def(&db1, &tech, &placed, &out1).expect("write 1");
+    write_routed_def(&db2, &tech, &placed, &out2).expect("write 2");
+    assert_eq!(
+        std::fs::read(&out1).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "two emit passes produced different bytes"
+    );
+}
+
+/// A forced-failure net emits conns-only — the picorv32 shape without
+/// picorv32's cost: n1 routes straight; n3 joins but `u2/C`'s rect
+/// holds no track (`Unattachable`) → its record is `( conns ) +
+/// USE SIGNAL ;` with no geometry statements.
+#[test]
+fn test_emit_unrouted_fixture() {
+    let tech = maze_tech();
+    let comps = "COMPONENTS 3 ;\n- u0 CELL + PLACED ( 0 0 ) N ;\n- u1 CELLB + PLACED ( 0 0 ) N ;\n- u2 CELLC + PLACED ( 0 0 ) N ;\nEND COMPONENTS\n";
+    let def_text = format!("{MAZE_DEF_HEAD}{comps}{MAZE_DEF_TAIL}");
+    let mut db = parse_def_bytes(def_text.as_bytes(), &tech, None).expect("fixture DEF parses");
+    let tracks = layer_tracks(&db, &tech);
+    let join = maze_guide(
+        &db,
+        &tech,
+        "n1\n(\n0 0 5000 2000 met1\n)\nn3\n(\n0 0 5000 5000 met1\n)\n",
+    );
+    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    let vias = via_table(&tech, &db).unwrap();
+    let route_db = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+    assert_eq!(route_db.unrouted.len(), 1, "{:?}", route_db.unrouted);
+    let report = apply_routes(&mut db, &tech, &graphs, &route_db, &vias).expect("apply");
+    assert_eq!(report.unrouted, vec!["n3".to_string()]);
+
+    // The fixture's own text is the splice template.
+    let template = tmp_def("fixture-template");
+    std::fs::write(&template, &def_text).unwrap();
+    let out = tmp_def("fixture-unrouted");
+    write_routed_def(&db, &tech, &template, &out).expect("write");
+    let text = std::fs::read_to_string(&out).unwrap();
+
+    let n3_start = text.find(" - n3 ").expect("n3 record missing");
+    let n3_end = n3_start + text[n3_start..].find("+ USE SIGNAL ;").unwrap();
+    let n3_rec = &text[n3_start..n3_end];
+    assert!(n3_rec.contains("( PIN io3 )") && n3_rec.contains("( u2 C )"), "{n3_rec}");
+    assert!(
+        !n3_rec.contains("ROUTED") && !n3_rec.contains("NEW"),
+        "unrouted net emitted geometry: {n3_rec}"
+    );
+    parse_def(&out, &tech, None).expect("fixture emit re-parses");
+}
+
+/// Every emitted `PdnVia` is the `ViaTable` pair default verbatim —
+/// emit reselects nothing (the placed shape must be the via the
+/// router priced).
+#[test]
+fn test_emit_via_default_consistency() {
+    let (_tech, db, _route_db, vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let mut placed = 0usize;
+    for geom in &db.net_geoms {
+        for via in &geom.vias {
+            placed += 1;
+            let pair = &vias.pairs[via.lower.0 as usize];
+            let di = pair.default.expect("via placed on a gap pair");
+            let cand = &vias.candidates[pair.candidates[di as usize] as usize];
+            assert_eq!(via.lower, cand.lower);
+            assert_eq!(via.upper, cand.upper);
+            assert_eq!(via.cut, cand.cut);
+            assert_eq!(via.cut_count, cand.cut_count);
+            assert_eq!(via.name, cand.name);
+            assert_eq!(via.geom, cand.geom);
+        }
+    }
+    assert!(placed > 0, "no vias emitted — vacuous");
+}
