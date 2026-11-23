@@ -9134,3 +9134,79 @@ widening to all layers; covered by a new malformed-record case in
 (3) `access_points` writes `per_layer` through `get_mut` so the
 index cannot outlive the `tracks.get` guard. `cargo test -p
 grus-core --lib readers::lef` 30/30, `--test drt` 4/4, clippy clean.
+
+### 2026-11-23 — e6-drt-graph: guide-bounded track graph (v0.12.2)
+
+`drt::graph` landed: `join_guides` resolves the committed
+`<d>.guide` blocks to `NetId`s (extra names bail inside
+`resolve_guide_nets`) and classifies absent `net_names` nets;
+`build_route_graphs` turns each guided net's box union into the
+covered `(ix, iy)` track-index region, one node per covered pair,
+induced-subgraph edges on both axes, and per-pin attachments from
+`pin_shapes` candidate rects. `pin_shapes` widened `fn → pub(crate)`;
+no behavior change. `access_points`/`layer_tracks` are reused
+unmodified.
+
+**Census** (`cargo test -p grus-core --test drt -- --nocapture`):
+
+| design | guide nets | joined | missing_signal | absent_expected | zero_cov | nodes | edges | region_escape |
+|---|---|---|---|---|---|---|---|---|
+| gcd | 269 | 269 | 0 | 0 | 0 | 756,483 | 1,453,444 | 17 |
+| picorv32 | 6,744 | 6,744 | 0 | 67 | 0 | 28,401,383 | 54,635,400 | 592 |
+
+`absent_expected` on picorv32 is the 67 single-pin io-port nets
+(`irq[0..31]`, `pcpi_rd[0..31]`, `pcpi_ready`, `pcpi_wait`,
+`pcpi_wr`) — OpenROAD emits no block for <2-pin nets. On gcd it is
+empty: **the planning note that VGND/VPWR sit in `net_names` was
+wrong** — they are `SPECIALNETS` records and land in `pdn_nets`, so
+every `net_names` net on gcd has a guide block. Node count on
+picorv32 (28.4M) is ~37× gcd's, not the planning probe's ~6× — the
+per-net union bound still holds per-element (`nodes ≤ Σ_box |covered
+ix|·|covered iy|`, asserted in `test_graph_census`).
+
+**Escapes, verified per-pin** (§7.5 — the planning probe predicted 3
+on gcd and 0 io; the real run names 17 and the probe was wrong on the
+io class):
+
+- gcd `_313_/X` (net `_007_`), `_301_/B1` (net `_134_`), `_307_/B1`
+  (net `_138_`): the pin shape straddles a GCell boundary and each
+  in-box fragment holds tracks on one axis only — no complete crossing
+  inside the shape. Same class as the probe predicted.
+- gcd's 14 io ports (`req_msg{[0],[1],[2],[3],[9],[16],[17],[18],
+  [25],[26]}`, `resp_msg{[0],[1],[9],[10]}`): met2 `+ LAYER` squares
+  ±140 DBU around the port. Checked `req_msg[0]` by hand: rect
+  `[45170,45450]×[102390,102670]` contains x-track 45310 but no
+  y-track (nearest are 102350 and 102810, both outside) — no crossing
+  exists inside the pin shape even though the guide's met2 stub box
+  covers the port GCell.
+- picorv32 592 (355 instance, 237 io): spot-checked `_09474_/S`
+  (net `_00009_`) — FS-placed `mux2_1`; the li1 box stops at the GCell
+  edge mid-rect and each in-box fragment sees a single axis. Same
+  genuine class; the set is printed by the gate, not pinned by name
+  (count pinned via the partition assert).
+
+The pinned gcd set (`{_313_/X, _301_/B1, _307_/B1}` + the 14 ports) is
+asserted by name in `test_pin_attachment`.
+
+**Determinism**: `build_route_graphs` twice → identical `nodes`,
+`edges`, `pin_nodes`, and census on both designs, with nonzero totals
+(gcd 756,483 / 1,453,444; picorv32 28,401,383 / 54,635,400).
+
+**Fail-proofs** (AGENTS §7.7, `test_region_escape_fixture`, synthetic
+LEF/DEF — no real inputs): full guide attaches both pins; shrinking
+u0/A's box below its rect's y-tracks escapes exactly `u0/A` (io stays
+attached, `zero_coverage` stays empty — the io box still covers
+crossings); shrinking both boxes under the grid escapes every member
+pin **and** names `(n1, met1)` zero-coverage; restoring the full guide
+returns green.
+
+**Checks run**: `cargo test -p grus-core --lib graph` (3 unit tests:
+region sets incl. no phantom corners, edge lists incl. no edge across
+a one-index gap, join classification + unknown-name error), `cargo
+test -p grus-core --test drt` (9/9 — the four pre-existing tests plus
+`test_guide_join`, `test_graph_census`, `test_pin_attachment`,
+`test_graph_determinism`, `test_region_escape_fixture`; also run under
+`--release`), `cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings`. `picorv32.placed.def` already present
+(gitignored artifact, not regenerated). Version `0.12.1 → 0.12.2`
+(feature, patch on 0.x). No commit per ticket instruction.
