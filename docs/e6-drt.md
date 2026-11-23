@@ -165,6 +165,14 @@ The via model (§6) is *not*:
   majority via per cut layer as evidence for the policy, not a target
   to match (the `mcon` pick is a documented name-only divergence on
   rect-identical candidates).
+- **A preferred-anchor node model** — the reference anchors most vias
+  at preferred-track crossings across two *different* layers
+  (`via-edges.md` §3), positions our same-layer-crossing nodes cannot
+  host; closing that gap revises `e6-drt-graph` node semantics and is
+  deferred model work (same class as the §5 io-port fallback).
+- **FIXED-viarule parameterization** — a DEF `+ VIA <lef>` record is
+  matched to its LEF def by the cut-layer triple only; any FIXED
+  parameterization beyond that triple is unmodeled.
 
 ## 5. Guide-bounded track graph
 

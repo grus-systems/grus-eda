@@ -9271,6 +9271,34 @@ same-coordinate. Two named zeros:
   is on gcd's grid) but zero guide-covered node pairs on either
   design — a coverage gap, not a grid gap.
 
+**Reference placement census** (`via-edges.md` §3, reproduced here).
+Provenance: arithmetic on the committed `<d>.routed.def` — via
+instances are the `( x y ) <viaName>` points in NETS; grid membership
+is checked against the same file's TRACKS. *Shared crossing* = the
+point is on both layers' track grids on both axes (our node rule);
+*preferred anchor* = `x ∈` the vertical-preferred layer's `tracks_x`
+∧ `y ∈` the horizontal-preferred layer's `tracks_y` (techlef
+DIRECTION: li1/met2/met4 VERTICAL, met1/met3/met5 HORIZONTAL — a
+shared crossing is always a preferred anchor); *off-anchor* = neither.
+
+| via | pair | inst | shared | pref anchor | off | inst | shared | pref anchor | off |
+|---|---|---|---|---|---|---|---|---|---|
+| | | **gcd** | | | | **picorv32** | | | |
+| `L1M1_PR_MR` | li1–met1 | 884 | 50 | 769 | 115 | 26,365 | 1,376 | 23,932 | 2,433 |
+| `M1M2_PR` | met1–met2 | 881 | 3 | 881 | 0 | 31,606 | 72 | 31,588 | 18 |
+| `M1M2_PR_MR` | met1–met2 | 2 | 0 | 2 | 0 | 183 | 0 | 183 | 0 |
+| `M2M3_PR` | met2–met3 | 28 | 0 | 28 | 0 | 1,784 | 0 | 1,782 | 2 |
+| `M3M4_PR` | met3–met4 | 2 | 0 | 2 | 0 | 90 | 0 | 90 | 0 |
+
+`M2M3_PR` sits at a preferred anchor `(met2_x, met3_y)` in 28/28 gcd
+and 1,782/1,784 picorv32 cases — a position that is a node on
+**neither** layer under the same-layer crossing rule, which is why
+met2–met3 reads zero via edges above.
+The gap is a node-model question (deferred, `docs/e6-drt.md` §4), not
+an emission bug; the smaller off-anchor residue (gcd `L1M1_PR_MR`
+115, picorv32 2,433) is pin-access off-grid drops, recorded
+unmodeled.
+
 **Fail-proof** (`test_via_edge_fixture`, synthetic LEF/DEF — no real
 inputs): a lower-layer node whose `(x,y)` is not on the upper grids
 gets no via edge; a coordinate on both grids but outside the guide

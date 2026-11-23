@@ -328,7 +328,9 @@ pub fn build_route_graphs(
                 pairs_hi,
                 lt_hi,
             );
-            out.via_edges_per_pair[l as usize] += pair_edges.len();
+            if let Some(slot) = out.via_edges_per_pair.get_mut(l as usize) {
+                *slot += pair_edges.len();
+            }
             via_edges.extend(pair_edges);
         }
 
