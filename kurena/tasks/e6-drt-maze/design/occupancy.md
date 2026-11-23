@@ -1,112 +1,119 @@
 # e6-drt-maze — Occupancy and spacing-lite
 
+Matches the implementation at `a52d771`.
+
 ## 1. Model
 
-The committed geometry of a design — macro OBS, placed via
-footprints, committed wires — is rasterized onto track lines so that
-an edge's conflict check is a **single-line interval query**.
+Committed geometry — macro OBS, pin shapes, via footprints,
+committed wire/stub rects — is rasterized onto track lines so an
+edge's conflict check is a single-line interval query.
 
-Per layer `l`, two maps (line coordinate → interval list):
+Per routing layer `l`, two maps (line coordinate → interval list):
 
-- `lines_y[l]`: `BTreeMap<i32, Vec<Interval>>` — horizontal lines
-  (`tracks_y` coords), queried by X-axis (horizontal) edges.
-- `lines_x[l]`: `BTreeMap<i32, Vec<Interval>>` — vertical lines,
-  queried by Y-axis edges.
-
-`Interval { lo, hi, who }` is a *shape* extent along the line axis
-(lo < hi, DBU) plus the occupant:
+- `lines_y[l]: BTreeMap<i32, Vec<Interval>>` — horizontal lines
+  (`tracks_y` coords), queried by `Axis::X` edges and rect scans.
+- `lines_x[l]` — vertical lines, queried by `Axis::Y` edges.
 
 ```rust
-enum Occupant { Obs, Net(NetId) }   // via footprints record their owner Net
+struct Interval { lo: i32, hi: i32, perp_lo: i32, perp_hi: i32, who: Occupant }
+enum  Occupant { Obs, Net(u32 /* NetId.0 */) }
 ```
 
-**Rasterization rule** — a rect `S` committed on layer `l` inserts
-`[S.yl, S.yh]` into every `lines_x[l][x]` with
-`x ∈ (S.xl − w/2 − s, S.xh + w/2 + s)` (strict band), and
-`[S.xl, S.xh]` into every `lines_y[l][y]` with
-`y ∈ (S.yl − w/2 − s, S.yh + w/2 + s)`, where `w =
-layer.width_dbu`, `s = layer.min_spacing_dbu()`, `w/2` is integer
-division (recorded; sky130 widths are even). Rects covering no track
-line inside a band contribute nothing on that axis — correct, since
-candidates only exist on lines.
+`perp_*` stores the marked shape's extent on the line's
+perpendicular axis so rect candidates (via footprints) and the
+post-hoc census run the exact `R' ∩ S` 2-D test, not just the band
+approximation a wire candidate gets for free.
 
-- **Committed wire** on line `y_l`, span `[a,b]`: its shape rect is
-  `[a − w/2, y_l − w/2, b + w/2, y_l + w/2]` — rasterized onto
-  *both* axes' lines, so it also blocks perpendicular crossings and
-  adjacent-line parallels (`|y − y_l| < w + s`; on sky130 only li1's
-  pitch is below `w + s`, so the band is same-line-only on met
-  layers — recorded, the model still handles it).
-- **Via** at `(x,y)` on pair `k`: the default candidate's
-  `ViaCandidate::rects` filtered to `DrcLayer::Routing`, shifted to
-  `(x,y)`, rasterized on both layers. Cut-layer occupancy is not
-  modeled (spacing-lite; recorded).
-- **Macro OBS**: per placed cell (`{Placed,Fixed,Cover}` gate +
-  `orient_rect` + translate — the `drc::geom` source-4 convention,
-  replicated locally for OBS only), `obs_rects` and `pin_obs_rects`
-  on routing layers, rasterized once at construction as `Obs`.
-  Macro *pin* shapes and io-port rects of other nets are not marked
-  (recorded simplification — pin-access DRC is the emit/e2e
-  tickets' job).
+**Rasterization** (`Occupancy::rasterize`): rect `r` on layer `l`
+inserts `[r.yl, r.yh]` into every `lines_x[l][x]` with
+`x ∈ (r.xl − w/2 − s, r.xh + w/2 + s)` (strict band) and
+`[r.xl, r.xh]` into every `lines_y[l][y]` likewise, with
+`w/2 = width_dbu/2` (integer division — sky130 widths are even) and
+`s = min_spacing_dbu()`. Each insertion is optionally logged as a
+`Mark` — the rip-up journal (`unmark` frees it). A rect covering no
+track line inside a band contributes nothing on that axis — correct,
+since candidates only exist on lines.
+
+**Pre-mark** (`premark_obs`, once at `route_nets` start):
+
+- Every placed cell's (`{Placed,Fixed,Cover}` gate + `orient_rect`
+  + translate — the `drc::geom` source-4 convention, OBS rects only)
+  `obs_rects` on routing layers → `Obs`.
+- Every instance pin's shapes → `Net(own_net)` — a pin's metal
+  blocks foreign nets but is free to its own net so routing can
+  reach its own attach nodes.
+- io-port rects are not marked (recorded simplification — pin-access
+  DRC is the emit/e2e tickets' job).
+
+**Commit** (`commit_route`): merged wire rects (`± w/2`), relaxed-via
+stub wires, and via footprints (the default candidate's routing
+rects shifted to the placement) → `Net(net)`, logged for rip-up.
+Cut-layer occupancy not modeled (spacing-lite).
 
 ## 2. Conflict check
 
-A candidate edge on line `t` on layer `l` (span `[c,d]` track
-coords, shape extent `[c − w/2, d + w/2]`):
+- `scan_wire(axis, l, t, c, d)`: candidate on line `t` spanning
+  track coords `[c,d]` — shape extent `[c − w/2, d + w/2]`, hits are
+  the line's intervals overlapping `[c − w/2 − s, d + w/2 + s]` —
+  shape edge-distance `< s` along the line; perpendicular `< s` is
+  guaranteed by the band the mark was rasterized into.
+- `scan_rect(l, r)`: via footprints — expand `r` by `s` and test
+  true 2-D intersection against the marks inside the `w/2 + s` band
+  on both axes, using the stored perpendicular extents.
 
-```
-hits = intervals on lines[l][t] overlapping [c − w/2 − s, d + w/2 + s]
-```
-
-— i.e. shape edge-distance `< s` along the line; the perpendicular
-distance `< s` is already guaranteed because the committed shape was
-rasterized onto `t` only within its `w/2 + s` band. Together this is
-the rect-expand-by-`s`-and-intersect rule restricted to track
-geometry — the spec's "interval + the LEF `SPACING` bound collides".
-
-Then:
+`hit_verdict(hits, own_pins, own, hist, hard, mode)` classifies:
 
 | hit class | soft iteration | last iteration (hard) |
 |---|---|---|
-| `Obs` | hard block | hard block |
+| `Obs` (uncarved) | hard block | hard block |
+| `Obs` (carved) | invisible | invisible |
 | `Net(own)` | free | free |
-| `Net(foreign)` | `+OCC_PENALTY × (1+hist) × #distinct foreign nets` | hard block |
+| `Net(foreign)` | `+(OCC_PENALTY + hist·HIST_STEP) × #distinct foreign` | hard block |
 
 `OccMode::Disabled` (the fail-proof knob) skips foreign-`Net`
-checks entirely — `Obs` stays blocking (a fixed blockage is not
-"occupancy") and collision recording is skipped.
+checks and collision recording entirely; `Obs` stays blocking — a
+fixed blockage is not "occupancy".
 
-## 3. What each clause of the spec maps to
+**Pin-carve exemption**: an `Obs` mark is invisible to the candidate
+net when `hit_rect(mark)` 2-D touches any rect of the net's own pins
+on the same layer — the rasterized form of "a net may touch the
+blockage its own pin already sits on". Without it, stdcell li1 OBS
+jumpers (which cover the whole cell including pin rects) wall in
+every li1 pin — this was the measured cause of the first NoPath
+flood. Recorded side effect: the whole OBS rect of a cell hosting
+the net's pin becomes transparent to that net.
+
+## 3. Spec mapping
 
 - "a committed route marks its track intervals occupied" — the
-  rasterized shape intervals above.
-- "later nets see the occupancy as cost" — the soft-mode penalty
-  (PathFinder-style: sharing is priced, not forbidden, while the
-  iteration has slack to route around it).
-- "a hard-block when the interval + SPACING collides" — `Obs` always;
-  foreign nets on the final iteration, when remaining conflicts can
-  no longer be deferred to another rip-up.
-- Commit-time recording: in soft mode the foreign hits an edge
-  actually takes are stored as provisional `Collision`s (deduped by
-  `(a, b, layer, line, lo, hi)`); they drive the rip-up set per
-  `search.md` §5.
+  rasterized shape intervals (wires + stubs + via footprints).
+- "later nets see the occupancy as cost" — soft-mode penalty
+  (PathFinder-style sharing priced, not forbidden).
+- "a hard-block when the interval + SPACING collides" — `Obs`
+  always; foreign nets on the final iteration.
+- Commit-time recording: in soft mode the foreign hits an edge took
+  are stored as provisional `Collision`s deduped on
+  `(a, b, layer, line, lo, hi)` with `a < b`; they drive the rip-up
+  set (`search.md` §6).
 
 ## 4. Post-hoc collision census
 
-`overlap_census(&[NetRoute], tech, tracks) -> Vec<Collision>`:
-rebuilds every route's wire-shape intervals and via footprints into
-the same per-line model (routes only, no OBS), sweeps each line's
-sorted intervals, and reports each cross-net pair whose spacing rule
-violates. Exact on the committed result — this is the `RouteDb`
-collision list and the `results.md` number, and the fail-proof
-compares it between `Enabled` and `Disabled` runs.
+`overlap_census(routes, tech, tracks, vias)`: rebuilds every route's
+wire rects and via footprints into a fresh `Occupancy` (routes only,
+no OBS), sweeps each line's sorted intervals, reports each cross-net
+pair whose `R + s`-intersect rule violates — checking both the
+along-line gap and the perpendicular gap (`pgap ≥ s` clears it).
+Exact on the committed result — the `RouteDb.collisions` list and
+the fail-proof's measuring stick.
 
-## 5. Cost notes (recorded, not optimized)
+## 5. Cost notes
 
-Rasterizing a wire inserts `O(span/pitch)` entries per axis;
-per-line `Vec`s stay unsorted (query = linear scan of one line's
-entries — short in practice on signal layers). picorv32-scale
-estimates put total inserts in the same order as routed edges;
-measure, record the runtime in `results.md`, and only then optimize.
+Per-line `Vec`s stay unsorted (linear scan per query — short in
+practice). Relaxed-via stub wires add marks but keep `O(span/pitch)`
+per axis. If the picorv32 census runs hot, the first lever is
+hoisting `relaxed_vias` out of `route_one_net` (per-iteration
+recompute is the current, simpler choice); record whatever was
+needed, do not change semantics silently.
 
 ## Files
 
