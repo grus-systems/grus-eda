@@ -261,6 +261,35 @@ deck statements (`allmN` + `*obsmN` widespacing) — the checked-source
 model has no separate obs plane. `rule_name` strings are verbatim
 `magic_rules_checked.names` templates.
 
+The table below joins every implemented spacing rule to its LEF bound
+and to the Magic techfile `%d`, re-derived from `sky130A.tech` `drc`
+section (`spacing`/`widespacing`/`cifspacing` statements, nm). Where
+the two disagree the difference is named — it is a claim boundary,
+not a parity bug.
+
+| `rule` | layer | LEF bound (DBU) | `rule_name` (verbatim) | Magic `%d` | divergence |
+|---|---|---|---|---|---|
+| `li.3` | li1 | 170 | `Local interconnect spacing < %d (li.3)` | 170 | — |
+| `li.c2` | li1 | 170 | `Core local interconnect spacing < %d (li.c2)` | 140 | Magic's core-li bound is *looser* (140); we check LEF 170 — same class as the `li.c1` width collapse |
+| `mcon.2` | mcon | 190 | `mcon.spacing < %d (mcon.2)` | 190 | — |
+| `met1.2` | met1 | 140 | `Metal1 spacing < %d (met1.2)` | 140 | — |
+| `met2.2` | met2 | 140 | `Metal2 spacing < %d (met2.2)` | 140 | — |
+| `met3.2` | met3 | 300 | `Metal3 spacing < %d (met3.2)` | 300 | — |
+| `met4.2` | met4 | 300 | `Metal4 spacing < %d (met4.2)` | 300 | — |
+| `met5.2` | met5 | 1600 | `Metal5 spacing < %d (met5.2)` | 1600 | — |
+| `via.2 - 2 * via.4a` | via | 170 | `Via1 spacing < %d (via.2 - 2 * via.4a)` | 60 | Magic checks the fabricated cut plane (60); we check the router-level LEF `SPACING` — tighter, recorded |
+| `via2.2 - 2 * via2.4` | via2 | 200 | `via2 spacing < %d (via2.2 - 2 * via2.4)` | 120 | same |
+| `via3.2 - 2 * via3.4` | via3 | 200 | `via3 spacing < %d (via3.2 - 2 * via3.4)` | 80 | same |
+| `via4.2 - 2 * via4.4` | via4 | 800 | `via4 spacing < %d (via4.2 - 2 * via4.4)` | 420 | same |
+| `met1.3a` | met1 | 280 | `Spacing of metal1 features attached to and within 0.28um of large metal1 < %d (met1.3a)` | 280 | bound equal; wide trigger differs — ours `>3000` (LEF `WIDTH 3` breakpoint) vs Magic `widespacing` 3005 |
+| `met1.3b` | met1 | 280 | `Metal1 > 3um spacing to unrelated m1 < %d (met1.3b)` | 280 | same trigger divergence |
+| `met2.3a` | met2 | 280 | `Spacing of metal2 features attached to and within 0.28um of large metal2 < %d (met2.3a)` | 280 | same |
+| `met2.3b` | met2 | 280 | `Metal2 > 3um spacing to unrelated m2 < %d (met2.3b)` | 280 | same |
+| `met3.3c` | met3 | 400 | `Spacing of metal3 features attached to and within 0.40um of large metal3 < %d (met3.3c)` | 400 | same |
+| `met3.3d` | met3 | 400 | `Metal3 > 3um spacing to unrelated m3 < %d (met3.3d)` | 400 | same |
+| `met4.5a` | met4 | 400 | `Spacing of metal4 features attached to and within 0.40um of large metal4 < %d (met4.5a)` | 400 | same |
+| `met4.5b` | met4 | 400 | `Metal4 > 3um spacing to unrelated m4 < %d (met4.5b)` | 400 | same |
+
 ## 11. Connectivity islands — what may flag
 
 Magic merges same-net touching shapes before spacing evaluation; we

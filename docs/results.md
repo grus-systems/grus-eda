@@ -8835,6 +8835,19 @@ goes red in 0.26 s: `gcd: 6 spacing violations`, all `met2.2` pairs
 with `net_a == net_b` (gap 30–60 between collinear wire records of one
 net that must merge). Restored → green.
 
+Secondary observation — `<`→`<=` break tried per design (`gx²+gy² >= b²`
+flipped to `> b²`, i.e. bound-exact Euclidean pairs flag): **stayed
+green** on all 10 unit tests and both designs' zero-violation gates.
+Two reasons, both structural: (a) the `reach = bound` sweep enumerates
+only pairs with `gx < bound` *and* `gy < bound` per axis, so an
+axis-aligned bound-exact pair (`gx == bound`) never reaches the
+squared predicate at all; (b) the remaining bound-exact case — a
+Pythagorean diagonal with `gx²+gy² == bound²`, e.g. 84²+112²=140² —
+does not occur among the candidates on gcd or picorv32. The
+merge-disable break is therefore the effective fail-proof; bound-edge
+behavior on axis-aligned pairs is additionally pinned by
+`test_gap_bound_strictness` (gap 139 flags, 140 and 141 do not).
+
 **Performance correction inside this ticket**: the first
 implementation probed each rect through `iter_overlapping` — O(n²) in
 practice, because a die-spanning power rail at `by_x[0]` sets
@@ -8851,3 +8864,18 @@ met1 wide rules enumerate 134 k candidate pairs each way).
 --lib drc` (21 drc tests). Version `0.9.0 → 0.10.0`: `ShapeRect`
 gained the public `group` field (breaking for literal construction;
 0.x minor per AGENTS §5). No commit per ticket instruction.
+
+**Card-#46 follow-ups on `dev`**: (1) `docs/e7-drc.md` §10 gained the
+full divergence record — every implemented `rule` joined to its LEF
+bound, verbatim `rule_name`, and Magic `%d` re-derived from
+`sky130A.tech` (names `li.c2`, via cut-plane 60/120/80/420 vs LEF
+router-level bounds, and the `>3000` vs `3005` wide trigger). (2) The
+`<`→`<=` secondary break record added above. (3) The determinism
+double-run now compares `check_spacing_report` — nonzero `candidates`
+asserted — instead of two empty violation vecs; `RuleReport` gained
+`PartialEq`. (4) The mechanical diffs in `congestion/guide.rs`,
+`interner.rs`, `sta/parasitics.rs`, `drc/width.rs` are required
+struct-literal updates for the new `RoutingLayer::{spacing_dbu,
+spacing_table}` / `ShapeRect.group` fields — no behavior change,
+nothing to revert. `cargo test -p grus-core --test drc` 8/8 green
+(~111 s) on the follow-up tree.

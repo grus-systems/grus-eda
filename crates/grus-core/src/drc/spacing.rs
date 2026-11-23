@@ -235,6 +235,7 @@ pub struct Violation {
 
 /// Per-rule outcome, for the zero-violation census in the integration
 /// gate (candidate counts name rules a design does not exercise).
+#[derive(Debug, PartialEq)]
 pub struct RuleReport {
     pub rule: &'static str,
     /// `None` when the rule's layer is absent from the loaded LEF.

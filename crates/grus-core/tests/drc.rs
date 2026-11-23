@@ -339,12 +339,18 @@ fn test_spacing_zero_violations() {
             "{name}: {} spacing violations",
             reports.iter().map(|r| r.violations.len()).sum::<usize>()
         );
-        // Deterministic double-run: islands and pair emission are
-        // input-order stable.
-        assert_eq!(
-            check_spacing(&l.drc, &l.tech),
-            check_spacing(&l.drc, &l.tech),
-            "{name}: spacing check is nondeterministic"
+        // Deterministic double-run: islands, candidate-pair census and
+        // pair emission are input-order stable — compare the report
+        // (which carries nonzero `candidates`), not just the empty
+        // violation vec.
+        let (ra, rb) = (
+            check_spacing_report(&l.drc, &l.tech),
+            check_spacing_report(&l.drc, &l.tech),
+        );
+        assert_eq!(ra, rb, "{name}: spacing check is nondeterministic");
+        assert!(
+            ra.iter().map(|r| r.candidates).sum::<usize>() > 0,
+            "{name}: zero candidate pairs — the pipeline ran on nothing"
         );
     }
 }
