@@ -665,6 +665,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 2,
             obs_rects: Vec::new(),
+            obs_rects_raw: Vec::new(),
             pin_obs_rects: Vec::new(),
         });
         for pname in ["A", "B"] {

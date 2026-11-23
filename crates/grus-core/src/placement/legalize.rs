@@ -1894,6 +1894,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 0,
             obs_rects: Vec::new(),
+            obs_rects_raw: Vec::new(),
             pin_obs_rects: Vec::new(),
         });
 
@@ -1984,6 +1985,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 0,
             obs_rects: Vec::new(),
+            obs_rects_raw: Vec::new(),
             pin_obs_rects: Vec::new(),
         });
         tech_db

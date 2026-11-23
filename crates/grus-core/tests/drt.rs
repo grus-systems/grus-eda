@@ -1223,7 +1223,10 @@ fn load_routed_inputs(
 ) {
     let (tech, db, tracks, _) = load(name);
     let (_, join) = load_guide(&db, &tech, name);
-    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    // The maze gets one spare layer above each net's topmost guided
+    // layer — OBS-sealed pin pockets need it (OpenROAD's routed DEF
+    // escapes on the next layer inside the same guide XY).
+    let graphs = grus_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, 1);
     let vias = via_table(&tech, &db).expect("via_table");
     (tech, db, tracks, join, graphs, vias)
 }
@@ -1657,115 +1660,3 @@ fn test_maze_determinism() {
     }
 }
 
-/// Temporary diagnosis for the gcd NoPath flood: routes each guided
-/// net standalone under `OccMode::Disabled` (foreign-Net checks off,
-/// `Obs` still blocking) and prints the first few failures with their
-/// attach-set sizes — separates Obs-walling from foreign occupancy.
-#[test]
-fn test_maze_debug_gcd() {
-    let (tech, db, tracks, join, graphs, vias) = load_routed_inputs("gcd");
-    let cfg = MazeConfig {
-        occ: OccMode::Disabled,
-        max_iters: 1,
-    };
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
-    println!(
-        "disabled+1iter: routed={} unrouted={}",
-        r.nets.len(),
-        r.unrouted.len()
-    );
-    for u in r.unrouted.iter().take(5) {
-        let g = graphs.nets.iter().find(|g| g.net == u.net).unwrap();
-        let sizes: Vec<usize> = g.pin_nodes.iter().map(|(_, s)| s.len()).collect();
-        println!(
-            "  {} nodes={} edges={} vedges={} attach_sizes={sizes:?} connected={} failed={}",
-            net_name(&db, u.net),
-            g.nodes.len(),
-            g.edges.len(),
-            g.via_edges.len(),
-            u.connected.len(),
-            u.failed.len(),
-        );
-    }
-    let cfg_on = MazeConfig {
-        occ: OccMode::Enabled,
-        max_iters: 1,
-    };
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg_on);
-    println!(
-        "enabled+1iter: routed={} unrouted={}",
-        r.nets.len(),
-        r.unrouted.len()
-    );
-
-    // Obs-blocking census: how many in-plane edges of each net are
-    // hard-blocked by macro OBS (+ unlinked pin shapes).
-    let stats = grus_core::drt::maze::debug_edge_stats(&db, &tech, &tracks, &graphs, &vias);
-    let total_e: usize = stats.iter().map(|s| s.1).sum();
-    let total_b: usize = stats.iter().map(|s| s.2).sum();
-    println!("obs-blocked in-plane edges: {total_b}/{total_e}");
-    for (net, edges, blocked, nodes) in stats.iter().take(10) {
-        println!(
-            "  {} nodes={nodes} edges={edges} obs_blocked={blocked}",
-            net_name(&db, NetId(*net))
-        );
-    }
-    let n0 = stats[0].0;
-    println!("--- net {} pin approach ---", net_name(&db, NetId(n0)));
-    println!(
-        "{}",
-        grus_core::drt::maze::debug_pin_approach(&db, &tech, &tracks, &graphs, &vias, n0)
-    );
-    for want in ["_010_", "_012_", "_038_", "clk"] {
-        let n = (0..db.num_nets() as u32)
-            .map(NetId)
-            .find(|&n| net_name(&db, n) == want)
-            .unwrap_or_else(|| panic!("{want}"));
-        println!("--- net {want} wave ---");
-        println!(
-            "{}",
-            grus_core::drt::maze::debug_net_wave(&db, &tech, &tracks, &graphs, &vias, n.0)
-        );
-    }
-
-    // Dump the failing pin's macro OBS vs pin rects on li1 (layer 0).
-    let p = (0..db.pin_names.len())
-        .map(|i| PinId(i as u32))
-        .find(|&p| pin_label(&db, p) == "_411_/D")
-        .expect("_411_/D");
-    let c = db.pin_cells[p.0 as usize].unwrap();
-    let mac = &tech.macros[db.cell_macros[c.0 as usize].0 as usize];
-    let (cx, cy) = (db.cell_x_dbu[c.0 as usize], db.cell_y_dbu[c.0 as usize]);
-    let o = db.cell_orient[c.0 as usize];
-    println!(
-        "_411_ macro {} at ({cx},{cy}) orient {o:?} obs_rects={} pin_obs={}",
-        tech.strings.resolve(mac.name),
-        mac.obs_rects.len(),
-        mac.pin_obs_rects.len()
-    );
-    for &(l, r) in &mac.obs_rects {
-        if l.0 == 0 {
-            let rr = DesignDb::orient_rect(r, mac.width_dbu, mac.height_dbu, o);
-            println!(
-                "  obs l{} [{},{},{},{}]",
-                l.0,
-                cx + rr.xl,
-                cy + rr.yl,
-                cx + rr.xh,
-                cy + rr.yh
-            );
-        }
-    }
-    let mp = db.pin_macro_pins[p.0 as usize].unwrap();
-    for &(l, r) in &tech.macro_pins[mp.0 as usize].rects {
-        let rr = DesignDb::orient_rect(r, mac.width_dbu, mac.height_dbu, o);
-        println!(
-            "  pin D l{} [{},{},{},{}]",
-            l.0,
-            cx + rr.xl,
-            cy + rr.yl,
-            cx + rr.xh,
-            cy + rr.yh
-        );
-    }
-}

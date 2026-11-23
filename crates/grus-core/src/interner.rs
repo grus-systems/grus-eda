@@ -312,6 +312,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 2,
             obs_rects: vec![(LayerId(0), RectDbu::new(0, 0, 920, 2720))],
+            obs_rects_raw: vec![(LayerId(0), RectDbu::new(0, 0, 920, 2720))],
             pin_obs_rects: Vec::new(),
         });
 
