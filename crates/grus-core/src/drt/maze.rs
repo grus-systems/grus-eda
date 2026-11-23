@@ -14,7 +14,7 @@ use crate::drt::via::ViaTable;
 use crate::interner::{LayerId, NetId, PinId};
 use crate::tech_db::{LayerDir, RectDbu, TechDb};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use xxhash_rust::xxh3::xxh3_64;
 
 // Recorded cost constants (docs/e6-drt.md §7).
@@ -148,7 +148,17 @@ enum Occupant {
     /// shapes ignore own-instance OBS" rule). `u32::MAX` marks
     /// blockage with no exempting host: metal of pins that own no net.
     Obs(u32),
+    /// A committed route's painted metal — the sequential router's
+    /// true occupancy: cost in soft iterations, a hard block on the
+    /// last.
     Net(u32), // NetId.0
+    /// A member pin's placed metal — free to its own net, a soft
+    /// penalty to foreign nets, never a hard block: a pin does not
+    /// move under rip-up, so charging it as congestion would churn
+    /// the queue forever without clearing the mark; a foreign wire
+    /// that lands on it is a pin-access finding for the emit/e2e
+    /// DRC, not a maze-time wall (`docs/e6-drt.md` §7).
+    Pin(u32), // NetId.0
 }
 
 /// A committed shape's extent along one track line, tagged with its
@@ -175,13 +185,29 @@ struct Mark {
     iv: Interval,
 }
 
+/// Intervals on one track line, kept `lo`-sorted with a chunked
+/// `max_hi` skip index (rebuilt eagerly on mutation) so a scan touches
+/// only the query window: a chunk with `max_hi ≤ qlo` is skipped, and
+/// `lo`-order lets the scan stop at `lo ≥ qhi`. The hit *set* is
+/// unchanged vs a linear scan; hit order may differ and both consumers
+/// are order-insensitive.
+const SKIP_CHUNK: usize = 16;
+
+#[derive(Clone, Debug, Default)]
+struct Line {
+    ivs: Vec<Interval>,
+    /// `max(hi)` per `SKIP_CHUNK` chunk of `ivs` — parallel to
+    /// `ivs.chunks(SKIP_CHUNK)`.
+    max_hi: Vec<i32>,
+}
+
 /// Per-layer committed geometry rasterized onto track lines so an
 /// edge's conflict check is a single-line interval query. `lines_x[l]`
 /// keys vertical lines (x-coords) → y-intervals; `lines_y[l]` keys
 /// horizontal lines → x-intervals.
 struct Occupancy {
-    lines_x: Vec<BTreeMap<i32, Vec<Interval>>>,
-    lines_y: Vec<BTreeMap<i32, Vec<Interval>>>,
+    lines_x: Vec<BTreeMap<i32, Line>>,
+    lines_y: Vec<BTreeMap<i32, Line>>,
     /// `width_dbu / 2` per routing layer (integer division — sky130
     /// widths are even).
     halfw: Vec<i32>,
@@ -191,30 +217,13 @@ struct Occupancy {
 
 /// One interval hit by a candidate edge: the rasterized mark (`iv`),
 /// the line it was found on, and the overlap of the two shape extents
-/// along the line (`lo > hi` encodes a gap). `x_line` separates the
-/// two line maps — vertical (`lines_x`) vs horizontal (`lines_y`)
-/// lines share the same coord range. The mark's full `iv`/`perp`
-/// extents are needed for the pin-carve OBS exemption in
-/// `hit_verdict`, which is a 2D rect-overlap test.
+/// along the line (`lo > hi` encodes a gap).
 #[derive(Clone, Copy, Debug)]
 struct Hit {
     iv: Interval,
-    layer: u8,
-    x_line: bool,
     line: i32,
     lo: i32,
     hi: i32,
-}
-
-/// The marked shape's rect, reconstructed from its line interval:
-/// `lines_x` marks store y-extent with x perp extent, `lines_y` the
-/// opposite.
-fn hit_rect(h: &Hit) -> RectDbu {
-    if h.x_line {
-        RectDbu::new(h.iv.perp_lo, h.iv.lo, h.iv.perp_hi, h.iv.hi)
-    } else {
-        RectDbu::new(h.iv.lo, h.iv.perp_lo, h.iv.hi, h.iv.perp_hi)
-    }
 }
 
 impl Occupancy {
@@ -264,7 +273,7 @@ impl Occupancy {
                 perp_hi: r.xh,
                 who,
             };
-            self.lines_x[l].entry(t).or_default().push(iv);
+            Self::insert(self.lines_x[l].entry(t).or_default(), iv);
             if let Some(m) = log.as_deref_mut() {
                 m.push(Mark {
                     x_axis: true,
@@ -285,7 +294,7 @@ impl Occupancy {
                 perp_hi: r.yh,
                 who,
             };
-            self.lines_y[l].entry(t).or_default().push(iv);
+            Self::insert(self.lines_y[l].entry(t).or_default(), iv);
             if let Some(m) = log.as_deref_mut() {
                 m.push(Mark {
                     x_axis: false,
@@ -297,6 +306,27 @@ impl Occupancy {
         }
     }
 
+    /// `lo`-sorted insert — after existing equal-`lo` entries, so
+    /// insertion order stays deterministic — plus the skip-index
+    /// rebuild.
+    fn insert(line: &mut Line, iv: Interval) {
+        let pos = line.ivs.partition_point(|e| e.lo <= iv.lo);
+        line.ivs.insert(pos, iv);
+        Self::rebuild_from(line, pos / SKIP_CHUNK);
+    }
+
+    /// Recomputes the chunk `max_hi` index from chunk `from` onward —
+    /// an insert/remove at position `p` can only dirty chunks at
+    /// `p / SKIP_CHUNK` and later.
+    fn rebuild_from(line: &mut Line, from: usize) {
+        line.max_hi.truncate(from);
+        line.max_hi.extend(
+            line.ivs[from * SKIP_CHUNK..]
+                .chunks(SKIP_CHUNK)
+                .map(|c| c.iter().map(|iv| iv.hi).max().unwrap_or(i32::MIN)),
+        );
+    }
+
     /// Frees one recorded insertion (rip-up).
     fn unmark(&mut self, m: &Mark) {
         let map = if m.x_axis {
@@ -304,10 +334,11 @@ impl Occupancy {
         } else {
             &mut self.lines_y[m.layer as usize]
         };
-        if let Some(ivs) = map.get_mut(&m.line)
-            && let Some(pos) = ivs.iter().position(|iv| *iv == m.iv)
+        if let Some(line) = map.get_mut(&m.line)
+            && let Some(pos) = line.ivs.iter().position(|iv| *iv == m.iv)
         {
-            ivs.remove(pos);
+            line.ivs.remove(pos);
+            Self::rebuild_from(line, pos / SKIP_CHUNK);
         }
     }
 
@@ -333,21 +364,27 @@ impl Occupancy {
             Axis::X => &self.lines_y[l],
             Axis::Y => &self.lines_x[l],
         };
-        let Some(ivs) = map.get(&t) else {
+        let Some(line) = map.get(&t) else {
             return;
         };
         let (qlo, qhi) = (c - w2 - s, d + w2 + s);
         let (slo, shi) = (c - w2, d + w2);
-        for iv in ivs {
-            if iv.lo < qhi && iv.hi > qlo {
-                out.push(Hit {
-                    iv: *iv,
-                    layer,
-                    x_line: axis == Axis::Y,
-                    line: t,
-                    lo: iv.lo.max(slo),
-                    hi: iv.hi.min(shi),
-                });
+        for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
+            if line.max_hi[ci] <= qlo {
+                continue;
+            }
+            for iv in chunk {
+                if iv.lo >= qhi {
+                    return; // `lo`-sorted: no later interval can overlap
+                }
+                if iv.hi > qlo {
+                    out.push(Hit {
+                        iv: *iv,
+                        line: t,
+                        lo: iv.lo.max(slo),
+                        hi: iv.hi.min(shi),
+                    });
+                }
             }
         }
     }
@@ -363,31 +400,43 @@ impl Occupancy {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
         let re = RectDbu::new(r.xl - s, r.yl - s, r.xh + s, r.yh + s);
-        for (&t, ivs) in self.lines_y[l].range(re.yl - w2 - s..=re.yh + w2 + s) {
-            for iv in ivs {
-                if iv.lo < re.xh && iv.hi > re.xl && iv.perp_lo < re.yh && iv.perp_hi > re.yl {
-                    out.push(Hit {
-                        iv: *iv,
-                        layer,
-                        x_line: false,
-                        line: t,
-                        lo: iv.lo.max(r.xl),
-                        hi: iv.hi.min(r.xh),
-                    });
+        for (&t, line) in self.lines_y[l].range(re.yl - w2 - s..=re.yh + w2 + s) {
+            for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
+                if line.max_hi[ci] <= re.xl {
+                    continue;
+                }
+                for iv in chunk {
+                    if iv.lo >= re.xh {
+                        break;
+                    }
+                    if iv.hi > re.xl && iv.perp_lo < re.yh && iv.perp_hi > re.yl {
+                        out.push(Hit {
+                            iv: *iv,
+                            line: t,
+                            lo: iv.lo.max(r.xl),
+                            hi: iv.hi.min(r.xh),
+                        });
+                    }
                 }
             }
         }
-        for (&t, ivs) in self.lines_x[l].range(re.xl - w2 - s..=re.xh + w2 + s) {
-            for iv in ivs {
-                if iv.lo < re.yh && iv.hi > re.yl && iv.perp_lo < re.xh && iv.perp_hi > re.xl {
-                    out.push(Hit {
-                        iv: *iv,
-                        layer,
-                        x_line: true,
-                        line: t,
-                        lo: iv.lo.max(r.yl),
-                        hi: iv.hi.min(r.yh),
-                    });
+        for (&t, line) in self.lines_x[l].range(re.xl - w2 - s..=re.xh + w2 + s) {
+            for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
+                if line.max_hi[ci] <= re.yl {
+                    continue;
+                }
+                for iv in chunk {
+                    if iv.lo >= re.yh {
+                        break;
+                    }
+                    if iv.hi > re.yl && iv.perp_lo < re.xh && iv.perp_hi > re.xl {
+                        out.push(Hit {
+                            iv: *iv,
+                            line: t,
+                            lo: iv.lo.max(r.yl),
+                            hi: iv.hi.min(r.yh),
+                        });
+                    }
                 }
             }
         }
@@ -397,11 +446,13 @@ impl Occupancy {
 /// Pre-marks every placed cell's macro `obs_rects` as `Obs` (the
 /// `drc::geom` source-4 convention: `{Placed, Fixed, Cover}` gate +
 /// `orient_rect` + translate, replicated for OBS only), and every
-/// instance pin's shapes as `Net(own_net)` — a pin's metal is a
-/// blockage to foreign nets but free to the net it belongs to, so
-/// routing can reach its own attach nodes. io-port rects are not
-/// marked (recorded simplification — pin-access DRC is the emit/e2e
-/// tickets' job).
+/// instance pin's shapes as `Pin(own_net)` — a pin's metal is free to
+/// its own net, soft-priced for foreign nets, and never a hard block
+/// (rip-up cannot move it; a landing wire is an emit-time DRC
+/// finding). Pins without a net get `Obs(u32::MAX)` — immovable
+/// blockage with no exempting host. io-port rects are not marked
+/// (recorded simplification — pin-access DRC is the emit/e2e tickets'
+/// job).
 fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut Occupancy) {
     for c in 0..db.num_cells() {
         if !matches!(
@@ -433,7 +484,7 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
             continue;
         }
         let pin = PinId(p as u32);
-        let who = db.pin_nets[p].map_or(Occupant::Obs(u32::MAX), |n| Occupant::Net(n.0));
+        let who = db.pin_nets[p].map_or(Occupant::Obs(u32::MAX), |n| Occupant::Pin(n.0));
         for (lid, r) in pin_shapes(db, tech, pin) {
             if (lid.0 as usize) < occ.lines_x.len() {
                 occ.rasterize(tracks, lid.0, &r, who, None);
@@ -453,12 +504,6 @@ fn covered_range(list: &[i32], lo: i32, hi: i32) -> (usize, usize) {
         list.partition_point(|&t| t < lo),
         list.partition_point(|&t| t <= hi),
     )
-}
-
-/// Widest gap between adjacent lines — the access-halo arm that
-/// guarantees `project_attach`'s one-line margin is carve-reachable.
-fn max_gap(v: &[i32]) -> i32 {
-    v.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0)
 }
 
 /// The projection fallback (`docs/e6-drt.md` §7): for each candidate
@@ -520,51 +565,35 @@ fn pref_axis(dir: LayerDir) -> Axis {
 }
 
 /// Classifies one candidate edge's occupancy hits: `None` = blocked
-/// (`Obs` hit always; foreign-net hit in hard mode), `Some(extra)` =
-/// soft-mode extra cost — `(OCC_PENALTY + hist·HIST_STEP)` per
-/// distinct foreign net hit (numerically `OCC_PENALTY × (1+hist)` at
-/// the current constants).
+/// (uncarved `Obs` always; foreign `Net` in hard mode), `Some(extra)`
+/// = extra cost — `(OCC_PENALTY + hist·HIST_STEP)` per distinct
+/// foreign net hit, `Net` and `Pin` pooling into the same set.
 ///
-/// Pin carve-out: an `Obs(cell)` mark is invisible to the candidate
-/// net when the candidate shape `cand` overlaps the pin-access halo
-/// of one of the net's own pins *hosted by that same cell* — the
+/// Host-cell carve: an `Obs(cell)` mark is invisible to the candidate
+/// net whenever the net has a member pin hosted by `cell` — the
 /// rasterized form of OpenROAD's "an access shape ignores
-/// own-instance OBS" rule. Stdcell li1 OBS fills the cell around the
-/// pin rects, so without this every li1 pin is walled in; the
-/// carve-out is what OpenROAD's gcd solution shows (the mcon's li1
-/// plate lands inside the pin rect, inside the OBS jumpers). The halo
-/// — pin rect expanded by `w/2` plus the layer's widest track gap —
-/// also covers the unmodeled access stub a projected attach node
-/// implies (the stub is what touches the pin metal). Neighboring
-/// cells' OBS stays blocking whatever the distance.
+/// own-instance OBS" rule, applied unconditionally (the earlier
+/// pin-halo version left pockets walled: the approach edge hit host
+/// OBS before reaching the halo — measured on gcd's 48 `NoPath`s).
+/// Recorded looseness: the net may cross the host cell's OBS anywhere,
+/// not just near the pin — connectivity-level acceptable; the
+/// emit/e2e DRC owns the real check. `Obs(u32::MAX)` (net-less pin
+/// metal) has no exempting host and always blocks.
+///
+/// `Pin` marks: own free, foreign soft-priced — never a hard block
+/// (rip-up cannot move a pin; a landing wire is an emit-time finding).
 fn hit_verdict(
     hits: &[Hit],
-    own_pins: &[Vec<(u32, RectDbu)>],
-    cand: &[(u8, RectDbu)],
+    host_cells: &[u32],
     own: u32,
     hist: u32,
     hard: bool,
     mode: OccMode,
 ) -> Option<u32> {
     for h in hits {
-        let Occupant::Obs(cell) = h.iv.who else {
-            continue;
-        };
-        let Some(cr) = cand
-            .iter()
-            .find(|(l, _)| *l == h.layer)
-            .map(|(_, r)| r)
-        else {
-            return None;
-        };
-        let carved = own_pins
-            .get(h.layer as usize)
-            .is_some_and(|pins| {
-                pins.iter().any(|(pc, p)| {
-                    *pc == cell && cr.xl <= p.xh && p.xl <= cr.xh && cr.yl <= p.yh && p.yl <= cr.yh
-                })
-            });
-        if !carved {
+        if let Occupant::Obs(cell) = h.iv.who
+            && host_cells.binary_search(&cell).is_err()
+        {
             return None;
         }
     }
@@ -572,15 +601,21 @@ fn hit_verdict(
         return Some(0);
     }
     let mut foreign: Vec<u32> = Vec::new();
+    let mut blocked = false;
     for h in hits {
-        if let Occupant::Net(m) = h.iv.who
-            && m != own
-            && !foreign.contains(&m)
-        {
+        let m = match h.iv.who {
+            Occupant::Net(m) => {
+                blocked |= m != own;
+                m
+            }
+            Occupant::Pin(m) => m,
+            _ => continue,
+        };
+        if m != own && !foreign.contains(&m) {
             foreign.push(m);
         }
     }
-    if hard && !foreign.is_empty() {
+    if hard && blocked {
         return None;
     }
     Some((OCC_PENALTY + hist * HIST_STEP) * foreign.len() as u32)
@@ -596,7 +631,7 @@ fn edge_cost(
     vias: &ViaTable,
     occ: &Occupancy,
     relax: &[RelaxedVia],
-    own_pins: &[Vec<(u32, RectDbu)>],
+    host_cells: &[u32],
     eidx: u32,
     own: u32,
     hist: u32,
@@ -605,7 +640,6 @@ fn edge_cost(
     hits: &mut Vec<Hit>,
 ) -> Option<u32> {
     hits.clear();
-    let mut cand: Vec<(u8, RectDbu)> = Vec::new();
     let e_plane = g.edges.len() as u32;
     let v_plane = e_plane + g.via_edges.len() as u32;
     let base;
@@ -631,14 +665,6 @@ fn edge_cost(
         } else {
             OFF_AXIS_COST
         };
-        let w2 = occ.halfw[l as usize];
-        cand.push((
-            l,
-            match e.axis {
-                Axis::X => RectDbu::new(c - w2, line - w2, d + w2, line + w2),
-                Axis::Y => RectDbu::new(line - w2, c - w2, line + w2, d + w2),
-            },
-        ));
         occ.scan_wire(e.axis, l, line, c, d, hits);
     } else {
         let (k, x, y) = if eidx < v_plane {
@@ -647,6 +673,12 @@ fn edge_cost(
             (g.nodes[ve.lower as usize].layer.0, x, y)
         } else {
             let rv = &relax[(eidx - v_plane) as usize];
+            // The implied stubs are committed metal — scan them like
+            // wires; the footprint check below only covers the via's
+            // own rect, so an unscanned stub could price/block
+            // nothing while colliding for real.
+            scan_stub(g, tracks, occ, rv.a, rv.lower, rv.x, rv.y, hits);
+            scan_stub(g, tracks, occ, rv.b, rv.lower + 1, rv.x, rv.y, hits);
             (rv.lower, rv.x, rv.y)
         };
         let pair = &vias.pairs[k as usize];
@@ -660,11 +692,35 @@ fn edge_cost(
                 continue;
             };
             let abs = RectDbu::new(x + r.xl, y + r.yl, x + r.xh, y + r.yh);
-            cand.push((lid.0, abs));
             occ.scan_rect(lid.0, &abs, hits);
         }
     }
-    hit_verdict(hits, own_pins, &cand, own, hist, hard, mode).map(|extra| base + extra)
+    hit_verdict(hits, host_cells, own, hist, hard, mode).map(|extra| base + extra)
+}
+
+/// Scans the wire stub a relaxed via implies between node `n`'s
+/// position and the via position `(x, y)` on layer `l` — the
+/// transition's real metal outside the via footprint. Each endpoint
+/// shares one coordinate with `(x, y)` by construction, so the stub
+/// is a single-axis interval (or absent when `n` sits on the via).
+fn scan_stub(
+    g: &NetGraph,
+    tracks: &[LayerTracks],
+    occ: &Occupancy,
+    n: u32,
+    l: u8,
+    x: i32,
+    y: i32,
+    out: &mut Vec<Hit>,
+) {
+    let (nx, ny) = node_xy(g, tracks, n);
+    if nx == x {
+        if ny != y {
+            occ.scan_wire(Axis::Y, l, nx, ny.min(y), ny.max(y), out);
+        }
+    } else if ny == y {
+        occ.scan_wire(Axis::X, l, ny, nx.min(x), nx.max(x), out);
+    }
 }
 
 /// Records every foreign-net spacing hit of one committed edge as a
@@ -726,6 +782,14 @@ fn edge_collisions(
             (g.nodes[ve.lower as usize].layer.0, x, y)
         } else {
             let rv = &relax[(eidx - v_plane) as usize];
+            // Stubs are committed metal — same miss class as in
+            // `edge_cost`.
+            hits.clear();
+            scan_stub(g, tracks, occ, rv.a, rv.lower, rv.x, rv.y, hits);
+            record(LayerId(rv.lower), hits);
+            hits.clear();
+            scan_stub(g, tracks, occ, rv.b, rv.lower + 1, rv.x, rv.y, hits);
+            record(LayerId(rv.lower + 1), hits);
             (rv.lower, rv.x, rv.y)
         };
         let pair = &vias.pairs[k as usize];
@@ -897,28 +961,31 @@ enum NetOutcome {
     Failed(UnroutedNet),
 }
 
-/// Per-net routing state: attach sets, the grown tree, the committed
-/// edge list, and the CSR adjacency + Dijkstra scratch.
-struct NetRun {
-    attach: Vec<Vec<u32>>, // per member pin (`pin_nodes` order)
+/// Per-net topology: everything `route_one_net` needs that does not
+/// depend on occupancy, `hist`, or `hard` — built once per net in
+/// `route_nets` and reused across rip-up iterations. The unified edge
+/// index space `[0,E) | [E,E+V) | [E+V,E+V+R)` and the arc order
+/// (in-plane, then strict, then relaxed) are identical to what
+/// `NetRun::new` used to build per attempt — byte-identical search.
+struct NetTopo {
+    /// Per member pin (`pin_nodes` order): strict `pin_nodes`, else the
+    /// projection fallback.
+    attach: Vec<Vec<u32>>,
     projected: Vec<bool>,
     attachable: Vec<bool>,
-    connected: Vec<bool>,
-    members: BTreeMap<u32, Vec<u32>>, // attach node → pin indices
-    in_tree: Vec<bool>,
-    tree_nodes: Vec<u32>,
-    used_edges: Vec<u32>,
+    /// Sorted cell indices hosting member pins — the host-cell OBS
+    /// carve's domain.
+    host_cells: Vec<u32>,
+    /// Attach node → member pin indices.
+    members: BTreeMap<u32, Vec<u32>>,
+    /// Per-net relaxed via edges (`relaxed_vias` output).
+    relax: Vec<RelaxedVia>,
     adj_start: Vec<u32>,
     adj_to: Vec<u32>,
     adj_eidx: Vec<u32>,
-    dist: Vec<u32>,
-    dstamp: Vec<u32>,
-    parent: Vec<u32>,
-    pstamp: Vec<u32>,
-    stamp: u32,
 }
 
-impl NetRun {
+impl NetTopo {
     /// CSR adjacency over the unified edge index space: each in-plane
     /// edge contributes both directions, then each legal via edge
     /// (`pairs[k].default.is_some()` — a `ViaGap` pair forbids the
@@ -927,13 +994,45 @@ impl NetRun {
     /// relaxed arcs so an equal-`VIA_COST` tie relaxes toward the
     /// strict placement.
     fn new(
+        db: &DesignDb,
+        tech: &TechDb,
+        tracks: &[LayerTracks],
         g: &NetGraph,
         vias: &ViaTable,
-        relax: &[RelaxedVia],
-        attach: Vec<Vec<u32>>,
-        projected: Vec<bool>,
-        attachable: Vec<bool>,
     ) -> Self {
+        // Attach sets: strict `pin_nodes`, else the projection
+        // fallback. `host_cells` collects the cells hosting member
+        // pins for the unconditional host-cell OBS carve in
+        // `hit_verdict`.
+        let m = g.pin_nodes.len();
+        let mut attach: Vec<Vec<u32>> = Vec::with_capacity(m);
+        let mut projected = vec![false; m];
+        let mut attachable = vec![true; m];
+        let mut host_cells: Vec<u32> = Vec::new();
+        for (pi, &(pin, ref strict)) in g.pin_nodes.iter().enumerate() {
+            if let Some(c) = db.pin_cells[pin.0 as usize] {
+                host_cells.push(c.0 as u32);
+            }
+            if !strict.is_empty() {
+                attach.push(strict.clone());
+                continue;
+            }
+            let shapes = pin_shapes(db, tech, pin);
+            let nodes = project_attach(g, &shapes, tracks);
+            projected[pi] = !nodes.is_empty();
+            attachable[pi] = !nodes.is_empty();
+            attach.push(nodes);
+        }
+        host_cells.sort_unstable();
+        host_cells.dedup();
+        let mut members: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (pi, ids) in attach.iter().enumerate() {
+            for &v in ids {
+                members.entry(v).or_default().push(pi as u32);
+            }
+        }
+
+        let relax = relaxed_vias(g, tech, tracks, vias);
         let n = g.nodes.len();
         let e_plane = g.edges.len() as u32;
         let mut deg = vec![0u32; n + 1];
@@ -975,28 +1074,51 @@ impl NetRun {
             adj_eidx[pos] = ei;
             fill[a as usize] += 1;
         }
-        let mut members: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        for (pi, ids) in attach.iter().enumerate() {
-            for &v in ids {
-                members.entry(v).or_default().push(pi as u32);
-            }
-        }
         Self {
             attach,
             projected,
             attachable,
-            connected: vec![false; g.pin_nodes.len()],
+            host_cells,
             members,
-            in_tree: vec![false; n],
-            tree_nodes: Vec::new(),
-            used_edges: Vec::new(),
+            relax,
             adj_start: deg,
             adj_to,
             adj_eidx,
-            dist: vec![u32::MAX; n],
-            dstamp: vec![0; n],
-            parent: vec![u32::MAX; n],
-            pstamp: vec![0; n],
+        }
+    }
+}
+
+/// Per-attempt routing state over a cached `NetTopo`: the grown tree,
+/// the committed edge list, and the wave scratch.
+struct NetRun<'t> {
+    topo: &'t NetTopo,
+    connected: Vec<bool>,
+    in_tree: Vec<bool>,
+    tree_nodes: Vec<u32>,
+    used_edges: Vec<u32>,
+    dist: Vec<u32>,
+    dstamp: Vec<u32>,
+    parent: Vec<u32>,
+    pstamp: Vec<u32>,
+    /// Unweighted hop distance to the nearest still-unconnected
+    /// attach node — the goal-direction heuristic (`extend_once`).
+    hop: Vec<u32>,
+    stamp: u32,
+}
+
+impl<'t> NetRun<'t> {
+    fn new(topo: &'t NetTopo, n_nodes: usize, n_pins: usize) -> Self {
+        Self {
+            topo,
+            connected: vec![false; n_pins],
+            in_tree: vec![false; n_nodes],
+            tree_nodes: Vec::new(),
+            used_edges: Vec::new(),
+            dist: vec![u32::MAX; n_nodes],
+            dstamp: vec![0; n_nodes],
+            parent: vec![u32::MAX; n_nodes],
+            pstamp: vec![0; n_nodes],
+            hop: vec![u32::MAX; n_nodes],
             stamp: 0,
         }
     }
@@ -1006,20 +1128,28 @@ impl NetRun {
     fn absorb_taps(&mut self) {
         for pi in 0..self.connected.len() {
             if !self.connected[pi]
-                && self.attachable[pi]
-                && self.attach[pi].iter().any(|&v| self.in_tree[v as usize])
+                && self.topo.attachable[pi]
+                && self.topo.attach[pi].iter().any(|&v| self.in_tree[v as usize])
             {
                 self.connected[pi] = true;
             }
         }
     }
 
-    /// One multi-source Dijkstra round from the tree to the nearest
-    /// unattached pin (`(cost, node)` PQ order — equal costs pop the
-    /// lower node id; neighbors enumerate in edge-list order). On a
-    /// hit, backtracks the `parent` chain to the tree and appends the
-    /// simple path. Returns the connected pin index, or `None` when
-    /// the wave exhausted with targets left.
+    /// One goal-directed multi-source round from the tree to the
+    /// nearest unattached pin. `hop` is the unweighted hop distance
+    /// to the nearest still-unconnected attach node, recomputed per
+    /// round by BFS over every arc class (occupancy-blind, so it
+    /// undercounts — with every edge costing ≥1 hop it is a
+    /// consistent heuristic: the `(g + hop, node)` PQ pops the same
+    /// minimum-g target a plain Dijkstra would, just without
+    /// flooding the whole graph. `u32::MAX` = no target reachable
+    /// in the unweighted sense; such nodes sort last and the wave
+    /// still exhausts before reporting `None`, so the `NoPath`
+    /// verdict is unchanged). On a hit, backtracks the `parent`
+    /// chain to the tree and appends the simple path. Returns the
+    /// connected pin index, or `None` when the wave exhausted with
+    /// targets left.
     #[allow(clippy::too_many_arguments)]
     fn extend_once(
         &mut self,
@@ -1028,45 +1158,72 @@ impl NetRun {
         tech: &TechDb,
         vias: &ViaTable,
         occ: &Occupancy,
-        relax: &[RelaxedVia],
-        own_pins: &[Vec<(u32, RectDbu)>],
         own: u32,
         hist: u32,
         hard: bool,
         mode: OccMode,
     ) -> Option<usize> {
+        let topo = self.topo;
+        // Hop field: BFS from every unconnected attachable pin's
+        // attach set, all arcs unit weight.
+        self.hop.fill(u32::MAX);
+        let mut bfs: VecDeque<u32> = VecDeque::new();
+        for (pi, ids) in topo.attach.iter().enumerate() {
+            if self.connected[pi] || !topo.attachable[pi] {
+                continue;
+            }
+            for &v in ids {
+                if self.hop[v as usize] == u32::MAX {
+                    self.hop[v as usize] = 0;
+                    bfs.push_back(v);
+                }
+            }
+        }
+        while let Some(v) = bfs.pop_front() {
+            let vi = v as usize;
+            let h = self.hop[vi] + 1;
+            for pos in topo.adj_start[vi] as usize..topo.adj_start[vi + 1] as usize {
+                let to = topo.adj_to[pos] as usize;
+                if self.hop[to] == u32::MAX {
+                    self.hop[to] = h;
+                    bfs.push_back(topo.adj_to[pos]);
+                }
+            }
+        }
+
         self.stamp += 1;
         let stamp = self.stamp;
         let mut pq: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
         for &v in &self.tree_nodes {
             self.dist[v as usize] = 0;
             self.dstamp[v as usize] = stamp;
-            pq.push(Reverse((0, v)));
+            pq.push(Reverse((self.hop[v as usize], v)));
         }
         let mut hits: Vec<Hit> = Vec::new();
         let mut found = None;
-        while let Some(Reverse((d, v))) = pq.pop() {
+        while let Some(Reverse((f, v))) = pq.pop() {
             let vi = v as usize;
-            if self.dstamp[vi] == stamp && self.dist[vi] < d {
-                continue;
+            if self.dstamp[vi] == stamp && self.dist[vi].saturating_add(self.hop[vi]) < f {
+                continue; // a better `g + hop` was pushed after this entry
             }
-            if let Some(pins) = self.members.get(&v)
+            if let Some(pins) = topo.members.get(&v)
                 && let Some(&pi) = pins
                     .iter()
-                    .find(|&&p| !self.connected[p as usize] && self.attachable[p as usize])
+                    .find(|&&p| !self.connected[p as usize] && topo.attachable[p as usize])
             {
                 found = Some((v, pi as usize));
                 break;
             }
-            for pos in self.adj_start[vi] as usize..self.adj_start[vi + 1] as usize {
-                let to = self.adj_to[pos];
+            let d = self.dist[vi];
+            for pos in topo.adj_start[vi] as usize..topo.adj_start[vi + 1] as usize {
+                let to = topo.adj_to[pos];
                 if self.in_tree[to as usize] {
                     continue; // tree nodes sit at dist 0 and cannot improve
                 }
-                let eidx = self.adj_eidx[pos];
+                let eidx = topo.adj_eidx[pos];
                 let Some(ec) = edge_cost(
-                    g, tracks, tech, vias, occ, relax, own_pins, eidx, own, hist, hard,
-                    mode, &mut hits,
+                    g, tracks, tech, vias, occ, &topo.relax, &topo.host_cells, eidx, own,
+                    hist, hard, mode, &mut hits,
                 ) else {
                     continue;
                 };
@@ -1082,7 +1239,7 @@ impl NetRun {
                     self.dstamp[ti] = stamp;
                     self.parent[ti] = eidx;
                     self.pstamp[ti] = stamp;
-                    pq.push(Reverse((nd, to)));
+                    pq.push(Reverse((nd.saturating_add(self.hop[ti]), to)));
                 }
             }
         }
@@ -1090,28 +1247,34 @@ impl NetRun {
         // Backtracked path is simple: parents record the arriving edge
         // of a strictly decreasing `dist` chain and terminate on the
         // tree; the tree only grows (nodes are added, never removed).
-        while !self.in_tree[v as usize] {
+        // The bound is an invariant guard, not a heuristic — a broken
+        // parent chain must surface as a named `NoPath`, never a hang.
+        for _ in 0..g.nodes.len() {
+            if self.in_tree[v as usize] {
+                self.connected[pi] = true;
+                return Some(pi);
+            }
             self.in_tree[v as usize] = true;
             self.tree_nodes.push(v);
             let e = self.parent[v as usize];
             self.used_edges.push(e);
-            v = other_end(g, relax, e, v);
+            v = other_end(g, &topo.relax, e, v);
         }
-        self.connected[pi] = true;
-        Some(pi)
+        None
     }
 }
 
-/// Routes one `NetGraph`: seed at the driver's attach set (else the
-/// first attachable member in `pin_nodes` order), extend the tree one
-/// pin at a time, and either return the committed `NetRoute` plus the
-/// provisional collisions its edges took, or the per-pin named
-/// failure.
+/// Routes one `NetGraph` over its cached `NetTopo`: seed at the
+/// driver's attach set (else the first attachable member in
+/// `pin_nodes` order), extend the tree one pin at a time, and either
+/// return the committed `NetRoute` plus the provisional collisions its
+/// edges took, or the per-pin named failure.
 fn route_one_net(
     db: &DesignDb,
     tech: &TechDb,
     tracks: &[LayerTracks],
     g: &NetGraph,
+    topo: &NetTopo,
     vias: &ViaTable,
     occ: &Occupancy,
     hist: u32,
@@ -1139,41 +1302,6 @@ fn route_one_net(
         );
     }
 
-    // Attach sets: strict `pin_nodes`, else the projection fallback.
-    // `own_pins` collects the member pin rects per routing layer,
-    // pre-expanded into access halos (`w/2` + the layer's widest
-    // track gap) for the pin-carve OBS exemption in `hit_verdict` —
-    // the halo must reach every node `project_attach` can emit.
-    let mut attach: Vec<Vec<u32>> = Vec::with_capacity(m);
-    let mut projected = vec![false; m];
-    let mut attachable = vec![true; m];
-    let mut own_pins: Vec<Vec<(u32, RectDbu)>> = vec![Vec::new(); tracks.len()];
-    for (pi, &(pin, ref strict)) in g.pin_nodes.iter().enumerate() {
-        let host = db.pin_cells[pin.0 as usize].map_or(u32::MAX, |c| c.0 as u32);
-        let shapes = pin_shapes(db, tech, pin);
-        for (lid, r) in &shapes {
-            let l = lid.0 as usize;
-            if l < own_pins.len() {
-                let w2 = tech.routing_layers[l].width_dbu / 2;
-                let (hx, hy) = (
-                    w2 + max_gap(&tracks[l].tracks_x),
-                    w2 + max_gap(&tracks[l].tracks_y),
-                );
-                own_pins[l].push((
-                    host,
-                    RectDbu::new(r.xl - hx, r.yl - hy, r.xh + hx, r.yh + hy),
-                ));
-            }
-        }
-        if !strict.is_empty() {
-            attach.push(strict.clone());
-            continue;
-        }
-        let nodes = project_attach(g, &shapes, tracks);
-        projected[pi] = !nodes.is_empty();
-        attachable[pi] = !nodes.is_empty();
-        attach.push(nodes);
-    }
     let ordered_pins = |connected: &[bool]| -> Vec<PinId> {
         g.pin_nodes
             .iter()
@@ -1200,14 +1328,11 @@ fn route_one_net(
             .collect()
     };
 
-    if !attachable.iter().any(|&a| a) {
-        return fail(Vec::new(), ordered_failed(&vec![false; m], &attachable));
+    if !topo.attachable.iter().any(|&a| a) {
+        return fail(Vec::new(), ordered_failed(&vec![false; m], &topo.attachable));
     }
 
-    // Relaxed transitions are per-graph — computed once per call and
-    // shared by the CSR build, the search, and extraction.
-    let relax = relaxed_vias(g, tech, tracks, vias);
-    let mut run = NetRun::new(g, vias, &relax, attach, projected, attachable);
+    let mut run = NetRun::new(topo, g.nodes.len(), m);
 
     // Seed: the driver pin's attach set (`net_driver`, else the first
     // attachable member in `net_pins` order).
@@ -1216,12 +1341,15 @@ fn route_one_net(
         .pin_nodes
         .iter()
         .position(|&(p, _)| Some(p) == drv)
-        .filter(|&pi| run.attachable[pi])
-        .or_else(|| (0..m).find(|&pi| run.attachable[pi]));
+        .filter(|&pi| topo.attachable[pi])
+        .or_else(|| (0..m).find(|&pi| topo.attachable[pi]));
     let Some(seed) = seed else {
-        return fail(Vec::new(), ordered_failed(&run.connected, &run.attachable));
+        return fail(
+            Vec::new(),
+            ordered_failed(&run.connected, &topo.attachable),
+        );
     };
-    for &v in &run.attach[seed].clone() {
+    for &v in &topo.attach[seed] {
         run.in_tree[v as usize] = true;
         run.tree_nodes.push(v);
     }
@@ -1232,17 +1360,15 @@ fn route_one_net(
         .connected
         .iter()
         .enumerate()
-        .any(|(pi, &c)| !c && run.attachable[pi])
+        .any(|(pi, &c)| !c && topo.attachable[pi])
     {
         if run
-            .extend_once(
-                g, tracks, tech, vias, occ, &relax, &own_pins, g.net.0, hist, hard, mode,
-            )
+            .extend_once(g, tracks, tech, vias, occ, g.net.0, hist, hard, mode)
             .is_none()
         {
             return fail(
                 ordered_pins(&run.connected),
-                ordered_failed(&run.connected, &run.attachable),
+                ordered_failed(&run.connected, &topo.attachable),
             );
         }
         run.absorb_taps();
@@ -1253,7 +1379,7 @@ fn route_one_net(
     if !run.connected.iter().all(|&c| c) {
         return fail(
             ordered_pins(&run.connected),
-            ordered_failed(&run.connected, &run.attachable),
+            ordered_failed(&run.connected, &topo.attachable),
         );
     }
 
@@ -1291,7 +1417,7 @@ fn route_one_net(
             // the lower layer, `(x,y) → b.xy` on the upper — are real
             // metal the committed geometry must carry (each shares
             // one coordinate, so each is a single-axis interval).
-            let rv = &relax[(eidx - v_plane) as usize];
+            let rv = &topo.relax[(eidx - v_plane) as usize];
             vplaced.insert((rv.lower, rv.x, rv.y));
             let (ax, ay) = node_xy(g, tracks, rv.a);
             let (bx, by) = node_xy(g, tracks, rv.b);
@@ -1376,7 +1502,7 @@ fn route_one_net(
     let mut prov = BTreeSet::new();
     let mut hits = Vec::new();
     for &eidx in &run.used_edges {
-        edge_collisions(g, tracks, vias, occ, &relax, eidx, g.net, &mut prov, &mut hits);
+        edge_collisions(g, tracks, vias, occ, &topo.relax, eidx, g.net, &mut prov, &mut hits);
     }
 
     NetOutcome::Routed(
@@ -1389,7 +1515,7 @@ fn route_one_net(
                 .pin_nodes
                 .iter()
                 .enumerate()
-                .filter(|(pi, _)| run.connected[*pi] && run.projected[*pi])
+                .filter(|(pi, _)| run.connected[*pi] && topo.projected[*pi])
                 .map(|(_, &(p, _))| p)
                 .collect(),
         },
@@ -1445,9 +1571,26 @@ pub fn route_nets(
     vias: &ViaTable,
     cfg: &MazeConfig,
 ) -> RouteDb {
+    let timing = std::env::var_os("GRUS_DRT_TIMING").is_some();
+    let t0 = std::time::Instant::now();
     let n = graphs.nets.len();
     let mut occ = Occupancy::new(tech);
     premark_obs(db, tech, tracks, &mut occ);
+    if timing {
+        eprintln!("drt: premark_obs {:?}", t0.elapsed());
+    }
+    // Per-net topology (attach sets, relaxed vias, CSR) is built once —
+    // occupancy/history/hard-mode vary per iteration, the graph does
+    // not. Arc order is fixed → determinism untouched.
+    let t1 = std::time::Instant::now();
+    let topos: Vec<NetTopo> = graphs
+        .nets
+        .iter()
+        .map(|g| NetTopo::new(db, tech, tracks, g, vias))
+        .collect();
+    if timing {
+        eprintln!("drt: topos {:?}", t1.elapsed());
+    }
     let net_idx: BTreeMap<u32, usize> = graphs
         .nets
         .iter()
@@ -1467,11 +1610,14 @@ pub fn route_nets(
         it += 1;
         iterations = it;
         let hard = it == cap;
+        let ti = std::time::Instant::now();
         let mut prov: BTreeSet<Collision> = BTreeSet::new();
         let mut failed: Vec<(usize, UnroutedNet)> = Vec::new();
-        for &i in &bad {
+        for (bi, &i) in bad.iter().enumerate() {
             let g = &graphs.nets[i];
-            match route_one_net(db, tech, tracks, g, vias, &occ, hist[i], hard, cfg.occ) {
+            let tn = std::time::Instant::now();
+            match route_one_net(db, tech, tracks, g, &topos[i], vias, &occ, hist[i], hard, cfg.occ)
+            {
                 NetOutcome::Routed(route, hits) => {
                     commit_route(&mut occ, tracks, vias, &route, &mut marks[i]);
                     if !hard && cfg.occ == OccMode::Enabled {
@@ -1480,6 +1626,19 @@ pub fn route_nets(
                     routes[i] = Some(route);
                 }
                 NetOutcome::Failed(u) => failed.push((i, u)),
+            }
+            if timing {
+                let el = tn.elapsed();
+                if timing && (el.as_millis() > 500 || bi % 500 == 0) {
+                    eprintln!(
+                        "drt:   net[{bi}/{}] nodes={} edges={} pins={} {:?}",
+                        bad.len(),
+                        g.nodes.len(),
+                        g.edges.len(),
+                        g.pin_nodes.len(),
+                        el
+                    );
+                }
             }
         }
         if hard {
@@ -1506,6 +1665,15 @@ pub fn route_nets(
             }
             routes[i] = None;
             hist[i] = hist[i].saturating_add(1);
+        }
+        if timing {
+            eprintln!(
+                "drt: iter {it} bad={} failed={} prov={} {:?}",
+                bad.len(),
+                failed.len(),
+                prov.len(),
+                ti.elapsed()
+            );
         }
     }
 
@@ -1543,12 +1711,11 @@ pub fn overlap_census(
     for l in 0..occ.lines_x.len() {
         let s = occ.spc[l];
         for map in [&occ.lines_x[l], &occ.lines_y[l]] {
-            for (&t, ivs) in map {
-                let mut sorted: Vec<&Interval> = ivs.iter().collect();
-                sorted.sort_by_key(|iv| iv.lo);
+            for (&t, line) in map {
+                let sorted = &line.ivs;
                 for i in 0..sorted.len() {
                     for b in sorted.iter().skip(i + 1) {
-                        let a = sorted[i];
+                        let a = &sorted[i];
                         if b.lo >= a.hi + s {
                             break;
                         }
@@ -1893,16 +2060,9 @@ mod tests {
 
         let occ = Occupancy::new(&tech);
         let cfg = MazeConfig::default();
+        let topo = NetTopo::new(&db, &tech, &tracks, &g, &vias);
         let outcome = route_one_net(
-            &db,
-            &tech,
-            &tracks,
-            &g,
-            &vias,
-            &occ,
-            0,
-            false,
-            cfg.occ,
+            &db, &tech, &tracks, &g, &topo, &vias, &occ, 0, false, cfg.occ,
         );
         let NetOutcome::Routed(route, _) = outcome else {
             panic!("square must route");
@@ -1929,537 +2089,5 @@ mod tests {
             ]
         );
         assert_eq!(route.connected, vec![PinId(0), PinId(1)]);
-    }
-
-    // ---- temporary NoPath diagnosis (removed before landing) ----
-
-    fn gcd_inputs() -> (TechDb, DesignDb, Vec<LayerTracks>, RouteGraphs, ViaTable) {
-        use crate::congestion::guide::parse_guides;
-        use crate::drt::graph::join_guides;
-        use crate::drt::tracks::layer_tracks;
-        use crate::drt::via::via_table;
-        use crate::interner::StringInterner;
-        use crate::readers::{load_tech_db, parse_def};
-        use std::path::PathBuf;
-        let lib_dir = PathBuf::from(std::env::var_os("HOME").expect("HOME"))
-            .join(".ciel/sky130A/libs.ref/sky130_fd_sc_hd");
-        let mut interner = StringInterner::new();
-        let tech = load_tech_db(
-            &lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"),
-            &lib_dir.join("lef/sky130_fd_sc_hd.lef"),
-            &mut interner,
-        )
-        .expect("load_tech_db")
-        .0;
-        let ddir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/designs/gcd");
-        let db = parse_def(&ddir.join("gcd.placed.def"), &tech, None).expect("parse_def");
-        let tracks = layer_tracks(&db, &tech);
-        let gtext = std::fs::read_to_string(ddir.join("gcd.guide")).expect("guide");
-        let parsed = parse_guides(&gtext, &tech).expect("parse_guides");
-        let join = join_guides(&db, &tech, &parsed).expect("join");
-        let graphs =
-            crate::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, 1);
-        let vias = via_table(&tech, &db).expect("via_table");
-        (tech, db, tracks, graphs, vias)
-    }
-
-    /// Reachable set of `seed` ignoring occupancy entirely (in-plane +
-    /// strict via + relaxed via arcs).
-    fn reach(g: &NetGraph, relax: &[RelaxedVia], seed: u32) -> Vec<bool> {
-        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); g.nodes.len()];
-        for e in &g.edges {
-            adj[e.a as usize].push(e.b);
-            adj[e.b as usize].push(e.a);
-        }
-        for ve in &g.via_edges {
-            adj[ve.lower as usize].push(ve.upper);
-            adj[ve.upper as usize].push(ve.lower);
-        }
-        for rv in relax {
-            adj[rv.a as usize].push(rv.b);
-            adj[rv.b as usize].push(rv.a);
-        }
-        let mut seen = vec![false; g.nodes.len()];
-        let mut stack = vec![seed];
-        seen[seed as usize] = true;
-        while let Some(v) = stack.pop() {
-            for &t in &adj[v as usize] {
-                if !seen[t as usize] {
-                    seen[t as usize] = true;
-                    stack.push(t);
-                }
-            }
-        }
-        seen
-    }
-
-    /// Occupancy-aware reachability: BFS over arcs whose `edge_cost`
-    /// is `Some` (Obs-carve rules applied) — mirrors the search.
-    #[allow(clippy::too_many_arguments)]
-    fn occ_reach(
-        g: &NetGraph,
-        relax: &[RelaxedVia],
-        tech: &TechDb,
-        tracks: &[LayerTracks],
-        vias: &ViaTable,
-        occ: &Occupancy,
-        own_pins: &[Vec<(u32, RectDbu)>],
-        own: u32,
-        seed: u32,
-    ) -> Vec<bool> {
-        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); g.nodes.len()];
-        let mut adj_e: Vec<Vec<u32>> = vec![Vec::new(); g.nodes.len()];
-        let e_plane = g.edges.len() as u32;
-        let v_plane = e_plane + g.via_edges.len() as u32;
-        for (i, e) in g.edges.iter().enumerate() {
-            adj[e.a as usize].push(e.b);
-            adj[e.b as usize].push(e.a);
-            adj_e[e.a as usize].push(i as u32);
-            adj_e[e.b as usize].push(i as u32);
-        }
-        for (i, ve) in g.via_edges.iter().enumerate() {
-            let ei = e_plane + i as u32;
-            adj[ve.lower as usize].push(ve.upper);
-            adj[ve.upper as usize].push(ve.lower);
-            adj_e[ve.lower as usize].push(ei);
-            adj_e[ve.upper as usize].push(ei);
-        }
-        for (i, rv) in relax.iter().enumerate() {
-            let ei = v_plane + i as u32;
-            adj[rv.a as usize].push(rv.b);
-            adj[rv.b as usize].push(rv.a);
-            adj_e[rv.a as usize].push(ei);
-            adj_e[rv.b as usize].push(ei);
-        }
-        let mut seen = vec![false; g.nodes.len()];
-        let mut stack = vec![seed];
-        seen[seed as usize] = true;
-        let mut hits = Vec::new();
-        while let Some(v) = stack.pop() {
-            for (k, &t) in adj[v as usize].iter().enumerate() {
-                if seen[t as usize] {
-                    continue;
-                }
-                if edge_cost(
-                    g, tracks, tech, vias, occ, relax, own_pins, adj_e[v as usize][k], own,
-                    0, false, OccMode::Disabled, &mut hits,
-                )
-                .is_none()
-                {
-                    continue;
-                }
-                seen[t as usize] = true;
-                stack.push(t);
-            }
-        }
-        seen
-    }
-
-    #[test]
-    fn tmp_gcd_standalone() {
-        let (tech, db, tracks, graphs, vias) = gcd_inputs();
-        let mut occ = Occupancy::new(&tech);
-        premark_obs(&db, &tech, &tracks, &mut occ);
-        let mut empty_wires = Vec::new();
-        let mut fails = Vec::new();
-        for g in &graphs.nets {
-            match route_one_net(&db, &tech, &tracks, g, &vias, &occ, 0, false, OccMode::Enabled)
-            {
-                NetOutcome::Routed(r, _) => {
-                    if r.wires.is_empty() {
-                        empty_wires.push((g.net.0, r.vias.len(), r.connected.len()));
-                    }
-                }
-                NetOutcome::Failed(u) => fails.push((g, u)),
-            }
-        }
-        println!("standalone: {} routed, {} failed", graphs.nets.len() - fails.len(), fails.len());
-        println!("empty-wire routes: {empty_wires:?}");
-        for g in &graphs.nets {
-            if g.net.0 != 7 && g.net.0 != 134 {
-                continue;
-            }
-            for (pi, &(p, ref strict)) in g.pin_nodes.iter().enumerate() {
-                let shapes = pin_shapes(&db, &tech, p);
-                let att = if strict.is_empty() {
-                    project_attach(g, &shapes, &tracks)
-                } else {
-                    strict.clone()
-                };
-                let rect_str: Vec<String> = shapes
-                    .iter()
-                    .map(|(l, r)| format!("l{} [{},{},{},{}]", l.0, r.xl, r.yl, r.xh, r.yh))
-                    .collect();
-                let pname = db.strings.resolve(db.pin_names[p.0 as usize]);
-                let label = match db.pin_cells[p.0 as usize] {
-                    Some(c) => format!(
-                        "{}/{}",
-                        db.strings.resolve(db.cell_names[c.0 as usize]),
-                        pname
-                    ),
-                    None => pname.to_string(),
-                };
-                println!(
-                    "  net{} pin#{pi} {label} strict={strict:?} att={att:?} rects={rect_str:?}",
-                    g.net.0
-                );
-            }
-        }
-        for (g, u) in &fails {
-            let relax = relaxed_vias(g, &tech, &tracks, &vias);
-            let mut own_pins: Vec<Vec<(u32, RectDbu)>> = vec![Vec::new(); tracks.len()];
-            for &(pin, _) in &g.pin_nodes {
-                let host = db.pin_cells[pin.0 as usize].map_or(u32::MAX, |c| c.0 as u32);
-                for (lid, r) in pin_shapes(&db, &tech, pin) {
-                    let l = lid.0 as usize;
-                    if l < own_pins.len() {
-                        let w2 = tech.routing_layers[l].width_dbu / 2;
-                        let (hx, hy) = (
-                            w2 + max_gap(&tracks[l].tracks_x),
-                            w2 + max_gap(&tracks[l].tracks_y),
-                        );
-                        own_pins[l].push((
-                            host,
-                            RectDbu::new(r.xl - hx, r.yl - hy, r.xh + hx, r.yh + hy),
-                        ));
-                    }
-                }
-            }
-            let seed = g
-                .pin_nodes
-                .iter()
-                .find(|(_, s)| !s.is_empty())
-                .map(|(_, s)| s[0])
-                .unwrap_or(0);
-            let name = db.strings.resolve(db.net_names[g.net.0 as usize]);
-            let free = reach(g, &relax, seed);
-            let seen = occ_reach(
-                g, &relax, &tech, &tracks, &vias, &occ, &own_pins, g.net.0, seed,
-            );
-            let mut per_layer = vec![0usize; tracks.len()];
-            let mut free_layer = vec![0usize; tracks.len()];
-            for (i, n) in g.nodes.iter().enumerate() {
-                if seen[i] {
-                    per_layer[n.layer.0 as usize] += 1;
-                }
-                if free[i] {
-                    free_layer[n.layer.0 as usize] += 1;
-                }
-            }
-            let mut attach_detail = format!(
-                "    reached/occ={per_layer:?} reached/free={free_layer:?}\n"
-            );
-            if name == "_134_" || name == "_138_" {
-                // Boundary edges on each layer: one endpoint
-                // occ-reached, the other not — why is the frontier
-                // sealed?
-                {
-                    let mut hits = Vec::new();
-                    for l in 0..2usize {
-                        let mut shown = 0;
-                        for (i, e) in g.edges.iter().enumerate() {
-                            let (a, b) = (e.a as usize, e.b as usize);
-                            if g.nodes[a].layer.0 as usize != l {
-                                continue;
-                            }
-                            if seen[a] == seen[b] {
-                                continue;
-                            }
-                            hits.clear();
-                            let c = edge_cost(
-                                g, &tracks, &tech, &vias, &occ, &relax, &own_pins,
-                                i as u32, g.net.0, 0, false, OccMode::Disabled, &mut hits,
-                            );
-                            if c.is_some() {
-                                continue;
-                            }
-                            let who: Vec<String> = hits
-                                .iter()
-                                .map(|h| {
-                                    let r = hit_rect(h);
-                                    format!(
-                                        "{:?}@l{}[{}..{} x {}..{}]",
-                                        h.iv.who, h.layer, r.xl, r.xh, r.yl, r.yh
-                                    )
-                                })
-                                .collect();
-                            let (ax, ay) = node_xy(g, &tracks, e.a);
-                            let (bx, by) = node_xy(g, &tracks, e.b);
-                            attach_detail.push_str(&format!(
-                                "    l{l} boundary e{i} ({ax},{ay})-({bx},{by}): {who:?}\n"
-                            ));
-                            shown += 1;
-                            if shown >= 60 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                for l in 0..tracks.len() {
-                    let mut hit_nodes: Vec<String> = Vec::new();
-                    let mut unhit: Vec<String> = Vec::new();
-                    for (i, n) in g.nodes.iter().enumerate() {
-                        if n.layer.0 as usize != l {
-                            continue;
-                        }
-                        let (x, y) = node_xy(g, &tracks, i as u32);
-                        if seen[i] {
-                            hit_nodes.push(format!("{i}@({x},{y})"));
-                        } else if free[i] {
-                            unhit.push(format!("{i}@({x},{y})"));
-                        }
-                    }
-                    attach_detail.push_str(&format!(
-                        "    l{l} occ-hit {} nodes: {}\n",
-                        hit_nodes.len(),
-                        hit_nodes.join(" ")
-                    ));
-                    attach_detail.push_str(&format!(
-                        "    l{l} free-only {} nodes: {}\n",
-                        unhit.len(),
-                        unhit.join(" ")
-                    ));
-                }
-            }
-            for (pi, &(p, ref strict)) in g.pin_nodes.iter().enumerate() {
-                let shapes = pin_shapes(&db, &tech, p);
-                let att = if strict.is_empty() {
-                    project_attach(g, &shapes, &tracks)
-                } else {
-                    strict.clone()
-                };
-                let reach_n = att.iter().filter(|&&v| seen[v as usize]).count();
-                let free_n = att.iter().filter(|&&v| free[v as usize]).count();
-                let layers: Vec<u8> = att
-                    .iter()
-                    .map(|&v| g.nodes[v as usize].layer.0)
-                    .collect();
-                let pname = db.strings.resolve(db.pin_names[p.0 as usize]);
-                let label = match db.pin_cells[p.0 as usize] {
-                    Some(c) => format!(
-                        "{}/{}",
-                        db.strings.resolve(db.cell_names[c.0 as usize]),
-                        pname
-                    ),
-                    None => pname.to_string(),
-                };
-                let rect_str: Vec<String> = shapes
-                    .iter()
-                    .map(|(l, r)| format!("l{} [{},{},{},{}]", l.0, r.xl, r.yl, r.xh, r.yh))
-                    .collect();
-                attach_detail.push_str(&format!(
-                    "    pin#{pi} {label} attach={} free={free_n} occ={reach_n} layers={layers:?} rects={rect_str:?}\n",
-                    att.len()
-                ));
-            }
-            // Deep-dive the first failing net's sealed attach nodes:
-            // every incident arc's verdict and the Obs rect that
-            // blocks it.
-            if fails.len() == 1 || name == "_134_" || name == "_138_" {
-                let mut hits = Vec::new();
-                let e_plane = g.edges.len() as u32;
-                let v_plane = e_plane + g.via_edges.len() as u32;
-                'dump: for (_pi, &(p, ref strict)) in g.pin_nodes.iter().enumerate() {
-                    if !u.failed.iter().any(|&(fp, _)| fp == p) {
-                        continue;
-                    }
-                    let shapes = pin_shapes(&db, &tech, p);
-                    let att = if strict.is_empty() {
-                        project_attach(g, &shapes, &tracks)
-                    } else {
-                        strict.clone()
-                    };
-                    for &v in &att {
-                        let (x, y) = node_xy(g, &tracks, v);
-                        attach_detail.push_str(&format!(
-                            "      node {v} l{} ({x},{y})\n",
-                            g.nodes[v as usize].layer.0
-                        ));
-                        let total = e_plane + g.via_edges.len() as u32 + relax.len() as u32;
-                        for eidx in 0..total {
-                            let incident = if eidx < e_plane {
-                                let e = &g.edges[eidx as usize];
-                                e.a == v || e.b == v
-                            } else if eidx < v_plane {
-                                let ve = &g.via_edges[(eidx - e_plane) as usize];
-                                ve.lower == v || ve.upper == v
-                            } else {
-                                let rv = &relax[(eidx - v_plane) as usize];
-                                rv.a == v || rv.b == v
-                            };
-                            if !incident {
-                                continue;
-                            }
-                            let to = other_end(g, &relax, eidx, v);
-                            if eidx >= v_plane {
-                                let rv = &relax[(eidx - v_plane) as usize];
-                                attach_detail.push_str(&format!(
-                                    "        relax pos=({},{})\n", rv.x, rv.y
-                                ));
-                            }
-                            hits.clear();
-                            let verdict = edge_cost(
-                                g, &tracks, &tech, &vias, &occ, &relax, &own_pins,
-                                eidx, g.net.0, 0, false, OccMode::Disabled, &mut hits,
-                            );
-                            let who: Vec<String> = hits
-                                .iter()
-                                .map(|h| {
-                                    let r = hit_rect(h);
-                                    format!(
-                                        "{:?}@l{}[{}..{} x {}..{}]",
-                                        h.iv.who, h.layer, r.xl, r.xh, r.yl, r.yh
-                                    )
-                                })
-                                .collect();
-                            attach_detail.push_str(&format!(
-                                "        e{eidx} -> n{to} cost={verdict:?} {who:?}\n"
-                            ));
-                        }
-                    }
-                    break 'dump;
-                }
-            }
-            println!(
-                "FAIL {name} nodes={} edges={} ve={} rv={} {}\n{attach_detail}",
-                g.nodes.len(),
-                g.edges.len(),
-                g.via_edges.len(),
-                relax.len(),
-                u.failed
-                    .iter()
-                    .map(|(p, k)| format!("{}:{k:?}", p.0))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-        }
-    }
-
-    #[test]
-    fn tmp_gcd_seq() {
-        let (tech, db, tracks, graphs, vias) = gcd_inputs();
-        let rdb = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
-        println!(
-            "seq: {} routed, {} unrouted",
-            rdb.nets.len(),
-            rdb.unrouted.len()
-        );
-        // Rebuild the final committed occupancy (premark + routed
-        // wires) and classify what seals each failing pin's attach
-        // arcs.
-        let mut occ = Occupancy::new(&tech);
-        premark_obs(&db, &tech, &tracks, &mut occ);
-        for r in &rdb.nets {
-            let mut sink = Vec::new();
-            commit_route(&mut occ, &tracks, &vias, r, &mut sink);
-        }
-        let net_idx: BTreeMap<u32, &NetGraph> = graphs
-            .nets
-            .iter()
-            .map(|g| (g.net.0, g))
-            .collect();
-        for u in &rdb.unrouted {
-            let g = net_idx[&u.net.0];
-            let name = db.strings.resolve(db.net_names[g.net.0 as usize]);
-            let relax = relaxed_vias(g, &tech, &tracks, &vias);
-            let mut own_pins: Vec<Vec<(u32, RectDbu)>> = vec![Vec::new(); tracks.len()];
-            for &(pin, _) in &g.pin_nodes {
-                let host = db.pin_cells[pin.0 as usize].map_or(u32::MAX, |c| c.0 as u32);
-                for (lid, r) in pin_shapes(&db, &tech, pin) {
-                    let l = lid.0 as usize;
-                    if l < own_pins.len() {
-                        let w2 = tech.routing_layers[l].width_dbu / 2;
-                        let (hx, hy) = (
-                            w2 + max_gap(&tracks[l].tracks_x),
-                            w2 + max_gap(&tracks[l].tracks_y),
-                        );
-                        own_pins[l].push((
-                            host,
-                            RectDbu::new(r.xl - hx, r.yl - hy, r.xh + hx, r.yh + hy),
-                        ));
-                    }
-                }
-            }
-            let e_plane = g.edges.len() as u32;
-            let v_plane = e_plane + g.via_edges.len() as u32;
-            let total = v_plane + relax.len() as u32;
-            let mut hits = Vec::new();
-            for &(p, ref strict) in &g.pin_nodes {
-                if !u.failed.iter().any(|&(fp, _)| fp == p) {
-                    continue;
-                }
-                let shapes = pin_shapes(&db, &tech, p);
-                let att = if strict.is_empty() {
-                    project_attach(g, &shapes, &tracks)
-                } else {
-                    strict.clone()
-                };
-                let pname = db.strings.resolve(db.pin_names[p.0 as usize]);
-                let label = match db.pin_cells[p.0 as usize] {
-                    Some(c) => format!(
-                        "{}/{}",
-                        db.strings.resolve(db.cell_names[c.0 as usize]),
-                        pname
-                    ),
-                    None => pname.to_string(),
-                };
-                for &v in &att {
-                    let (x, y) = node_xy(g, &tracks, v);
-                    let mut blockers: Vec<String> = Vec::new();
-                    let mut free_arcs = 0;
-                    for eidx in 0..total {
-                        let incident = if eidx < e_plane {
-                            let e = &g.edges[eidx as usize];
-                            e.a == v || e.b == v
-                        } else if eidx < v_plane {
-                            let ve = &g.via_edges[(eidx - e_plane) as usize];
-                            ve.lower == v || ve.upper == v
-                        } else {
-                            let rv = &relax[(eidx - v_plane) as usize];
-                            rv.a == v || rv.b == v
-                        };
-                        if !incident {
-                            continue;
-                        }
-                        hits.clear();
-                        let verdict = edge_cost(
-                            g, &tracks, &tech, &vias, &occ, &relax, &own_pins,
-                            eidx, g.net.0, 0, true, OccMode::Enabled, &mut hits,
-                        );
-                        if verdict.is_some() {
-                            free_arcs += 1;
-                            continue;
-                        }
-                        for h in &hits {
-                            let r = hit_rect(h);
-                            let s = match h.iv.who {
-                                Occupant::Obs(c) => {
-                                    let cn = if c == u32::MAX {
-                                        "nopin".to_string()
-                                    } else {
-                                        db.strings
-                                            .resolve(db.cell_names[c as usize])
-                                            .to_string()
-                                    };
-                                    format!("Obs[{cn}]l{}[{},{},{},{}]", h.layer, r.xl, r.yl, r.xh, r.yh)
-                                }
-                                Occupant::Net(m) => {
-                                    let nn =
-                                        db.strings.resolve(db.net_names[m as usize]);
-                                    format!("Net[{nn}]l{}[{},{},{},{}]", h.layer, r.xl, r.yl, r.xh, r.yh)
-                                }
-                            };
-                            if !blockers.contains(&s) {
-                                blockers.push(s);
-                            }
-                        }
-                    }
-                    println!(
-                        "  {name} {label} node{v} l{} ({x},{y}) free={free_arcs} blockers={blockers:?}",
-                        g.nodes[v as usize].layer.0
-                    );
-                }
-            }
-        }
     }
 }
