@@ -1,6 +1,6 @@
 use crate::design_db::{
-    DesignDb, GCellGridDef, GeneratedViaGeom, NetGeom, Orient, PdnConn, PdnNet, PdnUse, PdnVia,
-    PlacementRow, PlacementStatus, TrackGrid, ViaGeom,
+    DefViaDef, DesignDb, GCellGridDef, GeneratedViaGeom, NetGeom, Orient, PdnConn, PdnNet, PdnUse,
+    PdnVia, PlacementRow, PlacementStatus, TrackGrid, ViaGeom,
 };
 use crate::interner::{
     CellId, LayerId, LibPinId, MacroPinId, NetId, PinDir, PinId, StringInterner, SymbolId,
@@ -1717,6 +1717,43 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
             DefToken::Word("VIAS") => {
                 for_each_record(&mut lexer, "VIAS", |words, line| {
                     let (name, via) = add_def_via(&mut db, tech_db, words, line)?;
+                    // Retain resolvable defs for `drt::via`'s candidate
+                    // table — `DefViaMap` stays the wire-resolution
+                    // resolver; inline/unresolvable records store
+                    // nothing, same lazy-error semantics as before.
+                    let retained = match &via {
+                        DefVia::Generated {
+                            lower,
+                            upper,
+                            cut,
+                            cut_count,
+                            geom,
+                        } => Some(DefViaDef {
+                            name: db.strings.intern(&name),
+                            lower: *lower,
+                            upper: *upper,
+                            cut: *cut,
+                            cut_count: *cut_count,
+                            geom: ViaGeom::Generated(geom.clone()),
+                        }),
+                        DefVia::Fixed(sym) => {
+                            tech_db.via_by_name.get(sym).map(|&i| {
+                                let vd = &tech_db.via_defs[i as usize];
+                                DefViaDef {
+                                    name: db.strings.intern(&name),
+                                    lower: vd.lower,
+                                    upper: vd.upper,
+                                    cut: vd.cut,
+                                    cut_count: vd.cut_count,
+                                    geom: ViaGeom::Lef(i),
+                                }
+                            })
+                        }
+                        DefVia::Inline => None,
+                    };
+                    if let Some(def) = retained {
+                        db.def_vias.push(def);
+                    }
                     def_vias.insert(name, via);
                     Ok(())
                 }, false)?;
