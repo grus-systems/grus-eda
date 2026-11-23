@@ -14,14 +14,10 @@
 //!
 //! Tests fail loudly on missing inputs — no silent skips.
 
-use grus_core::congestion::guide::{
-    GuideBox, guide_net_name, parse_guides,
-};
+use grus_core::congestion::guide::{GuideBox, guide_net_name, parse_guides};
 use grus_core::design_db::DesignDb;
 use grus_core::drt::access::{AccessReport, access_points};
-use grus_core::drt::graph::{
-    GuideJoin, build_route_graphs, join_guides,
-};
+use grus_core::drt::graph::{GuideJoin, build_route_graphs, join_guides};
 use grus_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
 use grus_core::interner::{NetId, PinId, StringInterner};
 use grus_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
@@ -160,7 +156,8 @@ fn test_track_census() {
         for g in &gaps {
             println!(
                 "  gap: {} axis {:?}",
-                tech.strings.resolve(tech.routing_layers[g.layer.0 as usize].name),
+                tech.strings
+                    .resolve(tech.routing_layers[g.layer.0 as usize].name),
                 g.axis
             );
         }
@@ -308,8 +305,7 @@ END DESIGN
 fn test_access_off_track_fixture() {
     let mut interner = StringInterner::new();
     let mut tech = TechDb::new();
-    parse_lef_bytes(OFFTRACK_LEF.as_bytes(), &mut tech, &mut interner)
-        .expect("fixture LEF parses");
+    parse_lef_bytes(OFFTRACK_LEF.as_bytes(), &mut tech, &mut interner).expect("fixture LEF parses");
     tech.strings = interner.clone();
     tech.rebuild_maps();
     let db = parse_def_bytes(OFFTRACK_DEF.as_bytes(), &tech, None).expect("fixture DEF parses");
@@ -371,15 +367,21 @@ fn test_access_failproof() {
     );
 
     let restored = access_points(&db, &tech, &layer_tracks(&db, &tech));
-    assert!(restored.off_track.is_empty(), "rebuilt grid must restore green");
+    assert!(
+        restored.off_track.is_empty(),
+        "rebuilt grid must restore green"
+    );
 
     // The axis enum is also exercised: gaps report the preferred axis.
     let gaps = track_gaps(&tech, &degraded);
     assert_eq!(gaps.len(), tech.routing_layers.len());
-    assert!(gaps.iter().all(|g| match tech.routing_layers[g.layer.0 as usize].dir {
-        LayerDir::Horizontal => g.axis == Axis::Y,
-        LayerDir::Vertical => g.axis == Axis::X,
-    }));
+    assert!(
+        gaps.iter()
+            .all(|g| match tech.routing_layers[g.layer.0 as usize].dir {
+                LayerDir::Horizontal => g.axis == Axis::Y,
+                LayerDir::Vertical => g.axis == Axis::X,
+            })
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +590,13 @@ fn test_pin_attachment() {
                     "resp_msg[9]",
                 ]
             );
+        } else {
+            // Picorv32: same two classes — 355 instance pins at
+            // guide-region boundaries and 237 io ports whose ±140
+            // met2 square holds no in-region track crossing. Pin the
+            // split so silent drift in either class trips the gate.
+            assert_eq!(names.len(), 592, "{name}: region_escape drift");
+            assert_eq!(io_escapes, 237, "{name}: io escape drift");
         }
     }
 }
@@ -678,8 +687,7 @@ END DESIGN
 fn test_region_escape_fixture() {
     let mut interner = StringInterner::new();
     let mut tech = TechDb::new();
-    parse_lef_bytes(REGION_LEF.as_bytes(), &mut tech, &mut interner)
-        .expect("fixture LEF parses");
+    parse_lef_bytes(REGION_LEF.as_bytes(), &mut tech, &mut interner).expect("fixture LEF parses");
     tech.strings = interner.clone();
     tech.rebuild_maps();
     let db = parse_def_bytes(REGION_DEF.as_bytes(), &tech, None).expect("fixture DEF parses");
@@ -695,7 +703,11 @@ fn test_region_escape_fixture() {
     let graphs = build_route_graphs(&db, &tech, &tracks, &guide(full));
     assert_eq!(graphs.nets.len(), 1);
     assert!(graphs.total_nodes > 0 && graphs.total_edges > 0);
-    assert!(graphs.region_escape.is_empty(), "{:?}", graphs.region_escape);
+    assert!(
+        graphs.region_escape.is_empty(),
+        "{:?}",
+        graphs.region_escape
+    );
     assert!(graphs.zero_coverage.is_empty());
     assert!(
         graphs.nets[0]
@@ -709,13 +721,12 @@ fn test_region_escape_fixture() {
     // covered crossings so the census stays clean of zero_coverage.
     let shrunk = "n1\n(\n500 200 1500 800 met1\n2500 2500 3500 3500 met1\n)\n";
     let graphs = build_route_graphs(&db, &tech, &tracks, &guide(shrunk));
-    assert!(graphs.zero_coverage.is_empty(), "{:?}", graphs.zero_coverage);
-    assert_eq!(
-        graphs.region_escape.len(),
-        1,
+    assert!(
+        graphs.zero_coverage.is_empty(),
         "{:?}",
-        graphs.region_escape
+        graphs.zero_coverage
     );
+    assert_eq!(graphs.region_escape.len(), 1, "{:?}", graphs.region_escape);
     let e = &graphs.region_escape[0];
     assert_eq!(pin_label(&db, e.pin), "u0/A");
     assert_eq!(net_name(&db, e.net), "n1");
@@ -726,12 +737,7 @@ fn test_region_escape_fixture() {
     let empty = "n1\n(\n500 200 1500 800 met1\n500 200 1500 800 met1\n)\n";
     let graphs = build_route_graphs(&db, &tech, &tracks, &guide(empty));
     assert_eq!(graphs.total_nodes, 0);
-    assert_eq!(
-        graphs.region_escape.len(),
-        2,
-        "{:?}",
-        graphs.region_escape
-    );
+    assert_eq!(graphs.region_escape.len(), 2, "{:?}", graphs.region_escape);
     assert_eq!(graphs.zero_coverage.len(), 1);
     let z = &graphs.zero_coverage[0];
     assert_eq!(net_name(&db, z.net), "n1");

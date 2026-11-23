@@ -97,7 +97,10 @@ pub(crate) fn pin_shapes(db: &DesignDb, tech: &TechDb, p: PinId) -> Vec<(LayerId
                 .iter()
                 .map(|&(lid, r)| {
                     let r = DesignDb::orient_rect(r, mac.width_dbu, mac.height_dbu, orient);
-                    (lid, RectDbu::new(cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh))
+                    (
+                        lid,
+                        RectDbu::new(cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh),
+                    )
                 })
                 .collect()
         }

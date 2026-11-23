@@ -236,15 +236,11 @@ pub fn build_route_graphs(
         let mut layer_base: BTreeMap<u8, u32> = BTreeMap::new();
         for (&l, pairs) in &region {
             layer_base.insert(l, nodes.len() as u32);
-            nodes.extend(
-                pairs
-                    .iter()
-                    .map(|&(ix, iy)| RouteNode {
-                        layer: LayerId(l),
-                        ix,
-                        iy,
-                    }),
-            );
+            nodes.extend(pairs.iter().map(|&(ix, iy)| RouteNode {
+                layer: LayerId(l),
+                ix,
+                iy,
+            }));
             edges.extend(layer_edges(layer_base[&l], pairs));
         }
 
@@ -252,8 +248,7 @@ pub fn build_route_graphs(
         for &pin in db.net_pins(*net) {
             let mut attached: BTreeSet<u32> = BTreeSet::new();
             for (lid, rect) in pin_shapes(db, tech, pin) {
-                let (Some(&base), Some(pairs)) =
-                    (layer_base.get(&lid.0), region.get(&lid.0))
+                let (Some(&base), Some(pairs)) = (layer_base.get(&lid.0), region.get(&lid.0))
                 else {
                     continue;
                 };
@@ -330,13 +325,19 @@ mod tests {
 
         // Two diagonal boxes: the union is per-box coverage, so the
         // off-diagonal corners (0,2)/(2,0)-class nodes never appear.
-        let (region, _) = net_region(
-            &[gb(0, 0, 0, 100, 100), gb(0, 200, 200, 300, 300)],
-            &tracks,
-        );
+        let (region, _) = net_region(&[gb(0, 0, 0, 100, 100), gb(0, 200, 200, 300, 300)], &tracks);
         assert_eq!(
             region[&0],
-            vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 2), (2, 3), (3, 2), (3, 3)]
+            vec![
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (1, 1),
+                (2, 2),
+                (2, 3),
+                (3, 2),
+                (3, 3)
+            ]
         );
 
         // A box that misses every track contributes no entry.
@@ -471,12 +472,7 @@ mod tests {
         assert_eq!(join.missing_signal, vec![NetId(1)]);
         assert_eq!(join.absent_expected, vec![NetId(2), NetId(3)]);
 
-        let err = join_guides(
-            &db,
-            &tech,
-            &[("no_such_net".to_string(), Vec::new())],
-        )
-        .unwrap_err();
+        let err = join_guides(&db, &tech, &[("no_such_net".to_string(), Vec::new())]).unwrap_err();
         assert!(err.to_string().contains("no_such_net"));
     }
 }

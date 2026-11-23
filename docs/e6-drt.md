@@ -214,3 +214,10 @@ the GCell edge mid-rect and each in-box fragment sees a single axis);
 y-track (gcd's 14 `req_msg`/`resp_msg` ports, picorv32's 237 io
 escapes) — no complete crossing exists inside the pin shape. The
 pinned gcd set is asserted by name in `tests/drt.rs`.
+
+Router implication: class-(b) escapes are *unattachable* under the
+pure track-crossing model — the io port square holds no node at all,
+so the maze search cannot reach them. The via-model ticket must add
+an attachment fallback for these ports (an off-crossing tap on the
+port's own met2 rect, or honoring the reference DEF's port via), or
+every io-port net stays unroutable — recorded, not worked around.

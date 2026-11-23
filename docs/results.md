@@ -9210,3 +9210,14 @@ test -p grus-core --test drt` (9/9 — the four pre-existing tests plus
 --all-targets -- -D warnings`. `picorv32.placed.def` already present
 (gitignored artifact, not regenerated). Version `0.12.1 → 0.12.2`
 (feature, patch on 0.x). No commit per ticket instruction.
+
+**Card-#50 follow-ups on `dev`**: (1) `rustfmt` applied to the
+ticket-touched files only (`drt.rs`, `drt/graph.rs`,
+`tests/drt.rs`) — repo-wide drift left alone. (2) picorv32's
+`region_escape` is now pinned by count: `592` total with the
+`io=237`/`inst=355` split asserted, so drift in either class trips
+`test_pin_attachment`. (3) `docs/e6-drt.md` states the router
+implication explicitly — class-(b) io-port escapes are unattachable
+under the pure track-crossing model; the via-model ticket must add
+an attachment fallback. `cargo test -p grus-core --test drt` 9/9
+green.
