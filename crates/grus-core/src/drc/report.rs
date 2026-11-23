@@ -48,10 +48,12 @@ pub enum Measured {
 /// One finding, normalized across families.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Finding {
-    /// Offending geometry in DBU, sorted lexicographically:
-    /// width → [rect]; spacing → [a, b]; enclosure → [cut];
-    /// area/hole → [region]. This is the list a later `drc listall`
-    /// comparison consumes (Magic emits µm; divide by dbu_per_micron).
+    /// Offending geometry in DBU: width → [rect]; spacing → [a, b]
+    /// (`a` is the earlier-`xl` member, ties by rects index — the
+    /// sweep order, not a full lexicographic sort); enclosure →
+    /// [cut]; area/hole → [region]. This is the list a later
+    /// `drc listall` comparison consumes (Magic emits µm; divide by
+    /// dbu_per_micron).
     pub bboxes: Vec<RectDbu>,
     /// The bound applied, DBU or DBU² per `measured.kind`.
     pub bound: i64,
@@ -274,7 +276,10 @@ pub struct MagicDelta {
     pub magic_total: u64,
 }
 
-pub fn magic_deltas(report: &SubsetReport, golden: &serde_json::Value) -> MagicDelta {
+pub fn magic_deltas(
+    report: &SubsetReport,
+    golden: &serde_json::Value,
+) -> anyhow::Result<MagicDelta> {
     let mut deltas: Vec<RuleDelta> = report
         .rules
         .iter()
@@ -286,26 +291,26 @@ pub fn magic_deltas(report: &SubsetReport, golden: &serde_json::Value) -> MagicD
         })
         .collect();
     let mut unclaimed = Vec::new();
-    let per_rule = golden["magic_per_rule"]
-        .as_object()
-        .expect("golden `magic_per_rule` must be an object");
+    let per_rule = golden["magic_per_rule"].as_object().ok_or_else(|| {
+        anyhow::anyhow!("reference `magic_per_rule` missing or not an object")
+    })?;
     for (key, count) in per_rule {
-        let magic = count
-            .as_u64()
-            .expect("`magic_per_rule` counts are unsigned integers");
+        let magic = count.as_u64().ok_or_else(|| {
+            anyhow::anyhow!("reference `magic_per_rule[{key}]` is not an unsigned integer")
+        })?;
         match first_paren_id(key).and_then(|id| deltas.iter_mut().find(|d| d.rule == id)) {
             Some(d) => d.magic += magic,
             None => unclaimed.push((key.clone(), magic)),
         }
     }
-    let magic_total = golden["magic_total"]
-        .as_u64()
-        .expect("golden `magic_total` must be an unsigned integer");
-    MagicDelta {
+    let magic_total = golden["magic_total"].as_u64().ok_or_else(|| {
+        anyhow::anyhow!("reference `magic_total` missing or not an unsigned integer")
+    })?;
+    Ok(MagicDelta {
         deltas,
         unclaimed,
         magic_total,
-    }
+    })
 }
 
 /// Deck split pinned by `magic_rules_checked` in the committed

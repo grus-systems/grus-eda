@@ -1859,7 +1859,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .transpose()?;
             let delta = golden
                 .as_ref()
-                .map(|g| grus_core::drc::report::magic_deltas(&report, g));
+                .map(|g| grus_core::drc::report::magic_deltas(&report, g))
+                .transpose()?;
             let claim = match &golden {
                 Some(g) => drc_claim_from_golden(g)?,
                 None => DrcClaim::pinned(),

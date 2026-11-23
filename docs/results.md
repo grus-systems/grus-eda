@@ -9050,3 +9050,15 @@ test_subset_coverage_complete test_subset_gate_matches_golden` (2/2,
 both designs), `cargo test --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings`. No commit
 per ticket instruction.
+
+**Card-#48 follow-ups on `dev`**: (1) `magic_deltas` returns
+`anyhow::Result` — a `--reference` JSON lacking `magic_per_rule` /
+`magic_total` now reports an anyhow error instead of panicking
+(matches the `drc_claim_from_golden` convention; main.rs wraps via
+`transpose()?`). (2) `Finding.bboxes` doc corrected — spacing pair
+order is the sweep's (xl, rects-index) order, not lexicographic.
+(3) `EncMode` drops the unused `Deserialize`; the report types stay
+`Serialize`-only by necessity — `rule`/`rule_name` are `&'static
+str` and serde cannot express `'de: 'static` in a derive, so the
+JSON artifact is write-only by design (deviation from the design
+note recorded).

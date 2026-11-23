@@ -978,7 +978,7 @@ fn test_subset_gate_matches_golden() {
     for name in ["gcd", "picorv32"] {
         let l = load(name);
         let report = run_all(&l.drc, &l.tech, &l.design.strings);
-        let delta = magic_deltas(&report, &l.golden);
+        let delta = magic_deltas(&report, &l.golden).unwrap();
         println!("== {name} subset census (rule ours magic) ==");
         for d in &delta.deltas {
             println!("  {:8} {:5} {:5}", d.rule, d.ours, d.magic);
