@@ -1,12 +1,13 @@
 # e6-drt-maze — Test plan
 
 All maze tests exist in `crates/grus-core/tests/drt.rs` and pass
-where measured at `c1832dc` — the remaining work is *running* the
-rest and recording the numbers, not writing new tests.
-`picorv32.placed.def` is present in the worktree; `load_routed_inputs`
-fails loud on missing inputs.
+where measured — HEAD `cf34607` is a docs-only checkpoint on the
+measured `c1832dc` code, so the state below carries over. The
+remaining work is *running* the rest and recording the numbers, not
+writing new tests. `picorv32.placed.def` is present in the worktree;
+`load_routed_inputs` fails loud on missing inputs.
 
-## Measured state at `c1832dc`
+## Measured state (code identical at `cf34607`)
 
 - `cargo test -p grus-core --lib maze` — **green**, 5/5
   (`test_band_math`, `test_perpendicular_crossing`,
@@ -19,8 +20,8 @@ fails loud on missing inputs.
 - `test_maze_census` gcd leg — **green**: `guided=269 routed=269
   pins_connected=931 projected=17 unrouted=0 collisions=0
   iterations=8 ms=9704 digest=0xfbb3073487860974`.
-- `test_maze_census` picorv32 leg — **in-flight at design time**;
-  the assert to watch is the met3-bridge classifier (below).
+- `test_maze_census` picorv32 leg — **still unmeasured at design
+  time**; the assert to watch is the met3-bridge classifier (below).
 - `test_maze_occupancy` — **green** (17.6 s): Enabled
   `digest=0xfbb3073487860974 census=0` vs Disabled
   `digest=0x349f82f53a0c7143 census=6429`.

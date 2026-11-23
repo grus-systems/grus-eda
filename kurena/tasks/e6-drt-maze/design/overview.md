@@ -6,28 +6,36 @@ graph built by `e6-drt-graph`, using the via model from `e6-drt-via`.
 Non-goals stay as specced: no DEF emission, no full DRC during search,
 no timing awareness, no track-assignment stage, no parallelism.
 
-## Resume state (fourth revision, after card feedback #3)
+## Resume state (fifth revision, after card feedback #4)
 
-**HEAD is WIP commit `c1832dc`; the router is implemented and the
-gates are green where measured.** Card feedback #3 scopes the
-remainder to docs, lint, the verify run, and the commit — in the
-reviewer's order:
+**HEAD is WIP commit `cf34607` — a docs-only checkpoint on top of
+the `c1832dc` router rewrite; the code at HEAD is byte-identical to
+what was measured below.** Card feedback #4 re-scopes the remainder
+to implementation finishing, docs, lint, the verify run, and the
+commit — in the reviewer's order:
 
-1. `docs/e6-drt.md` §7 (search order, cost constants, rip-up rule,
+1. Implementation finishing — `maze.rs` compiles at HEAD
+   (`cargo check -p grus-core --tests` clean); the remaining code
+   task is only the clippy list. While writing `docs/e6-drt.md` §7,
+   re-check each claim `docs.md` mandates against `maze.rs` (the
+   constants, occupancy classes, rip-up rule, hop heuristic were
+   re-verified against HEAD at design time — `steps.md` §0).
+2. `docs/e6-drt.md` §7 (search order, cost constants, rip-up rule,
    occupancy) + `docs/results.md` dated entry with measured runtimes
    incl. the picorv32 census number + `docs/status.md` +
    `docs/roadmap.md` — all still untouched (`docs.md`).
-2. `cargo clippy --workspace --all-targets -- -D warnings` — **6
-   warnings at HEAD**, all mapped in `steps.md` §0.
-3. `cargo test --workspace`; record the measured picorv32 maze
+3. `cargo clippy --workspace --all-targets -- -D warnings` — **6
+   warnings at `cf34607`**, re-verified at the same lines mapped in
+   `steps.md` §1.
+4. `cargo test --workspace`; record the measured picorv32 maze
    runtime — earlier census runs took 25+ CPU-min; if that is the
    accepted number, say so explicitly in `results.md`.
-4. Version bump `0.12.3 → 0.12.4` + one commit.
+5. Version bump `0.12.3 → 0.12.4` + one commit.
 
 No further routing-model work is planned unless the verify runs
 contradict the measured state below.
 
-## Measured state at `c1832dc`
+## Measured state (code identical at `cf34607`)
 
 - `test_maze_cases` (4 synthetic cases) — **green** (0.00 s).
 - `cargo test -p grus-core --lib maze` — **green**, 5/5.
@@ -39,15 +47,17 @@ contradict the measured state below.
 - `test_maze_occupancy` — **green** (17.6 s): Enabled digest
   `0xfbb3073487860974` census=0 vs Disabled digest
   `0x349f82f53a0c7143` census=6429 — occupancy measurably constrains.
-- `test_maze_census` picorv32 leg — **in-flight at design time**
-  (>15 min debug-profile when this doc was written; the 25+ CPU-min
-  figure from the earlier run is the bound the reviewer accepted if
-  it recurs — record the measured number, whatever it is).
+- `test_maze_census` picorv32 leg — **still unmeasured at design
+  time** (>15 min debug-profile on the abandoned earlier attempt;
+  the 25+ CPU-min figure from that run is the bound the reviewer
+  accepted if it recurs — record the measured number, whatever it
+  is).
 - `test_maze_determinism` — untested (2× full runs per design; its
   cost follows the census number).
 - `docs/e6-drt.md` §7, `docs/results.md` entry, `docs/status.md`,
   `docs/roadmap.md` — not yet written.
-- `cargo clippy` — 6 warnings (exact list in `steps.md` §0).
+- `cargo clippy` — 6 warnings (exact list in `steps.md` §1;
+  re-verified at `cf34607`, same lines).
 
 ## What `c1832dc` landed over `2c3c713`
 

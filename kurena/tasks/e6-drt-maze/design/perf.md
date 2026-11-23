@@ -2,9 +2,10 @@
 
 The reviewer's "slow or stuck" question resolved as **slow** — the
 `c1832dc` rewrite lands the levers below and gcd's census leg went
-**203 s → 9.7 s** (measured, debug test profile). picorv32 (28.4 M
-nodes / 54.6 M edges, ~37× gcd's graph) is in-flight at design time;
-the earlier partially-optimized run needed 25+ CPU-min, which the
+**203 s → 9.7 s** (measured, debug test profile). HEAD `cf34607` is
+docs-only on top — same binary. picorv32 (28.4 M nodes / 54.6 M
+edges, ~37× gcd's graph) is still unmeasured at design time; the
+earlier partially-optimized run needed 25+ CPU-min, which the
 reviewer pre-accepted if it recurs — record the measured number.
 
 ## What landed (`c1832dc`)
@@ -40,7 +41,7 @@ All semantics-preserving; `RouteDb` output bytes unchanged.
 |---|---|---|
 | gcd `test_maze_census` leg | 203 s (48 unrouted) | **9,704 ms** (269/269, 0 unrouted, 0 collisions) |
 | gcd `test_maze_occupancy` (2 runs) | — | 17.6 s total |
-| picorv32 census leg | >21 CPU-min (killed) | **in-flight — record measured ms** |
+| picorv32 census leg | >21 CPU-min (killed) | **unmeasured — record measured ms** |
 
 The gcd figure includes the full `route_nets`: `premark_obs` +
 `NetTopo` build + 8 iterations + `overlap_census` (0 collisions

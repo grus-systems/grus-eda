@@ -1,8 +1,8 @@
 # e6-drt-maze — Occupancy and spacing-lite
 
-Matches the implementation at `c1832dc` — the §5 diagnosis resolved
-as C1 + C2 and the L3 skip index landed; the rules below are final
-for this ticket.
+Matches the implementation at `cf34607` (code identical to the
+`c1832dc` rewrite) — the §5 diagnosis resolved as C1 + C2 and the L3
+skip index landed; the rules below are final for this ticket.
 
 ## 1. Model
 

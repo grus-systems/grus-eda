@@ -1,8 +1,11 @@
-# e6-drt-maze — Implementation steps (resume from `c1832dc`)
+# e6-drt-maze — Implementation steps (resume from `cf34607`)
 
-The checkpoint compiles; synthetic cases, in-module units, the gcd
-census leg, and the occupancy fail-proof are green; the picorv32
-census leg is in-flight. Remaining work, in the reviewer's order:
+The checkpoint compiles (`cargo check -p grus-core --tests` clean
+at HEAD, re-verified); `cf34607` is a docs-only checkpoint on top of
+the `c1832dc` rewrite, so the measured state carries over unchanged:
+synthetic cases, in-module units, the gcd census leg, and the
+occupancy fail-proof are green; the picorv32 census leg is still
+unmeasured. Remaining work, in the reviewer's order:
 
 ## 0. `docs/e6-drt.md` §7 + §4/§5 amendments
 
@@ -13,9 +16,23 @@ claim boundary and §5 router implication to match what shipped
 (projection attach + spare layer answered the escape/pocket classes;
 relaxed vias bridge the strict-crossing gap).
 
+**Design-vs-code check before writing (card feedback #4)**: every
+§7 claim `docs.md` lists must be read against `maze.rs` at HEAD,
+not trusted from this design. Verified at design time: constants
+`PREF_COST 1 / OFF_AXIS_COST 2 / VIA_COST 4 / OCC_PENALTY 8 /
+HIST_STEP 8 / MAX_ITERS 8` (maze.rs:21-26), `SKIP_CHUNK = 16` (:194),
+the `Obs`/`Net`/`Pin` verdict table incl. unconditional host carve
+(`hit_verdict`, :585+), `host_cells` sorted+deduped
+(:1011,1026-1027), `build_route_graphs_ext(.., 1)` in the test
+loader (tests/drt.rs:1229), `GRUS_DRT_TIMING` gate (:1574), the
+met3-bridge `NoPath` classifier (tests/drt.rs ~1586-1609). If any
+claim drifts from the code, the
+code wins — fix the doc claim, note the delta in the commit body.
+
 ## 1. Clear the 6 clippy warnings
 
-All mechanical; match the file's existing conventions:
+Re-verified at `cf34607` — same six, same lines. All mechanical;
+match the file's existing conventions:
 
 - `drt/maze.rs:706` `scan_stub` — `too_many_arguments (8/7)` →
   `#[allow(clippy::too_many_arguments)]` (same convention as

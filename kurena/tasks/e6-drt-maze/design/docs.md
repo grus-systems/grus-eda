@@ -2,8 +2,13 @@
 
 All English, matching existing style. §7 content is fully determined
 by the committed code — write it from `maze.rs`, `search.md`, and
-`occupancy.md` as they stand at `c1832dc`; only `results.md` waits on
-the picorv32 measurement (AGENTS §2: measured, never estimated).
+`occupancy.md` as they stand at `cf34607` (code identical to the
+measured `c1832dc`); only `results.md` waits on the picorv32
+measurement (AGENTS §2: measured, never estimated). Per card
+feedback #4, every bullet below must be re-read against the code
+before it is written into `e6-drt.md` — the verified anchors are in
+`steps.md` §0; a drift means the code wins and the delta is noted in
+the commit body.
 
 ## `docs/e6-drt.md`
 

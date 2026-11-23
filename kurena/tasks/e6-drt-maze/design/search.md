@@ -1,8 +1,8 @@
 # e6-drt-maze — Search model
 
-Matches the implementation at `c1832dc` — the `NetTopo` cache,
-goal-directed wave (`hop` heuristic), and bounded backtrack all
-landed.
+Matches the implementation at `cf34607` (code identical to the
+`c1832dc` rewrite) — the `NetTopo` cache, goal-directed wave (`hop`
+heuristic), and bounded backtrack all landed.
 
 ## 1. Per-net routing unit
 

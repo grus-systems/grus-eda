@@ -1,9 +1,9 @@
 # e6-drt-maze — API surface
 
-Public surface as landed at `c1832dc`. The remaining work (docs,
-clippy, verify, commit) touches no signatures; the internal notes
-below are the code's current truth for whoever writes `docs/e6-drt.md`
-§7.
+Public surface as landed at `c1832dc`, unchanged at HEAD `cf34607`
+(a docs-only checkpoint). The remaining work (docs, clippy, verify,
+commit) touches no signatures; the internal notes below are the
+code's current truth for whoever writes `docs/e6-drt.md` §7.
 
 ## `drt.rs` (landed)
 
