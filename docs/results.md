@@ -9395,6 +9395,15 @@ calls on gcd produce `PartialEq`-equal `RouteDb`s and equal nonzero
 digests (asserted, not sampled). picorv32 double-run lives in the
 ignored companion test.
 
+**Digest addendum (v0.12.5)**: `e6-drt-emit`'s occupancy premark
+extension (PDN `SPECIALNETS` wire rects + via stacks as
+`Obs(u32::MAX)`, io-port rects as `Pin(own_net)`) re-routes gcd to
+digest `0x48593d441074229b` — the `0xfbb3…` digest above is the
+pre-premark measurement. Every count is unchanged (269/269, 0
+unrouted, 17 projected, 0 collisions, 8 iters); the occupancy
+fail-proof re-measures as enabled `0x48593d441074229b` census=0 vs
+disabled `0x362ddadaa71f1f80` census=6,226.
+
 **Checks run**: `cargo test --release -p grus-core --test drt`
 (16/16, 2 ignored — the picorv32 companions), `cargo clippy
 -p grus-core --all-targets` clean; `cargo test --workspace` per the
@@ -9477,9 +9486,12 @@ gcd (release binary, under parallel build load vs the pinned 1,886
 ms maze measurement — same class). The picorv32 gate leg runs
 detached: `cargo test --release -p grus-core --test drt
 test_emit_selfdrc_picorv32 -- --ignored --nocapture`, started
-2026-11-24T01:50 — route ≈135 min release + emit + parse +
+2026-11-24T01:50, stdout at `/tmp/emit-picorv32.log` — route ≈135
+min release CPU (slower under ambient load) + emit + parse +
 `run_all`; its unrouted residual re-measures under the new premark
 (the maze entry pinned 108 = 43 met3-bridge + 65 met2-connected).
+The measurement is in flight at this entry's commit; its outcome
+appends below the line when the log lands.
 
 **Checks run**: `cargo test --release -p grus-core --test drt emit`
 (6/6, 1 ignored — the picorv32 gate), `cargo test --workspace`,
