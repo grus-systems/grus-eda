@@ -1,113 +1,83 @@
-# e6-drt-maze — Implementation steps (resume from `cf34607`)
+# e6-drt-maze — Implementation steps (resume from `4ff7ade`)
 
-The checkpoint compiles (`cargo check -p grus-core --tests` clean
-at HEAD, re-verified); `cf34607` is a docs-only checkpoint on top of
-the `c1832dc` rewrite, so the measured state carries over unchanged:
-synthetic cases, in-module units, the gcd census leg, and the
-occupancy fail-proof are green; the picorv32 census leg is still
-unmeasured. Remaining work, in the reviewer's order:
+HEAD `4ff7ade` holds the landed router, `docs/e6-drt.md` §7, the
+clippy fixes, and `v0.12.4`; the tree is clean. Remaining work is
+measure → document → verify → commit, in that order. Start the
+long measurement first — it is the critical path.
 
-## 0. `docs/e6-drt.md` §7 + §4/§5 amendments
+## 0. Collect the runtime evidence (`measurement.md`)
 
-Write the "7. Maze search" section per `docs.md` — content is fully
-determined by the committed code (cost constants, occupancy classes,
-rip-up rule, hop heuristic); measure nothing new here. Amend §4
-claim boundary and §5 router implication to match what shipped
-(projection attach + spare layer answered the escape/pocket classes;
-relaxed vias bridge the strict-crossing gap).
+Kick off detached, poll the log:
 
-**Design-vs-code check before writing (card feedback #4)**: every
-§7 claim `docs.md` lists must be read against `maze.rs` at HEAD,
-not trusted from this design. Verified at design time: constants
-`PREF_COST 1 / OFF_AXIS_COST 2 / VIA_COST 4 / OCC_PENALTY 8 /
-HIST_STEP 8 / MAX_ITERS 8` (maze.rs:21-26), `SKIP_CHUNK = 16` (:194),
-the `Obs`/`Net`/`Pin` verdict table incl. unconditional host carve
-(`hit_verdict`, :585+), `host_cells` sorted+deduped
-(:1011,1026-1027), `build_route_graphs_ext(.., 1)` in the test
-loader (tests/drt.rs:1229), `GRUS_DRT_TIMING` gate (:1574), the
-met3-bridge `NoPath` classifier (tests/drt.rs ~1586-1609). If any
-claim drifts from the code, the
-code wins — fix the doc claim, note the delta in the commit body.
+```
+GRUS_DRT_TIMING=1 cargo test --release -p grus-core --test drt \
+    test_maze_census -- --nocapture 2>&1 | tee /tmp/maze-census.log
+```
 
-## 1. Clear the 6 clippy warnings
+Capture both designs' census lines verbatim (`ms=`, `digest=`),
+every `unrouted …` / `met3_bridge=` line, and the timing phase
+lines. picorv32 is the acceptance number — 30+ CPU-min in release
+was the earlier figure; record whatever the run measures.
 
-Re-verified at `cf34607` — same six, same lines. All mechanical;
-match the file's existing conventions:
+## 1. Write the docs (`docs.md`)
 
-- `drt/maze.rs:706` `scan_stub` — `too_many_arguments (8/7)` →
-  `#[allow(clippy::too_many_arguments)]` (same convention as
-  `edge_cost`, `extend_once`).
-- `drt/maze.rs:729` `edge_collisions` — `(9/7)` → same `#[allow]`.
-- `drt/maze.rs:1014` `host_cells.push(c.0 as u32)` —
-  `unnecessary_cast` → drop `as u32` (`PinId`/`CellId` `.0` is
-  already `u32`).
-- `drt/maze.rs:1185` (+use at 1189) `needless_range_loop` — the hop
-  BFS indexes only `adj_to` with `pos` → iterate the slice:
-  `for &to in &topo.adj_to[range]`; check the PQ loop at ~1218 for
-  the same warning after the fix (it uses `pos` for two arrays —
-  `adj_to[..].iter().zip(&adj_eidx[..])` if flagged).
-- `drt/maze.rs:1272` `route_one_net` — `(10/7)` → same `#[allow]`.
-- `tests/drt.rs:1495` `find(p: &mut Vec<usize>, i)` — `ptr_arg` →
-  `&mut [usize]`.
+- `docs/results.md` — dated `e6-drt-maze` entry with the census
+  table, fail-proof/determinism/fixture evidence, the runtime
+  before/after record, checks run, version bump. Numbers verbatim
+  from step 0 + the measured gcd/occupancy figures; state the
+  profile next to each `ms=`.
+- `docs/status.md` — new `Last updated:` head, demoting
+  `e6-drt-via` to `Previous:`.
+- `docs/roadmap.md` — the `v0.12.4` progress bullet after the
+  `e6-drt-via` line in the E6 block.
+- `docs/e6-drt.md` — spot-check §7 anchors only; fix drift if
+  found (code wins, note the delta in the commit body).
 
-`cargo clippy --workspace --all-targets -- -D warnings` → clean.
+## 2. Verify
 
-## 2. Verify runs (numbers feed `results.md`)
+```
+cargo test --workspace        # dev profile — detached, tee to a log
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-- `cargo test -p grus-core --test drt test_maze_census -- --nocapture`
-  — collect both designs' census lines verbatim (gcd already
-  measured: `routed=269/269 unrouted=0 collisions=0 ms=9704`;
-  picorv32's `ms=` is the acceptance number — record it however
-  large; if it lands near the earlier 25+ CPU-min bound, state that
-  explicitly per the reviewer).
-- `cargo test -p grus-core --test drt test_maze_occupancy` — already
-  measured (Enabled 0 collisions vs Disabled 6,429; digests differ).
-- `cargo test -p grus-core --test drt test_maze_determinism` — 2×
-  full runs per design; identical `RouteDb` + nonzero digest.
-- `cargo test --workspace` — the whole suite, including the
-  picorv32-bound tests (census + determinism = 3 full picorv32
-  route_nets runs total across the binary; plan the wall-clock
-  envelope accordingly — run with `--release`? **No**: acceptance
-  says "completes in a test, not a timeout" under the default
-  profile; the debug number is the honest one. If the suite's wall
-  time is dominated by the 3 picorv32 runs, that is the recorded
-  fact, not a reason to `#[ignore]`).
-- `GRUS_DRT_TIMING=1` on a census rerun is optional evidence — the
-  per-iteration `bad=`/`prov=` lines document convergence.
+`cargo test --workspace` includes all 3 picorv32 `route_nets`
+runs — run detached and let it finish; record the real wall-clock
+time (and the dev-profile `ms=` it prints) in `results.md` before
+committing. If a number in the entry is still pending when the
+docs are first drafted, fill it in from the gate log — do not
+commit placeholder text.
 
-## 3. `docs/results.md` + `docs/status.md` + `docs/roadmap.md`
+## 3. Commit
 
-Per `docs.md`: dated entry with the measured census table (both
-designs), the occupancy fail-proof numbers, determinism digest,
-perf before/after (203 s → measured on gcd), the picorv32 runtime
-statement, checks run, version bump. `status.md` head paragraph and
-the `roadmap.md` E6 progress line per the existing style.
+One commit with the doc delta (plus any contingency code fixes).
+Stage explicit paths — never `git add -A`.
 
-## 4. Version bump + commit
+```
+feat: Sequential maze router over the track graph
+```
 
-- `Cargo.toml` `[workspace.package] version 0.12.3 → 0.12.4` (feature,
-  patch on 0.x — same commit as the functional change, AGENTS §5).
-- One commit on top of the checkpoints:
-  `feat: Sequential maze router over the track graph`
-  (Conventional Commits, English, agent trailer). Stage explicit
-  paths — never `git add -A`.
+Conventional Commits, English; body lists what shipped (router
+shape, census numbers, named residuals) with the agent trailer
+(`Co-Authored-By`). Version `0.12.4` is already in the tree from
+the checkpoint — no second bump.
 
 ## Contingencies
 
-- **picorv32 census red on the met3-bridge classifier**: any unrouted
-  `NoPath` net outside the met3-bridge class needs its cause named
-  and the classifier extended (`tests.md`) — do not weaken the
-  assert silently.
-- **clippy fix changes output**: none of the six fixes touches
-  semantics; if the `RouteDb` digest changes after the edits, that
-  is a bug in the fix, not new routing behavior.
+- **picorv32 `NoPath` outside the met3-bridge class**: name the
+  cause per net and extend the classifier in
+  `test_maze_census` — never weaken the assert.
+- **Workspace gate impractically long in dev profile**: record
+  the measured envelope in `results.md` and surface it on the
+  card; do not `#[ignore]` the legs or add a `[profile.test]`
+  override.
+- **A verify red in existing tests**: fix in place (small,
+  focused), rerun the gate, note the fix in the commit body.
 
 ## Files
 
-- `crates/grus-core/src/drt/maze.rs`
-- `crates/grus-core/tests/drt.rs`
-- `docs/e6-drt.md`
 - `docs/results.md`
 - `docs/status.md`
 - `docs/roadmap.md`
-- `Cargo.toml`
+- `docs/e6-drt.md` (drift fixes only)
+- `crates/grus-core/src/drt/maze.rs` (contingency only)
+- `crates/grus-core/tests/drt.rs` (contingency only)
