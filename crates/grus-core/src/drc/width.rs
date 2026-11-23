@@ -232,41 +232,68 @@ fn chain_outreaches(
     reach >= perp_hi
 }
 
-/// Runs every resolvable `WIDTH_RULES` rule over `design`. A rule whose
-/// layer is absent from the loaded LEF, or whose bound is 0 (LEF omitted
-/// `WIDTH`), contributes nothing. Strict `<`: a shape exactly at the
-/// bound passes, matching Magic's `width < %d` reading.
-pub fn check_width(design: &DrcDesign, tech: &TechDb) -> Vec<Violation> {
-    let mut out = Vec::new();
+/// Per-rule outcome for the zero-violation census — same shape as
+/// `spacing::RuleReport`; `candidates` = rects that passed the
+/// checked-src filter.
+#[derive(Debug, PartialEq)]
+pub struct RuleReport {
+    pub rule: &'static str,
+    /// `None` when the rule's layer is absent from the loaded LEF.
+    pub layer: Option<DrcLayer>,
+    /// Resolved LEF `WIDTH` bound; 0 when undeclared.
+    pub bound_dbu: i32,
+    /// Rects that passed the checked-src filter (`SignalWire`/
+    /// `SpecialWire`/`IoPort` on routing layers, `Via` on cut layers).
+    pub candidates: usize,
+    pub violations: Vec<Violation>,
+}
+
+/// Every `WIDTH_RULES` rule over `design`, one `RuleReport` per rule.
+/// A rule whose layer is absent from the loaded LEF reports
+/// `layer: None`; one whose bound is 0 (LEF omitted `WIDTH`) reports
+/// `candidates = 0`, empty `violations`. Strict `<`: a shape exactly at
+/// the bound passes, matching Magic's `width < %d` reading.
+pub fn check_width_report(design: &DrcDesign, tech: &TechDb) -> Vec<RuleReport> {
+    let mut out = Vec::with_capacity(WIDTH_RULES.len());
     for rule in WIDTH_RULES {
-        let (layer, bound, rects): (DrcLayer, i32, &[ShapeRect]) = if rule.cut {
-            let Some(&idx) = tech
-                .strings
+        let mut report = RuleReport {
+            rule: rule.rule,
+            layer: None,
+            bound_dbu: 0,
+            candidates: 0,
+            violations: Vec::new(),
+        };
+        let resolved: Option<(DrcLayer, i32, &[ShapeRect])> = if rule.cut {
+            tech.strings
                 .get(rule.layer)
                 .and_then(|s| tech.cut_layer_by_name.get(&s))
-            else {
-                continue;
-            };
-            (
-                DrcLayer::Cut(idx),
-                tech.cut_layers[idx as usize].width_dbu,
-                design.cut[idx as usize].rects.as_slice(),
-            )
+                .map(|&idx| {
+                    (
+                        DrcLayer::Cut(idx),
+                        tech.cut_layers[idx as usize].width_dbu,
+                        design.cut[idx as usize].rects.as_slice(),
+                    )
+                })
         } else {
-            let Some(&lid) = tech
-                .strings
+            tech.strings
                 .get(rule.layer)
                 .and_then(|s| tech.layer_by_name.get(&s))
-            else {
-                continue;
-            };
-            (
-                DrcLayer::Routing(lid),
-                tech.routing_layers[lid.0 as usize].width_dbu,
-                design.routing[lid.0 as usize].rects.as_slice(),
-            )
+                .map(|&lid| {
+                    (
+                        DrcLayer::Routing(lid),
+                        tech.routing_layers[lid.0 as usize].width_dbu,
+                        design.routing[lid.0 as usize].rects.as_slice(),
+                    )
+                })
         };
+        let Some((layer, bound, rects)) = resolved else {
+            out.push(report);
+            continue;
+        };
+        report.layer = Some(layer);
+        report.bound_dbu = bound;
         if bound == 0 {
+            out.push(report);
             continue;
         }
         let ls_rects = rects;
@@ -285,6 +312,7 @@ pub fn check_width(design: &DrcDesign, tech: &TechDb) -> Vec<Violation> {
             if !checked {
                 continue;
             }
+            report.candidates += 1;
             let measured = s.rect.width().min(s.rect.height());
             if measured < bound {
                 // Merge-relief: Magic measures the merged polygon. A wire
@@ -317,7 +345,7 @@ pub fn check_width(design: &DrcDesign, tech: &TechDb) -> Vec<Violation> {
                         continue;
                     }
                 }
-                out.push(Violation {
+                report.violations.push(Violation {
                     rule: rule.rule,
                     rule_name: rule.rule_name,
                     layer,
@@ -328,8 +356,17 @@ pub fn check_width(design: &DrcDesign, tech: &TechDb) -> Vec<Violation> {
                 });
             }
         }
+        out.push(report);
     }
     out
+}
+
+/// Flat violation list across all 13 rules — the gate's checked value.
+pub fn check_width(design: &DrcDesign, tech: &TechDb) -> Vec<Violation> {
+    check_width_report(design, tech)
+        .into_iter()
+        .flat_map(|r| r.violations)
+        .collect()
 }
 
 #[cfg(test)]

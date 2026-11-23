@@ -1,10 +1,13 @@
 //! LEF+DEF DRC subset checker: `geom` assembles every shape the subset
-//! covers into a per-layer index, `width` and `spacing` implement the
-//! rule families verified against the committed Magic goldens.
+//! covers into a per-layer index; `width`, `spacing`, `enclosure` and
+//! `area` implement the rule families verified against the committed
+//! Magic goldens; `report` normalizes all five tables into one subset
+//! report for the CLI and the integration gate.
 
 pub mod area;
 pub mod enclosure;
 pub mod geom;
+pub mod report;
 pub mod spacing;
 pub mod union;
 pub mod width;

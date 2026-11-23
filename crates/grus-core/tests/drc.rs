@@ -16,6 +16,10 @@
 //! Tests fail loudly on missing inputs — no silent skips.
 
 use grus_core::drc::geom::assemble;
+use grus_core::drc::report::{
+    DECK_STATEMENTS, DECK_UNIQUE_NAMES, IMPLEMENTED_RULES, IMPLEMENTED_STATEMENTS,
+    MAGIC_ONLY_STATEMENTS, magic_deltas, run_all,
+};
 use grus_core::drc::spacing::{SPACING_RULES, check_spacing, check_spacing_report};
 use grus_core::drc::width::{Violation, WIDTH_RULES, check_width};
 use grus_core::drc::{DrcDesign, DrcLayer, ShapeSrc};
@@ -481,10 +485,41 @@ fn test_spacing_mutation_met2_probe() {
         "a violation must contain the probe rect {probe_rect:?}, got {all:?}"
     );
 
-    // Control: the unmutated DEF is clean.
+    // Report-level parity: run_all flags exactly `met2.2`, and Magic
+    // flagged the same rule on the same input shape
+    // (`sanity_control.magic_per_rule`). Count units differ: Magic's
+    // 3 is merged error regions, ours is rect pairs — ours > 0, never
+    // ours == 3.
+    let report = run_all(&drc, &tech, &db.strings);
+    let firing: Vec<_> = report
+        .rules
+        .iter()
+        .filter(|o| !o.findings.is_empty())
+        .collect();
+    assert_eq!(
+        firing.len(),
+        1,
+        "exactly one rule may fire, got {:?}",
+        firing.iter().map(|o| o.rule).collect::<Vec<_>>()
+    );
+    assert_eq!(firing[0].rule, "met2.2");
+    let magic_probe = golden["sanity_control"]["magic_per_rule"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(k, _)| k.contains("(met2.2)"));
+    assert!(
+        magic_probe
+            .map(|(_, v)| v.as_u64().unwrap() > 0)
+            .unwrap_or(false),
+        "sanity_control.magic_per_rule must carry a nonzero (met2.2) entry"
+    );
+
+    // Control: the unmutated DEF is clean across the full pipeline.
     let db = parse_def_bytes(text.as_bytes(), &tech, None).unwrap();
     let drc = assemble(&db, &tech).unwrap();
-    assert!(check_spacing(&drc, &tech).is_empty());
+    let report = run_all(&drc, &tech, &db.strings);
+    assert!(report.rules.iter().all(|o| o.findings.is_empty()));
 }
 
 // ---------------------------------------------------------------------------
@@ -855,4 +890,128 @@ fn test_area_mutation_met1_island() {
     let db = parse_def_bytes(text.as_bytes(), &tech, None).unwrap();
     let drc = assemble(&db, &tech).unwrap();
     assert!(grus_core::drc::area::check_area(&drc, &tech).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Subset gate — unified report vs the full lef_expressible deck
+// ---------------------------------------------------------------------------
+
+/// Coverage gate, exact in both directions: the implemented
+/// `rule_name` set equals the golden's `lef_expressible`
+/// classification keys — a rule dropped from any table or one added
+/// outside the class turns this red by name. The deck-split constants
+/// the CLI's claim-boundary line prints are pinned against the golden
+/// so the fixed text cannot drift from the data.
+#[test]
+fn test_subset_coverage_complete() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let report = run_all(&l.drc, &l.tech, &l.design.strings);
+        assert_eq!(report.rules.len(), IMPLEMENTED_RULES);
+
+        let cls = l.golden["magic_rules_checked"]["classification"]
+            .as_object()
+            .expect("classification");
+        let want: std::collections::BTreeSet<&str> = cls
+            .iter()
+            .filter(|(_, v)| v.as_str() == Some("lef_expressible"))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        let got: std::collections::BTreeSet<&str> =
+            report.rules.iter().map(|o| o.rule_name).collect();
+        assert_eq!(got, want, "{name}: implemented set != lef_expressible set");
+
+        // The `rule` ids are the `magic_per_rule` join key — they must
+        // not collide.
+        let ids: std::collections::BTreeSet<&&str> =
+            report.rules.iter().map(|o| &o.rule).collect();
+        assert_eq!(
+            ids.len(),
+            IMPLEMENTED_RULES,
+            "{name}: rule ids must be unique"
+        );
+
+        // The CLI prints deck constants; pin them to the golden.
+        let names: Vec<&str> = l.golden["magic_rules_checked"]["names"]
+            .as_array()
+            .expect("magic_rules_checked.names")
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        let class_of = |n: &str| cls.get(n).and_then(|v| v.as_str());
+        assert_eq!(DECK_STATEMENTS, names.len(), "{name}: deck statements");
+        assert_eq!(DECK_UNIQUE_NAMES, cls.len(), "{name}: deck unique names");
+        assert_eq!(
+            IMPLEMENTED_STATEMENTS,
+            names
+                .iter()
+                .filter(|&&n| class_of(n) == Some("lef_expressible"))
+                .count(),
+            "{name}: lef_expressible statements"
+        );
+        assert_eq!(
+            IMPLEMENTED_RULES,
+            want.len(),
+            "{name}: lef_expressible unique rules"
+        );
+        assert_eq!(
+            MAGIC_ONLY_STATEMENTS,
+            names
+                .iter()
+                .filter(|&&n| class_of(n) == Some("magic_only"))
+                .count(),
+            "{name}: magic_only statements"
+        );
+    }
+}
+
+/// Per-rule gate: every implemented rule reports exactly the
+/// `magic_per_rule` count on both designs. Written as equality, not
+/// `== 0`, so a golden that grows an implemented-rule entry fails
+/// honestly rather than being silently re-baselined — today every
+/// implemented rule is absent from `magic_per_rule` (expected 0).
+/// `unclaimed` must be exactly the golden's `magic_per_rule` key set:
+/// a *new* unclaimed rule names itself rather than growing the list
+/// silently.
+#[test]
+fn test_subset_gate_matches_golden() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let report = run_all(&l.drc, &l.tech, &l.design.strings);
+        let delta = magic_deltas(&report, &l.golden);
+        println!("== {name} subset census (rule ours magic) ==");
+        for d in &delta.deltas {
+            println!("  {:8} {:5} {:5}", d.rule, d.ours, d.magic);
+        }
+        for d in &delta.deltas {
+            assert_eq!(
+                d.ours, d.magic as usize,
+                "{name}: {} — ours {} vs magic {}",
+                d.rule, d.ours, d.magic
+            );
+        }
+        let per_rule = l.golden["magic_per_rule"]
+            .as_object()
+            .expect("magic_per_rule");
+        let unclaimed_keys: std::collections::BTreeSet<&str> =
+            delta.unclaimed.iter().map(|(k, _)| k.as_str()).collect();
+        let golden_keys: std::collections::BTreeSet<&str> =
+            per_rule.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            unclaimed_keys, golden_keys,
+            "{name}: unclaimed != the golden's magic_per_rule keys"
+        );
+        for (k, cnt) in &delta.unclaimed {
+            assert_eq!(
+                per_rule.get(k).and_then(|v| v.as_u64()),
+                Some(*cnt),
+                "{name}: unclaimed `{k}` count differs from the golden"
+            );
+        }
+        println!(
+            "{name}: magic_total={} ({} unclaimed keys — magic_only, not compared)",
+            delta.magic_total,
+            delta.unclaimed.len()
+        );
+    }
 }

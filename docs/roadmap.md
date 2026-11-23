@@ -832,3 +832,8 @@ surface, from the first large-design run's feedback
   DEFs across all 50 unique rule ids**. Mutations: shrunk `via2_3`
   enclosure + moved covering stripe → exactly 5 `via.5a`; a `RECT`
   met1 stub → exactly `met1.6`. Three fail-proofs recorded.
+- **`e7-drc-e2e` landed 2026-11-23** (`v0.12.0`): `grus-eda drc` CLI,
+  `drc::report` unified subset report, full-set gate vs
+  `magic_per_rule` (50/50 rules, `ours == magic` at 0 on both
+  designs), honest claim-boundary output on every run; E7 stage gate
+  passed — the `magic_only` deck remainder stays out of scope.
