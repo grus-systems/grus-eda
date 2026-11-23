@@ -1539,7 +1539,25 @@ fn guide_union_connected(boxes: &[GuideBox], max_layer: u8) -> bool {
 /// unrouted by name, collisions, iterations, wall-clock ms.
 #[test]
 fn test_maze_census() {
-    for name in ["gcd", "picorv32"] {
+    for name in ["gcd"] {
+        maze_census(name);
+    }
+}
+
+/// Ignored (runtime): the picorv32 route is real work for a sequential
+/// single-threaded router — a release run measures ~40 min wall
+/// (recorded in docs/results.md), well over the test-suite budget. The
+/// census runs identically under `--ignored`; the measured counts are
+/// pinned there. Run: `cargo test --release -p grus-core --test drt
+/// test_maze_census_picorv32 -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_maze_census_picorv32() {
+    maze_census("picorv32");
+}
+
+fn maze_census(name: &str) {
+    {
         let (tech, db, tracks, join, graphs, vias) = load_routed_inputs(name);
         let t0 = std::time::Instant::now();
         let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
@@ -1648,7 +1666,21 @@ fn test_maze_occupancy() {
 /// designs.
 #[test]
 fn test_maze_determinism() {
-    for name in ["gcd", "picorv32"] {
+    for name in ["gcd"] {
+        maze_determinism(name);
+    }
+}
+
+/// Ignored (runtime): two full picorv32 routes, same bound as the
+/// census — see `test_maze_census_picorv32` and docs/results.md.
+#[test]
+#[ignore]
+fn test_maze_determinism_picorv32() {
+    maze_determinism("picorv32");
+}
+
+fn maze_determinism(name: &str) {
+    {
         let (tech, db, tracks, _, graphs, vias) = load_routed_inputs(name);
         let cfg = MazeConfig::default();
         let r1 = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
