@@ -177,10 +177,6 @@ The via model (§6) is *not*:
 
 The routed result (§7) is *not*:
 
-- **DEF text** — `NetRoute` is connectivity plus painted intervals
-  (merged wire segments, via placements, connected/projected pin
-  lists); serialization into `ROUTED`/`SPECIALNETS` geometry is the
-  emit ticket's job.
 - **DRC-clean** — the occupancy model is spacing-lite: `w/2 + s`
   bands on track lines, no enclosure/min-area/cut rules, unmerged
   OBS marks with an unconditional host-cell carve, and `Pin` marks
@@ -190,6 +186,20 @@ The routed result (§7) is *not*:
   tree extension over our own region graph with relaxed (non-strict-
   crossing) via transitions, not a port of `FlexGridGraph`/`drWorker`;
   the census checks connectivity, not route equality.
+
+The emitted DEF (§8) is *not*:
+
+- **Magic-DRC-verified** — the self-DRC gate runs our 50-rule
+  `lef_expressible` subset on our own re-parsed output; the full
+  Magic deck check on our routed DEF is `e6-drt-e2e`'s container
+  gate, not this one's.
+- **Connectivity-verified** — the subset checks geometry, not
+  netlist continuity; opens beyond the named `unrouted` set and
+  antenna checks are e2e scope.
+- **Reference-geometry-identical** — the wire-length/via census vs
+  `variants.delegated`/`baseline` is informational; topology
+  differences are expected and the signed deltas are recorded, not
+  gated.
 
 ## 5. Guide-bounded track graph
 
@@ -386,8 +396,11 @@ y-track, so the tapping wire runs *along* that x-track and the
 adjacent-line nodes are the connection points; the one-line margin
 matters because a far node on a covered line can coincide with
 another pin's attach node, which `absorb_taps` would claim as a
-zero-edge connection. Recorded looseness: a projected tap node may
-sit off the pin shape — connectivity-level only, and `NetRoute::
+zero-edge connection. A projected tap node may sit off the pin
+shape — `route_one_net` paints the single-axis **access stub**
+closing the gap at extraction (the node's x or y lies inside the
+rect's covered range by `project_attach` construction, so the stub
+is always axis-aligned and reaches the pin metal); `NetRoute::
 projected` names every pin connected this way (gcd: 17). A pin with
 empty strict *and* projection sets is `Unattachable`.
 
@@ -476,7 +489,10 @@ footprints. Candidate `scan_wire` hits are intervals overlapping
 `[c − w/2 − s, d + w/2 + s]` — edge-distance `< s` along the line;
 perpendicular `< s` is guaranteed by the band. A collision sliver
 containing no track line on either axis is the recorded miss class.
-Cut-layer occupancy and io-port rects are unmodeled (spacing-lite).
+Cut-layer occupancy stays unmodeled (spacing-lite); io-port rects
+now mark `Pin(own_net)` (pre-mark below) — the unmarked class
+produced real emit-time `met3.2` findings the first gate run
+surfaced.
 
 Three occupant classes in `hit_verdict`:
 
@@ -507,13 +523,19 @@ the `merge_connected_obs` bbox fills the decap/edge gaps pins need.
 **Pre-mark** (`premark_obs`, once at `route_nets` start): every
 `{Placed, Fixed, Cover}` cell's `obs_rects_raw` on routing layers →
 `Obs(cell)` (the `drc::geom` source-4 convention — `orient_rect` +
-translate); every instance pin's shapes → `Pin(own_net)`, or
-`Obs(u32::MAX)` when the pin has no net.
+translate); every member pin's shapes → `Pin(own_net)` — instance
+pins and io-port rects alike, a priced band that never hard-blocks
+(or `Obs(u32::MAX)` when the pin has no net); and every PDN
+`SPECIALNETS` wire rect and via-stack routing-layer rect
+(`expand_via`-expanded) → `Obs(u32::MAX)` — signal routes must hold
+the `w/2 + s` band off the power grid, the shapes the emit-time
+self-DRC measures spacing against.
 
 **Commit** (`commit_route`): merged wire rects (`± w/2`), relaxed-via
-stub wires, and via footprints (the default candidate's routing rects
-shifted to the placement) → `Net(net)`, logged as `Mark`s — the
-rip-up journal (`unmark` frees them).
+stub wires, projected-pin access stubs, and via footprints (the
+default candidate's routing rects shifted to the placement) →
+`Net(net)`, logged as `Mark`s — the rip-up journal (`unmark` frees
+them).
 
 **Order and rip-up**: nets route in `join.nets` order. In soft
 iterations the foreign hits a committed edge actually took are
@@ -549,3 +571,83 @@ cache's byte-identical arcs. Two full runs produce identical
 **Instrumentation**: `GRUS_DRT_TIMING` (any value) makes `route_nets`
 print premark/topo/per-iteration/per-slow-net timings to stderr —
 opt-in, zero cost unset; it feeds `docs/results.md` runtime evidence.
+
+## 8. Routed DEF emission
+
+`drt::emit` turns a `RouteDb` into routed DEF in two steps:
+`apply_routes` writes each net's geometry into `db.net_geoms`, and
+`write_routed_def` splices a canonical `NETS` section into the placed
+DEF template — everything outside `NETS n ;` … `END NETS` passes
+through verbatim (`VIAS`, the `SPECIALNETS` PDN, `TRACKS`, `PINS`,
+`GCELLGRID` all survive; that survival is why `write_def_full` was
+rejected — it regenerates only `COMPONENTS`+`NETS` and drops the PDN
+shapes the self-DRC picture needs).
+
+**Geometry mapping**: every `WireSeg` expands to the square-cap rect
+`seg ± w/2` — identical to `parse_net_wire`'s two-point expansion and
+to `commit_route`'s occupancy rasterization, so the emitted DEF
+describes exactly the shapes the router priced. Every `ViaPlace`
+becomes a `PdnVia` naming its pair's `ViaTable` **default** verbatim
+— the emitter never reselects, because the placed shape must be the
+via the router priced. A `default == None` pair reaching emit is a
+graphs/table bug and bails; `vp.lower != cand.lower` likewise. Every
+`route_db.unrouted` net resets to `NetGeom::default()` — a guided net
+with no route emits a conns-only record, never stale geometry, and
+its DEF spelling is named in `EmitReport.unrouted`.
+
+**Record grammar** (TritonRoute's statement order):
+
+```
+ - <def_spelling> ( <comp> <pin> ) …
+   + ROUTED <layer> ( x1 y1 ) ( x2 y2 )
+   NEW <layer> ( x1 y1 ) ( x2 y2 )
+   NEW <lower_layer> ( x y ) <via_name>
+   + USE SIGNAL ;
+```
+
+Exactly one `+ ROUTED` — the first emitted statement — then `NEW`
+per remaining wire and per via. **No width token**: a bare integer
+after the layer parses as a point coordinate in regular `NETS`
+records — width is a `SPECIALNETS`-only construct, and TritonRoute's
+committed routed DEFs confirm the zero-width form. A standalone via
+record's layer token is the via's **lower** metal. Statements order
+deterministically: wires in `WireSeg` order (`layer, x1, y1, x2,
+y2` — canonical endpoint order keeps `(x1,y1) ≤ (x2,y2)`), vias in
+`ViaPlace` order (`lower, x, y`), nets in `db` order (= template
+`NETS` order on DEF input).
+
+**Byte stability** — `write(parse(write(db))) == write(db)`: the
+non-NETS bytes pass through verbatim both passes; `NETS` regenerates
+from `net_geoms` identically (net order preserved by parse's
+record-order append, conn order by `net_pin_ids`, and each wire rect
+recovers its centerline as `(xl+w2, yl+w2)–(xh−w2, yh−w2)` on the
+horizontal arm, symmetric on vertical — the exact fixed point of the
+`± w/2` expansion). A `wire_rect` that is not square-cap-expressible
+— foreign geometry like a `RECT` stub in a re-routed template —
+bails by name rather than distorting.
+
+**Self-DRC gate**: the emitted file re-parses through
+`parse_net_wire`/`resolve_def_via` (`db2`, not `db` — broken grammar
+or an unresolvable via name surfaces as a parse error, not wrong
+geometry), `drc::geom::assemble` builds the full picture (our signal
+geometry + the template's PDN stripes + macro pins/OBS + io rects),
+and `drc::report::run_all` applies the same 50-rule `lef_expressible`
+subset `tests/drc.rs` puts on TritonRoute's routed DEFs at 0
+findings. The claim boundary of §4 stands: this is our subset on our
+DEF; the full Magic deck check on our routed DEF is `e6-drt-e2e`.
+
+**CLI** — the delegation path's native replacement:
+
+```
+grus-eda drt --tlef <t> --lef <l> --def <placed.def> \
+    --guide <d>.guide --out-def <routed.def> \
+    [--reference <d>.drt.reference.json] [--self-drc] \
+    [--occ enabled|disabled] [--max-iters N]
+```
+
+prints the emit census (`guided/routed/unrouted/projected/
+collisions/iterations/route_ms`, one `unrouted <name>` line per
+unrouted net), the informational `wirelength_um` + `via.<cut>`
+deltas vs `variants.delegated`/`baseline`, and — under `--self-drc`
+— the re-parse→assemble→`run_all` verdict. The CLI reports and
+never exits nonzero on findings; the gate is `tests/drt.rs`.

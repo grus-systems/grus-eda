@@ -1894,6 +1894,17 @@ fn emit_gate(name: &str) {
     let drc2 = assemble(&db2, &tech).expect("assemble");
     assert_eq!(drc_report, run_all(&drc2, &tech, &db2.strings));
 
+    // Byte stability on the design under test itself: the re-parsed
+    // geometry re-emits to the same bytes (`out` is its own template,
+    // so this exercises the NETS-splice fixed point).
+    let out2 = tmp_def(&format!("{name}-gate2"));
+    write_routed_def(&db2, &tech, &out, &out2).expect("re-emit");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "{name}: write → parse → write is not byte-stable"
+    );
+
     let firing: Vec<String> = drc_report
         .rules
         .iter()

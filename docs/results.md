@@ -9401,3 +9401,87 @@ ignored companion test.
 kurena gate. `build_route_graphs_ext`'s `spare_above = 1` is the
 pin-pocket escape (OpenROAD `_038_` precedent, `docs/e6-drt.md` §7).
 Version `0.12.3 → 0.12.4` (feature, patch on 0.x).
+
+### 2026-11-24 — e6-drt-emit: routed DEF emission + self-DRC (v0.12.5)
+
+`drt::emit` lands routed DEF emission: `apply_routes` maps each
+`NetRoute` into `db.net_geoms` (square-cap `seg ± w/2` rects —
+identical to `parse_net_wire`'s expansion and `commit_route`'s
+occupancy rasterization — plus `PdnVia`s naming the `ViaTable` pair
+default verbatim), and `write_routed_def` splices a canonical
+zero-width `NETS` section into the placed-DEF template, every byte
+outside `NETS`…`END NETS` verbatim. `grus-eda drt` is the
+delegation-replacement CLI (`--tlef/--lef/--def/--guide/--out-def`,
+`--reference`, `--self-drc`, `--occ`, `--max-iters`). Emit-driven
+maze fixes in the same change: PDN `SPECIALNETS` wire rects + via
+stacks premark as `Obs(u32::MAX)`, io-port rects mark
+`Pin(own_net)` (the `met3.2` `req_msg`/`resp_msg` class the first
+gate run surfaced), and `route_one_net` paints projected-pin access
+stubs.
+
+**Self-DRC gate** (`test_emit_selfdrc_gcd`, release
+`cargo test --release -p grus-core --test drt emit`): write →
+re-parse → `assemble` → `run_all` — all 50 `lef_expressible` rules
+report `findings_total=0` on our own emitted gcd DEF, the same bar
+`tests/drc.rs` puts on TritonRoute's output (claim boundary: our
+subset on our DEF; the full Magic deck check on our DEF is
+`e6-drt-e2e`). Non-vacuity: `wire_rects=1,821`, `vias=1,250`, and
+every Width/Spacing/Enclosure/Area family saw `candidates > 0`.
+
+**Roundtrip**: `write_routed_def` → `parse_def` → `net_geoms`
+equality → re-write → byte-identical (`test_emit_roundtrip_gcd`);
+the same write → parse → write → identical check runs inside
+`emit_gate` for both designs.
+
+**Emit census** (fresh `route_nets` under the new PDN/io-port
+premark — gcd counts match the pinned maze entry: 269/269 routed,
+unrouted=0, projected=17, collisions=0, iters=8):
+
+```
+== drt emit: gcd ==
+guided=269 routed=269 unrouted=0 projected=17 collisions=0 iterations=8 route_ms=2113
+wirelength_um ours=7153.025 delegated=6046.305 delta=+1106.720 baseline=6154.505
+via.mcon   ours=661 delegated=879 delta=-218 baseline=884
+via.via    ours=472 delegated=901 delta=-429 baseline=883
+via.via2   ours=117 delegated=27 delta=+90 baseline=28
+via.via3   ours=0 delegated=- delta=- baseline=2
+self_drc findings_total=0
+```
+
+| metric | ours | delegated | baseline | delta vs delegated |
+|---|---|---|---|---|
+| wirelength (µm) | 7,153.025 | 6,046.305 | 6,154.505 | +1,106.720 (+18.3%) |
+| vias mcon/via/via2/via3 | 661/472/117/0 | 879/901/27/0 | 884/883/28/2 | −218/−429/+90/±0 |
+
+Informational deltas, not pass/fail — different router on the same
+guides (ours routes higher on via2 because the §6 met2–met3 domain
+gap pushes transitions onto relaxed edges; topology divergence is
+expected).
+
+**Fail-proof** (`test_emit_fail_proof`, both arms — AGENTS §7.7):
+arm A stretches net `_007_`'s met1 rect `xh → 72,839` leaving a
+positive 1-DBU gap vs foreign `_126_` (bound 140) → `met1.2`
+reports exactly **1 finding** — the emit→parse→check path detects
+what we emit. Arm B routes with `occ: Disabled` → **135 findings**
+(`mcon.2`×4, `met1.2`×70, `met2.2`×53, `met3.2`×8): occupancy-off
+geometry reaches the checker through our emitted text.
+
+**Determinism** (`test_emit_determinism`): two full route+emit
+passes produce `PartialEq`-equal `RouteDb`s, equal `EmitReport`s,
+equal `net_geoms`, and byte-identical emitted DEFs; a second
+`run_all` on the same assembled design repeats the `SubsetReport`
+verbatim.
+
+**Runtime**: emit is trivial (ms-scale write); `route_ms=2113` on
+gcd (release binary, under parallel build load vs the pinned 1,886
+ms maze measurement — same class). The picorv32 gate leg runs
+detached: `cargo test --release -p grus-core --test drt
+test_emit_selfdrc_picorv32 -- --ignored --nocapture`, started
+2026-11-24T01:50 — route ≈135 min release + emit + parse +
+`run_all`; its unrouted residual re-measures under the new premark
+(the maze entry pinned 108 = 43 met3-bridge + 65 met2-connected).
+
+**Checks run**: `cargo test --release -p grus-core --test drt emit`
+(6/6, 1 ignored — the picorv32 gate), `cargo test --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+Version `0.12.4 → 0.12.5` (feature, patch on 0.x).

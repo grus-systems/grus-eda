@@ -2098,19 +2098,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let ref_by_cut = |v: Option<&serde_json::Value>| {
                 let mut out: std::collections::BTreeMap<String, u64> =
                     std::collections::BTreeMap::new();
-                if let Some(v) = v {
-                    if let (Some(census), Some(meaning)) = (
+                if let Some(v) = v
+                    && let (Some(census), Some(meaning)) = (
                         v["vias_per_cut_layer"].as_object(),
                         v["via_names_meaning"].as_object(),
-                    ) {
-                        for (via_name, count) in census {
-                            let cut = meaning
-                                .get(via_name)
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("<unknown>");
-                            *out.entry(cut.to_string()).or_default() +=
-                                count.as_u64().unwrap_or(0);
-                        }
+                    )
+                {
+                    for (via_name, count) in census {
+                        let cut = meaning
+                            .get(via_name)
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("<unknown>");
+                        *out.entry(cut.to_string()).or_default() +=
+                            count.as_u64().unwrap_or(0);
                     }
                 }
                 out
@@ -2408,6 +2408,46 @@ mod tests {
                 "--sdc", "e", "--vcd", "v", "--saif", "s"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_drt_parses() {
+        let cli = Cli::try_parse_from([
+            "grus-eda",
+            "drt",
+            "--tlef",
+            "a",
+            "--lef",
+            "b",
+            "--def",
+            "c",
+            "--guide",
+            "g",
+            "--out-def",
+            "o",
+            "--self-drc",
+            "--occ",
+            "disabled",
+            "--reference",
+            "r.json",
+            "--max-iters",
+            "3",
+        ])
+        .expect("drt argv parses");
+        let Commands::Drt(args) = cli.command else {
+            panic!("expected Commands::Drt");
+        };
+        assert_eq!(args.out_def, PathBuf::from("o"));
+        assert!(args.self_drc);
+        assert!(matches!(args.occ, OccArg::Disabled));
+        assert_eq!(args.reference, Some(PathBuf::from("r.json")));
+        assert_eq!(args.max_iters, 3);
+
+        assert!(
+            Cli::try_parse_from(["grus-eda", "drt", "--tlef", "a", "--lef", "b", "--def", "c"])
+                .is_err(),
+            "drt without --guide/--out-def must fail"
         );
     }
 
