@@ -5,125 +5,122 @@ router's `RouteDb` (per-net `WireSeg`/`ViaPlace` lists) into DEF
 `NETS` geometry, adds the `grus-eda drt` CLI surface that replaces
 the delegation path (placed DEF + guide → routed DEF), and gates
 the result on our own 50-rule subset checker. Depends on
-`e6-drt-maze` (landed at `4ff7ade`, `v0.12.4`); the full Magic-deck
-check on our DEF belongs to `e6-drt-e2e` and is explicitly out of
-scope here.
+`e6-drt-maze` (`v0.12.4`); the full Magic-deck check on our DEF
+belongs to `e6-drt-e2e` and is explicitly out of scope here.
 
-## Pipeline
+## State at this revision (WIP `dc8cdb4`)
+
+The implementation **landed and compiles clean** — this revision of
+the design is a close-out plan, not a build plan:
+
+- `crates/grus-core/src/drt/emit.rs` (313 lines) — `apply_routes`,
+  `write_routed_def`, `EmitReport` exactly per api.md/def-model.md.
+- `grus-eda drt` CLI — `DrtArgs` + run arm in `main.rs`
+  (`--tlef --lef --def --guide --out-def`, `--reference`,
+  `--self-drc`, `--occ`, `--max-iters`), census print block.
+- `tests/drt.rs` emit suite (~420 lines) — `emit_leg`/`emit_gate`
+  helpers + `test_emit_roundtrip_gcd`, `test_emit_selfdrc_gcd`,
+  `test_emit_selfdrc_picorv32` (**`#[ignore]`d**),
+  `test_emit_fail_proof` (both arms), `test_emit_determinism`,
+  `test_emit_unrouted_fixture`, `test_emit_via_default_consistency`.
+- `drt/maze.rs` emit-driven fixes (already in the same WIP):
+  - `premark_obs` now rasterizes every PDN `SPECIALNETS` wire rect
+    and via-stack metal as `Obs(u32::MAX)` — signal routes must
+    hold the `w/2 + s` band off the power grid.
+  - io-port rects mark `Pin(own_net)` like instance pins — priced
+    band, never a hard block (the gcd `met3.2` `req_msg`/`resp_msg`
+    spacing class was a real finding this fixes).
+  - `route_one_net` paints the projected-pin access stub closing
+    the gap between `project_attach`'s node and the pin rect.
+
+**Not yet done** (the rejection memo's list, i.e. this design):
+
+1. Run the emit gate end to end — gcd legs pass in-suite;
+   `test_emit_selfdrc_picorv32` stays `#[ignore]`d and runs
+   detached for evidence. **No picorv32 leg may enter the default
+   test set** — the maze route alone is ~135 min release; a
+   non-ignored picorv32 leg timed the last verify run out.
+2. `docs/results.md` dated entry with measured emit census numbers
+   + the self-DRC verdict on both designs.
+3. `docs/e6-drt.md` §8 emission section + `docs/status.md` /
+   `docs/roadmap.md` updates.
+4. `cargo test --workspace` + `cargo clippy --workspace
+   --all-targets -- -D warnings`, version bump `0.12.4 → 0.12.5`,
+   commit.
+
+## Pipeline (as landed)
 
 ```
 placed DEF + <d>.guide
   → load_congestion_inputs (tlef/lef/def → TechDb + DesignDb)
-  → parse_guides → join_guides → build_route_graphs
-  → ViaTable::new → route_nets(MazeConfig)            [landed]
-  → drt::emit::apply_routes (RouteDb → db.net_geoms)  [this ticket]
-  → drt::emit::write_routed_def (NETS-section splice) [this ticket]
-  → parse_def(out) → drc::geom::assemble → run_all    [the gate]
-  → census: wirelength + vias/cut vs .drt.reference   [informational]
+  → parse_guides → join_guides → build_route_graphs_ext(…, 1)
+  → via_table → route_nets(MazeConfig)                  [e6-drt-maze]
+  → emit::apply_routes (RouteDb → db.net_geoms)         [landed]
+  → emit::write_routed_def (NETS-section splice)        [landed]
+  → parse_def(out) → drc::geom::assemble → run_all      [the gate]
+  → census: wirelength + vias/cut vs .drt.reference     [informational]
 ```
 
-## Decisions
+## Decisions (unchanged from the previous design round)
 
-1. **NETS-only template splice, not `write_def_full`.**
-   `write_def_full` emits header/DIEAREA/ROW/TRACKS/COMPONENTS/PINS/
-   NETS but **no** `VIAS`, `SPECIALNETS`, `GCELLGRID`, `BLOCKAGES`,
-   `NONDEFAULTRULES` — emitting a routed DEF through it would drop the
-   PDN geometry and DEF-generated via definitions, corrupting the
-   self-DRC picture. The writer instead mirrors `write_def`'s
-   `COMPONENTS` splice: scan the template for `NETS ` … `END NETS`,
-   pass every other byte through verbatim, regenerate the NETS records
-   canonically. PDN stripes, `VIAS`, `TRACKS`, `PINS`, `FILLS` all
-   survive untouched.
+1. **NETS-only template splice, not `write_def_full`** — every byte
+   outside `NETS`…`END NETS` passes through verbatim; `VIAS`,
+   `SPECIALNETS` PDN, `TRACKS`, `PINS` survive for the self-DRC
+   picture. Implemented in `write_routed_def`/`find_section`.
+2. **No width token on `+ ROUTED`** — a bare integer after the
+   layer parses as a point coordinate in regular `NETS` records;
+   width is `SPECIALNETS`-only. Deliberate deviation from the
+   spec's illustrative grammar; TritonRoute's committed DEFs
+   confirm.
+3. **Square-cap expansion** `seg ± w/2` everywhere — identical to
+   `parse_net_wire`'s 2-point expansion and `commit_route`'s
+   occupancy rasterization, so the emitted DEF describes exactly
+   the shapes the router priced, and re-parse is a fixed point.
+4. **Via records name the `ViaTable` pair default** — emit never
+   reselects; `vp.lower == cand.lower` asserted, `default == None`
+   bails (a gap pair reaching emit is a bug, not data).
+5. **Unrouted nets emit conns-only records** — named in
+   `EmitReport.unrouted`; picorv32's residual `NoPath` set is the
+   recorded 108-net class (43 met3-bridge + 65 met2-connected —
+   see the drift note below).
+6. **`drt` is its own subcommand**, flags mirroring `drc`.
 
-2. **`+ ROUTED <layer>` carries NO width token.** The spec's example
-   grammar (`+ ROUTED <layer> <width>`) does not parse through our own
-   reader: in regular `NETS` records a bare integer after the layer is
-   consumed as a point coordinate (width is a `SPECIALNETS` construct
-   only). TritonRoute's committed DEFs confirm — `+ ROUTED met2
-   ( 10350 48450 ) ( * 53210 )`, no width. Emitting a width would make
-   our own output un-parseable. This is a deliberate deviation from
-   the spec's illustrative grammar — recorded here so the implementer
-   does not "fix" it.
+## Number drift vs the pinned maze entry (record honestly)
 
-3. **Square-cap expansion, identical everywhere.** `apply_routes`
-   expands each `WireSeg` into a `wire_rect` of `[min(x1,x2)−w/2,
-   min(y1,y2)−w/2, max(x1,x2)+w/2, max(y1,y2)+w/2]` — the same formula
-   `parse_net_wire` applies to a 2-point record and the same rect
-   `commit_route` rasterizes into occupancy. The emitted DEF therefore
-   describes exactly the shapes the router priced, and re-parsing
-   yields exactly the rects `apply_routes` produced (fixed point for
-   the byte-stability argument). `w/2` for zero-width records is
-   `routing_layers[l].width_dbu / 2`.
+The WIP's `maze.rs` changes alter the route input: occupancy now
+covers PDN metal and io-port bands, and projected pins get real
+access stubs. The `e6-drt-maze` results entry pinned gcd 269/269 /
+picorv32 6,636+108 under the *old* marking. The emit legs re-run
+`route_nets`, so the emit results entry records **fresh**
+routed/unrouted/collision/projected counts and notes any delta vs
+the pinned numbers with this cause — never back-edits the maze
+entry. Test asserts are count-agnostic (`nets + unrouted ==
+guided`, classification asserts, digest-difference fail-proof), so
+no existing test should need re-pinning; if one does, that is a
+finding to investigate, not silently update.
 
-4. **Via records use the ViaTable's chosen default.** For each
-   `ViaPlace`, emit `pairs[vp.lower].default`'s candidate — name
-   (`escape_def_name(resolve(cand.name))`), `lower`, `upper`, `cut`,
-   `cut_count`, `geom` copied verbatim into the `PdnVia`. The emitter
-   never reselects a via: the placed shape must be the via the router
-   priced (`vp.lower == cand.lower` is asserted). On re-parse,
-   `resolve_def_via` finds LEF candidates via `via_by_name` and
-   DEF-generated candidates via the template's preserved `VIAS`
-   section — both name spaces already verified by
-   `test_via_defaults`' name checks.
+## Risks (still live for the close-out)
 
-5. **Unrouted nets emit connections only.** picorv32's 65 residual
-   `NoPath` nets (all met3-bridge class) get their `( conn ) …
-   + USE SIGNAL` record with no geometry; `EmitReport.unrouted`
-   names them. Unguided nets (`GuideJoin.missing_signal`) likewise
-   keep empty `net_geoms` → conns-only records. A guide block naming
-   a net the design lacks already bails inside `resolve_guide_nets`
-   at join time — emit never sees that condition.
-
-6. **New `drt` subcommand.** `route` is the E4 global-router guide
-   path; detailed routing gets its own surface (`drt`) rather than a
-   flag on `route`, keeping both commands' contracts simple. Flags
-   mirror `drc`'s conventions (`--tlef --lef --def` + `--guide
-   --out-def`, optional `--reference`, `--self-drc`).
-
-## Measured state at design time
-
-- `route_nets` census (e6-drt-maze, dev profile): gcd `guided=269
-  routed=269 pins=931 projected=17 unrouted=0 collisions=0 iters=8
-  ms=9704`; picorv32 `guided=780` with 65 met3-bridge `NoPath`
-  residuals (routed=715) at ~135 min release.
-- Occupancy fail-proof (maze): Enabled census=0 vs Disabled
-  census=6,429 on gcd — occupancy measurably constrains.
-- Self-DRC bar is real: `tests/drc.rs` asserts `run_all` finds **0**
-  findings across all 50 rules on both committed TritonRoute DEFs
-  (`gcd.routed.def`, `picorv32.routed.def`). The same assertion
-  applied to OUR emitted DEF is this ticket's gate.
-- `test_via_defaults`: LEF/DEF-alias candidates share geometry, all
-  5 adjacent pairs' defaults resolve in both name spaces.
-
-## Risks
-
-- **Self-DRC findings on our routes.** Maze occupancy is
-  deliberately loose: `Pin` marks are soft, host-cell OBS is carved
-  unconditionally, projected attaches land outside exact pin shapes,
-  io-port metal is unmarked, and cut-layer spacing is unmodeled.
-  Any of these can surface as spacing/enclosure findings. Each
-  finding is either a real router bug to fix in place or a named
-  class with rule + count in `results.md` — never a silenced assert.
-- **picorv32 wall clock.** The gate leg reuses `route_nets` (~135
-  min release). Tests follow the maze convention: census-scale
-  picorv32 legs are `#[ignore]`d and run detached for the results
-  evidence; the gate keeps a fast fixture + gcd leg.
-- **Foreign-geometry re-emission.** `write_routed_def` re-emits
-  `net_geoms` rects as 2-point centerlines — only valid for
-  square-cap-expanded rects (our emit path). A net carrying
-  RECT-stub or flush-cap geometry from a foreign routed DEF
-  template cannot be expressed in the no-width grammar; the writer
-  bails naming the net rather than silently distorting geometry.
-- **Pin-connection count formatting.** Emitted conn list must
-  include every `net_pin_ids` member (driver-first) — dropping a
-  conn silently changes connectivity while DRC still passes.
+- **`run_all` red on gcd.** The maze-side fixes above were made for
+  the known classes; the gate has not been run green end to end
+  yet. Any residual finding is a real bug to fix in place or a
+  named class with rule + count in `results.md` — the acceptance
+  accepts "0 or named", never a loosened assert.
+- **picorv32 wall clock.** ~135 min route + emit + assemble +
+  `run_all` on a 28M-node design's output — run detached under
+  `--release --ignored` early in the close-out, draft docs while
+  it runs.
+- **Verify timeout regression.** `cargo test --workspace` (the
+  kurena verify) must contain only gcd-scale emit legs — gcd
+  routes in ~2 s release / ~10 s dev, so ~7 gcd emit legs are
+  fine; the picorv32 gate stays `#[ignore]`d.
 
 ## Files
 
 - `crates/grus-core/src/drt/emit.rs`
-- `crates/grus-core/src/drt.rs`
-- `crates/grus-eda/src/main.rs`
+- `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/tests/drt.rs`
+- `crates/grus-eda/src/main.rs`
 - `docs/e6-drt.md`
 - `docs/results.md`
 - `docs/status.md`

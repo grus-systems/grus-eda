@@ -1,7 +1,9 @@
 # e6-drt-emit — Emitted DEF model
 
-The exact text `write_routed_def` produces, why it re-parses through
-`parse_net_wire`, and why a second write is byte-identical.
+**Landed at WIP `dc8cdb4`** — the grammar below is what
+`write_routed_def`/`nets_section` ship. The exact text it produces,
+why it re-parses through `parse_net_wire`, and why a second write
+is byte-identical.
 
 ## NETS splice
 

@@ -1,9 +1,11 @@
 # e6-drt-emit — API design
 
 One new module `drt::emit` plus a `drt` subcommand in `grus-eda`.
-Everything below names real symbols at `4ff7ade`.
+**Landed at WIP `dc8cdb4`** — the signatures below are the shipped
+ones (doc comments abridged); deltas vs the original plan are
+flagged inline.
 
-## `crates/grus-core/src/drt/emit.rs` (new)
+## `crates/grus-core/src/drt/emit.rs` (landed)
 
 ```rust
 /// What apply_routes did — printed by the CLI and asserted in tests.
@@ -120,20 +122,25 @@ struct DrtArgs {
 }
 ```
 
-Run sequence (mirrors `Route` + `Drc` arms):
+Run sequence (landed, mirrors `Route` + `Drc` arms):
 
-1. `load_congestion_inputs(&tlef, &lef, &def)` → `(tech, db)`.
+1. `load_congestion_inputs(&tlef, &lef, &def, None, None)` →
+   `(tech, db)` (`DrtArgs` fields are `PathBuf`).
 2. `fs::read_to_string(&guide)` → `parse_guides` → `join_guides` →
-   `build_route_graphs`.
-3. `access_points`, `ViaTable::new`, `route_nets(.., MazeConfig { occ,
-   max_iters })`.
+   `build_route_graphs_ext(&db, &tech, &tracks, &join, 1)` — the
+   one-spare-layer pin-pocket escape (`docs/e6-drt.md` §7).
+3. `layer_tracks`, `via_table`, `route_nets(.., MazeConfig { occ,
+   max_iters })` — landed fn names (not `ViaTable::new`).
 4. `apply_routes` → `EmitReport`; `write_routed_def`.
 5. Print block (informational, all lines labeled):
 
    ```
-   routed=<r> unrouted=<u> (names…)  projected=<p>
+   == drt emit: <design> ==
+   guided=<g> routed=<r> unrouted=<u> projected=<p> collisions=<c>
+       iterations=<i> route_ms=<t>
+     unrouted <name>            (one line per unrouted net)
    wirelength_um ours=<x> delegated=<y> delta=<±z> baseline=<b>
-   via.<cut>  ours=<x> delegated=<y> delta=<±z>
+   via.<cut>  ours=<x> delegated=<y> delta=<±z> baseline=<b>
    self_drc findings=<n> [rule names + counts]      [--self-drc]
    ```
 

@@ -1,5 +1,13 @@
 # e6-drt-emit — Self-DRC gate design
 
+**Landed in `emit_gate`/`self_drc` (tests/drt.rs)** — sequence and
+asserts below are the shipped ones. The maze-side fixes the first
+gate runs motivated are already in the WIP (overview.md): PDN
+`SPECIALNETS` metal as `Obs(u32::MAX)` occupancy, io-port rects as
+`Pin(own_net)` (the real `met3.2` `req_msg`/`resp_msg` class), and
+projected-pin access stubs. What remains is *running* the gate and
+recording the verdict.
+
 The gate: `run_all` on **our own re-parsed output** — the same
 50-rule subset that shows 0 findings on both committed TritonRoute
 DEFs (`tests/drc.rs` asserts this as its mutation-test control).
@@ -60,10 +68,15 @@ Two independent arms — the test uses both:
 
 1. **Injected geometry** (deterministic, emit-level): after
    `apply_routes`, pick two different-net wires on the same layer
-   that sit one spacing-bound apart in the census, extend one
-   `wire_rect` across the gap (`xh += bound`), then write → parse →
-   `run_all` → assert `findings ≥ 1`. Proves the emit→parse→DRC
-   path is not vacuous — the gate must detect what we emit.
+   separated by ≥ the layer's spacing bound, extend one
+   `wire_rect`'s `xh` to `foreign_xl − 1` — a **positive sub-bound
+   gap**, not an overlap. (Landed refinement: `axis_gap` clamps
+   overlaps to `(0,0)` which reads as edge-abutting `touching_ok` —
+   a same-layer short is connectivity territory this subset does
+   not measure, so the injected defect must keep a positive gap.)
+   Then write → parse → `run_all` → assert a `Family::Spacing`
+   finding fires. Proves the emit→parse→DRC path is not vacuous —
+   the gate must detect what we emit.
 2. **Occupancy-disabled route** (already proven by
    `test_maze_occupancy`: `OccMode::Disabled` ⇒ 6,429 track
    collisions on gcd): route with `occ: Disabled`, emit, gate →

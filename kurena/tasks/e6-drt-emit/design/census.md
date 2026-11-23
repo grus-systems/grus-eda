@@ -72,10 +72,13 @@ The dated entry carries one table per design:
 | wirelength (µm) | … | … | … | ±… |
 | vias: via/via2/…/via5 | n/n/n/n/n | … | … | ±… |
 
-plus the unrouted-net named list (picorv32's 65 met3-bridge nets are
-already named in the maze entry — reference, don't re-enumerate) and
-the runtime line (emit wall clock is trivial; total `route_nets` time
-is the maze entry's number — cite it).
+plus the unrouted-net count + named classes (picorv32's residual —
+108 nets = 43 met3-bridge + 65 met2-connected under the old
+occupancy marking; cite the maze entry rather than re-enumerating
+names, and re-record the fresh count the emit leg measures — see
+overview.md's drift note) and the runtime line (emit wall clock is
+trivial; total `route_nets` time re-measures in this leg — record
+it verbatim).
 
 ## Files
 

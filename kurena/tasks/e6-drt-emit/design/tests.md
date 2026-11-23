@@ -1,115 +1,90 @@
 # e6-drt-emit — Test design
 
-All tests live in `crates/grus-core/tests/drt.rs`, reusing the file's
-existing helpers (`load`, `load_guide`, `design_dir`, `require`,
-`route_graphs` builder). New tests extend `mod maze` or a sibling
-`mod emit` — prefer a sibling module to keep the maze module's scope
-statement accurate.
+All emit tests live in `crates/grus-core/tests/drt.rs` in the emit
+section after `mod maze` (sibling scope, shared helpers `emit_leg`,
+`self_drc`, `print_emit_census`, `emit_gate`, `tmp_def`,
+`placed_def`, `geom_totals`). Emitted DEFs land in
+`std::env::temp_dir()` per-process paths — generated artifacts,
+never committed (the committed `<d>.drt.ours.routed.def` is
+`e6-drt-e2e`'s artifact).
 
-Emitted DEFs land in `target/` temp paths (`std::env::temp_dir` or
-`cargo`'s `OUT_DIR`-style scratch — use a per-test tempdir via
-`std::fs` + process-unique name), never into `tests/designs/`: our
-routed DEFs are generated artifacts, not committed goldens (the
-committed `<d>.drt.ours.routed.def` arrives in `e6-drt-e2e` via its
-own generation script).
+## Landed test list (WIP `dc8cdb4`)
 
-## Test list
+- `test_emit_roundtrip_gcd` — the byte-stable gate: route →
+  `apply_routes` → `write_routed_def(out1)` → `parse_def(out1)` →
+  `net_geoms` equality → `write_routed_def(db2, out1 → out2)` →
+  `out1`/`out2` byte-equal. Non-vacuity asserts on routed count,
+  wire/via totals, empty `unrouted` on gcd.
+- `test_emit_selfdrc_gcd` — the acceptance gate via `emit_gate`:
+  write → re-parse → `assemble` → `run_all`, all 50 rules'
+  `findings` empty; non-vacuity per-family `candidates > 0`;
+  `run_all` double-run identical; census print via
+  `print_emit_census`.
+- `test_emit_selfdrc_picorv32` — same gate, **`#[ignore]`d** for
+  wall clock (`route_nets` ≈ 135 min release). Runs detached for
+  the `results.md` evidence.
+- `test_emit_fail_proof` — arm A injected positive sub-bound gap →
+  `Family::Spacing` finding; arm B `OccMode::Disabled` → findings
+  ≥ 1. (Occupancy marks are still painted under `Disabled` —
+  `premark_obs` is unconditional — but the `Enabled`-only verdict
+  check never consults them, so collisions still reach the emitted
+  text.)
+- `test_emit_determinism` — two full gcd route+emit passes:
+  `RouteDb` equality, report equality, `net_geoms` equality,
+  emitted-byte equality.
+- `test_emit_unrouted_fixture` — synthetic `Unattachable` net emits
+  a conns-only record (no `ROUTED`/`NEW`) that re-parses.
+- `test_emit_via_default_consistency` — every emitted `PdnVia`
+  equals its pair's default candidate verbatim.
 
-### `test_emit_roundtrip_gcd` — the byte-stable gate
+## Remaining test work (this revision)
 
-1. Route gcd (`route_nets`, default `MazeConfig`), `apply_routes`,
-   `write_routed_def` → `out1.def`.
-2. `parse_def_bytes(out1)` → `db2` — must not error (grammar proof:
-   layer names, via names, conn tokens all resolve).
-3. `db2.net_geoms == db.net_geoms` on every guided net — rects and
-   `PdnVia`s identical (the `PartialEq` assert already used by
-   `test_routed_def_net_geoms_reparse` in `tests/drc.rs`).
-4. `write_routed_def(&db2, …, out1 → out2)` → `out2` bytes ==
-   `out1` bytes, compared with `std::fs::read` + `assert_eq!` — the
-   acceptance's "write → parse → write → identical".
-5. Non-vacuity: `routed == guided`, `wire_rects` total > 0, `vias`
-   total > 0, `unrouted` empty on gcd.
+1. **Hoist the byte-stable check into `emit_gate`** — today only
+   the gcd roundtrip test does write → parse → write → identical.
+   The acceptance words the roundtrip over *both* designs, and the
+   marginal cost inside the picorv32 leg is one extra write+read
+   (seconds vs the 135-min route). Add to `emit_gate` after
+   `self_drc(out, …)`:
 
-### `test_emit_selfdrc_gcd` — the acceptance gate
+   ```rust
+   let out2 = tmp_def(&format!("{name}-gate2"));
+   write_routed_def(&db2, &tech, &out, &out2).expect("re-emit");
+   assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap(),
+              "{name}: write → parse → write is not byte-stable");
+   ```
 
-`out1` → `parse` → `assemble` → `run_all` → assert all 50
-`RuleOutcome.findings` empty; on failure the assert message dumps
-`rule=id findings=n` per firing rule plus `{:?}` of each finding
-(existing tests' idiom). Census print: every rule's `candidates`
-count — assert > 0 on the families TritonRoute's DEF exercises
-(width/spacing/enclosure/area). Double-run `run_all` → identical
-report.
+   `test_emit_roundtrip_gcd` keeps its own explicit check (it also
+   asserts `net_geoms` equality pre-write) — no dedup needed.
 
-### `test_emit_selfdrc_picorv32` — `#[ignore]`
+2. **CLI parse test** — `Drt` arm has no `Cli::try_parse_from`
+   coverage yet (the original plan listed one). Add a short assert
+   in `main.rs`'s `mod tests` matching the
+   `cli_parsers_reject_out_of_range_and_nan` idiom:
+   `grus-eda drt --tlef a --lef b --def c --guide g --out-def o`
+   parses to `Commands::Drt` (plus `--self-drc`, `--occ disabled`,
+   `--reference`, `--max-iters` binding). ~15 lines.
 
-Same gate on picorv32. Ignored for wall clock (`route_nets` ≈ 135
-min release + full-DEF DRC); run detached with `--nocapture` for the
-`results.md` evidence. Unrouted nets carry their named class — the
-assert allows the gate to pass *with* the 65 met3-bridge conns-only
-records (they contribute no geometry) but never silently: print each
-unrouted name.
-
-### `test_emit_fail_proof` — deliberate red
-
-Arm A (injected): post-`apply_routes`, find two different-net
-wire_rects on one layer separated by ≥ the layer's spacing bound —
-or simpler and fully deterministic: extend `net_geoms[i].wire_rects
-[j].xh` by `bound` onto a known neighboring foreign rect — write →
-parse → `run_all` → assert `findings ≥ 1` and at least one finding's
-`rule` is that layer's spacing rule. Arm B (`occ: Disabled`):
-route+emit on gcd → gate → assert `findings ≥ 1` (maze already
-proves 6,429 track collisions; this arm proves they reach the
-checker through our emitted text).
-
-### `test_emit_census` — reference join (gcd + picorv32 route)
-
-Print the census block per census.md; asserts: `vias_per_cut` keys
-resolve to real cut layers, totals > 0, `drt.reference.json`
-deserializes with `delegated`/`baseline` present and all five cut
-names mapped. Deltas print signed — never asserted. gcd leg in the
-default suite; picorv32 leg shares the `#[ignore]` gate test's
-output (one `#[ignore]` test producing both gate + census, to avoid
-paying `route_nets` twice).
-
-### `test_emit_determinism`
-
-Two full `route_nets` + emit passes on gcd → `RouteDb`s equal,
-`out` bytes equal. picorv32 leg folded into the `#[ignore]` test
-(same reasoning).
-
-### `test_emit_unrouted_fixture` — synthetic
-
-Small fixture (reuse `mod maze`'s fixture-builder style): one
-routed net + one forced-`NoPath` net → emit → assert the unrouted
-net's record contains its conns + `+ USE SIGNAL` and **no**
-`ROUTED`/`NEW`, `EmitReport.unrouted` names it, and the written DEF
-re-parses. Covers the picorv32 shape without picorv32's cost.
-
-### `test_emit_via_default_consistency`
-
-For every emitted `PdnVia`: `lower == pairs[..].lower`,
-`geom` == the table candidate's `geom` (`PartialEq` on `ViaGeom`),
-and `resolve_def_via`-equivalence: the emitted name resolves to the
-same `(lower, upper, cut, cut_count)` on re-parse — asserts emit
-never reselects a different via than routing priced.
-
-### CLI smoke
-
-`Cli::try_parse_from(&["grus-eda", "drt", "--tlef", …])` parses to
-`Commands::Drt` with all fields bound (existing `test_parse_drc`/
-`test_parse_route` idiom). End-to-end `Run` invocation is covered
-by the core tests' equivalent sequence — no separate binary test
-(the CLI arm is thin).
+3. **Hard constraint — the `#[ignore]` boundary does not move.**
+   `test_emit_selfdrc_picorv32` stays ignored, and no new
+   picorv32-input leg may be added to the default set (incl.
+   via a shared helper called from a non-ignored test). Grep-check
+   before verify: `#[ignore]` must directly precede every test
+   that reaches `emit_leg("picorv32"`/`emit_gate("picorv32"`.
 
 ## Existing tests that must stay green
 
-- `test_via_defaults` — emitted names are exactly the default names
-  it census-prints.
-- `test_routed_def_net_geoms_reparse`, the `run_all` control in
-  `tests/drc.rs` — the emit path does not touch the parser.
-- All `mod maze` tests — emit reads `RouteDb`/`ViaTable` read-only.
+- `test_maze_*` — the WIP's `maze.rs` changes (PDN/io-port premark,
+  projected stubs) shift route digests; asserts are count-agnostic
+  so they should hold, but a pinned-number failure is a finding to
+  investigate, not silently re-pin.
+- `test_via_defaults`, `test_routed_def_net_geoms_reparse`, the
+  `tests/drc.rs` `run_all` control — emit touches neither the
+  parser nor the via table.
+- `test_maze_occupancy` — `Disabled` arm still paints-but-ignores
+  marks, so collisions still occur; only digest/census difference
+  is asserted.
 
 ## Files
 
 - `crates/grus-core/tests/drt.rs`
-- `crates/grus-eda/src/main.rs` (parse test only)
+- `crates/grus-eda/src/main.rs`

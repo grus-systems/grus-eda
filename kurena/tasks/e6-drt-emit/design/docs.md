@@ -1,7 +1,12 @@
 # e6-drt-emit — Documentation updates
 
 All English, existing style. Every number in `results.md` comes from
-the step-6 captures verbatim, with the test profile stated.
+the step-1/2/3 captures verbatim (detached picorv32 log, in-suite
+gcd log, CLI run), with the test profile stated. Numbers measured
+under the *new* occupancy marking may drift from the pinned
+`e6-drt-maze` entry — record fresh values and name the cause
+(PDN metal + io-port premark, projected stubs); do not back-edit
+the maze entry.
 
 ## `docs/e6-drt.md`
 
@@ -29,10 +34,16 @@ covering, in the doc's claim-boundary voice:
   subset — with the standing claim-boundary line: this is our
   subset on our DEF; the full Magic deck gate on our DEF is
   `e6-drt-e2e`.
+- The emit-driven maze amendments land in §7 too (same doc, same
+  change): PDN `SPECIALNETS` metal + via stacks as immovable
+  `Obs(u32::MAX)`, io-port rects marked `Pin(own_net)` (priced
+  band, not hard block — the `met3.2` `req_msg`/`resp_msg`
+  finding class), and the projected-pin access stub `route_one_net`
+  paints.
 - CLI: the `drt` command surface + flags.
 
-Also update the file's claim-boundary paragraph if it says routed
-DEF output is future work.
+Also update the file's claim-boundary paragraph (§4) — it still
+says routed DEF output is future work.
 
 ## `docs/results.md`
 
@@ -48,8 +59,11 @@ DEF output is future work.
 - **Structural census**: the per-design table from census.md —
   wirelength + per-cut vias vs delegated + baseline, signed deltas,
   with the "informational, topology differs" line.
-- **Unrouted**: picorv32's residual count + named class
-  (met3-bridge; cite the maze entry rather than re-listing 65 names).
+- **Unrouted**: picorv32's fresh residual count + named classes,
+  plus an explicit line naming any delta vs the maze entry's pinned
+  108 (43 met3-bridge + 65 met2-connected) and its cause — the
+  WIP's occupancy-premark widening; cite the maze entry rather than
+  re-listing names.
 - **Fail-proof record**: both arms — injected-rect finding
   (rule + count), `occ: Disabled` finding (rule + count) — proving
   the gate goes red.

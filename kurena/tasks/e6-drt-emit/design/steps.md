@@ -1,60 +1,21 @@
-# e6-drt-emit — Implementation steps
+# e6-drt-emit — Close-out steps
 
-Order matters: the roundtrip test proves the grammar before the
-self-DRC gate consumes it; picorv32 evidence runs detached while
-docs are drafted. Estimated diff: ~300–400 lines code + tests
-(emit.rs ~200, CLI ~60, tests ~150) — larger than the ~50–150
-guideline but one coherent unit (the roundtrip can't be split from
-the writer it tests).
+Implementation landed at WIP `dc8cdb4`; this is the run + docs +
+verify sequence the rejection memo asked for. Order matters: the
+detached picorv32 leg starts **first** (~135+ min release) so it
+runs while everything else closes.
 
-## 1. `drt::emit` module + `apply_routes`
+## 0. Small test additions (tests.md)
 
-- New `crates/grus-core/src/drt/emit.rs` per api.md; `pub mod emit`
-  in `drt.rs`.
-- `apply_routes`: resize `db.net_geoms` to `num_nets`; iterate
-  `route_db.nets` (each `NetRoute` carries `nr.net: NetId`) → build
-  `NetGeom`; clear `net_geoms` for every `route_db.unrouted` entry's
-  `net`. `RouteDb` has no outcome enum — `nets` holds only
-  successful routes, `unrouted: Vec<UnroutedNet{net, connected,
-  failed}>` the rest.
-- No width token anywhere; square-cap expansion; via via
-  `pairs[..].default`.
+- Byte-stable check inside `emit_gate` (picorv32 gets the
+  write → parse → write → identical proof too).
+- `drt` CLI parse assert in `main.rs` `mod tests`.
+- Re-confirm the `#[ignore]` boundary: `test_emit_selfdrc_picorv32`
+  (and `test_maze_census_picorv32`, `test_maze_determinism_picorv32`)
+  stay ignored; nothing new reaches picorv32 inputs from a
+  non-ignored test.
 
-## 2. `write_routed_def`
-
-- Port `write_def`'s `COMPONENTS` splice mechanics to `NETS`
-  (scan for `NETS ` … `END NETS`); verbatim passthrough elsewhere.
-- Record emission per def-model.md: name via `guide_net_name`,
-  conns from `net_pin_ids` (`( comp pin )` / `( PIN name )`),
-  `+ ROUTED` first geom stmt, `NEW` rest, `+ USE SIGNAL ;`.
-- Centerline recovery with the bail arm for non-square-cap rects.
-
-## 3. Roundtrip test first
-
-`test_emit_roundtrip_gcd` — the grammar proof. Green before moving
-on; a red here means the grammar diverged from `parse_net_wire`
-(most likely spot: via-record layer token, or a stray width).
-
-## 4. CLI `drt` subcommand
-
-`DrtArgs` + `Commands::Drt` + run arm per api.md; census print
-block; `--reference` JSON load for the delta columns;
-`--self-drc` runs the gate sequence and prints findings (never
-exits nonzero on findings).
-
-## 5. Self-DRC gate + fail-proof tests
-
-`test_emit_selfdrc_gcd`, `test_emit_selfdrc_picorv32` (`#[ignore]`),
-`test_emit_fail_proof` (both arms), `test_emit_determinism`,
-`test_emit_unrouted_fixture`, `test_emit_via_default_consistency`,
-CLI parse test.
-
-If `run_all` fires on our routes: classify per selfdrc.md's table —
-real router bug → fix in `drt/maze.rs`/`emit.rs` in place (small,
-focused); structural looseness → name rule + count + class in
-`results.md`. Never loosen the assert.
-
-## 6. Long legs — detached, before docs
+## 1. Launch the picorv32 gate detached — first
 
 ```
 cargo test --release -p grus-core --test drt \
@@ -62,59 +23,104 @@ cargo test --release -p grus-core --test drt \
     2>&1 | tee /tmp/emit-picorv32.log
 ```
 
-Captures: per-rule census, any finding dumps, census block,
-unrouted names, wall clock. The 65 met3-bridge `NoPath` nets are
-expected in `unrouted=` — anything else is a regression in maze
-land, named not silenced.
+Run detached (nohup / separate shell), budget ≈ route (~135 min)
++ emit + parse + `run_all` + byte-check writes. Captures for
+`results.md`: routed/unrouted/wire_rects/vias line, every unrouted
+name, emit census block (wirelength + per-cut via deltas), gate
+findings (or the empty `firing` set), and wall clock.
 
-## 7. Docs (docs.md)
-
-`docs/e6-drt.md` emission section, `docs/results.md` dated entry,
-`docs/status.md` head line, `docs/roadmap.md` progress bullet.
-
-## 8. Verify
+## 2. In-suite gcd legs
 
 ```
-cargo test --workspace                                # detached, tee log
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --release -p grus-core --test drt emit -- --nocapture \
+    2>&1 | tee /tmp/emit-gcd.log
 ```
 
-The workspace gate now includes gcd route+emit+DRC legs
-(fast) — picorv32 stays `#[ignore]`d, so the gate does not
-inherit the 135-min leg. Record real wall clock in results.md.
+Runs the six non-ignored emit tests (gcd routes ≈ 2 s release).
+Capture the census + `self_drc findings_total=0` lines verbatim.
 
-## 9. Version + commit
+**If `run_all` fires on gcd**: classify per selfdrc.md's table —
+fix in `maze.rs`/`emit.rs` in place when the root cause is small
+and clear; otherwise name rule + count + class in `results.md`.
+Never loosen the assert, never skip the leg.
 
-`[workspace.package] version` `0.12.4 → 0.12.5` (feature → patch
-per 0.x rule), same commit. Conventional Commit, English, agent
-trailer:
+## 3. CLI end-to-end on gcd (release binary)
+
+```
+cargo run --release -p grus-eda -- drt \
+    --tlef ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef \
+    --lef  ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef \
+    --def  tests/designs/gcd/gcd.placed.def \
+    --guide tests/designs/gcd/gcd.guide \
+    --out-def /tmp/gcd.drt.ours.routed.def \
+    --reference tests/designs/gcd/gcd.drt.reference.json \
+    --self-drc
+```
+
+Proves the delegation-replacement surface end to end; its census
+block joins the test-side numbers in `results.md`. Output DEF is a
+`/tmp` artifact — not committed (`e6-drt-e2e` owns the committed
+ours-DEF).
+
+## 4. Docs (docs.md), drafted while step 1 runs
+
+`docs/e6-drt.md` §8, `docs/results.md` dated entry with **measured**
+numbers only (gcd from step 2–3 captures; picorv32 fills in when
+step 1 lands — mark the entry's picorv32 row only after the log
+exists), `docs/status.md` head line, `docs/roadmap.md` bullet.
+
+## 5. Version + verify
+
+- `[workspace.package] version` `0.12.4 → 0.12.5` (feature → patch
+  on 0.x), same commit.
+- `cargo test --workspace` — must complete inside the verify
+  budget; the default set carries only gcd-scale emit legs.
+- `cargo clippy --workspace --all-targets -- -D warnings`.
+
+## 6. Commit
+
+Conventional Commit, English, agent trailer:
 
 ```
 feat: Routed DEF emission and self-DRC gate
 ```
 
+Body bullets: emit model (no-width grammar, NETS splice, square-cap
+model, ViaTable-default vias), `grus-eda drt` surface, the maze-side
+occupancy/stub fixes with their motivation (self-DRC findings),
+test list, verdict + census headline, remaining (`e6-drt-e2e`).
+
 ## Contingencies
 
-- **`run_all` red on gcd**: expected classes listed in selfdrc.md —
-  fix-or-name; a spacing red reachable by the Disabled arm but not
-  the Enabled arm means the gate is vacuous — investigate the
-  fixture, don't accept the pass.
-- **Via default `None` at emit** (gap pair reached emit): the
-  router skips gap transitions, so a `ViaPlace` on a gap pair means
-  graphs/table disagreement — bail loudly, it's a bug not data.
-- **Re-parse error on our own text**: grammar drift — compare the
-  emitted record against `parse_net_wire` token-by-token; the
-  `NEW <lower> ( x y ) name` via form is the most fragile spot.
-- **picorv32 leg finds violations**: name every rule + count in
-  `results.md` per the acceptance wording — the gate records them
-  honestly; "0 or named" both satisfy the acceptance.
+- **gcd gate red** — see step 2. A spacing red reachable by the
+  `Disabled` arm but not `Enabled` means the gate is vacuous —
+  investigate the fixture, don't accept the pass.
+- **picorv32 leg still running at verify time** — the kurena verify
+  (`cargo test --workspace`) never runs it; the results entry waits
+  for the log. If it cannot finish inside the ticket's wall clock,
+  commit the gcd-complete entry with the picorv32 leg recorded as
+  "running detached — command + start time" and land the numbers in
+  a follow-up amend only if the card is still open; otherwise the
+  e2e ticket inherits it. Do **not** gate-verify an unfinished
+  claim.
+- **picorv32 unrouted count drifts from the pinned 108** — expected
+  direction is *fewer* `NoPath` (io-port/PDN marking changes the
+  pricing, not the graph). Record the fresh count + class split and
+  note the premark change as cause; a *larger* or reclassifying
+  residual is a maze regression — investigate before naming.
+- **Byte-check red on re-emit** — grammar drift on the second pass
+  (foreign-geometry arm of `centerline`): a `wire_rect` the parser
+  produced that isn't square-cap-expressible. Debug against
+  `parse_net_wire` token-by-token; the via-record line is the
+  fragile spot.
+- **Pinned maze test red** from the occupancy changes — per
+  tests.md: investigate the shifted number, fix or record with
+  cause; do not re-pin silently.
 
 ## Files
 
-- `crates/grus-core/src/drt/emit.rs`
-- `crates/grus-core/src/drt.rs`
-- `crates/grus-eda/src/main.rs`
 - `crates/grus-core/tests/drt.rs`
+- `crates/grus-eda/src/main.rs`
 - `docs/e6-drt.md`
 - `docs/results.md`
 - `docs/status.md`
