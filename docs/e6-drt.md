@@ -412,13 +412,16 @@ searched — but they *are* committed metal, occupancy-scanned via
 `scan_stub` before the via footprint check and emitted as real
 `WireSeg`s at extraction. **Single-nearest rule (recorded gap)**: if
 the nearest upper preferred line holds no in-region node, `v` gets
-no relaxed edge — a named stranded-pocket class; widening to the
-second-nearest line stayed unnecessary (gcd closed at `unrouted=0`).
-This includes met2–met3: `M2M3_PR` is a default pair, so relaxed
-edges do give it a transition path wherever a nearby met3 preferred
-line carries in-region nodes — the §6 "dead capacity" note survives
-only as the residual class where they do not (the census test's
-met3-bridge classifier names any `NoPath` there). Emitted in node
+no relaxed edge — a named stranded-pocket class; on gcd it stays
+theoretical (`unrouted=0`), while picorv32 measures 65 `NoPath`
+nets inside already-`met2`-connected guide unions (pockets, OBS
+seals, or final-pass occupancy — `docs/results.md`). This includes
+met2–met3: `M2M3_PR` is a default pair, so relaxed edges do give
+it a transition path wherever a nearby met3 preferred line carries
+in-region nodes — the §6 "dead capacity" note survives as the
+met3-bridge residual class (43 picorv32 nets whose ≤met2 guide
+union only met3+ rejoins; the census test's classifier names both
+classes and rejects anything else). Emitted in node
 order — deterministic; parallel strict/relaxed edges coexist and the
 equal-`VIA_COST` tie breaks toward the strict arc (CSR order), with
 extraction deduping the placement on `(lower, x, y)`.

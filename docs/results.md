@@ -9318,3 +9318,86 @@ test double-builds and `test_graph_determinism` now pins
 `picorv32.placed.def` already present (gitignored artifact).
 Version `0.12.2 → 0.12.3` (feature, patch on 0.x). No commit per
 ticket instruction.
+
+### 2026-11-23 — e6-drt-maze: sequential maze router (v0.12.4)
+
+`drt::maze::route_nets` lands the routing core: per guided net,
+pathfinder-style tree extension over the region graph — strict
+`pin_nodes` attach first, a projection fallback onto the nearest
+preferred line for the `region_escape` classes, a multi-source BFS
+`hop[v]` heuristic feeding a `(g + hop, node)` `BinaryHeap`
+(admissible: every edge ≥1 hop), preferred-direction `PREF_COST=1` /
+`OFF_AXIS_COST=2` / `VIA_COST=4` costs, foreign-net occupancy as a
+hard block, and per-net escalating rip-up to `MAX_ITERS = 8` with the
+last iteration in hard mode. **Relaxed via edges** (`design
+docs`: each node `v` synthesizes one edge to the in-region node on
+the nearest upper-layer preferred line) answer the §6 met2–met3
+zero-shared-crossing gap — the reference anchors most vias at exactly
+those preferred crossings (`via-edges.md` §3). `Occupant` keeps a
+host-cell id so a pin's own-instance OBS exempts its access carve;
+OBS marks use the new unmerged `MacroDef::obs_rects_raw` (the merged
+set seals pin pockets). Post-hoc `overlap_census` rebuilds every
+route's `± w/2` rects + via footprints and reports cross-net pairs
+inside the `R + s` band; `UnroutedNet`/`FailKind{Unattachable,
+NoPath}` names every failure per pin; `route_digest` is an xxh3 over
+the canonical route set.
+
+**Synthetic cases** (`test_maze_cases`): one-track straight route
+emits a single merged segment; a met2-only pin forces exactly one
+cheapest shared-crossing via; a macro OBS on the direct line detours
+with the emitted intervals asserted outside the `w/2 + s` band (not
+trust); a split-guide net yields `u0/A: NoPath` and a trackless pin
+`u2/C: Unattachable` — named, bounded by the cap, no hang.
+
+**Census** (`test_maze_census`, release `cargo test --release`):
+
+| design | guided | routed | pins connected | projected | unrouted | collisions | iters | wall |
+|---|---|---|---|---|---|---|---|---|
+| gcd | 269 | 269 | 931 | 17 | 0 | 0 | 8 | 1,886 ms |
+| picorv32 | 6,744 | 6,636 | 25,037 | 458 | 108 | 0 | 8 | 8,125,811 ms |
+
+picorv32 digest `0x17e1cb6f25be196e`; the 108 unrouted nets are 522
+pins, every one `NoPath` and named per-pin in the test output.
+
+`projected=17` on gcd is exactly the graph ticket's 17
+`region_escape` pins — every one routes through the projection
+fallback, none lost. `NoPath` classification (the census test
+computes the {li1,met1,met2} guide union per unrouted net and
+asserts every `NoPath` lands in a named class):
+
+- **met3-bridge — 43 nets**: the ≤met2 union is disconnected and
+  only met3+ boxes rejoin it — the recorded met2–met3
+  shared-crossing gap (`docs/e6-drt.md` §6–§7).
+- **met2-connected — 65 nets**: the ≤met2 union is already
+  connected, so the failure sits inside the connected region —
+  stranded pockets (single-nearest relaxed-via rule), OBS-sealed
+  pin pockets, or occupancy blocks surviving to the final
+  hard-mode pass. Classified from the committed guide boxes.
+
+**picorv32 is `#[ignore]`d** (`test_maze_census_picorv32`,
+`test_maze_determinism_picorv32`): the sequential single-threaded
+route takes ≈135 min release wall — over the suite/CI budget — so
+the counts above are the pinned evidence; the tests run identical
+logic under `--ignored` (`cargo test --release -p grus-core --test
+drt test_maze_census_picorv32 -- --ignored --nocapture`). This is a
+runtime split, not a coverage loss: the same asserts check picorv32
+when invoked.
+
+**Occupancy fail-proof** (`test_maze_occupancy`, AGENTS §7.7):
+`OccMode::Disabled` on identical gcd input must differ somewhere —
+enabled digest `0xfbb3073487860974`, census 0 vs disabled digest
+`0x349f82f53a0c7143`, census **6,429** collisions: occupancy is the
+only thing keeping routes apart, exactly the measured constraint the
+gate demands.
+
+**Determinism** (`test_maze_determinism`): two full `route_nets`
+calls on gcd produce `PartialEq`-equal `RouteDb`s and equal nonzero
+digests (asserted, not sampled). picorv32 double-run lives in the
+ignored companion test.
+
+**Checks run**: `cargo test --release -p grus-core --test drt`
+(16/16, 2 ignored — the picorv32 companions), `cargo clippy
+-p grus-core --all-targets` clean; `cargo test --workspace` per the
+kurena gate. `build_route_graphs_ext`'s `spare_above = 1` is the
+pin-pocket escape (OpenROAD `_038_` precedent, `docs/e6-drt.md` §7).
+Version `0.12.3 → 0.12.4` (feature, patch on 0.x).

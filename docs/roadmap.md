@@ -830,9 +830,10 @@ surface, from the first large-design run's feedback
   `overlap_census` reports cross-net `R+s` collisions; named
   `UnroutedNet`/`FailKind` report; deterministic `route_digest`.
   Determinism/occupancy fail-proofs in `docs/results.md`; the
-  picorv32 census runs under `--ignored` (~40 min release) with the
-  measured counts pinned in `docs/results.md`. Remaining: routed-DEF
-  emission, e2e vs the TritonRoute reference.
+  picorv32 census measured under `--ignored` (~135 min release) —
+  6,636/6,744 routed, 0 collisions, 108 `NoPath` nets classified
+  43 met3-bridge + 65 met2-connected, pinned in `docs/results.md`.
+  Remaining: routed-DEF emission, e2e vs the TritonRoute reference.
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset

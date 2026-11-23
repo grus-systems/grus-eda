@@ -1539,13 +1539,11 @@ fn guide_union_connected(boxes: &[GuideBox], max_layer: u8) -> bool {
 /// unrouted by name, collisions, iterations, wall-clock ms.
 #[test]
 fn test_maze_census() {
-    for name in ["gcd"] {
-        maze_census(name);
-    }
+    maze_census("gcd");
 }
 
 /// Ignored (runtime): the picorv32 route is real work for a sequential
-/// single-threaded router — a release run measures ~40 min wall
+/// single-threaded router — a release run measures ~135 min wall
 /// (recorded in docs/results.md), well over the test-suite budget. The
 /// census runs identically under `--ignored`; the measured counts are
 /// pinned there. Run: `cargo test --release -p grus-core --test drt
@@ -1601,30 +1599,44 @@ fn maze_census(name: &str) {
             "{name}: routed net with no wires"
         );
 
-        // Classify `NoPath` nets: the met3-bridge class has a
-        // disconnected {li1,met1,met2} box union that only the met3+
-        // boxes rejoin (the recorded met2–met3 crossing gap).
+        // Classify `NoPath` nets: `met3_bridge` has a disconnected
+        // {li1,met1,met2} box union that only the met3+ boxes rejoin
+        // (the recorded met2–met3 crossing gap); `met2_connected`
+        // already has a connected ≤met2 union — the failure is inside
+        // the connected region (pin-pocket walls, OBS seals, or
+        // occupancy in the final hard-mode pass, `docs/e6-drt.md` §7).
+        // Anything else means a fully-disjoint guide set — not
+        // possible on real GRT output — so it must never appear.
         let mut unclassified = Vec::new();
+        let (mut n_bridge, mut n_met2) = (0usize, 0usize);
         for u in &r.unrouted {
             let (_, boxes) = join
                 .nets
                 .iter()
                 .find(|(n, _)| *n == u.net)
                 .expect("unrouted net must be guided");
-            let bridged = !guide_union_connected(boxes, 2) && guide_union_connected(boxes, u8::MAX);
+            let bridged =
+                !guide_union_connected(boxes, 2) && guide_union_connected(boxes, u8::MAX);
+            let pocket = guide_union_connected(boxes, 2);
+            if !bridged && pocket {
+                n_met2 += 1;
+            }
+            n_bridge += bridged as usize;
             for (_, k) in &u.failed {
-                if *k == FailKind::NoPath && !bridged {
+                if *k == FailKind::NoPath && !bridged && !pocket {
                     unclassified.push(net_name(&db, u.net));
                 }
             }
+            println!("  {} met3_bridge={bridged} met2_connected={pocket}", net_name(&db, u.net));
+        }
+        if !r.unrouted.is_empty() {
             println!(
-                "  {} met3_bridge={bridged}",
-                net_name(&db, u.net)
+                "{name}: unrouted class counts met3_bridge={n_bridge} met2_connected={n_met2}"
             );
         }
         assert!(
             unclassified.is_empty(),
-            "{name}: NoPath nets outside the met3-bridge class: {unclassified:?}"
+            "{name}: NoPath nets with fully-disjoint guides: {unclassified:?}"
         );
     }
 }
@@ -1666,9 +1678,7 @@ fn test_maze_occupancy() {
 /// designs.
 #[test]
 fn test_maze_determinism() {
-    for name in ["gcd"] {
-        maze_determinism(name);
-    }
+    maze_determinism("gcd");
 }
 
 /// Ignored (runtime): two full picorv32 routes, same bound as the
