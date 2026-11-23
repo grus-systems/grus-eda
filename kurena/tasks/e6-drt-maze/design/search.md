@@ -1,7 +1,8 @@
 # e6-drt-maze — Search model
 
-Matches the implementation at `2c3c713`, plus the bounded-backtrack
-hardening (`steps.md` §1).
+Matches the implementation at `c1832dc` — the `NetTopo` cache,
+goal-directed wave (`hop` heuristic), and bounded backtrack all
+landed.
 
 ## 1. Per-net routing unit
 
@@ -72,15 +73,16 @@ pair emits none) the maze synthesizes one edge to `k+1`:
   preferred wires; the hang node is the same wire a track step away
   at most. Recorded looseness: the implied stubs may step outside
   the guide boxes (guide boxes are GCell-boundary, not exact) and
-  are not searched — the edge's occupancy check scans the via
-  footprint only.
+  are not searched — but they *are* occupancy-scanned (`scan_stub`),
+  since they are committed metal the footprint check alone would
+  miss.
 - Emitted in node order — deterministic. Parallel strict/relaxed
   edges are left alone: equal `VIA_COST` breaks toward the strict
   arc (CSR order), extraction dedupes the placement by `(lower,x,y)`.
 - **Single-nearest rule (recorded gap)**: if the nearest upper line
-  holds no in-region node, that node gets no relaxed edge — a
-  candidate cause for stranded pockets (H3); widening to the
-  next-nearest lines is the first knob (`occupancy.md` §5 C3).
+  holds no in-region node, that node gets no relaxed edge — a named
+  stranded-pocket class. Widening stayed unnecessary: gcd closed at
+  `unrouted=0` without it (`occupancy.md` §5 C3).
 
 The implied geometry is committed, not just traversed: extraction
 emits the two stub wires — lower-layer wire `a.xy → (x,y)` and
@@ -95,28 +97,40 @@ the real metal. `docs/e6-drt.md` §7 records this model change.
 first attachable member in `pin_nodes` order. While unconnected
 attachable pins remain:
 
-1. Multi-source Dijkstra: every tree node at cost 0.
-2. `BinaryHeap<Reverse<(u32,u32)>>` — total order, equal costs pop
+1. **Hop field**: unit-weight BFS over all arc classes from every
+   unconnected attachable pin's attach set fills `hop[v]` — the
+   unweighted distance to the nearest target. Occupancy-blind, so it
+   undercounts; with every edge costing ≥1 hop it is a consistent
+   heuristic. `u32::MAX` = no unweighted path to a target — such
+   nodes sort last, the wave still exhausts before `None`, so the
+   `NoPath` verdict is unchanged.
+2. Goal-directed multi-source wave: every tree node enters at
+   `g = 0`; the PQ keys `(g + hop, node)`. The `g + hop` pop order
+   picks the same minimum-`g` target plain Dijkstra would, without
+   flooding the whole graph.
+3. `BinaryHeap<Reverse<(u32,u32)>>` — total order, equal keys pop
    the lower node id; CSR neighbor order is in-plane edges, then
    strict via edges, then relaxed via edges, each both directions.
-3. First popped node carrying an unconnected attachable pin wins;
+   Stale entries are skipped via the `dstamp`/`dist` check
+   (`dist + hop < f` ⇒ a better key was pushed later).
+4. First popped node carrying an unconnected attachable pin wins;
    backtrack `parent` edge ids to the tree, append the simple path
    (strictly decreasing `dist` chain — always simple), mark the pin,
    `absorb_taps` for pins whose attach set already touches the tree.
-4. Wave exhaustion with targets left ⇒ net fails this round;
+5. Wave exhaustion with targets left ⇒ net fails this round;
    remaining pins named `NoPath`.
 
 `dist`/`parent` use per-round stamps (`dstamp`/`pstamp`) — no
-O(nodes) reset per round.
+O(nodes) reset per round; `tree_nodes`/`used_edges` carry the grown
+state across rounds.
 
-**Backtrack bound (hardening)**: the `while !in_tree[v]` walk is the
-only unbounded loop in the router. A parent chain is provably simple
+**Backtrack bound (landed)**: the parent-chain walk is a `for` loop
+bounded at `g.nodes.len()` steps. A parent chain is provably simple
 (strictly decreasing dist to a dist-0 tree node), but if a bug ever
-breaks that invariant the loop would hang silently — exactly the
-reviewer's "stuck vs slow" ambiguity. Bound the walk at
-`g.nodes.len()` steps; exceeding it returns the net as `NoPath`
-named failure (a bug-shaped result, still bounded, still reported).
-This is a cheap invariant guard, not a routing heuristic.
+breaks that invariant the loop would hang silently — the bound turns
+it into a `None` ⇒ named `NoPath` failure (a bug-shaped result,
+still bounded, still reported). Cheap invariant guard, not a
+routing heuristic.
 
 ## 5. Costs — recorded constants
 

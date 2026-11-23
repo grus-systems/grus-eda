@@ -1,7 +1,8 @@
 # e6-drt-maze — Occupancy and spacing-lite
 
-Matches the implementation at `2c3c713`, plus the diagnosis-driven
-change candidates in §5.
+Matches the implementation at `c1832dc` — the §5 diagnosis resolved
+as C1 + C2 and the L3 skip index landed; the rules below are final
+for this ticket.
 
 ## 1. Model
 
@@ -9,17 +10,20 @@ Committed geometry — macro OBS, pin shapes, via footprints,
 committed wire/stub rects — is rasterized onto track lines so an
 edge's conflict check is a per-line interval query.
 
-Per routing layer `l`, two maps (line coordinate → interval list):
+Per routing layer `l`, two maps (line coordinate → `Line`):
 
-- `lines_y[l]: BTreeMap<i32, Vec<Interval>>` — horizontal lines
-  (`tracks_y` coords), queried by `Axis::X` edges and rect scans.
+- `lines_y[l]: BTreeMap<i32, Line>` — horizontal lines (`tracks_y`
+  coords), queried by `Axis::X` edges and rect scans.
 - `lines_x[l]` — vertical lines, queried by `Axis::Y` edges.
 
 ```rust
 struct Interval { lo: i32, hi: i32, perp_lo: i32, perp_hi: i32,
                   who: Occupant }
 enum  Occupant { Obs(u32 /* cell idx; u32::MAX = no exempting host */),
-                 Net(u32 /* NetId.0 */) }
+                 Net(u32 /* NetId.0 */),
+                 Pin(u32 /* NetId.0 */) }
+struct Line { ivs: Vec<Interval>,  // lo-sorted
+              max_hi: Vec<i32> }   // max(hi) per SKIP_CHUNK=16 chunk
 ```
 
 `perp_*` stores the marked shape's extent on the line's perpendicular
@@ -30,12 +34,20 @@ candidate gets for free.
 **Rasterization** (`Occupancy::rasterize`): rect `r` on layer `l`
 inserts `[r.yl, r.yh]` into every `lines_x[l][x]` with
 `x ∈ (r.xl − w/2 − s, r.xh + w/2 + s)` (strict band) and
-`[r.xl, r.xh]` into every `lines_y[l][y]` likewise, with
+`[r.xl, r.xh]` into `lines_y[l][y]` likewise, with
 `w/2 = width_dbu/2` (integer division — sky130 widths are even) and
 `s = min_spacing_dbu()`. Each insertion is optionally logged as a
 `Mark` — the rip-up journal (`unmark` frees it). A rect covering no
 track line inside a band contributes nothing on that axis — correct,
 since candidates only exist on lines.
+
+**Skip index**: `ivs` stays `lo`-sorted (insert via
+`partition_point`, equal-`lo` goes after existing entries so
+insertion order is deterministic); `max_hi` is rebuilt eagerly from
+the dirty chunk onward (`rebuild_from`). Scans skip a chunk when
+`max_hi ≤ qlo` and stop at `lo ≥ qhi` — the hit *set* is identical
+to a linear scan; the hit *order* may differ and both consumers are
+order-insensitive.
 
 **Pre-mark** (`premark_obs`, once at `route_nets` start):
 
@@ -43,10 +55,13 @@ since candidates only exist on lines.
   + translate — the `drc::geom` source-4 convention) `obs_rects_raw`
   on routing layers → `Obs(cell_idx)`. The **unmerged** set: the
   `merge_connected_obs` bbox fills the decap/edge gaps pins need.
-- Every instance pin's shapes → `Net(own_net)` — a pin's metal
-  blocks foreign nets but is free to its own net so routing can
-  reach its own attach nodes. Pins without a net get
-  `Obs(u32::MAX)` (never carved — no exempting host).
+- Every instance pin's shapes → `Pin(own_net)` — a pin's metal is
+  free to its own net, soft-priced for foreign nets, and **never a
+  hard block** (rip-up cannot move a pin; charging it as congestion
+  churns the queue without clearing the mark; a foreign wire landing
+  on it is a pin-access finding for the emit/e2e DRC). Pins without
+  a net get `Obs(u32::MAX)` — immovable blockage with no exempting
+  host.
 - io-port rects are not marked (recorded simplification — pin-access
   DRC is the emit/e2e tickets' job).
 
@@ -64,29 +79,38 @@ Cut-layer occupancy not modeled (spacing-lite).
   guaranteed by the band the mark was rasterized into.
 - `scan_rect(l, r)`: via footprints — expand `r` by `s` and test
   true 2-D intersection against the marks inside the `w/2 + s` band
-  on both axes, using the stored perpendicular extents.
+  on both axes, using the stored perpendicular extents. A collision
+  sliver containing no track line on either axis is the recorded
+  miss class (spacing-lite).
+- `scan_stub`: a relaxed via's implied stub wire between the hang
+  node and the true via position is committed metal — scanned like
+  a wire on both layers before the footprint check.
 
-`hit_verdict(hits, own_pins, cand, own, hist, hard, mode)`:
+`hit_verdict(hits, host_cells, own, hist, hard, mode)`:
 
 | hit class | soft iteration | last iteration (hard) |
 |---|---|---|
-| `Obs(cell)`, uncarved | hard block | hard block |
-| `Obs(cell)`, carved | invisible | invisible |
+| `Obs(cell)`, `cell ∈ host_cells` | invisible | invisible |
+| `Obs(cell)`, `cell ∉ host_cells` | hard block | hard block |
+| `Obs(u32::MAX)` | hard block | hard block |
 | `Net(own)` | free | free |
-| `Net(foreign)` | `+(OCC_PENALTY + hist·HIST_STEP) × #distinct foreign` | hard block |
+| `Net(foreign)` | `+(OCC_PENALTY + hist·HIST_STEP)` per distinct foreign net | hard block |
+| `Pin(own)` | free | free |
+| `Pin(foreign)` | same penalty, pooled with `Net` in the distinct set | **soft-priced — never a block** |
 
-`OccMode::Disabled` (the fail-proof knob) skips foreign-`Net`
+**Host-cell carve (final rule, C1)**: `host_cells` is the sorted,
+deduped set of cells hosting the candidate net's member pins. An
+`Obs(cell)` hit is invisible whenever `cell ∈ host_cells` — the
+rasterized form of OpenROAD's "access shapes ignore own-instance
+OBS", applied unconditionally. Measured: the earlier access-halo
+carve left the approach edge blocked before it reached the halo —
+that was 47/48 of the gcd `NoPath`s. Recorded looseness: the net may
+cross the host cell's OBS anywhere, not just near the pin —
+connectivity-level acceptable; the emit/e2e DRC owns the real check.
+
+`OccMode::Disabled` (the fail-proof knob) skips foreign-`Net`/`Pin`
 checks and collision recording entirely; `Obs` stays blocking — a
 fixed blockage is not "occupancy".
-
-**Pin-carve exemption (current rule)**: an `Obs(cell)` hit is
-invisible when the *candidate rect* `cr` (the edge/via's own shape
-on that layer) overlaps the access halo — pin rect expanded by
-`w/2` + the layer's widest track gap — of one of the candidate net's
-own pins **hosted by that same cell**. The halo reaches every node
-`project_attach` can emit and the unmodeled access stub a projected
-node implies. Neighboring cells' OBS stays blocking whatever the
-distance.
 
 ## 3. Spec mapping
 
@@ -95,7 +119,8 @@ distance.
 - "later nets see the occupancy as cost" — soft-mode penalty
   (PathFinder-style sharing priced, not forbidden).
 - "a hard-block when the interval + SPACING collides" — `Obs`
-  always; foreign nets on the final iteration.
+  always; foreign `Net` on the final iteration. `Pin` stays
+  soft-only (recorded deviation — a pin cannot move under rip-up).
 - Commit-time recording: in soft mode the foreign hits an edge took
   are stored as provisional `Collision`s deduped on
   `(a, b, layer, line, lo, hi)` with `a < b`; they drive the rip-up
@@ -111,49 +136,27 @@ along-line gap and the perpendicular gap (`pgap ≥ s` clears it).
 Exact on the committed result — the `RouteDb.collisions` list and
 the fail-proof's measuring stick.
 
-## 5. Routability-gap candidates (diagnosis decides — `steps.md` §2)
+Measured on gcd: Enabled → 0 collisions; Disabled → 6,429 — the
+fail-proof's nonzero evidence that occupancy constrains.
 
-The measured gcd residual is 48 `NoPath` nets, almost all deep inner
-pins on AOI/OAI cells. Candidates, in expected-hit order:
+## 5. Resolved diagnosis record
 
-- **C1 — unconditional host carve.** If the probe shows host-cell
-  `Obs` hits blocking approach edges whose candidate rect has not
-  yet reached the halo, widen the exemption: `Obs(cell)` is
-  invisible to the candidate net whenever the net has a member pin
-  hosted by `cell`. This matches OpenROAD's "access shapes ignore
-  own-instance OBS" directly (the halo approximation was the
-  intermediate step). Recorded looseness: the net may cross the host
-  cell's OBS anywhere, not just near the pin — acceptable at
-  connectivity level; the emit/e2e DRC owns the real check.
-- **C2 — pin-metal occupant class.** If foreign pin marks wall the
-  pocket (hard-mode block), split pin marks into `Occupant::Pin(net)`
-  — exempt for own net, soft penalty for foreign, never hard-block
-  (or stop marking pin shapes entirely). Pin-pin shorts become a
-  post-check finding, recorded in `docs/e6-drt.md`.
-- **C3 — spare-layer / relaxed-via widening.** If the pocket mouth
-  is sealed on every covered layer, or the nearest upper line holds
-  no in-region node, widen `relaxed_vias` to probe the next-nearest
-  lines (bounded, e.g. ±2) and/or reconsider `spare_above`.
-- **C4 — none of the above**: the probe names the real blocker class
-  and the doc records it (the `unclassified` assert stays strict —
-  classes are named, not excused).
+The 48-net gcd `NoPath` residual at `2c3c713` resolved as:
 
-Each fix is applied minimally and recorded in `docs/e6-drt.md` §7 —
-no silent semantic changes (AGENTS §2).
-
-## 6. Performance levers (`perf.md`)
-
-The per-line `Vec<Interval>` linear scan is the prime suspect for
-the superlinear blowup. Lever L3 replaces each list with a
-`lo`-sorted structure plus a skip index (chunked `max_hi` summaries
-rebuilt lazily per line on mutation) so `scan_wire`/`scan_rect`
-touch only intervals in the query window. Hit *sets* are unchanged;
-hit *order* may change — both consumers (`hit_verdict`,
-`edge_collisions`) are order-insensitive, so output bytes are
-preserved. Record whichever structure lands.
+- **C1 — unconditional host carve** (landed): host `Obs` walled the
+  pocket approach outside the old halo — the deep-inner-pin pattern
+  on AOI/OAI cells (`a21oi`/`a22o`/`a221o`/`a32o`/`o2bb2a`/`a21boi`,
+  the `_131_`/`_132_` pin groups).
+- **C2 — `Pin` occupant class** (landed): pin metal can seal a
+  pocket mouth under hard mode and cannot be ripped up, so it must
+  never hard-block.
+- **C3 — relaxed-via widening / bigger spare layer**: *not needed* —
+  gcd closed at `unrouted=0` without it; picorv32 decides whether it
+  resurfaces (a residual there is named per-pin, `tests.md`).
+- **H4 — stuck-loop**: ruled out by the bounded backtrack; the
+  rewrite's measured runtimes confirm "slow, not stuck".
 
 ## Files
 
 - `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/src/tech_db.rs`
-- `crates/grus-core/src/readers/lef.rs`

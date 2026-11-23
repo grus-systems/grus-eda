@@ -1,105 +1,93 @@
-# e6-drt-maze — Implementation steps (resume from `2c3c713`)
+# e6-drt-maze — Implementation steps (resume from `c1832dc`)
 
-The checkpoint compiles with 2 warnings; synthetic cases pass;
-**measured**: gcd census 203 s with 48 `NoPath` unrouted (47 not
-met3-bridge → classification assert red), picorv32 unmeasured
-(>21 CPU-min observed on the earlier run). Remaining work, in order:
+The checkpoint compiles; synthetic cases, in-module units, the gcd
+census leg, and the occupancy fail-proof are green; the picorv32
+census leg is in-flight. Remaining work, in the reviewer's order:
 
-## 0. Clear the two warnings
+## 0. `docs/e6-drt.md` §7 + §4/§5 amendments
 
-- Delete `hit_rect` and the `Hit::x_line` field (dead since the
-  carve moved to candidate-vs-halo). Remove `x_line` from the three
-  `Hit{..}` constructions (`scan_wire`, `scan_rect` ×2).
-- `cargo check -p grus-core` → zero warnings.
+Write the "7. Maze search" section per `docs.md` — content is fully
+determined by the committed code (cost constants, occupancy classes,
+rip-up rule, hop heuristic); measure nothing new here. Amend §4
+claim boundary and §5 router implication to match what shipped
+(projection attach + spare layer answered the escape/pocket classes;
+relaxed vias bridge the strict-crossing gap).
 
-## 1. Bounded backtrack (hardening — do before diagnosis)
+## 1. Clear the 6 clippy warnings
 
-In `NetRun::extend_once`, bound `while !in_tree[v]` at
-`g.nodes.len()` steps; overflow ⇒ treat the net as failed this round
-(the parent-chain invariant makes it unreachable in correct runs —
-`search.md` §4). This converts the one theoretical hang into a named
-`NoPath`, so the rest of the plan can trust "still running = slow".
+All mechanical; match the file's existing conventions:
 
-## 2. Diagnose the 48 gcd `NoPath`s
+- `drt/maze.rs:706` `scan_stub` — `too_many_arguments (8/7)` →
+  `#[allow(clippy::too_many_arguments)]` (same convention as
+  `edge_cost`, `extend_once`).
+- `drt/maze.rs:729` `edge_collisions` — `(9/7)` → same `#[allow]`.
+- `drt/maze.rs:1014` `host_cells.push(c.0 as u32)` —
+  `unnecessary_cast` → drop `as u32` (`PinId`/`CellId` `.0` is
+  already `u32`).
+- `drt/maze.rs:1185` (+use at 1189) `needless_range_loop` — the hop
+  BFS indexes only `adj_to` with `pos` → iterate the slice:
+  `for &to in &topo.adj_to[range]`; check the PQ loop at ~1218 for
+  the same warning after the fix (it uses `pos` for two arrays —
+  `adj_to[..].iter().zip(&adj_eidx[..])` if flagged).
+- `drt/maze.rs:1272` `route_one_net` — `(10/7)` → same `#[allow]`.
+- `tests/drt.rs:1495` `find(p: &mut Vec<usize>, i)` — `ptr_arg` →
+  `&mut [usize]`.
 
-Temporary instrumentation (removed before commit — same convention
-as the deleted `debug_*` fns):
+`cargo clippy --workspace --all-targets -- -D warnings` → clean.
 
-1. `OccMode::Disabled` control on gcd. Still fails ⇒ `Obs`/topology
-   (observed NoPath pattern already implies this — soft-mode foreign
-   marks only cost, they never block).
-2. Blocker probe (`debug_pin_block` or equivalent): for each failed
-   pin, scan its attach nodes' incident edges through `edge_cost`
-   and tally which `Occupant` class returns `None` —
-   `Obs(host)`-uncarved / `Obs(other cell)` / `Net(foreign)` /
-   no-hits-at-all (⇒ node component split, including relaxed-via
-   single-nearest misses).
-3. Decide per `occupancy.md` §5: **C1** unconditional host carve
-   (expected primary — deep-pin pattern matches), **C2** `Pin`
-   occupant class / unmark pin shapes, **C3** relaxed-via
-   next-nearest widening or spare-layer bump. Apply minimally; a
-   fix that lands gets a matching in-module unit case (`tests.md`).
-4. Re-run `test_maze_cases` (case 3's OBS detour must still detour)
-   and the gcd census leg — target `unrouted = 0`; any residual is
-   classified by name (`tests.md`).
+## 2. Verify runs (numbers feed `results.md`)
 
-## 3. Performance (`perf.md`)
-
-Instrument (per-iteration `eprintln!`: `bad` count, routed/failed,
-cumulative ms; top-5 nets by ms with nodes/edges/pins; `edge_cost`
-and interval-compare counters), run gcd, then picorv32 under an
-external timeout. Apply levers in order until the budget is met:
-
-1. **L1** `cand` scratch buffer into `edge_cost` (per-relax alloc).
-2. **L2** `NetTopo` split — build attach/`relaxed_vias`/CSR once per
-   net, reuse across iterations (`api.md`).
-3. **L3** bounded interval scans — `lo`-sorted per-line lists with a
-   chunked `max_hi` skip index (`occupancy.md` §6).
-4. Re-measure after each lever; keep the counters' numbers for
-   `results.md` (before/after, honest record — AGENTS §2).
-
-Budget: picorv32 census leg completes inside the debug test run
-(working target single-digit minutes; `perf.md` §3); record the
-measured `ms=`. L4 (`[profile.test] opt-level`) only if L1–L3 fail —
-recorded decision, never silent.
-
-## 4. Green the gates
-
-- `cargo test -p grus-core --lib maze` — in-module units.
-- `cargo test -p grus-core --test drt test_maze_cases` — synthetic.
 - `cargo test -p grus-core --test drt test_maze_census -- --nocapture`
-  — collect both designs' census lines for `results.md`.
-- `test_maze_occupancy` + `test_maze_determinism` — fail-proof and
-  double-run evidence.
-- `cargo test --workspace`;
-  `cargo clippy --workspace --all-targets -- -D warnings`.
-- Remove the temporary instrumentation before the commit.
+  — collect both designs' census lines verbatim (gcd already
+  measured: `routed=269/269 unrouted=0 collisions=0 ms=9704`;
+  picorv32's `ms=` is the acceptance number — record it however
+  large; if it lands near the earlier 25+ CPU-min bound, state that
+  explicitly per the reviewer).
+- `cargo test -p grus-core --test drt test_maze_occupancy` — already
+  measured (Enabled 0 collisions vs Disabled 6,429; digests differ).
+- `cargo test -p grus-core --test drt test_maze_determinism` — 2×
+  full runs per design; identical `RouteDb` + nonzero digest.
+- `cargo test --workspace` — the whole suite, including the
+  picorv32-bound tests (census + determinism = 3 full picorv32
+  route_nets runs total across the binary; plan the wall-clock
+  envelope accordingly — run with `--release`? **No**: acceptance
+  says "completes in a test, not a timeout" under the default
+  profile; the debug number is the honest one. If the suite's wall
+  time is dominated by the 3 picorv32 runs, that is the recorded
+  fact, not a reason to `#[ignore]`).
+- `GRUS_DRT_TIMING=1` on a census rerun is optional evidence — the
+  per-iteration `bad=`/`prov=` lines document convergence.
 
-## 5. Docs + version (same commit)
+## 3. `docs/results.md` + `docs/status.md` + `docs/roadmap.md`
 
-- `docs/e6-drt.md` §7 per `docs.md` — must record the *final* carve/
-  pin-mark rules, the spare layer, relaxed vias, `obs_rects_raw`,
-  the rip-up rule, and the §4/§5 claim-boundary amendments.
-- `docs/results.md` dated entry — measured census numbers, the
-  diagnosis evidence chain, the perf before/after, checks run.
-- `docs/status.md` head paragraph; `docs/roadmap.md` E6 line.
-- `Cargo.toml` `[workspace.package] version 0.12.3 → 0.12.4`.
+Per `docs.md`: dated entry with the measured census table (both
+designs), the occupancy fail-proof numbers, determinism digest,
+perf before/after (203 s → measured on gcd), the picorv32 runtime
+statement, checks run, version bump. `status.md` head paragraph and
+the `roadmap.md` E6 progress line per the existing style.
 
-## Commit
+## 4. Version bump + commit
 
-One commit on top of the checkpoints:
-`feat: Sequential maze router over the track graph`
-(Conventional Commits, English, agent trailer). The two checkpoint
-diffs plus this remainder are one unit of work; stage explicit
-paths — never `git add -A`.
+- `Cargo.toml` `[workspace.package] version 0.12.3 → 0.12.4` (feature,
+  patch on 0.x — same commit as the functional change, AGENTS §5).
+- One commit on top of the checkpoints:
+  `feat: Sequential maze router over the track graph`
+  (Conventional Commits, English, agent trailer). Stage explicit
+  paths — never `git add -A`.
+
+## Contingencies
+
+- **picorv32 census red on the met3-bridge classifier**: any unrouted
+  `NoPath` net outside the met3-bridge class needs its cause named
+  and the classifier extended (`tests.md`) — do not weaken the
+  assert silently.
+- **clippy fix changes output**: none of the six fixes touches
+  semantics; if the `RouteDb` digest changes after the edits, that
+  is a bug in the fix, not new routing behavior.
 
 ## Files
 
 - `crates/grus-core/src/drt/maze.rs`
-- `crates/grus-core/src/drt.rs`
-- `crates/grus-core/src/drt/graph.rs`
-- `crates/grus-core/src/tech_db.rs`
-- `crates/grus-core/src/readers/lef.rs`
 - `crates/grus-core/tests/drt.rs`
 - `docs/e6-drt.md`
 - `docs/results.md`

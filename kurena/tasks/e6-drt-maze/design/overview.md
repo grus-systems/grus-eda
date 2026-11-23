@@ -6,108 +6,105 @@ graph built by `e6-drt-graph`, using the via model from `e6-drt-via`.
 Non-goals stay as specced: no DEF emission, no full DRC during search,
 no timing awareness, no track-assignment stage, no parallelism.
 
-## Resume state (third revision, after card feedback #2)
+## Resume state (fourth revision, after card feedback #3)
 
-**HEAD is WIP commit `2c3c713`; it compiles** (2 dead-code warnings:
-`Hit::x_line`, `hit_rect`) and the synthetic cases pass. Two real
-gaps were *measured* while preparing this revision:
+**HEAD is WIP commit `c1832dc`; the router is implemented and the
+gates are green where measured.** Card feedback #3 scopes the
+remainder to docs, lint, the verify run, and the commit — in the
+reviewer's order:
 
-1. **Routability gap.** `test_maze_census` on gcd: `guided=269
-   routed=221 pins_connected=662 projected=12 unrouted=48
-   collisions=189 iterations=8 ms=203058` — then the
-   `unclassified.is_empty()` assert goes red: **47 of 48 `NoPath`
-   nets are not met3-bridge**. Acceptance expects unrouted = 0; this
-   is the primary remaining engineering task. The failure pattern is
-   systematic, not congestion: single inner pins (`A1`/`A2`/`B1`/`B2`)
-   on multi-input AOI/OAI cells (`a21oi`, `a22o`, `a221o`, `a32o`,
-   `o2bb2a`, `a21boi`), whole pin groups on `_131_`/`_132_`. All are
-   `NoPath` (attach sets exist but are unreachable), meaning the
-   pockets are *walled*, not detached.
-2. **Runtime gap.** gcd alone takes 203 s in the debug test profile;
-   picorv32 (28.4 M nodes / 54.6 M edges, ~37× gcd's graph) did not
-   finish inside the ~21+ CPU-minutes observed on the review run —
-   far beyond linear scaling. Whether it is stuck or merely slow is
-   unresolved until instrumented (`perf.md`); the only unbounded loop
-   in the code is the `extend_once` backtrack, which gets a bound.
+1. `docs/e6-drt.md` §7 (search order, cost constants, rip-up rule,
+   occupancy) + `docs/results.md` dated entry with measured runtimes
+   incl. the picorv32 census number + `docs/status.md` +
+   `docs/roadmap.md` — all still untouched (`docs.md`).
+2. `cargo clippy --workspace --all-targets -- -D warnings` — **6
+   warnings at HEAD**, all mapped in `steps.md` §0.
+3. `cargo test --workspace`; record the measured picorv32 maze
+   runtime — earlier census runs took 25+ CPU-min; if that is the
+   accepted number, say so explicitly in `results.md`.
+4. Version bump `0.12.3 → 0.12.4` + one commit.
 
-What `2c3c713` landed on top of `a52d771` (the earlier checkpoint):
+No further routing-model work is planned unless the verify runs
+contradict the measured state below.
 
-- `RelaxedVia` threading finished: `relaxed_vias()` per call,
-  unified edge index space `[0,E) | [E,E+V) | [E+V,E+V+R)`, CSR
-  carries all three arc classes (strict before relaxed so
-  equal-`VIA_COST` ties break to strict), extraction emits the
-  placement **and** the two implied stub wires.
-- `drt::graph::net_region`/`build_route_graphs_ext` gained
-  `spare_above` (maze calls it with 1): every guide box's XY is also
-  covered on `top_guided + 1` — OBS-sealed pin pockets are reached
-  one layer above the global route's layer choice.
-- `MacroDef::obs_rects_raw` (pre-`merge_connected_obs`) added in
-  `tech_db.rs` + populated in `readers/lef.rs` — the merged bbox
-  seals the gaps decap/edge cells leave, so `premark_obs` marks the
-  unmerged set.
-- `Occupant::Obs(u32)` now carries the cell index; pin shapes are
-  premarked `Net(own_net)` (or `Obs(u32::MAX)` for net-less pins).
-  Pin-carve rule changed to host-cell + access-halo: an `Obs(cell)`
-  hit is invisible when the candidate rect overlaps the halo
-  (pin rect + `w/2` + widest track gap) of an own pin *hosted by that
-  same cell*.
-- Projection attach now takes a one-line margin (`project_attach`).
-- The diagnosis scaffolding (`debug_*` fns, `test_maze_debug_gcd`)
-  is already gone; `tests/drt.rs` has `load_routed_inputs` +
-  `guide_union_connected` and the four acceptance test groups.
+## Measured state at `c1832dc`
 
-## Working diagnosis for the 48 gcd failures
+- `test_maze_cases` (4 synthetic cases) — **green** (0.00 s).
+- `cargo test -p grus-core --lib maze` — **green**, 5/5.
+- `test_maze_census` gcd leg — **green**: `guided=269 routed=269
+  pins_connected=931 projected=17 unrouted=0 collisions=0
+  iterations=8 ms=9704 digest=0xfbb3073487860974`. Down from 203 s
+  and 48 `NoPath` unrouted at `2c3c713` — the C1/C2 occupancy fixes
+  and the L1–L3+heuristic perf work landed together.
+- `test_maze_occupancy` — **green** (17.6 s): Enabled digest
+  `0xfbb3073487860974` census=0 vs Disabled digest
+  `0x349f82f53a0c7143` census=6429 — occupancy measurably constrains.
+- `test_maze_census` picorv32 leg — **in-flight at design time**
+  (>15 min debug-profile when this doc was written; the 25+ CPU-min
+  figure from the earlier run is the bound the reviewer accepted if
+  it recurs — record the measured number, whatever it is).
+- `test_maze_determinism` — untested (2× full runs per design; its
+  cost follows the census number).
+- `docs/e6-drt.md` §7, `docs/results.md` entry, `docs/status.md`,
+  `docs/roadmap.md` — not yet written.
+- `cargo clippy` — 6 warnings (exact list in `steps.md` §0).
 
-`NoPath` means attachable-but-unreached. In soft iterations foreign
-`Net` marks only cost `OCC_PENALTY`; a net that still fails in *every*
-iteration is blocked by `Obs` marks or by a node-level component
-split. Ranked hypotheses (instrumentation in `steps.md` §2 decides):
+## What `c1832dc` landed over `2c3c713`
 
-- **H1 — carve radius too small.** The carve engages only when the
-  candidate rect already overlaps the pin halo. A pin pocket deeper
-  than `w/2 + max_gap` from the pocket mouth is unreachable: the
-  approach edge hits host-cell OBS *before* it overlaps the halo and
-  stays blocked. Matches the deep-inner-pin pattern exactly.
-  Recorded fix: carve `Obs(host)` for the net unconditionally once
-  the net has a pin on `host` (OpenROAD's "access shapes ignore
-  own-instance OBS"), not only inside the halo.
-- **H2 — non-host walls.** Neighbor cells' OBS (abutted placement)
-  and foreign pin metal (`Net(m ≠ own)`, hard-blocked on the last
-  iteration) can seal a pocket the host-carve never opens. Recorded
-  fix candidates: a third occupant class `Pin(net)` that never
-  hard-blocks (or: stop marking pin shapes — the post-DRC tickets
-  own pin-access correctness), and/or pocket-mouth escape via the
-  spare layer.
-- **H3 — node-level disconnect inside a guide-connected region**:
-  `guide_union_connected` is box-level; the only intra-level check.
-  Relaxed-via's *single-nearest rule* (nearest upper line holds no
-  in-region node ⇒ no edge at all) can strand nodes. Fix: widen to
-  the next-nearest lines — already the recorded first knob.
-- **H4 — stuck-loop masquerading as NoPath**: ruled out by the
-  bounded backtrack guard + per-phase instrumentation.
+A rewrite of `drt/maze.rs` (1,204-line diff) that closed both the
+routability gap and most of the runtime gap:
 
-If H1/H2 hold, an `OccMode::Disabled` control run should still fail
-(Obs stays blocking under Disabled) — which is itself diagnostic:
-the probe (`steps.md` §2) reports, per failed pin, which occupant
-class blocks the attach neighborhood's incident edges.
+- **C1 — unconditional host-cell carve** (`occupancy.md`): `Obs(cell)`
+  is invisible to a net that has a member pin hosted by `cell`
+  (`host_cells`, sorted+deduped per net). The earlier access-halo
+  carve left approach edges blocked before the halo was reached —
+  measured root cause of 47/48 gcd `NoPath`s. `Obs(u32::MAX)`
+  (net-less pin metal) is never carved.
+- **C2 — `Occupant::Pin(u32)` class**: member pin metal is marked
+  `Pin(own_net)`, not `Net` — free to its own net, soft-priced for
+  foreign nets, never a hard block (rip-up cannot move a pin; a
+  landing wire is an emit-time DRC finding).
+- **C3 partially folded into C2's reasoning**: relaxed-via stayed
+  single-nearest; the spare layer (`spare_above = 1`) stayed.
+- **`NetTopo` cache (L2)**: attach sets, `relaxed_vias`, and the CSR
+  adjacency over the unified edge index space built once per net in
+  `route_nets`, reused across rip-up iterations — byte-identical arc
+  order.
+- **Chunked skip index (L3)**: per-line `Interval` lists are
+  `lo`-sorted with a `SKIP_CHUNK = 16` `max_hi` index rebuilt from
+  the dirty chunk; scans touch only the query window.
+- **Goal-directed wave**: per round, a unit-weight BFS from every
+  unconnected attachable pin's attach set fills `hop`; the PQ keys
+  `(g + hop, node)` — a consistent heuristic (every edge ≥1 hop),
+  so the wave stops at the first target pop without flooding the
+  graph. `u32::MAX`-hop nodes sort last; `NoPath` semantics unchanged.
+- **Bounded backtrack**: the parent-chain walk caps at
+  `g.nodes.len()` steps — a bug-shaped invariant breach surfaces as
+  named `NoPath`, never a hang.
+- **`GRUS_DRT_TIMING` env-gated instrumentation**: premark/topo/
+  per-iteration/per-net `eprintln!` — stays in the committed code
+  (opt-in, zero cost when unset) and feeds the `results.md` runtime
+  evidence. Recorded decision, not stray scaffolding.
 
 ## Decisions (detail in the sibling docs)
 
 1. **Sequential single-net ordering** in `join.nets` (guide-file)
    order — deterministic for free; pin-count ordering rejected.
-2. **Pathfinder-style tree extension**: multi-source Dijkstra from
-   the routed tree to the nearest unattached pin's node set.
+2. **Pathfinder-style tree extension**: multi-source goal-directed
+   search (`g + hop` PQ) from the routed tree to the nearest
+   unattached pin's node set.
 3. **Integer hop costs** — `PREF 1 / OFF_AXIS 2 / VIA 4 / OCC 8 /
    HIST 8 / MAX_ITERS 8`, last iteration hard-conflict.
 4. **Occupancy = per-line shape intervals** rasterized within the
-   `w/2 + s` band on both axes; `Obs` always hard, foreign `Net`
-   soft then hard, own net free, host-cell pin-carve exemption.
+   `w/2 + s` band on both axes, `lo`-sorted with the chunked skip
+   index; `Obs` always hard (host-carved), foreign `Net` soft then
+   hard, `Pin` soft-only, own net free.
 5. **Projection attachment** only when strict `pin_nodes` is empty,
-   with a one-line margin — loosening counted in `NetRoute::projected`.
+   with a one-line margin — loosening counted in `NetRoute::projected`
+   (gcd: 17 pins, all the §5 escape classes).
 6. **Relaxed via edges** per net: every lower-layer node gets one
    transition whose true position sits on both layers' preferred
-   wires (strict crossings coincide every 7820 DBU on li1–met1/
-   met1–met2 and never on met2–met3).
+   wires, plus committed stub wires at extraction.
 7. **Spare-layer region** (`spare_above = 1`): each box's XY covered
    on `top_guided + 1` for OBS-sealed pocket escapes.
 8. **Unmerged OBS marks** (`obs_rects_raw`): the merged bbox fills
@@ -115,15 +112,11 @@ class blocks the attach neighborhood's incident edges.
 9. **Rip-up rule**: re-queue unrouted nets plus both parties of every
    provisional collision; per-net `hist` escalation; cap 8.
 10. **Named unrouted report** per pin (`Unattachable` vs `NoPath`) —
-    never a panic, never an infinite loop (backtrack bound added).
+    never a panic, never an infinite loop (backtrack bound).
 
 ## Files
 
 - `crates/grus-core/src/drt/maze.rs`
-- `crates/grus-core/src/drt.rs`
-- `crates/grus-core/src/drt/graph.rs`
-- `crates/grus-core/src/tech_db.rs`
-- `crates/grus-core/src/readers/lef.rs`
 - `crates/grus-core/tests/drt.rs`
 - `docs/e6-drt.md`
 - `docs/results.md`

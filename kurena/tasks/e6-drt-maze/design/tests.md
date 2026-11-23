@@ -1,21 +1,31 @@
 # e6-drt-maze — Test plan
 
-All maze tests exist in `crates/grus-core/tests/drt.rs` at `2c3c713`
-— the remaining work is making them *green*, not writing new ones.
-Existing E6 gate conventions apply: `load_routed_inputs` helper,
-fail-loud on missing inputs; `picorv32.placed.def` is present in the
-worktree.
+All maze tests exist in `crates/grus-core/tests/drt.rs` and pass
+where measured at `c1832dc` — the remaining work is *running* the
+rest and recording the numbers, not writing new tests.
+`picorv32.placed.def` is present in the worktree; `load_routed_inputs`
+fails loud on missing inputs.
 
-## Measured state at HEAD
+## Measured state at `c1832dc`
 
-- `test_maze_cases` — **green** (0.00 s).
-- `test_maze_census` — **red**: gcd leg `routed=221/269`,
-  `unrouted=48` (all `NoPath`; 47 not met3-bridge) → the
-  `unclassified.is_empty()` assert fires; picorv32 leg never ran
-  (assert aborts first). Runtime 203 s for gcd alone.
-- `test_maze_occupancy`, `test_maze_determinism` — untested at HEAD
-  (each runs `route_nets` ≥2× on gcd at 203 s → minutes; picorv32
-  determinism needs 2 full runs).
+- `cargo test -p grus-core --lib maze` — **green**, 5/5
+  (`test_band_math`, `test_perpendicular_crossing`,
+  `test_projection_fallback`, `test_pq_tie_order`,
+  `test_tree_extension_simple_path`).
+- `test_maze_cases` — **green** (0.00 s): the four synthetic
+  acceptance cases incl. the OBS detour under the *unconditional*
+  host carve (`blk`'s OBS still blocks `n1` — the net owns no pin on
+  `blk`, exactly the boundary case C1 must not open).
+- `test_maze_census` gcd leg — **green**: `guided=269 routed=269
+  pins_connected=931 projected=17 unrouted=0 collisions=0
+  iterations=8 ms=9704 digest=0xfbb3073487860974`.
+- `test_maze_census` picorv32 leg — **in-flight at design time**;
+  the assert to watch is the met3-bridge classifier (below).
+- `test_maze_occupancy` — **green** (17.6 s): Enabled
+  `digest=0xfbb3073487860974 census=0` vs Disabled
+  `digest=0x349f82f53a0c7143 census=6429`.
+- `test_maze_determinism` — untested (2× `route_nets` per design).
+- `cargo test --workspace` — pending the picorv32 leg.
 
 ## Synthetic fixture — `test_maze_cases` (green)
 
@@ -37,11 +47,7 @@ macro (`blk`), a track-less pin (`u2/C`).
    bridge ⇒ `u0/A` = `NoPath`); `n3`'s `u2/C` covers no track
    (`Unattachable`). Named pins/kinds, `nets` empty, bounded return.
 
-Re-check after the routability fix — especially case 3 under any
-carve widening (`blk`'s OBS must still block `n1`; the net owns no
-pin on `blk`, so C1 does not open it).
-
-## Real-design census — `test_maze_census` (fix target)
+## Real-design census — `test_maze_census`
 
 Per design: `route_nets` over the committed guide (spare layer = 1);
 prints guided / routed / pins_connected / projected / unrouted
@@ -51,47 +57,29 @@ for `results.md`. Asserts:
 - `nets.len() + unrouted.len() == join.nets.len()` (no silent drops).
 - Every `unrouted` entry names ≥1 `(pin, FailKind)`.
 - Nonzero evidence: nets nonempty, every routed net has wires.
-- `NoPath` classification — **expected post-fix state**: unrouted =
-  0 on both designs under the committed guides (acceptance). If a
-  residual survives the `occupancy.md` §5 fixes, the classifier is
-  *extended with the named cause* (met3-bridge today; add e.g.
-  `obs_walled`/`foreign_pin_walled`/`region_split` with the probe's
-  evidence) — the assert stays strict; classes are named, never
-  excused. Whatever lands is recorded in `docs/results.md`.
+- `NoPath` classification — every unrouted `NoPath` net must be the
+  met3-bridge class (guide boxes rejoin only on met3+, which the
+  relaxed-via model still cannot transition to). **Expected post-fix
+  state**: unrouted = 0 on both designs (acceptance). If a residual
+  survives on picorv32, the classifier is *extended with the named
+  cause* (e.g. `obs_walled`/`foreign_pin_walled`/`region_split` with
+  probe evidence) — the assert stays strict; classes are named,
+  never excused. Whatever lands is recorded in `docs/results.md`.
 
-## Occupancy fail-proof — `test_maze_occupancy`
+## Occupancy fail-proof — `test_maze_occupancy` (green)
 
 gcd only: `Enabled` vs `Disabled`, identical inputs; asserts the
-outcomes measurably differ (digest or `overlap_census` count).
-Prints both digests + counts for `results.md`. Note: `Disabled`
-still honors `Obs` blocks — the fail-proof measures foreign-`Net`
-constraints, which is what the spec asks ("a fail-proof (skip
-occupancy) measurably changes routes or collisions").
+outcomes measurably differ (digest or `overlap_census` count) —
+measured: digest differs **and** census 0 → 6,429. `Disabled` still
+honors `Obs` blocks; the fail-proof measures foreign-`Net`/`Pin`
+constraints, which is what the spec asks.
 
 ## Determinism — `test_maze_determinism`
 
 Two full `route_nets` per design: `assert_eq!(r1, r2)` on the whole
-`RouteDb`, nonzero `route_digest` equality. Runtime note: this is
-2× the census cost per design — it passes the same perf budget as
-the census (`perf.md` §3); if it does not, that is a perf finding,
-not a reason to weaken the test.
-
-## Diagnosis instrumentation (temporary)
-
-One bounded probe (e.g. `debug_pin_block`) — same lifecycle as the
-deleted `debug_*` fns: for each failed pin, enumerate its attach
-nodes' incident-edge verdicts and classify the blocker
-(`Obs(host)` / `Obs(other)` / `Net(foreign)` / none ⇒ component
-split). Plus `OccMode::Disabled` control + per-phase ms + edge
-counters (`perf.md` §0). Removed before the ticket lands.
-
-## In-module unit tests (`drt/maze.rs`, written)
-
-Band math (abut-at-`s` legal, strict `<`), perpendicular crossing,
-projection fallback on an escaped pin, PQ tie order, square-graph
-tree-extension path shape. If the routability fix adds a carve rule,
-add a matching unit case (e.g. `Obs(host)` beyond the halo but on
-the host cell) — keep it in-module.
+`RouteDb`, nonzero `route_digest` equality. Cost = 2× the census per
+design — its runtime follows the picorv32 census number; a timeout
+there is a perf finding, not a reason to weaken the test.
 
 ## Files
 
