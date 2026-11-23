@@ -364,6 +364,10 @@ fn parse_layer(
     let mut edge_cap_per_um = 0.0f32;
     let mut spacing_um = None;
     let mut spacing_table_um: Vec<(f32, f32)> = Vec::new();
+    let mut area_um2 = None;
+    let mut min_enclosed_area_um2 = None;
+    let mut enc_below_um: Option<[f32; 2]> = None;
+    let mut enc_above_um: Option<[f32; 2]> = None;
     let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
@@ -473,6 +477,36 @@ fn parse_layer(
                 } else {
                     lexer.skip_to_semi();
                 }
+            } else if w.eq_ignore_ascii_case("AREA") {
+                // Routing `AREA <f> ;` — minimum merged-polygon area.
+                // ANTENNA* keywords are longer words, no collision.
+                area_um2 = Some(required_f32(lexer, "LAYER AREA")?);
+                lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("MINENCLOSEDAREA") {
+                min_enclosed_area_um2 =
+                    Some(required_f32(lexer, "LAYER MINENCLOSEDAREA")?);
+                lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("ENCLOSURE") {
+                // Cut-layer `ENCLOSURE {BELOW|ABOVE} o1 o2 ;` — the
+                // overhang pair the metal on that side must provide.
+                // VIARULE's `ENCLOSURE x y` form never reaches this loop
+                // (VIARULE blocks skip at top level); a non-side keyword
+                // is unmodeled and skipped like any other statement.
+                match lexer.next_word() {
+                    Some(side) if side.eq_ignore_ascii_case("BELOW") => {
+                        let o1 = required_f32(lexer, "LAYER ENCLOSURE BELOW")?;
+                        let o2 = required_f32(lexer, "LAYER ENCLOSURE BELOW")?;
+                        enc_below_um = Some([o1, o2]);
+                        lexer.skip_to_semi();
+                    }
+                    Some(side) if side.eq_ignore_ascii_case("ABOVE") => {
+                        let o1 = required_f32(lexer, "LAYER ENCLOSURE ABOVE")?;
+                        let o2 = required_f32(lexer, "LAYER ENCLOSURE ABOVE")?;
+                        enc_above_um = Some([o1, o2]);
+                        lexer.skip_to_semi();
+                    }
+                    _ => lexer.skip_to_semi(),
+                }
             } else {
                 lexer.skip_to_semi();
             }
@@ -496,6 +530,12 @@ fn parse_layer(
             above: below,
             width_dbu: width_um.map(|w| (w * dbu).round() as i32).unwrap_or(0),
             spacing_dbu: spacing_um.map(|s| (s * dbu).round() as i32).unwrap_or(0),
+            enc_below_dbu: enc_below_um
+                .map(|[a, b]| [(a * dbu).round() as i32, (b * dbu).round() as i32])
+                .unwrap_or([0, 0]),
+            enc_above_dbu: enc_above_um
+                .map(|[a, b]| [(a * dbu).round() as i32, (b * dbu).round() as i32])
+                .unwrap_or([0, 0]),
         });
         tech_db.cut_layer_by_name.insert(cut_sym, cut_idx);
         if let Some(res) = cut_res_ohm {
@@ -544,6 +584,12 @@ fn parse_layer(
                     spacing_dbu: (s * dbu).round() as i32,
                 })
                 .collect(),
+            area_dbu2: area_um2
+                .map(|a| (a * dbu * dbu).round() as i64)
+                .unwrap_or(0),
+            min_enclosed_area_dbu2: min_enclosed_area_um2
+                .map(|a| (a * dbu * dbu).round() as i64)
+                .unwrap_or(0),
         });
     }
 
@@ -1829,5 +1875,86 @@ END xyzzy
         let mut db = TechDb::new();
         parse_lef_bytes(with_width.as_bytes(), &mut db, &mut interner).unwrap();
         assert_eq!(db.cut_layers[0].width_dbu, 150);
+    }
+
+    /// `AREA`/`MINENCLOSEDAREA` on routing layers and
+    /// `ENCLOSURE {BELOW|ABOVE}` on cut layers — the bounds the
+    /// enclosure/area/hole DRC families read. `mcon` must follow a
+    /// routing layer to be recorded as a cut layer.
+    const ENC_AREA_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+LAYER li1
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.17 ;
+  AREA 0.0561 ;
+END li1
+LAYER mcon
+  TYPE CUT ;
+  WIDTH 0.17 ;
+  ENCLOSURE BELOW 0 0 ;
+  ENCLOSURE ABOVE 0.03 0.06 ;
+END mcon
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+  AREA 0.083 ;
+  MINENCLOSEDAREA 0.14 ;
+END met1
+LAYER via
+  TYPE CUT ;
+  WIDTH 0.15 ;
+  ENCLOSURE 0.055 0.085 ;
+  ENCLOSURE BELOW 0.055 0.085 ;
+END via
+END LIBRARY
+"#;
+
+    #[test]
+    fn test_layer_area_enclosure_retained() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(ENC_AREA_LEF.as_bytes(), &mut db, &mut interner).unwrap();
+
+        // Cut layers: mcon keeps both enclosure pairs; via's bare
+        // `ENCLOSURE 0.055 0.085` (no BELOW/ABOVE) is skipped while the
+        // BELOW pair records — matching the documented grammar.
+        let mcon = &db.cut_layers[0];
+        assert_eq!(mcon.enc_below_dbu, [0, 0]);
+        assert_eq!(mcon.enc_above_dbu, [30, 60]);
+        let via = &db.cut_layers[1];
+        assert_eq!(via.enc_below_dbu, [55, 85]);
+        assert_eq!(via.enc_above_dbu, [0, 0]);
+
+        // Routing: met1 carries both area bounds (µm² → DBU²); li1 has
+        // AREA but no MINENCLOSEDAREA.
+        let met1 = &db.routing_layers[1];
+        assert_eq!(met1.area_dbu2, 83000);
+        assert_eq!(met1.min_enclosed_area_dbu2, 140000);
+        let li1 = &db.routing_layers[0];
+        assert_eq!(li1.area_dbu2, 56100);
+        assert_eq!(li1.min_enclosed_area_dbu2, 0);
+    }
+
+    /// A cut layer with no `ENCLOSURE` and a routing layer with no
+    /// `AREA`/`MINENCLOSEDAREA` record zeros — the downstream rules
+    /// treat 0 as "undeclared, skip".
+    #[test]
+    fn test_layer_area_enclosure_defaults_zero() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(VIA_TLEF.as_bytes(), &mut db, &mut interner).unwrap();
+        let cut = &db.cut_layers[0];
+        assert_eq!(cut.enc_below_dbu, [0, 0]);
+        assert_eq!(cut.enc_above_dbu, [0, 0]);
+        assert!(db
+            .routing_layers
+            .iter()
+            .all(|l| l.area_dbu2 == 0 && l.min_enclosed_area_dbu2 == 0));
     }
 }

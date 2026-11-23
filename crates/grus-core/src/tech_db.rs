@@ -35,6 +35,12 @@ pub struct RoutingLayer {
     /// modeled — selecting by width alone can only over-require.
     #[serde(default)]
     pub spacing_table: Vec<SpacingTableRow>,
+    /// LEF `AREA` — minimum merged-polygon area, DBU². 0 = undeclared.
+    #[serde(default)]
+    pub area_dbu2: i64,
+    /// LEF `MINENCLOSEDAREA` — minimum hole area, DBU². 0 = undeclared.
+    #[serde(default)]
+    pub min_enclosed_area_dbu2: i64,
 }
 
 impl RoutingLayer {
@@ -136,6 +142,13 @@ pub struct CutLayer {
     /// Plain `SPACING <v>` in DBU, 0 when the LEF omits it.
     #[serde(default)]
     pub spacing_dbu: i32,
+    /// LEF `ENCLOSURE BELOW o1 o2` — overhang pair the routing layer
+    /// below the cut must provide. [0,0] = undeclared / zero.
+    #[serde(default)]
+    pub enc_below_dbu: [i32; 2],
+    /// LEF `ENCLOSURE ABOVE o1 o2` — same for the routing layer above.
+    #[serde(default)]
+    pub enc_above_dbu: [i32; 2],
 }
 
 /// Which coordinate space a `ViaLayerRect` lives on.

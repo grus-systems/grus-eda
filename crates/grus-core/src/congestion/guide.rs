@@ -648,6 +648,8 @@ mod tests {
                 edge_cap_per_um: 0.0,
                 spacing_dbu: 0,
                 spacing_table: Vec::new(),
+                area_dbu2: 0,
+                min_enclosed_area_dbu2: 0,
             });
         }
         // One macro, two li1 pins; offsets land the design pins in the
@@ -1199,6 +1201,8 @@ mod tests {
             edge_cap_per_um: 0.0,
             spacing_dbu: 0,
             spacing_table: Vec::new(),
+            area_dbu2: 0,
+            min_enclosed_area_dbu2: 0,
         });
         tech.rebuild_maps();
         let design = mini_design();

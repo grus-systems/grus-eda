@@ -486,3 +486,373 @@ fn test_spacing_mutation_met2_probe() {
     let drc = assemble(&db, &tech).unwrap();
     assert!(check_spacing(&drc, &tech).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Enclosure gate vs Magic golden
+// ---------------------------------------------------------------------------
+
+use grus_core::drc::area::{AREA_RULES, HOLE_RULES, check_area_report, check_hole_report};
+use grus_core::drc::enclosure::{
+    ENCLOSURE_RULES, EncMode, check_enclosure, check_enclosure_report,
+};
+
+/// Zero enclosure violations on both committed routed DEFs — the same
+/// verdict Magic's `drc(full)` reached. Every rule has real candidates
+/// on both designs (884 mcon / 1033 via1 cuts on gcd, ~26 k/~34 k on
+/// picorv32 — real coverage named per AGENTS §7.4). The census makes
+/// the coverage visible.
+#[test]
+fn test_enclosure_zero_violations() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let reports = check_enclosure_report(&l.drc, &l.tech);
+        println!("== {name} enclosure census ==");
+        for r in &reports {
+            let lname = r
+                .layer
+                .map(|dl| layer_name(&l.tech, dl))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:8} layer={lname:5} bound={:4} candidates={:6} violations={}",
+                r.rule,
+                r.bound_dbu,
+                r.candidates,
+                r.violations.len()
+            );
+        }
+        for r in &reports {
+            for v in &r.violations {
+                println!("{name}: {v:?}");
+            }
+        }
+        assert!(
+            reports.iter().all(|r| r.violations.is_empty()),
+            "{name}: {} enclosure violations",
+            reports.iter().map(|r| r.violations.len()).sum::<usize>()
+        );
+        let (ra, rb) = (
+            check_enclosure_report(&l.drc, &l.tech),
+            check_enclosure_report(&l.drc, &l.tech),
+        );
+        assert_eq!(ra, rb, "{name}: enclosure check is nondeterministic");
+        assert!(
+            ra.iter().map(|r| r.candidates).sum::<usize>() > 0,
+            "{name}: zero cut rects — the pipeline ran on nothing"
+        );
+    }
+}
+
+/// Every implemented enclosure `rule_name` is a verbatim
+/// `magic_rules_checked.names` template classified `lef_expressible`,
+/// and no `magic_per_rule` key carries any implemented `(id)`.
+#[test]
+fn test_enclosure_rules_join_golden() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let names: Vec<&str> = l.golden["magic_rules_checked"]["names"]
+            .as_array()
+            .expect("magic_rules_checked.names")
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        for r in ENCLOSURE_RULES {
+            assert!(
+                names.contains(&r.rule_name),
+                "{name}: golden names lack `{}`",
+                r.rule_name
+            );
+            assert_eq!(
+                l.golden["magic_rules_checked"]["classification"][r.rule_name],
+                "lef_expressible",
+                "{name}: `{}` is not lef_expressible in the golden taxonomy",
+                r.rule_name
+            );
+        }
+        let per_rule = l.golden["magic_per_rule"]
+            .as_object()
+            .expect("magic_per_rule");
+        for key in per_rule.keys() {
+            let tokens = paren_tokens(key);
+            for r in ENCLOSURE_RULES {
+                assert!(
+                    !tokens.contains(&r.rule),
+                    "{name}: magic_per_rule reports `{}` via `{key}`",
+                    r.rule
+                );
+            }
+        }
+    }
+}
+
+/// Mutation gate: shrink `via2_3`'s lower (met1) enclosure 85/165 →
+/// 10/10 and move the VGND FOLLOWPIN stripe at y=87040 — the same-net
+/// 480-wide wire otherwise rescues the cut slab (union measurement),
+/// so both edits are required. The 5-cut instance at (25140,87040)
+/// must produce exactly 5 `via.5a` violations, `failed == Both` at
+/// bound 55; the met2 side (55/85) stays clean.
+#[test]
+fn test_enclosure_mutation_def_via_enclosure() {
+    let lib_dir = sky130_hd();
+    let tlef = require(lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+    let lef = require(lib_dir.join("lef/sky130_fd_sc_hd.lef"));
+    let def = require(design_dir("gcd").join("gcd.routed.def"));
+    let mut interner = StringInterner::new();
+    let tech = load_tech_db(&tlef, &lef, &mut interner)
+        .expect("load_tech_db")
+        .0;
+
+    let text = std::fs::read_to_string(&def).unwrap();
+    let mut mutated = text.replacen(
+        "+ ENCLOSURE 85 165 55 85",
+        "+ ENCLOSURE 10 10 55 85",
+        1,
+    );
+    assert_ne!(text, mutated, "fixture must contain the ENCLOSURE pair");
+    let stripe = "( 5520 87040 ) ( 86020 87040 )";
+    mutated = mutated.replacen(stripe, "( 5520 90000 ) ( 86020 90000 )", 1);
+    assert!(mutated.contains("( 5520 90000 )"), "stripe must move");
+
+    let db = parse_def_bytes(mutated.as_bytes(), &tech, None).unwrap();
+    let drc = assemble(&db, &tech).unwrap();
+    let all = check_enclosure(&drc, &tech);
+    for v in &all {
+        println!("{v:?}");
+    }
+    assert_eq!(all.len(), 5, "one 5-cut via must flag, got {all:?}");
+    assert!(all.iter().all(|v| v.rule == "via.5a"));
+    assert!(all.iter().all(|v| v.failed == EncMode::Both));
+    assert!(all.iter().all(|v| v.bound_dbu == 55));
+    assert_eq!(
+        all.iter().map(|v| v.group).collect::<std::collections::BTreeSet<_>>().len(),
+        1,
+        "all five cuts belong to one via instance"
+    );
+
+    // Control: the unmutated DEF is clean.
+    let db = parse_def_bytes(text.as_bytes(), &tech, None).unwrap();
+    let drc = assemble(&db, &tech).unwrap();
+    assert!(check_enclosure(&drc, &tech).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Min-area + hole-area gate vs Magic golden
+// ---------------------------------------------------------------------------
+
+/// Zero min-area violations on both committed routed DEFs. Every rule
+/// has evaluated components on both designs (li1 members come from
+/// L1M1_PR via metals — 869/25 943 candidates), named in the census.
+#[test]
+fn test_area_zero_violations() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let reports = check_area_report(&l.drc, &l.tech);
+        println!("== {name} min-area census ==");
+        for r in &reports {
+            let lname = r
+                .layer
+                .map(|dl| layer_name(&l.tech, dl))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:8} layer={lname:5} bound={:7} candidates={:6} violations={}",
+                r.rule,
+                r.bound_dbu2,
+                r.candidates,
+                r.violations.len()
+            );
+        }
+        for r in &reports {
+            for v in &r.violations {
+                println!("{name}: {v:?}");
+            }
+        }
+        assert!(
+            reports.iter().all(|r| r.violations.is_empty()),
+            "{name}: {} min-area violations",
+            reports.iter().map(|r| r.violations.len()).sum::<usize>()
+        );
+        let (ra, rb) = (
+            check_area_report(&l.drc, &l.tech),
+            check_area_report(&l.drc, &l.tech),
+        );
+        assert_eq!(ra, rb, "{name}: area check is nondeterministic");
+        assert!(
+            ra.iter().map(|r| r.candidates).sum::<usize>() > 0,
+            "{name}: zero components — the pipeline ran on nothing"
+        );
+    }
+}
+
+/// Golden join for the 6 min-area rules.
+#[test]
+fn test_area_rules_join_golden() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let names: Vec<&str> = l.golden["magic_rules_checked"]["names"]
+            .as_array()
+            .expect("magic_rules_checked.names")
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        for r in AREA_RULES {
+            assert!(
+                names.contains(&r.rule_name),
+                "{name}: golden names lack `{}`",
+                r.rule_name
+            );
+            assert_eq!(
+                l.golden["magic_rules_checked"]["classification"][r.rule_name],
+                "lef_expressible",
+                "{name}: `{}` is not lef_expressible in the golden taxonomy",
+                r.rule_name
+            );
+        }
+        let per_rule = l.golden["magic_per_rule"]
+            .as_object()
+            .expect("magic_per_rule");
+        for key in per_rule.keys() {
+            let tokens = paren_tokens(key);
+            for r in AREA_RULES {
+                assert!(
+                    !tokens.contains(&r.rule),
+                    "{name}: magic_per_rule reports `{}` via `{key}`",
+                    r.rule
+                );
+            }
+        }
+    }
+}
+
+/// Zero hole-area violations; the census prints detected enclosed
+/// voids (likely 0 — recorded honestly).
+#[test]
+fn test_hole_zero_violations() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let reports = check_hole_report(&l.drc, &l.tech);
+        println!("== {name} hole census ==");
+        for r in &reports {
+            let lname = r
+                .layer
+                .map(|dl| layer_name(&l.tech, dl))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:8} layer={lname:5} bound={:7} voids={:4} violations={}",
+                r.rule,
+                r.bound_dbu2,
+                r.candidates,
+                r.violations.len()
+            );
+        }
+        for r in &reports {
+            for v in &r.violations {
+                println!("{name}: {v:?}");
+            }
+        }
+        assert!(
+            reports.iter().all(|r| r.violations.is_empty()),
+            "{name}: {} hole violations",
+            reports.iter().map(|r| r.violations.len()).sum::<usize>()
+        );
+        let (ra, rb) = (
+            check_hole_report(&l.drc, &l.tech),
+            check_hole_report(&l.drc, &l.tech),
+        );
+        assert_eq!(ra, rb, "{name}: hole check is nondeterministic");
+    }
+}
+
+/// Golden join for the 2 hole rules.
+#[test]
+fn test_hole_rules_join_golden() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let names: Vec<&str> = l.golden["magic_rules_checked"]["names"]
+            .as_array()
+            .expect("magic_rules_checked.names")
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        for r in HOLE_RULES {
+            assert!(
+                names.contains(&r.rule_name),
+                "{name}: golden names lack `{}`",
+                r.rule_name
+            );
+            assert_eq!(
+                l.golden["magic_rules_checked"]["classification"][r.rule_name],
+                "lef_expressible",
+                "{name}: `{}` is not lef_expressible in the golden taxonomy",
+                r.rule_name
+            );
+        }
+        let per_rule = l.golden["magic_per_rule"]
+            .as_object()
+            .expect("magic_per_rule");
+        for key in per_rule.keys() {
+            let tokens = paren_tokens(key);
+            for r in HOLE_RULES {
+                assert!(
+                    !tokens.contains(&r.rule),
+                    "{name}: magic_per_rule reports `{}` via `{key}`",
+                    r.rule
+                );
+            }
+        }
+    }
+}
+
+/// Mutation gate: append a `NEW met1 ( 0 0 ) RECT ( 0 0 140 140 )`
+/// stub to the first net record — the (0,0) corner carries no member
+/// metal for ±400 DBU, so the stub is its own component with union
+/// area 19600 < 83000 → exactly one `met1.6` violation (and no width
+/// flag: the stub is 140 wide).
+#[test]
+fn test_area_mutation_met1_island() {
+    let lib_dir = sky130_hd();
+    let tlef = require(lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+    let lef = require(lib_dir.join("lef/sky130_fd_sc_hd.lef"));
+    let def = require(design_dir("gcd").join("gcd.routed.def"));
+    let mut interner = StringInterner::new();
+    let tech = load_tech_db(&tlef, &lef, &mut interner)
+        .expect("load_tech_db")
+        .0;
+
+    let text = std::fs::read_to_string(&def).unwrap();
+    let nets_sec = text.find("\nNETS ").expect("a NETS section");
+    let nets_at = text[nets_sec..]
+        .find("    - ")
+        .map(|i| nets_sec + i)
+        .expect("a NETS record anchor");
+    let end_at = text[nets_at..]
+        .find(';')
+        .map(|i| nets_at + i)
+        .expect("net record terminates with `;`");
+    let mutated = format!(
+        "{}      NEW met1 ( 0 0 ) RECT ( 0 0 140 140 )\n{}",
+        &text[..end_at],
+        &text[end_at..]
+    );
+    assert_ne!(text, mutated, "mutation must change the DEF text");
+
+    let db = parse_def_bytes(mutated.as_bytes(), &tech, None).unwrap();
+    let drc = assemble(&db, &tech).unwrap();
+    let all = grus_core::drc::area::check_area(&drc, &tech);
+    for v in &all {
+        println!("{v:?}");
+    }
+    assert_eq!(all.len(), 1, "exactly one met1.6 violation, got {all:?}");
+    assert_eq!(all[0].rule, "met1.6");
+    assert_eq!(all[0].area_dbu2, 19600);
+    assert_eq!(all[0].bound_dbu2, 83000);
+    // The stub is 140 wide and >2× spacing from all other met1 — the
+    // width family must report nothing new either.
+    assert!(
+        check_width(&drc, &tech).iter().all(|v| v.rect != all[0].region),
+        "the stub must not trigger a width finding"
+    );
+
+    // Control: the unmutated DEF is clean.
+    let db = parse_def_bytes(text.as_bytes(), &tech, None).unwrap();
+    let drc = assemble(&db, &tech).unwrap();
+    assert!(grus_core::drc::area::check_area(&drc, &tech).is_empty());
+}
