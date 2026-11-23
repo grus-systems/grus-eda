@@ -24,6 +24,14 @@ pub struct RoutingLayer {
     pub pitch_dbu: i32,
     pub width_dbu: i32,
     pub offset_dbu: i32,
+    /// LEF `TRACKS X` coordinates, expanded and sorted. Empty when the
+    /// tech LEF declares none (sky130: always empty — the DEF supplies
+    /// the grid; `drt::tracks::layer_tracks` merges both sources).
+    #[serde(default)]
+    pub tracks_x: Vec<i32>,
+    /// LEF `TRACKS Y` coordinates, same convention.
+    #[serde(default)]
+    pub tracks_y: Vec<i32>,
     pub res_per_sq: f32,      // Ohms per square
     pub cap_per_sq_um: f32,   // pF per um^2
     pub edge_cap_per_um: f32, // pF per um
@@ -186,6 +194,23 @@ pub struct ViaDef {
     pub rects: Vec<ViaLayerRect>,
 }
 
+/// One LEF `TRACKS` record, kept in declared µm units until
+/// `parse_lef_bytes` finishes: `TRACKS` may precede the `UNITS` scale
+/// and the `LAYER` statement it names, so expansion is deferred the
+/// same way `cut_res_above` is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LefTrackRecord {
+    /// true = `TRACKS X` (vertical lines / x-coords), false = `TRACKS Y`.
+    pub is_x: bool,
+    pub start_um: f32,
+    pub count: u32,
+    pub step_um: f32,
+    /// `None` = bare form (applies to every routing layer).
+    pub layers: Option<Vec<String>>,
+    /// Source line, for unknown-layer / expansion error messages.
+    pub line: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MacroDef {
     pub name: SymbolId,
@@ -216,6 +241,11 @@ pub struct TechDb {
     /// per CUT layer, finalized into `via_res_ohm_above` by `load_tech_db`.
     #[serde(skip)]
     pub cut_res_above: Vec<(u8, f32)>,
+    /// Transient parse state: raw `TRACKS` records in file order,
+    /// expanded into `RoutingLayer::tracks_{x,y}` at the end of each
+    /// `parse_lef_bytes` call.
+    #[serde(skip)]
+    pub lef_track_records: Vec<LefTrackRecord>,
     /// CUT layers in LEF order (`licon`, which sits below every routing
     /// layer, is not recorded — it has no `above`).
     #[serde(default)]

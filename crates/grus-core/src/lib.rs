@@ -4,6 +4,7 @@ pub mod congestion;
 pub mod cts;
 pub mod design_db;
 pub mod drc;
+pub mod drt;
 pub mod floorplan;
 pub mod interner;
 pub mod lib_db;

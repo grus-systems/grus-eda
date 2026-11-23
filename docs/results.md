@@ -9062,3 +9062,66 @@ order is the sweep's (xl, rects-index) order, not lexicographic.
 str` and serde cannot express `'de: 'static` in a derive, so the
 JSON artifact is write-only by design (deviation from the design
 note recorded).
+
+### 2026-11-23 — e6-drt-tracks: LEF `TRACKS` + track grid + access-point census (v0.12.1)
+
+`RoutingLayer` gained `tracks_x`/`tracks_y` (LEF `TRACKS` records,
+deferred µm→DBU expansion at `parse_lef_bytes` end — round-then-expand
+per the `pitch_dbu` convention); `drt::tracks::layer_tracks` merges
+them with the DEF `TRACKS` grids into the per-layer effective grid and
+`track_gaps` names preferred-axis holes; `drt::access::access_points`
+enumerates candidate access points for every signal-net member pin
+(instance pins via `pin_macro_pins` + `orient_rect` + translate gated
+on `Placed|Fixed|Cover`, io `BTERM`s via `pin_io_rects`), midpoint
+rule, boundary-inclusive, per-pin dedup, deterministic emission order.
+
+**Track census** (`test_track_census --nocapture`): LEF `TRACKS` = **0
+records** in the sky130 techlef — the entire grid below is DEF-sourced
+(`RoutingLayer.tracks_*` total = 0, asserted by inspection not claim).
+
+| layer | dir | gcd tracks_x | gcd tracks_y | picorv32 tracks_x | picorv32 tracks_y |
+|---|---|---|---|---|---|
+| li1 | Vertical | 200 | 302 | 1047 | 1448 |
+| met1 | Horizontal | 270 | 302 | 1417 | 1448 |
+| met2 | Vertical | 200 | 223 | 1047 | 1070 |
+| met3 | Horizontal | 135 | 151 | 708 | 724 |
+| met4 | Vertical | 100 | 111 | 523 | 535 |
+| met5 | Horizontal | 27 | 30 | 141 | 145 |
+
+`track_gaps` → `[]` on both designs (preferred axis covered on all six
+layers).
+
+**Access census** (`test_access_census --nocapture`): `off_track` = 0,
+`no_shapes` = 0 on both designs; every iterated member pin (per-element
+check) produced ≥1 point.
+
+| design | member pins | points | li1 | met1 | met2 | met3 | met4 | met5 |
+|---|---|---|---|---|---|---|---|---|
+| gcd | 931 | 5,217 | 5,015 | 108 | 44 | 50 | 0 | 0 |
+| picorv32 | 26,901 | 180,671 | 166,707 | 13,383 | 464 | 117 | 0 | 0 |
+
+met4/met5 carry zero points on both designs — the only `+ LAYER` rects
+on those layers belong to `+ SPECIAL` ports (VGND/VPWR), which are not
+signal-net members; signal io ports live on met2/met3. Not a finding.
+
+**Determinism**: `access_points` twice → `points` identical, nonempty
+(5,217 / 180,671).
+
+**Fail-proofs** (AGENTS §7.7): dropped the preferred-axis list on every
+routing layer (`tracks_y` for `Horizontal`, `tracks_x` for `Vertical`)
+→ `test_access_failproof` census red: **14 off-track pins** on gcd
+(named: `req_msg[0]`, `req_msg[16]`, … — io ports whose met2/met3
+rects then intersect no remaining axis); rebuilt grid → green. The
+off-track fixture (`test_access_off_track_fixture`, macro pin rect
+`[100,300]²` between 1000-DBU tracks) names exactly `u0/A` while the
+on-grid io port still emits points — a finding, not a void.
+
+**Checks run**: `cargo test -p grus-core --test drt` (4/4 —
+`test_track_census`, `test_access_census`,
+`test_access_off_track_fixture`, `test_access_failproof`), `cargo test
+-p grus-core --lib` (9 new TRACKS/drt unit tests), `cargo test
+--workspace`, `cargo clippy --workspace --all-targets -- -D warnings`.
+`picorv32.placed.def` already present (gitignored artifact, not
+regenerated). Version `0.12.0 → 0.12.1` (feature addition, patch on
+0.x). `LayerId`/`PinId` gained `Ord` for the layer-ordered emission.
+No commit per ticket instruction.

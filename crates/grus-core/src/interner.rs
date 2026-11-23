@@ -10,7 +10,7 @@ pub struct LibCellId(pub u16);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LibPinId(pub u16);
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LayerId(pub u8);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub struct CellId(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NetId(pub u32);
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PinId(pub u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +266,8 @@ mod tests {
             pitch_dbu: 340,
             width_dbu: 140,
             offset_dbu: 170,
+            tracks_x: Vec::new(),
+            tracks_y: Vec::new(),
             res_per_sq: 0.125,
             cap_per_sq_um: 0.00003,
             edge_cap_per_um: 0.00004,
