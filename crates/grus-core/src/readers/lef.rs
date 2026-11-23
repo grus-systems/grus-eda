@@ -362,6 +362,8 @@ fn parse_layer(
     let mut cut_res_ohm = None;
     let mut cap_per_sq_um = 0.0f32;
     let mut edge_cap_per_um = 0.0f32;
+    let mut spacing_um = None;
+    let mut spacing_table_um: Vec<(f32, f32)> = Vec::new();
     let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
@@ -432,6 +434,45 @@ fn parse_layer(
             } else if w.eq_ignore_ascii_case("EDGECAPACITANCE") {
                 edge_cap_per_um = required_f32(lexer, "LAYER EDGECAPACITANCE")?;
                 lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("SPACINGTABLE") {
+                // `SPACINGTABLE PARALLELRUNLENGTH <f>... WIDTH <w> <s> ... ;`
+                // — keep the `WIDTH w s` rows; the run-length dimension is
+                // not modeled (selecting by width can only over-require).
+                while let Some(t) = lexer.next_token() {
+                    match t {
+                        Token::Semi => break,
+                        Token::Word(kw) if kw.eq_ignore_ascii_case("WIDTH") => {
+                            let row = lexer
+                                .next_word()
+                                .and_then(|w| w.parse::<f32>().ok())
+                                .zip(lexer.next_word().and_then(|s| s.parse::<f32>().ok()));
+                            if let Some(row) = row {
+                                spacing_table_um.push(row);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if w.eq_ignore_ascii_case("SPACING") {
+                // Plain `SPACING <v> ;` is the only form sky130 `LAYER`
+                // blocks carry; `RANGE`/`BY`/`SAMENET` forms (seen inside
+                // VIARULE blocks, which never reach this loop) are skipped
+                // like any unmodeled statement rather than misread.
+                let plain = match lexer.peek_token() {
+                    Some(Token::Word(v)) => v.parse::<f32>().ok(),
+                    _ => None,
+                };
+                if let Some(v) = plain {
+                    let _ = lexer.next_token();
+                    if let Some(Token::Semi) = lexer.peek_token() {
+                        let _ = lexer.next_token();
+                        spacing_um = Some(v);
+                    } else {
+                        lexer.skip_to_semi();
+                    }
+                } else {
+                    lexer.skip_to_semi();
+                }
             } else {
                 lexer.skip_to_semi();
             }
@@ -454,6 +495,7 @@ fn parse_layer(
             name: cut_sym,
             above: below,
             width_dbu: width_um.map(|w| (w * dbu).round() as i32).unwrap_or(0),
+            spacing_dbu: spacing_um.map(|s| (s * dbu).round() as i32).unwrap_or(0),
         });
         tech_db.cut_layer_by_name.insert(cut_sym, cut_idx);
         if let Some(res) = cut_res_ohm {
@@ -494,6 +536,14 @@ fn parse_layer(
             res_per_sq,
             cap_per_sq_um,
             edge_cap_per_um,
+            spacing_dbu: spacing_um.map(|s| (s * dbu).round() as i32).unwrap_or(0),
+            spacing_table: spacing_table_um
+                .iter()
+                .map(|&(w, s)| crate::tech_db::SpacingTableRow {
+                    width_dbu: (w * dbu).round() as i32,
+                    spacing_dbu: (s * dbu).round() as i32,
+                })
+                .collect(),
         });
     }
 
@@ -1482,6 +1532,85 @@ END
 
         assert!(report.skipped.is_empty());
         assert_eq!(report.total(), 0);
+    }
+
+    /// `SPACING`/`SPACINGTABLE` inside `LAYER` blocks: plain scalar on a
+    /// CUT layer, PRL/WIDTH table on a ROUTING layer, a non-plain form
+    /// skipped like any unmodeled statement, and a layer with neither.
+    const SPACING_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+LAYER li1
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.17 ;
+END li1
+LAYER mcon
+  TYPE CUT ;
+  WIDTH 0.17 ;
+  SPACING 0.19 ;
+END mcon
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+  SPACING 0.3 RANGE 3 100 ;
+END met1
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+  SPACINGTABLE
+     PARALLELRUNLENGTH 0
+     WIDTH 0 0.14
+     WIDTH 3 0.28 ;
+END met2
+END LIBRARY
+"#;
+
+    #[test]
+    fn test_layer_spacing_scalar_and_table() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(SPACING_LEF.as_bytes(), &mut db, &mut interner).unwrap();
+
+        let mcon = &db.cut_layers[0];
+        assert_eq!(mcon.spacing_dbu, 190);
+
+        // `SPACING 0.3 RANGE 3 100` is not the plain scalar form — the
+        // statement is consumed but records nothing.
+        let met1 = &db.routing_layers[1];
+        assert_eq!(met1.spacing_dbu, 0);
+        assert!(met1.spacing_table.is_empty());
+        assert_eq!(met1.min_spacing_dbu(), 0);
+        assert_eq!(met1.wide_spacing(), None);
+
+        let met2 = &db.routing_layers[2];
+        assert_eq!(met2.spacing_dbu, 0);
+        assert_eq!(
+            met2.spacing_table,
+            vec![
+                crate::tech_db::SpacingTableRow {
+                    width_dbu: 0,
+                    spacing_dbu: 140,
+                },
+                crate::tech_db::SpacingTableRow {
+                    width_dbu: 3000,
+                    spacing_dbu: 280,
+                },
+            ]
+        );
+        assert_eq!(met2.min_spacing_dbu(), 140);
+        assert_eq!(met2.wide_spacing(), Some((3000, 280)));
+
+        // li1 carries neither statement — both helpers report no data.
+        let li1 = &db.routing_layers[0];
+        assert_eq!(li1.min_spacing_dbu(), 0);
+        assert_eq!(li1.wide_spacing(), None);
     }
 
     /// A `VIA` whose name spells nothing about layers — resolution must come

@@ -8,6 +8,15 @@ pub enum LayerDir {
     Vertical,
 }
 
+/// One `SPACINGTABLE` `WIDTH w s` row: shapes wider than `width_dbu`
+/// require `spacing_dbu` edge clearance (strict `>` — the commented
+/// `SPACING ... RANGE 3.001 100` form reads 3.001µm, i.e. >3000 DBU).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpacingTableRow {
+    pub width_dbu: i32,
+    pub spacing_dbu: i32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoutingLayer {
     pub name: SymbolId,
@@ -18,6 +27,44 @@ pub struct RoutingLayer {
     pub res_per_sq: f32,      // Ohms per square
     pub cap_per_sq_um: f32,   // pF per um^2
     pub edge_cap_per_um: f32, // pF per um
+    /// Plain `SPACING <v>` in DBU; 0 when the layer is table-driven.
+    #[serde(default)]
+    pub spacing_dbu: i32,
+    /// `SPACINGTABLE` `WIDTH` rows in file order (ascending threshold in
+    /// sky130; the helpers do not rely on order). The PRL column is not
+    /// modeled — selecting by width alone can only over-require.
+    #[serde(default)]
+    pub spacing_table: Vec<SpacingTableRow>,
+}
+
+impl RoutingLayer {
+    /// Minimum same-layer spacing: plain `SPACING` when present (LEF
+    /// precedence), else the smallest-width-threshold table row's
+    /// spacing. 0 = no LEF spacing data (rule skipped, mirroring
+    /// `width_dbu == 0`).
+    pub fn min_spacing_dbu(&self) -> i32 {
+        if self.spacing_dbu != 0 {
+            return self.spacing_dbu;
+        }
+        self.spacing_table
+            .iter()
+            .min_by_key(|r| r.width_dbu)
+            .map(|r| r.spacing_dbu)
+            .unwrap_or(0)
+    }
+
+    /// The wide-metal row — the `WIDTH` row with the largest threshold —
+    /// as `(width_threshold_dbu, spacing_dbu)`. `None` when the table has
+    /// a single row or is absent.
+    pub fn wide_spacing(&self) -> Option<(i32, i32)> {
+        if self.spacing_table.len() < 2 {
+            return None;
+        }
+        self.spacing_table
+            .iter()
+            .max_by_key(|r| r.width_dbu)
+            .map(|r| (r.width_dbu, r.spacing_dbu))
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +133,9 @@ pub struct CutLayer {
     /// `WIDTH` in DBU, 0 when the LEF omits it.
     #[serde(default)]
     pub width_dbu: i32,
+    /// Plain `SPACING <v>` in DBU, 0 when the LEF omits it.
+    #[serde(default)]
+    pub spacing_dbu: i32,
 }
 
 /// Which coordinate space a `ViaLayerRect` lives on.

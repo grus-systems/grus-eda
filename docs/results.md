@@ -8781,3 +8781,73 @@ golden-join test also asserts each implemented rule is classified
 `cargo test -p grus-core --test drc` 5/5, `cargo test -p grus-core
 --lib` 483, `cargo clippy --workspace --all-targets -- -D warnings`
 clean.
+
+### 2026-11-23 — e7-drc-spacing: spacing rule family + same-net connectivity (v0.10.0)
+
+`crates/grus-core/src/drc/spacing.rs` — the 20 `lef_expressible`
+spacing rules on the assembled `DrcDesign`; LEF `SPACING`/
+`SPACINGTABLE` retention in `readers/lef.rs` + `tech_db.rs`
+(`RoutingLayer::{spacing_dbu, spacing_table, min_spacing_dbu,
+wide_spacing}`, `CutLayer::spacing_dbu`); `ShapeRect.group` via-
+instance ids in `drc::geom` + `LayerShapes::for_each_pair_within` in
+`drc.rs`. Goldens **reused, not regenerated**.
+
+**Zero-violation census** (`test_spacing_zero_violations --nocapture`)
+— `violations` is 0 on every rule, both designs; `candidates` names
+coverage (a 0-candidates rule is not exercised, not passed):
+
+| rule | bound | gcd cand | picorv32 cand | gcd | picorv32 |
+|---|---|---|---|---|---|
+| li.3 / li.c2 | 170 | 0 | 0 | 0 | 0 |
+| mcon.2 | 190 | 0 | 0 | 0 | 0 |
+| via.2 | 170 | 0 | 0 | 0 | 0 |
+| via2.2 / via3.2 | 200 | 0 | 0 | 0 | 0 |
+| via4.2 | 800 | 0 | 0 | 0 | 0 |
+| met1.2 / met2.2 | 140 | 0 / 0 | 0 / 0 | 0 | 0 |
+| met3.2 / met4.2 | 300 | 0 / 0 | 0 / 0 | 0 | 0 |
+| met5.2 | 1600 | 0 | 0 | 0 | 0 |
+| met1.3a / 3b | 280 | 3584 | 134253 | 0 | 0 |
+| met2.3a / 3b | 280 | 607 | 38727 | 0 | 0 |
+| met3.3c / 3d | 400 | 0 | 1542 | 0 | 0 |
+| met4.5a / 5b | 400 | 0 | 0 | 0 | 0 |
+
+The `metN.3*`/`metN.5*` candidate mass is real coverage: pairs inside
+the wide bound that qualify on neither side — e.g. picorv32's met1
+rails on a 280 pitch sit exactly at-gap-140, which is `>= bound` for
+met1.2 but `< 280` for met1.3a/3b.
+
+`test_spacing_rules_join_golden` asserts each `SPACING_RULES`
+`rule_name` is a verbatim `magic_rules_checked.names` template
+classified `lef_expressible`, and that no `magic_per_rule` key
+carries an implemented `(id)`.
+
+**Mutation fixture** (`test_spacing_mutation_met2_probe`): replays
+`sanity_control.mutation` — appends `NEW met2 ( 10520 48450 ) (
+10520 48950 )` to net `_001_` in `gcd.routed.def`, a 0.03 µm gap from
+`_000_`'s wire. Magic's control: `new_rules_vs_clean` = `["Metal2
+spacing < 0.14um (met2.2)"]` (asserted from the golden). Our checker:
+exactly 1 violation — `met2.2`, `gap_x 30`, `gap_y 0`, `bound 140` —
+no other rule fires.
+
+**Fail-proof record** (AGENTS §7.7): commented the same-net `union` in
+`build_islands` (same-layer pass) → `test_spacing_zero_violations`
+goes red in 0.26 s: `gcd: 6 spacing violations`, all `met2.2` pairs
+with `net_a == net_b` (gap 30–60 between collinear wire records of one
+net that must merge). Restored → green.
+
+**Performance correction inside this ticket**: the first
+implementation probed each rect through `iter_overlapping` — O(n²) in
+practice, because a die-spanning power rail at `by_x[0]` sets
+`max_xh` ≈ die-edge for the whole layer, defeating the probe's
+prefix-max skip (the integration run stalled >9 min on picorv32
+met1's 144 k rects). Replaced batch pair enumeration with
+`for_each_pair_within` (xl-sweep + xh-keyed active set); the full
+8-test `drc` integration suite now runs in ~112 s debug (picorv32's
+met1 wide rules enumerate 134 k candidate pairs each way).
+
+**Checks run**: `cargo test --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test -p grus-core --test drc` (8/8), `cargo test -p grus-core
+--lib drc` (21 drc tests). Version `0.9.0 → 0.10.0`: `ShapeRect`
+gained the public `group` field (breaking for literal construction;
+0.x minor per AGENTS §5). No commit per ticket instruction.

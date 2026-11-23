@@ -171,7 +171,7 @@ WIDTH w` override; `EXT`/`DESIGNRULEWIDTH`/`SUBNET` bail loudly.
 | Family | Status |
 |---|---|
 | `width` | **implemented** — `drc::width`, 13 rules, 0 violations on both routed DEFs |
-| `spacing` | pending — the `LayerShapes::iter_overlapping` spatial index exists for it |
+| `spacing` | **implemented** — `drc::spacing`, 20 rules, 0 violations on both routed DEFs (§10–12) |
 | `enclosure` | pending |
 | `area` | pending |
 | `holes` | pending |
@@ -219,3 +219,84 @@ sources are `SignalWire`/`SpecialWire`/`Via`/`IoPort`/`MacroPin`.
 resist-li contexts); our model carries no per-statement position, so
 all three `li1` names share the LEF bound — a recorded collapse, fine
 for the zero gate since every real li1 shape meets the tightest bound.
+
+---
+
+# E7 ticket 3 (`e7-drc-spacing`): spacing family + connectivity
+
+`drc::spacing` checks the 20 `lef_expressible` spacing rules against
+the same assembled `DrcDesign`. Bounds are parsed LEF
+`SPACING`/`SPACINGTABLE` values retained per layer
+(`RoutingLayer::{spacing_dbu, spacing_table}`,
+`CutLayer::spacing_dbu`) — never the Magic techfile constants, which
+for this deck happen to be identical numbers.
+
+## 10. Spacing rules — LEF provenance
+
+Non-plain `SPACING` forms (`... RANGE ...` — only commented-out lines
+in this PDK) are consumed and ignored; `min_spacing_dbu()` prefers the
+plain scalar, else the lowest-width `SPACINGTABLE` row (choosing by
+width, not PRL — over-requires at worst). `wide_spacing()` returns the
+top row only when the table has ≥2 rows; met5's single-row table
+correctly yields no wide rules, matching the deck's absent `met5.*`
+wide statements.
+
+| `rule` | layer | LEF bound (DBU) | provenance |
+|---|---|---|---|
+| `li.3` / `li.c2` | li1 | 170 | `SPACINGTABLE WIDTH 0 0.17` |
+| `mcon.2` | mcon | 190 | `SPACING 0.19` |
+| `via.2 - 2 * via.4a` | via | 170 | `SPACING 0.17` |
+| `via2.2 - 2 * via2.4` | via2 | 200 | `SPACING 0.2` |
+| `via3.2 - 2 * via3.4` | via3 | 200 | `SPACING 0.2` |
+| `via4.2 - 2 * via4.4` | via4 | 800 | `SPACING 0.8` |
+| `met1.2` / `met2.2` | met1/2 | 140 | `SPACINGTABLE WIDTH 0 0.14` |
+| `met1.3a`/`3b`, `met2.3a`/`3b` | met1/2 | 280 | `SPACINGTABLE WIDTH 3 0.28` (threshold 3 µm) |
+| `met3.2` / `met4.2` | met3/4 | 300 | `SPACINGTABLE WIDTH 0 0.3` |
+| `met3.3c`/`3d`, `met4.5a`/`5b` | met3/4 | 400 | `SPACINGTABLE WIDTH 3 0.4` (threshold 3 µm) |
+| `met5.2` | met5 | 1600 | `SPACINGTABLE WIDTH 0 1.6` |
+
+Deck-id irregularities are pinned, not "fixed": the met3 wide pair is
+`3c`/`3d`, met4's is `5a`/`5b`, and each `*b`/`*d` name covers two
+deck statements (`allmN` + `*obsmN` widespacing) — the checked-source
+model has no separate obs plane. `rule_name` strings are verbatim
+`magic_rules_checked.names` templates.
+
+## 11. Connectivity islands — what may flag
+
+Magic merges same-net touching shapes before spacing evaluation; we
+reproduce that with a union-find over the flat all-layer rect space:
+
+- **Same layer**: same-net rects that touch or overlap merge
+  (closed-box intersection — corner contact counts, it only ever adds
+  connectivity). Same-net *separated* islands still check against each
+  other.
+- **Cross layer**: every rect emitted by one via instance shares a
+  `ShapeRect.group` id and merges unconditionally — a cut array's
+  cuts connect through the via's metals, not through cut-layer
+  proximity. This is what chains `met1 wire ↔ via1 cut ↔ met2 wire`.
+
+A pair in different islands flags iff its Euclidean gap is in
+`(0, bound)` — integer-exact `gx² + gy² < bound²` over per-axis
+separations (the golden ran `drc euclidean on`). Exact-bound passes;
+distance-0 different-island pairs are exempt (`touching_ok` in every
+deck spacing statement).
+
+Pair enumeration is `LayerShapes::for_each_pair_within` — an
+`xl`-order sweep with an `xh`-keyed active set, O((n + pairs) log n).
+Per-rect `iter_overlapping` probes degrade to O(n²) here because a
+die-spanning power rail carries the `max_xh` prefix past every probe
+start; the sweep visits each candidate pair exactly once.
+
+## 12. Wide-metal rules
+
+`WideUnrelated` (`MetalN > 3um spacing to unrelated mN`) fires when
+either side's `min(w,h)` exceeds the LEF `WIDTH` threshold (3 µm = the
+`WIDTH 3` table breakpoint) and the pair is in different islands.
+
+`WideAttached` (`features attached to and within 0.28/0.40um of large
+metalN`) fires when a non-wide member of a wide rect's island sits
+within `window` (Euclidean, inclusive — the names say "within") of the
+wide member and meets a non-wide shape of another island at sub-bound
+gap; `window` is the rule's bound (280/400). `MacroPin`/`MacroObs`
+join islands (pin metal is connectivity) but never generate findings —
+under-reports at worst vs Magic's GDS-plane checks.

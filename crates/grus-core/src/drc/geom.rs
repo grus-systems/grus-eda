@@ -118,6 +118,7 @@ pub fn assemble(db: &DesignDb, tech: &TechDb) -> Result<DrcDesign> {
                     rect,
                     src: ShapeSrc::SignalWire,
                     net,
+                    group: 0,
                 },
             );
         }
@@ -133,11 +134,14 @@ pub fn assemble(db: &DesignDb, tech: &TechDb) -> Result<DrcDesign> {
                     rect,
                     src: ShapeSrc::SpecialWire,
                     net: Some(pdn.name),
+                    group: 0,
                 },
             );
         }
     }
     // 3. Via instances, signal then special, expanded at their points.
+    //    `group` tags every rect of one instance so the spacing merge
+    //    can chain connectivity across layers through the via metals.
     let vias = db
         .net_geoms
         .iter()
@@ -146,12 +150,14 @@ pub fn assemble(db: &DesignDb, tech: &TechDb) -> Result<DrcDesign> {
         .chain(db.pdn_nets.iter().flat_map(|p| {
             p.vias.iter().map(move |v| (Some(p.name) as Option<SymbolId>, v))
         }));
-    for (net, via) in vias {
+    for (k, (net, via)) in vias.enumerate() {
+        let group = k as u32 + 1;
         for (layer, rect) in expand_via(via, tech)? {
             push(&mut routing, &mut cut, layer, ShapeRect {
                 rect,
                 src: ShapeSrc::Via,
                 net,
+                group,
             });
         }
     }
@@ -187,6 +193,7 @@ pub fn assemble(db: &DesignDb, tech: &TechDb) -> Result<DrcDesign> {
                     rect: place(r),
                     src: ShapeSrc::MacroPin,
                     net,
+                    group: 0,
                 });
             }
         }
@@ -195,6 +202,7 @@ pub fn assemble(db: &DesignDb, tech: &TechDb) -> Result<DrcDesign> {
                 rect: place(r),
                 src: ShapeSrc::MacroObs,
                 net: None,
+                group: 0,
             });
         }
     }
@@ -208,6 +216,7 @@ pub fn assemble(db: &DesignDb, tech: &TechDb) -> Result<DrcDesign> {
                 rect: r,
                 src: ShapeSrc::IoPort,
                 net: db.pin_nets[p].map(|n| db.net_names[n.0 as usize]),
+                group: 0,
             });
         }
     }
@@ -406,7 +415,12 @@ END DESIGN
             RectDbu::new(100, 0, 150, 100), // touches A on the x=100 edge only
             RectDbu::new(150, 50, 300, 80),
         ] {
-            l.push(ShapeRect { rect: r, src: ShapeSrc::SignalWire, net: None });
+            l.push(ShapeRect {
+                rect: r,
+                src: ShapeSrc::SignalWire,
+                net: None,
+                group: 0,
+            });
         }
         let l = l.finish();
         let hits = |q: RectDbu| -> Vec<RectDbu> {
@@ -440,6 +454,7 @@ END DESIGN
                 rect: r,
                 src: ShapeSrc::SignalWire,
                 net: None,
+                group: 0,
             });
         }
         let l = l.finish();
@@ -514,6 +529,34 @@ END DESIGN
             shapes(DrcLayer::Routing(m1), ShapeSrc::IoPort),
             vec![RectDbu::new(2930, 4930, 3070, 5070)]
         );
+    }
+
+    /// Via-instance rects share a nonzero `group` id in chain order;
+    /// every other source carries `group == 0`.
+    #[test]
+    fn test_via_instance_group_ids() {
+        let (db, tech) = drc_design();
+        let d = assemble(&db, &tech).expect("assemble");
+        let groups: Vec<u32> = d
+            .routing
+            .iter()
+            .chain(d.cut.iter())
+            .flat_map(|ls| ls.rects.iter())
+            .filter(|s| s.src == ShapeSrc::Via)
+            .map(|s| s.group)
+            .collect();
+        // The fixture has one via instance → all its rects share `1`.
+        assert!(!groups.is_empty());
+        assert!(groups.iter().all(|&g| g == 1));
+        for s in d
+            .routing
+            .iter()
+            .chain(d.cut.iter())
+            .flat_map(|ls| ls.rects.iter())
+            .filter(|s| s.src != ShapeSrc::Via)
+        {
+            assert_eq!(s.group, 0);
+        }
     }
 
     /// Two assembles of the same DB produce equal `DrcDesign`s — the

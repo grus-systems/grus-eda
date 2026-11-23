@@ -16,6 +16,7 @@
 //! Tests fail loudly on missing inputs — no silent skips.
 
 use grus_core::drc::geom::assemble;
+use grus_core::drc::spacing::{SPACING_RULES, check_spacing, check_spacing_report};
 use grus_core::drc::width::{Violation, WIDTH_RULES, check_width};
 use grus_core::drc::{DrcDesign, DrcLayer, ShapeSrc};
 use grus_core::design_db::DesignDb;
@@ -203,6 +204,16 @@ fn test_width_zero_violations() {
     }
 }
 
+/// `(id)` tokens inside a `magic_per_rule` key's parens — the keys
+/// carry resolved values ("< 0.14um"), so the join splits the paren
+/// text into tokens.
+fn paren_tokens(key: &str) -> Vec<&str> {
+    let paren = &key[key.rfind('(').unwrap()..];
+    paren
+        .split(|c: char| !(c.is_alphanumeric() || c == '.'))
+        .collect()
+}
+
 /// The join convention: every implemented `rule_name` is a verbatim
 /// `magic_rules_checked.names` template, and no `magic_per_rule` key
 /// carries any implemented rule's `(id)`.
@@ -232,13 +243,8 @@ fn test_width_rules_join_golden() {
         let per_rule = l.golden["magic_per_rule"]
             .as_object()
             .expect("magic_per_rule");
-        // `magic_per_rule` keys carry resolved values ("< 0.14um"),
-        // so join on the `(id)` tokens inside the parens.
         for key in per_rule.keys() {
-            let paren = &key[key.rfind('(').unwrap()..];
-            let tokens: Vec<&str> = paren
-                .split(|c: char| !(c.is_alphanumeric() || c == '.'))
-                .collect();
+            let tokens = paren_tokens(key);
             for r in WIDTH_RULES {
                 assert!(
                     !tokens.contains(&r.rule),
@@ -281,4 +287,196 @@ fn test_width_mutation_met1() {
     );
     let met1 = tech.layer_by_name[&tech.strings.get("met1").unwrap()];
     assert_eq!(v[0].layer, DrcLayer::Routing(met1));
+}
+
+// ---------------------------------------------------------------------------
+// Spacing gate vs Magic golden
+// ---------------------------------------------------------------------------
+
+fn layer_name(tech: &TechDb, layer: DrcLayer) -> String {
+    match layer {
+        DrcLayer::Routing(l) => tech
+            .strings
+            .resolve(tech.routing_layers[l.0 as usize].name)
+            .to_string(),
+        DrcLayer::Cut(c) => tech
+            .strings
+            .resolve(tech.cut_layers[c as usize].name)
+            .to_string(),
+    }
+}
+
+/// Zero spacing violations on both committed routed DEFs — the same
+/// verdict Magic's `drc(full)` reached (`magic_per_rule` lists no
+/// spacing rule). The census names rules a design does not exercise
+/// (zero candidates is not coverage).
+#[test]
+fn test_spacing_zero_violations() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let reports = check_spacing_report(&l.drc, &l.tech);
+        println!("== {name} spacing census ==");
+        for r in &reports {
+            let lname = r
+                .layer
+                .map(|dl| layer_name(&l.tech, dl))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:8} layer={lname:5} bound={:5} candidates={:6} violations={}",
+                r.rule,
+                r.bound_dbu,
+                r.candidates,
+                r.violations.len()
+            );
+        }
+        for r in &reports {
+            for v in &r.violations {
+                println!("{name}: {v:?}");
+            }
+        }
+        assert!(
+            reports.iter().all(|r| r.violations.is_empty()),
+            "{name}: {} spacing violations",
+            reports.iter().map(|r| r.violations.len()).sum::<usize>()
+        );
+        // Deterministic double-run: islands and pair emission are
+        // input-order stable.
+        assert_eq!(
+            check_spacing(&l.drc, &l.tech),
+            check_spacing(&l.drc, &l.tech),
+            "{name}: spacing check is nondeterministic"
+        );
+    }
+}
+
+/// Every implemented spacing `rule_name` is a verbatim
+/// `magic_rules_checked.names` template classified `lef_expressible`,
+/// and no `magic_per_rule` key carries any implemented `(id)`.
+#[test]
+fn test_spacing_rules_join_golden() {
+    for name in ["gcd", "picorv32"] {
+        let l = load(name);
+        let names: Vec<&str> = l.golden["magic_rules_checked"]["names"]
+            .as_array()
+            .expect("magic_rules_checked.names")
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        for r in SPACING_RULES {
+            assert!(
+                names.contains(&r.rule_name),
+                "{name}: golden names lack `{}`",
+                r.rule_name
+            );
+            assert_eq!(
+                l.golden["magic_rules_checked"]["classification"][r.rule_name],
+                "lef_expressible",
+                "{name}: `{}` is not lef_expressible in the golden taxonomy",
+                r.rule_name
+            );
+        }
+        let per_rule = l.golden["magic_per_rule"]
+            .as_object()
+            .expect("magic_per_rule");
+        for key in per_rule.keys() {
+            let tokens = paren_tokens(key);
+            for r in SPACING_RULES {
+                assert!(
+                    !tokens.contains(&r.rule),
+                    "{name}: magic_per_rule reports `{}` via `{key}`",
+                    r.rule
+                );
+            }
+        }
+    }
+}
+
+/// Mutation gate, golden-driven: replay `sanity_control.mutation` —
+/// the committed control appended `NEW met2 ( 10520 48450 ) ( 10520
+/// 48950 )` to net `_001_` at a 0.03 µm gap from `_000_`'s wire and
+/// Magic flagged `Metal2 spacing < 0.14um (met2.2)`. Our checker must
+/// flag exactly `met2.2` (our count unit is rect pairs, not merged
+/// regions).
+#[test]
+fn test_spacing_mutation_met2_probe() {
+    let lib_dir = sky130_hd();
+    let tlef = require(lib_dir.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+    let lef = require(lib_dir.join("lef/sky130_fd_sc_hd.lef"));
+    let def = require(design_dir("gcd").join("gcd.routed.def"));
+    let golden: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(require(design_dir("gcd").join("gcd.drc.reference.json")))
+            .expect("read golden"),
+    )
+    .expect("golden JSON parses");
+    let mut interner = StringInterner::new();
+    let tech = load_tech_db(&tlef, &lef, &mut interner)
+        .expect("load_tech_db")
+        .0;
+
+    let m = &golden["sanity_control"]["mutation"];
+    let net_b = m["net_b"].as_str().unwrap();
+    let layer = m["layer"].as_str().unwrap();
+    let seg: Vec<i32> = m["segment_dbu"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
+    let half = m["layer_width_dbu"].as_i64().unwrap() as i32 / 2;
+    let probe_rect = grus_core::tech_db::RectDbu::new(
+        seg[0].min(seg[2]) - half,
+        seg[1].min(seg[3]) - half,
+        seg[0].max(seg[2]) + half,
+        seg[1].max(seg[3]) + half,
+    );
+
+    let text = std::fs::read_to_string(&def).unwrap();
+    // The control's magic_per_rule verdict names only met2.2 as new.
+    assert_eq!(
+        golden["sanity_control"]["new_rules_vs_clean"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        golden["sanity_control"]["new_rules_vs_clean"][0]
+            .as_str()
+            .unwrap()
+            .contains("(met2.2)")
+    );
+
+    let anchor = format!("- {net_b} ");
+    let net_at = text
+        .find(&anchor)
+        .unwrap_or_else(|| panic!("{anchor} must anchor a NETS record"));
+    let end_at = text[net_at..]
+        .find(';')
+        .map(|i| net_at + i)
+        .expect("net record terminates with `;`");
+    let stmt = format!("      NEW {layer} ( {} {} ) ( {} {} )\n", seg[0], seg[1], seg[2], seg[3]);
+    let mutated = format!("{}{}{}", &text[..end_at], stmt, &text[end_at..]);
+    assert_ne!(text, mutated, "mutation must change the DEF text");
+
+    let db = parse_def_bytes(mutated.as_bytes(), &tech, None).unwrap();
+    let drc = assemble(&db, &tech).unwrap();
+    let all = check_spacing(&drc, &tech);
+    assert!(!all.is_empty(), "the probe must produce violations");
+    for v in &all {
+        println!("{v:?}");
+    }
+    assert!(
+        all.iter().all(|v| v.rule == "met2.2"),
+        "only met2.2 may fire, got {} other",
+        all.iter().filter(|v| v.rule != "met2.2").count()
+    );
+    assert!(
+        all.iter().any(|v| v.a == probe_rect || v.b == probe_rect),
+        "a violation must contain the probe rect {probe_rect:?}, got {all:?}"
+    );
+
+    // Control: the unmutated DEF is clean.
+    let db = parse_def_bytes(text.as_bytes(), &tech, None).unwrap();
+    let drc = assemble(&db, &tech).unwrap();
+    assert!(check_spacing(&drc, &tech).is_empty());
 }
