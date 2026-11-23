@@ -8982,3 +8982,71 @@ drc` (43 drc tests), `cargo test --workspace`,
 `0.10.1 → 0.11.0`: `RoutingLayer`/`CutLayer` gained required public
 fields (breaking for literal construction; 0.x minor per AGENTS §5).
 No commit per ticket instruction.
+
+### 2026-11-23 — e7-drc-e2e: unified report, full-set gate, `grus-eda drc` (v0.12.0)
+
+`crates/grus-core/src/drc/report.rs` normalizes all five checker
+families into one ordered `SubsetReport` (rule, family, layer, bound,
+candidates, findings with `[xl,yl,xh,yh]` DBU bboxes + measured
+quantity); `width` gained a `check_width_report` per-rule API to
+match spacing/enclosure/area. `grus-eda drc` lands the CLI
+(`--tlef/--lef/--def`, `--reference`, `--json`; no `--lib`). Goldens
+**reused, not regenerated**. Version `0.11.0 → 0.12.0`: new `drc`
+subcommand + `serde` dep on `grus-eda` (minor per AGENTS §5).
+
+**Commands** (release build, `~/.ciel` PDK):
+
+```
+grus-eda drc --tlef .../sky130_fd_sc_hd__nom.tlef --lef .../sky130_fd_sc_hd.lef \
+  --def tests/designs/gcd/gcd.routed.def \
+  --reference tests/designs/gcd/gcd.drc.reference.json --json out.json
+# same for picorv32
+```
+
+**Outcome** — 50 rules, 0 findings, `ours == magic` on every
+implemented rule, both designs (per-rule census in
+`test_subset_gate_matches_golden --nocapture`):
+
+| family | rules | gcd cand | gcd | picorv32 cand | picorv32 |
+|---|---|---|---|---|---|
+| width | 13 | 4075 | 0 | 128539 | 0 |
+| spacing | 20 | 8382 | 0 | 349044 | 0 |
+| enclosure | 9 | 4376 | 0 | 133646 | 0 |
+| area | 6 | 2160 | 0 | 68069 | 0 |
+| hole | 2 | 0 | 0 | 0 | 0 |
+
+Claim boundary printed verbatim on every run: *"55 of 278 Magic
+drc(full) statements implemented (50 unique rules); 223 magic_only
+statements (wells, diffusion, taps, poly, FETs, caps, angle rules)
+are not checkable from LEF+DEF and are not claimed — N findings is
+not a full-deck clean result"*.
+
+Unclaimed `magic_per_rule` keys (magic_only, ours not consulted —
+`magic_total` is merged error regions, not comparable to findings):
+
+| key | gcd | picorv32 |
+|---|---|---|
+| All nwells must contain metal-connected N+ taps (nwell.4) | 300 | 8084 |
+| N-well spacing < 1.27um (nwell.2a) | 120 | 2756 |
+| N-well width < 0.84um (nwell.1) | 6 | 242 |
+| `magic_total` (context) | 305 | 8049 |
+
+**Mutation parity** — the committed met2 probe (0.03 µm gap wire):
+Magic `sanity_control.magic_per_rule` records `met2.2` = **3** merged
+regions on both designs; `run_all` flags **exactly `met2.2`** — count
+units differ (findings vs merged regions, docs/e7-drc.md §18).
+Unmutated DEF: 0 findings across all 50 rules.
+
+**Runtimes** (release): gcd load 13.9 ms / assemble 0.7 ms / check
+55.5 ms; picorv32 load 51.0 ms / assemble 13.9 ms / check 14 451 ms
+(check is the dominant phase; spacing pair scans dominate).
+
+**Fail-proof** (AGENTS §7.7): dropped the `met5.1` row from
+`WIDTH_RULES` → `test_subset_coverage_complete` red (`left: 49,
+right: 50`). Restored → green.
+
+**Checks run**: `cargo test -p grus-core --test drc
+test_subset_coverage_complete test_subset_gate_matches_golden` (2/2,
+both designs), `cargo test --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`. No commit
+per ticket instruction.

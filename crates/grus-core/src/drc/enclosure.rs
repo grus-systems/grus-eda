@@ -42,7 +42,7 @@ pub enum Side {
 }
 
 /// Which clause(s) of the overhang pair the deck name checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EncMode {
     /// `enc >= min(pair)` required on both axes.
     Both,

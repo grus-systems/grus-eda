@@ -180,7 +180,10 @@ WIDTH w` override; `EXT`/`DESIGNRULEWIDTH`/`SUBNET` bail loudly.
 All **50** unique `lef_expressible` rules are covered
 (13 width + 20 spacing + 9 enclosure + 6 area + 2 holes), each joined
 to the committed golden by verbatim `rule_name` — the remaining Magic
-statements live permanently in `magic_only`.
+statements live permanently in `magic_only`. The subset is also
+reachable end-to-end as `grus-eda drc` and gated as a set against
+`magic_per_rule` (§16–18) — the per-family tests remain the
+per-family gates.
 
 ## 8. Rule bounds — LEF provenance
 
@@ -439,3 +442,67 @@ intersection) is discarded — real content hides behind the obs
 abstract, and discarding the whole void rather than subtracting the
 obs rect is the conservative direction. Both areas compare strict `<`
 on exact integers — no tolerance.
+
+---
+
+# E7 ticket 5 (`e7-drc-e2e`): unified report, full-set gate, `grus-eda drc`
+
+The five family checkers land behind one ordered report
+(`drc::report`), one integration gate over the committed goldens, and
+one CLI. The claim stays the `lef_expressible` subset — `grus-eda drc`
+prints the boundary on every run.
+
+## 16. `grus-eda drc`
+
+```
+grus-eda drc --tlef <sky130_fd_sc_hd__nom.tlef> --lef <sky130_fd_sc_hd.lef> \
+  --def <d>.routed.def [--reference <d>.drc.reference.json] [--json out.json]
+```
+
+No `--lib` — DRC needs geometry only (`parse_def` with `None`). The
+run is load → `drc::geom::assemble` → `drc::report::run_all`, wrapped
+in `timing::phase` spans (`drc.load.lef`, `drc.load.def`,
+`drc.assemble`, `drc.check`). stdout prints the per-rule census
+(rule, family, layer, bound, candidates, findings) then every
+finding's `[xl,yl,xh,yh]` DBU bboxes plus its measured quantity
+(min-side / gap / overhang / area), the claim boundary, and — with
+`--reference` — the per-rule `ours`/`magic` table plus the unclaimed
+`magic_per_rule` keys verbatim. `--json` writes the same surfaces as
+one artifact (`DrcJsonReport` in `main.rs`: a `rules` list of
+`drc::report::RuleOutcome` plus `claim`, `reference` deltas, and
+`runtime_ms`); the finding bboxes are what a later `drc listall`
+comparison consumes.
+
+## 17. The claim boundary, machine-readable
+
+The deck split ships as constants in `drc::report`, provenance
+`magic_rules_checked` in the committed goldens:
+
+| constant | value | meaning |
+|---|---|---|
+| `DECK_STATEMENTS` | 278 | `magic_rules_checked.names` entries |
+| `DECK_UNIQUE_NAMES` | 239 | distinct `classification` keys |
+| `IMPLEMENTED_STATEMENTS` | 55 | `names` classified `lef_expressible` |
+| `IMPLEMENTED_RULES` | 50 | distinct implemented rule ids |
+| `MAGIC_ONLY_STATEMENTS` | 223 | `names` classified `magic_only` |
+
+Every run prints `claim_boundary_from(...)`: *"55 of 278 Magic
+drc(full) statements implemented (50 unique rules); 223 magic_only
+statements (wells, diffusion, taps, poly, FETs, caps, angle rules)
+are not checkable from LEF+DEF and are not claimed — N findings is
+not a full-deck clean result"*. With `--reference` the split is
+re-derived from the loaded golden (`drc_claim_from_golden` counts
+`names` through `classification`) rather than restated, so a drifted
+taxonomy shows in the output instead of being asserted away; the
+integration gate pins constants == golden.
+
+## 18. Count units — findings vs merged regions
+
+Ours = rect/pair/component findings; `magic_per_rule` = merged error
+regions. They coincide at zero — the gate's exact-match claim — and
+diverge the moment a rule fires: the met2 probe control records Magic
+`met2.2` = **3** merged regions (`sanity_control.magic_per_rule`,
+both designs) while we report the offending rect pairs — nonzero,
+never asserted equal to 3. A `drc listall` bbox-level comparison is
+the compatible next step; findings already emit `[xl,yl,xh,yh]` DBU
+per shape for exactly that.

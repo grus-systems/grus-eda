@@ -74,6 +74,10 @@ enum Commands {
     /// E8: Sparse DC IR-drop solve on extracted PDN meshes
     #[command(name = "irdrop")]
     Irdrop(IrdropArgs),
+
+    /// E7: LEF+DEF DRC subset checker — the 50 lef_expressible rules of the Magic deck
+    #[command(name = "drc")]
+    Drc(DrcArgs),
 }
 
 #[derive(Args, Debug)]
@@ -477,6 +481,174 @@ struct CtsArgs {
 
     #[arg(long, help = "Write the buffer census report as JSON to this path")]
     report: Option<PathBuf>,
+}
+
+/// The deck split the claim-boundary line states — pinned constants
+/// without `--reference`, measured from the loaded golden with it.
+#[derive(serde::Serialize)]
+struct DrcClaim {
+    implemented_rules: usize,
+    implemented_statements: usize,
+    deck_statements: usize,
+    deck_unique_names: usize,
+    magic_only_statements: usize,
+}
+
+impl DrcClaim {
+    fn pinned() -> Self {
+        Self {
+            implemented_rules: grus_core::drc::report::IMPLEMENTED_RULES,
+            implemented_statements: grus_core::drc::report::IMPLEMENTED_STATEMENTS,
+            deck_statements: grus_core::drc::report::DECK_STATEMENTS,
+            deck_unique_names: grus_core::drc::report::DECK_UNIQUE_NAMES,
+            magic_only_statements: grus_core::drc::report::MAGIC_ONLY_STATEMENTS,
+        }
+    }
+}
+
+/// The claim split measured from a loaded `*.drc.reference.json`:
+/// `magic_rules_checked.names` counted through `classification`, so a
+/// `--reference` run states the split it measured, not the pinned one.
+fn drc_claim_from_golden(golden: &serde_json::Value) -> anyhow::Result<DrcClaim> {
+    let checked = &golden["magic_rules_checked"];
+    let names = checked["names"].as_array().ok_or_else(|| {
+        anyhow::anyhow!("reference magic_rules_checked.names missing or not an array")
+    })?;
+    let cls = checked["classification"].as_object().ok_or_else(|| {
+        anyhow::anyhow!("reference magic_rules_checked.classification missing or not an object")
+    })?;
+    let class_of = |n: &serde_json::Value| {
+        n.as_str()
+            .and_then(|s| cls.get(s))
+            .and_then(|v| v.as_str())
+    };
+    let (mut le_stmts, mut magic_only) = (0, 0);
+    for n in names {
+        match class_of(n) {
+            Some("lef_expressible") => le_stmts += 1,
+            Some("magic_only") => magic_only += 1,
+            _ => {}
+        }
+    }
+    Ok(DrcClaim {
+        implemented_rules: cls
+            .values()
+            .filter(|v| v.as_str() == Some("lef_expressible"))
+            .count(),
+        implemented_statements: le_stmts,
+        deck_statements: names.len(),
+        deck_unique_names: cls.len(),
+        magic_only_statements: magic_only,
+    })
+}
+
+/// CLI report artifact — a wrapper over `drc::report::SubsetReport`.
+#[derive(serde::Serialize)]
+struct DrcJsonReport<'a> {
+    design: &'a str,
+    input_def: String,
+    claim_boundary: String,
+    claim: DrcClaim,
+    rules: &'a [grus_core::drc::report::RuleOutcome],
+    reference: Option<DrcJsonReference>,
+    runtime_ms: DrcRuntime,
+}
+
+#[derive(serde::Serialize)]
+struct DrcJsonReference {
+    path: String,
+    magic_total: u64,
+    deltas: Vec<grus_core::drc::report::RuleDelta>,
+    unclaimed: Vec<DrcUnclaimed>,
+}
+
+#[derive(serde::Serialize)]
+struct DrcUnclaimed {
+    key: String,
+    magic: u64,
+}
+
+#[derive(serde::Serialize)]
+struct DrcRuntime {
+    load: f64,
+    assemble: f64,
+    check: f64,
+}
+
+fn drc_family_name(f: grus_core::drc::report::Family) -> &'static str {
+    match f {
+        grus_core::drc::report::Family::Width => "width",
+        grus_core::drc::report::Family::Spacing => "spacing",
+        grus_core::drc::report::Family::Enclosure => "enclosure",
+        grus_core::drc::report::Family::Area => "area",
+        grus_core::drc::report::Family::Hole => "hole",
+    }
+}
+
+/// One finding line: the offending `[xl,yl,xh,yh]` DBU bboxes plus the
+/// measured quantity — the per-shape list a later `drc listall`
+/// comparison consumes.
+fn drc_finding_line(rule: &str, f: &grus_core::drc::report::Finding) -> String {
+    use grus_core::drc::report::Measured;
+    let rect = |r: &grus_core::tech_db::RectDbu| {
+        format!("[{},{},{},{}]", r.xl, r.yl, r.xh, r.yh)
+    };
+    let nets = if f.nets.is_empty() {
+        "-".to_string()
+    } else {
+        f.nets.join(",")
+    };
+    let b = &f.bboxes;
+    match f.measured {
+        Measured::Width { min_side_dbu } => {
+            format!("{rule} {} min_side={min_side_dbu} bound={} nets={nets}", rect(&b[0]), f.bound)
+        }
+        Measured::Spacing {
+            gap_x_dbu,
+            gap_y_dbu,
+        } => format!(
+            "{rule} {} x {} gap=({gap_x_dbu},{gap_y_dbu}) bound={} nets={nets}",
+            rect(&b[0]),
+            rect(&b[1]),
+            f.bound
+        ),
+        Measured::Enclosure {
+            enc_x_dbu,
+            enc_y_dbu,
+            failed,
+        } => format!(
+            "{rule} {} enc=({enc_x_dbu},{enc_y_dbu}) clause={failed:?} bound={} nets={nets}",
+            rect(&b[0]),
+            f.bound
+        ),
+        Measured::Area { area_dbu2 } => {
+            format!("{rule} {} area={area_dbu2} bound={} nets={nets}", rect(&b[0]), f.bound)
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+struct DrcArgs {
+    #[arg(long, help = "Path to technology LEF (.tlef) file")]
+    tlef: PathBuf,
+
+    #[arg(long, help = "Path to standard cell LEF (.lef) file")]
+    lef: PathBuf,
+
+    #[arg(long, help = "Path to routed DEF (.def) file")]
+    def: PathBuf,
+
+    #[arg(
+        long,
+        help = "<design>.drc.reference.json; prints per-rule deltas vs magic_per_rule"
+    )]
+    reference: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Write the full DRC report (per-rule findings + bboxes) as JSON to this path"
+    )]
+    json: Option<PathBuf>,
 }
 
 /// Shared load path of the `congestion` and `route` arms: tech + placed DEF
@@ -1644,6 +1816,142 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 std::fs::write(path, json)?;
                 println!("Wrote CTS report JSON to {:?}", path);
             }
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
+            }
+        }
+        Commands::Drc(args) => {
+            println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
+            let mut interner = grus_core::interner::StringInterner::new();
+            let t_load = std::time::Instant::now();
+            let tech_db = {
+                let _p = grus_core::timing::phase("drc.load.lef");
+                load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
+            };
+            println!("Loading DEF from {:?}", args.def);
+            let design_db = {
+                let _p = grus_core::timing::phase("drc.load.def");
+                grus_core::readers::parse_def(&args.def, &tech_db, None)?
+            };
+            let elapsed_load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
+            let t_asm = std::time::Instant::now();
+            let drc_design = {
+                let _p = grus_core::timing::phase("drc.assemble");
+                grus_core::drc::geom::assemble(&design_db, &tech_db)?
+            };
+            let elapsed_assemble_ms = t_asm.elapsed().as_secs_f64() * 1000.0;
+            let t_check = std::time::Instant::now();
+            let report = {
+                let _p = grus_core::timing::phase("drc.check");
+                grus_core::drc::report::run_all(&drc_design, &tech_db, &design_db.strings)
+            };
+            let elapsed_check_ms = t_check.elapsed().as_secs_f64() * 1000.0;
+
+            let golden: Option<serde_json::Value> = args
+                .reference
+                .as_ref()
+                .map(|path| -> anyhow::Result<serde_json::Value> {
+                    let bytes = std::fs::read(path)
+                        .map_err(|e| anyhow::anyhow!("read {:?}: {e}", path))?;
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| anyhow::anyhow!("parse {:?}: {e}", path))
+                })
+                .transpose()?;
+            let delta = golden
+                .as_ref()
+                .map(|g| grus_core::drc::report::magic_deltas(&report, g));
+            let claim = match &golden {
+                Some(g) => drc_claim_from_golden(g)?,
+                None => DrcClaim::pinned(),
+            };
+            let boundary = grus_core::drc::report::claim_boundary_from(
+                claim.deck_statements,
+                claim.implemented_statements,
+                claim.implemented_rules,
+                claim.magic_only_statements,
+            );
+
+            let findings_total: usize = report.rules.iter().map(|o| o.findings.len()).sum();
+            println!(
+                "DRC {}: {} rules, {} findings (assemble={:.2}ms, check={:.2}ms)",
+                design_db.design_name,
+                report.rules.len(),
+                findings_total,
+                elapsed_assemble_ms,
+                elapsed_check_ms
+            );
+            println!(
+                "  {:8} {:9} {:5} {:5} {:>10} {:>8}",
+                "rule", "family", "layer", "bound", "candidates", "findings"
+            );
+            for o in &report.rules {
+                println!(
+                    "  {:8} {:9} {:5} {:5} {:>10} {:>8}",
+                    o.rule,
+                    drc_family_name(o.family),
+                    o.layer.as_deref().unwrap_or("-"),
+                    o.bound.map(|b| b.to_string()).unwrap_or_else(|| "-".into()),
+                    o.candidates,
+                    o.findings.len(),
+                );
+                for f in &o.findings {
+                    println!("    {}", drc_finding_line(o.rule, f));
+                }
+            }
+            println!(
+                "claim boundary: {} — {} findings is not a full-deck clean result",
+                boundary, findings_total
+            );
+            if let (Some(path), Some(d)) = (&args.reference, &delta) {
+                println!("deltas vs {:?}:", path);
+                println!("  {:8} {:>5} {:>5}", "rule", "ours", "magic");
+                for d in &d.deltas {
+                    println!("  {:8} {:>5} {:>5}", d.rule, d.ours, d.magic);
+                }
+                println!("unclaimed (magic_only / unmodeled, ours not consulted):");
+                for (k, c) in &d.unclaimed {
+                    println!("  {}: {}", k, c);
+                }
+                println!(
+                    "magic_total={} (includes unclaimed master-internal findings; not comparable)",
+                    d.magic_total
+                );
+            }
+            if let Some(path) = &args.json {
+                let out = DrcJsonReport {
+                    design: &design_db.design_name,
+                    input_def: args.def.display().to_string(),
+                    claim_boundary: boundary,
+                    claim,
+                    rules: &report.rules,
+                    reference: delta.map(|d| DrcJsonReference {
+                        path: args
+                            .reference
+                            .as_ref()
+                            .expect("delta implies --reference")
+                            .display()
+                            .to_string(),
+                        magic_total: d.magic_total,
+                        deltas: d.deltas,
+                        unclaimed: d
+                            .unclaimed
+                            .into_iter()
+                            .map(|(key, magic)| DrcUnclaimed { key, magic })
+                            .collect(),
+                    }),
+                    runtime_ms: DrcRuntime {
+                        load: elapsed_load_ms,
+                        assemble: elapsed_assemble_ms,
+                        check: elapsed_check_ms,
+                    },
+                };
+                std::fs::write(path, serde_json::to_string_pretty(&out)?)?;
+                println!("Wrote DRC report JSON to {:?}", path);
+            }
+            println!(
+                "Runtime: load={:.2}ms assemble={:.2}ms check={:.2}ms",
+                elapsed_load_ms, elapsed_assemble_ms, elapsed_check_ms
+            );
             if grus_core::timing::enabled() {
                 grus_core::timing::print_report();
             }
