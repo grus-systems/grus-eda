@@ -220,6 +220,14 @@ pub struct MacroDef {
     pub pin_offset: u32,
     pub pin_count: u16,
     pub obs_rects: Vec<(LayerId, RectDbu)>,
+    /// `OBS` rectangles before `merge_connected_obs`. The merged set
+    /// inflates chains of touching rects into their bounding box —
+    /// acceptable for gcell blockage density and the DRC source-4
+    /// convention, but it fills the gaps decap/edge cells leave
+    /// between cap fingers and seals neighboring pin pockets, so the
+    /// maze router marks this unmerged set instead.
+    #[serde(default)]
+    pub obs_rects_raw: Vec<(LayerId, RectDbu)>,
     pub pin_obs_rects: Vec<(LayerId, RectDbu)>,
 }
 

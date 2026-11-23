@@ -170,23 +170,47 @@ type RegionMap = BTreeMap<u8, Vec<(u32, u32)>>;
 /// work is `O(boxes × tracks-per-box)`, never `O(die)`. Two diagonally
 /// disjoint boxes cannot spawn corner nodes — coverage is enumerated
 /// per box, not as a bounding cross product.
-fn net_region(boxes: &[GuideBox], tracks: &[LayerTracks]) -> (RegionMap, BTreeSet<u8>) {
+/// `spare_above` extra routing layers per net, covered within each
+/// box's XY on top of the guided layer. A guide box bounds the XY
+/// region; the global route's layer choice does not bind detailed
+/// routing — OBS-sealed pin pockets are reached one layer above the
+/// topmost guided layer (OpenROAD's routed DEF confirms: gcd `_038_`
+/// escapes its li1+met1 guide on met2 inside the same box).
+fn net_region(
+    boxes: &[GuideBox],
+    tracks: &[LayerTracks],
+    spare_above: u8,
+) -> (RegionMap, BTreeSet<u8>) {
     let mut region: BTreeMap<u8, Vec<(u32, u32)>> = BTreeMap::new();
     let mut box_layers: BTreeSet<u8> = BTreeSet::new();
+    let spare = boxes
+        .iter()
+        .map(|b| b.layer.0)
+        .max()
+        .map_or(0, |m| m.saturating_add(spare_above))
+        .min(tracks.len().saturating_sub(1).min(u8::MAX as usize) as u8);
     for b in boxes {
         box_layers.insert(b.layer.0);
-        let Some(lt) = tracks.get(b.layer.0 as usize) else {
-            continue;
-        };
-        let (x0, x1) = covered_range(&lt.tracks_x, b.rect.xl, b.rect.xh);
-        let (y0, y1) = covered_range(&lt.tracks_y, b.rect.yl, b.rect.yh);
-        if x0 >= x1 || y0 >= y1 {
-            continue;
-        }
-        let pairs = region.entry(b.layer.0).or_default();
-        for ix in x0..x1 {
-            for iy in y0..y1 {
-                pairs.push((ix as u32, iy as u32));
+        // `spare_above == 0` reproduces the guided-layer-only coverage
+        // (the graph stage's pinned census); >0 adds the spare layer
+        // on every box's XY for the maze's OBS-seal freedom.
+        for l in [b.layer.0, spare]
+            .into_iter()
+            .take(usize::from(spare_above > 0) + 1)
+        {
+            let Some(lt) = tracks.get(l as usize) else {
+                continue;
+            };
+            let (x0, x1) = covered_range(&lt.tracks_x, b.rect.xl, b.rect.xh);
+            let (y0, y1) = covered_range(&lt.tracks_y, b.rect.yl, b.rect.yh);
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+            let pairs = region.entry(l).or_default();
+            for ix in x0..x1 {
+                for iy in y0..y1 {
+                    pairs.push((ix as u32, iy as u32));
+                }
             }
         }
     }
@@ -279,12 +303,26 @@ pub fn build_route_graphs(
     tracks: &[LayerTracks],
     join: &GuideJoin,
 ) -> RouteGraphs {
+    build_route_graphs_ext(db, tech, tracks, join, 0)
+}
+
+/// `build_route_graphs` plus `spare_above` extra routing layers per
+/// net, covered on every guide box's XY (see `net_region`). The maze
+/// router passes 1 — detailed routing may need one layer above the
+/// global route's choice to reach OBS-sealed pin pockets.
+pub fn build_route_graphs_ext(
+    db: &DesignDb,
+    tech: &TechDb,
+    tracks: &[LayerTracks],
+    join: &GuideJoin,
+    spare_above: u8,
+) -> RouteGraphs {
     let mut out = RouteGraphs {
         via_edges_per_pair: vec![0; tech.routing_layers.len().saturating_sub(1)],
         ..Default::default()
     };
     for (net, boxes) in &join.nets {
-        let (region, box_layers) = net_region(boxes, tracks);
+        let (region, box_layers) = net_region(boxes, tracks, spare_above);
         for &l in &box_layers {
             if region.get(&l).is_none_or(|v| v.is_empty()) {
                 out.zero_coverage.push(ZeroCoverage {
@@ -411,13 +449,13 @@ mod tests {
     #[test]
     fn test_net_region() {
         let tracks = [lt()];
-        let (region, layers) = net_region(&[gb(0, 50, 50, 250, 150)], &tracks);
+        let (region, layers) = net_region(&[gb(0, 50, 50, 250, 150)], &tracks, 0);
         assert_eq!(region[&0], vec![(1, 1), (2, 1)]);
         assert_eq!(layers, BTreeSet::from([0]));
 
         // Two diagonal boxes: the union is per-box coverage, so the
         // off-diagonal corners (0,2)/(2,0)-class nodes never appear.
-        let (region, _) = net_region(&[gb(0, 0, 0, 100, 100), gb(0, 200, 200, 300, 300)], &tracks);
+        let (region, _) = net_region(&[gb(0, 0, 0, 100, 100), gb(0, 200, 200, 300, 300)], &tracks, 0);
         assert_eq!(
             region[&0],
             vec![
@@ -433,7 +471,7 @@ mod tests {
         );
 
         // A box that misses every track contributes no entry.
-        let (region, layers) = net_region(&[gb(0, 500, 500, 600, 600)], &tracks);
+        let (region, layers) = net_region(&[gb(0, 500, 500, 600, 600)], &tracks, 0);
         assert!(region.is_empty());
         assert_eq!(layers, BTreeSet::from([0]));
     }
@@ -527,6 +565,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 2,
             obs_rects: Vec::new(),
+            obs_rects_raw: Vec::new(),
             pin_obs_rects: Vec::new(),
         });
         for (pname, power) in [("SIG", false), ("PWR", true)] {

@@ -916,6 +916,7 @@ fn parse_macro(
         bail!("LEF: MACRO {macro_name} has no SIZE");
     };
 
+    let obs_rects_raw = obs_rects.clone();
     merge_connected_obs(&mut obs_rects);
 
     let pin_count = (tech_db.macro_pins.len() as u32 - pin_offset) as u16;
@@ -930,6 +931,7 @@ fn parse_macro(
         pin_offset,
         pin_count,
         obs_rects,
+        obs_rects_raw,
         pin_obs_rects,
     });
 

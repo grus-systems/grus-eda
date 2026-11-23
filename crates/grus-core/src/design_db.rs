@@ -297,7 +297,7 @@ impl DesignDb {
     /// Macro-coords rect → oriented macro-coords rect (`w`/`h` = macro size).
     /// Shared by `congestion::gcell` (blockages) and `pdn` (pin attach); the
     /// caller translates by the cell's placement point.
-    pub(crate) fn orient_rect(r: RectDbu, w: i32, h: i32, orient: Orient) -> RectDbu {
+    pub fn orient_rect(r: RectDbu, w: i32, h: i32, orient: Orient) -> RectDbu {
         match orient {
             Orient::N => r,
             Orient::S => RectDbu::new(w - r.xh, h - r.yh, w - r.xl, h - r.yl),

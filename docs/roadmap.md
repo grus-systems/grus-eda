@@ -817,6 +817,23 @@ surface, from the first large-design run's feedback
   met2–met3's grids are disjoint mod-20 domains — zero shared
   crossings, needs an offset-snap rule before routing. Remaining:
   io-port attachment fallback, costs/legality, maze search.
+- Progress 2026-11-23 (`v0.12.4`, ticket `e6-drt-maze`): the
+  sequential maze router — `drt::maze::route_nets` connects every
+  guided signal net inside its region graph: pathfinder-style tree
+  extension (multi-source BFS hop heuristic + `(g+hop, node)` PQ),
+  preferred-direction and via costs, foreign-occupancy hard-block,
+  per-net escalating rip-up (`MAX_ITERS = 8`), and relaxed via edges
+  that snap each node to the nearest upper preferred line — the rule
+  that answers the §6 met2–met3 zero-edge gap. Pin fallback: strict
+  `pin_nodes`, else projection onto the nearest preferred line
+  (gcd's 17 `region_escape` pins route through it). Post-hoc
+  `overlap_census` reports cross-net `R+s` collisions; named
+  `UnroutedNet`/`FailKind` report; deterministic `route_digest`.
+  Determinism/occupancy fail-proofs in `docs/results.md`; the
+  picorv32 census measured under `--ignored` (~135 min release) —
+  6,636/6,744 routed, 0 collisions, 108 `NoPath` nets classified
+  43 met3-bridge + 65 met2-connected, pinned in `docs/results.md`.
+  Remaining: routed-DEF emission, e2e vs the TritonRoute reference.
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset

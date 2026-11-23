@@ -1936,6 +1936,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 2,
             obs_rects: Vec::new(),
+            obs_rects_raw: Vec::new(),
             pin_obs_rects: Vec::new(),
         });
         // Pin A is an li1 box (10,10,20,20), pin B (30,10,40,20), in
