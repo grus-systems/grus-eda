@@ -271,6 +271,8 @@ mod tests {
             edge_cap_per_um: 0.00004,
             spacing_dbu: 0,
             spacing_table: Vec::new(),
+            area_dbu2: 0,
+            min_enclosed_area_dbu2: 0,
         });
 
         let macro_name = interner.intern("sky130_fd_sc_hd__buf_1");

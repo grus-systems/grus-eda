@@ -172,9 +172,9 @@ WIDTH w` override; `EXT`/`DESIGNRULEWIDTH`/`SUBNET` bail loudly.
 |---|---|
 | `width` | **implemented** — `drc::width`, 13 rules, 0 violations on both routed DEFs |
 | `spacing` | **implemented** — `drc::spacing`, 20 rules, 0 violations on both routed DEFs (§10–12) |
-| `enclosure` | pending |
-| `area` | pending |
-| `holes` | pending |
+| `enclosure` | **implemented** — `drc::enclosure`, 9 rules, 0 violations on both routed DEFs (§13–14) |
+| `area` | **implemented** — `drc::area`, 6 rules, 0 violations on both routed DEFs (§15) |
+| `holes` | **implemented** — `drc::area`, 2 rules, 0 violations on both routed DEFs (§15) |
 | `magic_only` statements | out of scope per §3 (nwell-in-master etc. — the 305/8049 `magic_total` counts live here) |
 
 ## 8. Rule bounds — LEF provenance
@@ -329,3 +329,108 @@ wide member and meets a non-wide shape of another island at sub-bound
 gap; `window` is the rule's bound (280/400). `MacroPin`/`MacroObs`
 join islands (pin metal is connectivity) but never generate findings —
 under-reports at worst vs Magic's GDS-plane checks.
+
+---
+
+# E7 ticket 4 (`e7-drc-enc-area`): enclosure + area + hole families
+
+`drc::enclosure` checks the 9 `lef_expressible` cut-overlap rules;
+`drc::union` + `drc::area` check the 6 min-area and 2 min-hole-area
+rules over merged plane polygons. Bounds are the LEF `ENCLOSURE`
+(directional pairs on cut layers), `AREA`, and `MINENCLOSEDAREA`
+statements retained in `TechDb` — never the Magic techfile constants.
+
+## 13. Enclosure rules — LEF provenance
+
+`ENCLOSURE {BELOW|ABOVE} o1 o2` reads symmetrically: `min(o1,o2)`
+required on both axes **and** `max(o1,o2)` on at least one — what the
+deck's `surround` pairs encode and what OpenDB's generated-via
+expansion produces. A per-axis pinning is *not* used: the deck proves
+the symmetric reading and a directional cut would falsely flag a via
+rotated the other way. The table joins each implemented rule to its
+LEF pair and the Magic `%d`, re-derived from `sky130A.tech` `drc`
+section (`surround` statements, nm) — where they diverge the
+difference is a claim boundary.
+
+| `rule` | cut → metal | LEF overhangs (DBU) | `rule_name` (verbatim) | Magic `%d` | divergence |
+|---|---|---|---|---|---|
+| `met1.4` | mcon → met1 | 30 / 60 → both ≥ 30 | `Metal1 overlap of local interconnect contact < %d (met1.4)` | 30 | — |
+| `met1.5` | mcon → met1 | → one ≥ 60 | `Metal1 overlap of local interconnect contact < %d in one direction (met1.5)` | 60 | — |
+| `via.5a` | via → met1 | 55 / 85 → both ≥ 55 ∧ one ≥ 85 | `Metal1 overlap of Via1 < %d in one direction (via.5a - via.4a)` | 30 | Magic checks ≥30 one-directional only; we check the LEF pair — tighter, recorded |
+| `met2.5` | via → met2 | 55 / 85 → same | `Metal2 overlap of Via1 < %d in one direction (met2.5 - met2.4)` | 30 | same |
+| `via2.4a` | via2 → met2 | 40 / 85 → same | `Metal2 overlap of via2 < %d in one direction (via2.4a - via2.4)` | 45 | Magic 45 one-directional vs LEF 40/85 pair |
+| `met3.4` | via2 → met3 | 65 / 65 → both ≥ 65 | `Metal3 overlap of via2 < %d (met3.4)` | 25 | Magic 25 vs LEF 65 |
+| `via3.5` | via3 → met3 | 60 / 90 → same | `Metal3 overlap of via3 in one direction < %d (via3.5 - via3.4)` | 30 | Magic 30 vs LEF 60/90 |
+| `met4.3` | via3 → met4 | 65 / 65 → both ≥ 65 | `Metal4 overlap of via3 < %d (met4.3 - via3.4)` | 5 | Magic 5 vs LEF 65 |
+| `met5.3` | via4 → met5 | 310 / 310 → both ≥ 310 | `Metal5 overlap of via4 < %d (met5.3 - via4.4)` | 120 | Magic 120 vs LEF 310 |
+
+Sides without a deck statement are not implemented (recorded): mcon
+BELOW → li1 is LEF `0 0`; via4 BELOW → met4 (`via4.4` = 190) is folded
+into Magic's `via4.1` width composite (1180 = 800 + 2·190), which the
+width family already checks at LEF `WIDTH 800` — same folding for
+`via.1a`, `via2.1a`, `via3.1`.
+
+## 14. Enclosure measurement
+
+For each `ShapeSrc::Via` cut rect (the only cut-layer source):
+
+- **Candidates** — every *same-net* rect on the rule's metal layer
+  within `bmax` of the cut (`iter_overlapping` on the probe). Net
+  filtering is the model: the via's own metals carry the same net tag
+  and foreign metal reaching the cut would be a short anyway.
+- **Side overhangs** — split the cut's perpendicular span into
+  elementary sub-intervals at candidate rect edges; inside a
+  sub-interval the covering union is constant so the overhang is
+  exact: `cut_edge − union_edge`, negative when the cut edge
+  protrudes past all same-net metal. `enc_x = min(left, right)`,
+  `enc_y = min(bottom, top)`.
+- **Clauses** — `Both`: flag iff `enc_x < b ‖ enc_y < b` at
+  `min(pair)`; `One`: flag iff both axes `< max(pair)`; `Full`
+  evaluates `Both` at `min` first then `One` at `max` — one violation
+  per (rule, cut) recording the failing clause. Exact-bound passes
+  (`enc == b` satisfies `>=`); the real generated vias sit exactly at
+  the LEF bound in places, which is what the `>`-flip fail-proof
+  exercises.
+
+`MacroObs` never encloses (blockage abstract, not metal); a cut with
+no same-net metal reaching its edge gets a negative overhang —
+`absence_illegal` semantics.
+
+## 15. Min-area and hole-area rules
+
+`drc::union` supplies the shared substrate: `components` merges member
+rects (`SignalWire`/`SpecialWire`/`Via`/`IoPort`/`MacroPin` —
+`MacroObs` is never a member) on closed touch **regardless of net**,
+matching Magic's merged-plane model (a two-net touch is a short, not
+something the area check splits over); `union_area` is an x-sweep
+union measure; `enclosed_voids` extracts free-space components inside
+a component's bbox that never touch its boundary — the boundary test
+is what separates exterior notches from holes, and a void pinched to
+a point still counts as enclosed.
+
+| `rule` | layer | LEF bound (DBU²) | `rule_name` (verbatim) | Magic | divergence |
+|---|---|---|---|---|---|
+| `li.6` | li1 | 56100 | `Local interconnect minimum area < %a (li.6)` | 56100 | — |
+| `met1.6` | met1 | 83000 | `Metal1 minimum area < %a (met1.6)` | 83000 | — |
+| `met2.6` | met2 | 67600 | `Metal2 minimum area < %a (met2.6)` | 67600 | — |
+| `met3.6` | met3 | 240000 | `Metal3 minimum area < %a (met3.6)` | 240000 | — |
+| `met4.4a` | met4 | 240000 | `Metal4 minimum area < %a (met4.4a)` | 240000 | — |
+| `met5.4` | met5 | 4000000 | `Metal5 minimum area < %a (met5.4)` | 4000000 | — |
+| `met1.7` | met1 | 140000 | `Min area of metal1 holes > 0.14um^2 (met1.7)` | derived hole plane | — |
+| `met2.7` | met2 | 140000 | `Min area of metal2 holes > 0.14um^2 (met2.7)` | same | — |
+
+Evaluation gates (recorded, same class as width's finding filter): a
+component is checked only when it holds ≥1 drawn member
+(`SignalWire`/`SpecialWire`/`Via`/`IoPort`) — `MacroPin`-only islands
+are pin abstracts that understate the real GDS, so flagging them can
+only over-report. `MacroPin` metal still merges and still counts in
+area/coverage. `li.6` appears twice in `names` (`allli,*obsli` and the
+`coreli` variant) — one rule row, same collapse class as `li.c*`.
+
+Hole bounds resolve `MINENCLOSEDAREA` first; a LEF that omits it falls
+back to the deck-pinned `140000` (the `rule_name` literal itself
+carries "0.14um^2"). A void touching any `MacroObs` rect (closed
+intersection) is discarded — real content hides behind the obs
+abstract, and discarding the whole void rather than subtracting the
+obs rect is the conservative direction. Both areas compare strict `<`
+on exact integers — no tolerance.

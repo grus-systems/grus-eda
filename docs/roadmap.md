@@ -821,4 +821,14 @@ surface, from the first large-design run's feedback
   probe mutation flags exactly `met2.2`; merge-disable fail-proof
   recorded. Pair enumeration uses `LayerShapes::for_each_pair_within`
   (xl-sweep) after per-rect probes proved O(n²) on rail-poisoned
-  `max_xh` prefixes. Enclosure, area and hole families remain pending.
+  `max_xh` prefixes.
+- **`e7-drc-enc-area` landed 2026-11-23** (`v0.11.0`): the subset
+  checker completes the `lef_expressible` set — LEF
+  `ENCLOSURE {BELOW|ABOVE}` / `AREA` / `MINENCLOSEDAREA` retention,
+  `drc::enclosure` (9 cut-overlap rules, symmetric min/max pair
+  reading over the same-net metal union), `drc::union` +
+  `drc::area` (6 min-area + 2 min-hole-area rules over net-agnostic
+  merged polygons, OBS void discard) — **0 violations on both routed
+  DEFs across all 50 unique rule ids**. Mutations: shrunk `via2_3`
+  enclosure + moved covering stripe → exactly 5 `via.5a`; a `RECT`
+  met1 stub → exactly `met1.6`. Three fail-proofs recorded.

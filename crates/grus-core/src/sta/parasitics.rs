@@ -1920,6 +1920,8 @@ mod tests {
                 edge_cap_per_um: 5e-5,
                 spacing_dbu: 0,
                 spacing_table: Vec::new(),
+                area_dbu2: 0,
+                min_enclosed_area_dbu2: 0,
             });
         }
         t.via_res_ohm_above = vec![9.3, 4.5, 0.0];

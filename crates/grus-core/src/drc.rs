@@ -2,8 +2,11 @@
 //! covers into a per-layer index, `width` and `spacing` implement the
 //! rule families verified against the committed Magic goldens.
 
+pub mod area;
+pub mod enclosure;
 pub mod geom;
 pub mod spacing;
+pub mod union;
 pub mod width;
 
 use crate::interner::{LayerId, SymbolId};

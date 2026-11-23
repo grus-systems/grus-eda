@@ -82,30 +82,37 @@ Mini LEF: met1/met2 routing + `mcon` (`BELOW 0 0`, `ABOVE 30 60`) +
 
 1. **`test_enclosure_zero_violations`** — `check_enclosure_report`
    on both designs: all violations empty; census print per rule
-   (layer, bound, cut-rect candidates, violations). `met1.4`/`met1.5`
-   are expected 0-candidate (no mcon shapes — real coverage named per
-   AGENTS §7.4; exercised by unit fixtures). Deterministic double-run
-   on the report like the spacing test.
+   (layer, bound, cut-rect candidates, violations). Measured on the
+   real designs: every rule has candidates — 884 mcon / 1033 via1
+   cuts on gcd, 26 365/34 399 on picorv32 (the `met1.4`/`met1.5`
+   "expected 0-candidate" note was wrong — L1M1_PR signal vias carry
+   mcon cuts on both designs). Deterministic double-run on the
+   report like the spacing test.
 2. **`test_enclosure_rules_join_golden`** — every `rule_name` ∈
    `magic_rules_checked.names` verbatim, `classification ==
    "lef_expressible"`; no `magic_per_rule` key carries an implemented
    id (`paren_tokens` helper already shared).
 3. **`test_area_zero_violations`** + **`test_area_rules_join_golden`**
    — same pattern for `check_area_report` (candidates = evaluated
-   components; `li.6` expected 0 — li1 has no drawn members) and
-   `AREA_RULES`.
+   components; `li.6` measured 869/25 943 — li1 has drawn members via
+   L1M1_PR via metals on both designs) and `AREA_RULES`.
 4. **`test_hole_zero_violations`** + **`test_hole_rules_join_golden`**
    — `check_hole_report`; census prints enclosed voids detected
    (likely 0 — record honestly).
 5. **`test_enclosure_mutation_def_via_enclosure`** (gcd) — mutate the
    committed `VIAS` record `via2_3_1600_480_1_5_320_320`'s
-   `+ ENCLOSURE 85 165 55 85` → `+ ENCLOSURE 10 10 55 85` (single
-   `replacen` on the ENCLOSURE text, asserted changed). The met1
-   (BELOW) side drops to 10/10 < 55 → `via.5a - via.4a` flags on
-   every instance's 5 cuts (155 = 31 instances × 5 expected — assert
-   on rule set and nonzero, print count); met2 side stays 55/85 →
-   clean. Assert: nonempty, **all** violations `rule == "via.5a"`,
-   `failed == Both`, no other rule fires; unmutated control → 0.
+   `+ ENCLOSURE 85 165 55 85` → `+ ENCLOSURE 10 10 55 85` **and** move
+   the VGND FOLLOWPIN stripe `( 5520 87040 ) ( 86020 87040 )` → y
+   90000 (two `replacen` edits). Correction vs the single-edit plan:
+   measurement unions all same-net metal, and every via2_3 instance
+   sits on a same-net 480-wide FOLLOWPIN stripe covering its cut slab
+   with 165 DBU y-overhang — the enclosure shrink alone is rescued by
+   the wire and flags nothing. With the stripe moved, the met1
+   (BELOW) side drops to 10/10 < 55 → `via.5a` flags exactly the
+   instance at (25140,87040)'s 5 cuts (`failed == Both`, bound 55,
+   one `group`); met2 side stays 55/85 → clean. Assert: `all.len()
+   == 5`, every violation `rule == "via.5a"`, `failed == Both`;
+   unmutated control → 0.
 6. **`test_area_mutation_met1_island`** (gcd) — append a `+ RECT
    met1 ( x y ) ( x+140 y+140 )` stub to an existing net's record
    (coordinates chosen ≥ ~2× spacing from all met1 shapes — found by

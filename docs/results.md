@@ -8879,3 +8879,106 @@ struct-literal updates for the new `RoutingLayer::{spacing_dbu,
 spacing_table}` / `ShapeRect.group` fields — no behavior change,
 nothing to revert. `cargo test -p grus-core --test drc` 8/8 green
 (~111 s) on the follow-up tree.
+
+### 2026-11-23 — e7-drc-enc-area: enclosure + min-area + hole-area families (v0.11.0)
+
+`crates/grus-core/src/drc/enclosure.rs` — the 9 `lef_expressible`
+cut-overlap rules; `drc/union.rs` + `drc/area.rs` — the 6 min-area
+and 2 min-hole-area rules over merged plane polygons. LEF
+`ENCLOSURE {BELOW|ABOVE}` / `AREA` / `MINENCLOSEDAREA` retention in
+`readers/lef.rs` + `tech_db.rs` (`RoutingLayer::{area_dbu2,
+min_enclosed_area_dbu2}`, `CutLayer::{enc_below_dbu,
+enc_above_dbu}`). Goldens **reused, not regenerated**.
+
+**Enclosure census** (`test_enclosure_zero_violations --nocapture`)
+— 0 violations on every rule, both designs; `candidates` = cut rects
+evaluated. Every rule is exercised (real coverage, per AGENTS §7.4):
+
+| rule | bound (DBU) | gcd cand | picorv32 cand | gcd | picorv32 |
+|---|---|---|---|---|---|
+| met1.4 / met1.5 | 30 / 60 | 884 | 26365 | 0 | 0 |
+| via.5a / met2.5 | 85 / 85 | 1033 | 34399 | 0 | 0 |
+| via2.4a / met3.4 | 85 / 65 | 148 | 3872 | 0 | 0 |
+| via3.5 / met4.3 | 90 / 65 | 122 | 2178 | 0 | 0 |
+| met5.3 | 310 | 2 | 18 | 0 | 0 |
+
+Note: `ENCLOSURE_RULES` lists 9 names but 8 (cut,metal) measurement
+passes — `met1.4`/`met1.5` share the mcon→met1 pass, so the census
+counts the same 884/26365 cuts under both names.
+
+**Min-area census** (`test_area_zero_violations --nocapture`) —
+`candidates` = evaluated components (≥1 drawn member):
+
+| rule | bound (DBU²) | gcd cand | picorv32 cand | gcd | picorv32 |
+|---|---|---|---|---|---|
+| li.6 | 56100 | 869 | 25943 | 0 | 0 |
+| met1.6 | 83000 | 818 | 26164 | 0 | 0 |
+| met2.6 | 67600 | 411 | 14483 | 0 | 0 |
+| met3.6 | 240000 | 57 | 1426 | 0 | 0 |
+| met4.4a | 240000 | 3 | 47 | 0 | 0 |
+| met5.4 | 4000000 | 2 | 6 | 0 | 0 |
+
+`li.6` has drawn members on both designs (L1M1_PR via li1 metals) —
+the earlier design note expecting 0 was corrected by measurement.
+
+**Hole census** (`test_hole_zero_violations --nocapture`) — `voids` =
+enclosed free-space components detected inside drawn components:
+
+| rule | bound (DBU²) | gcd voids | picorv32 voids | gcd | picorv32 |
+|---|---|---|---|---|---|
+| met1.7 | 140000 | 0 | 0 | 0 | 0 |
+| met2.7 | 140000 | 0 | 0 | 0 | 0 |
+
+No enclosed voids exist on either routed design — the check ran (the
+fail-proof below proves it can flag), but honest coverage is 0
+candidate voids; the flag-positive path is covered by the unit
+fixtures (donut, pinched channel, OBS discard).
+
+**Mutation fixture — enclosure**
+(`test_enclosure_mutation_def_via_enclosure`, gcd): the committed
+`VIAS` record `via2_3_1600_480_1_5_320_320`'s `+ ENCLOSURE 85 165 55
+85` → `+ ENCLOSURE 10 10 55 85` **plus** moving the VGND FOLLOWPIN
+stripe `( 5520 87040 ) ( 86020 87040 )` → y 90000. The design's
+single-edit plan does *not* flag: measurement unions all same-net
+metal, and every via2_3 instance sits on a same-net 480-wide
+FOLLOWPIN stripe that covers its cut slab with 165 DBU y-overhang —
+the stripe must move for the shrunk via metal to matter. Result:
+exactly **5 violations**, all `via.5a`, `failed == Both` at bound
+55, one via-instance `group` (the 5 cuts at (25140,87040)); met2
+side (55/85) and all other instances stay clean; unmutated control
+→ 0.
+
+**Mutation fixture — min-area**
+(`test_area_mutation_met1_island`, gcd): appends `NEW met1 ( 0 0 )
+RECT ( 0 0 140 140 )` to the first `NETS` record — a 140×140 =
+19600 DBU² stub in a region scanned free of member metal for ±400
+DBU (corner (0,0)). Result: exactly **1 violation**, `met1.6`,
+`area_dbu2 == 19600 < bound 83000`; no width finding (140 ≥ 140);
+unmutated control → 0.
+
+**Fail-proof records** (AGENTS §7.7 — break, observe red, restore):
+
+- **Enclosure**: flipped the clause comparisons `enc < b` to
+  `enc <= b` (both `Both`/`One`/`Full` arms) →
+  `test_enclosure_zero_violations` goes red on gcd alone: **3343
+  violations** — bound-exact generated/LEF vias fire (`via3.5` at
+  enc 90/65 vs bound 90, `met4.3` at 65/65, etc.). Restored → green.
+  The DEF-VIAS mutation is the flag-positive control.
+- **Min-area**: disabled the component merge in `drc::union`
+  (each rect its own component) → `test_area_zero_violations` red:
+  **gcd 2137 violations** (li.6 884, met1.6 1198, met2.6 20,
+  met3.6 31, met4.4a 2, met5.4 2 — unmerged wire rects below bound).
+  Restored → green.
+- **Holes**: dropped the "touches window boundary ⇒ exterior"
+  retain in `enclosed_voids` → `test_hole_zero_violations` red:
+  **gcd 1085 violations** (met1.7 686, met2.7 399 — all exterior
+  free space miscounted as holes). Restored → green. The donut unit
+  fixture is the flag-positive control.
+
+**Checks run**: `cargo test -p grus-core --test drc` (16/16,
+~5.5 min debug — picorv32 dominates), `cargo test -p grus-core --lib
+drc` (43 drc tests), `cargo test --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`. Version
+`0.10.0 → 0.11.0`: `RoutingLayer`/`CutLayer` gained required public
+fields (breaking for literal construction; 0.x minor per AGENTS §5).
+No commit per ticket instruction.
