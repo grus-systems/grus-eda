@@ -168,11 +168,28 @@ The via model (§6) is *not*:
 - **A preferred-anchor node model** — the reference anchors most vias
   at preferred-track crossings across two *different* layers
   (`via-edges.md` §3), positions our same-layer-crossing nodes cannot
-  host; closing that gap revises `e6-drt-graph` node semantics and is
-  deferred model work (same class as the §5 io-port fallback).
+  host. §7's relaxed via edges closed the transition gap without
+  revising node semantics — each carries its true preferred-crossing
+  position separately from its endpoint nodes.
 - **FIXED-viarule parameterization** — a DEF `+ VIA <lef>` record is
   matched to its LEF def by the cut-layer triple only; any FIXED
   parameterization beyond that triple is unmodeled.
+
+The routed result (§7) is *not*:
+
+- **DEF text** — `NetRoute` is connectivity plus painted intervals
+  (merged wire segments, via placements, connected/projected pin
+  lists); serialization into `ROUTED`/`SPECIALNETS` geometry is the
+  emit ticket's job.
+- **DRC-clean** — the occupancy model is spacing-lite: `w/2 + s`
+  bands on track lines, no enclosure/min-area/cut rules, unmerged
+  OBS marks with an unconditional host-cell carve, and `Pin` marks
+  that never hard-block. A foreign wire landing on pin metal is an
+  emit/e2e finding, not a search-time error.
+- **A TritonRoute reproduction** — the search is a pathfinder-style
+  tree extension over our own region graph with relaxed (non-strict-
+  crossing) via transitions, not a port of `FlexGridGraph`/`drWorker`;
+  the census checks connectivity, not route equality.
 
 ## 5. Guide-bounded track graph
 
@@ -235,12 +252,18 @@ y-track (gcd's 14 `req_msg`/`resp_msg` ports, picorv32's 237 io
 escapes) — no complete crossing exists inside the pin shape. The
 pinned gcd set is asserted by name in `tests/drt.rs`.
 
-Router implication: class-(b) escapes are *unattachable* under the
-pure track-crossing model — the io port square holds no node at all,
-so the maze search cannot reach them. The via model (§6) did not add
-an attachment fallback; these ports still need an off-crossing tap on
-the port's own met2 rect (or honoring the reference DEF's port via),
-or every io-port net stays unroutable — recorded, not worked around.
+Router implication (updated by §7 — this paragraph's prediction is
+now historical): class-(b) escapes are *unattachable* under the pure
+track-crossing model — the io port square holds no node at all, so
+the maze search cannot reach them. The shipped answer is the §7
+projection fallback (in-region nodes in the rect's track
+neighborhood, one line of margin), plus `spare_above = 1` region
+layers for OBS-sealed pockets: guide boxes bound the search in XY,
+but the guide's layer choice does not bind which layer detailed
+routing taps on. The remaining recorded gap is the met2–met3
+transition itself (§6's disjoint-grids gap) — relaxed edges bridge
+strict-crossing sparsity *within* a pair whose upper preferred lines
+exist, and met2–met3 has no transition path at all.
 
 ## 6. Via model
 
@@ -335,3 +358,191 @@ a grid gap.
 present on the lower layer only — same `(x,y)` fails the upper
 track-list search — gets no via edge, and a coordinate shared by both
 grids but outside the guide gets none either; the gate asserts both.
+
+## 7. Maze search
+
+`drt::maze` connects each guided net's member pins inside its region
+graph — sequential, deterministic, one `NetGraph` at a time in
+`join.nets` (guide-file) order. `route_nets` returns a `RouteDb`:
+per-net `NetRoute`s (merged wire segments, via placements, connected
+pins), a named unrouted report, the post-hoc collision census, and
+the iteration count.
+
+**Region input**: the tests build graphs with
+`build_route_graphs_ext(.., spare_above = 1)` — every guide box's XY
+is also covered on `top_guided + 1`. Guide boxes bound the search in
+XY, but their layer choice does not bind detailed routing: OBS-sealed
+pin pockets are reached one layer above the global route's pick
+(OpenROAD's gcd `_038_` escapes its li1+met1 guide on met2 inside the
+same guide XY — the precedent this spare layer answers).
+
+**Attach sets**: strict `pin_nodes` first — the §5 in-region
+node-inside-pin-rect rule. When strict is empty the pin falls back
+to **projection** (`project_attach`): for each candidate rect
+`(l, r)`, the in-region nodes on `l` whose `ix`/`iy` sit inside the
+rect's covered track ranges expanded by one line on each side, on at
+least one covered line. A met2 io-port square holds an x-track but no
+y-track, so the tapping wire runs *along* that x-track and the
+adjacent-line nodes are the connection points; the one-line margin
+matters because a far node on a covered line can coincide with
+another pin's attach node, which `absorb_taps` would claim as a
+zero-edge connection. Recorded looseness: a projected tap node may
+sit off the pin shape — connectivity-level only, and `NetRoute::
+projected` names every pin connected this way (gcd: 17). A pin with
+empty strict *and* projection sets is `Unattachable`.
+
+**Edge classes** — one unified `u32` index space per net:
+`[0, E)` in-plane edges, `[E, E+V)` strict via edges (§6's shared
+`(x,y)` crossings, gated on `pairs[k].default.is_some()`), `[E+V,
+E+V+R)` **relaxed via edges**. A real via needs a *preferred*-track
+crossing — the vertical layer's x-track and the horizontal layer's
+y-track — not a same-layer-node crossing; strict crossings coincide
+only every 7820 DBU on li1–met1/met1–met2 and never on met2–met3
+(the §6 gap), so strict edges alone leave pin areas disconnected.
+For every node `v` on routing layer `k` (with `k+1` a routing layer
+and `pairs[k].default` set) the maze synthesizes one relaxed edge:
+upper `Horizontal` ⇒ via at `(v.x, nearest upper y-track)`, `b` the
+in-region upper node on that line nearest `v.x` (bracketing entries
+of the sorted ix list, lower index on ties); upper `Vertical`
+mirrors it. The true position `(x, y)` sits on both layers'
+preferred wires; the hang node is the same wire a track step away at
+most. Recorded looseness: the implied stubs may step outside the
+guide boxes (boxes are GCell-boundary, not exact) and are not
+searched — but they *are* committed metal, occupancy-scanned via
+`scan_stub` before the via footprint check and emitted as real
+`WireSeg`s at extraction. **Single-nearest rule (recorded gap)**: if
+the nearest upper preferred line holds no in-region node, `v` gets
+no relaxed edge — a named stranded-pocket class; widening to the
+second-nearest line stayed unnecessary (gcd closed at `unrouted=0`).
+This includes met2–met3: `M2M3_PR` is a default pair, so relaxed
+edges do give it a transition path wherever a nearby met3 preferred
+line carries in-region nodes — the §6 "dead capacity" note survives
+only as the residual class where they do not (the census test's
+met3-bridge classifier names any `NoPath` there). Emitted in node
+order — deterministic; parallel strict/relaxed edges coexist and the
+equal-`VIA_COST` tie breaks toward the strict arc (CSR order), with
+extraction deduping the placement on `(lower, x, y)`.
+
+**Search** (pathfinder-style tree extension): `NetTopo` is built
+once per net — attach sets, `host_cells`, relaxed vias, and the CSR
+adjacency over the unified index space — and reused across rip-up
+iterations (byte-identical arc order). The tree seeds at the driver
+pin's attach set (`net_driver`, else the first attachable member in
+`net_pins` order). Each extension round: a unit-weight BFS over all
+arc classes from every unconnected attachable pin's attach set fills
+`hop[v]` (occupancy-blind, so it undercounts — a consistent
+heuristic since every edge costs ≥1 hop); a `BinaryHeap` keyed
+`(g + hop, node)` then pops the same minimum-`g` target a plain
+Dijkstra would without flooding the region. `u32::MAX`-hop nodes
+sort last; the wave still exhausts before `None`, so the `NoPath`
+verdict is unchanged. On a hit the `parent` chain backtracks to the
+tree — provably simple (strictly decreasing `dist`), but bounded at
+`nodes.len()` steps so a broken invariant surfaces as `NoPath`,
+never a hang. `absorb_taps` then marks unconnected pins whose attach
+set already touches the tree (shared attach nodes connect for free).
+Wave exhaustion with targets left ⇒ the remaining pins are `NoPath`.
+
+**Costs** — hop count, not distance (recorded simplification):
+
+| constant | value | meaning |
+|---|---|---|
+| `PREF_COST` | 1 | in-plane edge along the layer's preferred axis |
+| `OFF_AXIS_COST` | 2 | in-plane edge against it (stubs/jogs) |
+| `VIA_COST` | 4 | one layer transition, strict or relaxed |
+| `OCC_PENALTY` | 8 | per distinct foreign net hit, soft iterations |
+| `HIST_STEP` | 8 | added per re-queue to the penalty multiplier |
+| `MAX_ITERS` | 8 | iteration cap; the last iteration is hard mode |
+
+The preferred axis follows §1's direction-to-axis flip: a
+`Horizontal` layer's `Axis::X` edges cost `PREF_COST`; `Vertical`'s
+`Axis::Y` edges.
+
+**Occupancy** (`Occupancy`): committed geometry — macro OBS, pin
+shapes, committed wires/stubs, via footprints — rasterized onto
+track lines so an edge's conflict check is a per-line interval
+query. Per layer, `lines_y`/`lines_x` map a line coordinate to a
+`Line`: `lo`-sorted `ivs` plus a `max_hi` skip index per
+`SKIP_CHUNK = 16` chunk (rebuilt eagerly from the dirty chunk; a
+scan skips `max_hi ≤ qlo` chunks and stops at `lo ≥ qhi` — identical
+hit *set*, both consumers order-insensitive). A rect `r` marks
+`[r.yl, r.yh]` on every vertical line inside the strict
+`w/2 + s` band (`w/2 = width_dbu/2`, `s = min_spacing_dbu()`) and
+`[r.xl, r.xh]` likewise on horizontal lines; `perp_*` stores the
+perpendicular extent so `scan_rect` runs the true 2-D test on via
+footprints. Candidate `scan_wire` hits are intervals overlapping
+`[c − w/2 − s, d + w/2 + s]` — edge-distance `< s` along the line;
+perpendicular `< s` is guaranteed by the band. A collision sliver
+containing no track line on either axis is the recorded miss class.
+Cut-layer occupancy and io-port rects are unmodeled (spacing-lite).
+
+Three occupant classes in `hit_verdict`:
+
+| mark | soft iteration | last iteration (hard) |
+|---|---|---|
+| `Obs(cell)`, `cell ∈ host_cells` | invisible | invisible |
+| `Obs(cell)`, `cell ∉ host_cells` | hard block | hard block |
+| `Obs(u32::MAX)` (net-less pin metal) | hard block | hard block |
+| `Net(own)` | free | free |
+| `Net(foreign)` | `+(OCC_PENALTY + hist·HIST_STEP)` per distinct foreign net | hard block |
+| `Pin(own)` | free | free |
+| `Pin(foreign)` | same penalty, pooled into the distinct set | **soft — never a block** |
+
+The **host-cell carve** is unconditional: `host_cells` is the sorted,
+deduped set of cells hosting the net's member pins, and an
+`Obs(cell)` hit is invisible whenever `cell ∈ host_cells` — the
+rasterized "access shapes ignore own-instance OBS" rule (the earlier
+pin-halo carve left approach edges blocked before the halo was
+reached — measured root cause of 47/48 gcd `NoPath`s). Recorded
+looseness: the net may cross its host cell's OBS anywhere, not just
+near the pin — connectivity-level acceptable; the emit/e2e DRC owns
+the real check. `Pin` never hard-blocks because rip-up cannot move a
+pin — charging it as congestion churns the queue without clearing
+the mark; a foreign wire landing on pin metal is an emit-time
+finding. Macro OBS marks use the **unmerged** `obs_rects_raw` set —
+the `merge_connected_obs` bbox fills the decap/edge gaps pins need.
+
+**Pre-mark** (`premark_obs`, once at `route_nets` start): every
+`{Placed, Fixed, Cover}` cell's `obs_rects_raw` on routing layers →
+`Obs(cell)` (the `drc::geom` source-4 convention — `orient_rect` +
+translate); every instance pin's shapes → `Pin(own_net)`, or
+`Obs(u32::MAX)` when the pin has no net.
+
+**Commit** (`commit_route`): merged wire rects (`± w/2`), relaxed-via
+stub wires, and via footprints (the default candidate's routing rects
+shifted to the placement) → `Net(net)`, logged as `Mark`s — the
+rip-up journal (`unmark` frees them).
+
+**Order and rip-up**: nets route in `join.nets` order. In soft
+iterations the foreign hits a committed edge actually took are
+recorded as provisional `Collision`s deduped on `(a, b, layer, line,
+lo, hi)` with `a < b`. After each round: `bad` = unrouted nets ∪ both
+parties of every provisional collision; each bad net's marks are
+ripped up and its `hist` escalates — per-net escalation breaks the
+two-net ping-pong cycle. Kept nets stay committed and price later
+re-routes. Cap `MAX_ITERS = 8`; the last iteration runs hard mode and
+its failures become the unrouted report. `OccMode::Disabled` (the
+fail-proof knob) skips foreign-`Net`/`Pin` checks and collision
+recording entirely; `Obs` still blocks — a fixed blockage is not
+"occupancy". After the cap, `overlap_census` rebuilds every route's
+wire rects and via footprints into a fresh occupancy (no OBS) and
+reports each cross-net pair whose `R + s`-intersect rule violates —
+the exact `RouteDb.collisions` list (`Enabled` only).
+
+**Unrouted taxonomy**: `UnroutedNet` names `connected` pins plus
+`failed` per-pin `(PinId, FailKind)` — `Unattachable` (strict +
+projection attach empty) vs `NoPath` (attachable but unreachable:
+pocket walls, region-component splits, or hard-mode blocking). An
+empty region is `NoPath`, never a panic; a leftover `Unattachable`
+member after the loop still lands the net in the report.
+
+**Determinism**: fixed net/pin/neighbor order, the `(g + hop, node)`
+total-order PQ (equal keys pop the lower node id), integer costs,
+`BTree` containers, canonical extraction (merged sorted wires,
+deduped sorted vias), `relaxed_vias` in node order, and the `NetTopo`
+cache's byte-identical arcs. Two full runs produce identical
+`RouteDb`s — asserted on the full structure plus the nonzero `xxh3`
+`route_digest`.
+
+**Instrumentation**: `GRUS_DRT_TIMING` (any value) makes `route_nets`
+print premark/topo/per-iteration/per-slow-net timings to stderr —
+opt-in, zero cost unset; it feeds `docs/results.md` runtime evidence.

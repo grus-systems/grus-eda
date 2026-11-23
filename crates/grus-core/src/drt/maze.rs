@@ -703,6 +703,7 @@ fn edge_cost(
 /// transition's real metal outside the via footprint. Each endpoint
 /// shares one coordinate with `(x, y)` by construction, so the stub
 /// is a single-axis interval (or absent when `n` sits on the via).
+#[allow(clippy::too_many_arguments)]
 fn scan_stub(
     g: &NetGraph,
     tracks: &[LayerTracks],
@@ -726,6 +727,7 @@ fn scan_stub(
 /// Records every foreign-net spacing hit of one committed edge as a
 /// provisional `Collision` (deduped on `(a, b, layer, line, lo, hi)`
 /// — `a < b` canonically).
+#[allow(clippy::too_many_arguments)]
 fn edge_collisions(
     g: &NetGraph,
     tracks: &[LayerTracks],
@@ -1011,7 +1013,7 @@ impl NetTopo {
         let mut host_cells: Vec<u32> = Vec::new();
         for (pi, &(pin, ref strict)) in g.pin_nodes.iter().enumerate() {
             if let Some(c) = db.pin_cells[pin.0 as usize] {
-                host_cells.push(c.0 as u32);
+                host_cells.push(c.0);
             }
             if !strict.is_empty() {
                 attach.push(strict.clone());
@@ -1182,11 +1184,12 @@ impl<'t> NetRun<'t> {
         while let Some(v) = bfs.pop_front() {
             let vi = v as usize;
             let h = self.hop[vi] + 1;
-            for pos in topo.adj_start[vi] as usize..topo.adj_start[vi + 1] as usize {
-                let to = topo.adj_to[pos] as usize;
-                if self.hop[to] == u32::MAX {
-                    self.hop[to] = h;
-                    bfs.push_back(topo.adj_to[pos]);
+            let range = topo.adj_start[vi] as usize..topo.adj_start[vi + 1] as usize;
+            for &to in &topo.adj_to[range] {
+                let ti = to as usize;
+                if self.hop[ti] == u32::MAX {
+                    self.hop[ti] = h;
+                    bfs.push_back(to);
                 }
             }
         }
@@ -1269,6 +1272,7 @@ impl<'t> NetRun<'t> {
 /// `pin_nodes` order), extend the tree one pin at a time, and either
 /// return the committed `NetRoute` plus the provisional collisions its
 /// edges took, or the per-pin named failure.
+#[allow(clippy::too_many_arguments)]
 fn route_one_net(
     db: &DesignDb,
     tech: &TechDb,

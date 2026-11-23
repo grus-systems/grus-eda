@@ -1492,7 +1492,7 @@ fn guide_union_connected(boxes: &[GuideBox], max_layer: u8) -> bool {
         return false;
     }
     let mut parent: Vec<usize> = (0..kept.len()).collect();
-    fn find(p: &mut Vec<usize>, i: usize) -> usize {
+    fn find(p: &mut [usize], i: usize) -> usize {
         let mut r = i;
         while p[r] != r {
             r = p[r];
