@@ -1,110 +1,105 @@
-# e6-drt-maze — Implementation steps (resume from `a52d771`)
+# e6-drt-maze — Implementation steps (resume from `2c3c713`)
 
-The checkpoint is committed; the tree is clean and does not compile.
-Remaining work is one logical unit: finish the `relax` refactor,
-run the gates, write the docs → one commit (plus the version bump,
-same commit per repo rules).
+The checkpoint compiles with 2 warnings; synthetic cases pass;
+**measured**: gcd census 203 s with 48 `NoPath` unrouted (47 not
+met3-bridge → classification assert red), picorv32 unmeasured
+(>21 CPU-min observed on the earlier run). Remaining work, in order:
 
-## 1. Finish the `RelaxedVia` refactor (`drt/maze.rs`)
+## 0. Clear the two warnings
 
-`cargo check -p grus-core` today reports 9 errors. Fixes:
+- Delete `hit_rect` and the `Hit::x_line` field (dead since the
+  carve moved to candidate-vs-halo). Remove `x_line` from the three
+  `Hit{..}` constructions (`scan_wire`, `scan_rect` ×2).
+- `cargo check -p grus-core` → zero warnings.
 
-1. **`relaxed_vias` `b`-endpoint bug** (lines ~810, ~832): the code
-   passes `jx`/`jy` — `usize` indices into the `ixs`/`iys` line
-   lists — where `node_id(l, ix: u32, iy: u32)` expects the track
-   *index values*. Both a type error and a wrong-node bug:
-   - Horizontal arm: `b: node_id((k + 1) as u8, ixs[jx], jy)`
-   - Vertical arm:   `b: node_id((k + 1) as u8, jx, iys[jy])`
-2. **`edge_collisions`** (def ~line 639): add
-   `relax: &[RelaxedVia]` after `occ` — its via branch already
-   dereferences `relax` at ~line 693. Update the call in
-   `route_one_net`'s extraction loop (~line 1277) to pass `&relax`.
-3. **`NetRun::new`**: add `relax: &[RelaxedVia]`; after the strict
-   `via_edges` loop, push arcs `(rv.a, rv.b, v_plane + ri)` and
-   `(rv.b, rv.a, v_plane + ri)` for each entry (pre-gated —
-   `relaxed_vias` already skips `default.is_none()` pairs, so add
-   unconditionally). *The compiler cannot catch this one:* without
-   arcs, relaxed edges exist in the index space but are unreachable.
-4. **`extend_once`**: add `relax: &[RelaxedVia]`; pass to
-   `edge_cost` (~line 1019) and `other_end` (~line 1050).
-5. **`route_one_net`**: `let relax = relaxed_vias(g, tech, tracks,
-   vias);` before `NetRun::new` (computed once per call — the
-   per-iteration recompute; hoisting is the recorded optimization
-   lever, `occupancy.md` §5). Pass `&relax` to `NetRun::new` and
-   `extend_once`. Fix the extraction via branch (~lines 1217-1222):
-   split `eidx < v_plane` (strict, existing) from `else` (relaxed —
-   currently `g.via_edges[eidx - e_plane]` panics out-of-bounds).
-   For a relaxed edge emit **both** the `ViaPlace` at
-   `(rv.lower, rv.x, rv.y)` and the implied stub wires:
-   `a.xy → (rv.x, rv.y)` on the lower layer (one coord shared —
-   exactly one of the two endpoints may already coincide) and
-   `(rv.x, rv.y) → b.xy` on the upper — pushed into `hlines`/
-   `vlines` so the existing merge produces canonical `WireSeg`s.
-6. **Delete the diagnosis scaffolding**: `debug_edge_stats`,
-   `debug_pin_approach`, `debug_net_wave` (each doc comment says
-   "Removed before the ticket lands") and `test_maze_debug_gcd` in
-   `tests/drt.rs`. This clears the remaining stale call sites at
-   ~1350/~1393/~1488/~1509; if a fresh investigation needs them they
-   are recoverable from `a52d771`.
-7. Verify: `cargo check -p grus-core` clean;
-   `cargo test -p grus-core --lib maze` — in-module unit tests
-   (band math, perpendicular crossing, projection fallback, PQ tie
-   order, square-graph path).
+## 1. Bounded backtrack (hardening — do before diagnosis)
 
-## 2. Synthetic gate
+In `NetRun::extend_once`, bound `while !in_tree[v]` at
+`g.nodes.len()` steps; overflow ⇒ treat the net as failed this round
+(the parent-chain invariant makes it unreachable in correct runs —
+`search.md` §4). This converts the one theoretical hang into a named
+`NoPath`, so the rest of the plan can trust "still running = slow".
 
-`cargo test -p grus-core --test drt test_maze_cases` — the four
-acceptance cases. Watch case 2 (`ViaPlace { lower:0, x:4000,
-y:3000 }`): strict and relaxed arcs tie on `VIA_COST`; the CSR must
-enumerate strict before relaxed (step 1.3 appends relaxed last) so
-the strict position wins ties — check ordering before touching the
-assert. Case 4 relies on relaxed edges *not* bridging the fixture's
-split region (no met2 box ⇒ no upper nodes ⇒ no relaxed edge).
+## 2. Diagnose the 48 gcd `NoPath`s
 
-## 3. Real-design census
+Temporary instrumentation (removed before commit — same convention
+as the deleted `debug_*` fns):
 
-`cargo test -p grus-core --test drt test_maze_census -- --nocapture`
-(gcd, then picorv32 — `picorv32.placed.def` is present in the
-worktree). Collect the printed line (guided / routed /
-pins_connected / projected / unrouted / collisions / iterations /
-ms / digest) for `results.md`. Relaxed met2–met3 transitions may
-route the met3-bridge class outright — if `unrouted` comes back
-nonzero, every `NoPath` must classify (existing met3-bridge probe or
-a new named cause pinned in the test comment; do not weaken the
-`unclassified.is_empty()` assert silently — name the class).
+1. `OccMode::Disabled` control on gcd. Still fails ⇒ `Obs`/topology
+   (observed NoPath pattern already implies this — soft-mode foreign
+   marks only cost, they never block).
+2. Blocker probe (`debug_pin_block` or equivalent): for each failed
+   pin, scan its attach nodes' incident edges through `edge_cost`
+   and tally which `Occupant` class returns `None` —
+   `Obs(host)`-uncarved / `Obs(other cell)` / `Net(foreign)` /
+   no-hits-at-all (⇒ node component split, including relaxed-via
+   single-nearest misses).
+3. Decide per `occupancy.md` §5: **C1** unconditional host carve
+   (expected primary — deep-pin pattern matches), **C2** `Pin`
+   occupant class / unmark pin shapes, **C3** relaxed-via
+   next-nearest widening or spare-layer bump. Apply minimally; a
+   fix that lands gets a matching in-module unit case (`tests.md`).
+4. Re-run `test_maze_cases` (case 3's OBS detour must still detour)
+   and the gcd census leg — target `unrouted = 0`; any residual is
+   classified by name (`tests.md`).
 
-## 4. Fail-proof + determinism
+## 3. Performance (`perf.md`)
 
-`test_maze_occupancy` (gcd Enabled vs Disabled — printed digests +
-census counts for `results.md`) and `test_maze_determinism`
-(double-run `RouteDb` equality + nonzero digest, both designs).
+Instrument (per-iteration `eprintln!`: `bad` count, routed/failed,
+cumulative ms; top-5 nets by ms with nodes/edges/pins; `edge_cost`
+and interval-compare counters), run gcd, then picorv32 under an
+external timeout. Apply levers in order until the budget is met:
 
-## 5. Workspace gates
+1. **L1** `cand` scratch buffer into `edge_cost` (per-relax alloc).
+2. **L2** `NetTopo` split — build attach/`relaxed_vias`/CSR once per
+   net, reuse across iterations (`api.md`).
+3. **L3** bounded interval scans — `lo`-sorted per-line lists with a
+   chunked `max_hi` skip index (`occupancy.md` §6).
+4. Re-measure after each lever; keep the counters' numbers for
+   `results.md` (before/after, honest record — AGENTS §2).
 
-`cargo test --workspace` and
-`cargo clippy --workspace --all-targets -- -D warnings`. picorv32
-runtime is measured by the census test — record the number; if hot,
-apply the `occupancy.md` §5 lever and record it.
+Budget: picorv32 census leg completes inside the debug test run
+(working target single-digit minutes; `perf.md` §3); record the
+measured `ms=`. L4 (`[profile.test] opt-level`) only if L1–L3 fail —
+recorded decision, never silent.
 
-## 6. Docs + version (same commit)
+## 4. Green the gates
 
-- `docs/e6-drt.md` §7 per `docs.md` — must record the relaxed-via
-  model change (preferred-track crossing, implied stubs, single-
-  nearest rule, guide-box looseness) and the pin-carve exemption.
-- `docs/results.md` dated entry with the **measured** census
-  numbers — never estimates (AGENTS §2).
+- `cargo test -p grus-core --lib maze` — in-module units.
+- `cargo test -p grus-core --test drt test_maze_cases` — synthetic.
+- `cargo test -p grus-core --test drt test_maze_census -- --nocapture`
+  — collect both designs' census lines for `results.md`.
+- `test_maze_occupancy` + `test_maze_determinism` — fail-proof and
+  double-run evidence.
+- `cargo test --workspace`;
+  `cargo clippy --workspace --all-targets -- -D warnings`.
+- Remove the temporary instrumentation before the commit.
+
+## 5. Docs + version (same commit)
+
+- `docs/e6-drt.md` §7 per `docs.md` — must record the *final* carve/
+  pin-mark rules, the spare layer, relaxed vias, `obs_rects_raw`,
+  the rip-up rule, and the §4/§5 claim-boundary amendments.
+- `docs/results.md` dated entry — measured census numbers, the
+  diagnosis evidence chain, the perf before/after, checks run.
 - `docs/status.md` head paragraph; `docs/roadmap.md` E6 line.
 - `Cargo.toml` `[workspace.package] version 0.12.3 → 0.12.4`.
 
 ## Commit
 
-One commit: `feat: Sequential maze router over the track graph`
-(Conventional Commits, English, agent trailer). The checkpoint diff
-plus this remainder is one unit of work.
+One commit on top of the checkpoints:
+`feat: Sequential maze router over the track graph`
+(Conventional Commits, English, agent trailer). The two checkpoint
+diffs plus this remainder are one unit of work; stage explicit
+paths — never `git add -A`.
 
 ## Files
 
 - `crates/grus-core/src/drt/maze.rs`
+- `crates/grus-core/src/drt.rs`
+- `crates/grus-core/src/drt/graph.rs`
+- `crates/grus-core/src/tech_db.rs`
+- `crates/grus-core/src/readers/lef.rs`
 - `crates/grus-core/tests/drt.rs`
 - `docs/e6-drt.md`
 - `docs/results.md`

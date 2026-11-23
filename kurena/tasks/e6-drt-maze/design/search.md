@@ -1,13 +1,18 @@
 # e6-drt-maze — Search model
 
-Matches the WIP at `a52d771` plus the `RelaxedVia` threading it left
-unfinished (`steps.md` §1 has the edit list).
+Matches the implementation at `2c3c713`, plus the bounded-backtrack
+hardening (`steps.md` §1).
 
 ## 1. Per-net routing unit
 
 Routing is strictly sequential, one `NetGraph` at a time in
 `join.nets` (guide-file) order. A *route* is a subtree of the
-region graph reaching every member pin's attach set.
+region graph reaching every member pin's attach set. The maze tests
+build graphs via `build_route_graphs_ext(.., spare_above = 1)`: the
+guide boxes' XY is covered on `top_guided + 1` too, because
+OBS-sealed pin pockets are reached one layer above the global
+route's layer choice (recorded in `docs/e6-drt.md` §7 — gcd `_038_`
+in the reference routed DEF escapes its li1+met1 guide on met2).
 
 - **attach set** = the pin's `pin_nodes`, or the projection fallback
   (§2) when that is empty.
@@ -22,13 +27,16 @@ candidate rects), unchanged from `e6-drt-graph`.
 
 **Projection fallback** (`project_attach`), only when strict is
 empty: for each candidate rect `(l, r)` from `pin_shapes`, the
-in-region nodes on `l` with `ix ∈ covered_range(tracks_x, r)` **or**
-`iy ∈ covered_range(tracks_y, r)` — crossings on the track lines
-that touch the pin shape. A met2 io-port square holds an x-track but
-no y-track; the tapping wire runs *along* that x-track, so any
-in-region node on the line is a connection point. Computed on sorted
-node order (deterministic). Pins connected through it are recorded
-on `NetRoute::projected`. Still empty ⇒ `FailKind::Unattachable`.
+in-region nodes on `l` whose `ix`/`iy` sit inside the covered ranges
+**expanded by one line on each side**, on at least one covered line.
+A met2 io-port square holds an x-track but no y-track; the tapping
+wire runs *along* that x-track, so adjacent-line nodes are the
+connection points. The one-line margin matters: far nodes on a
+covered line can coincide with *another* pin's attach node, which
+`absorb_taps` would then claim as a zero-edge connection. Computed
+on the sorted node order — deterministic. Pins connected through it
+are recorded on `NetRoute::projected`. Still empty ⇒
+`FailKind::Unattachable`.
 
 ## 3. Edges — in-plane, strict via, relaxed via
 
@@ -53,10 +61,11 @@ via edge. So for every node `v` on routing layer `k` (with `k+1`
 still a routing layer and `pairs[k].default.is_some()` — a `ViaGap`
 pair emits none) the maze synthesizes one edge to `k+1`:
 
-- Upper `Horizontal` ⇒ via position `(v.x, up.tracks_y[jy])`, `jy`
-  the upper y-track nearest `v.y`; `b` = in-region upper node on
-  that line whose ix is nearest `v.x` (the two bracketing entries of
-  the line's sorted ix list, lower index on ties).
+- Upper `Horizontal` ⇒ the via sits at `(v.x, up.tracks_y[jy])`,
+  `jy` the upper y-track nearest `v.y`, and `b` is the in-region
+  upper node on that line whose ix is nearest `v.x` (the two
+  bracketing entries of the line's sorted ix list, lower index on
+  ties).
 - Upper `Vertical` ⇒ mirrors it: `(up.tracks_x[jx], v.y)`, `b` on
   that x-line nearest `v.y`.
 - `a` = `v`. The true position `(x, y)` is on both layers'
@@ -68,10 +77,10 @@ pair emits none) the maze synthesizes one edge to `k+1`:
 - Emitted in node order — deterministic. Parallel strict/relaxed
   edges are left alone: equal `VIA_COST` breaks toward the strict
   arc (CSR order), extraction dedupes the placement by `(lower,x,y)`.
-- If the nearest upper line holds no in-region node, that node gets
-  no relaxed edge (single-nearest rule — recorded; widening to
-  next-nearest lines is the first knob if the census shows a
-  residual class).
+- **Single-nearest rule (recorded gap)**: if the nearest upper line
+  holds no in-region node, that node gets no relaxed edge — a
+  candidate cause for stranded pockets (H3); widening to the
+  next-nearest lines is the first knob (`occupancy.md` §5 C3).
 
 The implied geometry is committed, not just traversed: extraction
 emits the two stub wires — lower-layer wire `a.xy → (x,y)` and
@@ -99,6 +108,15 @@ attachable pins remain:
 
 `dist`/`parent` use per-round stamps (`dstamp`/`pstamp`) — no
 O(nodes) reset per round.
+
+**Backtrack bound (hardening)**: the `while !in_tree[v]` walk is the
+only unbounded loop in the router. A parent chain is provably simple
+(strictly decreasing dist to a dist-0 tree node), but if a bug ever
+breaks that invariant the loop would hang silently — exactly the
+reviewer's "stuck vs slow" ambiguity. Bound the walk at
+`g.nodes.len()` steps; exceeding it returns the net as `NoPath`
+named failure (a bug-shaped result, still bounded, still reported).
+This is a cheap invariant guard, not a routing heuristic.
 
 ## 5. Costs — recorded constants
 
@@ -147,8 +165,9 @@ for it in 1..=max_iters:
 `UnroutedNet { net, connected, failed: Vec<(PinId, FailKind)> }`.
 
 - `Unattachable` — strict + projection attach empty.
-- `NoPath` — attachable but unreachable this round: region-component
-  splits (met3-bridge class — see `tests.md`) or hard-mode blocking.
+- `NoPath` — attachable but unreachable this round: pocket walls
+  (`occupancy.md` §5 classes), region-component splits
+  (met3-bridge class — see `tests.md`), or hard-mode blocking.
 - A leftover unattachable member after the loop lands the net in the
   report; empty graph is `NoPath`, never a panic.
 
@@ -157,9 +176,12 @@ for it in 1..=max_iters:
 Fixed net/pin/neighbor order, `(cost,node)` total-order PQ, integer
 costs, canonical extraction (merged sorted wire intervals, sorted
 via placements), `BTree` containers throughout, `relaxed_vias`
-emitted in node order. Two full runs produce identical `RouteDb`
-(full `assert_eq` plus `xxh3` digest — nonzero evidence).
+emitted in node order. The `NetTopo` cache (perf lever L2) reuses
+byte-identical topology across iterations — construction order is
+unchanged. Two full runs produce identical `RouteDb` (full
+`assert_eq` plus `xxh3` digest — nonzero evidence).
 
 ## Files
 
 - `crates/grus-core/src/drt/maze.rs`
+- `crates/grus-core/src/drt/graph.rs`
