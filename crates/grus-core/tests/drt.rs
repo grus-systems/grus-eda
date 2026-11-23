@@ -14,10 +14,16 @@
 //!
 //! Tests fail loudly on missing inputs — no silent skips.
 
+use grus_core::congestion::guide::{
+    GuideBox, guide_net_name, parse_guides,
+};
 use grus_core::design_db::DesignDb;
 use grus_core::drt::access::{AccessReport, access_points};
+use grus_core::drt::graph::{
+    GuideJoin, build_route_graphs, join_guides,
+};
 use grus_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
-use grus_core::interner::{PinId, StringInterner};
+use grus_core::interner::{NetId, PinId, StringInterner};
 use grus_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
 use grus_core::tech_db::{LayerDir, TechDb};
 use std::path::{Path, PathBuf};
@@ -82,6 +88,28 @@ fn pin_label(db: &DesignDb, pin: PinId) -> String {
         ),
         None => pname.to_string(),
     }
+}
+
+/// Reads the committed `<d>.guide` reference (OpenROAD
+/// `global_route -guide_file` output), parses it, and joins the
+/// blocks to design nets. A missing or unparseable file is a loud
+/// failure — never a skip.
+fn load_guide(
+    db: &DesignDb,
+    tech: &TechDb,
+    name: &str,
+) -> (Vec<(String, Vec<GuideBox>)>, GuideJoin) {
+    let path = require(design_dir(name).join(format!("{name}.guide")));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let parsed = parse_guides(&text, tech)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+    let join = join_guides(db, tech, &parsed).expect("guide join failed");
+    (parsed, join)
+}
+
+fn net_name(db: &DesignDb, net: NetId) -> String {
+    db.strings.resolve(db.net_names[net.0 as usize]).to_string()
 }
 
 fn print_findings(db: &DesignDb, report: &AccessReport) {
@@ -352,4 +380,363 @@ fn test_access_failproof() {
         LayerDir::Horizontal => g.axis == Axis::Y,
         LayerDir::Vertical => g.axis == Axis::X,
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Guide join
+// ---------------------------------------------------------------------------
+
+/// Every guide block resolves to a design net in file order (an extra
+/// name would bail inside `resolve_guide_nets`); the absent `net_names`
+/// nets classify into `missing_signal` (a gap — empty on both designs)
+/// and `absent_expected` (<2-pin or non-signal, named not silent).
+#[test]
+fn test_guide_join() {
+    for name in ["gcd", "picorv32"] {
+        let (tech, db, _, _) = load(name);
+        let (parsed, join) = load_guide(&db, &tech, name);
+
+        assert_eq!(
+            join.nets.len(),
+            parsed.len(),
+            "{name}: unresolved guide blocks"
+        );
+        for ((net, _), (pname, _)) in join.nets.iter().zip(&parsed) {
+            assert_eq!(guide_net_name(&db, *net), *pname, "{name}: order drift");
+        }
+
+        let missing: Vec<String> = join
+            .missing_signal
+            .iter()
+            .map(|&n| net_name(&db, n))
+            .collect();
+        let mut absent: Vec<String> = join
+            .absent_expected
+            .iter()
+            .map(|&n| net_name(&db, n))
+            .collect();
+        absent.sort();
+        println!(
+            "{name}: guide_blocks={} joined={} missing_signal={:?} absent_expected={} {:?}",
+            parsed.len(),
+            join.nets.len(),
+            missing,
+            absent.len(),
+            absent
+        );
+        assert!(
+            join.missing_signal.is_empty(),
+            "{name}: missing_signal {missing:?}"
+        );
+        if name == "gcd" {
+            // VGND/VPWR live in SPECIALNETS (`pdn_nets`), not `NETS`
+            // — every `net_names` net has a guide block on gcd.
+            assert!(absent.is_empty(), "{name}: absent_expected");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Graph census
+// ---------------------------------------------------------------------------
+
+/// Per-guided-net region/node/edge census: nonzero totals, no
+/// zero-coverage (net,layer) pairs, nodes sorted and deduped, and the
+/// union bound `nodes <= Σ_box |covered ix|·|covered iy|` — the
+/// O(boxes × tracks) sizing, never O(die).
+#[test]
+fn test_graph_census() {
+    for name in ["gcd", "picorv32"] {
+        let (tech, db, tracks, _) = load(name);
+        let (_, join) = load_guide(&db, &tech, name);
+        let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+
+        assert!(
+            graphs.total_nodes > 0 && graphs.total_edges > 0,
+            "{name}: empty graph"
+        );
+        let zc: Vec<String> = graphs
+            .zero_coverage
+            .iter()
+            .map(|z| format!("({},{})", net_name(&db, z.net), z.layer.0))
+            .collect();
+        assert!(
+            graphs.zero_coverage.is_empty(),
+            "{name}: zero_coverage {zc:?}"
+        );
+
+        for (g, (_, boxes)) in graphs.nets.iter().zip(&join.nets) {
+            assert!(
+                g.nodes.windows(2).all(|w| w[0] < w[1]),
+                "{name}: nodes unsorted or duplicated"
+            );
+            let bound: usize = boxes
+                .iter()
+                .map(|b| {
+                    let lt = &tracks[b.layer.0 as usize];
+                    let nx = lt.tracks_x.partition_point(|&t| t <= b.rect.xh)
+                        - lt.tracks_x.partition_point(|&t| t < b.rect.xl);
+                    let ny = lt.tracks_y.partition_point(|&t| t <= b.rect.yh)
+                        - lt.tracks_y.partition_point(|&t| t < b.rect.yl);
+                    nx * ny
+                })
+                .sum();
+            assert!(
+                g.nodes.len() <= bound,
+                "{name}: net {} nodes {} > union bound {bound}",
+                net_name(&db, g.net),
+                g.nodes.len()
+            );
+        }
+
+        println!(
+            "{name}: guide_nets={} missing_signal={} absent_expected={} zero_cov={} nodes={} edges={} escapes={}",
+            join.nets.len(),
+            join.missing_signal.len(),
+            join.absent_expected.len(),
+            graphs.zero_coverage.len(),
+            graphs.total_nodes,
+            graphs.total_edges,
+            graphs.region_escape.len()
+        );
+    }
+}
+
+/// The attachment partition, checked per element (§7.5): every member
+/// pin of every guided net has ≥1 attached node or appears in
+/// `region_escape` — and every escape appears in `pin_nodes` with an
+/// empty list. Escape names print per design; the gcd set is pinned.
+#[test]
+fn test_pin_attachment() {
+    for name in ["gcd", "picorv32"] {
+        let (tech, db, tracks, _) = load(name);
+        let (_, join) = load_guide(&db, &tech, name);
+        let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+        let escapes: std::collections::BTreeSet<PinId> =
+            graphs.region_escape.iter().map(|e| e.pin).collect();
+
+        let mut members_total = 0usize;
+        for g in &graphs.nets {
+            let members = db.net_pins(g.net);
+            members_total += members.len();
+            assert_eq!(
+                g.pin_nodes.len(),
+                members.len(),
+                "{name}: pin_nodes does not cover every member pin"
+            );
+            for (i, &(pin, ref ids)) in g.pin_nodes.iter().enumerate() {
+                assert_eq!(pin, members[i], "{name}: pin order");
+                assert!(ids.windows(2).all(|w| w[0] < w[1]));
+                if escapes.contains(&pin) {
+                    assert!(ids.is_empty(), "{name}: escape pin has nodes");
+                } else {
+                    assert!(
+                        !ids.is_empty(),
+                        "{name}: pin {} of net {} attached nothing and is not named",
+                        pin_label(&db, pin),
+                        net_name(&db, g.net)
+                    );
+                }
+            }
+        }
+
+        let labels: Vec<String> = graphs
+            .region_escape
+            .iter()
+            .map(|e| format!("{} (net {})", pin_label(&db, e.pin), net_name(&db, e.net)))
+            .collect();
+        let io_escapes = graphs
+            .region_escape
+            .iter()
+            .filter(|e| db.pin_cells[e.pin.0 as usize].is_none())
+            .count();
+        println!(
+            "{name}: member_pins={members_total} region_escape={} (io={io_escapes} inst={}) {labels:?}",
+            labels.len(),
+            labels.len() - io_escapes
+        );
+        let mut names: Vec<String> = graphs
+            .region_escape
+            .iter()
+            .map(|e| pin_label(&db, e.pin))
+            .collect();
+        names.sort();
+        if name == "gcd" {
+            // 3 instance pins of the guide-stops-at-GCell-boundary
+            // class plus 14 io ports whose ±140 met2 square holds an
+            // x-track but no y-track — no in-region crossing exists
+            // inside the pin shape. Recorded in docs/results.md.
+            assert_eq!(
+                names,
+                [
+                    "_301_/B1",
+                    "_307_/B1",
+                    "_313_/X",
+                    "req_msg[0]",
+                    "req_msg[16]",
+                    "req_msg[17]",
+                    "req_msg[18]",
+                    "req_msg[1]",
+                    "req_msg[25]",
+                    "req_msg[26]",
+                    "req_msg[2]",
+                    "req_msg[3]",
+                    "req_msg[9]",
+                    "resp_msg[0]",
+                    "resp_msg[10]",
+                    "resp_msg[1]",
+                    "resp_msg[9]",
+                ]
+            );
+        }
+    }
+}
+
+/// Determinism with nonzero evidence (§7.7): two runs produce
+/// identical nodes, edges, and pin attachments on both designs.
+#[test]
+fn test_graph_determinism() {
+    for name in ["gcd", "picorv32"] {
+        let (tech, db, tracks, _) = load(name);
+        let (_, join) = load_guide(&db, &tech, name);
+        let g1 = build_route_graphs(&db, &tech, &tracks, &join);
+        let g2 = build_route_graphs(&db, &tech, &tracks, &join);
+        assert!(
+            g1.total_nodes > 0 && g1.total_edges > 0,
+            "{name}: empty graph proves nothing"
+        );
+        assert_eq!(g1.nets, g2.nets, "{name}: nondeterministic graphs");
+        assert_eq!(g1.zero_coverage, g2.zero_coverage);
+        assert_eq!(g1.region_escape, g2.region_escape);
+        assert_eq!(g1.total_nodes, g2.total_nodes);
+        assert_eq!(g1.total_edges, g2.total_edges);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Region-escape fixture
+// ---------------------------------------------------------------------------
+
+/// A met1 5×5 grid (tracks at 0..4000 step 1000); `u0/A` is a macro
+/// pin rect `[900,1100]²` centered on crossing (1000,1000), io port a
+/// `[2900,3100]²` rect on crossing (3000,3000). Net `n1` joins them.
+const REGION_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+MACRO CELL
+  CLASS CORE ;
+  SIZE 2.0 BY 2.0 ;
+  PIN A
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER met1 ;
+        RECT 0.9 0.9 1.1 1.1 ;
+    END
+  END A
+END CELL
+END LIBRARY
+"#;
+
+const REGION_DEF: &str = r#"VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN d ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 4000 4000 ) ;
+ROW ROW_0 unithd 0 0 N DO 8 BY 1 STEP 460 2720 ;
+TRACKS X 0 DO 5 STEP 1000 LAYER met1 ;
+TRACKS Y 0 DO 5 STEP 1000 LAYER met1 ;
+COMPONENTS 1 ;
+- u0 CELL + PLACED ( 0 0 ) N ;
+END COMPONENTS
+PINS 1 ;
+- io + NET n1 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 3000 3000 ) N ;
+END PINS
+NETS 1 ;
+- n1 ( PIN io ) ( u0 A ) + USE SIGNAL ;
+END NETS
+END DESIGN
+"#;
+
+/// Green → red → green: the full guide attaches both pins; shrinking
+/// u0/A's box below its pin rect's y-tracks escapes exactly `u0/A`;
+/// shrinking both boxes under the grid escapes every member pin and
+/// names `(n1, met1)` a zero-coverage pair; restoring goes green.
+#[test]
+fn test_region_escape_fixture() {
+    let mut interner = StringInterner::new();
+    let mut tech = TechDb::new();
+    parse_lef_bytes(REGION_LEF.as_bytes(), &mut tech, &mut interner)
+        .expect("fixture LEF parses");
+    tech.strings = interner.clone();
+    tech.rebuild_maps();
+    let db = parse_def_bytes(REGION_DEF.as_bytes(), &tech, None).expect("fixture DEF parses");
+    let tracks = layer_tracks(&db, &tech);
+
+    let guide = |text: &str| {
+        let parsed = parse_guides(text, &tech).expect("fixture guide parses");
+        join_guides(&db, &tech, &parsed).expect("fixture join")
+    };
+
+    // Control: each pin's crossing sits inside its own guide box.
+    let full = "n1\n(\n0 0 2000 2000 met1\n2500 2500 3500 3500 met1\n)\n";
+    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(full));
+    assert_eq!(graphs.nets.len(), 1);
+    assert!(graphs.total_nodes > 0 && graphs.total_edges > 0);
+    assert!(graphs.region_escape.is_empty(), "{:?}", graphs.region_escape);
+    assert!(graphs.zero_coverage.is_empty());
+    assert!(
+        graphs.nets[0]
+            .pin_nodes
+            .iter()
+            .all(|(_, ids)| !ids.is_empty())
+    );
+
+    // The shrunk box covers x-track 1000 but no y-track inside u0/A's
+    // rect — exactly u0/A escapes; io stays attached; met1 still has
+    // covered crossings so the census stays clean of zero_coverage.
+    let shrunk = "n1\n(\n500 200 1500 800 met1\n2500 2500 3500 3500 met1\n)\n";
+    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(shrunk));
+    assert!(graphs.zero_coverage.is_empty(), "{:?}", graphs.zero_coverage);
+    assert_eq!(
+        graphs.region_escape.len(),
+        1,
+        "{:?}",
+        graphs.region_escape
+    );
+    let e = &graphs.region_escape[0];
+    assert_eq!(pin_label(&db, e.pin), "u0/A");
+    assert_eq!(net_name(&db, e.net), "n1");
+
+    // Fail-proof: both boxes under the grid — every member pin escapes
+    // and (n1, met1) is a named zero-coverage pair, then restoring the
+    // full guide returns green.
+    let empty = "n1\n(\n500 200 1500 800 met1\n500 200 1500 800 met1\n)\n";
+    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(empty));
+    assert_eq!(graphs.total_nodes, 0);
+    assert_eq!(
+        graphs.region_escape.len(),
+        2,
+        "{:?}",
+        graphs.region_escape
+    );
+    assert_eq!(graphs.zero_coverage.len(), 1);
+    let z = &graphs.zero_coverage[0];
+    assert_eq!(net_name(&db, z.net), "n1");
+    assert_eq!(z.layer.0, 0);
+
+    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(full));
+    assert!(graphs.region_escape.is_empty() && graphs.zero_coverage.is_empty());
 }

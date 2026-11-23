@@ -795,6 +795,16 @@ surface, from the first large-design run's feedback
   proofs recorded. Next tickets: the maze/grid graph this substrate
   feeds (this ticket is substrate-only — no routing, vias, TA, or
   DRC-aware pruning).
+- Progress 2026-11-23 (`v0.12.2`, ticket `e6-drt-graph`): the
+  guide-bounded track graph — `drt::graph` joins the committed
+  `<d>.guide` blocks to nets (all 269/6,744 resolved; `missing_signal`
+  0; `absent_expected` gcd 0, picorv32 67 single-pin io nets), builds
+  each net's region as covered `(ix,iy)` track-index pairs (gcd
+  756,483 nodes / 1,453,444 edges; picorv32 28.4M / 54.6M;
+  `zero_coverage` 0), and attaches member pins — `region_escape` named
+  per design (gcd 17, picorv32 592; both are the guide/shape-holds-no-
+  crossing class, verified per-pin). Remaining: via/layer-transition
+  model (needs LEF `VIA` geometry), costs/legality, maze search.
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset

@@ -75,7 +75,7 @@ fn rect_points(rect: &RectDbu, lt: &LayerTracks) -> Vec<(i32, i32)> {
 /// `BTERM`s via `pin_io_rects` (already absolute, source 5). `+ SPECIAL`
 /// ports share `pin_cells == None` but are never members of
 /// `net_names` nets, so they are never visited.
-fn pin_shapes(db: &DesignDb, tech: &TechDb, p: PinId) -> Vec<(LayerId, RectDbu)> {
+pub(crate) fn pin_shapes(db: &DesignDb, tech: &TechDb, p: PinId) -> Vec<(LayerId, RectDbu)> {
     let idx = p.0 as usize;
     match db.pin_cells[idx] {
         None => db.pin_io_rects[idx].clone(),
