@@ -381,6 +381,7 @@ END LIBRARY
                         rect: r,
                         src,
                         net: None,
+                        group: 0,
                     })
                     .collect(),
             )

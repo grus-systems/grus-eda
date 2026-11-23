@@ -810,5 +810,15 @@ surface, from the first large-design run's feedback
   `drc::width` covering the 13 `lef_expressible` width rules — **0
   violations on both routed DEFs** joined to the Magic goldens by
   rule-name template; `NEW met1 100` mutation flags exactly `met1.1`;
-  `<`→`<=` fail-proof recorded in `docs/results.md`. Spacing,
-  enclosure, area and hole families remain pending.
+  `<`→`<=` fail-proof recorded in `docs/results.md`.
+- **`e7-drc-spacing` landed 2026-11-23** (`v0.10.0`): the spacing
+  family — LEF `SPACING`/`SPACINGTABLE` retention, `ShapeRect.group`
+  via-instance ids, union-find connectivity islands (same-net touching
+  merges; via cuts chain layers through the instance's metals), and
+  `drc::spacing` covering all 20 `lef_expressible` spacing rules
+  (same-layer min on li/mcon/via*/met1–5 + the met1–4 wide-metal
+  pairs) — **0 violations on both routed DEFs**; the committed met2
+  probe mutation flags exactly `met2.2`; merge-disable fail-proof
+  recorded. Pair enumeration uses `LayerShapes::for_each_pair_within`
+  (xl-sweep) after per-rect probes proved O(n²) on rail-poisoned
+  `max_xh` prefixes. Enclosure, area and hole families remain pending.
