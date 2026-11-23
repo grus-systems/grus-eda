@@ -261,6 +261,12 @@ fn measure_axis(
         enc_lo = enc_lo.min(lo);
         enc_hi = enc_hi.min(hi);
     }
+    if enc_lo == i32::MAX {
+        // Degenerate zero-span cut (pl == ph): no bands to measure.
+        // Return the no-metal fallback — `absence_illegal`, not a
+        // silent pass.
+        return (cl - ch, cl - ch);
+    }
     (enc_lo, enc_hi)
 }
 

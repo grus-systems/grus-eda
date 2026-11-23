@@ -8979,6 +8979,6 @@ unmutated control → 0.
 ~5.5 min debug — picorv32 dominates), `cargo test -p grus-core --lib
 drc` (43 drc tests), `cargo test --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings`. Version
-`0.10.0 → 0.11.0`: `RoutingLayer`/`CutLayer` gained required public
+`0.10.1 → 0.11.0`: `RoutingLayer`/`CutLayer` gained required public
 fields (breaking for literal construction; 0.x minor per AGENTS §5).
 No commit per ticket instruction.

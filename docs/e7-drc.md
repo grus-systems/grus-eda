@@ -177,6 +177,11 @@ WIDTH w` override; `EXT`/`DESIGNRULEWIDTH`/`SUBNET` bail loudly.
 | `holes` | **implemented** — `drc::area`, 2 rules, 0 violations on both routed DEFs (§15) |
 | `magic_only` statements | out of scope per §3 (nwell-in-master etc. — the 305/8049 `magic_total` counts live here) |
 
+All **50** unique `lef_expressible` rules are covered
+(13 width + 20 spacing + 9 enclosure + 6 area + 2 holes), each joined
+to the committed golden by verbatim `rule_name` — the remaining Magic
+statements live permanently in `magic_only`.
+
 ## 8. Rule bounds — LEF provenance
 
 Bounds are the **LEF** layer `WIDTH` / via-cut `WIDTH`, never the Magic
