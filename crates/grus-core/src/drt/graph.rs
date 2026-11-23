@@ -2,9 +2,10 @@
 //! boxes clipped to the merged track grid becomes the set of covered
 //! `(ix, iy)` track-index pairs — the nodes — with in-plane edges
 //! between consecutive-index nodes on both axes, and per-pin
-//! attachments from `drt::access::pin_shapes` candidate rects. Via
-//! (layer-transition) edges, costs, and direction legality are later
-//! tickets. See `docs/e6-drt.md` §5 for the model and claim boundary.
+//! attachments from `drt::access::pin_shapes` candidate rects, plus
+//! the layer-transition (via) edges between nodes at shared track
+//! crossings. Costs and direction legality are later tickets. See
+//! `docs/e6-drt.md` §5–§6 for the model and claim boundary.
 
 use crate::congestion::guide::{GuideBox, resolve_guide_nets};
 use crate::design_db::DesignDb;
@@ -33,6 +34,16 @@ pub struct RouteEdge {
     pub axis: Axis,
 }
 
+/// A layer-transition edge between nodes `lower` (layer l) and
+/// `upper` (l+1) at the same (x,y) — a track crossing on both layers
+/// and guide-covered on both. `lower < upper` always (nodes are
+/// emitted layer-ascending).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViaEdge {
+    pub lower: u32,
+    pub upper: u32,
+}
+
 /// One guided net's on-grid graph plus its pin attachments.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NetGraph {
@@ -41,6 +52,10 @@ pub struct NetGraph {
     pub nodes: Vec<RouteNode>,
     /// In node order, each unordered pair once.
     pub edges: Vec<RouteEdge>,
+    /// Layer-transition edges, adjacent pair ascending → lower-layer
+    /// node order. Kept separate from in-plane `edges` — the router
+    /// prices transitions differently.
+    pub via_edges: Vec<ViaEdge>,
     /// `(pin, attached node ids)` for each member pin in `net_pins`
     /// order; node ids sorted/deduped, empty iff the pin escaped.
     pub pin_nodes: Vec<(PinId, Vec<u32>)>,
@@ -78,6 +93,12 @@ pub struct RouteGraphs {
     pub region_escape: Vec<RegionEscape>,
     pub total_nodes: usize,
     pub total_edges: usize,
+    pub total_via_edges: usize,
+    /// Via-edge count per adjacent pair — parallel to
+    /// `tech.routing_layers.len() - 1` (index = lower layer). The
+    /// census evidence; a pair pinned at 0 is the named edge-domain
+    /// tech gap (`docs/e6-drt.md` §6, met2–met3 on sky130).
+    pub via_edges_per_pair: Vec<usize>,
 }
 
 /// A member pin counts as signal when it is an instance pin whose
@@ -207,17 +228,61 @@ fn layer_edges(base: u32, pairs: &[(u32, u32)]) -> Vec<RouteEdge> {
     edges
 }
 
-/// Builds every guided net's region graph and pin attachments.
-/// `tracks` is `drt::tracks::layer_tracks` output, parallel to
-/// `tech.routing_layers`. Emission order is fixed (layer asc →
-/// (ix,iy) asc → +x/+y edges in node order): two runs are identical.
+/// Via edges between two layers' covered pair sets: for each lower
+/// node `(ix,iy)` the crossing's (x,y) must binary-search-hit both
+/// upper track lists and land on an upper covered pair — the strict
+/// shared-crossing rule of `docs/e6-drt.md` §6. Each lower node emits
+/// ≤1 edge and distinct (x,y) map to distinct upper nodes, so ≤1 edge
+/// exists per coordinate per pair.
+fn layer_via_edges(
+    lower_base: u32,
+    lower_pairs: &[(u32, u32)],
+    lower_tracks: &LayerTracks,
+    upper_base: u32,
+    upper_pairs: &[(u32, u32)],
+    upper_tracks: &LayerTracks,
+) -> Vec<ViaEdge> {
+    let mut out = Vec::new();
+    for (i, &(ix, iy)) in lower_pairs.iter().enumerate() {
+        let x = lower_tracks.tracks_x[ix as usize];
+        let y = lower_tracks.tracks_y[iy as usize];
+        let Ok(jx) = upper_tracks.tracks_x.binary_search(&x) else {
+            continue;
+        };
+        let Ok(jy) = upper_tracks.tracks_y.binary_search(&y) else {
+            continue;
+        };
+        if let Ok(j) = upper_pairs.binary_search(&(jx as u32, jy as u32)) {
+            out.push(ViaEdge {
+                lower: lower_base + i as u32,
+                upper: upper_base + j as u32,
+            });
+        }
+    }
+    out
+}
+
+/// Builds every guided net's region graph, pin attachments, and
+/// layer-transition via edges. `tracks` is `drt::tracks::layer_tracks`
+/// output, parallel to `tech.routing_layers`. Emission order is fixed
+/// (layer asc → (ix,iy) asc → +x/+y edges in node order; via edges
+/// pair asc → lower node order): two runs are identical.
+///
+/// Via-edge emission is purely geometric — a shared crossing plus
+/// guide coverage on both layers — so no `ViaTable` is consulted: a
+/// pair with zero candidates is `drt::via`'s `ViaGap` finding, and
+/// whatever edges the geometry still yields are the data explaining
+/// it. The maze router joins table and graph for legality/pricing.
 pub fn build_route_graphs(
     db: &DesignDb,
     tech: &TechDb,
     tracks: &[LayerTracks],
     join: &GuideJoin,
 ) -> RouteGraphs {
-    let mut out = RouteGraphs::default();
+    let mut out = RouteGraphs {
+        via_edges_per_pair: vec![0; tech.routing_layers.len().saturating_sub(1)],
+        ..Default::default()
+    };
     for (net, boxes) in &join.nets {
         let (region, box_layers) = net_region(boxes, tracks);
         for &l in &box_layers {
@@ -242,6 +307,29 @@ pub fn build_route_graphs(
                 iy,
             }));
             edges.extend(layer_edges(layer_base[&l], pairs));
+        }
+
+        let mut via_edges = Vec::new();
+        for (&l, pairs_lo) in &region {
+            let u = l + 1;
+            let Some(pairs_hi) = region.get(&u) else {
+                continue;
+            };
+            let (Some(lt_lo), Some(lt_hi)) =
+                (tracks.get(l as usize), tracks.get(u as usize))
+            else {
+                continue;
+            };
+            let pair_edges = layer_via_edges(
+                layer_base[&l],
+                pairs_lo,
+                lt_lo,
+                layer_base[&u],
+                pairs_hi,
+                lt_hi,
+            );
+            out.via_edges_per_pair[l as usize] += pair_edges.len();
+            via_edges.extend(pair_edges);
         }
 
         let mut pin_nodes = Vec::new();
@@ -282,10 +370,12 @@ pub fn build_route_graphs(
 
         out.total_nodes += nodes.len();
         out.total_edges += edges.len();
+        out.total_via_edges += via_edges.len();
         out.nets.push(NetGraph {
             net: *net,
             nodes,
             edges,
+            via_edges,
             pin_nodes,
         });
     }
@@ -367,6 +457,41 @@ mod tests {
             ]
         );
         assert!(layer_edges(0, &[(0, 0), (2, 0)]).is_empty());
+    }
+
+    /// Via-edge emission on two hand-built pair sets: a lower node at
+    /// a shared crossing covered on both layers gets an edge; a lower
+    /// node off the upper grid or uncovered on the upper side gets
+    /// none; `lower < upper` always.
+    #[test]
+    fn test_layer_via_edges() {
+        let lo_tracks = LayerTracks {
+            tracks_x: vec![0, 100, 200],
+            tracks_y: vec![0, 100, 200],
+        };
+        // Upper grid shares (0,0) and (200,200) coordinates only.
+        let hi_tracks = LayerTracks {
+            tracks_x: vec![0, 200],
+            tracks_y: vec![0, 200],
+        };
+        let lo_pairs = vec![(0, 0), (0, 1), (1, 1), (2, 2)];
+        // Upper covers (0,0) but not (200,200).
+        let hi_pairs = vec![(0, 0), (0, 1)];
+
+        let edges = layer_via_edges(10, &lo_pairs, &lo_tracks, 20, &hi_pairs, &hi_tracks);
+        assert_eq!(edges, vec![ViaEdge { lower: 10, upper: 20 }]);
+        assert!(edges[0].lower < edges[0].upper);
+
+        // Both shared crossings covered → two edges, lower node order.
+        let hi_full = vec![(0, 0), (1, 1)];
+        let edges = layer_via_edges(10, &lo_pairs, &lo_tracks, 20, &hi_full, &hi_tracks);
+        assert_eq!(
+            edges,
+            vec![
+                ViaEdge { lower: 10, upper: 20 },
+                ViaEdge { lower: 13, upper: 21 },
+            ]
+        );
     }
 
     /// Join fixture: `guided` (two signal instance pins) is the only

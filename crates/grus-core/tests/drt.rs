@@ -1,6 +1,7 @@
-//! E6 DRT substrate gate: the merged LEF∪DEF track grid and the
-//! candidate access-point census over the committed placed DEFs of gcd
-//! and picorv32.
+//! E6 DRT substrate gate: the merged LEF∪DEF track grid, the
+//! candidate access-point census, the guide-bounded track graph, and
+//! the via candidate table + layer-transition edge census over the
+//! committed placed DEFs of gcd and picorv32.
 //!
 //! What this proves:
 //! - Every routing layer carries nonempty track lists on both axes and
@@ -8,9 +9,15 @@
 //! - Every signal-net member pin (instance pins and io `BTERM`s) has at
 //!   least one access point; `off_track`/`no_shapes` findings are empty
 //!   on both designs and would name their pins if not.
-//! - Output is deterministic (double-run assert on a nonempty `points`).
-//! - A synthetic off-track pin is a named finding, and dropping the
-//!   preferred-axis tracks turns the census red — the gate can fail.
+//! - Every adjacent routing-layer pair has ≥1 via candidate and a named
+//!   default, joined to the committed `<d>.drt.reference.json`
+//!   `vias_per_cut_layer` census.
+//! - Via edges exist only at real shared track crossings; met2–met3
+//!   yields exactly 0 on both designs — the named edge-domain tech gap.
+//! - Output is deterministic (double-run asserts on nonempty data).
+//! - Synthetic fixtures prove the gate can fail: an off-track pin, a
+//!   shrunk guide region, a dropped coverage box, and a gap pair are
+//!   all named findings.
 //!
 //! Tests fail loudly on missing inputs — no silent skips.
 
@@ -19,9 +26,11 @@ use grus_core::design_db::DesignDb;
 use grus_core::drt::access::{AccessReport, access_points};
 use grus_core::drt::graph::{GuideJoin, build_route_graphs, join_guides};
 use grus_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
-use grus_core::interner::{NetId, PinId, StringInterner};
+use grus_core::drt::via::{ViaPair, ViaTable, via_table};
+use grus_core::interner::{LayerId, NetId, PinId, StringInterner};
 use grus_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
 use grus_core::tech_db::{LayerDir, TechDb};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -619,6 +628,8 @@ fn test_graph_determinism() {
         assert_eq!(g1.region_escape, g2.region_escape);
         assert_eq!(g1.total_nodes, g2.total_nodes);
         assert_eq!(g1.total_edges, g2.total_edges);
+        assert_eq!(g1.total_via_edges, g2.total_via_edges);
+        assert_eq!(g1.via_edges_per_pair, g2.via_edges_per_pair);
     }
 }
 
@@ -745,4 +756,446 @@ fn test_region_escape_fixture() {
 
     let graphs = build_route_graphs(&db, &tech, &tracks, &guide(full));
     assert!(graphs.region_escape.is_empty() && graphs.zero_coverage.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Via candidates + layer-transition edges
+// ---------------------------------------------------------------------------
+
+/// `variants.baseline.vias_per_cut_layer` (+ `via_names_meaning`) of
+/// the committed `<d>.drt.reference.json` — `require`'d so a missing
+/// file is a loud failure.
+fn load_drt_ref(name: &str) -> serde_json::Value {
+    let path = require(design_dir(name).join(format!("{name}.drt.reference.json")));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()))
+}
+
+/// The routed-DEF via census grouped by cut layer: `vias_per_cut_layer`
+/// (name → instance count) bucketed by `via_names_meaning`'s cut name —
+/// per cut layer `(majority name, total instances, used names)`.
+/// `def_viarule:`-prefixed DEF names carry no `via_names_meaning`
+/// entry and land under `<unknown>`, matching no real cut layer.
+fn ref_via_census(r: &serde_json::Value) -> BTreeMap<String, (String, u64, Vec<String>)> {
+    let census = r["variants"]["baseline"]["vias_per_cut_layer"]
+        .as_object()
+        .expect("vias_per_cut_layer missing");
+    let meaning = r["variants"]["baseline"]["via_names_meaning"]
+        .as_object()
+        .expect("via_names_meaning missing");
+    let mut by_cut: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+    for (via, count) in census {
+        let cut = meaning
+            .get(via)
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        by_cut
+            .entry(cut.to_string())
+            .or_default()
+            .push((via.clone(), count.as_u64().unwrap()));
+    }
+    by_cut
+        .into_iter()
+        .map(|(cut, mut used)| {
+            used.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+            let names: Vec<String> = used.iter().map(|(n, _)| n.clone()).collect();
+            let total: u64 = used.iter().map(|(_, c)| c).sum();
+            (cut, (used[0].0.clone(), total, names))
+        })
+        .collect()
+}
+
+/// The pair's policy pick, resolved to its interned name. `db.strings`
+/// — not `tech.strings` — resolves every candidate name: it clones the
+/// tech interner at parse start and additionally carries the DEF `VIAS`
+/// names.
+fn default_name<'a>(db: &'a DesignDb, table: &'a ViaTable, p: &ViaPair) -> &'a str {
+    let c = &table.candidates[p.candidates[p.default.unwrap() as usize] as usize];
+    db.strings.resolve(c.name)
+}
+
+fn routing_name(tech: &TechDb, l: LayerId) -> &str {
+    tech.strings.resolve(tech.routing_layers[l.0 as usize].name)
+}
+
+/// The candidate table on both designs: every adjacent pair has ≥1
+/// candidate (`gaps`/`unmatched` empty), counts pinned `{5,6,6,6,6}`
+/// (five LEF defs per pair plus the four DEF `VIAS` generated records
+/// on pairs 1–4 — `def_vias` retention exercised end to end), and the
+/// per-pair default joins to the reference `vias_per_cut_layer`
+/// census — matched on via/via2/via3, a name-only divergence on mcon
+/// (`L1M1_PR` ≡ `L1M1_PR_MR` rect-for-rect, asserted per element), and
+/// via4 unobserved.
+#[test]
+fn test_via_candidate_table() {
+    for name in ["gcd", "picorv32"] {
+        let (tech, db, _, _) = load(name);
+        let table = via_table(&tech, &db).expect("via_table");
+        let ref_census = ref_via_census(&load_drt_ref(name));
+
+        let gaps: Vec<String> = table
+            .gaps
+            .iter()
+            .map(|g| format!("({},{})", routing_name(&tech, g.lower), routing_name(&tech, g.upper)))
+            .collect();
+        assert!(table.gaps.is_empty(), "{name}: via gaps {gaps:?}");
+        let unmatched: Vec<String> = table
+            .unmatched
+            .iter()
+            .map(|u| db.strings.resolve(u.name).to_string())
+            .collect();
+        assert!(
+            table.unmatched.is_empty(),
+            "{name}: unmatched via defs {unmatched:?}"
+        );
+
+        let counts: Vec<usize> = table.pairs.iter().map(|p| p.candidates.len()).collect();
+        assert_eq!(counts, [5, 6, 6, 6, 6], "{name}: candidate counts");
+        assert_eq!(table.candidates.len(), 29, "{name}: 25 LEF + 4 DEF vias");
+        for p in &table.pairs {
+            assert!(p.cut.is_some(), "{name}: pair {p:?} has no cut layer");
+        }
+
+        let defaults: Vec<&str> = table
+            .pairs
+            .iter()
+            .map(|p| default_name(&db, &table, p))
+            .collect();
+        assert_eq!(
+            defaults,
+            ["L1M1_PR", "M1M2_PR", "M2M3_PR", "M3M4_PR", "M4M5_PR"],
+            "{name}: default picks"
+        );
+
+        println!("== {name} via candidate table ==");
+        for p in &table.pairs {
+            let cut_name = tech.strings.resolve(p.cut.unwrap());
+            let (majority, total, used) = ref_census
+                .get(cut_name)
+                .map(|(m, t, u)| (m.as_str(), *t, u.clone()))
+                .unwrap_or(("<unobserved>", 0, Vec::new()));
+            let our = default_name(&db, &table, p).to_string();
+            println!(
+                "  {}–{} cut={cut_name} candidates={} default={our} ref_majority={majority} ref_total={total} ref_used={used:?}",
+                routing_name(&tech, p.lower),
+                routing_name(&tech, p.upper),
+                p.candidates.len(),
+            );
+            match cut_name {
+                "via" | "via2" | "via3" => {
+                    assert_eq!(
+                        our, majority,
+                        "{name}: default diverges from reference on {cut_name}"
+                    );
+                }
+                "mcon" => {
+                    assert_eq!(majority, "L1M1_PR_MR", "{name}: mcon majority drift");
+                    assert_eq!(our, "L1M1_PR");
+                    // Name-only divergence: the two defs must stay
+                    // rect-for-rect identical — a future deck change
+                    // that differentiates them fails loudly here.
+                    let rects_of = |n: &str| {
+                        table
+                            .candidates
+                            .iter()
+                            .find(|c| db.strings.resolve(c.name) == n)
+                            .unwrap()
+                            .rects
+                            .clone()
+                    };
+                    assert_eq!(rects_of("L1M1_PR"), rects_of("L1M1_PR_MR"));
+                }
+                "via4" => {
+                    // Zero M4M5 instances in either routed DEF — a
+                    // policy pick with no reference evidence.
+                    assert!(
+                        !ref_census.contains_key("via4"),
+                        "{name}: via4 unexpectedly observed"
+                    );
+                }
+                other => panic!("{name}: unexpected cut layer {other}"),
+            }
+        }
+    }
+}
+
+/// The layer-transition edge census: `total_via_edges` nonzero on both
+/// designs; `via_edges_per_pair` printed and joined to the reference
+/// census; met2–met3 pinned at 0 — the named edge-domain tech gap
+/// (met2 coords ≡10 mod 20, met3 ≡0 mod 20, the grids never coincide);
+/// every edge endpoint checked per element for adjacent layers at an
+/// identical (x,y); deterministic double-run.
+#[test]
+fn test_via_edge_census() {
+    for name in ["gcd", "picorv32"] {
+        let (tech, db, tracks, _) = load(name);
+        let (_, join) = load_guide(&db, &tech, name);
+        let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+        let table = via_table(&tech, &db).expect("via_table");
+        let ref_census = ref_via_census(&load_drt_ref(name));
+
+        assert!(
+            graphs.total_via_edges > 0,
+            "{name}: zero via edges — the census is vacuous"
+        );
+        assert_eq!(
+            graphs.via_edges_per_pair.len(),
+            tech.routing_layers.len() - 1
+        );
+        // met2–met3 is pinned at 0 — the named edge-domain tech gap
+        // (met2 coords ≡10 mod 20, met3 ≡0 mod 20, the grids never
+        // coincide; docs/e6-drt.md §6). met4–met5's shared crossings
+        // (1 gcd / 36 picorv32 pre-coverage) admit no guide-covered
+        // node pair on either design. The full row is pinned so
+        // silent drift trips the gate.
+        let expected: Vec<usize> = if name == "gcd" {
+            vec![13_292, 375, 0, 2, 0]
+        } else {
+            vec![395_479, 13_961, 0, 47, 0]
+        };
+        assert_eq!(
+            graphs.via_edges_per_pair, expected,
+            "{name}: via-edge census drift"
+        );
+        assert_eq!(graphs.total_via_edges, expected.iter().sum::<usize>());
+
+        // §7.5 per-element check: every via edge connects adjacent
+        // layers at the same (x,y).
+        for g in &graphs.nets {
+            for e in &g.via_edges {
+                let lo = g.nodes[e.lower as usize];
+                let hi = g.nodes[e.upper as usize];
+                assert!(e.lower < e.upper, "{name}: via edge order");
+                assert_eq!(lo.layer.0 + 1, hi.layer.0, "{name}: non-adjacent via");
+                let lt = &tracks[lo.layer.0 as usize];
+                let ut = &tracks[hi.layer.0 as usize];
+                assert_eq!(lt.tracks_x[lo.ix as usize], ut.tracks_x[hi.ix as usize]);
+                assert_eq!(lt.tracks_y[lo.iy as usize], ut.tracks_y[hi.iy as usize]);
+            }
+        }
+
+        assert!(table.gaps.is_empty(), "{name}: via gaps");
+        assert!(
+            graphs.via_edges_per_pair[0] > 0
+                && graphs.via_edges_per_pair[1] > 0
+                && graphs.via_edges_per_pair[3] > 0,
+            "{name}: pairs the reference transitions have no edges"
+        );
+
+        println!("== {name} via edge census ==");
+        for (k, p) in table.pairs.iter().enumerate() {
+            let cut_name = tech.strings.resolve(p.cut.unwrap());
+            let (majority, used) = ref_census
+                .get(cut_name)
+                .map(|(m, _, u)| (m.as_str(), u.clone()))
+                .unwrap_or(("<unobserved>", Vec::new()));
+            let our = p
+                .default
+                .map(|_| default_name(&db, &table, p))
+                .unwrap_or("<none>");
+            println!(
+                "  {}–{} cut={cut_name} candidates={} via_edges={} default={our} ref_majority={majority} ref_used={used:?}",
+                routing_name(&tech, p.lower),
+                routing_name(&tech, p.upper),
+                p.candidates.len(),
+                graphs.via_edges_per_pair[k],
+            );
+        }
+        println!("{name}: total_via_edges={}", graphs.total_via_edges);
+
+        // Determinism: a second run yields identical per-net via edges
+        // and pair counts.
+        let g2 = build_route_graphs(&db, &tech, &tracks, &join);
+        for (a, b) in graphs.nets.iter().zip(&g2.nets) {
+            assert_eq!(a.via_edges, b.via_edges, "{name}: nondeterministic via edges");
+        }
+        assert_eq!(graphs.via_edges_per_pair, g2.via_edges_per_pair);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Via-edge fixture
+// ---------------------------------------------------------------------------
+
+/// Two-layer stack with `mv12` last so truncating at `"VIA mv12"`
+/// yields the no-via variant. met1 tracks land on {0,1000,2000}, met2
+/// on {0,1500} — (0,0) is the only shared crossing.
+const VIA_FIXTURE_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+LAYER via12
+  TYPE CUT ;
+  WIDTH 0.15 ;
+END via12
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+END met2
+MACRO CELL
+  CLASS CORE ;
+  SIZE 2.0 BY 2.0 ;
+  PIN A
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER met1 ;
+        RECT 0.9 0.9 1.1 1.1 ;
+    END
+  END A
+END CELL
+VIA mv12
+  LAYER via12 ;
+    RECT -0.075 -0.075 0.075 0.075 ;
+  LAYER met1 ;
+    RECT -0.16 -0.13 0.16 0.13 ;
+  LAYER met2 ;
+    RECT -0.13 -0.16 0.13 0.16 ;
+END mv12
+"#;
+
+const VIA_FIXTURE_DEF_HEAD: &str = r#"VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN d ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 4000 4000 ) ;
+ROW ROW_0 unithd 0 0 N DO 8 BY 1 STEP 460 2720 ;
+TRACKS X 0 DO 3 STEP 1000 LAYER met1 ;
+TRACKS Y 0 DO 3 STEP 1000 LAYER met1 ;
+TRACKS X 0 DO 2 STEP 1500 LAYER met2 ;
+TRACKS Y 0 DO 2 STEP 1500 LAYER met2 ;
+"#;
+
+/// `+ VIARULE` generated record — exercises `def_vias` retention
+/// end-to-end through `parse_def_bytes`.
+const VIA_FIXTURE_VIAS: &str = r#"VIAS 1 ;
+- gen + VIARULE r + CUTSIZE 100 100 + LAYERS met1 via12 met2 + CUTSPACING 0 0 + ENCLOSURE 10 10 10 10 ;
+END VIAS
+"#;
+
+const VIA_FIXTURE_DEF_TAIL: &str = r#"COMPONENTS 1 ;
+- u0 CELL + PLACED ( 0 0 ) N ;
+END COMPONENTS
+PINS 1 ;
+- io + NET n1 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 0 0 ) N ;
+END PINS
+NETS 1 ;
+- n1 ( PIN io ) ( u0 A ) + USE SIGNAL ;
+END NETS
+END DESIGN
+"#;
+
+/// Shared-crossing via edges on a synthetic grid: exactly one edge at
+/// (0,0); off-crossing nodes touch none; dropping the met2 guide box
+/// turns the count red; and a LEF with no via def makes (met1, met2)
+/// a named `ViaGap`.
+#[test]
+fn test_via_edge_fixture() {
+    let lef = |with_via: bool| {
+        let text = if with_via {
+            VIA_FIXTURE_LEF
+        } else {
+            &VIA_FIXTURE_LEF[..VIA_FIXTURE_LEF.find("VIA mv12").unwrap()]
+        };
+        let mut interner = StringInterner::new();
+        let mut tech = TechDb::new();
+        parse_lef_bytes(text.as_bytes(), &mut tech, &mut interner).expect("fixture LEF parses");
+        tech.strings = interner.clone();
+        tech.rebuild_maps();
+        tech
+    };
+    let def_text = |with_vias: bool| {
+        format!(
+            "{}{}{}",
+            VIA_FIXTURE_DEF_HEAD,
+            if with_vias { VIA_FIXTURE_VIAS } else { "" },
+            VIA_FIXTURE_DEF_TAIL
+        )
+    };
+
+    let tech = lef(true);
+    let db = parse_def_bytes(def_text(true).as_bytes(), &tech, None).expect("fixture DEF parses");
+    assert_eq!(db.def_vias.len(), 1, "DEF VIAS record not retained");
+
+    let tracks = layer_tracks(&db, &tech);
+    let guide = |text: &str| {
+        let parsed = parse_guides(text, &tech).expect("fixture guide parses");
+        join_guides(&db, &tech, &parsed).expect("fixture join")
+    };
+    let node_xy = |g: &grus_core::drt::graph::NetGraph, id: u32| {
+        let n = g.nodes[id as usize];
+        let lt = &tracks[n.layer.0 as usize];
+        (lt.tracks_x[n.ix as usize], lt.tracks_y[n.iy as usize])
+    };
+
+    // Full guide: exactly one via edge, between the (0,0) nodes.
+    let full = "n1\n(\n0 0 2000 2000 met1\n0 0 2000 2000 met2\n)\n";
+    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(full));
+    assert_eq!(graphs.via_edges_per_pair, vec![1]);
+    assert_eq!(graphs.total_via_edges, 1);
+    let g = &graphs.nets[0];
+    assert_eq!(g.nodes.len(), 9 + 4, "9 met1 + 4 met2 crossings");
+    let e = g.via_edges[0];
+    assert_eq!(node_xy(g, e.lower), (0, 0));
+    assert_eq!(node_xy(g, e.upper), (0, 0));
+
+    // Off-crossing nodes touch no via edge: (met1,1000,1000) is a met1
+    // crossing off every met2 grid line; (met2,1500,1500) vice versa.
+    for &id in &[4usize, 12usize] {
+        assert_eq!(node_xy(g, id as u32), if id == 4 { (1000, 1000) } else { (1500, 1500) });
+        assert!(
+            g.via_edges
+                .iter()
+                .all(|e| e.lower != id as u32 && e.upper != id as u32),
+            "off-crossing node {id} touches a via edge"
+        );
+    }
+
+    // Coverage gate: dropping the met2 box leaves the crossing on the
+    // grid but no upper node → 0 edges; restoring returns 1.
+    let no_met2 = "n1\n(\n0 0 2000 2000 met1\n)\n";
+    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(no_met2));
+    assert_eq!(graphs.total_via_edges, 0, "met2 box dropped must go red");
+    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(full));
+    assert_eq!(graphs.total_via_edges, 1, "restored guide must go green");
+
+    // Table side on the fixture: `mv12` (LEF) + `gen` (DEF VIAS) both
+    // match (met1, met2); dropping `mv12` leaves `gen` the lone
+    // candidate; no defs at all makes the pair a named ViaGap.
+    let table = via_table(&tech, &db).unwrap();
+    assert_eq!(table.pairs[0].candidates.len(), 2);
+    let names: Vec<&str> = table.pairs[0]
+        .candidates
+        .iter()
+        .map(|&i| db.strings.resolve(table.candidates[i as usize].name))
+        .collect();
+    assert_eq!(names, ["mv12", "gen"]);
+
+    let tech_novia = lef(false);
+    let db_bare = parse_def_bytes(def_text(false).as_bytes(), &tech_novia, None)
+        .expect("fixture DEF parses");
+    let table = via_table(&tech_novia, &db_bare).unwrap();
+    assert_eq!(
+        table.gaps,
+        vec![grus_core::drt::via::ViaGap {
+            lower: LayerId(0),
+            upper: LayerId(1)
+        }]
+    );
+    assert!(table.pairs[0].default.is_none());
 }

@@ -9221,3 +9221,72 @@ implication explicitly — class-(b) io-port escapes are unattachable
 under the pure track-crossing model; the via-model ticket must add
 an attachment fallback. `cargo test -p grus-core --test drt` 9/9
 green.
+
+### 2026-11-23 — e6-drt-via: via candidate table + layer-transition edges (v0.12.3)
+
+`drt::via` landed: `via_table` expands every LEF `VIA` def
+(`tech.via_defs`) and every resolvable DEF `VIAS` record
+(`db.def_vias` — newly retained at read: `+ VIARULE` records keep
+`GeneratedViaGeom`, `+ VIA <lef>` records resolve through
+`via_by_name` and keep `ViaGeom::Lef` under their DEF name, inline
+`+ RECT` records stay unretained) into origin-relative
+`ViaCandidate.rects` via `drc::geom::expand_via`, grouped per
+adjacent routing-layer pair with named `ViaGap`/`UnmatchedVia`
+findings and a `default` pick ranked
+`(nonpref_metal, area_dbu2, declaration order)`. `drt::graph` emits
+`ViaEdge{lower,upper}` per net wherever a lower node's physical
+`(x,y)` hits both upper track lists *and* a covered upper pair — the
+strict shared-crossing rule; ≤1 edge per coordinate per pair,
+deterministic emission, per-pair totals in
+`via_edges_per_pair`. `DefViaDef`/`DesignDb::def_vias` added;
+candidate names intern into `db.strings` (a `SymbolId` from the DEF
+record is *not* resolvable through `tech.strings` — the
+`tests/drt.rs` helpers resolve accordingly).
+
+**Candidate table** (`test_via_candidate_table`): `gaps`=0,
+`unmatched`=0, 29 candidates = 25 LEF + 4 DEF, per-pair {5,6,6,6,6}
+on both designs. Reference join (`<d>.drt.reference.json`
+`vias_per_cut_layer` grouped by `via_names_meaning`):
+
+| pair | cut | candidates | default | ref majority | ref total (gcd / picorv32) |
+|---|---|---|---|---|---|
+| li1–met1 | mcon | 5 | `L1M1_PR` | `L1M1_PR_MR` — name-only divergence, rects asserted identical | 884 / 26,365 |
+| met1–met2 | via | 6 | `M1M2_PR` | `M1M2_PR` | 883 / 31,789 |
+| met2–met3 | via2 | 6 | `M2M3_PR` | `M2M3_PR` | 28 / 1,784 |
+| met3–met4 | via3 | 6 | `M3M4_PR` | `M3M4_PR` | 2 / 90 |
+| met4–met5 | via4 | 6 | `M4M5_PR` | unobserved (policy-only pick) | 0 / 0 |
+
+**Via-edge census** (`test_via_edge_census`, exact per-pair rows
+pinned): gcd {13,292, 375, **0**, 2, 0} = 13,669; picorv32 {395,479,
+13,961, **0**, 47, 0} = 409,487. Every edge verified adjacent-layer
+same-coordinate. Two named zeros:
+
+- **met2–met3 — edge-domain tech gap**: met2's DEF grids are
+  `230+460k` ≡10 (mod 20), met3's are `340+680k` ≡0 (mod 20) — the
+  coordinate sets are disjoint, no shared crossing exists on the die.
+  The reference still places 28/1,784 `via2` instances, so the router
+  needs an offset-snap rule before this pair routes; recorded, not
+  worked around.
+- **met4–met5**: shared crossings exist (both ≡20 mod 40; `x=y=39100`
+  is on gcd's grid) but zero guide-covered node pairs on either
+  design — a coverage gap, not a grid gap.
+
+**Fail-proof** (`test_via_edge_fixture`, synthetic LEF/DEF — no real
+inputs): a lower-layer node whose `(x,y)` is not on the upper grids
+gets no via edge; a coordinate on both grids but outside the guide
+gets none either; a true shared covered crossing gets exactly one.
+Unit tests in `drt/via.rs` cover triple-matching/`UnmatchedVia`/
+`ViaGap`, the ranking (preferred-aligned beats rotated, file order
+breaks rect-identical ties), and a generated `+ VIARULE` record's
+cut-array rects.
+
+**Checks run**: `cargo test -p grus-core --lib` (via + graph units),
+`cargo test -p grus-core --test drt` (12/12 — the nine pre-existing
+plus `test_via_candidate_table`, `test_via_edge_census`,
+`test_via_edge_fixture`), `cargo test --workspace`, `cargo clippy
+--workspace --all-targets -- -D warnings`. Determinism: the census
+test double-builds and `test_graph_determinism` now pins
+`total_via_edges`/`via_edges_per_pair` across runs.
+`picorv32.placed.def` already present (gitignored artifact).
+Version `0.12.2 → 0.12.3` (feature, patch on 0.x). No commit per
+ticket instruction.

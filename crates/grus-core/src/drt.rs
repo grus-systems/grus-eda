@@ -3,8 +3,10 @@
 //! names preferred-axis gaps; `access` enumerates the candidate
 //! attachment points of every signal-net member pin on that grid;
 //! `graph` turns per-net guide boxes into the guide-bounded
-//! track-crossing graph the maze search walks.
+//! track-crossing graph the maze search walks; `via` enumerates the
+//! adjacent-pair candidate defs and names each pair's default pick.
 
 pub mod access;
 pub mod graph;
 pub mod tracks;
+pub mod via;

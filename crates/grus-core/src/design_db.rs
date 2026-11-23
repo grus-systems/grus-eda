@@ -136,6 +136,22 @@ pub struct PdnVia {
     pub y_dbu: i32,
 }
 
+/// A resolved DEF `VIAS` record: `+ VIARULE` generated vias keep
+/// their geometry params; `+ VIA <lef>` aliases resolve to
+/// `ViaGeom::Lef`. `+ RECT`/`+ POLYGON` inline records and `+ VIA`
+/// names the LEF does not define store nothing — name-reference
+/// errors stay lazy on the wire-resolution path.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DefViaDef {
+    /// DEF-spelled name.
+    pub name: SymbolId,
+    pub lower: LayerId,
+    pub upper: LayerId,
+    pub cut: SymbolId,
+    pub cut_count: u32,
+    pub geom: ViaGeom,
+}
+
 /// Routed shapes of one `NETS` net — same shape vocabulary `PdnNet`
 /// proved for SPECIALNETS.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -169,6 +185,11 @@ pub struct DesignDb {
     /// per DEF net name.
     #[serde(default)]
     pub pdn_nets: Vec<PdnNet>,
+    /// DEF `VIAS` defs in record order — the via candidate table's
+    /// second source (`drt::via`). Inline `+ RECT`/`+ POLYGON` records
+    /// store nothing.
+    #[serde(default)]
+    pub def_vias: Vec<DefViaDef>,
 
     // --- Cell SoA (indexed by CellId) ---
     pub cell_names: Vec<SymbolId>,

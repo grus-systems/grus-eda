@@ -805,6 +805,18 @@ surface, from the first large-design run's feedback
   per design (gcd 17, picorv32 592; both are the guide/shape-holds-no-
   crossing class, verified per-pin). Remaining: via/layer-transition
   model (needs LEF `VIA` geometry), costs/legality, maze search.
+- Progress 2026-11-23 (`v0.12.3`, ticket `e6-drt-via`): the
+  layer-transition model — `drt::via`'s `ViaTable` (25 LEF `VIA` defs
+  + 4 resolvable DEF `VIAS` records now retained as `db.def_vias`;
+  {5,6,6,6,6} candidates/pair, named `ViaGap`/`UnmatchedVia`, policy
+  default = `nonpref_metal → area → file order`, matching the
+  reference majority on `via`/`via2`/`via3`; `mcon` diverges by name
+  only — `L1M1_PR`/`L1M1_PR_MR` are rect-identical) and `drt::graph`'s
+  `ViaEdge`s at same-`(x,y)` crossings covered on both layers (gcd
+  13,669 / picorv32 409,487, pinned rows, deterministic). Named gap:
+  met2–met3's grids are disjoint mod-20 domains — zero shared
+  crossings, needs an offset-snap rule before routing. Remaining:
+  io-port attachment fallback, costs/legality, maze search.
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset

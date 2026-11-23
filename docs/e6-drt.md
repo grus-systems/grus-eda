@@ -142,17 +142,29 @@ attachment partition. Access points and route nodes are *not*:
 
 The route graph is *not*:
 
-- **Via edges / layer transitions** — the via model is the next
-  ticket's; via selection needs LEF `VIA` geometry, which the readers
-  do not yet surface.
 - **Costs or direction legality** — both axes are offered on every
   layer (`RouteEdge.axis` records which); preferred-direction legality
   and cost assignment are the maze router's concern.
 - **DRC/OBS-pruned** — the region is purely guide-defined; no node is
-  dropped for spacing or blockage overlap.
+  dropped for spacing or blockage overlap. Via edges are likewise
+  geometric only (§6): a shared crossing plus guide coverage, not a
+  DRC-clean transition.
 - **A reproduction of TritonRoute's `FlexGridGraph`** — this is a
   substrate the later search walks, checked by census, not by graph
   diff against the reference implementation.
+
+The via model (§6) is *not*:
+
+- **DRC-aware selection** — `ViaPair::default` is a declared policy
+  pick (preferred-direction alignment → area → file order), not a
+  per-site legality check; every candidate is retained for the later
+  cost model.
+- **Stacked/multi-hop transitions** — only one-cut adjacent edges are
+  emitted; stacked vias are the search composing them.
+- **A reference-via reproduction** — the reference join names the
+  majority via per cut layer as evidence for the policy, not a target
+  to match (the `mcon` pick is a documented name-only divergence on
+  rect-identical candidates).
 
 ## 5. Guide-bounded track graph
 
@@ -217,7 +229,101 @@ pinned gcd set is asserted by name in `tests/drt.rs`.
 
 Router implication: class-(b) escapes are *unattachable* under the
 pure track-crossing model — the io port square holds no node at all,
-so the maze search cannot reach them. The via-model ticket must add
-an attachment fallback for these ports (an off-crossing tap on the
-port's own met2 rect, or honoring the reference DEF's port via), or
-every io-port net stays unroutable — recorded, not worked around.
+so the maze search cannot reach them. The via model (§6) did not add
+an attachment fallback; these ports still need an off-crossing tap on
+the port's own met2 rect (or honoring the reference DEF's port via),
+or every io-port net stays unroutable — recorded, not worked around.
+
+## 6. Via model
+
+`drt::via` builds the per-design `ViaTable` and `drt::graph` emits
+`ViaEdge`s — the layer-transition half of the substrate.
+
+**Candidate table** (`via_table`): every LEF `VIA` in
+`tech.via_defs` (file order) then every resolvable DEF `VIAS` record
+in `db.def_vias` (record order) is expanded at the origin by
+`drc::geom::expand_via` into `ViaCandidate.rects` — the same geometry
+the DRC walkers price — plus its total painted `area_dbu2`. The DEF
+reader now retains those records: `+ VIARULE` generated records keep
+their `GeneratedViaGeom`; `+ VIA <lef>` records resolve through
+`tech.via_by_name` and keep `ViaGeom::Lef` under their DEF name;
+`+ RECT` inline records stay unresolvable and are not retained (same
+lazy-error semantics as wire resolution). A def whose `(lower,
+upper)` is an adjacent pair joins `pairs[lower]`; any other span is a
+named `UnmatchedVia`, and a pair with zero candidates is a named
+`ViaGap` — sky130 has neither on real inputs (all 25 LEF defs land on
+adjacent pairs; the placed DEFs' four generated records add one each
+to met1–met2 … met4–met5).
+
+**Default policy** (`ViaPair::default`): `min` by
+`(nonpref_metal, area_dbu2, declaration order)` — first the count of
+metal rects elongated *against* their layer's preferred direction
+(the techlef's `PR`/`PR_R`/`PR_M`/`PR_MR` naming encodes which metals
+ride the preferred direction), then total painted area, then file
+order. This is a declared pick, not DRC-driven selection; every
+candidate stays in the table for the later cost model.
+
+**Reference join** (the census test deserializes
+`<d>.drt.reference.json` and groups `vias_per_cut_layer` by the
+file's `via_names_meaning` mapping): sky130 picks `M1M2_PR`,
+`M2M3_PR`, `M3M4_PR` on `via`/`via2`/`via3` — the policy's pick on
+all three. On `mcon` the reference majority is `L1M1_PR_MR` while the
+policy picks `L1M1_PR`: the two candidates are **rect-for-rect
+identical** (asserted in `test_via_candidate_table`), so the
+divergence is name-only — the reference's rotated-name twin is the
+same painted geometry. `via4` has candidates but zero reference
+instances on both designs; its `M4M5_PR` pick is policy-only,
+unobserved.
+
+| pair | cut | candidates | default | ref majority | ref total |
+|---|---|---|---|---|---|
+| li1–met1 | mcon | 5 | `L1M1_PR` | `L1M1_PR_MR` (name-only) | 884 / 26,365 |
+| met1–met2 | via | 6 | `M1M2_PR` | `M1M2_PR` | 883 / 31,789 |
+| met2–met3 | via2 | 6 | `M2M3_PR` | `M2M3_PR` | 28 / 1,784 |
+| met3–met4 | via3 | 6 | `M3M4_PR` | `M3M4_PR` | 2 / 90 |
+| met4–met5 | via4 | 6 | `M4M5_PR` | unobserved | 0 / 0 |
+
+(ref totals: gcd / picorv32; the met1–met2 row groups `M1M2_PR` and
+`M1M2_PR_MR`, both present in the reference.)
+
+**Via edges** (`NetGraph::via_edges`): a `ViaEdge{lower, upper}`
+joins node `(l, ix, iy)` to node `(l+1, jx, jy)` iff the lower node's
+physical `(x, y)` binary-search-hits *both* upper track lists and the
+resulting `(jx, jy)` is a covered upper pair — the same coordinate a
+track crossing on both layers *and* guide-covered on both.
+Non-preferred-axis tracks count: every coordinate in a layer's
+`tracks_x`/`tracks_y` is a real grid line. Each lower node emits ≤1
+edge and distinct coordinates map to distinct upper nodes, so ≤1 via
+edge exists per coordinate per pair. Emission is deterministic
+(adjacent pair ascending → lower node order) and geometric only — no
+`ViaTable` is consulted: edges are the shared-crossing evidence,
+candidate legality/pricing is the router's join. Per-pair totals land
+in `RouteGraphs::via_edges_per_pair`.
+
+**Census** (`test_via_edge_census`, pinned per design):
+
+| pair | gcd | picorv32 |
+|---|---|---|
+| li1–met1 | 13,292 | 395,479 |
+| met1–met2 | 375 | 13,961 |
+| met2–met3 | 0 | 0 |
+| met3–met4 | 2 | 47 |
+| met4–met5 | 0 | 0 |
+| **total** | **13,669** | **409,487** |
+
+Two named zeros. **met2–met3 is an edge-domain tech gap**: met2's
+DEF grids are `230 + 460k` (≡10 mod 20) on both axes while met3's are
+`340 + 680k` (≡0 mod 20) — the coordinate sets are disjoint, so *no*
+shared crossing exists anywhere on the die; `M2M3_PR` vias are
+legal on track-adjacent geometry the strict crossing rule cannot see.
+The router will need an offset-snap rule (TritonRoute places `via2`
+freely — the reference has 28/1,784 instances) before this pair can
+route; recorded, not worked around. **met4–met5** has shared
+crossings (both ≡20 mod 40; e.g. `x = y = 39100` on gcd's grid) but
+zero guide-covered node pairs on both designs — a coverage gap, not
+a grid gap.
+
+**Fixture** (`test_via_edge_fixture`, synthetic LEF/DEF): a node
+present on the lower layer only — same `(x,y)` fails the upper
+track-list search — gets no via edge, and a coordinate shared by both
+grids but outside the guide gets none either; the gate asserts both.
