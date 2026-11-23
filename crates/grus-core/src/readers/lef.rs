@@ -1,7 +1,7 @@
 use crate::interner::{LayerId, MacroId, PinDir, StringInterner};
 use crate::tech_db::{
-    CutLayer, LayerDir, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer, TechDb, ViaDef,
-    ViaLayerRect, ViaRectLayer,
+    CutLayer, LayerDir, LefTrackRecord, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer,
+    TechDb, ViaDef, ViaLayerRect, ViaRectLayer,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -258,6 +258,8 @@ pub fn parse_lef_bytes(
             count_skip(&mut report, word);
         } else if word.eq_ignore_ascii_case("VIA") {
             parse_via(&mut lexer, tech_db, interner)?;
+        } else if word.eq_ignore_ascii_case("TRACKS") {
+            parse_tracks(&mut lexer, tech_db)?;
         } else if word.eq_ignore_ascii_case("VIARULE")
             || word.eq_ignore_ascii_case("NONDEFAULTRULE")
         {
@@ -278,7 +280,135 @@ pub fn parse_lef_bytes(
         }
     }
 
+    expand_tracks(tech_db, interner)?;
     Ok(report)
+}
+
+/// `TRACKS {X|Y} start DO n STEP s [LAYER l]+ ;` — raw µm values into
+/// `TechDb::lef_track_records`; expansion to DBU happens in
+/// `expand_tracks` once the whole file is read (the record may precede
+/// `UNITS` and the `LAYER` it names). A record without `LAYER` applies
+/// to every routing layer.
+fn parse_tracks(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
+    let axis = required_word(lexer, "TRACKS axis")?;
+    let is_x = if axis.eq_ignore_ascii_case("X") {
+        true
+    } else if axis.eq_ignore_ascii_case("Y") {
+        false
+    } else {
+        bail!(
+            "LEF line {}: TRACKS axis must be X or Y, found `{axis}`",
+            lexer.line()
+        );
+    };
+    let start_um = required_f32(lexer, "TRACKS start")?;
+    let do_kw = required_word(lexer, "TRACKS")?;
+    if !do_kw.eq_ignore_ascii_case("DO") {
+        bail!(
+            "LEF line {}: TRACKS expects `DO <n> STEP <s>`, found `{do_kw}`",
+            lexer.line()
+        );
+    }
+    let count = required_i32(lexer, "TRACKS count")?;
+    if count < 0 {
+        bail!(
+            "LEF line {}: TRACKS count {count} is negative",
+            lexer.line()
+        );
+    }
+    let step_kw = required_word(lexer, "TRACKS")?;
+    if !step_kw.eq_ignore_ascii_case("STEP") {
+        bail!(
+            "LEF line {}: TRACKS expects `STEP <s>`, found `{step_kw}`",
+            lexer.line()
+        );
+    }
+    let step_um = required_f32(lexer, "TRACKS step")?;
+
+    let mut layers = Vec::new();
+    match lexer.next_token() {
+        Some(Token::Semi) => {}
+        Some(Token::Word(w)) if w.eq_ignore_ascii_case("LAYER") => {
+            // One or more layer names up to `;` (the plural form the DEF
+            // reader also accepts). MASK/SAMEMASK or any other keyword is
+            // malformed here, not skipped.
+            loop {
+                match lexer.next_token() {
+                    Some(Token::Semi) => break,
+                    Some(Token::Word(w)) => layers.push(w.to_string()),
+                    other => bail!(
+                        "LEF line {}: TRACKS LAYER expects layer names terminated by `;`, found {other:?}",
+                        lexer.line()
+                    ),
+                }
+            }
+        }
+        other => bail!(
+            "LEF line {}: TRACKS expects `;` or `LAYER <name>... ;`, found {other:?}",
+            lexer.line()
+        ),
+    }
+
+    tech_db.lef_track_records.push(LefTrackRecord {
+        is_x,
+        start_um,
+        count: count as u32,
+        step_um,
+        layers: (!layers.is_empty()).then_some(layers),
+        line: lexer.line(),
+    });
+    Ok(())
+}
+
+/// Expands the buffered `TRACKS` records into `RoutingLayer::tracks_{x,y}`:
+/// `start`/`step` round to DBU first (the `pitch_dbu`/`offset_dbu`
+/// convention), then `coord[k] = x0 + k·s`. An unknown layer name is an
+/// error — deliberately stricter than the DEF reader, which drops unknown
+/// `TRACKS` layers silently.
+fn expand_tracks(tech_db: &mut TechDb, interner: &StringInterner) -> Result<()> {
+    if tech_db.lef_track_records.is_empty() {
+        return Ok(());
+    }
+    let dbu = tech_db.dbu_per_micron as f32;
+    let routing_count = tech_db.routing_layers.len();
+    for rec in std::mem::take(&mut tech_db.lef_track_records) {
+        let x0 = (rec.start_um * dbu).round() as i32;
+        let s = (rec.step_um * dbu).round() as i32;
+        let targets: Vec<LayerId> = match &rec.layers {
+            None => (0..routing_count as u8).map(LayerId).collect(),
+            Some(names) => {
+                let mut ids = Vec::with_capacity(names.len());
+                for name in names {
+                    let lid = interner
+                        .get(name)
+                        .and_then(|sym| tech_db.layer_by_name.get(&sym).copied());
+                    match lid {
+                        Some(lid) => ids.push(lid),
+                        None => bail!(
+                            "LEF line {}: TRACKS references layer `{name}`, which is not a routing layer",
+                            rec.line
+                        ),
+                    }
+                }
+                ids
+            }
+        };
+        for lid in targets {
+            let list = if rec.is_x {
+                &mut tech_db.routing_layers[lid.0 as usize].tracks_x
+            } else {
+                &mut tech_db.routing_layers[lid.0 as usize].tracks_y
+            };
+            list.extend((0..rec.count as i32).map(|k| x0 + k * s));
+        }
+    }
+    for layer in &mut tech_db.routing_layers {
+        layer.tracks_x.sort_unstable();
+        layer.tracks_x.dedup();
+        layer.tracks_y.sort_unstable();
+        layer.tracks_y.dedup();
+    }
+    Ok(())
 }
 
 fn parse_units(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
@@ -573,6 +703,8 @@ fn parse_layer(
             pitch_dbu,
             width_dbu,
             offset_dbu,
+            tracks_x: Vec::new(),
+            tracks_y: Vec::new(),
             res_per_sq,
             cap_per_sq_um,
             edge_cap_per_um,
@@ -1956,5 +2088,119 @@ END LIBRARY
             .routing_layers
             .iter()
             .all(|l| l.area_dbu2 == 0 && l.min_enclosed_area_dbu2 == 0));
+    }
+
+    /// Two routing layers so the bare/`LAYER a b` forms are observable.
+    const TRACKS_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+END met2
+"#;
+
+    fn tracks_db(lef: &str) -> TechDb {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(lef.as_bytes(), &mut db, &mut interner).expect("TRACKS LEF must parse");
+        db
+    }
+
+    #[test]
+    fn test_tracks_xy_expand() {
+        let lef = format!(
+            "{TRACKS_LEF}TRACKS X 0.17 DO 3 STEP 0.34 LAYER met1 ;\n\
+             TRACKS Y 0.23 DO 2 STEP 0.46 LAYER met1 ;\n\
+             END LIBRARY\n"
+        );
+        let db = tracks_db(&lef);
+        assert_eq!(db.routing_layers[0].tracks_x, vec![170, 510, 850]);
+        assert_eq!(db.routing_layers[0].tracks_y, vec![230, 690]);
+        assert!(db.routing_layers[1].tracks_x.is_empty());
+    }
+
+    /// `LAYER a b` (plural) hits both named layers; a record with no
+    /// `LAYER` at all lands on every routing layer.
+    #[test]
+    fn test_tracks_multi_layer_and_bare() {
+        let lef = format!(
+            "{TRACKS_LEF}TRACKS X 0.1 DO 2 STEP 0.2 LAYER met1 met2 ;\n\
+             TRACKS Y 0.05 DO 1 STEP 0.5 ;\n\
+             END LIBRARY\n"
+        );
+        let db = tracks_db(&lef);
+        for layer in &db.routing_layers {
+            assert_eq!(layer.tracks_x, vec![100, 300]);
+            assert_eq!(layer.tracks_y, vec![50]);
+        }
+    }
+
+    /// Overlapping records merge into one sorted, deduplicated list.
+    #[test]
+    fn test_tracks_dedup_and_sort() {
+        let lef = format!(
+            "{TRACKS_LEF}TRACKS X 0.5 DO 2 STEP 0.2 LAYER met1 ;\n\
+             TRACKS X 0.1 DO 3 STEP 0.2 LAYER met1 ;\n\
+             END LIBRARY\n"
+        );
+        let db = tracks_db(&lef);
+        assert_eq!(db.routing_layers[0].tracks_x, vec![100, 300, 500, 700]);
+    }
+
+    /// A `TRACKS` record ahead of `UNITS` still expands at the declared
+    /// scale — expansion is deferred to end of file.
+    #[test]
+    fn test_tracks_before_units() {
+        let lef = r#"
+TRACKS X 0.1 DO 1 STEP 0.1 ;
+UNITS
+  DATABASE MICRONS 2000 ;
+END UNITS
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+END LIBRARY
+"#;
+        let db = tracks_db(lef);
+        assert_eq!(db.routing_layers[0].tracks_x, vec![200]);
+    }
+
+    #[test]
+    fn test_tracks_unknown_layer_errors() {
+        let lef = format!("{TRACKS_LEF}TRACKS X 0.1 DO 1 STEP 0.1 LAYER foo ;\n");
+        let msg = lef_error(&lef);
+        assert!(msg.contains("TRACKS") && msg.contains("foo"), "{msg}");
+    }
+
+    #[test]
+    fn test_tracks_malformed_errors() {
+        for needle in [
+            "TRACKS X 0.1 DO 1 LAYER met1 ;",          // missing STEP
+            "TRACKS X 0.1 1 STEP 0.1 LAYER met1 ;",    // missing DO
+            "TRACKS X abc DO 1 STEP 0.1 LAYER met1 ;", // non-numeric start
+            "TRACKS X 0.1 DO 1 STEP 0.1 MASK 3 LAYER met1 ;", // MASK token
+            "TRACKS Q 0.1 DO 1 STEP 0.1 LAYER met1 ;", // bad axis
+        ] {
+            let lef = format!("{TRACKS_LEF}{needle}\nEND LIBRARY\n");
+            let msg = lef_error(&lef);
+            assert!(msg.contains("TRACKS"), "`{needle}` → {msg}");
+        }
     }
 }

@@ -1915,6 +1915,8 @@ mod tests {
                 pitch_dbu: 100,
                 width_dbu: 100,
                 offset_dbu: 0,
+                tracks_x: Vec::new(),
+                tracks_y: Vec::new(),
                 res_per_sq: res,
                 cap_per_sq_um: 0.001,
                 edge_cap_per_um: 5e-5,

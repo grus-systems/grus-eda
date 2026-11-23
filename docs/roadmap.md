@@ -786,6 +786,15 @@ surface, from the first large-design run's feedback
   gcd −1.76% wirelength / +10 vias / 0 antenna; picorv32 −2.11%
   wirelength / +1,279 vias / antenna 38 → 30. JSON byte-reproduces on
   rerun outside the `timing` block. See `docs/results.md` 2026-11-23.
+- Progress 2026-11-23 (`v0.12.1`, ticket `e6-drt-tracks`): the on-grid
+  substrate landed — LEF `TRACKS` parse into `RoutingLayer.tracks_{x,y}`,
+  `drt::tracks` merges the DEF `TRACKS` grids (sky130's techlef declares
+  none — grid is DEF-sourced) with named preferred-axis `TrackGap`s, and
+  `drt::access` enumerates candidate access points per signal-net member
+  pin — census green on both designs (off_track=0, no_shapes=0), fail-
+  proofs recorded. Next tickets: the maze/grid graph this substrate
+  feeds (this ticket is substrate-only — no routing, vias, TA, or
+  DRC-aware pruning).
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset
