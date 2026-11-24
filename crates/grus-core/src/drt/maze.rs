@@ -213,8 +213,10 @@ pub struct RouteDb {
     pub hole_residuals: Vec<HoleResidual>,
     /// Pins that got no legal paint — the `Unattachable` census
     /// (`pin-access.md` r3 semantics: projected stubs suppressed by
-    /// hull confinement plus access arcs blocked by live occupancy;
-    /// every entry maps to an `unrouted` net).
+    /// hull confinement plus access arcs blocked by live occupancy).
+    /// Collected across all iterations: every `Unattachable` pin of
+    /// an `unrouted` net appears here, alongside pins of nets that
+    /// re-attached on a later pass.
     pub stub_outside_cover: Vec<(NetId, PinId)>,
 }
 
@@ -1632,8 +1634,10 @@ enum NetOutcome {
         /// diagnostic (`pin-access.md` r3): projected stubs
         /// suppressed by hull confinement plus access arcs blocked
         /// by live occupancy. `route_nets` collects them into
-        /// `RouteDb::stub_outside_cover`; every entry maps to an
-        /// `unrouted` net.
+        /// `RouteDb::stub_outside_cover` across all iterations, so a
+        /// net that re-attaches on a later pass keeps its record —
+        /// every final `Unattachable` pin appears there, but not
+        /// every recorded pin belongs to an `unrouted` net.
         stub_blocked: Vec<PinId>,
     },
 }
@@ -2608,6 +2612,7 @@ enum AttachElem {
 /// named residuals; `Reject` asks the caller to drop `pin`'s
 /// committed attach element (`src`-tagged paint) and re-attach it on
 /// the next candidate.
+#[derive(Debug)]
 enum ClosureResult {
     Done {
         fills: Vec<(LayerId, RectDbu)>,
@@ -3209,6 +3214,15 @@ fn try_fill(
                 // Inside a foreign hull: never legal.
                 None => blockers.push(hull),
                 Some(rs) => {
+                    // Host-open layers (`hull_host_open_layer`) leave the
+                    // whole member-hull interior legal — the legality rule
+                    // `rect_allowed` applies here too, so the uncovered-part
+                    // carve is li1-strict only. Carving it on met1 produced
+                    // fills that stopped short of the prongs' facing band —
+                    // exactly the residual notch Magic then flags.
+                    if mask.host_open(l) {
+                        continue;
+                    }
                     let fin = RectDbu::new(
                         gap.xl.max(hull.xl),
                         gap.yl.max(hull.yl),
@@ -4741,6 +4755,121 @@ mod tests {
         assert_eq!(
             fills,
             vec![(LayerId(0), RectDbu::new(499, 930, 601, 1070))],
+        );
+    }
+
+    /// `self-spacing.md`'s Reject arm: an unfillable notch on a prong
+    /// carrying droppable attach paint rejects that element (smallest
+    /// `Ord` first — `ProjStub` before `Access`) so the pin retries
+    /// its next candidate, instead of naming a residual.
+    #[test]
+    fn test_closure_reject_droppable() {
+        let tech = toy_tech();
+        let db = DesignDb::new();
+        let g = NetGraph {
+            net: NetId(0),
+            nodes: vec![],
+            edges: vec![],
+            via_edges: vec![],
+            pin_nodes: vec![],
+        };
+        let mut occ = toy_occ(&tech);
+        // Foreign committed metal walls the [500,600]×[930,1070] gap —
+        // every `try_fill` slab loses it to `fill_blocked`.
+        occ.rasterize(
+            &toy_tracks(),
+            0,
+            &RectDbu::new(500, 930, 600, 1070),
+            Occupant::Net(9),
+            None,
+        );
+        let mask = HullMask::new(&db, &tech);
+        let cover = PinCover::new();
+        let vias = ViaTable::default();
+        let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+            BTreeMap::new();
+        hlines.insert(
+            (0, 1000),
+            vec![(0, 500, PaintSrc::ProjStub(0)), (600, 1100, PaintSrc::Access(1))],
+        );
+        let res = close_self_spacing(
+            &db,
+            &tech,
+            &g,
+            &occ,
+            &mask,
+            &cover,
+            &vias,
+            &hlines,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        let ClosureResult::Reject { pin, src } = res else {
+            panic!("a droppable prong on a blocked notch must Reject: {res:?}");
+        };
+        assert_eq!(
+            (pin, src),
+            (0, PaintSrc::ProjStub(0)),
+            "the smaller blast radius goes back first"
+        );
+    }
+
+    /// The undroppable arm: `Tree`/`PinShape` prongs over a walled
+    /// gap cannot reject — the site lands named in
+    /// `residuals.notches`, the census a Magic `*.2` finding maps
+    /// back to (`self-spacing.md`, `residuals.md` §5).
+    #[test]
+    fn test_closure_notch_residual() {
+        let tech = toy_tech();
+        let db = DesignDb::new();
+        let g = NetGraph {
+            net: NetId(0),
+            nodes: vec![],
+            edges: vec![],
+            via_edges: vec![],
+            pin_nodes: vec![],
+        };
+        let mut occ = toy_occ(&tech);
+        occ.rasterize(
+            &toy_tracks(),
+            0,
+            &RectDbu::new(500, 930, 600, 1070),
+            Occupant::Net(9),
+            None,
+        );
+        let mask = HullMask::new(&db, &tech);
+        let cover = PinCover::new();
+        let vias = ViaTable::default();
+        let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+            BTreeMap::new();
+        hlines.insert(
+            (0, 1000),
+            vec![(0, 500, PaintSrc::Tree), (600, 1100, PaintSrc::PinShape(0))],
+        );
+        let res = close_self_spacing(
+            &db,
+            &tech,
+            &g,
+            &occ,
+            &mask,
+            &cover,
+            &vias,
+            &hlines,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        let ClosureResult::Done { fills, residuals } = res else {
+            panic!("no droppable prong exists — must be Done");
+        };
+        assert!(fills.is_empty(), "a walled gap must not fill: {fills:?}");
+        assert_eq!(
+            residuals.notches,
+            vec![NotchResidual {
+                net: NetId(0),
+                layer: LayerId(0),
+                a: RectDbu::new(0, 930, 500, 1070),
+                b: RectDbu::new(600, 930, 1100, 1070),
+            }]
         );
     }
 

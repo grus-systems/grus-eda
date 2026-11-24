@@ -670,8 +670,13 @@ geometry), `drc::geom::assemble` builds the full picture (our signal
 geometry + the template's PDN stripes + macro pins/OBS + io rects),
 and `drc::report::run_all` applies the same 50-rule `lef_expressible`
 subset `tests/drc.rs` puts on TritonRoute's routed DEFs at 0
-findings. The claim boundary of §4 stands: this is our subset on our
-DEF; the full Magic deck check on our routed DEF is `e6-drt-e2e`.
+findings. Measured scope: the spacing family compares *connectivity
+islands* — same-net touching paint merges into one component, so a
+sub-spacing concavity between prongs bridged elsewhere in the island
+is invisible to it while Magic `drc(full)` measures edge-to-edge
+inside the island (the r5 `met1.2` class, closed at emit — see §9).
+The claim boundary of §4 stands: this is our subset on our DEF; the
+full Magic deck check on our routed DEF is `e6-drt-e2e`.
 
 **CLI** — the delegation path's native replacement:
 
@@ -690,3 +695,43 @@ component), the informational `wirelength_um` + `via.<cut>`
 deltas vs `variants.delegated`/`baseline`, and — under `--self-drc`
 — the re-parse→assemble→`run_all` verdict. The CLI reports and
 never exits nonzero on findings; the gate is `tests/drt.rs`.
+
+## 9. End-to-end Magic gate (`e6-drt-e2e`)
+
+`tests/designs/check_drt_ours.sh <d>` scores the committed
+`<d>.drt.ours.routed.def` with Magic `drc(full)` inside the pinned
+LibreLane container — the full 278-statement deck, not our 50-rule
+subset — and assembles `<d>.drt.ours.reference.json`: per-rule
+`lef_expressible`/`magic_only`/`unclassified` decompositions across
+{our DEF, the placed baseline, TritonRoute's routed reference}, a
+`sanity_control` mutation arm, the `ours_router` emit census
+(including `cli_lines` evidence), `def_metrics`, `delta` vs both
+references, and OpenROAD antenna counts. `generate_drt_ours.sh <d>
+--verify` double-emits and byte-compares.
+
+**gcd outcome** (numbers in `docs/results.md`): `lef_expressible` =
+0 on all 50 rules — trajectory ~3025 → 847 → 514 → 317 → 0, the
+last hop a `try_fill` mask-decomposition fix (the `met1.2` 32-fragment
+residual: fills stopped short of the facing band because the li1-strict
+uncovered-cover carve ran on `hull_host_open` met1; skipping it on
+host-open layers closed all 7 sites and the `_099_` notch residual).
+`magic_only` rows are the inherited cell-master nwell paint
+(6/120/300, identical on every input); `unclassified_fired` empty;
+antenna 0. `unrouted=81` — the golden's `ours_router.unrouted` is
+the pinned list; `notch_fills=343`, all residual vectors empty.
+Mechanisms: `kurena/tasks/e6-drt-e2e/design/`.
+
+**picorv32** — leg deferred (r4/r5 memo): no golden commits;
+`test_e2e_ours_reference_picorv32` is `#[ignore]`d with the same
+joins ready.
+
+**Test gate** (`tests/drt.rs`): `test_e2e_ours_reference_gcd` joins
+the golden to the `drc.reference.json` taxonomy — strict
+`ours == placed` per unpinned `lef_expressible` rule, the
+`PINNED_LEF_RESIDUALS` mechanism (currently empty) for named
+residuals, `magic_only` all-inherited, the two-name unclassified
+allowlist, the sanity-control liveness asserts, the
+`cli_lines`-evidence census joins, and the viability floor
+(`signal_nets_routed == routed == nets_in_def − unrouted_count`).
+`test_e2e_ours_def_deterministic_gcd` byte-compares a fresh emit to
+the committed DEF.
