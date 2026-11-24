@@ -1,5 +1,9 @@
 # e6-drt-e2e — `<d>.drt.ours.reference.json` schema (r4)
 
+> **r7 status — unchanged at `5d1502b`.** The alias refactor
+> (`LineNodes`/`PaintLines`) emits identical bytes; the committed
+> golden below remains the one fresh `check_drt_ours.sh gcd` output.
+>
 > **r6 status — LANDED, schema unchanged.** The committed
 > `gcd.drt.ours.reference.json` is one fresh full
 > `check_drt_ours.sh gcd` run's step-E output inside the pinned image

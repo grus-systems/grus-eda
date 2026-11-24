@@ -1,5 +1,8 @@
 # e6-drt-e2e — met1.2 residual attribution (r5, the memo's central item)
 
+> **r7 note — unchanged at `5d1502b`** (alias refactor only; the X3
+> fix and all-0 outcome stand).
+>
 > **r6 outcome — RESOLVED, X3 arm fired.** `who6.tcl` (site D) +
 > `who7.tcl` (site E) ran in-container per §3: `drc why` names
 > `met1.2`, the flattened tile dump shows only own-net met1 paint —

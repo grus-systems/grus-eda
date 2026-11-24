@@ -1,8 +1,10 @@
-# e6-drt-e2e — doc updates (r6, landed at 0d113ba)
+# e6-drt-e2e — doc updates (r7, landed; head `5d1502b`)
 
 All docs below landed with the **final measured numbers** — the X3
 fix superseded the r5 pinned-residual draft (no `met1.2=32` entry
-exists in the committed docs).
+exists in the committed docs). `5d1502b` touched only `maze.rs`
+internals (alias refactor) — **no doc delta**, the numbers below
+still describe the committed golden verbatim.
 
 ## `docs/results.md` — dated 2026-11-24 entry (landed)
 

@@ -1,5 +1,8 @@
 # e6-drt-e2e — instance-hull occupancy model (shipped v1 + r3 confinement)
 
+> **r7 note — unchanged at `5d1502b`** (alias refactor only; the
+> mask model below stands, `lef_expressible` 0 on all 50 rules).
+>
 > **r4 status — LANDED.** The union-exact cover (`rect_covered` /
 > `rect_minus` in `drc/union.rs`) shipped at `b372d5e` with the
 > closure; no r4 changes here. This file stays as the model record.

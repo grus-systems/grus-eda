@@ -1,4 +1,9 @@
-# e6-drt-e2e — integration gate (r6, landed at 0d113ba)
+# e6-drt-e2e — integration gate (r7, landed; head `5d1502b`)
+
+> **r7 note** — `5d1502b` is refactor-only (`LineNodes`/`PaintLines`
+> aliases + a clippy allow in `maze.rs`); no test or golden join
+> changed. `test_e2e_ours_def_deterministic_gcd`'s byte-equality is
+> the check that proves the rename has no functional delta.
 
 All additions landed in `crates/grus-core/tests/drt.rs`, additive to
 the existing emit/self-DRC/maze tests. A `load_ours_ref(name)` helper

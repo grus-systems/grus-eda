@@ -1,5 +1,10 @@
 # e6-drt-e2e — same-net self-spacing (the measured residual class)
 
+> **r7 note — `5d1502b` renamed the ledger type only**: the
+> `hlines`/`vlines` maps below are now spelled `PaintLines`
+> (`(layer, line) → [(lo, hi, PaintSrc)]`); semantics, admission
+> scans and emitted bytes unchanged.
+>
 > **r4 status — LANDED at `b372d5e`.** `close_self_spacing` +
 > `PaintSrc` provenance + `try_fill` shrink-retry + `RECT` emission +
 > `notch_fills`/`notch_residual` census all shipped; the routed DEF

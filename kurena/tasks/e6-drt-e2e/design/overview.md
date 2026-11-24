@@ -1,20 +1,24 @@
-# e6-drt-e2e — overview (r6, as-built)
+# e6-drt-e2e — overview (r7, as-built at `5d1502b`)
 
 E6 stage gate: run the real Magic `drc(full)` / OpenROAD antenna deck
 on **our** natively-routed DEF (`grus-eda drt`) inside the pinned
 LibreLane container, against the committed `e6-drt-ref` surfaces.
 Depends on `e6-drt-emit`.
 
-**This revision is as-built.** The human memo on the r5 design
-confirms work at `0d113ba` is complete — the gate is green
+**This revision is as-built at `5d1502b`.** The human memo on the r6
+design confirms that checkpoint is complete and correct — doc-sync
+plus the `LineNodes`/`PaintLines` type-alias refactor in `maze.rs`
+(`#[allow(clippy::too_many_arguments)]` on `access_vias`), a pure
+rename with **no functional delta vs the green `0d113ba`**: the
+committed DEF (`635f19a9aae86a44`) and golden are unchanged, and the
+determinism byte-join re-proves it in verify. The gate stays green
 (`lef_expressible` ours all-0, `unclassified` 0, antenna 0), the
 comparison table, determinism and what-ran records are in
-`docs/results.md`, tests + docs + the version bump are done, and the
-driver only timed out post-completion. **Nothing remains to
-implement** — what remains is verify/diffreview against this record.
-The r5 "what remains" items all landed, including the central one
-(met1.2 attribution → X3 fix → `PINNED_LEF_RESIDUALS` empty, not
-pinned).
+`docs/results.md`, tests + docs + the version bump are done.
+**Nothing remains to implement** — what remains is
+verify/diffreview against this record. The r5 "what remains" items
+all landed, including the central one (met1.2 attribution → X3 fix →
+`PINNED_LEF_RESIDUALS` empty, not pinned).
 
 ## What landed (checkpoint trajectory)
 
@@ -39,6 +43,14 @@ pinned).
   emitted the committed golden on the regenerated DEF
   (`input_def_sha_prefix=635f19a9aae86a44`). Gate tests + fixtures +
   docs + `0.12.6 → 0.12.7` in the same commit.
+- `5d1502b` — **refactor + doc-sync only** (the memo's description):
+  `LineNodes` (`layer → line → sorted in-region node indices`, the
+  `layer_line_maps` pair) and `PaintLines` (the extraction ledger
+  `(layer, line idx) → sorted (lo, hi, PaintSrc)` intervals — every
+  committed wire/stub/fill/via plate carrying its `PaintSrc` for the
+  self-spacing closure) type aliases in `maze.rs`, plus
+  `#[allow(clippy::too_many_arguments)]` on `access_vias`. No
+  functional delta — same emit bytes, same golden, same gate.
 
 ## Final measured state (committed golden `gcd.drt.ours.reference.json`)
 
@@ -78,7 +90,7 @@ byte-compares a fresh emit against the committed DEF test-side.
 | Magic `listall why` 0 on every `lef_expressible` on ours; `magic_only` decomposed to baseline class | green — all 50 at 0; 3 nwell rows all `inherited`; `unclassified_fired` empty |
 | `generate_drt_ours.sh` byte-identical reruns | green — `--verify` arm + committed-DEF byte-equal test |
 | wirelength/via/antenna deltas in `docs/results.md`, named outliers | landed — dated 2026-11-24 entry, via2/via3 +wirelength-rise named |
-| `cargo test --workspace`, clippy `-D warnings` | reported clean at 0d113ba — verify re-runs |
+| `cargo test --workspace`, clippy `-D warnings` | reported clean at 5d1502b — verify re-runs |
 | `docs/status.md` honest E6 state | landed — carries unrouted=81 + picorv32 deferral |
 
 ## Non-goals (held — nothing was relaxed)
@@ -95,7 +107,7 @@ byte-compares a fresh emit against the committed DEF test-side.
   output on the committed DEF; `input_def_sha_prefix` matches the
   committed file.
 
-## Files (as actually touched at 0d113ba)
+## Files (as actually touched on the branch, head `5d1502b`)
 
 - `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/tests/drt.rs`

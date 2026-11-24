@@ -1,5 +1,8 @@
 # e6-drt-e2e r3 — pin access / unrouted recovery
 
+> **r7 note — unchanged at `5d1502b`** (alias refactor only;
+> `unrouted=81` stands as the named residual).
+>
 > **r4 status — PARTIAL, remainder deferred.** A1 (union-cover
 > probing) and the A3 `ACCESS_K` 3→8 widening landed at `b372d5e`;
 > measured `unrouted` 73 → 81 (`NoPath` 57→45, `Unattachable` 33→57

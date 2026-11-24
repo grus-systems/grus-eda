@@ -1,5 +1,8 @@
 # e6-drt-e2e — residual decomposition + bounded closure (r4)
 
+> **r7 status — unchanged at `5d1502b`** (alias refactor only; every
+> residual vector still empty, `PINNED_LEF_RESIDUALS = []`).
+>
 > **r6 status — FULLY CLOSED at `0d113ba`.** §4's `_099_` did **not**
 > survive to a pin: the `met12-attribution.md` probes classified it
 > X3 alongside the 6 fill sites — the same `try_fill` host-open carve

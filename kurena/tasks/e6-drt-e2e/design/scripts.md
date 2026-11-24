@@ -1,5 +1,8 @@
 # e6-drt-e2e — script deltas (r4)
 
+> **r7 status — still no script delta at `5d1502b`.** The checkpoint
+> is `maze.rs`-internal (alias refactor); neither script moved.
+>
 > **r6 status — COMPLETE, no script delta at `0d113ba`.** The owed
 > fresh `check_drt_ours.sh gcd` run executed on the regenerated
 > committed DEF and emitted the committed golden

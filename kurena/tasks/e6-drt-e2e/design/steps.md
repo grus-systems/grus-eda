@@ -1,9 +1,13 @@
-# e6-drt-e2e — steps (r6, as-built at 0d113ba)
+# e6-drt-e2e — steps (r7, as-built at `5d1502b`)
 
-**All r5 steps landed.** This file is now the landed-step record plus
-the verify/diffreview checklist — the human memo confirms nothing is
-left to implement. Commit `0d113ba` carries the final hop on top of
-the `d8d0c6c`/`4c5e2cb`/`b372d5e`/`fba5f85` mechanism checkpoints.
+**All steps landed; `5d1502b` is the head.** This file is the
+landed-step record plus the verify/diffreview checklist — the human
+memo confirms nothing is left to implement. `5d1502b` carries only
+doc-sync and the `LineNodes`/`PaintLines` alias refactor on top of
+`0d113ba`'s final hop — **no functional delta**: the committed DEF
+(`635f19a9aae86a44`), the golden and every measured number below are
+unchanged — over the `d8d0c6c`/`4c5e2cb`/`b372d5e`/`fba5f85`
+mechanism checkpoints.
 
 Container: image `ghcr.io/librelane/librelane:3.0.16` cached locally
 (`image_id sha256:02d50f259d483979e126ef188a50f5b61e1d285b9d538312f280b087439b0302`
@@ -122,10 +126,15 @@ designs" item remains open — flagged on the card, not silently green.
 3. Golden-vs-DEF join: `sha256(gcd.drt.ours.routed.def)[:16]` ==
    golden `input_def_sha_prefix` (`635f19a9aae86a44`) — verified in
    planning; re-check in verify.
-4. Diff audit vs this design: `maze.rs` delta is the `host_open`
-   carve skip + `stub_outside_cover`/`stub_blocked` comment
-   corrections + `ClosureResult` `Debug` + two fixtures — nothing
-   else moved; `drt.rs` delta is additive gate/tests plus the two
+4. Diff audit vs this design (`dev...5d1502b`): `maze.rs` delta is
+   the `host_open` carve skip + `stub_outside_cover`/`stub_blocked`
+   comment corrections + `ClosureResult` `Debug` + two fixtures +
+   the `5d1502b` pure refactor (`LineNodes`/`PaintLines` aliases,
+   `#[allow(clippy::too_many_arguments)]` on `access_vias`) —
+   nothing else moved on top of the documented mechanism files
+   (`graph.rs` hull mask/`PinCover`, `emit.rs` `RECT` emission,
+   `union.rs` `rect_minus`/`enclosed_voids`, `main.rs` census
+   lines); `drt.rs` delta is additive gate/tests plus the two
    re-pins; no mask/spacing/hard-block relaxation anywhere (the
    non-goals audit).
 5. Golden audit vs `golden.md` schema: no absolute paths in
@@ -135,7 +144,7 @@ designs" item remains open — flagged on the card, not silently green.
    transcribed from the same file) — spot-check the comparison table
    against `delta.vs_*`.
 
-## Files (as actually touched at 0d113ba)
+## Files (as actually touched on the branch, head `5d1502b`)
 
 - `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/tests/drt.rs`
