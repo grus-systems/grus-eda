@@ -34,6 +34,10 @@ tests/designs/picorv32/picorv32.cts.ours.report.json
 tests/designs/gcd/gcd.drt.*.def
 tests/designs/picorv32/picorv32.drt.*.def
 
+# e6-drt-e2e: gcd's ours routed DEF is committed (<1 MB) — asserted
+# byte-equal to a fresh emission; picorv32's stays ignored.
+!tests/designs/gcd/gcd.drt.ours.routed.def
+
 # aes generated artifacts over 1 MB (regenerate with tests/designs/aes/generate_ref.sh)
 tests/designs/aes/aes.synth.v
 tests/designs/aes/aes.synth.json

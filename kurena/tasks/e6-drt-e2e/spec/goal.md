@@ -28,9 +28,43 @@ every stage carries — and compares against the committed
 4. **Determinism** — `generate_drt_ours.sh` run twice emits
    byte-identical DEF.
 
+## Revision note (2026-11-24, card #63)
+
+First contact measured a RED gate on gcd: Magic `drc(full)` on our
+routed DEF fires 7 `lef_expressible` rules (li.3=1846, li.6=718,
+li.c2=264, met1.2=106, met1.6=79, met3.2=8, li.c1=4 — ~3025 bbox
+fragments) plus 2 unclassified names (Can't overlap those
+layers=1058, can't abut or partially overlap between subcells=143),
+while the placed baseline and the delegated routed reference are 0
+on every rule. Our self-DRC reported findings_total=0 — proof the
+violations are our-geometry vs subcell-internal geometry our
+occupancy model does not contain: sampled error bboxes land inside
+placed-instance bboxes (e.g. li.3 at Magic-units {6929 17527} sits
+inside `_328_` at (34040,87040)). Per the never-rebaseline rule the
+red golden is not committed; the fix is part of this ticket.
+
+Direction to evaluate in design: inside any instance bbox
+(including decap/filler/tap cells) block all maze nodes on every
+layer for every net, except node geometry fully overlapping a pin
+rect of that instance's own net — Magic requires full overlap at
+the hierarchy boundary; abutment and partial overlap are errors.
+Expect unrouted to rise vs the raw-OBS model; name residuals per
+class. Secondary fixes required: pin the two observed unclassified
+names as the only allowed ones (step E aborts on any new
+unclassified name), strip absolute-path lines from
+`ours_router.cli_lines` in the golden, keep gate.md/golden.md
+schema docs in sync with the `{ours,placed,routed_ref,inherited}`
+object form, and never claim `count_flat==0` as a routing-level
+signal (the mutation control left it at 0 — it is insensitive).
+
+The measurement scripts from the first run are committed on dev:
+`tests/designs/generate_drt_ours.sh`, `tests/designs/check_drt_ours.sh`
+— fix their flagged issues rather than rewriting them.
+
 ## Files
 
-- `tests/designs/generate_drt_ours.sh` + `check_drt_ours.sh` (new)
+- `tests/designs/generate_drt_ours.sh` + `check_drt_ours.sh`
+  (committed on dev — fix, don't rewrite)
 - `tests/designs/<d>/<d>.drt.ours.reference.json` (committed)
 - `crates/grus-core/tests/drt.rs` (gate vs ours reference)
 - `docs/e6-drt.md` (e2e section + claim boundary)
