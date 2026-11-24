@@ -1,117 +1,113 @@
-# e6-drt-e2e — overview
+# e6-drt-e2e — overview (r2)
 
 E6 stage gate: run the real Magic `drc(full)` / OpenROAD antenna deck
 on **our** natively-routed DEF (`grus-eda drt`) inside the pinned
 LibreLane container, against the committed `e6-drt-ref` surfaces —
-and fix the router so the gate is green. Depends on `e6-drt-emit`.
+and finish the fix work so the gate is green. Depends on
+`e6-drt-emit`. This revision continues from checkpoint `d8d0c6c`
+(review card memo, 2026-11-24).
 
-## What exists today
+## What checkpoint d8d0c6c already landed
 
-- `tests/designs/generate_drt_ours.sh` + `tests/designs/check_drt_ours.sh`
-  (committed in `20ad784`) — emit + container-side scoring pipeline.
-  Steps A–E are complete: antenna probe, Magic on ours / placed /
-  mutation-control DEFs, python assembly of
-  `<d>.drt.ours.reference.json` with the `{ours, placed, routed_ref,
-  inherited}` object form and taxonomy join vs
-  `<d>.drc.reference.json`.
-- `crates/grus-core/src/drt/` — maze router whose occupancy model
-  (`maze.rs::premark_obs`) rasterizes `mac.obs_rects_raw` as
-  `Obs(cell)`, member pin shapes as `Pin(net)`/`Obs(u32::MAX)`, and
-  PDN metal as `Obs(u32::MAX)`; `hit_verdict` carves `Obs(cell)` for
-  nets with member pins on that cell — the recorded looseness that
-  lets wires cross instance internals.
-- Committed goldens: `<d>.drt.reference.json` (baseline/delegated
-  surfaces, both designs), `<d>.drc.reference.json` (taxonomy:
-  50 `lef_expressible` ↔ 55 statements, 189 `magic_only` ↔ 223).
+- `crates/grus-core/src/drt/graph.rs` — the instance-hull occupancy
+  model, **L1 variant of the ladder**: `HullMask` masks `li1`/`met1`
+  inside every `{Placed, Fixed, Cover}` instance bbox for every net;
+  exemption is the net's own-pin `PinCover` (XY regions grown to the
+  via-stack's track corridor). `met1` is additionally *host-open*:
+  inside a host hull the whole interior survives at graph level and
+  `Obs(cell)` marks carry legality instead of the cover. Region
+  extension: `transit_extend` gives each host hull a track-grid +
+  L-corridor on the lowest unmasked layer. `pin_nodes`/`pin_cover`/
+  `hull_masked` census wired in `build_route_graphs_ext`.
+- `crates/grus-core/src/drt/maze.rs` — `mac.pin_obs_rects` chained
+  into `premark_obs`; `ObsPin` occupant (instance-pin metal inside
+  hulls: own free, foreign **hard** block); host-cell `Obs` carve
+  restricted to `mask.carve` layers (li1 only); hull confinement on
+  relaxed vias and projected access stubs (`seg_allowed`,
+  `stub_outside_cover` census); `DRT_DEBUG_NET` graph-reachability
+  hook.
+- `tests/designs/check_drt_ours.sh` — both flagged fixes: pinned
+  two-name `ALLOWED_UNCLASSIFIED` allowlist + abort on new
+  unclassified names; `wrote routed DEF` dropped from `cli_lines`
+  plus an absolute-path guard. `hull_masked` parsed into
+  `ours_router`.
+- `tests/designs/gcd/gcd.drt.ours.routed.def` — first post-mask DEF
+  committed (as the byte-equal test target once the route settles).
 
-## The measured red gate (first contact, card #63)
+## Measured state (2026-11-24, release binary at d8d0c6c)
 
-Magic `drc(full)` on `gcd.drt.ours.routed.def`: 7 `lef_expressible`
-rules fire (li.3=1846, li.6=718, li.c2=264, met1.2=106, met1.6=79,
-met3.2=8, li.c1=4 — ~3025 bbox fragments) plus 2 unclassified names
-(`Can't overlap those layers`=1058, `This layer can't abut or
-partially overlap between subcells`=143 — Magic's built-in
-hierarchy-boundary messages, `DRCtech.c` tags 2/3). Placed baseline
-and TritonRoute delegated reference are 0 on every rule; our
-self-DRC reports `findings_total=0`. Error bboxes land inside
-placed-instance bboxes (li.3 at {6929 17527} inside `_328_` at
-(34040,87040)) — our geometry crosses subcell-internal paint the
-occupancy model does not contain.
+- Emit census gcd: `guided=269 routed=202 unrouted=67 projected=10
+  collisions=0 area_patches=1 area_residuals=0 iterations=8
+  route_ms≈5700 hull_masked=227033`; `self_drc findings_total=0`;
+  `stub_outside_cover` empty.
+- `cargo test -p grus-core --test drt test_emit_roundtrip_gcd`
+  **fails** on `report.unrouted.is_empty()` — the workspace suite is
+  red until the unrouted class resolves (measured, 57 s).
+- `check_drt_ours.sh` has **not** been re-run on the post-mask DEF —
+  the container verdict (whether the 7 `lef_expressible` rules + 2
+  unclassified names dropped to 0) is still unmeasured.
+- Live probe (`DRT_DEBUG_NET`): all sampled failures are `NoPath`
+  pockets — nonzero attach sets, graph-reachable, unreachable under
+  `edge_cost`. One blocker class demonstrated (`_300_/A2`: the lone
+  relaxed `mcon` arc's li1 plate + `s` overlaps sibling pin `A1`'s
+  `ObsPin`). See `pin-access.md`.
 
-A second measurement frames the fix's cost model: the clean
-delegated `gcd.routed.def` carries 234 li1/met1 segments crossing
-*foreign* instance bboxes (and 1104 inside own-member cells) —
-Magic's real rule is paint-overlap, not bbox-intersection, so an
-instance-bbox ban is a deliberately conservative proxy whose cost
-is connectivity, paid as unrouted nets the design must name.
+## What remains (the review memo's three items)
 
-## What this ticket adds
-
-1. **Instance-hull occupancy model** (`hull-model.md`) — inside any
-   placed instance bbox, block all maze nodes on every routing layer
-   for every net, except node geometry fully overlapping a pin rect
-   of that instance's own net (the card's direction); plus the
-   missing `pin_obs_rects` OBS source. Named residual classes for
-   the connectivity cost.
-2. **Script fixes** (`scripts.md`) — `check_drt_ours.sh`: pin the
-   two observed unclassified names as the only allowed ones (step E
-   aborts on any new unclassified name); strip the absolute-path
-   `wrote routed DEF` line from `ours_router.cli_lines` so the
-   golden byte-reproduces outside this checkout.
-3. **Green goldens committed** (`golden.md`) —
-   `<d>.drt.ours.reference.json` for both designs (generated inside
-   `ghcr.io/librelane/librelane:3.0.16`, `image_id` recorded) and
-   `gcd.drt.ours.routed.def` (<1 MB, byte-equal test target). The
-   RED first-run artifacts were never committed — these are the
-   first, post-fix goldens, not a rebaseline.
-4. **Gate tests** (`gate.md`) — `crates/grus-core/tests/drt.rs`:
-   `lef_expressible` ours == placed (== 0) per rule, `magic_only`
-   rows all `inherited`, unclassified ⊆ pinned allowlist, sanity
-   control structural asserts, byte-equal determinism vs the
-   committed DEF. Picorv32 leg `#[ignore]`d.
-5. **Docs** (`docs.md`) — `docs/e6-drt.md` looseness inventory +
-   e2e section + claim boundary, `docs/results.md` dated entry with
-   per-rule deltas, `docs/status.md`/`docs/roadmap.md` lines.
-   `count_flat` is recorded but never claimed as a routing signal
-   (mutation control proved it insensitive).
+1. **Mask verification in the container** — `check_drt_ours.sh gcd`
+   on the checkpoint DEF: did `lef_expressible` (7 rules) and the 2
+   unclassified names drop to 0? Unrouted nets emit no wires, so this
+   isolates "are the emitted wires clean?" from "did we connect
+   everything?". Measurement-only entry in `docs/results.md`; the
+   committed golden waits for the final DEF (the mask's verdict is
+   what this run proves, not the artifact).
+2. **Pin access** (`pin-access.md`) — unrouted 67 → toward 0 by
+   widening the legal-candidate set (multi-candidate relaxed vias,
+   cover-scoped region extension, sibling-clearance-aware access),
+   never by relaxing the hull mask or the `ObsPin`/`Obs(MAX)` hard
+   blocks. Residual classes named, not tolerated silently.
+3. **Finish the pipeline** — re-emit + container check → commit
+   `gcd.drt.ours.routed.def` + `gcd.drt.ours.reference.json` iff the
+   gate reads clean; picorv32 leg (emit + check) → its golden;
+   `drt.rs` gate tests; `docs/results.md` / `status.md` / `e6-drt.md`
+   / `roadmap.md`; version bump; `cargo test --workspace` + clippy.
 
 ## Acceptance traceability
 
 | acceptance item | where |
 |---|---|
 | `<d>.drt.ours.reference.json` generated by committed script in pinned image, committed both designs | `golden.md`, `steps.md` |
-| Magic `listall why` 0 on every `lef_expressible` rule on ours; `magic_only` decomposed per rule, baseline-matched | `hull-model.md` (fix), `gate.md` (asserts) |
+| Magic `listall why` 0 on every `lef_expressible` rule on ours; `magic_only` decomposed per rule, baseline-matched | `hull-model.md` (landed model), `pin-access.md` (remaining connectivity work), `gate.md` (asserts) |
 | `generate_drt_ours.sh` byte-identical reruns | `gate.md` (committed-DEF byte-equal + `--verify`) |
 | wirelength/via/antenna deltas in `docs/results.md`, named outliers | `docs.md`, `golden.md` (`vs_baseline`/`vs_delegated` blocks) |
-| `cargo test --workspace`, clippy `-D warnings` | `steps.md` |
+| `cargo test --workspace`, clippy `-D warnings` | `steps.md` (currently red on unrouted — restored by item 2) |
 | `docs/status.md` honest E6 state | `docs.md` |
 
 ## Non-goals
 
-- Not a rewrite of the measurement scripts — fix the flagged issues
-  in place.
-- No new Magic rules, no self-DRC extension — `e6-drt-emit` scoped
-  the subset checker; this gate uses the full deck's verdict.
+- No relaxation of `hull_masked_layer`, the foreign-hull ban, the
+  `ObsPin`/`Obs(u32::MAX)` hard blocks, or `w/2 + s` scans to regain
+  routed count.
+- No new Magic rules, no self-DRC extension — this gate uses the full
+  deck's verdict.
 - No claiming `count_flat` as a routing-level signal.
-- No change to guides, placement, or the baseline/delegated
-  surfaces.
+- No change to guides, placement, or the baseline/delegated surfaces.
+- Not a rewrite of the measurement scripts.
 
 ## Files
 
-- `crates/grus-core/src/drt/maze.rs` (hull mask, `pin_obs_rects`,
-  census)
-- `crates/grus-core/src/drt/graph.rs` (region filtering — if the
-  mask lands there rather than in `maze.rs`)
-- `crates/grus-core/src/drt/emit.rs` (attach/stub confinement — only
-  if residual measurement requires it)
-- `crates/grus-core/tests/drt.rs` (gate tests)
-- `tests/designs/check_drt_ours.sh` (unclassified allowlist,
-  cli_lines strip)
-- `tests/designs/gcd/gcd.drt.ours.routed.def` (committed)
+- `crates/grus-core/src/drt/graph.rs` (relax-candidate widening,
+  cover-scoped region extension — if the P1/P2 fixes land there)
+- `crates/grus-core/src/drt/maze.rs` (per-pin census, blocker
+  attribution, `NetTopo`/`route_one_net` changes)
+- `crates/grus-eda/src/main.rs` (unrouted-kinds census print)
+- `crates/grus-core/tests/drt.rs` (gate tests + re-pins)
+- `tests/designs/check_drt_ours.sh` (keep-list/golden fields only if
+  the log gains lines)
+- `tests/designs/gcd/gcd.drt.ours.routed.def` (regenerated, committed)
 - `tests/designs/gcd/gcd.drt.ours.reference.json`,
   `tests/designs/picorv32/picorv32.drt.ours.reference.json`
   (committed goldens)
 - `docs/e6-drt.md`, `docs/results.md`, `docs/status.md`,
   `docs/roadmap.md`
-- `Cargo.toml` (workspace version bump — behavior change, patch
-  per `0.x` rules)
+- `Cargo.toml` (workspace version bump — behavior change, patch)

@@ -39,10 +39,13 @@ non-null/non-empty, not its value), `input_def_sha_prefix`,
   "emit_log": "tests/designs/<d>/runs/drt-ours/<d>.drt.ours.log",
   "emit_log_present": true,
   "cli_lines": [ "== drt emit: gcd ==", "guided=269 routed=…",
+                 "unrouted_kinds NoPath=… Unattachable=…",
                  "  unrouted <name>", "  area_residual …",
                  "self_drc findings_total=0", "self_drc scope: …" ],
   "routed": n, "unrouted_count": n, "unrouted": ["…"],
-  "collisions": n, "area_patches": n, "area_residuals": n
+  "unrouted_kinds": {"NoPath": n, "Unattachable": n},
+  "collisions": n, "area_patches": n, "area_residuals": n,
+  "hull_masked": n
 }
 ```
 
@@ -50,7 +53,11 @@ non-null/non-empty, not its value), `input_def_sha_prefix`,
 …` is removed** (absolute path, redundant with `input_def`) and a
 guard fails assembly if any retained line carries `/`-absolute
 paths. Post-fix, `unrouted`/`unrouted_count` name the connectivity
-cost of the hull mask — the named residual list.
+cost of the hull mask — the named residual list — and
+`unrouted_kinds` decomposes it by `FailKind` (`pin-access.md` step 0
+adds the emit line; the field is `null` only if that line never
+ships). `hull_masked` is the node count the mask removed — `> 0` is
+a gate assertion (the mask fires, not vacuously green).
 
 ## `openroad`
 
