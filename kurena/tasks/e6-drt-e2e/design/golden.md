@@ -1,4 +1,4 @@
-# e6-drt-e2e — `<d>.drt.ours.reference.json` schema
+# e6-drt-e2e — `<d>.drt.ours.reference.json` schema (r3)
 
 Emitted by `check_drt_ours.sh` step E inside the pinned container;
 committed for both designs. `json.dump(indent=2) + "\n"` — the file
@@ -40,24 +40,42 @@ non-null/non-empty, not its value), `input_def_sha_prefix`,
   "emit_log_present": true,
   "cli_lines": [ "== drt emit: gcd ==", "guided=269 routed=…",
                  "unrouted_kinds NoPath=… Unattachable=…",
+                 "unrouted_blockers l1Obs=… l1Net=…",
                  "  unrouted <name>", "  area_residual …",
+                 "  stub_outside_cover <net> <pin>",
                  "self_drc findings_total=0", "self_drc scope: …" ],
   "routed": n, "unrouted_count": n, "unrouted": ["…"],
   "unrouted_kinds": {"NoPath": n, "Unattachable": n},
+  "unrouted_blockers": {"l1Obs": n, "l1Net": n, "l2Net": n} | null,
   "collisions": n, "area_patches": n, "area_residuals": n,
-  "hull_masked": n
+  "hull_masked": n, "notch_fills": n
 }
 ```
 
 `cli_lines` is the allowlisted prefix set — **`wrote routed DEF to
-…` is removed** (absolute path, redundant with `input_def`) and a
-guard fails assembly if any retained line carries `/`-absolute
-paths. Post-fix, `unrouted`/`unrouted_count` name the connectivity
-cost of the hull mask — the named residual list — and
-`unrouted_kinds` decomposes it by `FailKind` (`pin-access.md` step 0
-adds the emit line; the field is `null` only if that line never
-ships). `hull_masked` is the node count the mask removed — `> 0` is
-a gate assertion (the mask fires, not vacuously green).
+…` stays removed** (absolute checkout path) and a guard fails
+assembly if any retained line carries `/`-absolute paths.
+
+Field semantics:
+
+- `unrouted`/`unrouted_count` — the connectivity cost, named per net.
+- `unrouted_kinds` — decomposition by `FailKind`; `null` only if the
+  emit binary predates the line (the emit and script are
+  version-locked; a present census line with a missing kinds line is
+  a `fail`, not a guess).
+- `unrouted_blockers` — wave-death postmortem census `{l<L><Kind>: n}`
+  (kind: Obs/ObsPin/Net/Pin); `null` when no blockers were
+  attributable. Recorded, not gated — it is the access work's input
+  data (`pin-access.md`).
+- `stub_outside_cover` lines (in `cli_lines`) — the unattachable-pin
+  census: pins that got no legal paint. **r3 redefines it** — it is
+  the `Unattachable` diagnostic (r2's "nonzero is a bug" predates the
+  access model). Target empty post-recovery; the gate asserts every
+  entry's net appears in `unrouted` (`gate.md`).
+- `hull_masked` — nodes removed per mask; `> 0` is a gate assertion.
+- `notch_fills` — self-spacing fill rects emitted (new field,
+  appended to the `guided=` census line — `self-spacing.md`;
+  recorded `>= 0`, never a target to optimize toward).
 
 ## `openroad`
 
@@ -96,8 +114,10 @@ as a missing check). Antenna fields mirror the baseline variant's.
 the placed DEF — the inherited-class source. `def_metrics` parses
 our emitted DEF (signal nets, wirelength µm, per-cut-layer via
 census, `via_names_meaning`, `dbu_per_micron`) — same grammar as
-`generate_drt_ref.sh`'s `routed_metrics`. `delta.vs_baseline` /
-`delta.vs_delegated` carry `{total_wirelength_um,
+`generate_drt_ref.sh`'s `routed_metrics`; `RECT` fill pieces count
+as paint, not as wire segments or vias (note their count in the
+metrics comment only if the parser reports them). `delta.vs_baseline`
+/ `delta.vs_delegated` carry `{total_wirelength_um,
 total_wirelength_pct, via_count_total, vias_per_cut_layer,
 antenna_violations, antenna_pin_violations, signal_nets_routed}`
 signed deltas — the `results.md` comparison table's source.
@@ -105,19 +125,22 @@ signed deltas — the `results.md` comparison table's source.
 ## `sanity_control`
 
 `{mutation, count_flat, count_total, per_rule, new_rules_vs_clean,
-in_deck, violated_rules_in_checked_deck}` — step D injected a probe
+in_deck, violated_rules_in_checked_deck}` — step D injects a probe
 wire into a copy of our DEF; the deck must flag ≥1 new
-`lef_expressible` rule vs clean. Asserted structurally in `gate.md`.
+`lef_expressible` rule vs clean. Once the golden reads clean,
+`new_rules_vs_clean` is non-empty **by construction** (the WIP
+golden had it empty because probe fragments joined the
+already-firing `met2.2` — recorded, not a defect to chase).
 
 ## Determinism contract
 
 Byte-reproduction is required across reruns in the same image and
 across checkouts: all path fields are repo-relative, all counts
-derive from Magic's stable `per_rule` output, and `sort_keys` is
-not used — field order is fixed by construction. If a rerun diffs,
-the diff is the bug — investigate, don't re-commit (never
-rebaseline). `image_id` drift across pulls is the one expected
-change; record the current digest, don't gate on it.
+derive from Magic's stable `per_rule` output and the deterministic
+emit, and `sort_keys` is not used — field order is fixed by
+construction. If a rerun diffs, the diff is the bug — investigate,
+don't re-commit (never rebaseline). `image_id` drift across pulls is
+the one expected change; record the current digest, don't gate on it.
 
 ## Files
 

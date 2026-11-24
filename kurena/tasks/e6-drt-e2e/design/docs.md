@@ -1,62 +1,69 @@
-# e6-drt-e2e — docs updates (r2)
+# e6-drt-e2e — doc updates (r3)
 
-## `docs/e6-drt.md`
+All in `docs/`, written at the end of implementation with the final
+measured numbers — not pre-written claims.
 
-- **§7 recorded-looseness inventory**: update the host-cell OBS
-  carve entry — on li1 the carve survives (masked, `!open`) scoped
-  as shipped; on met1 it was *removed* — the host-open layer carries
-  legality through `Obs(cell)` marks instead. Record the shipped
-  hull model: masked layers {li1, met1}, host-open {met1}, the
-  `PinCover` corridor growth, `transit_extend`, `ObsPin`, the
-  `pin_obs_rects` addition, and which `pin-access.md` rungs landed
-  (P1/P2/P3) with their measured unrouted deltas.
-- **New e2e section**: the container gate result — per-rule
-  `lef_expressible` counts on ours vs placed vs delegated
-  (all-zero table), `magic_only` decomposition verdict, the two
-  unclassified names with per-input counts, antenna surface,
-  `hull_masked`/`unrouted_kinds` census.
-- **Claim boundary**: claimed — Magic `drc(full)` clean on the
-  `lef_expressible` subset for our routed DEF under committed
-  guides; NOT claimed — `count_flat` (insensitive counter),
-  `drt_report` (n/a for the native router), any `magic_only`
-  residual names, unrouted residual classes by name.
+## `docs/results.md` — dated entry
 
-## `docs/results.md`
+Structure (E7-style, plus the fix trajectory):
 
-One dated entry, four measurements in order:
+- **Trajectory line**: `lef_expressible` violations on our DEF
+  ~3025 (first contact) → 847 (`d8d0c6c` mask) → 514 (`4c5e2cb`
+  confinement WIP) → final. Each hop names what landed and what was
+  measured, including the rung-by-rung `unrouted` series from the
+  access ladder (`pin-access.md`).
+- **Root-cause record** (the r3 measurement, evidence-attached):
+  `met1.2=740`/`met2.2=56` decomposed into the two same-net classes
+  (45 plate-pair sites ≈665 tiles; ~75 wire-end tiles; 15 met2 jog
+  sites); the `drc why` + flattened-dump anatomy; the `who5.tcl`
+  move-via causality proof (135→600 DBU gap clears the site); the
+  `.mag` inspection refuting subcell-internal met1 for the sampled
+  cells; the census tables. Probe files named
+  (`runs/drt-ours/who*.tcl`, `region.mag`, `gcd.whofix.def` —
+  gitignored).
+- **Gate table** (final): per-rule `lef_expressible` ours vs placed
+  vs routed_ref, `magic_only` decomposition, `unclassified_fired`
+  status, `sanity_control` result.
+- **Comparison table**: `delta.vs_baseline`/`vs_delegated` —
+  wirelength, vias per cut layer, antenna counts, signal nets routed;
+  named outlier explanations (unrouted nets carry zero geometry —
+  the wirelength −35.55% reading is restated as "on the 196 routed
+  nets" with the unrouted names listed, per the honest-delta
+  convention).
+- **Connectivity record**: `unrouted` final list + `FailKind` +
+  `unrouted_blockers` census + `stub_outside_cover` final state;
+  `notch_fills` count (the repair cost, recorded not hidden).
+- **What ran** (E0 rule 9): which script steps, which legs, which
+  container digest; any partial reruns named.
 
-- The RED first-contact measurement (7 rules, ~3025 fragments, 2
-  unclassified names, self-DRC=0 proof) — the gate's demonstrated
-  red arm, kept as failure log per convention.
-- **Mask-verification run** (`check_drt_ours.sh gcd` on the
-  checkpoint DEF, unrouted=67): per-rule `lef_expressible` +
-  unclassified verdict *before* connectivity work — proves the
-  emitted wires were already clean (or names the residual rules and
-  their root cause). Measurement-only; JSON not committed.
-- The pin-access landing: which rungs shipped, `unrouted_kinds`
-  progression per rung, residual classes by name + blocking
-  `Occupant` attribution.
-- The green table: per-rule `lef_expressible` `{ours, placed,
-  routed_ref}` rows (all-zero), `magic_only` `inherited` verdicts,
-  unclassified counts; then the `delta` block as rows — wirelength
-  µm + %, via total + per-cut-layer, antenna,
-  `signal_nets_routed` — vs baseline and vs delegated, with named
-  explanations for outliers (wirelength divergence from hull
-  detours, via-count deltas from access-stack placement).
-- Which verify arms ran: `generate_drt_ours.sh --verify`
-  (`OURS-DETERMINISTIC <sha>`), `check_drt_ours.sh` per design,
-  `cargo test` legs (including the ignored picorv32 legs run
-  manually), clippy.
+## `docs/e6-drt.md` — e2e section + §7 correction
 
-## `docs/status.md` / `docs/roadmap.md`
+- e2e section: gate outcome, both designs, the fix narrative at
+  summary level (self-spacing closure + access model — mechanisms
+  point at `kurena/tasks/e6-drt-e2e/design/` docs, results has the
+  numbers).
+- **§7 self-DRC scope — corrected and expanded**: the inventory
+  already records "checks foreign-spacing only; same-net paint is
+  free-for-adjacency". Amend: the same-net blind spot is a *measured*
+  gap — it reported `findings_total=0` on geometry Magic flags at
+  796 fragments; the emit-side closure pass owns that class, not
+  self-DRC (or, if self-DRC is extended to catch it, the record
+  states the new scope). Claim boundary stays honest: self-DRC
+  remains a fast pre-gate, not the deck.
+- Emit-grammar note: `RECT` fill pieces in the NETS section — what
+  they are and why they exist.
 
-E7-style done line for E6's native-DRT subset scope: "routed under
-committed guides, Magic `drc(full)` clean on the `lef_expressible`
-subset" + named residuals if any remain. Honest wording: if unrouted
-residuals exist the line names them with their blocking class, same
-as E8's convention.
+## `docs/status.md` + `docs/roadmap.md`
+
+E7-style done line scoped honestly: "native DRT under committed
+guides — clean on the Magic `drc(full)` `lef_expressible` subset on
+gcd[/picorv32], N unrouted residuals named (if any), deltas vs
+baseline/delegated in results.md". If `unrouted` survives, the line
+carries the count — no "fully routed" claim.
 
 ## Files
 
-- `docs/e6-drt.md`, `docs/results.md`, `docs/status.md`,
-  `docs/roadmap.md`
+- `docs/results.md`
+- `docs/e6-drt.md`
+- `docs/status.md`
+- `docs/roadmap.md`

@@ -1,4 +1,4 @@
-# e6-drt-e2e — integration gate (r2)
+# e6-drt-e2e — integration gate (r3)
 
 All additions land in `crates/grus-core/tests/drt.rs`, additive to
 the existing emit/self-DRC/maze tests. `load(name)` already wires
@@ -27,15 +27,21 @@ Deserialize `gcd.drt.ours.reference.json` + reuse the taxonomy from
   with a genuine residual, replace `0` with the pinned measured count
   and name the residual in `docs/results.md` — never silently.
 - **`sanity_control` structural asserts**:
-  `violated_rules_in_checked_deck == true`,
-  `new_rules_vs_clean` non-empty, `mutation` object present —
-  proves the deck flags injected violations on our DEF (the
-  fail-proof arm; E0 lesson 7).
+  `violated_rules_in_checked_deck == true`, `mutation` object
+  present. `new_rules_vs_clean` non-empty **by construction** once
+  the golden is clean (any fired rule on the mutation DEF is a new
+  rule vs the all-zero baseline — keep the assert so a vacuous
+  control still fails; at `4c5e2cb` it was empty because probe
+  fragments joined the already-firing met2.2).
 - **`ours_router` block**: `hull_masked > 0` on gcd (the mask fires,
-  not vacuously green); `unrouted` name list asserted against the
-  pinned expectation — empty if the pin-access work lands clean, else
-  the exact `BTreeSet` residual list named in `docs/results.md`;
-  `unrouted_kinds` counts consistent with `unrouted_count`.
+  not vacuously green); `notch_fills` present and asserted `>= 0`
+  (recorded, not gated — `self-spacing.md`); `unrouted` name list
+  asserted against the pinned expectation — empty if the access work
+  lands clean, else the exact `BTreeSet` residual list named in
+  `docs/results.md`; `unrouted_kinds`/`unrouted_blockers` counts
+  consistent with `unrouted_count`; every `stub_outside_cover`
+  `cli_line` entry maps to a net in the `unrouted` list (the
+  unattachable-pin census may not name a routed net).
 - **`openroad` block**: `drt_report_source ==
   "not_applicable_native_router"` pinned; antenna counts recorded
   and printed, not gated (deltas vs baseline/delegated are the
@@ -54,22 +60,23 @@ committed `tests/designs/gcd/gcd.drt.ours.routed.def`. The committed
 file IS the golden: the test proves `generate_drt_ours.sh`'s emit
 path is byte-stable (the `--verify` arm demonstrates the same
 property script-side; results.md records which arms ran). The DEF
-committed at `d8d0c6c` is superseded — recommit the post-fix
-emission in the same change as the fix it measures.
+committed at `4c5e2cb` is superseded — recommit the post-fix
+emission in the same change as the fix it measures. Note: the emit
+now includes `RECT` fill pieces (`self-spacing.md`) — the byte-equal
+assert covers them like any other statement.
 
 ## 3. `#[ignore]` picorv32 leg
 
 `test_e2e_ours_reference_picorv32` — same joins as (1) on
 `picorv32.drt.ours.reference.json`; ignored for runtime, run
 manually before committing its golden (E0: say what ran). Its
-`unrouted`/`hull_masked` asserts take picorv32's own pinned values
-(the pre-mask baseline had 108 `NoPath` — the mask-era list is
-measured, not assumed).
+`unrouted`/`hull_masked`/`notch_fills` asserts take picorv32's own
+pinned values (measured, not assumed).
 
 ## 4. Re-pins of existing assertions
 
-- `test_emit_roundtrip_gcd` — **currently red** at `d8d0c6c`
-  (`report.unrouted.is_empty()` with 67 names). The pin-access work
+- `test_emit_roundtrip_gcd` — **currently red** at `4c5e2cb`
+  (`report.unrouted.is_empty()` with 73 names). The access work
   restores it to empty; if residuals remain, pin the measured name
   list (`BTreeSet` literal) — the named residual class, reviewed on
   change.
@@ -77,18 +84,22 @@ measured, not assumed).
   FailKinds/blocking classes appear; `hull_masked` census prints
   added.
 - `test_emit_selfdrc_gcd` `findings_total == 0` and
-  `area_residuals.is_empty()` — must still hold.
+  `area_residuals.is_empty()` — must still hold. The same-net notch
+  class is outside self-DRC's foreign-spacing scope (recorded in
+  `docs/e6-drt.md` §7) — if self-DRC *is* extended to catch it, the
+  assert stays `== 0` post-closure.
 - `test_maze_occupancy`, `test_maze_determinism*` — digests re-pin
-  only to measured values; route changes under P1/P2 legitimately
-  move digests (recorded, not "fixed" blindly).
+  only to measured values; route changes under the fix/access
+  rungs legitimately move digests (recorded, not "fixed" blindly).
 
 ## Fail-proof demonstration
 
-Container-side: the RED first-run measurement already demonstrated
-the deck fires nonzero on our old DEF — recorded in results.md as
-the gate's proven red arm. Test-side: `sanity_control` asserts +
-`hull_masked > 0` (the mask fires, not vacuously green) + the
-viability floor (routes exist, not an empty pass).
+Container-side: the RED first-contact measurement demonstrated the
+deck fires nonzero on our DEF; the committed mutation DEF keeps the
+arm live every run. Test-side: `sanity_control` asserts +
+`hull_masked > 0` + the viability floor. Fix-side: `who5.tcl`'s
+move-via probe is the demonstrated mechanism for the closure pass —
+`docs/results.md` records it.
 
 ## Files
 

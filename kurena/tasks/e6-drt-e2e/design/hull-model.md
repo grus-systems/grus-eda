@@ -1,114 +1,112 @@
-# e6-drt-e2e — instance-hull occupancy model (shipped v1)
+# e6-drt-e2e — instance-hull occupancy model (shipped v1 + r3 confinement)
 
-The core fix, **landed at `d8d0c6c`**: make the maze's occupancy
-model conservative w.r.t. subcell-internal geometry it cannot see.
-Inside any instance bbox (including decap/filler/tap cells) block all
-maze nodes on the masked layers for every net, except inside the
-net's own-pin cover. This file records what actually shipped; the
-remaining connectivity work is `pin-access.md`.
+The core fix, **landed at `d8d0c6c` and tightened at `4c5e2cb`**: make
+the maze's occupancy model conservative w.r.t. subcell-internal
+geometry it cannot see. Inside any instance bbox (including
+decap/filler/tap cells) block all maze nodes on the masked layers for
+every net, except inside the net's own-pin cover — or, on host-open
+layers, anywhere the `Obs`/`ObsPin` marks leave room.
 
-## Why the pre-mask model was loose
+## What the mask actually bought (measured trajectory)
 
-`premark_obs` rasterizes `mac.obs_rects_raw` → `Obs(cell)` over each
-placed instance. The old `hit_verdict` made `Obs(cell)` invisible to
-any net owning a member pin on `cell` — the recorded looseness that
-let host nets route *through* their own cells' internals (the red
-gate's error bboxes inside `_328_`-class instances) and let two
-subcell geometry sources go unmodelled (`mac.pin_obs_rects`, and
-everything Magic sees inside the master that LEF OBS does not
-declare). The delegated reference proves the real rule is finer than
-a bbox ban — 234 li1/met1 segments in `gcd.routed.def` cross foreign
-instance bboxes through genuine whitespace, Magic-clean — so the
-hull is the conservative substitute and the cost is connectivity,
-not correctness.
+`lef_expressible` violations on the same emit went
+**~3025 (7 rules + 2 unclassified) → 847 → 514** across the two
+checkpoints — the mask model works. The remaining 514 are **not**
+the foreign-shape class the model was built for; they are same-net
+self-spacing notches in our own emitted paint (`self-spacing.md` —
+measured partner, not guessed).
 
-## Shipped model (what `d8d0c6c` implements)
+## Root-cause correction (r3 measurement)
+
+The review memo carried the hypothesis "our mcon/met1 paint vs
+subcell-internal met1 or adjacent pin metal". Probes inside the
+pinned image (`runs/drt-ours/who*.tcl`, `region.mag`) refute it for
+the measured sites:
+
+- `and2_2`/`a22o_2` `.mag` metal1 = VPWR/VGND rails + mcon teeth
+  only, all inside the rail pin-rect bands — `ObsPin`-marked, spacing
+  enforced, never invisible. The flattened DRC site contains **only
+  our own net's metal1**.
+- The failing edges are our own access-stack plates facing each other
+  at 135 < 140 (same-net notch). Moving the escape via clears the
+  site — causality proven in-container.
+
+The mask therefore stays exactly as shipped — the residual is an
+*emit-time* geometry class, not an occupancy-model gap.
+
+## Shipped model (as of `4c5e2cb`)
 
 **Hull.** `HullMask` indexes every `{Placed, Fixed, Cover}` cell's
-placed outline (`orient_rect` + translate, the `drc::geom` transform)
-into y-banded x-interval lists (`HullBand`, `premiy`/`premix` prefix
-maxima for skip scans). Point query `hull_cells_at`, legality
-`point_allowed` / `seg_allowed`.
+placed outline into y-banded x-interval lists; legality
+`point_allowed` / `rect_allowed` / `seg_allowed`.
 
-**Masked layers = {li1, met1}** — the L1 variant: sky130_fd_sc_hd
-masters paint internals only on li1/met1, so met2+ transit over a
-cell stays legal detailed routing (the strict all-layer variant
-starves every net to graph islands — measured pre-landing). On a
-masked layer a node survives inside a hull iff the cell hosts a
-member pin of the net **and** the point is inside the net's
-`PinCover` rect for that cell — except on *host-open* layers.
-
-**Host-open = {met1}** — `hull_host_open_layer`: inside a foreign
-hull met1 stays fully masked, but inside a host hull the whole
-interior is open at graph level and `Obs(cell)` marks carry legality
-(the delegated routes run met1 access wires through exactly those
-OBS-free bands). `mask.carve(l)` = `masked[l] && !open[l]` — the
-host-cell `Obs` carve applies on **li1 only** (li1 internals are too
-dense to navigate); on met1 the marks block the host too.
+**Masked layers = {li1, met1}; host-open = {met1}** — inside a
+foreign hull both are fully masked; inside a host hull (cell hosts a
+member pin of the net) li1 needs the pin cover, met1's whole
+interior is open at graph level and `Obs(cell)`/`ObsPin` marks carry
+legality (the delegated routes run met1 access wires through exactly
+those OBS-free bands).
 
 **`PinCover`** — `cell → [RectDbu]`, the XY union of the net's member
 pin shapes per host cell (not layer-keyed: the delegated routes drop
 the whole mcon→met1→M1M2 access stack inside a pin rect's XY on
-layers the pin does not declare), grown by `grow_to_track` to hold a
-track line of every masked layer and its escape layer — without the
-growth a narrow pin rect holds no via-capable crossing (measured:
-~half of gcd's sinks `NoPath` on the strict rect).
+layers the pin does not declare). Raw LEF rects — the 4c5e2cb
+checkpoint removed the `grow_to_track` corridor growth.
 
-**Mechanics** — the mask filters `region` pair lists at graph build
-(`point_allowed` per node, `hull_masked` census); `transit_extend`
-then inserts each host hull's track-grid + index-adjacent
-L-corridor on the lowest unmasked layer (met2) so escape vias have
-landing nodes. `pin_nodes`, `via_edges`, `relaxed_vias` see only
-surviving nodes.
+**Occupancy** — `premark_obs` clips each cell's OBS against its own
+pin rects (`rect_minus`); residual slabs are `Obs(cell)` walls for
+every net; `ObsPin` = instance-pin metal, foreign hard-block;
+`exempt_obs` drops `Obs(c)` hits only where paint ⊆ own-pin cover.
 
-**Occupancy additions** — `mac.pin_obs_rects` chained into
-`premark_obs` (source the maze was missing; empty for sky130_hd but
-correct); `ObsPin` occupant for instance-pin metal inside hulls —
-own net free, foreign **hard** block (a soft price there is a Magic
-subcell-overlap finding the maze cannot see); io-port rects keep the
-soft `Pin` mark.
+**Confinement (r3 — union-exact)** — the covered-part test in
+`rect_allowed`/`seg_allowed` is `part ⊆ ⋃ cover rects`
+(residual-empty after `rect_minus` over the cell's cover rects),
+not `⊆ one rect`: a plate spanning joined same-pin sub-rects is
+legal (delegated's 65 "partial" mcons are that class, Magic-clean),
+a plate bridging disjoint pin shapes still fails.
 
-**Confinement** — relaxed-via positions/stubs must pass
-`point_allowed`/`seg_allowed` on masked layers (candidate list
-bounded, nearest-first confined wins); `project_attach` admits only
-stubs staying inside own cover; `route_one_net` re-checks committed
-projected stubs (`stub_outside_cover` — expected empty, nonzero is
-a bug).
+## r3 met1 rule — per-piece confinement + transit clause
 
-## Connectivity cost (measured at d8d0c6c)
+Per the review memo, applied per emitted rect on masked layers
+inside member hulls (`self-spacing.md` Rule A):
 
-`hull_masked=227033` nodes removed on gcd; `unrouted` 0 → 67;
-`collisions=0`, `self_drc=0`, `stub_outside_cover=0`. All sampled
-failures are `NoPath` pockets — graph-reachable attach sets whose
-escape arcs die in `edge_cost`. The pin-access work to bring unrouted
-back toward 0 is `pin-access.md` — its guardrail: **the mask itself
-(masked layer set, foreign-hull ban, cover semantics) is not the
-knob.**
+- paint inside a member hull must either sit inside own-pin
+  cover-union **or** keep `≥ s` from every foreign mark — the
+  host-open layer already enforces the second clause via occupancy;
+  the first is asserted for pin-touch paint (mcon, pin-side stub);
+- **no same-net sub-spacing disjointness** — `self-spacing.md` Rule B
+  (the measured fix) closes the notches the memo's clause cannot see.
+
+Escalation (only if residual `met1.2` sites survive): strict
+delegated model — the whole access stack ⊆ pin-cover union, escape
+via inside the pin, met2 transit onward.
 
 ## Residual classes (named, counted, printed)
 
-- `hull_masked` — nodes removed per layer, census print (landed).
-- `unrouted` + `unrouted_kinds` — the connectivity cost, per net and
-  per `FailKind` (`pin-access.md` step 0 adds the kinds line).
-- `stub_outside_cover` — committed stubs violating confinement
-  (expected 0 — a nonzero count is a bug, not a residual).
-- `boundary_overlap` / `boundary_abut` — the two allowed unclassified
-  Magic names, per-input counts in the golden; `ours` target 0.
+- `hull_masked` — nodes removed per layer (census print, landed).
+- `unrouted` + `unrouted_kinds` + `unrouted_blockers` — connectivity
+  cost, per net, per `FailKind`, per blocking `Occupant` class.
+- `stub_outside_cover` — the unattachable-pin census (pins that got
+  no legal paint; `pin-access.md` r3 redefines it — it is the
+  `Unattachable` diagnostic, not a bug).
+- `notch_fills` — self-spacing repair count (new, `self-spacing.md`).
+- `boundary_overlap` / `boundary_abut` — the two allowed
+  unclassified Magic names; `ours` target 0.
 - Any nonzero `lef_expressible` count post-fix is a gate failure to
   chase, **not** a residual.
 
 ## Falsification arms
 
-- Occupancy mask disabled (`--occ` off path) must reproduce the red
-  gate's nonzero counts — the deck's nonzero-failure path (E0 lesson
-  7; the first-contact RED measurement is itself the demonstrated
-  arm, recorded in `docs/results.md`).
-- A gate arm asserting `hull_masked > 0` on gcd — the mask fires,
-  not vacuously green.
+- The RED first-contact and WIP measurements are the demonstrated
+  nonzero paths (recorded in `docs/results.md`).
+- The committed mutation DEF (step D) must flag ≥1 rule vs clean —
+  trivially non-vacuous once the golden reads clean (every fired
+  rule is new).
+- `hull_masked > 0` gate assert — the mask fires.
 
 ## Files
 
-- `crates/grus-core/src/drt/graph.rs` (landed: `HullMask`,
-  `pin_cover`, `transit_extend`, `hull_masked`)
-- `crates/grus-core/src/drt/maze.rs` (landed: `ObsPin`, carve gate,
-  confinement)
+- `crates/grus-core/src/drt/graph.rs` (`HullMask`, `PinCover` union,
+  `transit_extend`, covered-part test)
+- `crates/grus-core/src/drt/maze.rs` (`ObsPin`, `exempt_obs`,
+  confinement admissions, closure pass)
