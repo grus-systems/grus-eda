@@ -914,6 +914,8 @@ ours_router = {
     "cli_lines": None,
     "routed": None,
     "unrouted_count": None,
+    "unrouted_kinds": None,
+    "unrouted_blockers": None,
     "unrouted": None,
     "collisions": None,
     "area_patches": None,
@@ -927,6 +929,8 @@ if ours_router["emit_log_present"]:
         s = ln.rstrip()
         if (s.startswith("== drt emit") or s.startswith("guided=")
                 or s.lstrip().startswith("unrouted ")
+                or s.lstrip().startswith("unrouted_kinds ")
+                or s.lstrip().startswith("unrouted_blockers ")
                 or s.lstrip().startswith("area_residual ")
                 or s.lstrip().startswith("stub_outside_cover ")
                 or s.startswith("self_drc")):
@@ -952,6 +956,17 @@ if ours_router["emit_log_present"]:
     ours_router["area_residuals"] = int(mg.group(7))
     ours_router["hull_masked"] = int(mg.group(10))
     ours_router["unrouted"] = re.findall(r"^\s+unrouted (\S+)$", elog, re.M)
+    mk = re.search(
+        r"^unrouted_kinds NoPath=(\d+) Unattachable=(\d+)$", elog, re.M)
+    ours_router["unrouted_kinds"] = (
+        {"NoPath": int(mk.group(1)), "Unattachable": int(mk.group(2))}
+        if mk else None)
+    mb = re.search(r"^unrouted_blockers (.*)$", elog, re.M)
+    ours_router["unrouted_blockers"] = (
+        dict(
+            (kv.split("=")[0], int(kv.split("=")[1]))
+            for kv in mb.group(1).split())
+        if mb else None)
 
 # ---------- sanity control -------------------------------------------
 mutation = json.load(open(require(f"{run}/mutation.json")))

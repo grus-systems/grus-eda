@@ -2063,6 +2063,34 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 elapsed_route_ms,
                 graphs.hull_masked.iter().sum::<usize>(),
             );
+            let (mut nopath, mut unatt) = (0usize, 0usize);
+            for u in &route_db.unrouted {
+                for &(_, k) in &u.failed {
+                    match k {
+                        grus_core::drt::maze::FailKind::NoPath => nopath += 1,
+                        grus_core::drt::maze::FailKind::Unattachable => unatt += 1,
+                    }
+                }
+            }
+            println!("unrouted_kinds NoPath={nopath} Unattachable={unatt}");
+            {
+                let kind = ["Obs", "ObsPin", "Net", "Pin"];
+                let mut blk: std::collections::BTreeMap<(u8, u8), usize> =
+                    std::collections::BTreeMap::new();
+                for u in &route_db.unrouted {
+                    for &(l, k) in &u.blockers {
+                        *blk.entry((l, k)).or_default() += 1;
+                    }
+                }
+                if !blk.is_empty() {
+                    let s = blk
+                        .iter()
+                        .map(|(&(l, k), &n)| format!("l{l}{}={n}", kind[k as usize]))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!("unrouted_blockers {s}");
+                }
+            }
             for name in &report.unrouted {
                 println!("  unrouted {name}");
             }

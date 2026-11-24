@@ -236,27 +236,23 @@ fn net_region(
 /// delegated routes drop the whole mcon→met1→M1M2 access stack inside
 /// a pin rect's XY footprint on layers the pin does not declare
 /// (gcd `_001_`: met1 stub + both vias inside the li1 `D` rect's XY),
-/// so the cover is the pin's XY landing region — grown to the
-/// via-capable corridor `pin_cover` computes — on every masked layer.
+/// so the cover is the pin's XY landing region — the raw rects
+/// `pin_rects` computes — on every masked layer.
 /// A `cell` key exists only when the cell hosts a member pin of the
 /// net, so host-ness needs no second lookup.
 pub type PinCover = BTreeMap<u32, Vec<RectDbu>>;
 
 /// `cover(N)` for the hull mask — `pin_shapes` over `net`'s member
-/// instance pins, XY-unioned per host cell and grown into the pin's
-/// *access corridor*: on each axis the rect is extended to the
-/// nearest track of every layer the escape stack climbs through —
-/// `li1`→`met1`→`met2` for the shipped mask — so the mcon and M1M2
-/// positions and the stubs reaching them stay inside the cover.
-/// Without the growth a narrow pin rect holds no via-capable crossing
-/// and the pin is a graph island (measured: ~half of gcd's sinks
-/// `NoPath` on the strict rect).
-pub fn pin_cover(
-    db: &DesignDb,
-    tech: &TechDb,
-    tracks: &[LayerTracks],
-    net: NetId,
-) -> PinCover {
+/// instance pins, XY-unioned per host cell. The raw pin rect is the
+/// confinement boundary on masked layers: emitted metal inside a hull
+/// is legal only where it fully overlaps the pin's own LEF rect —
+/// paint in a grown corridor is what Magic flags as subcell-boundary
+/// spacing/abutment (the `drc(full)` residual class), and host OBS
+/// marks enforce the same `w/2 + s` clearance `premark_obs` knows.
+/// A pin rect that holds no track gets its access off-track via the
+/// pin-anchored arcs in `maze::access_vias` — the delegated router's
+/// model — not by growing the cover.
+pub fn pin_rects(db: &DesignDb, tech: &TechDb, net: NetId) -> PinCover {
     let mut cover: PinCover = BTreeMap::new();
     for &pin in db.net_pins(net) {
         let Some(c) = db.pin_cells[pin.0 as usize] else {
@@ -266,53 +262,7 @@ pub fn pin_cover(
             cover.entry(c.0).or_default().push(r);
         }
     }
-    // The stack climbs masked layer `l` through the `l`→`l+1` via, so
-    // the corridor must hold a track line of each masked layer and of
-    // the layer it escapes to.
-    let mut need: BTreeSet<usize> = BTreeSet::new();
-    for l in 0..tech.routing_layers.len() {
-        if hull_masked_layer(tech, l) {
-            need.insert(l);
-            if l + 1 < tech.routing_layers.len() {
-                need.insert(l + 1);
-            }
-        }
-    }
-    for rects in cover.values_mut() {
-        for r in rects.iter_mut() {
-            for &l in &need {
-                grow_to_track(&mut r.xl, &mut r.xh, &tracks[l].tracks_x);
-                grow_to_track(&mut r.yl, &mut r.yh, &tracks[l].tracks_y);
-            }
-        }
-    }
     cover
-}
-
-/// Grow `[*lo, *hi]` to include the nearest `tracks` line when none
-/// falls inside — ties go to the lower side; no-op when the track
-/// list is empty or a line already lies within.
-fn grow_to_track(lo: &mut i32, hi: &mut i32, tracks: &[i32]) {
-    let first_in = tracks.partition_point(|&t| t < *lo);
-    let last_in = first_in + tracks[first_in..].partition_point(|&t| t <= *hi);
-    if last_in > first_in {
-        return;
-    }
-    match (
-        first_in.checked_sub(1).map(|i| tracks[i]),
-        tracks.get(first_in).copied(),
-    ) {
-        (Some(a), Some(b)) => {
-            if *lo - a <= b - *hi {
-                *lo = a;
-            } else {
-                *hi = b;
-            }
-        }
-        (Some(a), None) => *lo = a,
-        (None, Some(b)) => *hi = b,
-        (None, None) => {}
-    }
 }
 
 /// Cell `c`'s placed outline — the conservative hull rect a master
@@ -486,6 +436,11 @@ impl HullMask {
         }
     }
 
+    /// Whether the mask applies on layer `l` (`hull_masked_layer`).
+    pub fn masked(&self, l: u8) -> bool {
+        self.masked.get(l as usize).copied().unwrap_or(false)
+    }
+
     /// Point legality for a net with `cover` on layer `l`: outside
     /// every hull, or inside an own-pin rect of a containing cell.
     pub fn point_allowed(
@@ -513,14 +468,51 @@ impl HullMask {
         })
     }
 
-    /// Host-carve per layer: `Obs(cell)` marks are invisible to nets
-    /// hosting a member pin on `cell` exactly where the strict cover —
-    /// not the OBS model — carries in-hull legality (li1's internals
-    /// are too dense to navigate). On `open` layers the marks must
-    /// block the host too, so in-hull channels stay honest.
-    pub fn carve(&self, l: u8) -> bool {
-        self.masked.get(l as usize).copied().unwrap_or(false)
-            && !self.open.get(l as usize).copied().unwrap_or(false)
+    /// Rect legality on layer `l` — the via-footprint counterpart of
+    /// `seg_allowed`: for every hull `r` intersects, the covered part
+    /// must sit inside one own-pin rect of that cell. A via plate
+    /// that pokes past the pin edge paints hull-internal metal Magic
+    /// flags as a subcell-boundary violation (the delegated router
+    /// keeps every access plate inside the pin rect).
+    pub fn rect_allowed(&self, cover: &PinCover, l: u8, r: &RectDbu) -> bool {
+        if !self.masked.get(l as usize).copied().unwrap_or(false) {
+            return true;
+        }
+        let pos = self.bands.partition_point(|b| b.yl <= r.yh);
+        for i in (0..pos).rev() {
+            if self.premiy[i] < r.yl {
+                break;
+            }
+            let b = &self.bands[i];
+            if b.yh < r.yl || b.yl > r.yh {
+                continue;
+            }
+            let xp = b.ivs.partition_point(|iv| iv.0 <= r.xh);
+            for j in (0..xp).rev() {
+                if b.premix[j] < r.xl {
+                    break;
+                }
+                let (xl, xh, c) = b.ivs[j];
+                if xl > r.xh {
+                    continue;
+                }
+                let (sxl, sxh) = (r.xl.max(xl), r.xh.min(xh));
+                let (syl, syh) = (r.yl.max(b.yl), r.yh.min(b.yh));
+                if sxl > sxh || syl > syh {
+                    continue;
+                }
+                let covered = cover.get(&c).is_some_and(|rs| {
+                    self.open.get(l as usize).copied().unwrap_or(false)
+                        || rs.iter().any(|p| {
+                            sxl >= p.xl && sxh <= p.xh && syl >= p.yl && syh <= p.yh
+                        })
+                });
+                if !covered {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Axis-aligned segment legality on layer `l`: for every hull the
@@ -749,7 +741,7 @@ pub fn build_route_graphs_ext(
         // internals the occupancy model cannot see (`drc(full)`
         // finding class). Attachment is unaffected: a pin's own
         // nodes sit inside its cover.
-        let cover = pin_cover(db, tech, tracks, *net);
+        let cover = pin_rects(db, tech, *net);
         for (&l, pairs) in region.iter_mut() {
             if !hull.masked.get(l as usize).copied().unwrap_or(false) {
                 continue;
@@ -807,12 +799,33 @@ pub fn build_route_graphs_ext(
         let mut layer_base: BTreeMap<u8, u32> = BTreeMap::new();
         for (&l, pairs) in &region {
             layer_base.insert(l, nodes.len() as u32);
+            let base = layer_base[&l];
             nodes.extend(pairs.iter().map(|&(ix, iy)| RouteNode {
                 layer: LayerId(l),
                 ix,
                 iy,
             }));
-            edges.extend(layer_edges(layer_base[&l], pairs));
+            let mut es = layer_edges(base, pairs);
+            if hull.masked.get(l as usize).copied().unwrap_or(false) {
+                // Node filtering keeps endpoints inside the pin rects,
+                // but an edge between two rects of one cell still
+                // paints the hull-internal strip between them —
+                // `seg_allowed` is the committed-paint check.
+                let lt = &tracks[l as usize];
+                es.retain(|e| {
+                    let (ia, ib) = ((e.a - base) as usize, (e.b - base) as usize);
+                    let (ax, ay) = (
+                        lt.tracks_x[pairs[ia].0 as usize],
+                        lt.tracks_y[pairs[ia].1 as usize],
+                    );
+                    let (bx, by) = (
+                        lt.tracks_x[pairs[ib].0 as usize],
+                        lt.tracks_y[pairs[ib].1 as usize],
+                    );
+                    hull.seg_allowed(&cover, l, ax, ay, bx, by)
+                });
+            }
+            edges.extend(es);
         }
 
         let mut via_edges = Vec::new();

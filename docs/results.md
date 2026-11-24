@@ -9579,3 +9579,70 @@ below when the log lands.
 drt` (20/20), `cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings` clean, the gcd emit suite above.
 Version `0.12.5 → 0.12.6` (feature, patch on 0.x).
+### 2026-11-24 — e6-drt-e2e r2 step 1: mask verification on the checkpoint DEF (measurement only)
+
+`tests/designs/check_drt_ours.sh gcd` inside the pinned
+`ghcr.io/librelane/librelane:3.0.16` container, run on the committed
+checkpoint `gcd.drt.ours.routed.def` (emit log `guided=269 routed=202
+unrouted=67 projected=10 collisions=0 area_patches=1
+hull_masked=227033`). Measurement only — the JSON is not committed
+(step 1: the golden's `input_def_sha_prefix` must match the final
+DEF).
+
+**Result**: `lef_expressible` ours = **847 fragments** (down from
+~3025 at first contact): `li.3`=527, `li.c2`=310, `met1.2`=3,
+`met2.2`=4, `met3.2`=3 — every row `inherited=false` (real findings,
+not baseline). `magic_only` rows all inherited (nwell.1=6/120/300
+matching the placed DEF exactly). `unclassified` ours = 0, antenna
+= 0, sanity control passed. Delta vs delegated: wirelength −28.5%,
+vias −568, `signal_nets_routed` −67 (the unrouted nets emit no
+wires). Verdict per steps.md: `lef_expressible` dirty → chase
+per-rule before connectivity work.
+
+**Root-cause analysis** (flat-`drc listall why` bboxes ×5 = DEF DBU,
+localized against a flattened `gcd_flat.mag` tile dump and a minimal
+hand-built DEF probe):
+
+- **li.3/li.c2 (~837 frags) — masked-layer paint outside raw pin
+  rects.** ~806 inside instance hulls: our mcon `L1M1` plates and
+  li1 stubs land inside the *grown* `PinCover` but outside the *raw*
+  pin rect, colliding with subcell-internal li1 paint (mostly the
+  LEF-declared OBS `obsli1` tiles — carved away for host cells —
+  plus undeclared internals Magic paints from `.mag`). Example
+  `_389_` (dfxtp_2): our mcon at x=15410 → plate `[15325,15495]`
+  pokes 45 DBU past pin rect xh=15450; counterpart `obsli1` at
+  x=15620 (gap 125 < 170). The delegated mcon at x=15365 keeps its
+  plate `[15280,15450]` exactly inside — **all 884 delegated mcon
+  centres sit inside a target pin rect (760 plates fully contained)
+  and the delegated DEF emits zero li1 wire segments**. Off-track
+  via positions: the delegated point is on a met1 track, off-track
+  on li1 — the pin access-point model, not a track crossing.
+  ~31 fragments sit in placement gaps just outside hulls: our li1
+  wires within `s` of the *host* cell's own OBS li1 — the host
+  carve removes the `Obs(cell)` band globally, so the wire was
+  never priced (`_153_` li1 vertical at x=25070 vs `_331_`'s OBS
+  edge at 24840, gap 145 < 170).
+- **met1.2/met2.2/met3.2 (3 sites, 10 frags) — same-net disjoint
+  tiles inside `s`.** Each site is our via plate vs our own wire of
+  the *same* net, separated `< s` without overlapping: `clk` M1M2
+  plate edge x=27530 vs its met1 stub edge x=27640 (gap 110 < 140);
+  `_127_` M2M3 plate bottom y=34835 vs its met2 wire top y=34800
+  (gap 35 < 140); `_122_` M2M3 met3 plate edge x=35355 vs its met3
+  stub edge x=35550 (gap 195 < 300). A hand-built two-segment DEF
+  proves **Magic's spacing deck is net-agnostic** — disjoint
+  same-net tiles inside `s` are flagged identically to cross-net
+  ones, so emitted geometry must be merge-or-`s`-separated even
+  within one net.
+- **Census on the committed DEF**: 232/531 in-hull `L1M1` plates
+  and 31/31 in-hull li1 wire segments paint outside the net's own
+  pin rects — the grown cover admits them; confinement must tighten
+  to painted-footprint ⊆ own-pin-rect, and pin access needs
+  off-track mcon positions (the delegated access-point model) to
+  keep connectivity.
+
+**Fix direction** (design docs update pending with the code): li1
+paint inside a host hull ⊆ the net's own pin rects (raw, ungrown);
+`Obs(cell)` carve scoped to footprints inside own pin rects instead
+of host-global; pin-anchored off-track `mcon` access arcs
+(`pin ↔ mcon ⊆ rect ↔ met1 stub`) per delegated geometry; a
+post-route same-net self-spacing merge on unmasked layers.
