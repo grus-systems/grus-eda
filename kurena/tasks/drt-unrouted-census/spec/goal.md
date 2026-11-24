@@ -1,6 +1,6 @@
 # drt-unrouted-census: surface per-pin failure classification
 
-External review (fabric-scale run, ~8k unrouted): the operator
+External review (large-scale run, ~8k unrouted): the operator
 cannot tell whether unrouted nets died `Unattachable` or `NoPath`,
 so a class of failure (e.g. 42 consecutive unrouted nets sharing a
 guide region) cannot be root-caused without a debugger. The
