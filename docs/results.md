@@ -9493,6 +9493,22 @@ min release CPU (slower under ambient load) + emit + parse +
 The measurement is in flight at this entry's commit; its outcome
 appends below the line when the log lands.
 
+**picorv32 gate landed 2026-11-24 (30,658 s wall — ambient-load
+slowdown vs the ~135 min clean route)**: `routed=6,628` (8 fewer
+than the pre-premark 6,636), `unrouted=116` (108 + 8 — the new
+PDN/io-port obstacles push 8 more nets to `NoPath`, consistent),
+`wire_rects=52,145`, `vias=38,147`, emit census vs delegated:
+wirelength +62,480 µm, via `mcon −8,012` / `via −17,625` /
+`via2 +2,150` / `via3 +200` / `via4 127`. **Self-DRC reports 42
+findings — the gate caught a real router bug, not an emit bug**:
+`li.6`×3 (component area 28,900 < bound 56,100) and `met3.6`×39
+(190,500–237,000 < bound 240,000) — every finding is a min-area
+shortfall on a stub-class component, the class the relaxed-via and
+projected-pin stubs create when the connected metal is one via
+plus a short stub. TritonRoute's equivalent is a post-route
+min-area patch pass; that fix and its fixture-pinned regression
+are the next revision's work — the picorv32 leg stays `#[ignore]`d.
+
 **Checks run**: `cargo test --release -p grus-core --test drt emit`
 (6/6, 1 ignored — the picorv32 gate), `cargo test --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
