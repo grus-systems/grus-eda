@@ -2049,10 +2049,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             grus_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
 
             let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
+            let notch_fills: usize = route_db.nets.iter().map(|n| n.fills.len()).sum();
             println!("== drt emit: {} ==", design_db.design_name);
             println!(
                 "guided={} routed={} unrouted={} projected={projected} collisions={} \
-                 area_patches={} area_residuals={} iterations={} route_ms={:.0} hull_masked={}",
+                 area_patches={} area_residuals={} iterations={} route_ms={:.0} hull_masked={} \
+                 notch_fills={notch_fills}",
                 join.nets.len(),
                 report.routed,
                 report.unrouted.len(),
@@ -2120,6 +2122,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     r.area_dbu2,
                     r.bound_dbu2,
                     r.region,
+                );
+            }
+            for r in &route_db.notch_residuals {
+                println!(
+                    "  notch_residual {} {} a={:?} b={:?}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    tech_db
+                        .strings
+                        .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
+                    r.a,
+                    r.b,
                 );
             }
 

@@ -326,6 +326,91 @@ pub fn enclosed_voids(solid: &[RectDbu], window: RectDbu) -> Vec<Hole> {
     holes
 }
 
+/// `cur` minus each rect of `sub` — the residual slabs. Iterating `sub`
+/// in order splits off up to four axis-aligned slabs per subtraction;
+/// the result order is fixed by input order (determinism), overlaps
+/// between `sub` rects are harmless (a slab can only shrink).
+pub fn rect_minus(mut cur: Vec<RectDbu>, sub: &[RectDbu]) -> Vec<RectDbu> {
+    for s in sub {
+        let mut next = Vec::with_capacity(cur.len() * 2);
+        for r in cur.drain(..) {
+            let (ixl, ixh) = (r.xl.max(s.xl), r.xh.min(s.xh));
+            let (iyl, iyh) = (r.yl.max(s.yl), r.yh.min(s.yh));
+            if ixl >= ixh || iyl >= iyh {
+                next.push(r);
+                continue;
+            }
+            // left / right full-height slabs
+            if r.xl < ixl {
+                next.push(RectDbu::new(r.xl, r.yl, ixl, r.yh));
+            }
+            if ixh < r.xh {
+                next.push(RectDbu::new(ixh, r.yl, r.xh, r.yh));
+            }
+            // top / bottom slabs inside the x-overlap
+            if ixl < ixh {
+                if r.yl < iyl {
+                    next.push(RectDbu::new(ixl, r.yl, ixh, iyl));
+                }
+                if iyh < r.yh {
+                    next.push(RectDbu::new(ixl, iyh, ixh, r.yh));
+                }
+            }
+        }
+        cur = next;
+        if cur.is_empty() {
+            break;
+        }
+    }
+    cur
+}
+
+/// Is `[lo, hi]` covered by the union of `ivs` — boundary contact
+/// counts as connected (two abutting cover rects hold the paint
+/// between them just as one merged rect would)?
+fn intervals_cover(ivs: &mut [(i32, i32)], lo: i32, hi: i32) -> bool {
+    ivs.sort_unstable();
+    let mut cur = lo;
+    for &(a, b) in ivs.iter() {
+        if a > cur {
+            break;
+        }
+        cur = cur.max(b);
+        if cur >= hi {
+            return true;
+        }
+    }
+    cur >= hi
+}
+
+/// `part ⊆ ⋃ rects` — union-exact containment (the r3 confinement
+/// test): a part spanning joined same-pin sub-rects is inside the
+/// cover even when no single rect holds it (the L-shaped-pin class).
+/// Degenerate parts are exact too: a line/point part is covered iff
+/// the varying axis's interval is covered by the rects containing the
+/// fixed coordinate.
+pub fn rect_covered(rects: &[RectDbu], part: &RectDbu) -> bool {
+    if part.xl == part.xh {
+        // Point or vertical-segment part at x: the y-interval must be
+        // covered by rects spanning x.
+        let mut ivs: Vec<(i32, i32)> = rects
+            .iter()
+            .filter(|r| part.xl >= r.xl && part.xh <= r.xh)
+            .map(|r| (r.yl, r.yh))
+            .collect();
+        return intervals_cover(&mut ivs, part.yl, part.yh);
+    }
+    if part.yl == part.yh {
+        let mut ivs: Vec<(i32, i32)> = rects
+            .iter()
+            .filter(|r| part.yl >= r.yl && part.yh <= r.yh)
+            .map(|r| (r.xl, r.xh))
+            .collect();
+        return intervals_cover(&mut ivs, part.xl, part.xh);
+    }
+    rect_minus(vec![*part], rects).is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

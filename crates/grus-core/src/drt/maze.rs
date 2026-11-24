@@ -9,9 +9,10 @@ use crate::design_db::{DesignDb, PlacementStatus};
 use crate::drc::area::is_drawn;
 use crate::drc::geom::expand_via;
 use crate::drc::union;
+use crate::drc::union::{rect_covered, rect_minus};
 use crate::drc::{DrcLayer, LayerShapes, ShapeRect, ShapeSrc};
 use crate::drt::access::pin_shapes;
-use crate::drt::graph::{pin_rects, HullMask, NetGraph, PinCover, RouteGraphs};
+use crate::drt::graph::{cell_hull_rect, pin_rects, HullMask, NetGraph, PinCover, RouteGraphs};
 use crate::drt::tracks::{Axis, LayerTracks};
 use crate::drt::via::ViaTable;
 use crate::interner::{LayerId, NetId, PinId};
@@ -92,6 +93,11 @@ pub struct NetRoute {
     /// Subset of `connected` attached via the projection fallback —
     /// named so the loosening is visible (`docs/e6-drt.md` §7).
     pub projected: Vec<PinId>,
+    /// Self-spacing repair rects (`self-spacing.md` Rule B): notch
+    /// fills committed by the extraction closure pass, emitted as
+    /// `RECT` path records — absolute DBU geometry, rasterized into
+    /// occupancy like wires and plates.
+    pub fills: Vec<(LayerId, RectDbu)>,
 }
 
 /// Why a member pin did not connect.
@@ -144,6 +150,18 @@ pub struct AreaResidual {
     pub bound_dbu2: i64,
 }
 
+/// A same-net sub-spacing pair the closure pass could not repair —
+/// every candidate fill was inadmissible and neither prong was a
+/// droppable access/stub element (tree-only paint). Recorded, never
+/// hidden: Magic's `drc(full)` flags the site.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NotchResidual {
+    pub net: NetId,
+    pub layer: LayerId,
+    pub a: RectDbu,
+    pub b: RectDbu,
+}
+
 /// The router's complete deterministic output.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RouteDb {
@@ -162,11 +180,14 @@ pub struct RouteDb {
     /// every residual maps to a `*.6` self-DRC finding if the gate
     /// fires, and every `*.6` finding must map back to one of these.
     pub area_residuals: Vec<AreaResidual>,
-    /// Pins whose projected access stubs were suppressed by the
-    /// hull-confinement check — the net landed in `unrouted` with
-    /// the pin marked `Unattachable`. Expected empty (`project_attach`
-    /// admission pre-filters); a nonempty list is a bug to name, not
-    /// a residual to tolerate.
+    /// Same-net notches the closure pass could not fill or reject —
+    /// expected empty; each maps to a `*.2`-family Magic finding on
+    /// the routed DEF (`self-spacing.md`).
+    pub notch_residuals: Vec<NotchResidual>,
+    /// Pins that got no legal paint — the `Unattachable` census
+    /// (`pin-access.md` r3 semantics: projected stubs suppressed by
+    /// hull confinement plus access arcs blocked by live occupancy;
+    /// every entry maps to an `unrouted` net).
     pub stub_outside_cover: Vec<(NetId, PinId)>,
 }
 
@@ -255,14 +276,29 @@ struct Occupancy {
 
 /// One interval hit by a candidate edge: the rasterized mark (`iv`),
 /// the line it was found on, and the overlap of the two shape extents
-/// along the line (`lo > hi` encodes a gap).
+/// along the line (`lo > hi` encodes a gap). `x_axis` says which map
+/// the hit came from — `lines_x` marks are vertical-line intervals
+/// (`lo..hi` on y), `lines_y` marks horizontal (`lo..hi` on x) — so a
+/// blocking shape's full bbox can be reconstructed for repair
+/// decomposition.
 #[derive(Clone, Copy, Debug)]
 struct Hit {
     iv: Interval,
     line: i32,
     layer: u8,
+    x_axis: bool,
     lo: i32,
     hi: i32,
+}
+
+/// The blocking shape's absolute bbox behind `h` — `iv` stores the
+/// mark's extent along its line plus the perpendicular extent.
+fn hit_bbox(h: &Hit) -> RectDbu {
+    if h.x_axis {
+        RectDbu::new(h.iv.perp_lo, h.iv.lo, h.iv.perp_hi, h.iv.hi)
+    } else {
+        RectDbu::new(h.iv.lo, h.iv.perp_lo, h.iv.hi, h.iv.perp_hi)
+    }
 }
 
 impl Occupancy {
@@ -421,6 +457,7 @@ impl Occupancy {
                         iv: *iv,
                         line: t,
                         layer,
+                        x_axis: matches!(axis, Axis::Y),
                         lo: iv.lo.max(slo),
                         hi: iv.hi.min(shi),
                     });
@@ -454,6 +491,7 @@ impl Occupancy {
                             iv: *iv,
                             line: t,
                             layer,
+                            x_axis: false,
                             lo: iv.lo.max(r.xl),
                             hi: iv.hi.min(r.xh),
                         });
@@ -475,6 +513,7 @@ impl Occupancy {
                             iv: *iv,
                             line: t,
                             layer,
+                            x_axis: true,
                             lo: iv.lo.max(r.yl),
                             hi: iv.hi.min(r.yh),
                         });
@@ -499,46 +538,6 @@ impl Occupancy {
 /// foreign wire inside a port's spacing band is a real emit-time
 /// finding (the gcd `met3.2` `req_msg`/`resp_msg` class), so the
 /// band is priced even though it never hard-blocks.
-/// `r` minus each rect of `sub` — the residual slabs that still need
-/// an `Obs` wall. Iterating `sub` in order splits off up to four
-/// axis-aligned slabs per subtraction; the result order is fixed by
-/// input order (determinism), overlaps between `sub` rects are
-/// harmless (a slab can only shrink).
-fn rect_minus(mut cur: Vec<RectDbu>, sub: &[RectDbu]) -> Vec<RectDbu> {
-    for s in sub {
-        let mut next = Vec::with_capacity(cur.len() * 2);
-        for r in cur.drain(..) {
-            let (ixl, ixh) = (r.xl.max(s.xl), r.xh.min(s.xh));
-            let (iyl, iyh) = (r.yl.max(s.yl), r.yh.min(s.yh));
-            if ixl >= ixh || iyl >= iyh {
-                next.push(r);
-                continue;
-            }
-            // left / right full-height slabs
-            if r.xl < ixl {
-                next.push(RectDbu::new(r.xl, r.yl, ixl, r.yh));
-            }
-            if ixh < r.xh {
-                next.push(RectDbu::new(ixh, r.yl, r.xh, r.yh));
-            }
-            // top / bottom slabs inside the x-overlap
-            if ixl < ixh {
-                if r.yl < iyl {
-                    next.push(RectDbu::new(ixl, r.yl, ixh, iyl));
-                }
-                if iyh < r.yh {
-                    next.push(RectDbu::new(ixl, iyh, ixh, r.yh));
-                }
-            }
-        }
-        cur = next;
-        if cur.is_empty() {
-            break;
-        }
-    }
-    cur
-}
-
 fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut Occupancy) {
     // Cell → its instance pins' placed shapes per layer — OBS paint
     // clipped against them keeps a wall only where it is not pin.
@@ -882,20 +881,20 @@ fn edge_cost(
 }
 
 /// Drops the hits added since `from` whose `Obs(c)` spacing does not
-/// apply: paint fully inside one of cell `c`'s own-pin cover rects
-/// merges with the pin on connect (the delegated access stacks sit
-/// flush inside the pin rect and Magic reports nothing — the
+/// apply: paint fully inside cell `c`'s own-pin cover *union* merges
+/// with the pin on connect (the delegated access stacks sit flush
+/// inside the pin rect and Magic reports nothing — the
 /// subcell-internal abutment is the cell's own geometry), while any
 /// paint outside the pin rects keeps the full `w/2 + s` wall.
+/// Union-exact (`rect_covered`): paint spanning joined same-pin
+/// sub-rects of one pin exempts just like paint inside a single rect.
 fn exempt_obs(cover: &PinCover, paint: &RectDbu, hits: &mut Vec<Hit>, from: usize) {
     let kept: Vec<Hit> = hits[from..]
         .iter()
         .copied()
         .filter(|h| {
             !matches!(h.iv.who, Occupant::Obs(c) if cover.get(&c).is_some_and(|rs| {
-                rs.iter().any(|p| {
-                    paint.xl >= p.xl && paint.xh <= p.xh && paint.yl >= p.yl && paint.yh <= p.yh
-                })
+                rect_covered(rs, paint)
             }))
         })
         .collect();
@@ -1285,7 +1284,11 @@ fn access_vias(
     mask: &HullMask,
     cover: &PinCover,
 ) -> Vec<Vec<AccessVia>> {
-    const ACCESS_K: usize = 3;
+    const ACCESS_K: usize = 8;
+    /// A4: upper-line fan-out — index steps past the block of lines
+    /// inside the pin's projection (the `relaxed_vias` L-corridor
+    /// reach); the stub stays axis-aligned.
+    const B_EXT: u32 = 2;
     let nl = tracks.len();
     let (lines_h, lines_v) = layer_line_maps(g, nl);
     let node_id = |l: u8, ix: u32, iy: u32| -> u32 {
@@ -1297,162 +1300,239 @@ fn access_vias(
         if db.pin_cells[pin.0 as usize].is_none() {
             continue; // io-port rects live outside every hull
         }
-        let mut seen: BTreeSet<(u8, i32, i32, u32)> = BTreeSet::new();
+        // Per-layer pin shapes merged into overlap-connected
+        // components (A1: the plate-fit test is against a component's
+        // union, not one sub-rect — a plate spanning joined same-pin
+        // rects is the delegated 65-partial class).
+        let mut by_layer: BTreeMap<u8, Vec<RectDbu>> = BTreeMap::new();
         for (lid, r) in pin_shapes(db, tech, pin) {
-            let k = lid.0 as usize;
-            if k + 1 >= nl || !mask.masked(lid.0) {
+            by_layer.entry(lid.0).or_default().push(r);
+        }
+        let mut seen: BTreeSet<(u8, i32, i32, u32)> = BTreeSet::new();
+        for (l8, rects) in by_layer {
+            let k = l8 as usize;
+            let lid = LayerId(l8);
+            if k + 1 >= nl || !mask.masked(l8) {
                 continue;
             }
             let Some(di) = vias.pairs[k].default else {
                 continue;
             };
+            // The emitted footprint (A2): candidates widen the *probe*
+            // enumeration, but placement always drops `default` —
+            // confined() prices exactly what emit paints.
             let vcand = &vias.candidates[vias.pairs[k].candidates[di as usize] as usize];
-            // The position range the pin-shape-layer plate fits in:
-            // `(x, y) + vr ⊆ r` — the via touches the pin's own metal.
-            let Some(vr) = vcand.rects.iter().find_map(|(dl, vr)| {
+            let Some(dvr) = vcand.rects.iter().find_map(|(dl, vr)| {
                 matches!(dl, DrcLayer::Routing(l2) if *l2 == lid).then_some(vr)
             }) else {
                 continue;
             };
-            let (x0, x1) = (r.xl - vr.xl, r.xh - vr.xh);
-            let (y0, y1) = (r.yl - vr.yl, r.yh - vr.yh);
-            if x0 > x1 || y0 > y1 {
-                continue;
-            }
             let up = &tracks[k + 1];
-            // Free-axis probe positions: edge fits first (the
-            // delegated right-edge choice), then the range midpoint,
-            // then every upper track inside the range — the OBS
-            // filter below usually kills the edge fits, and a clean
-            // position exists for most rects (the delegated mcons
-            // prove it). Ordered by distance to the range midpoint,
-            // ties by value — deterministic.
-            let probes = |lo: i32, hi: i32, trks: &[i32]| {
-                let mut v = vec![lo, hi, (lo + hi) / 2];
-                let mid = (lo + hi) / 2;
-                v.extend(trks.iter().copied().filter(|&t| t > lo && t < hi));
-                v.sort_unstable();
-                v.dedup();
-                v.sort_by_key(|&t| ((t - mid).abs(), t));
-                v
-            };
-            let (xprobes, yprobes) = (
-                probes(x0, x1, &up.tracks_x),
-                probes(y0, y1, &up.tracks_y),
-            );
-            // Confinement (mask) + first-iteration occupancy: a
-            // candidate whose paint already collides is never an
-            // attach point — that would be a false-claim waiting for
-            // extraction. `Net`/`Pin` marks can't exist yet (topo
-            // build predates commits) but the check stays uniform
-            // with the extraction guard.
-            let own = g.net.0;
-            let confined = |scratch: &mut Vec<u32>, vx: i32, vy: i32, b: u32| {
-                if !(mask.point_allowed(cover, scratch, lid.0, vx, vy)
-                    && mask.point_allowed(cover, scratch, lid.0 + 1, vx, vy)
-                    && vcand.rects.iter().all(|(dl, vr)| {
-                        let DrcLayer::Routing(l2) = dl else {
-                            return true;
-                        };
-                        mask.rect_allowed(
-                            cover,
-                            l2.0,
-                            &RectDbu::new(vx + vr.xl, vy + vr.yl, vx + vr.xh, vy + vr.yh),
-                        )
-                    }))
-                {
-                    return false;
+            let pitch = tech.routing_layers[k].pitch_dbu.max(1);
+            for comp in rect_components(&rects) {
+                let cb = comp_bbox(&comp);
+                // Contact range: the plate at (x,y) touches pin metal —
+                // strict-superset of the per-candidate fit ranges.
+                let (cx0, cx1) = (cb.xl - dvr.xh, cb.xh - dvr.xl);
+                let (cy0, cy1) = (cb.yl - dvr.yh, cb.yh - dvr.yl);
+                if cx0 > cx1 || cy0 > cy1 {
+                    continue;
                 }
-                let mut hits = Vec::new();
-                for (dl, vr) in &vcand.rects {
-                    let DrcLayer::Routing(l2) = dl else {
+                // Free-axis probes (A2 + A3): every candidate's
+                // per-sub-rect edge fits, contact-range midpoints and
+                // in-range upper tracks, plus a half-pitch raster —
+                // DBU-fine where the range is smaller.
+                let mut xs: BTreeSet<i32> = BTreeSet::new();
+                let mut ys: BTreeSet<i32> = BTreeSet::new();
+                for &ci in &vias.pairs[k].candidates {
+                    let cand = &vias.candidates[ci as usize];
+                    let Some(vr) = cand.rects.iter().find_map(|(dl, vr)| {
+                        matches!(dl, DrcLayer::Routing(l2) if *l2 == lid).then_some(vr)
+                    }) else {
                         continue;
                     };
-                    let paint =
-                        RectDbu::new(vx + vr.xl, vy + vr.yl, vx + vr.xh, vy + vr.yh);
-                    let from = hits.len();
-                    occ.scan_rect(l2.0, &paint, &mut hits);
-                    exempt_obs(cover, &paint, &mut hits, from);
+                    let (x0, x1) = (cb.xl - vr.xh, cb.xh - vr.xl);
+                    let (y0, y1) = (cb.yl - vr.yh, cb.yh - vr.yl);
+                    if x0 > x1 || y0 > y1 {
+                        continue;
+                    }
+                    for r in &comp {
+                        xs.extend([r.xl - vr.xl, r.xh - vr.xh]);
+                        ys.extend([r.yl - vr.yl, r.yh - vr.yh]);
+                    }
+                    xs.insert((x0 + x1) / 2);
+                    ys.insert((y0 + y1) / 2);
+                    xs.extend(up.tracks_x.iter().copied().filter(|&t| t >= x0 && t <= x1));
+                    ys.extend(up.tracks_y.iter().copied().filter(|&t| t >= y0 && t <= y1));
+                    for (lo, hi, set) in [(x0, x1, &mut xs), (y0, y1, &mut ys)] {
+                        let span = hi - lo;
+                        if span <= 0 {
+                            continue;
+                        }
+                        let step = (pitch / 2).min(span).max(1);
+                        let mut t = lo;
+                        while t <= hi {
+                            set.insert(t);
+                            t += step;
+                        }
+                        set.insert(hi);
+                    }
                 }
-                scan_stub(g, tracks, occ, cover, b, lid.0 + 1, vx, vy, &mut hits);
-                !hits.iter().any(|h| match h.iv.who {
-                    Occupant::Obs(_) => true,
-                    Occupant::ObsPin(m) | Occupant::Net(m) | Occupant::Pin(m) => m != own,
-                })
-            };
-            match tech.routing_layers[k + 1].dir {
-                LayerDir::Horizontal => {
-                    let mid = (y0 + y1) / 2;
-                    let mut jys: Vec<u32> = (0..up.tracks_y.len() as u32)
-                        .filter(|&jy| {
-                            up.tracks_y[jy as usize] >= y0 && up.tracks_y[jy as usize] <= y1
-                        })
-                        .collect();
-                    jys.sort_by_key(|&jy| {
-                        ((up.tracks_y[jy as usize] - mid).abs(), up.tracks_y[jy as usize])
-                    });
-                    'enough: for jy in jys {
-                        let vy = up.tracks_y[jy as usize];
-                        let Some(ixs) = lines_h[k + 1].get(&jy) else {
+                let (mx, my) = ((cx0 + cx1) / 2, (cy0 + cy1) / 2);
+                let mut xprobes: Vec<i32> = xs.into_iter().collect();
+                let mut yprobes: Vec<i32> = ys.into_iter().collect();
+                xprobes.sort_by_key(|&t| ((t - mx).abs(), t));
+                yprobes.sort_by_key(|&t| ((t - my).abs(), t));
+                // Connectivity: the emitted (default) lower plate must
+                // touch the component's pin metal — confinement alone
+                // does not imply it once probes range past the strict
+                // fit range.
+                let touches_pin = |vx: i32, vy: i32| {
+                    let pl = RectDbu::new(
+                        vx + dvr.xl,
+                        vy + dvr.yl,
+                        vx + dvr.xh,
+                        vy + dvr.yh,
+                    );
+                    comp.iter().any(|r| overlaps_closed(&pl, r))
+                };
+                // Confinement (mask) + first-iteration occupancy: a
+                // candidate whose paint already collides is never an
+                // attach point — that would be a false-claim waiting
+                // for extraction. `Net`/`Pin` marks can't exist yet
+                // (topo build predates commits) but the check stays
+                // uniform with the extraction guard.
+                let own = g.net.0;
+                let confined = |scratch: &mut Vec<u32>, vx: i32, vy: i32, b: u32| {
+                    if !(touches_pin(vx, vy)
+                        && mask.point_allowed(cover, scratch, l8, vx, vy)
+                        && mask.point_allowed(cover, scratch, l8 + 1, vx, vy)
+                        && vcand.rects.iter().all(|(dl, vr)| {
+                            let DrcLayer::Routing(l2) = dl else {
+                                return true;
+                            };
+                            mask.rect_allowed(
+                                cover,
+                                l2.0,
+                                &RectDbu::new(
+                                    vx + vr.xl,
+                                    vy + vr.yl,
+                                    vx + vr.xh,
+                                    vy + vr.yh,
+                                ),
+                            )
+                        }))
+                    {
+                        return false;
+                    }
+                    let mut hits = Vec::new();
+                    for (dl, vr) in &vcand.rects {
+                        let DrcLayer::Routing(l2) = dl else {
                             continue;
                         };
-                        for &vx in &xprobes {
-                            for jx in nearest_k(ixs, |jx| up.tracks_x[jx as usize], vx, 3) {
-                                let bx = up.tracks_x[jx as usize];
-                                if !mask.seg_allowed(cover, lid.0 + 1, vx, vy, bx, vy) {
+                        let paint = RectDbu::new(
+                            vx + vr.xl,
+                            vy + vr.yl,
+                            vx + vr.xh,
+                            vy + vr.yh,
+                        );
+                        let from = hits.len();
+                        occ.scan_rect(l2.0, &paint, &mut hits);
+                        exempt_obs(cover, &paint, &mut hits, from);
+                    }
+                    scan_stub(g, tracks, occ, cover, b, l8 + 1, vx, vy, &mut hits);
+                    !hits.iter().any(|h| match h.iv.who {
+                        Occupant::Obs(_) => true,
+                        Occupant::ObsPin(m) | Occupant::Net(m) | Occupant::Pin(m) => m != own,
+                    })
+                };
+                // Upper lines inside the contact range, extended ±B_EXT
+                // index steps (A4): ordered by distance to the range
+                // midpoint, in-range lines first by construction.
+                let line_ixs = |trks: &[i32], lo: i32, hi: i32| -> Vec<u32> {
+                    let n = trks.len() as u32;
+                    let ja = trks.partition_point(|&t| t < lo) as u32;
+                    let jb = trks.partition_point(|&t| t <= hi) as u32;
+                    (ja.saturating_sub(B_EXT)..(jb + B_EXT).min(n)).collect()
+                };
+                match tech.routing_layers[k + 1].dir {
+                    LayerDir::Horizontal => {
+                        let mut jys = line_ixs(&up.tracks_y, cy0, cy1);
+                        jys.sort_by_key(|&jy| {
+                            ((up.tracks_y[jy as usize] - my).abs(), up.tracks_y[jy as usize])
+                        });
+                        'enough: for jy in jys {
+                            let vy = up.tracks_y[jy as usize];
+                            let Some(ixs) = lines_h[k + 1].get(&jy) else {
+                                continue;
+                            };
+                            for &vx in &xprobes {
+                                if vx < cx0 || vx > cx1 {
                                     continue;
                                 }
-                                let b = node_id(lid.0 + 1, jx, jy);
-                                if confined(&mut scratch, vx, vy, b)
-                                    && seen.insert((lid.0, vx, vy, b))
+                                for jx in
+                                    nearest_k(ixs, |jx| up.tracks_x[jx as usize], vx, 4)
                                 {
-                                    out[pi].push(AccessVia {
-                                        x: vx,
-                                        y: vy,
-                                        lower: lid.0,
-                                        b,
-                                    });
-                                    if out[pi].len() >= ACCESS_K {
-                                        break 'enough;
+                                    let bx = up.tracks_x[jx as usize];
+                                    if !mask
+                                        .seg_allowed(cover, l8 + 1, vx, vy, bx, vy)
+                                    {
+                                        continue;
+                                    }
+                                    let b = node_id(l8 + 1, jx, jy);
+                                    if confined(&mut scratch, vx, vy, b)
+                                        && seen.insert((l8, vx, vy, b))
+                                    {
+                                        out[pi].push(AccessVia {
+                                            x: vx,
+                                            y: vy,
+                                            lower: l8,
+                                            b,
+                                        });
+                                        if out[pi].len() >= ACCESS_K {
+                                            break 'enough;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                LayerDir::Vertical => {
-                    let mid = (x0 + x1) / 2;
-                    let mut jxs: Vec<u32> = (0..up.tracks_x.len() as u32)
-                        .filter(|&jx| {
-                            up.tracks_x[jx as usize] >= x0 && up.tracks_x[jx as usize] <= x1
-                        })
-                        .collect();
-                    jxs.sort_by_key(|&jx| {
-                        ((up.tracks_x[jx as usize] - mid).abs(), up.tracks_x[jx as usize])
-                    });
-                    'enough: for jx in jxs {
-                        let vx = up.tracks_x[jx as usize];
-                        let Some(iys) = lines_v[k + 1].get(&jx) else {
-                            continue;
-                        };
-                        for &vy in &yprobes {
-                            for jy in nearest_k(iys, |jy| up.tracks_y[jy as usize], vy, 3) {
-                                let by = up.tracks_y[jy as usize];
-                                if !mask.seg_allowed(cover, lid.0 + 1, vx, vy, vx, by) {
+                    LayerDir::Vertical => {
+                        let mut jxs = line_ixs(&up.tracks_x, cx0, cx1);
+                        jxs.sort_by_key(|&jx| {
+                            ((up.tracks_x[jx as usize] - mx).abs(), up.tracks_x[jx as usize])
+                        });
+                        'enough: for jx in jxs {
+                            let vx = up.tracks_x[jx as usize];
+                            let Some(iys) = lines_v[k + 1].get(&jx) else {
+                                continue;
+                            };
+                            for &vy in &yprobes {
+                                if vy < cy0 || vy > cy1 {
                                     continue;
                                 }
-                                let b = node_id(lid.0 + 1, jx, jy);
-                                if confined(&mut scratch, vx, vy, b)
-                                    && seen.insert((lid.0, vx, vy, b))
+                                for jy in
+                                    nearest_k(iys, |jy| up.tracks_y[jy as usize], vy, 4)
                                 {
-                                    out[pi].push(AccessVia {
-                                        x: vx,
-                                        y: vy,
-                                        lower: lid.0,
-                                        b,
-                                    });
-                                    if out[pi].len() >= ACCESS_K {
-                                        break 'enough;
+                                    let by = up.tracks_y[jy as usize];
+                                    if !mask
+                                        .seg_allowed(cover, l8 + 1, vx, vy, vx, by)
+                                    {
+                                        continue;
+                                    }
+                                    let b = node_id(l8 + 1, jx, jy);
+                                    if confined(&mut scratch, vx, vy, b)
+                                        && seen.insert((l8, vx, vy, b))
+                                    {
+                                        out[pi].push(AccessVia {
+                                            x: vx,
+                                            y: vy,
+                                            lower: l8,
+                                            b,
+                                        });
+                                        if out[pi].len() >= ACCESS_K {
+                                            break 'enough;
+                                        }
                                     }
                                 }
                             }
@@ -1463,6 +1543,39 @@ fn access_vias(
         }
     }
     out
+}
+
+/// Overlap-connected components of `rects` — boundary contact counts
+/// (the Magic merge rule). Component order is canonical (by bbox).
+fn rect_components(rects: &[RectDbu]) -> Vec<Vec<RectDbu>> {
+    let mut comps: Vec<Vec<RectDbu>> = Vec::new();
+    for &r in rects {
+        let mut merged = vec![r];
+        let mut rest = Vec::with_capacity(comps.len() + 1);
+        for c in comps {
+            if c.iter().any(|s| overlaps_closed(s, &r)) {
+                merged.extend(c);
+            } else {
+                rest.push(c);
+            }
+        }
+        rest.push(merged);
+        comps = rest;
+    }
+    comps.sort_by_key(|c| comp_bbox(c));
+    comps
+}
+
+/// The component's bounding box.
+fn comp_bbox(comp: &[RectDbu]) -> RectDbu {
+    comp.iter().fold(comp[0], |b, r| {
+        RectDbu::new(
+            b.xl.min(r.xl),
+            b.yl.min(r.yl),
+            b.xh.max(r.xh),
+            b.yh.max(r.yh),
+        )
+    })
 }
 
 /// The other endpoint of edge `eidx` seen from `v`.
@@ -1483,7 +1596,9 @@ fn other_end(g: &NetGraph, relax: &[RelaxedVia], eidx: u32, v: u32) -> u32 {
 
 /// One routed net's outcome.
 enum NetOutcome {
-    Routed(NetRoute, Vec<Collision>),
+    /// Route, provisional collisions, and the closure pass's
+    /// unrepaired same-net notches (`self-spacing.md`).
+    Routed(NetRoute, Vec<Collision>, Vec<NotchResidual>),
     Failed {
         unrouted: UnroutedNet,
         /// Pins whose only projected access stubs crossed an
@@ -2170,10 +2285,13 @@ fn route_one_net(
     }
 
     // Extraction: merge unit edge spans per (layer, line) into
-    // canonical wire intervals; dedupe via placements.
-    let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32)>> = BTreeMap::new();
-    let mut vlines: BTreeMap<(u8, i32), Vec<(i32, i32)>> = BTreeMap::new();
-    let mut vplaced: BTreeSet<(u8, i32, i32)> = BTreeSet::new();
+    // canonical wire intervals; dedupe via placements. Every interval
+    // and via placement carries its `PaintSrc` so the self-spacing
+    // closure can reject the access element that painted a notch
+    // prong (`self-spacing.md`).
+    let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> = BTreeMap::new();
+    let mut vlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> = BTreeMap::new();
+    let mut vplaced: BTreeMap<(u8, i32, i32), PaintSrc> = BTreeMap::new();
     let e_plane = g.edges.len() as u32;
     let v_plane = e_plane + g.via_edges.len() as u32;
     for &eidx in &run.used_edges {
@@ -2186,17 +2304,17 @@ fn route_one_net(
                 Axis::X => hlines
                     .entry((l, ay))
                     .or_default()
-                    .push((ax.min(bx), ax.max(bx))),
+                    .push((ax.min(bx), ax.max(bx), PaintSrc::Tree)),
                 Axis::Y => vlines
                     .entry((l, ax))
                     .or_default()
-                    .push((ay.min(by), ay.max(by))),
+                    .push((ay.min(by), ay.max(by), PaintSrc::Tree)),
             }
         } else if eidx < v_plane {
             let ve = &g.via_edges[(eidx - e_plane) as usize];
             let n = &g.nodes[ve.lower as usize];
             let (x, y) = node_xy(g, tracks, ve.lower);
-            vplaced.insert((n.layer.0, x, y));
+            vplaced.insert((n.layer.0, x, y), PaintSrc::Tree);
         } else {
             // Relaxed transition: the via sits on both layers'
             // preferred wires; its implied stubs — `a.xy → (x,y)` on
@@ -2204,7 +2322,7 @@ fn route_one_net(
             // metal the committed geometry must carry (each shares
             // one coordinate, so each is a single-axis interval).
             let rv = &topo.relax[(eidx - v_plane) as usize];
-            vplaced.insert((rv.lower, rv.x, rv.y));
+            vplaced.insert((rv.lower, rv.x, rv.y), PaintSrc::Tree);
             let (ax, ay) = node_xy(g, tracks, rv.a);
             let (bx, by) = node_xy(g, tracks, rv.b);
             if ax == rv.x {
@@ -2212,26 +2330,26 @@ fn route_one_net(
                     vlines
                         .entry((rv.lower, ax))
                         .or_default()
-                        .push((ay.min(rv.y), ay.max(rv.y)));
+                        .push((ay.min(rv.y), ay.max(rv.y), PaintSrc::Tree));
                 }
             } else if ay == rv.y {
                 hlines
                     .entry((rv.lower, ay))
                     .or_default()
-                    .push((ax.min(rv.x), ax.max(rv.x)));
+                    .push((ax.min(rv.x), ax.max(rv.x), PaintSrc::Tree));
             }
             if bx == rv.x {
                 if by != rv.y {
                     vlines
                         .entry((rv.lower + 1, bx))
                         .or_default()
-                        .push((by.min(rv.y), by.max(rv.y)));
+                        .push((by.min(rv.y), by.max(rv.y), PaintSrc::Tree));
                 }
             } else if by == rv.y {
                 hlines
                     .entry((rv.lower + 1, by))
                     .or_default()
-                    .push((bx.min(rv.x), bx.max(rv.x)));
+                    .push((bx.min(rv.x), bx.max(rv.x), PaintSrc::Tree));
             }
         }
     }
@@ -2240,133 +2358,66 @@ fn route_one_net(
     // already; a projected pin needs its access stub painted; a pin
     // reached only through an access landing needs the pin-anchored
     // via + stub. Anything left is unattachable-in-fact.
+    //
+    // The attach pass and the self-spacing closure iterate: a notch
+    // whose only droppable prong is pin-attach paint rejects that
+    // element (it lands in the pin's tried-set), the pin re-attaches
+    // on its next candidate, and the closure reruns.
     let mut stub_blocked: Vec<u32> = Vec::new();
-    for (pi, &(pin, ref strict)) in g.pin_nodes.iter().enumerate() {
-        if !run.connected[pi] {
-            continue;
-        }
-        let mut legal = strict.iter().any(|&v| run.in_tree[v as usize]);
-        // Projected-pin access stubs: `project_attach` attaches at an
-        // in-region node within one track of the pin rect, but the
-        // pin's metal may not reach the shape committed at that node —
-        // paint the single-axis stub closing the gap (the node's x or
-        // y lies inside the rect's covered range by `project_attach`
-        // construction, so the stub is always axis-aligned).
-        if !legal && topo.projected[pi] {
-            'shapes: for &(lid, r) in &pin_shapes(db, tech, pin) {
-                for &v in &topo.attach[pi] {
-                    if g.nodes[v as usize].layer != lid || !run.in_tree[v as usize] {
-                        continue;
-                    }
-                    let (x, y) = node_xy(g, tracks, v);
-                    let (cx, cy) = (x.clamp(r.xl, r.xh), y.clamp(r.yl, r.yh));
-                    // The access stub is committed metal: on a masked
-                    // layer it must stay inside this net's own pin
-                    // rects — a stub through uncovered hull is the
-                    // exact class the mask exists to kill, so the
-                    // candidate is skipped rather than emitted
-                    // (admission in `project_attach` pre-filters; this
-                    // is the guard).
-                    if x == cx {
-                        if y != cy {
-                            if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
-                                continue;
-                            }
-                            vlines
-                                .entry((lid.0, x))
-                                .or_default()
-                                .push((cy.min(y), cy.max(y)));
-                        }
-                        legal = true;
-                        break 'shapes;
-                    }
-                    if y == cy {
-                        if x != cx {
-                            if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
-                                continue;
-                            }
-                            hlines
-                                .entry((lid.0, y))
-                                .or_default()
-                                .push((cx.min(x), cx.max(x)));
-                        }
-                        legal = true;
-                        break 'shapes;
-                    }
-                    // This node is not adjacent to this shape — another
-                    // of the pin's shapes produced it.
-                }
+    let mut tried_proj: Vec<BTreeSet<(usize, u32)>> =
+        (0..g.pin_nodes.len()).map(|_| BTreeSet::new()).collect();
+    let mut tried_arc: Vec<BTreeSet<usize>> =
+        (0..g.pin_nodes.len()).map(|_| BTreeSet::new()).collect();
+    let mut elem: Vec<Option<AttachElem>> = vec![None; g.pin_nodes.len()];
+    let mut fills: Vec<(LayerId, RectDbu)>;
+    let notch_residuals: Vec<NotchResidual>;
+    'outer: loop {
+        for pi in 0..g.pin_nodes.len() {
+            if !run.connected[pi] || elem[pi].is_some() {
+                continue;
+            }
+            match try_pin_paint(
+                db,
+                tech,
+                tracks,
+                g,
+                topo,
+                vias,
+                occ,
+                mask,
+                &run,
+                debug,
+                pi,
+                &mut hlines,
+                &mut vlines,
+                &mut vplaced,
+                &mut tried_proj[pi],
+                &mut tried_arc[pi],
+            ) {
+                Some(e) => elem[pi] = Some(e),
+                None => stub_blocked.push(pi as u32),
             }
         }
-        if !legal {
-            // Pin-anchored access arcs: paint the first candidate
-            // whose landing node is in the tree and whose via + upper
-            // stub clears live occupancy — OBS, foreign pins and
-            // committed routes all count here (unlike `edge_cost`,
-            // emit never gets a soft pass).
-            for av in &topo.access[pi] {
-                if !run.in_tree[av.b as usize] {
-                    continue;
-                }
-                let mut hits = Vec::new();
-                let pair = &vias.pairs[av.lower as usize];
-                let Some(di) = pair.default else {
-                    continue;
-                };
-                let vcand = &vias.candidates[pair.candidates[di as usize] as usize];
-                for (dl, r) in &vcand.rects {
-                    let DrcLayer::Routing(lid) = dl else {
-                        continue;
-                    };
-                    let paint =
-                        RectDbu::new(av.x + r.xl, av.y + r.yl, av.x + r.xh, av.y + r.yh);
-                    let from = hits.len();
-                    occ.scan_rect(lid.0, &paint, &mut hits);
-                    exempt_obs(&topo.cover, &paint, &mut hits, from);
-                }
-                scan_stub(g, tracks, occ, &topo.cover, av.b, av.lower + 1, av.x, av.y, &mut hits);
-                if let Some(h) = hits.iter().find(|h| match h.iv.who {
-                    Occupant::Obs(_) => true,
-                    Occupant::ObsPin(m) | Occupant::Net(m) | Occupant::Pin(m) => {
-                        m != g.net.0
-                    }
-                }) {
-                    if debug {
-                        let who = match h.iv.who {
-                            Occupant::Obs(c) => format!("Obs(cell#{c})"),
-                            Occupant::ObsPin(m) => format!("ObsPin(net#{m})"),
-                            Occupant::Net(m) => format!("Net(net#{m})"),
-                            Occupant::Pin(m) => format!("Pin(net#{m})"),
-                        };
-                        eprintln!(
-                            "DBG   access-block pin#{pi} via=({},{}) l={} b={} who={who} \
-                             iv=[{},{}]@{}",
-                            av.x, av.y, av.lower, av.b, h.lo, h.hi, h.line
-                        );
-                    }
-                    continue;
-                }
-                vplaced.insert((av.lower, av.x, av.y));
-                let (bx, by) = node_xy(g, tracks, av.b);
-                if bx == av.x {
-                    if by != av.y {
-                        vlines
-                            .entry((av.lower + 1, bx))
-                            .or_default()
-                            .push((by.min(av.y), by.max(av.y)));
-                    }
-                } else {
-                    hlines
-                        .entry((av.lower + 1, by))
-                        .or_default()
-                        .push((bx.min(av.x), bx.max(av.x)));
-                }
-                legal = true;
-                break;
+        match close_self_spacing(
+            db, tech, g, occ, mask, &topo.cover, vias, &hlines, &vlines, &vplaced,
+        ) {
+            ClosureResult::Done { fills: f, residuals } => {
+                fills = f;
+                notch_residuals = residuals;
+                break 'outer;
             }
-        }
-        if !legal {
-            stub_blocked.push(pi as u32);
+            ClosureResult::Reject { pin, src } => {
+                match elem[pin].take() {
+                    Some(AttachElem::Proj(si, v)) => {
+                        tried_proj[pin].insert((si, v));
+                    }
+                    Some(AttachElem::Access(ai)) => {
+                        tried_arc[pin].insert(ai);
+                    }
+                    _ => {}
+                }
+                remove_paint(src, &mut hlines, &mut vlines, &mut vplaced);
+            }
         }
     }
     // A connected pin with no legal paint — every access stub across
@@ -2394,10 +2445,10 @@ fn route_one_net(
         };
     }
     let mut wires: Vec<WireSeg> = Vec::new();
-    let mut emit = |l: u8, t: i32, mut ivs: Vec<(i32, i32)>, vertical: bool| {
+    let mut emit = |l: u8, t: i32, mut ivs: Vec<(i32, i32, PaintSrc)>, vertical: bool| {
         ivs.sort_unstable();
         let mut merged: Vec<(i32, i32)> = Vec::new();
-        for (lo, hi) in ivs {
+        for (lo, hi, _src) in ivs {
             match merged.last_mut() {
                 // Touching counts: a wire passing through a node is one
                 // continuous segment.
@@ -2432,8 +2483,9 @@ fn route_one_net(
         emit(l, t, ivs, true);
     }
     wires.sort_unstable();
+    fills.sort_unstable();
     let vias_out: Vec<ViaPlace> = vplaced
-        .into_iter()
+        .into_keys()
         .map(|(l, x, y)| ViaPlace {
             lower: LayerId(l),
             x,
@@ -2464,9 +2516,520 @@ fn route_one_net(
                 .filter(|(pi, _)| run.connected[*pi] && topo.projected[*pi])
                 .map(|(_, &(p, _))| p)
                 .collect(),
+            fills,
         },
         prov.into_iter().collect(),
+        notch_residuals,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Self-spacing closure (self-spacing.md Rule B)
+// ---------------------------------------------------------------------------
+
+/// Which committed element painted a piece — the closure pass's
+/// rejection provenance. `Tree`/`PinShape` are immovable (rip-up
+/// territory, never a notch rejection); `ProjStub`/`Access` are
+/// pin-attach paint that can be dropped so the pin retries its next
+/// candidate. `Ord` prefers `ProjStub` over `Access` when a prong
+/// holds both — the stub is the smaller blast radius.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PaintSrc {
+    /// Tree paint: edges, strict/relaxed vias, their stubs, fills.
+    Tree,
+    /// Member pin metal (immovable).
+    PinShape,
+    /// Projected access stub of member pin `u32` (`pin_nodes` index).
+    ProjStub(u32),
+    /// Access-arc via + upper stub of member pin `u32`.
+    Access(u32),
+}
+
+impl PaintSrc {
+    /// The pin-attach paints — the only droppable sources.
+    fn droppable(&self) -> bool {
+        matches!(self, PaintSrc::ProjStub(_) | PaintSrc::Access(_))
+    }
+    /// `pin_nodes` index of the pin this paint attaches.
+    fn pin(&self) -> usize {
+        match self {
+            PaintSrc::ProjStub(pi) | PaintSrc::Access(pi) => *pi as usize,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// The attach element a pin's legal paint came from — recorded so a
+/// rejected element lands in that pin's tried-set.
+#[derive(Clone, Copy, Debug)]
+enum AttachElem {
+    /// A strict attach node in the tree — no extra paint committed.
+    Strict,
+    /// Projected attach: `(pin_shapes index, attach node)`.
+    Proj(usize, u32),
+    /// Access arc: `topo.access[pin]` index.
+    Access(usize),
+}
+
+/// One closure outcome: `Done` carries the pass's admitted fills and
+/// named residuals; `Reject` asks the caller to drop `pin`'s
+/// committed attach element (`src`-tagged paint) and re-attach it on
+/// the next candidate.
+enum ClosureResult {
+    Done {
+        fills: Vec<(LayerId, RectDbu)>,
+        residuals: Vec<NotchResidual>,
+    },
+    Reject {
+        pin: usize,
+        src: PaintSrc,
+    },
+}
+
+/// Paints pin `pi`'s first legal attach element — the extraction-time
+/// version of `hit_verdict`'s `legal`: strict in-tree node → no paint
+/// → `Strict`; projected pin → first untried `(shape, node)` whose
+/// stub stays inside cover → `Proj`; else first untried access arc
+/// whose via + upper stub clears live occupancy → `Access`.
+#[allow(clippy::too_many_arguments)]
+fn try_pin_paint(
+    db: &DesignDb,
+    tech: &TechDb,
+    tracks: &[LayerTracks],
+    g: &NetGraph,
+    topo: &NetTopo,
+    vias: &ViaTable,
+    occ: &Occupancy,
+    mask: &HullMask,
+    run: &NetRun,
+    debug: bool,
+    pi: usize,
+    hlines: &mut BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    vlines: &mut BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    vplaced: &mut BTreeMap<(u8, i32, i32), PaintSrc>,
+    tried_proj: &mut BTreeSet<(usize, u32)>,
+    tried_arc: &mut BTreeSet<usize>,
+) -> Option<AttachElem> {
+    let (pin, ref strict) = g.pin_nodes[pi];
+    if strict.iter().any(|&v| run.in_tree[v as usize]) {
+        return Some(AttachElem::Strict);
+    }
+    // Projected-pin access stubs: `project_attach` attaches at an
+    // in-region node within one track of the pin rect, but the pin's
+    // metal may not reach the shape committed at that node — paint
+    // the single-axis stub closing the gap (the node's x or y lies
+    // inside the rect's covered range by `project_attach`
+    // construction, so the stub is always axis-aligned).
+    if topo.projected[pi] {
+        for (si, &(lid, r)) in pin_shapes(db, tech, pin).iter().enumerate() {
+            for &v in &topo.attach[pi] {
+                if g.nodes[v as usize].layer != lid
+                    || !run.in_tree[v as usize]
+                    || tried_proj.contains(&(si, v))
+                {
+                    continue;
+                }
+                let (x, y) = node_xy(g, tracks, v);
+                let (cx, cy) = (x.clamp(r.xl, r.xh), y.clamp(r.yl, r.yh));
+                // The access stub is committed metal: on a masked layer
+                // it must stay inside this net's own pin rect union —
+                // a stub through uncovered hull is the exact class the
+                // mask exists to kill, so the candidate is skipped
+                // rather than emitted.
+                if x == cx {
+                    if y != cy {
+                        if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
+                            continue;
+                        }
+                        vlines
+                            .entry((lid.0, x))
+                            .or_default()
+                            .push((cy.min(y), cy.max(y), PaintSrc::ProjStub(pi as u32)));
+                    }
+                    return Some(AttachElem::Proj(si, v));
+                }
+                if y == cy {
+                    if x != cx {
+                        if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
+                            continue;
+                        }
+                        hlines
+                            .entry((lid.0, y))
+                            .or_default()
+                            .push((cx.min(x), cx.max(x), PaintSrc::ProjStub(pi as u32)));
+                    }
+                    return Some(AttachElem::Proj(si, v));
+                }
+                // This node is not adjacent to this shape — another of
+                // the pin's shapes produced it.
+            }
+        }
+    }
+    // Pin-anchored access arcs: paint the first untried candidate
+    // whose landing node is in the tree and whose via + upper stub
+    // clears live occupancy — OBS, foreign pins and committed routes
+    // all count here (unlike `edge_cost`, emit never gets a soft
+    // pass).
+    for (ai, av) in topo.access[pi].iter().enumerate() {
+        if !run.in_tree[av.b as usize] || tried_arc.contains(&ai) {
+            continue;
+        }
+        let mut hits = Vec::new();
+        let pair = &vias.pairs[av.lower as usize];
+        let Some(di) = pair.default else {
+            continue;
+        };
+        let vcand = &vias.candidates[pair.candidates[di as usize] as usize];
+        for (dl, r) in &vcand.rects {
+            let DrcLayer::Routing(lid) = dl else {
+                continue;
+            };
+            let paint = RectDbu::new(av.x + r.xl, av.y + r.yl, av.x + r.xh, av.y + r.yh);
+            let from = hits.len();
+            occ.scan_rect(lid.0, &paint, &mut hits);
+            exempt_obs(&topo.cover, &paint, &mut hits, from);
+        }
+        scan_stub(g, tracks, occ, &topo.cover, av.b, av.lower + 1, av.x, av.y, &mut hits);
+        if let Some(h) = hits.iter().find(|h| match h.iv.who {
+            Occupant::Obs(_) => true,
+            Occupant::ObsPin(m) | Occupant::Net(m) | Occupant::Pin(m) => m != g.net.0,
+        }) {
+            if debug {
+                let who = match h.iv.who {
+                    Occupant::Obs(c) => format!("Obs(cell#{c})"),
+                    Occupant::ObsPin(m) => format!("ObsPin(net#{m})"),
+                    Occupant::Net(m) => format!("Net(net#{m})"),
+                    Occupant::Pin(m) => format!("Pin(net#{m})"),
+                };
+                eprintln!(
+                    "DBG   access-block pin#{pi} via=({},{}) l={} b={} who={who} \
+                     iv=[{},{}]@{}",
+                    av.x, av.y, av.lower, av.b, h.lo, h.hi, h.line
+                );
+            }
+            continue;
+        }
+        vplaced.insert((av.lower, av.x, av.y), PaintSrc::Access(pi as u32));
+        let (bx, by) = node_xy(g, tracks, av.b);
+        if bx == av.x {
+            if by != av.y {
+                vlines
+                    .entry((av.lower + 1, bx))
+                    .or_default()
+                    .push((by.min(av.y), by.max(av.y), PaintSrc::Access(pi as u32)));
+            }
+        } else {
+            hlines
+                .entry((av.lower + 1, by))
+                .or_default()
+                .push((bx.min(av.x), bx.max(av.x), PaintSrc::Access(pi as u32)));
+        }
+        return Some(AttachElem::Access(ai));
+    }
+    None
+}
+
+/// Drops every interval / via placement tagged `src` — the rejected
+/// attach element's paint, so the rebuilt piece set no longer holds
+/// it.
+fn remove_paint(
+    src: PaintSrc,
+    hlines: &mut BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    vlines: &mut BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    vplaced: &mut BTreeMap<(u8, i32, i32), PaintSrc>,
+) {
+    for ivs in hlines.values_mut() {
+        ivs.retain(|&(_, _, s)| s != src);
+    }
+    for ivs in vlines.values_mut() {
+        ivs.retain(|&(_, _, s)| s != src);
+    }
+    vplaced.retain(|_, s| *s != src);
+}
+
+/// Same-net self-spacing closure (self-spacing.md Rule B). Builds the
+/// committed piece set per routing layer — merged wire rects, via
+/// plates, member pin metal — and scans each layer's pieces pairwise
+/// for facing-edge disjointness under `s_l`. Each notch is closed
+/// with a fill rect admitted under the same mask/occupancy scans as
+/// every committed shape, iterated to fixpoint; an inadmissible notch
+/// rejects a droppable attach element (`Reject`) or — when both
+/// prongs are tree/pin paint — lands in `residuals`, named and
+/// visible.
+#[allow(clippy::too_many_arguments)]
+fn close_self_spacing(
+    db: &DesignDb,
+    tech: &TechDb,
+    g: &NetGraph,
+    occ: &Occupancy,
+    mask: &HullMask,
+    cover: &PinCover,
+    vias: &ViaTable,
+    hlines: &BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    vlines: &BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    vplaced: &BTreeMap<(u8, i32, i32), PaintSrc>,
+) -> ClosureResult {
+    let mut pieces: BTreeMap<u8, Vec<(RectDbu, BTreeSet<PaintSrc>)>> = BTreeMap::new();
+    for (vertical, lines) in [(false, hlines), (true, vlines)] {
+        for (&(l, t), ivs) in lines {
+            let w2 = occ.halfw[l as usize];
+            let mut sorted = ivs.clone();
+            sorted.sort_unstable();
+            let mut cur: Option<(i32, i32, BTreeSet<PaintSrc>)> = None;
+            for &(a, b, src) in &sorted {
+                match &mut cur {
+                    Some((_, chi, cs)) if a <= *chi => {
+                        *chi = (*chi).max(b);
+                        cs.insert(src);
+                    }
+                    _ => {
+                        if let Some((clo, chi, cs)) = cur.take() {
+                            pieces.entry(l).or_default().push((
+                                if vertical {
+                                    RectDbu::new(t - w2, clo, t + w2, chi)
+                                } else {
+                                    RectDbu::new(clo, t - w2, chi, t + w2)
+                                },
+                                cs,
+                            ));
+                        }
+                        cur = Some((a, b, BTreeSet::from([src])));
+                    }
+                }
+            }
+            if let Some((clo, chi, cs)) = cur {
+                pieces.entry(l).or_default().push((
+                    if vertical {
+                        RectDbu::new(t - w2, clo, t + w2, chi)
+                    } else {
+                        RectDbu::new(clo, t - w2, chi, t + w2)
+                    },
+                    cs,
+                ));
+            }
+        }
+    }
+    for (&(l, x, y), &src) in vplaced {
+        let pair = &vias.pairs[l as usize];
+        let Some(di) = pair.default else {
+            continue;
+        };
+        for (dl, r) in &vias.candidates[pair.candidates[di as usize] as usize].rects {
+            let DrcLayer::Routing(lid) = dl else {
+                continue;
+            };
+            pieces.entry(lid.0).or_default().push((
+                RectDbu::new(x + r.xl, y + r.yl, x + r.xh, y + r.yh),
+                BTreeSet::from([src]),
+            ));
+        }
+    }
+    for &(pin, _) in &g.pin_nodes {
+        for (lid, r) in pin_shapes(db, tech, pin) {
+            pieces
+                .entry(lid.0)
+                .or_default()
+                .push((r, BTreeSet::from([PaintSrc::PinShape])));
+        }
+    }
+
+    let mut fills: Vec<(LayerId, RectDbu)> = Vec::new();
+    let mut residuals: Vec<NotchResidual> = Vec::new();
+    for (&l, ps) in pieces.iter_mut() {
+        let s = occ.spc[l as usize];
+        // A prong pair is adjudicated once: an admitted fill bridges
+        // it (the prongs stay disjoint pieces, so without this mark
+        // the same pair re-fires every fixpoint pass) and a failed one
+        // is either a named residual or a Reject. Only fills added
+        // since can raise a new notch, so re-scanning proceeds but
+        // old pairs stay closed.
+        let mut seen: BTreeSet<(RectDbu, RectDbu)> = BTreeSet::new();
+        'fix: loop {
+            ps.sort_by_key(|(r, _)| (r.xl, r.yl, r.xh, r.yh));
+            let mut added: Option<(RectDbu, BTreeSet<PaintSrc>)> = None;
+            'pair: for i in 0..ps.len() {
+                for j in i + 1..ps.len() {
+                    let (p, q) = (ps[i].0, ps[j].0);
+                    if q.xl >= p.xh + s {
+                        break;
+                    }
+                    let Some(axis) = notch_axis(&p, &q, s) else {
+                        continue;
+                    };
+                    let key = (p.min(q), p.max(q));
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    match try_fill(db, tech, occ, mask, cover, g.net, l, &p, &q, axis) {
+                        Some(f) => {
+                            fills.push((LayerId(l), f));
+                            added = Some((f, BTreeSet::from([PaintSrc::Tree])));
+                            break 'pair;
+                        }
+                        None => {
+                            // Smallest droppable src (Ord: ProjStub
+                            // before Access — the smaller blast radius).
+                            let mut srcs: BTreeSet<PaintSrc> = ps[i]
+                                .1
+                                .iter()
+                                .chain(&ps[j].1)
+                                .copied()
+                                .filter(PaintSrc::droppable)
+                                .collect();
+                            if let Some(src) = srcs.pop_first() {
+                                return ClosureResult::Reject {
+                                    pin: src.pin(),
+                                    src,
+                                };
+                            }
+                            residuals.push(NotchResidual {
+                                net: g.net,
+                                layer: LayerId(l),
+                                a: p,
+                                b: q,
+                            });
+                        }
+                    }
+                }
+            }
+            match added {
+                Some(p) => ps.push(p),
+                None => break 'fix,
+            }
+        }
+    }
+    ClosureResult::Done { fills, residuals }
+}
+
+/// The notch signature (`self-spacing.md`): `p`/`q` disjoint, facing
+/// edges overlapping or line-touching on the other axis, gap in
+/// `(0, s)`. Returns the gap axis.
+fn notch_axis(p: &RectDbu, q: &RectDbu, s: i32) -> Option<Axis> {
+    let ov_x = p.xh.min(q.xh) - p.xl.max(q.xl);
+    let ov_y = p.yh.min(q.yh) - p.yl.max(q.yl);
+    if ov_x > 0 && ov_y > 0 {
+        return None;
+    }
+    if ov_x < 0 && ov_x > -s && ov_y >= 0 {
+        return Some(Axis::X);
+    }
+    if ov_y < 0 && ov_y > -s && ov_x >= 0 {
+        return Some(Axis::Y);
+    }
+    None
+}
+
+/// Closed-overlap (boundary touch counts — Magic merges on contact).
+fn overlaps_closed(a: &RectDbu, b: &RectDbu) -> bool {
+    a.xl <= b.xh && a.xh >= b.xl && a.yl <= b.yh && a.yh >= b.yl
+}
+
+/// Does `h` block committed paint for `own` net — the emit-time
+/// verdict (same predicate as `try_pin_paint`'s arc scan).
+fn fill_blocked(h: &Hit, own: u32) -> bool {
+    match h.iv.who {
+        Occupant::Obs(_) => true,
+        Occupant::ObsPin(m) | Occupant::Net(m) | Occupant::Pin(m) => m != own,
+    }
+}
+
+/// Fill legality — the same scans every committed shape faces:
+/// `rect_allowed` (union-exact cover confinement) plus live occupancy
+/// with the own-pin OBS exemption.
+fn fill_admitted(
+    occ: &Occupancy,
+    mask: &HullMask,
+    cover: &PinCover,
+    own: u32,
+    l: u8,
+    f: &RectDbu,
+) -> bool {
+    if !mask.rect_allowed(cover, l, f) {
+        return false;
+    }
+    let mut hits = Vec::new();
+    occ.scan_rect(l, f, &mut hits);
+    exempt_obs(cover, f, &mut hits, 0);
+    !hits.iter().any(|h| fill_blocked(h, own))
+}
+
+/// Tries to close the `(p, q)` notch on layer `l` (`axis` = the gap
+/// axis): the gap-spanning fill rect — grown ±1 into both prongs so
+/// the merge is unconditional, pruned to the facing-edge overlap —
+/// admitted iff `fill_admitted`. On failure the fill is decomposed
+/// against mask blockers (foreign hulls, uncovered member-hull parts)
+/// and occupancy blockers; any residual slab still touching both
+/// prongs is retried (the shrink-retry of self-spacing.md).
+#[allow(clippy::too_many_arguments)]
+fn try_fill(
+    db: &DesignDb,
+    tech: &TechDb,
+    occ: &Occupancy,
+    mask: &HullMask,
+    cover: &PinCover,
+    own: NetId,
+    l: u8,
+    p: &RectDbu,
+    q: &RectDbu,
+    axis: Axis,
+) -> Option<RectDbu> {
+    let gap = match axis {
+        Axis::X => {
+            let (lo, hi) = if p.xh <= q.xl { (p.xh, q.xl) } else { (q.xh, p.xl) };
+            let (ylo, yhi) = (p.yl.max(q.yl), p.yh.min(q.yh));
+            let e = i32::from(ylo == yhi);
+            RectDbu::new(lo - 1, ylo - e, hi + 1, yhi + e)
+        }
+        Axis::Y => {
+            let (lo, hi) = if p.yh <= q.yl { (p.yh, q.yl) } else { (q.yh, p.yl) };
+            let (xlo, xhi) = (p.xl.max(q.xl), p.xh.min(q.xh));
+            let e = i32::from(xlo == xhi);
+            RectDbu::new(xlo - e, lo - 1, xhi + e, hi + 1)
+        }
+    };
+    let mut slabs = vec![gap];
+    if mask.masked(l) {
+        let mut cells = Vec::new();
+        mask.hulls_overlapping(&gap, &mut cells);
+        let mut blockers: Vec<RectDbu> = Vec::new();
+        for &c in &cells {
+            let hull = cell_hull_rect(db, tech, c);
+            match cover.get(&c) {
+                // Inside a foreign hull: never legal.
+                None => blockers.push(hull),
+                Some(rs) => {
+                    let fin = RectDbu::new(
+                        gap.xl.max(hull.xl),
+                        gap.yl.max(hull.yl),
+                        gap.xh.min(hull.xh),
+                        gap.yh.min(hull.yh),
+                    );
+                    if fin.xl < fin.xh && fin.yl < fin.yh {
+                        blockers.extend(rect_minus(vec![fin], rs));
+                    }
+                }
+            }
+        }
+        slabs = rect_minus(slabs, &blockers);
+    }
+    let mut hits = Vec::new();
+    occ.scan_rect(l, &gap, &mut hits);
+    exempt_obs(cover, &gap, &mut hits, 0);
+    let blockers: Vec<RectDbu> = hits
+        .iter()
+        .filter(|h| fill_blocked(h, own.0))
+        .map(hit_bbox)
+        .collect();
+    slabs = rect_minus(slabs, &blockers);
+    for f in slabs {
+        if !(overlaps_closed(&f, p) && overlaps_closed(&f, q)) {
+            continue;
+        }
+        if fill_admitted(occ, mask, cover, own.0, l, &f) {
+            return Some(f);
+        }
+    }
+    None
 }
 
 /// Rasterizes one committed route's shapes (merged wire rects + via
@@ -2499,6 +3062,9 @@ fn commit_route(
             let shift = RectDbu::new(v.x + r.xl, v.y + r.yl, v.x + r.xh, v.y + r.yh);
             occ.rasterize(tracks, lid.0, &shift, Occupant::Net(route.net.0), Some(marks));
         }
+    }
+    for (lid, r) in &route.fills {
+        occ.rasterize(tracks, lid.0, r, Occupant::Net(route.net.0), Some(marks));
     }
 }
 
@@ -2572,6 +3138,11 @@ fn net_layer_shapes(
             if lid.0 == l {
                 out.push(sh(r, src));
             }
+        }
+    }
+    for (lid, r) in &route.fills {
+        if lid.0 == l {
+            out.push(sh(*r, ShapeSrc::SignalWire));
         }
     }
     out
@@ -2891,6 +3462,7 @@ pub fn route_nets(
         .map(|(i, g)| (g.net.0, i))
         .collect();
     let mut routes: Vec<Option<NetRoute>> = vec![None; n];
+    let mut res_of: Vec<Vec<NotchResidual>> = vec![Vec::new(); n];
     let mut marks: Vec<Vec<Mark>> = vec![Vec::new(); n];
     let mut hist = vec![0u32; n];
     let mut bad: Vec<usize> = (0..n).collect();
@@ -2913,11 +3485,12 @@ pub fn route_nets(
             match route_one_net(
                 db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i], hard, cfg.occ,
             ) {
-                NetOutcome::Routed(route, hits) => {
+                NetOutcome::Routed(route, hits, res) => {
                     commit_route(&mut occ, tracks, vias, &route, &mut marks[i]);
                     if !hard && cfg.occ == OccMode::Enabled {
                         prov.extend(hits);
                     }
+                    res_of[i] = res;
                     routes[i] = Some(route);
                 }
                 NetOutcome::Failed {
@@ -2927,6 +3500,7 @@ pub fn route_nets(
                     for &p in &stub_blocked {
                         stub_outside_cover.push((g.net, p));
                     }
+                    res_of[i].clear();
                     failed.push((i, unrouted));
                 }
             }
@@ -3031,6 +3605,7 @@ pub fn route_nets(
         iterations,
         area_patches,
         area_residuals,
+        notch_residuals: res_of.into_iter().flatten().collect(),
         stub_outside_cover,
     }
 }
@@ -3109,6 +3684,14 @@ pub fn route_digest(routed: &RouteDb) -> u64 {
             put(v.x as u32);
             put(v.y as u32);
         }
+        put(r.fills.len() as u32);
+        for (lid, f) in &r.fills {
+            put(lid.0 as u32);
+            put(f.xl as u32);
+            put(f.yl as u32);
+            put(f.xh as u32);
+            put(f.yh as u32);
+        }
         put(r.connected.len() as u32);
         for p in &r.connected {
             put(p.0);
@@ -3142,6 +3725,19 @@ pub fn route_digest(routed: &RouteDb) -> u64 {
         put(c.line as u32);
         put(c.lo as u32);
         put(c.hi as u32);
+    }
+    put(routed.notch_residuals.len() as u32);
+    for nr in &routed.notch_residuals {
+        put(nr.net.0);
+        put(nr.layer.0 as u32);
+        put(nr.a.xl as u32);
+        put(nr.a.yl as u32);
+        put(nr.a.xh as u32);
+        put(nr.a.yh as u32);
+        put(nr.b.xl as u32);
+        put(nr.b.yl as u32);
+        put(nr.b.xh as u32);
+        put(nr.b.yh as u32);
     }
     put(routed.stub_outside_cover.len() as u32);
     for (n, p) in &routed.stub_outside_cover {
@@ -3456,7 +4052,7 @@ mod tests {
         let outcome = route_one_net(
             &db, &tech, &tracks, &g, &topo, &vias, &occ, &mask, 0, false, cfg.occ,
         );
-        let NetOutcome::Routed(route, _) = outcome else {
+        let NetOutcome::Routed(route, _, _) = outcome else {
             panic!("square must route");
         };
         // Deterministic tie: node 1 reached before node 2, so the path
@@ -3530,6 +4126,7 @@ mod tests {
             vias: vec![],
             connected: vec![],
             projected: vec![],
+            fills: vec![],
         }
     }
 

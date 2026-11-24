@@ -93,7 +93,7 @@ pub enum MacroClass {
     Other,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RectDbu {
     pub xl: i32,
     pub yl: i32,

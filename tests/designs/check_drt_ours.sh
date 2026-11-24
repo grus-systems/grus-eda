@@ -932,6 +932,7 @@ if ours_router["emit_log_present"]:
                 or s.lstrip().startswith("unrouted_kinds ")
                 or s.lstrip().startswith("unrouted_blockers ")
                 or s.lstrip().startswith("area_residual ")
+                or s.lstrip().startswith("notch_residual ")
                 or s.lstrip().startswith("stub_outside_cover ")
                 or s.startswith("self_drc")):
             cli.append(s)
@@ -946,15 +947,18 @@ if ours_router["emit_log_present"]:
     mg = re.search(
         r"^guided=(\d+) routed=(\d+) unrouted=(\d+) projected=(\d+) "
         r"collisions=(\d+) area_patches=(\d+) area_residuals=(\d+) "
-        r"iterations=(\d+) route_ms=(\d+) hull_masked=(\d+)", elog, re.M)
+        r"iterations=(\d+) route_ms=(\d+) hull_masked=(\d+) "
+        r"notch_fills=(\d+)", elog, re.M)
     if mg is None:
-        fail("emit log present but its guided= census line is missing")
+        fail("emit log present but its guided= census line is missing "
+             "or lacks notch_fills= (emit/script version lock)")
     ours_router["routed"] = int(mg.group(2))
     ours_router["unrouted_count"] = int(mg.group(3))
     ours_router["collisions"] = int(mg.group(5))
     ours_router["area_patches"] = int(mg.group(6))
     ours_router["area_residuals"] = int(mg.group(7))
     ours_router["hull_masked"] = int(mg.group(10))
+    ours_router["notch_fills"] = int(mg.group(11))
     ours_router["unrouted"] = re.findall(r"^\s+unrouted (\S+)$", elog, re.M)
     mk = re.search(
         r"^unrouted_kinds NoPath=(\d+) Unattachable=(\d+)$", elog, re.M)

@@ -9,6 +9,7 @@
 
 use crate::congestion::guide::{GuideBox, resolve_guide_nets};
 use crate::design_db::{DesignDb, PlacementStatus};
+use crate::drc::union::rect_covered;
 use crate::drt::access::pin_shapes;
 use crate::drt::tracks::{Axis, LayerTracks};
 use crate::interner::{LayerId, NetId, PinId};
@@ -267,7 +268,7 @@ pub fn pin_rects(db: &DesignDb, tech: &TechDb, net: NetId) -> PinCover {
 
 /// Cell `c`'s placed outline — the conservative hull rect a master
 /// may paint internals anywhere inside of on the layers it uses.
-fn cell_hull_rect(db: &DesignDb, tech: &TechDb, c: u32) -> RectDbu {
+pub(crate) fn cell_hull_rect(db: &DesignDb, tech: &TechDb, c: u32) -> RectDbu {
     let mac = &tech.macros[db.cell_macros[c as usize].0 as usize];
     let r = DesignDb::orient_rect(
         RectDbu::new(0, 0, mac.width_dbu, mac.height_dbu),
@@ -441,6 +442,40 @@ impl HullMask {
         self.masked.get(l as usize).copied().unwrap_or(false)
     }
 
+    /// Whether `l` is a host-open masked layer
+    /// (`hull_host_open_layer`): inside a hull hosting a member pin
+    /// the whole interior is open at graph level.
+    pub fn host_open(&self, l: u8) -> bool {
+        self.open.get(l as usize).copied().unwrap_or(false)
+    }
+
+    /// Cells whose hull intersects `r` with positive area (strict
+    /// overlap — a shared edge is not an intersection). `out` is
+    /// caller scratch, replaced.
+    pub(crate) fn hulls_overlapping(&self, r: &RectDbu, out: &mut Vec<u32>) {
+        out.clear();
+        let pos = self.bands.partition_point(|b| b.yl < r.yh);
+        for i in (0..pos).rev() {
+            if self.premiy[i] <= r.yl {
+                break;
+            }
+            let b = &self.bands[i];
+            if b.yh <= r.yl || b.yl >= r.yh {
+                continue;
+            }
+            let xp = b.ivs.partition_point(|iv| iv.0 < r.xh);
+            for j in (0..xp).rev() {
+                if b.premix[j] <= r.xl {
+                    break;
+                }
+                let (xl, xh, c) = b.ivs[j];
+                if xl < r.xh && xh > r.xl {
+                    out.push(c);
+                }
+            }
+        }
+    }
+
     /// Point legality for a net with `cover` on layer `l`: outside
     /// every hull, or inside an own-pin rect of a containing cell.
     pub fn point_allowed(
@@ -470,10 +505,12 @@ impl HullMask {
 
     /// Rect legality on layer `l` — the via-footprint counterpart of
     /// `seg_allowed`: for every hull `r` intersects, the covered part
-    /// must sit inside one own-pin rect of that cell. A via plate
-    /// that pokes past the pin edge paints hull-internal metal Magic
-    /// flags as a subcell-boundary violation (the delegated router
-    /// keeps every access plate inside the pin rect).
+    /// must sit inside the own-pin rect *union* of that cell
+    /// (`rect_covered` — the same union-exact rule `seg_allowed`
+    /// uses). A via plate that pokes past the pin edge paints
+    /// hull-internal metal Magic flags as a subcell-boundary violation
+    /// (the delegated router keeps every access plate inside the pin
+    /// rect union).
     pub fn rect_allowed(&self, cover: &PinCover, l: u8, r: &RectDbu) -> bool {
         if !self.masked.get(l as usize).copied().unwrap_or(false) {
             return true;
@@ -503,9 +540,7 @@ impl HullMask {
                 }
                 let covered = cover.get(&c).is_some_and(|rs| {
                     self.open.get(l as usize).copied().unwrap_or(false)
-                        || rs.iter().any(|p| {
-                            sxl >= p.xl && sxh <= p.xh && syl >= p.yl && syh <= p.yh
-                        })
+                        || rect_covered(rs, &RectDbu::new(sxl, syl, sxh, syh))
                 });
                 if !covered {
                     return false;
@@ -516,9 +551,12 @@ impl HullMask {
     }
 
     /// Axis-aligned segment legality on layer `l`: for every hull the
-    /// segment intersects, the covered subsegment must sit inside one
-    /// own-pin rect of that cell. A zero-area touch (a stub grazing a
-    /// hull edge) counts as inside — consistent with `hull_cells_at`.
+    /// segment intersects, the covered subsegment must sit inside the
+    /// own-pin rect *union* of that cell (`rect_covered` — a part
+    /// spanning joined same-pin sub-rects is legal; the delegated
+    /// plate class that merges two LEF sub-rects of one pin). A
+    /// zero-area touch (a stub grazing a hull edge) counts as inside —
+    /// consistent with `hull_cells_at`.
     pub fn seg_allowed(&self, cover: &PinCover, l: u8, x1: i32, y1: i32, x2: i32, y2: i32) -> bool {
         if !self.masked.get(l as usize).copied().unwrap_or(false) {
             return true;
@@ -553,9 +591,7 @@ impl HullMask {
                 }
                 let covered = cover.get(&c).is_some_and(|rs| {
                     self.open.get(l as usize).copied().unwrap_or(false)
-                        || rs.iter().any(|r| {
-                            sxl >= r.xl && sxh <= r.xh && syl >= r.yl && syh <= r.yh
-                        })
+                        || rect_covered(rs, &RectDbu::new(sxl, syl, sxh, syh))
                 });
                 if !covered {
                     return false;

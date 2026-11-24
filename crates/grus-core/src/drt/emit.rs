@@ -3,9 +3,12 @@
 //! grammar is exactly what `parse_net_wire` reads back — regular-net
 //! wires carry no width token (width is a `SPECIALNETS`-only
 //! construct; a bare integer after the layer parses as a point
-//! coordinate), and a standalone via record is `NEW <lower> ( x y )
-//! <via_name>` naming the `ViaTable` pair default. See
-//! `docs/e6-drt.md` §8 for the model and the claim boundary.
+//! coordinate), a standalone via record is `NEW <lower> ( x y )
+//! <via_name>` naming the `ViaTable` pair default, and a non-square-cap
+//! rect (a self-spacing fill) is `<layer> ( x y ) RECT ( 0 0 w h )`
+//! — deltas from the point, which the parser reads back into
+//! `wire_rects` unchanged. See `docs/e6-drt.md` §8 for the model and
+//! the claim boundary.
 
 use crate::congestion::guide::guide_net_name;
 use crate::design_db::{DesignDb, NetGeom, PdnVia};
@@ -95,6 +98,12 @@ pub fn apply_routes(
         for w in &nr.wires {
             report.wire_length_dbu += (w.x2 - w.x1 + w.y2 - w.y1) as u64;
             geom.wire_rects.push((w.layer, seg_rect(w, tech)));
+        }
+        // Self-spacing fills are committed paint — a `wire_rects`
+        // entry each (they emit as `RECT` path records, not 2-point
+        // wires, so `wire_length_dbu` stays centerline-honest).
+        for (lid, r) in &nr.fills {
+            geom.wire_rects.push((*lid, *r));
         }
         for vp in &nr.vias {
             let via = place_via(db, tech, via_table, vp, nr.net)?;
@@ -252,13 +261,24 @@ fn nets_section(db: &DesignDb, tech: &TechDb) -> Result<String> {
         let mut stmts: Vec<String> = Vec::new();
         if let Some(geom) = db.net_geom(net) {
             for &(lid, ref rect) in &geom.wire_rects {
-                let Some((x1, y1, x2, y2)) = centerline(lid, rect, tech) else {
-                    bail!(
-                        "net {net_name}: wire_rect {rect:?} on {} is not expressible as a zero-width 2-point record",
+                match centerline(lid, rect, tech) {
+                    Some((x1, y1, x2, y2)) => {
+                        stmts.push(format!("{} ( {x1} {y1} ) ( {x2} {y2} )", layer_name(lid)));
+                    }
+                    // Not square-cap-expressible → a `RECT` record:
+                    // deltas from the point, which `parse_net_wire`
+                    // reads back as the identical `wire_rect` —
+                    // self-spacing fills and foreign `RECT` stubs from
+                    // a routed template both round-trip byte-stable.
+                    None => stmts.push(format!(
+                        "{} ( {} {} ) RECT ( 0 0 {} {} )",
                         layer_name(lid),
-                    );
-                };
-                stmts.push(format!("{} ( {x1} {y1} ) ( {x2} {y2} )", layer_name(lid)));
+                        rect.xl,
+                        rect.yl,
+                        rect.xh - rect.xl,
+                        rect.yh - rect.yl,
+                    )),
+                }
             }
             for via in &geom.vias {
                 stmts.push(format!(
