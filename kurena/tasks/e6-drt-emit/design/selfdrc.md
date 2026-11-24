@@ -1,12 +1,10 @@
 # e6-drt-emit — Self-DRC gate design
 
 **Landed in `emit_gate`/`self_drc` (tests/drt.rs)** — sequence and
-asserts below are the shipped ones. The maze-side fixes the first
-gate runs motivated are already in the WIP (overview.md): PDN
-`SPECIALNETS` metal as `Obs(u32::MAX)` occupancy, io-port rects as
-`Pin(own_net)` (the real `met3.2` `req_msg`/`resp_msg` class), and
-projected-pin access stubs. What remains is *running* the gate and
-recording the verdict.
+asserts below are the shipped ones. The gate has been run end to end
+on both designs: **gcd clean, picorv32 red with one classified
+cause** — the min-area stub class, now fixed router-side by the
+`minarea.md` patch pass rather than named.
 
 The gate: `run_all` on **our own re-parsed output** — the same
 50-rule subset that shows 0 findings on both committed TritonRoute
@@ -46,13 +44,22 @@ each must be fixed in the router or named with rule + count:
 | foreign-pin landing | `Pin` marks are soft (`hit_verdict`: never hard-block) — a route may end within spacing of another net's pin metal | `*.2` spacing |
 | OBS crossing | host-cell OBS carved unconditionally; approach edges clear the OBS box but the wire itself may clip OBS shapes | `*.2` spacing vs OBS net |
 | projected attach | `projected` pins land at the nearest legal point — the stub may sit inside OBS or near foreign metal | spacing/enclosure |
-| io-port landing | top-level `PIN` metal is not in occupancy | spacing vs `net 0` shapes |
+| io-port landing | top-level `PIN` metal marks `Pin(own)` — priced band, never a hard block | spacing vs io rects |
 | cut-layer spacing | cuts unmodeled in occupancy — two adjacent vias' cuts may violate cut spacing | spacing on cut layers |
 | short stub | relaxed-via stubs paint beyond the pin — may touch foreign metal | spacing |
+| min-area stub | **measured** — one via + short stub = a connected component under the layer's `AREA` bound; the class relaxed-via and projected-pin stubs create | `li.6`, `met*.6` — picorv32 fired `li.6`×3 + `met3.6`×39 → fixed by the `minarea.md` patch pass |
 
 The checker unions same-net shapes through via stacks (`group`
 tags), so same-net T-junctions and via-to-wire abutment inside one
 net do **not** self-flag.
+
+The min-area row is the only *measured* class. Post-patch, every
+still-firing `*.6` finding must correspond to a `RouteDb.
+area_residuals` entry (the patch pass names its own failures:
+net, layer, bbox, area, bound) — a finding with no residual is a
+component-model divergence between `patch_net_min_area` and
+`check_area_report`, treated as a bug to investigate, never a
+loosened assert.
 
 Acceptance wording: "0 violations across all 50 subset rules —
 every violation is either fixed or explicitly named with its rule

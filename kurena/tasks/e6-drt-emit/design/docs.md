@@ -1,97 +1,78 @@
-# e6-drt-emit — Documentation updates
+# e6-drt-emit — Documentation updates (post-rejection revision)
 
-All English, existing style. Every number in `results.md` comes from
-the step-1/2/3 captures verbatim (detached picorv32 log, in-suite
-gcd log, CLI run), with the test profile stated. Numbers measured
-under the *new* occupancy marking may drift from the pinned
-`e6-drt-maze` entry — record fresh values and name the cause
-(PDN metal + io-port premark, projected stubs); do not back-edit
-the maze entry.
+All English, existing style. The `v0.12.5` dated entry already
+records the landed emit + the measured 42-finding picorv32 gate —
+**do not rewrite it**; this revision appends the patch outcome as a
+follow-on block in the same entry (the record keeps the failure and
+the fix in one place, same convention as the maze entry's digest
+addendum).
 
 ## `docs/e6-drt.md`
 
-New section after §7 "Maze search" — **§8 Routed DEF emission** —
-covering, in the doc's claim-boundary voice:
+§7 "Maze search" gains a **post-extraction min-area patch**
+paragraph, in the doc's claim-boundary voice:
 
-- RouteDb → `net_geoms` mapping: square-cap expansion `seg ± w/2`
-  (identical to `parse_net_wire`'s 2-point expansion and to the
-  occupancy rasterization — the emitted DEF describes exactly the
-  shapes the router priced).
-- The emitted record grammar: `+ ROUTED <layer> ( p )( p )` /
-  `NEW …` / `NEW <lower> ( x y ) <via>` / `+ USE SIGNAL` — and the
-  **no-width deviation**: regular-net wires carry no width token
-  because our own `NETS` parser consumes a bare integer as a
-  coordinate; width is a `SPECIALNETS`-only construct. (Cite the
-  spec's example grammar as the source of the deviation.)
-- Via records name the `ViaTable` default — emitter never reselects.
-- Template splice: everything outside `NETS` passes through
-  verbatim (why `write_def_full` was rejected: it drops
-  `VIAS`/`SPECIALNETS`/etc.).
-- Unrouted nets: conns-only records, named in `EmitReport`.
-- Byte-stability: the fixed-point argument (order + square-cap
-  recovery), one paragraph.
-- The self-DRC gate: `run_all` on the re-parsed emit, 50-rule
-  subset — with the standing claim-boundary line: this is our
-  subset on our DEF; the full Magic deck gate on our DEF is
-  `e6-drt-e2e`.
-- The emit-driven maze amendments land in §7 too (same doc, same
-  change): PDN `SPECIALNETS` metal + via stacks as immovable
-  `Obs(u32::MAX)`, io-port rects marked `Pin(own_net)` (priced
-  band, not hard block — the `met3.2` `req_msg`/`resp_msg`
-  finding class), and the projected-pin access stub `route_one_net`
-  paints.
-- CLI: the `drt` command surface + flags.
+- What it fixes: the stub-class component (one via + short stub —
+  relaxed-via implied stubs and projected-pin access stubs) that
+  lands under a layer's `AREA` bound; cite the measured picorv32
+  classes (`li.6`×3, `met3.6`×39) with a pointer to `results.md`.
+- The model: per-layer member rects (wires `±w/2`, via-metal of the
+  pair default, member-pin shapes) merged by the checker's own
+  `union::components`/`union_area`; conservative direction
+  (`area_ours ≤ area_checker`, foreign metal can only help).
+- The extension: preferred-axis node-walk, one graph-edge span per
+  step, occupancy-strict (own `Net`/`Pin` hits only — no `Obs`, no
+  foreign marks, no host-carve), inside the guide region by
+  construction; endpoints are node coords, on-track.
+- The residual contract: `RouteDb.area_residuals` names every
+  component it cannot fix; a `*.6` gate finding without a residual
+  is a model divergence, i.e. a bug — never a tolerance.
 
-Also update the file's claim-boundary paragraph (§4) — it still
-says routed DEF output is future work.
+§8 keeps its emission content; add one line that patch wires are
+ordinary `WireSeg`s — emit, roundtrip, and the census see them
+identically. The §4 claim-boundary paragraph stays honest: subset
+gate on our DEF, Magic deck is `e6-drt-e2e`.
 
 ## `docs/results.md`
 
-`### <date> — e6-drt-emit: routed DEF emission + self-DRC (v0.12.5)`
+Append to the `### 2026-11-24 — e6-drt-emit` entry (do not open a
+new dated section — same ticket, same version line `v0.12.6` noted
+inline):
 
-- What landed (dense paragraph): emit model, CLI, gate, census.
-- **Self-DRC census**: per design, all 50 rules' candidates and
-  findings (the zero table prints compactly — one line per family
-  if all zero, or the full per-rule table if anything fires).
-  Any firing rule: named with count + root-cause class.
-- **Roundtrip evidence**: `out1 == out2` byte check, `net_geoms`
-  re-parse equality, non-vacuity numbers (rects/vias totals).
-- **Structural census**: the per-design table from census.md —
-  wirelength + per-cut vias vs delegated + baseline, signed deltas,
-  with the "informational, topology differs" line.
-- **Unrouted**: picorv32's fresh residual count + named classes,
-  plus an explicit line naming any delta vs the maze entry's pinned
-  108 (43 met3-bridge + 65 met2-connected) and its cause — the
-  WIP's occupancy-premark widening; cite the maze entry rather than
-  re-listing names.
-- **Fail-proof record**: both arms — injected-rect finding
-  (rule + count), `occ: Disabled` finding (rule + count) — proving
-  the gate goes red.
-- **Determinism**: two-pass byte equality + identical SubsetReport.
-- **Runtime**: emit is trivial; the picorv32 leg's measured wall
-  clock verbatim (release profile, `#[ignore]` convention stated).
-- **Checks run**: exact commands incl. `--release`/`--ignored`
-  where used, suite wall clock, version bump.
+- **Min-area patch** (one dense paragraph): the measured class, the
+  fix (post-loop `route_nets` pass, preferred-axis in-region
+  occupancy-strict extension), the `area_patches`/`area_residuals`
+  census from both logs.
+- **Fixture evidence**: the five `drt::maze::tests` fixtures and
+  what each pins (fill, pin-merge, occupancy-blocked residual,
+  region-bound residual, through-`route_nets` hook).
+- **gcd legs**: `findings_total=0` re-confirmed under the patch,
+  `area_patches`/`area_residuals` measured values, digest line
+  (`0x48593d441074229b` or the explained new digest with cause).
+- **picorv32 re-run** (`/tmp/emit-picorv32-patch.log`): fresh
+  routed/unrouted/wirelength/via census **vs the committed
+  baseline** — `li.6`×3 + `met3.6`×39 = 42 findings → the new
+  `findings_total`, any residual findings each mapped to their
+  `AreaResidual` record (net, layer, area, bound), wall clock vs
+  the 30,658 s baseline. If the leg is still running at commit
+  time, the block says exactly that (command + start time) — the
+  previous entry's in-flight convention.
+- **Checks run**: the exact commands (`drt::maze::tests`, the
+  release emit suite, workspace test, clippy) and the
+  `0.12.5 → 0.12.6` bump.
 
 ## `docs/status.md`
 
-New `Last updated:` head paragraph, demoting `e6-drt-maze` to the
-next `Previous:` in the chain. Content: `e6-drt-emit` (`v0.12.5`) —
-RouteDb → routed DEF through a NETS-section template splice
-(no-width grammar, ViaTable-default via names, square-cap model);
-`grus-eda drt` CLI; self-DRC gate state — honest wording:
-"clean on our 50-rule subset on OUR routed DEF" or named residuals;
-roundtrip byte-stability; census deltas recorded as informational;
-remaining = `e6-drt-e2e` (full Magic deck on our DEF in the
-container). Do **not** write anything implying Magic ran on our
-output.
+Update the head `Last updated:` paragraph's emit clause: the
+self-DRC gate line becomes "0 findings on gcd; picorv32 re-run post
+min-area patch — `<result>`" with the measured number (or "detached
+re-run in flight"), plus one clause on the patch pass itself.
+Everything else stands.
 
 ## `docs/roadmap.md`
 
-One `- Progress <date> (`v0.12.5`, ticket `e6-drt-emit`):` bullet
-after the `e6-drt-maze` line in the E6 block — emission model +
-CLI + gate verdict + census headline + remaining (e2e), same style
-as the prior bullets.
+The existing `e6-drt-emit` progress bullet gains one line: min-area
+patch landed (stub-class fix) + the picorv32 gate delta headline.
 
 ## Files
 

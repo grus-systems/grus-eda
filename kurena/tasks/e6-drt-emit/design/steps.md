@@ -1,124 +1,114 @@
-# e6-drt-emit — Close-out steps
+# e6-drt-emit — Close-out steps (post-rejection revision)
 
-Implementation landed at WIP `dc8cdb4`; this is the run + docs +
-verify sequence the rejection memo asked for. Order matters: the
-detached picorv32 leg starts **first** (~135+ min release) so it
-runs while everything else closes.
+Emission landed; the detached picorv32 gate measured 42 min-area
+findings (`li.6`×3, `met3.6`×39 — committed in `results.md`). This
+revision lands the `minarea.md` patch, proves it on toy fixtures,
+then re-runs the picorv32 leg **once** and records the delta.
 
-## 0. Small test additions (tests.md)
+## 1. Implement the patch (maze.rs)
 
-- Byte-stable check inside `emit_gate` (picorv32 gets the
-  write → parse → write → identical proof too).
-- `drt` CLI parse assert in `main.rs` `mod tests`.
-- Re-confirm the `#[ignore]` boundary: `test_emit_selfdrc_picorv32`
-  (and `test_maze_census_picorv32`, `test_maze_determinism_picorv32`)
-  stay ignored; nothing new reaches picorv32 inputs from a
-  non-ignored test.
+- `AreaResidual` + `RouteDb.area_patches`/`area_residuals` fields +
+  `drt.rs` re-export.
+- `patch_net_min_area` per `minarea.md` — component model via
+  `LayerShapes::from_rects` + `union::components` + `union_area`
+  (the checker's own primitives), preferred-axis node-walk under
+  occupancy-strict `scan_wire`, post-loop hook in `route_nets`
+  before `routes` flattens.
+- Census lines in `emit_gate` and the `drt` CLI print block
+  (`area_patches`/`area_residuals` + per-residual lines).
+- `route.wires.sort_unstable()` after patching.
 
-## 1. Launch the picorv32 gate detached — first
+## 2. Unit fixtures (maze.rs `mod tests`)
+
+The five fixtures from `tests.md` — `toy_tech` gains the
+`area_dbu2` bound parameter with existing callers at `0`. Run:
+
+```
+cargo test -p grus-core drt::maze::tests -- --nocapture
+```
+
+Every fixture must show the sub-bound component first (non-vacuity
+assert inside each test, AGENTS §7.7).
+
+## 3. In-suite legs
+
+```
+cargo test --release -p grus-core --test drt emit -- --nocapture \
+    2>&1 | tee /tmp/emit-gcd-patch.log
+cargo test -p grus-core --lib drt
+```
+
+Expected: gcd gate stays `findings_total=0`; `area_patches`/`residual`
+census prints (gcd may legitimately be `0/0` — record what it
+measures); digest stays `0x48593d441074229b` if the patch is a
+no-op on gcd — a shift is investigated first (it would mean gcd
+has sub-bound components the gate didn't flag, i.e. foreign-metal
+merging carried them — plausible but must be *seen*, not assumed).
+
+## 4. Launch the picorv32 gate re-run — detached, once
 
 ```
 cargo test --release -p grus-core --test drt \
     test_emit_selfdrc_picorv32 -- --ignored --nocapture \
-    2>&1 | tee /tmp/emit-picorv32.log
+    2>&1 | tee /tmp/emit-picorv32-patch.log
 ```
 
-Run detached (nohup / separate shell), budget ≈ route (~135 min)
-+ emit + parse + `run_all` + byte-check writes. Captures for
-`results.md`: routed/unrouted/wire_rects/vias line, every unrouted
-name, emit census block (wirelength + per-cut via deltas), gate
-findings (or the empty `firing` set), and wall clock.
+Detached (nohup / separate shell) — budget ≈ route (~135 min clean;
+the last leg measured 30,658 s under ambient load) + emit + parse +
+`run_all`. Captures for `results.md`: routed/unrouted, the
+`area_patches`/`area_residuals` census lines, emit census deltas,
+the `li.6`/`met3.6` findings delta vs the committed 42 (target: 0
+findings; each surviving `*.6` must map to a recorded
+`AreaResidual`), wall clock.
 
-## 2. In-suite gcd legs
+## 5. Docs (docs.md), drafted while step 4 runs
 
-```
-cargo test --release -p grus-core --test drt emit -- --nocapture \
-    2>&1 | tee /tmp/emit-gcd.log
-```
+`docs/e6-drt.md` §7 gains the min-area patch paragraph (post-loop
+pass, component model, occupancy-strict extension, residual naming);
+`docs/results.md` appends the re-run outcome to the dated entry
+(baseline 42 → fresh count, patch census, wall clock); `docs/
+status.md` and `docs/roadmap.md` one-line updates.
 
-Runs the six non-ignored emit tests (gcd routes ≈ 2 s release).
-Capture the census + `self_drc findings_total=0` lines verbatim.
+## 6. Version + verify + commit
 
-**If `run_all` fires on gcd**: classify per selfdrc.md's table —
-fix in `maze.rs`/`emit.rs` in place when the root cause is small
-and clear; otherwise name rule + count + class in `results.md`.
-Never loosen the assert, never skip the leg.
-
-## 3. CLI end-to-end on gcd (release binary)
-
-```
-cargo run --release -p grus-eda -- drt \
-    --tlef ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef \
-    --lef  ~/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef \
-    --def  tests/designs/gcd/gcd.placed.def \
-    --guide tests/designs/gcd/gcd.guide \
-    --out-def /tmp/gcd.drt.ours.routed.def \
-    --reference tests/designs/gcd/gcd.drt.reference.json \
-    --self-drc
-```
-
-Proves the delegation-replacement surface end to end; its census
-block joins the test-side numbers in `results.md`. Output DEF is a
-`/tmp` artifact — not committed (`e6-drt-e2e` owns the committed
-ours-DEF).
-
-## 4. Docs (docs.md), drafted while step 1 runs
-
-`docs/e6-drt.md` §8, `docs/results.md` dated entry with **measured**
-numbers only (gcd from step 2–3 captures; picorv32 fills in when
-step 1 lands — mark the entry's picorv32 row only after the log
-exists), `docs/status.md` head line, `docs/roadmap.md` bullet.
-
-## 5. Version + verify
-
-- `[workspace.package] version` `0.12.4 → 0.12.5` (feature → patch
+- `[workspace.package] version` `0.12.5 → 0.12.6` (bugfix → patch
   on 0.x), same commit.
-- `cargo test --workspace` — must complete inside the verify
-  budget; the default set carries only gcd-scale emit legs.
+- `cargo test --workspace` — default set only (the picorv32 leg is
+  `#[ignore]`d and never enters it).
 - `cargo clippy --workspace --all-targets -- -D warnings`.
-
-## 6. Commit
-
-Conventional Commit, English, agent trailer:
-
-```
-feat: Routed DEF emission and self-DRC gate
-```
-
-Body bullets: emit model (no-width grammar, NETS splice, square-cap
-model, ViaTable-default vias), `grus-eda drt` surface, the maze-side
-occupancy/stub fixes with their motivation (self-DRC findings),
-test list, verdict + census headline, remaining (`e6-drt-e2e`).
+- Commit: `fix: Post-route min-area patch for stub components`
+  (Conventional, English, agent trailer). Body: the measured class,
+  the model, the occupancy-strict/region rules, fixture list, the
+  re-run delta (or "in flight" note per below).
 
 ## Contingencies
 
-- **gcd gate red** — see step 2. A spacing red reachable by the
-  `Disabled` arm but not `Enabled` means the gate is vacuous —
-  investigate the fixture, don't accept the pass.
-- **picorv32 leg still running at verify time** — the kurena verify
-  (`cargo test --workspace`) never runs it; the results entry waits
-  for the log. If it cannot finish inside the ticket's wall clock,
-  commit the gcd-complete entry with the picorv32 leg recorded as
-  "running detached — command + start time" and land the numbers in
-  a follow-up amend only if the card is still open; otherwise the
-  e2e ticket inherits it. Do **not** gate-verify an unfinished
-  claim.
-- **picorv32 unrouted count drifts from the pinned 108** — expected
-  direction is *fewer* `NoPath` (io-port/PDN marking changes the
-  pricing, not the graph). Record the fresh count + class split and
-  note the premark change as cause; a *larger* or reclassifying
-  residual is a maze regression — investigate before naming.
-- **Byte-check red on re-emit** — grammar drift on the second pass
-  (foreign-geometry arm of `centerline`): a `wire_rect` the parser
-  produced that isn't square-cap-expressible. Debug against
-  `parse_net_wire` token-by-token; the via-record line is the
-  fragile spot.
-- **Pinned maze test red** from the occupancy changes — per
-  tests.md: investigate the shifted number, fix or record with
-  cause; do not re-pin silently.
+- **picorv32 leg still running at verify time** — same rule as last
+  round: the kurena verify never runs it; commit the unit-fixture +
+  gcd evidence with the leg recorded as "running detached — command
+  + start time", and land the delta numbers in the card's follow-up
+  or the e2e ticket. Do **not** gate-verify an unfinished claim.
+- **Residual `*.6` findings on the re-run** — each must correspond
+  to an `AreaResidual` line; a finding without one is a component-
+  model divergence — investigate, never loosen the assert. If the
+  residuals all share a mechanism (e.g., a preferred axis walled by
+  foreign metal), name it in `results.md` — the acceptance's named
+  path.
+- **New spacing/enclosure findings** — the patch is
+  occupancy-strict by construction; a new class means the scan
+  semantics diverged from the checker's — debug against the
+  specific finding before touching thresholds.
+- **gcd digest/count shift** — investigate (see step 3); re-pin
+  only after the shifted number is explained in `results.md`.
+- **Fixture shows the walk can't reach bound on a real class** —
+  the preferred-axis-only domain is decision 9; if a measured
+  finding class needs a perpendicular fallback, that is a design
+  change for the next card, not a silent extension.
 
 ## Files
 
+- `crates/grus-core/src/drt/maze.rs`
+- `crates/grus-core/src/drt.rs`
 - `crates/grus-core/tests/drt.rs`
 - `crates/grus-eda/src/main.rs`
 - `docs/e6-drt.md`

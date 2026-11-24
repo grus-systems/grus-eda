@@ -8,11 +8,17 @@ gate.
 ## Quantities
 
 - **`wire_length_dbu`** (`EmitReport`): Σ Manhattan length over
-  emitted `WireSeg`s — the same centerline accounting
+  emitted `WireSeg`s — min-area patch wires are ordinary `WireSeg`s
+  and join this total like any other segment (the re-run's
+  wirelength delta vs the committed baseline includes them — name
+  that in the results delta). The same centerline accounting
   `routed_def_parse` applies to `routed.def` when it produces
   `total_wirelength_um` in the reference JSON. µm conversion:
   `db.dbu_per_micron` (the DEF `UNITS DISTANCE MICRONS` value,
   1000 on sky130hd) — state the divisor source next to the number.
+- **`area_patches` / `area_residuals`** (`RouteDb`): the patch
+  census — components brought to bound, and the named leftovers
+  (net, layer, bbox, area, bound) the gate can still fire on.
 - **`vias_per_cut`** (`EmitReport`): placed vias grouped by cut-layer
   name (`tech.strings` resolve of `pairs[vp.lower].cut`) — joins the
   reference's `vias_per_cut_layer`, which `routed_def_parse` builds by

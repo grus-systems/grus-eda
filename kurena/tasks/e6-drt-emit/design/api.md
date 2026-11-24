@@ -5,6 +5,69 @@ One new module `drt::emit` plus a `drt` subcommand in `grus-eda`.
 ones (doc comments abridged); deltas vs the original plan are
 flagged inline.
 
+**This revision** adds the min-area patch's surface: two `RouteDb`
+fields, one new public struct, and census print lines. Nothing
+else's signature changes — `route_one_net`, `apply_routes`,
+`write_routed_def`, and `DrtArgs` are untouched.
+
+## `crates/grus-core/src/drt/maze.rs` (this revision)
+
+```rust
+/// A connected component that stayed under its layer's `AREA`
+/// bound after the patch pass — the named-residual record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AreaResidual {
+    pub net: NetId,
+    pub layer: LayerId,
+    /// Sub-bound component's bbox.
+    pub region: RectDbu,
+    pub area_dbu2: i64,
+    pub bound_dbu2: i64,
+}
+
+pub struct RouteDb {
+    pub nets: Vec<NetRoute>,
+    pub unrouted: Vec<UnroutedNet>,
+    pub collisions: Vec<Collision>,
+    pub iterations: u32,
+    /// Components the min-area patch brought to bound.
+    pub area_patches: usize,
+    /// Components it could not — named with layer/bbox/area/bound;
+    /// every residual maps to a `*.6` self-DRC finding if the gate
+    /// fires, and every `*.6` finding must map back to one of these.
+    pub area_residuals: Vec<AreaResidual>,
+}
+```
+
+`drt.rs` adds `AreaResidual` to the `pub use maze::{…}` list.
+`route_digest` is unchanged (wires already carry the patch).
+
+Internal hook — `route_nets` runs it per committed net between the
+iteration loop and `overlap_census`, before `routes` flattens into
+`nets` (the loop still has the `graphs.nets[i]` ↔ `routes[i]`
+pairing — no net-id lookup needed):
+
+```rust
+let mut area_residuals = Vec::new();
+let mut area_patches = 0;
+for (i, g) in graphs.nets.iter().enumerate() {
+    let Some(route) = &mut routes[i] else { continue };
+    area_patches += patch_net_min_area(
+        db, tech, tracks, g, vias, &mut occ, route,
+        &mut area_residuals,
+    );
+}
+
+/// Patch one committed net's sub-bound components toward its
+/// layers' `AREA` bounds; returns components fixed.
+fn patch_net_min_area(
+    db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks],
+    g: &NetGraph, vias: &ViaTable,
+    occ: &mut Occupancy, route: &mut NetRoute,
+    residuals: &mut Vec<AreaResidual>,
+) -> usize;
+```
+
 ## `crates/grus-core/src/drt/emit.rs` (landed)
 
 ```rust
@@ -137,8 +200,11 @@ Run sequence (landed, mirrors `Route` + `Drc` arms):
    ```
    == drt emit: <design> ==
    guided=<g> routed=<r> unrouted=<u> projected=<p> collisions=<c>
+       area_patches=<ap> area_residuals=<ar>
        iterations=<i> route_ms=<t>
      unrouted <name>            (one line per unrouted net)
+     area_residual <net> <layer> area=<a> bound=<b>
+                                 (one line per residual)
    wirelength_um ours=<x> delegated=<y> delta=<±z> baseline=<b>
    via.<cut>  ours=<x> delegated=<y> delta=<±z> baseline=<b>
    self_drc findings=<n> [rule names + counts]      [--self-drc]
@@ -168,7 +234,8 @@ is compared *against* them, not re-committed (the e2e ticket adds
 
 ## Files
 
-- `crates/grus-core/src/drt/emit.rs`
+- `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/src/drt.rs`
+- `crates/grus-core/src/drt/emit.rs`
 - `crates/grus-eda/src/main.rs`
 - `crates/grus-core/tests/drt.rs`
