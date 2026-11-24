@@ -921,6 +921,9 @@ ours_router = {
     "area_patches": None,
     "area_residuals": None,
     "hull_masked": None,
+    "notch_fills": None,
+    "notch_residuals": None,
+    "hole_residuals": None,
 }
 if ours_router["emit_log_present"]:
     elog = open(emit_log_abs).read()
@@ -933,7 +936,10 @@ if ours_router["emit_log_present"]:
                 or s.lstrip().startswith("unrouted_blockers ")
                 or s.lstrip().startswith("area_residual ")
                 or s.lstrip().startswith("notch_residual ")
+                or s.lstrip().startswith("hole_residual ")
                 or s.lstrip().startswith("stub_outside_cover ")
+                or s.startswith("  rule=")
+                or re.match(r"^    \S+ \[", s)
                 or s.startswith("self_drc")):
             cli.append(s)
     # The golden must byte-reproduce on any checkout: the `wrote routed
@@ -948,10 +954,12 @@ if ours_router["emit_log_present"]:
         r"^guided=(\d+) routed=(\d+) unrouted=(\d+) projected=(\d+) "
         r"collisions=(\d+) area_patches=(\d+) area_residuals=(\d+) "
         r"iterations=(\d+) route_ms=(\d+) hull_masked=(\d+) "
-        r"notch_fills=(\d+)", elog, re.M)
+        r"notch_fills=(\d+) notch_residuals=(\d+) hole_residuals=(\d+)",
+        elog, re.M)
     if mg is None:
         fail("emit log present but its guided= census line is missing "
-             "or lacks notch_fills= (emit/script version lock)")
+             "or lacks notch_residuals=/hole_residuals= (emit/script "
+             "version lock)")
     ours_router["routed"] = int(mg.group(2))
     ours_router["unrouted_count"] = int(mg.group(3))
     ours_router["collisions"] = int(mg.group(5))
@@ -959,6 +967,8 @@ if ours_router["emit_log_present"]:
     ours_router["area_residuals"] = int(mg.group(7))
     ours_router["hull_masked"] = int(mg.group(10))
     ours_router["notch_fills"] = int(mg.group(11))
+    ours_router["notch_residuals"] = int(mg.group(12))
+    ours_router["hole_residuals"] = int(mg.group(13))
     ours_router["unrouted"] = re.findall(r"^\s+unrouted (\S+)$", elog, re.M)
     mk = re.search(
         r"^unrouted_kinds NoPath=(\d+) Unattachable=(\d+)$", elog, re.M)

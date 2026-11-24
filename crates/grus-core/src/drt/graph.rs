@@ -268,7 +268,7 @@ pub fn pin_rects(db: &DesignDb, tech: &TechDb, net: NetId) -> PinCover {
 
 /// Cell `c`'s placed outline — the conservative hull rect a master
 /// may paint internals anywhere inside of on the layers it uses.
-pub(crate) fn cell_hull_rect(db: &DesignDb, tech: &TechDb, c: u32) -> RectDbu {
+pub fn cell_hull_rect(db: &DesignDb, tech: &TechDb, c: u32) -> RectDbu {
     let mac = &tech.macros[db.cell_macros[c as usize].0 as usize];
     let r = DesignDb::orient_rect(
         RectDbu::new(0, 0, mac.width_dbu, mac.height_dbu),

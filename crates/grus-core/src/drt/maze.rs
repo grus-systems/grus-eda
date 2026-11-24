@@ -162,6 +162,29 @@ pub struct NotchResidual {
     pub b: RectDbu,
 }
 
+/// An enclosed void under the layer's `MINENCLOSEDAREA` bound that
+/// the void-closure pass could not legally fill — the named-residual
+/// record for the `*.7` hole rules (`residuals.md` §3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HoleResidual {
+    pub net: NetId,
+    pub layer: LayerId,
+    /// Enclosed void's bbox.
+    pub region: RectDbu,
+    pub area_dbu2: i64,
+    pub bound_dbu2: i64,
+}
+
+/// The closure pass's named residual records for one routed net —
+/// reported, never hidden (`residuals.md` §5).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClosureResiduals {
+    /// Same-net sub-spacing notches (`self-spacing.md`).
+    pub notches: Vec<NotchResidual>,
+    /// Unfillable under-bound enclosed voids (`residuals.md` §3).
+    pub holes: Vec<HoleResidual>,
+}
+
 /// The router's complete deterministic output.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RouteDb {
@@ -184,6 +207,10 @@ pub struct RouteDb {
     /// expected empty; each maps to a `*.2`-family Magic finding on
     /// the routed DEF (`self-spacing.md`).
     pub notch_residuals: Vec<NotchResidual>,
+    /// Under-bound enclosed voids the void-closure pass could not
+    /// fill — expected empty; each maps to a `*.7` Magic hole
+    /// finding on the routed DEF (`residuals.md` §3).
+    pub hole_residuals: Vec<HoleResidual>,
     /// Pins that got no legal paint — the `Unattachable` census
     /// (`pin-access.md` r3 semantics: projected stubs suppressed by
     /// hull confinement plus access arcs blocked by live occupancy;
@@ -1596,16 +1623,17 @@ fn other_end(g: &NetGraph, relax: &[RelaxedVia], eidx: u32, v: u32) -> u32 {
 
 /// One routed net's outcome.
 enum NetOutcome {
-    /// Route, provisional collisions, and the closure pass's
-    /// unrepaired same-net notches (`self-spacing.md`).
-    Routed(NetRoute, Vec<Collision>, Vec<NotchResidual>),
+    /// Route, provisional collisions, and the closure pass's named
+    /// residuals (`self-spacing.md`, `residuals.md`).
+    Routed(NetRoute, Vec<Collision>, ClosureResiduals),
     Failed {
         unrouted: UnroutedNet,
-        /// Pins whose only projected access stubs crossed an
-        /// uncovered hull — suppressed by the confinement check.
-        /// `route_nets` collects them into
-        /// `RouteDb::stub_outside_cover` (expected empty: admission
-        /// pre-filters them; nonzero is a bug, not a residual).
+        /// Pins that got no legal paint — the `Unattachable`
+        /// diagnostic (`pin-access.md` r3): projected stubs
+        /// suppressed by hull confinement plus access arcs blocked
+        /// by live occupancy. `route_nets` collects them into
+        /// `RouteDb::stub_outside_cover`; every entry maps to an
+        /// `unrouted` net.
         stub_blocked: Vec<PinId>,
     },
 }
@@ -2370,7 +2398,7 @@ fn route_one_net(
         (0..g.pin_nodes.len()).map(|_| BTreeSet::new()).collect();
     let mut elem: Vec<Option<AttachElem>> = vec![None; g.pin_nodes.len()];
     let mut fills: Vec<(LayerId, RectDbu)>;
-    let notch_residuals: Vec<NotchResidual>;
+    let residuals: ClosureResiduals;
     'outer: loop {
         for pi in 0..g.pin_nodes.len() {
             if !run.connected[pi] || elem[pi].is_some() {
@@ -2401,9 +2429,12 @@ fn route_one_net(
         match close_self_spacing(
             db, tech, g, occ, mask, &topo.cover, vias, &hlines, &vlines, &vplaced,
         ) {
-            ClosureResult::Done { fills: f, residuals } => {
+            ClosureResult::Done {
+                fills: f,
+                residuals: res,
+            } => {
                 fills = f;
-                notch_residuals = residuals;
+                residuals = res;
                 break 'outer;
             }
             ClosureResult::Reject { pin, src } => {
@@ -2519,7 +2550,7 @@ fn route_one_net(
             fills,
         },
         prov.into_iter().collect(),
-        notch_residuals,
+        residuals,
     )
 }
 
@@ -2537,8 +2568,10 @@ fn route_one_net(
 enum PaintSrc {
     /// Tree paint: edges, strict/relaxed vias, their stubs, fills.
     Tree,
-    /// Member pin metal (immovable).
-    PinShape,
+    /// Member pin metal (immovable) — the `pin_nodes` index rides
+    /// along so the void pass can tell a cell pin (`MacroPin`) from
+    /// an io port (`IoPort`) for the checker's drawn gate.
+    PinShape(u32),
     /// Projected access stub of member pin `u32` (`pin_nodes` index).
     ProjStub(u32),
     /// Access-arc via + upper stub of member pin `u32`.
@@ -2578,7 +2611,7 @@ enum AttachElem {
 enum ClosureResult {
     Done {
         fills: Vec<(LayerId, RectDbu)>,
-        residuals: Vec<NotchResidual>,
+        residuals: ClosureResiduals,
     },
     Reject {
         pin: usize,
@@ -2829,12 +2862,12 @@ fn close_self_spacing(
             pieces
                 .entry(lid.0)
                 .or_default()
-                .push((r, BTreeSet::from([PaintSrc::PinShape])));
+                .push((r, BTreeSet::from([PaintSrc::PinShape(pin.0)])));
         }
     }
 
     let mut fills: Vec<(LayerId, RectDbu)> = Vec::new();
-    let mut residuals: Vec<NotchResidual> = Vec::new();
+    let mut residuals = ClosureResiduals::default();
     for (&l, ps) in pieces.iter_mut() {
         let s = occ.spc[l as usize];
         // A prong pair is adjudicated once: an admitted fill bridges
@@ -2844,61 +2877,222 @@ fn close_self_spacing(
         // since can raise a new notch, so re-scanning proceeds but
         // old pairs stay closed.
         let mut seen: BTreeSet<(RectDbu, RectDbu)> = BTreeSet::new();
-        'fix: loop {
-            ps.sort_by_key(|(r, _)| (r.xl, r.yl, r.xh, r.yh));
-            let mut added: Option<(RectDbu, BTreeSet<PaintSrc>)> = None;
-            'pair: for i in 0..ps.len() {
-                for j in i + 1..ps.len() {
-                    let (p, q) = (ps[i].0, ps[j].0);
-                    if q.xl >= p.xh + s {
-                        break;
-                    }
-                    let Some(axis) = notch_axis(&p, &q, s) else {
-                        continue;
-                    };
-                    let key = (p.min(q), p.max(q));
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    match try_fill(db, tech, occ, mask, cover, g.net, l, &p, &q, axis) {
-                        Some(f) => {
-                            fills.push((LayerId(l), f));
-                            added = Some((f, BTreeSet::from([PaintSrc::Tree])));
-                            break 'pair;
+        let mut seen_holes: BTreeSet<RectDbu> = BTreeSet::new();
+        'fp: loop {
+            'fix: loop {
+                ps.sort_by_key(|(r, _)| (r.xl, r.yl, r.xh, r.yh));
+                let mut added: Option<(RectDbu, BTreeSet<PaintSrc>)> = None;
+                'pair: for i in 0..ps.len() {
+                    for j in i + 1..ps.len() {
+                        let (p, q) = (ps[i].0, ps[j].0);
+                        if q.xl >= p.xh + s {
+                            break;
                         }
-                        None => {
-                            // Smallest droppable src (Ord: ProjStub
-                            // before Access — the smaller blast radius).
-                            let mut srcs: BTreeSet<PaintSrc> = ps[i]
-                                .1
-                                .iter()
-                                .chain(&ps[j].1)
-                                .copied()
-                                .filter(PaintSrc::droppable)
-                                .collect();
-                            if let Some(src) = srcs.pop_first() {
-                                return ClosureResult::Reject {
-                                    pin: src.pin(),
-                                    src,
-                                };
+                        let Some(axis) = notch_axis(&p, &q, s) else {
+                            continue;
+                        };
+                        let key = (p.min(q), p.max(q));
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        match try_fill(db, tech, occ, mask, cover, g.net, l, &p, &q, axis)
+                        {
+                            Some(f) => {
+                                fills.push((LayerId(l), f));
+                                added = Some((f, BTreeSet::from([PaintSrc::Tree])));
+                                break 'pair;
                             }
-                            residuals.push(NotchResidual {
-                                net: g.net,
-                                layer: LayerId(l),
-                                a: p,
-                                b: q,
-                            });
+                            None => {
+                                // Smallest droppable src (Ord: ProjStub
+                                // before Access — the smaller blast radius).
+                                let mut srcs: BTreeSet<PaintSrc> = ps[i]
+                                    .1
+                                    .iter()
+                                    .chain(&ps[j].1)
+                                    .copied()
+                                    .filter(PaintSrc::droppable)
+                                    .collect();
+                                if let Some(src) = srcs.pop_first() {
+                                    return ClosureResult::Reject {
+                                        pin: src.pin(),
+                                        src,
+                                    };
+                                }
+                                residuals.notches.push(NotchResidual {
+                                    net: g.net,
+                                    layer: LayerId(l),
+                                    a: p,
+                                    b: q,
+                                });
+                            }
                         }
                     }
                 }
+                match added {
+                    Some(p) => ps.push(p),
+                    None => break 'fix,
+                }
             }
-            match added {
-                Some(p) => ps.push(p),
-                None => break 'fix,
+            // Void-closure (`residuals.md` §3): a void-fill merges
+            // into its enclosing walls — it cannot open a new notch —
+            // but it can stitch components into a fresh enclosure, so
+            // the fixpoint reruns while fills still commit.
+            if !close_voids(
+                db,
+                tech,
+                g,
+                occ,
+                mask,
+                cover,
+                l,
+                ps,
+                &mut fills,
+                &mut seen_holes,
+                &mut residuals.holes,
+            ) {
+                break 'fp;
             }
         }
     }
+    // `residuals.md` §1: identical fill rects — separate prong pairs
+    // facing one gap — collapse to one committed `RECT`; overlapping
+    // but distinct fills stay.
+    fills.sort_unstable();
+    fills.dedup();
     ClosureResult::Done { fills, residuals }
+}
+
+/// The `MINENCLOSEDAREA` bound the deck applies on layer `l` — only
+/// layers carrying a `*.7` hole rule (the checker's `HOLE_RULES`
+/// layer set) get the void pass; the bound is the LEF value, else the
+/// same deck-pinned fallback `check_hole_report` uses.
+fn hole_bound(tech: &TechDb, l: u8) -> Option<i64> {
+    let rl = &tech.routing_layers[l as usize];
+    let ruled = crate::drc::area::HOLE_RULES
+        .iter()
+        .any(|r| r.layer == tech.strings.resolve(rl.name));
+    if !ruled {
+        return None;
+    }
+    Some(if rl.min_enclosed_area_dbu2 > 0 {
+        rl.min_enclosed_area_dbu2
+    } else {
+        crate::drc::area::HOLE_FALLBACK_DBU2
+    })
+}
+
+/// Void-closure pass (`residuals.md` §3): enclosed voids under the
+/// layer's `MINENCLOSEDAREA` bound get their free-rect decomposition
+/// committed as same-net fills iff every covering rect passes
+/// `fill_admitted` (all-or-nothing per void); an unfillable
+/// under-bound void lands named in `hole_residuals`. The component /
+/// solid / obs model mirrors `check_hole_report` exactly: drawn
+/// components only (`MacroPin`-only islands are not evaluated),
+/// `solid` is every member rect overlapping the component window —
+/// foreign committed marks included, `Obs(u32::MAX)` PDN/netless
+/// metal counts as real paint — and a void touching an `Obs`
+/// abstract is real content: discarded, never filled, never a
+/// residual. Returns true when any fill committed, so the caller can
+/// re-run the notch fixpoint.
+#[allow(clippy::too_many_arguments)]
+fn close_voids(
+    db: &DesignDb,
+    tech: &TechDb,
+    g: &NetGraph,
+    occ: &Occupancy,
+    mask: &HullMask,
+    cover: &PinCover,
+    l: u8,
+    ps: &mut Vec<(RectDbu, BTreeSet<PaintSrc>)>,
+    fills: &mut Vec<(LayerId, RectDbu)>,
+    seen_holes: &mut BTreeSet<RectDbu>,
+    hole_residuals: &mut Vec<HoleResidual>,
+) -> bool {
+    let Some(bound) = hole_bound(tech, l) else {
+        return false;
+    };
+    let own = g.net.0;
+    let sh = |r: &RectDbu, srcs: &BTreeSet<PaintSrc>| ShapeRect {
+        rect: *r,
+        src: match srcs.iter().next() {
+            Some(&PaintSrc::PinShape(pi)) if srcs.len() == 1 => {
+                if db.pin_cells[pi as usize].is_some() {
+                    ShapeSrc::MacroPin
+                } else {
+                    ShapeSrc::IoPort
+                }
+            }
+            _ => ShapeSrc::SignalWire,
+        },
+        net: None,
+        group: 0,
+    };
+    let ls = LayerShapes::from_rects(ps.iter().map(|(r, s)| sh(r, s)).collect());
+    let comps = union::components(&ls);
+    let mut progress = false;
+    let mut hits = Vec::new();
+    for members in &comps.members {
+        if !members
+            .iter()
+            .any(|&i| is_drawn(ls.rects[i as usize].src))
+        {
+            continue;
+        }
+        let mrects = comp_rects(&ls, members);
+        let window = rect_bbox(&mrects);
+        let mut solid: Vec<RectDbu> = ps
+            .iter()
+            .map(|(r, _)| *r)
+            .filter(|r| {
+                r.xl < window.xh && r.xh > window.xl && r.yl < window.yh && r.yh > window.yl
+            })
+            .collect();
+        let mut obs: Vec<RectDbu> = Vec::new();
+        hits.clear();
+        occ.scan_rect(l, &window, &mut hits);
+        for h in hits.drain(..) {
+            match h.iv.who {
+                Occupant::Obs(u32::MAX) => solid.push(hit_bbox(&h)),
+                Occupant::Obs(_) => obs.push(hit_bbox(&h)),
+                Occupant::ObsPin(m) | Occupant::Net(m) | Occupant::Pin(m) if m != own => {
+                    solid.push(hit_bbox(&h))
+                }
+                _ => {}
+            }
+        }
+        for hole in union::enclosed_voids(&solid, window) {
+            if hole.area_dbu2 >= bound {
+                continue;
+            }
+            let obs_hit = hole
+                .rects
+                .iter()
+                .any(|f| obs.iter().any(|o| overlaps_closed(f, o)));
+            if obs_hit || !seen_holes.insert(hole.bbox) {
+                continue;
+            }
+            if hole
+                .rects
+                .iter()
+                .all(|f| fill_admitted(occ, mask, cover, own, l, f))
+            {
+                for f in &hole.rects {
+                    fills.push((LayerId(l), *f));
+                    ps.push((*f, BTreeSet::from([PaintSrc::Tree])));
+                }
+                progress = true;
+            } else {
+                hole_residuals.push(HoleResidual {
+                    net: g.net,
+                    layer: LayerId(l),
+                    region: hole.bbox,
+                    area_dbu2: hole.area_dbu2,
+                    bound_dbu2: bound,
+                });
+            }
+        }
+    }
+    progress
 }
 
 /// The notch signature (`self-spacing.md`): `p`/`q` disjoint, facing
@@ -2917,6 +3111,23 @@ fn notch_axis(p: &RectDbu, q: &RectDbu, s: i32) -> Option<Axis> {
         return Some(Axis::Y);
     }
     None
+}
+
+/// The open gap between the facing edges of a `notch_axis` pair —
+/// the region `try_fill` paints, minus its ±1 grow into the prongs.
+/// Degenerate (line-width) gaps are exact too: `rect_covered` treats
+/// them as interval coverage.
+fn notch_gap(p: &RectDbu, q: &RectDbu, axis: Axis) -> RectDbu {
+    match axis {
+        Axis::X => {
+            let (lo, hi) = if p.xh <= q.xl { (p.xh, q.xl) } else { (q.xh, p.xl) };
+            RectDbu::new(lo, p.yl.max(q.yl), hi, p.yh.min(q.yh))
+        }
+        Axis::Y => {
+            let (lo, hi) = if p.yh <= q.yl { (p.yh, q.yl) } else { (q.yh, p.yl) };
+            RectDbu::new(p.xl.max(q.xl), lo, p.xh.min(q.xh), hi)
+        }
+    }
 }
 
 /// Closed-overlap (boundary touch counts — Magic merges on contact).
@@ -3183,9 +3394,15 @@ fn span_rect(axis: Axis, w2: i32, line_t: i32, lo: i32, hi: i32) -> RectDbu {
 /// `scan_wire` reports own-net `Net`/`Pin` hits exclusively: the
 /// patch is occupancy-strict — any `Obs` (the host-cell carve is not
 /// inherited; patch metal is optional) or foreign `Net`/`Pin` hit
-/// stops that direction. On reaching bound the accumulated span
-/// commits as a single `WireSeg` rasterized as `Net(own)`; returns
-/// whether it committed.
+/// stops that direction. Once the accumulated span reaches `bound` it
+/// must also clear the same-net guard (`residuals.md` §2): it may
+/// merge into the net's other components (touch ⇒ merge ⇒ free) but
+/// may not stop `< s` short of any own rect it stays disjoint from —
+/// the closure's notch signature applied to post-closure paint; a
+/// violating reach does not end the walk, a later step can still
+/// merge through. The first bound-reaching legal span commits as a
+/// single `WireSeg` rasterized as `Net(own)`; returns whether it
+/// committed.
 #[allow(clippy::too_many_arguments)]
 fn patch_component(
     tracks: &[LayerTracks],
@@ -3196,11 +3413,13 @@ fn patch_component(
     pref: Axis,
     lines: &BTreeMap<u32, BTreeSet<u32>>,
     mrects: &[RectDbu],
+    net_rects: &[RectDbu],
     bound: i64,
     w2: i32,
 ) -> bool {
     let lt = &tracks[l as usize];
     let own = route.net.0;
+    let s = occ.spc[l as usize];
     let coord = |pos: u32| -> i32 {
         match pref {
             Axis::X => lt.tracks_x[pos as usize],
@@ -3273,9 +3492,16 @@ fn patch_component(
                 } else {
                     lo = next;
                 }
-                let mut all = mrects.to_vec();
-                all.push(span_rect(pref, w2, line_at(line), coord(lo), coord(hi)));
-                if union::union_area(&all) >= bound {
+                let span = span_rect(pref, w2, line_at(line), coord(lo), coord(hi));
+                let mut grown = mrects.to_vec();
+                grown.push(span);
+                if union::union_area(&grown) >= bound
+                    && net_rects.iter().all(|q| {
+                        notch_axis(&span, q, s).is_none_or(|ax| {
+                            rect_covered(net_rects, &notch_gap(&span, q, ax))
+                        })
+                    })
+                {
                     reached = true;
                     break;
                 }
@@ -3364,6 +3590,10 @@ fn patch_net_min_area(
                 break;
             }
             let comps = union::components(&ls);
+            // The §2 same-net guard's rect set: every member rect of
+            // the net on this layer, all components — a span that
+            // merges is free, one that stops `< s` short is a notch.
+            let net_rects: Vec<RectDbu> = ls.rects.iter().map(|s| s.rect).collect();
             let mut committed = false;
             for members in &comps.members {
                 if !members
@@ -3377,7 +3607,7 @@ fn patch_net_min_area(
                     continue;
                 }
                 if patch_component(
-                    tracks, g, occ, route, l, pref, &lines, &mrects, bound, w2,
+                    tracks, g, occ, route, l, pref, &lines, &mrects, &net_rects, bound, w2,
                 ) {
                     patches += 1;
                     // Re-derive: the patch can merge two sub-bound
@@ -3462,7 +3692,8 @@ pub fn route_nets(
         .map(|(i, g)| (g.net.0, i))
         .collect();
     let mut routes: Vec<Option<NetRoute>> = vec![None; n];
-    let mut res_of: Vec<Vec<NotchResidual>> = vec![Vec::new(); n];
+    let mut res_of: Vec<ClosureResiduals> =
+        (0..n).map(|_| ClosureResiduals::default()).collect();
     let mut marks: Vec<Vec<Mark>> = vec![Vec::new(); n];
     let mut hist = vec![0u32; n];
     let mut bad: Vec<usize> = (0..n).collect();
@@ -3500,7 +3731,7 @@ pub fn route_nets(
                     for &p in &stub_blocked {
                         stub_outside_cover.push((g.net, p));
                     }
-                    res_of[i].clear();
+                    res_of[i] = ClosureResiduals::default();
                     failed.push((i, unrouted));
                 }
             }
@@ -3605,7 +3836,14 @@ pub fn route_nets(
         iterations,
         area_patches,
         area_residuals,
-        notch_residuals: res_of.into_iter().flatten().collect(),
+        notch_residuals: res_of
+            .iter()
+            .flat_map(|r| r.notches.iter().copied())
+            .collect(),
+        hole_residuals: res_of
+            .iter()
+            .flat_map(|r| r.holes.iter().copied())
+            .collect(),
         stub_outside_cover,
     }
 }
@@ -3738,6 +3976,19 @@ pub fn route_digest(routed: &RouteDb) -> u64 {
         put(nr.b.yl as u32);
         put(nr.b.xh as u32);
         put(nr.b.yh as u32);
+    }
+    put(routed.hole_residuals.len() as u32);
+    for hr in &routed.hole_residuals {
+        put(hr.net.0);
+        put(hr.layer.0 as u32);
+        put(hr.region.xl as u32);
+        put(hr.region.yl as u32);
+        put(hr.region.xh as u32);
+        put(hr.region.yh as u32);
+        put(hr.area_dbu2 as u64 as u32);
+        put((hr.area_dbu2 as u64 >> 32) as u32);
+        put(hr.bound_dbu2 as u64 as u32);
+        put((hr.bound_dbu2 as u64 >> 32) as u32);
     }
     put(routed.stub_outside_cover.len() as u32);
     for (n, p) in &routed.stub_outside_cover {
@@ -4424,5 +4675,302 @@ mod tests {
             x2: 1000,
             y2: 1000
         }));
+    }
+
+    /// `residuals.md` §1 — identical fills collapse: a wire piece and
+    /// a via plate sharing their facing edge with a third piece each
+    /// admit the same gap rect (`(A,B)` and `(A,C)` pairs), so
+    /// `fills` dedups to one committed `RECT`, not two.
+    #[test]
+    fn test_closure_fill_dedup() {
+        let tech = toy_tech();
+        let db = DesignDb::new();
+        let g = NetGraph {
+            net: NetId(0),
+            nodes: vec![],
+            edges: vec![],
+            via_edges: vec![],
+            pin_nodes: vec![],
+        };
+        let occ = toy_occ(&tech);
+        let mask = HullMask::new(&db, &tech);
+        let cover = PinCover::new();
+        let vias = ViaTable {
+            candidates: vec![ViaCandidate {
+                name: SymbolId(0),
+                lower: LayerId(0),
+                upper: LayerId(1),
+                cut: SymbolId(0),
+                cut_count: 1,
+                geom: crate::design_db::ViaGeom::Lef(0),
+                rects: vec![(
+                    DrcLayer::Routing(LayerId(0)),
+                    RectDbu::new(0, -70, 100, 70),
+                )],
+                area_dbu2: 0,
+            }],
+            pairs: vec![ViaPair {
+                lower: LayerId(0),
+                upper: LayerId(1),
+                cut: Some(SymbolId(0)),
+                candidates: vec![0],
+                default: Some(0),
+            }],
+            gaps: vec![],
+            unmatched: vec![],
+        };
+        // Pieces: A [0,930,500,1070], B [600,930,1100,1070] on the
+        // t=1000 line; the via at (600,1000) plates
+        // C [600,930,700,1070] — C faces A across the identical
+        // [500,600]×[930,1070] gap B does (gap 100 < s=140).
+        let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+            BTreeMap::new();
+        hlines.insert(
+            (0, 1000),
+            vec![(0, 500, PaintSrc::Tree), (600, 1100, PaintSrc::Tree)],
+        );
+        let vlines = BTreeMap::new();
+        let mut vplaced = BTreeMap::new();
+        vplaced.insert((0u8, 600, 1000), PaintSrc::Tree);
+        let res = close_self_spacing(
+            &db, &tech, &g, &occ, &mask, &cover, &vias, &hlines, &vlines, &vplaced,
+        );
+        let ClosureResult::Done { fills, .. } = res else {
+            panic!("no droppable prong exists — must be Done");
+        };
+        assert_eq!(
+            fills,
+            vec![(LayerId(0), RectDbu::new(499, 930, 601, 1070))],
+        );
+    }
+
+    /// `residuals.md` §2 — the same-net guard admits a merge-through:
+    /// the reaching span at hi=2 would stop 60 < s=140 short of the
+    /// second own component, so the walk must continue to the hi=3
+    /// span that merges it instead of painting the notch.
+    #[test]
+    fn test_min_area_patch_same_net_guard() {
+        let tech = toy_tech_area(250_000);
+        let tracks = toy_tracks();
+        let g = line_graph();
+        let vias = ViaTable::default();
+        let db = DesignDb::new();
+        let mut route = one_wire_route(0, 1000);
+        // Second own component at gap 60 past the hi=2 reach — an
+        // unguarded walk commits (0,0)–(2000,0) and leaves a notch.
+        route.fills = vec![(LayerId(0), RectDbu::new(2130, -70, 2470, 70))];
+        let mut occ = toy_occ(&tech);
+        occ.rasterize(
+            &tracks,
+            0,
+            &RectDbu::new(-70, -70, 1070, 70),
+            Occupant::Net(0),
+            None,
+        );
+        let mut residuals = Vec::new();
+        let patches = patch_net_min_area(
+            &db,
+            &tech,
+            &tracks,
+            &g,
+            &vias,
+            &mut occ,
+            &mut route,
+            &mut residuals,
+        );
+        assert_eq!(patches, 1, "{residuals:?}");
+        assert!(residuals.is_empty(), "{residuals:?}");
+        assert!(
+            route.wires.contains(&WireSeg {
+                layer: LayerId(0),
+                x1: 0,
+                y1: 0,
+                x2: 3000,
+                y2: 0
+            }),
+            "the commit must merge the facing component, not notch it: {:?}",
+            route.wires
+        );
+    }
+
+    /// The guard's residual arm: flanking own components sit `< s`
+    /// off every legal stop, so no span commits — the wire component
+    /// lands named in `residuals` rather than painting a notch.
+    #[test]
+    fn test_min_area_patch_same_net_residual() {
+        let tech = toy_tech_area(250_000);
+        let tracks = toy_tracks();
+        let g = line_graph();
+        let vias = ViaTable::default();
+        let db = DesignDb::new();
+        let mut route = one_wire_route(0, 1000);
+        route.fills = vec![
+            (LayerId(0), RectDbu::new(2130, -70, 2470, 70)),
+            (LayerId(0), RectDbu::new(3130, -70, 3570, 70)),
+        ];
+        let mut occ = toy_occ(&tech);
+        occ.rasterize(
+            &tracks,
+            0,
+            &RectDbu::new(-70, -70, 1070, 70),
+            Occupant::Net(0),
+            None,
+        );
+        let mut residuals = Vec::new();
+        let patches = patch_net_min_area(
+            &db,
+            &tech,
+            &tracks,
+            &g,
+            &vias,
+            &mut occ,
+            &mut route,
+            &mut residuals,
+        );
+        assert_eq!(patches, 0);
+        assert_eq!(route.wires.len(), 1, "rejected patch must not emit");
+        assert!(
+            residuals.contains(&AreaResidual {
+                net: NetId(0),
+                layer: LayerId(0),
+                region: RectDbu::new(-70, -70, 1070, 70),
+                area_dbu2: 159_600,
+                bound_dbu2: 250_000,
+            }),
+            "{residuals:?}"
+        );
+    }
+
+    /// `residuals.md` §3 — void closure: a committed donut's
+    /// under-bound enclosed void is decomposed and committed as
+    /// same-net fills; a foreign instance hull over the void makes it
+    /// unfillable → a named `hole_residuals` entry, not silent paint.
+    #[test]
+    fn test_close_voids_fill_and_residual() {
+        // Wall pieces ± w2 = 70: void (140,140)-(860,860) =
+        // 518,400 < bound 600,000.
+        let donut = || {
+            let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+                BTreeMap::new();
+            hlines.insert((0, 70), vec![(0, 1000, PaintSrc::Tree)]);
+            hlines.insert((0, 930), vec![(0, 1000, PaintSrc::Tree)]);
+            let mut vlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+                BTreeMap::new();
+            vlines.insert((0, 70), vec![(0, 1000, PaintSrc::Tree)]);
+            vlines.insert((0, 930), vec![(0, 1000, PaintSrc::Tree)]);
+            (hlines, vlines)
+        };
+        let g = NetGraph {
+            net: NetId(0),
+            nodes: vec![],
+            edges: vec![],
+            via_edges: vec![],
+            pin_nodes: vec![],
+        };
+
+        // Filled arm: no hulls, no marks — the void's decomposition
+        // commits in full.
+        let tech = {
+            let mut tech = TechDb::new();
+            let name = tech.strings.intern("met1");
+            tech.routing_layers.push(RoutingLayer {
+                name,
+                dir: LayerDir::Horizontal,
+                pitch_dbu: 340,
+                width_dbu: 140,
+                offset_dbu: 0,
+                tracks_x: vec![],
+                tracks_y: vec![],
+                res_per_sq: 0.0,
+                cap_per_sq_um: 0.0,
+                edge_cap_per_um: 0.0,
+                spacing_dbu: 140,
+                spacing_table: vec![],
+                area_dbu2: 0,
+                min_enclosed_area_dbu2: 600_000,
+            });
+            tech
+        };
+        let db = DesignDb::new();
+        let occ = toy_occ(&tech);
+        let mask = HullMask::new(&db, &tech);
+        let cover = PinCover::new();
+        let vias = ViaTable::default();
+        let (hlines, vlines) = donut();
+        let res = close_self_spacing(
+            &db,
+            &tech,
+            &g,
+            &occ,
+            &mask,
+            &cover,
+            &vias,
+            &hlines,
+            &vlines,
+            &BTreeMap::new(),
+        );
+        let ClosureResult::Done { fills, residuals } = res else {
+            panic!("no droppable prong exists — must be Done");
+        };
+        assert!(residuals.holes.is_empty(), "{:?}", residuals.holes);
+        assert_eq!(
+            union::union_area(
+                &fills.iter().map(|(_, r)| *r).collect::<Vec<_>>()
+            ),
+            518_400,
+            "the void's decomposition must commit completely: {fills:?}"
+        );
+
+        // Residual arm: a foreign cell hull covers the void — every
+        // covering rect fails `fill_admitted`'s mask clause.
+        let mut db2 = DesignDb::new();
+        db2.cell_names.push(db2.strings.intern("c0"));
+        db2.cell_macros.push(crate::interner::MacroId(0));
+        db2.cell_lib_ids.push(None);
+        db2.cell_status.push(PlacementStatus::Placed);
+        db2.cell_x_dbu.push(0);
+        db2.cell_y_dbu.push(0);
+        db2.cell_orient.push(crate::design_db::Orient::N);
+        db2.cell_pin_offsets = vec![0, 0];
+        let mut tech2 = tech.clone();
+        tech2.macros.push(crate::tech_db::MacroDef {
+            name: tech2.strings.intern("BIG"),
+            class: crate::tech_db::MacroClass::Block,
+            width_dbu: 5000,
+            height_dbu: 5000,
+            pin_offset: 0,
+            pin_count: 0,
+            obs_rects: vec![],
+            obs_rects_raw: vec![],
+            pin_obs_rects: vec![],
+        });
+        let mask2 = HullMask::new(&db2, &tech2);
+        let (hlines, vlines) = donut();
+        let res = close_self_spacing(
+            &db2,
+            &tech2,
+            &g,
+            &occ,
+            &mask2,
+            &cover,
+            &vias,
+            &hlines,
+            &vlines,
+            &BTreeMap::new(),
+        );
+        let ClosureResult::Done { fills, residuals } = res else {
+            panic!("no droppable prong exists — must be Done");
+        };
+        assert!(fills.is_empty(), "hull-covered void must not fill");
+        assert_eq!(
+            residuals.holes,
+            vec![HoleResidual {
+                net: NetId(0),
+                layer: LayerId(0),
+                region: RectDbu::new(140, 140, 860, 860),
+                area_dbu2: 518_400,
+                bound_dbu2: 600_000,
+            }]
+        );
     }
 }

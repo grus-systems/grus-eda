@@ -2054,7 +2054,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             println!(
                 "guided={} routed={} unrouted={} projected={projected} collisions={} \
                  area_patches={} area_residuals={} iterations={} route_ms={:.0} hull_masked={} \
-                 notch_fills={notch_fills}",
+                 notch_fills={notch_fills} notch_residuals={} hole_residuals={}",
                 join.nets.len(),
                 report.routed,
                 report.unrouted.len(),
@@ -2064,6 +2064,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 route_db.iterations,
                 elapsed_route_ms,
                 graphs.hull_masked.iter().sum::<usize>(),
+                route_db.notch_residuals.len(),
+                route_db.hole_residuals.len(),
             );
             let (mut nopath, mut unatt) = (0usize, 0usize);
             for u in &route_db.unrouted {
@@ -2133,6 +2135,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
                     r.a,
                     r.b,
+                );
+            }
+            for r in &route_db.hole_residuals {
+                println!(
+                    "  hole_residual {} {} area={} bound={} region={:?}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    tech_db
+                        .strings
+                        .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
+                    r.area_dbu2,
+                    r.bound_dbu2,
+                    r.region,
                 );
             }
 

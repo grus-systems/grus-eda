@@ -24,7 +24,9 @@
 use grus_core::congestion::guide::{GuideBox, guide_net_name, parse_guides};
 use grus_core::design_db::DesignDb;
 use grus_core::drt::access::{AccessReport, access_points};
-use grus_core::drt::graph::{GuideJoin, build_route_graphs, join_guides};
+use grus_core::drt::graph::{
+    GuideJoin, HullMask, build_route_graphs, cell_hull_rect, join_guides, pin_rects,
+};
 use grus_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
 use grus_core::drt::via::{ViaPair, ViaTable, via_table};
 use grus_core::interner::{LayerId, NetId, PinId, StringInterner};
@@ -476,28 +478,75 @@ fn test_graph_census() {
             "{name}: zero_coverage {zc:?}"
         );
 
-        for (g, (_, boxes)) in graphs.nets.iter().zip(&join.nets) {
+        let hull = HullMask::new(&db, &tech);
+        let transit_l = (0..tech.routing_layers.len())
+            .find(|&l| !hull.masked(l as u8))
+            .map(|l| l as u8);
+        let grid = |r: &grus_core::tech_db::RectDbu, lt: &LayerTracks| -> usize {
+            let nx = lt.tracks_x.partition_point(|&t| t <= r.xh)
+                - lt.tracks_x.partition_point(|&t| t < r.xl);
+            let ny = lt.tracks_y.partition_point(|&t| t <= r.yh)
+                - lt.tracks_y.partition_point(|&t| t < r.yl);
+            nx * ny
+        };
+        let union =
+            |a: grus_core::tech_db::RectDbu, b: grus_core::tech_db::RectDbu| {
+                grus_core::tech_db::RectDbu::new(
+                    a.xl.min(b.xl),
+                    a.yl.min(b.yl),
+                    a.xh.max(b.xh),
+                    a.yh.max(b.yh),
+                )
+            };
+        for (g, (net, boxes)) in graphs.nets.iter().zip(&join.nets) {
             assert!(
                 g.nodes.windows(2).all(|w| w[0] < w[1]),
                 "{name}: nodes unsorted or duplicated"
             );
-            let bound: usize = boxes
-                .iter()
-                .map(|b| {
-                    let lt = &tracks[b.layer.0 as usize];
-                    let nx = lt.tracks_x.partition_point(|&t| t <= b.rect.xh)
-                        - lt.tracks_x.partition_point(|&t| t < b.rect.xl);
-                    let ny = lt.tracks_y.partition_point(|&t| t <= b.rect.yh)
-                        - lt.tracks_y.partition_point(|&t| t < b.rect.yl);
-                    nx * ny
-                })
-                .sum();
-            assert!(
-                g.nodes.len() <= bound,
-                "{name}: net {} nodes {} > union bound {bound}",
-                net_name(&db, g.net),
-                g.nodes.len()
-            );
+            // Per-layer union bound: guide boxes contribute their
+            // covered crossings (the mask only removes). On the
+            // lowest unmasked layer `transit_extend` adds each member
+            // host hull's track grid plus an index-adjacent
+            // L-corridor to the nearest box pair — the corridor lies
+            // inside the index bbox spanning the hull and the net's
+            // box union on that layer, so per host hull the grid of
+            // that bbox bounds the extension.
+            let mut bounds: BTreeMap<u8, usize> = BTreeMap::new();
+            for b in boxes {
+                *bounds.entry(b.layer.0).or_default() +=
+                    grid(&b.rect, &tracks[b.layer.0 as usize]);
+            }
+            let cover = pin_rects(&db, &tech, *net);
+            if let Some(l) = transit_l
+                && !cover.is_empty()
+            {
+                let mut span: Option<grus_core::tech_db::RectDbu> = None;
+                for b in boxes.iter().filter(|b| b.layer.0 == l) {
+                    span = Some(match span {
+                        None => b.rect,
+                        Some(r) => union(r, b.rect),
+                    });
+                }
+                for &c in cover.keys() {
+                    let h = cell_hull_rect(&db, &tech, c);
+                    // Hull grid alone when no box covers the layer
+                    // (`base.is_empty()` skips only the corridor).
+                    let ext = span.map_or(h, |s| union(h, s));
+                    *bounds.entry(l).or_default() += grid(&ext, &tracks[l as usize]);
+                }
+            }
+            let mut per_layer: BTreeMap<u8, usize> = BTreeMap::new();
+            for n in &g.nodes {
+                *per_layer.entry(n.layer.0).or_default() += 1;
+            }
+            for (l, cnt) in &per_layer {
+                let bound = bounds.get(l).copied().unwrap_or(0);
+                assert!(
+                    *cnt <= bound,
+                    "{name}: net {} layer {l} nodes {cnt} > union bound {bound}",
+                    net_name(&db, g.net),
+                );
+            }
         }
 
         println!(
@@ -950,10 +999,15 @@ fn test_via_edge_census() {
         // (1 gcd / 36 picorv32 pre-coverage) admit no guide-covered
         // node pair on either design. The full row is pinned so
         // silent drift trips the gate.
+        // The hull mask's node filter removes shared crossings inside
+        // foreign instance hulls on masked layers (li1/met1) — the
+        // census drop vs the pre-mask pins is the mask working, not
+        // lost connectivity (masked nodes are unreachable by
+        // definition).
         let expected: Vec<usize> = if name == "gcd" {
-            vec![13_292, 375, 0, 2, 0]
+            vec![6_636, 322, 0, 2, 0]
         } else {
-            vec![395_479, 13_961, 0, 47, 0]
+            vec![180_346, 11_128, 0, 47, 0]
         };
         assert_eq!(
             graphs.via_edges_per_pair, expected,
@@ -1166,11 +1220,14 @@ fn test_via_edge_fixture() {
         );
     }
 
-    // Coverage gate: dropping the met2 box leaves the crossing on the
-    // grid but no upper node → 0 edges; restoring returns 1.
-    let no_met2 = "n1\n(\n0 0 2000 2000 met1\n)\n";
-    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(no_met2));
-    assert_eq!(graphs.total_via_edges, 0, "met2 box dropped must go red");
+    // Coverage gate: dropping the met1 box leaves the transit-layer
+    // grid (guide + `transit_extend`'s host-hull met2 fill) but no
+    // lower node → 0 edges; restoring returns 1. (met2 coverage is
+    // partially hull-derived for a net with member pins, so the
+    // met2-drop arm no longer isolates the guide-coverage rule.)
+    let no_met1 = "n1\n(\n0 0 2000 2000 met2\n)\n";
+    let graphs = build_route_graphs(&db, &tech, &tracks, &guide(no_met1));
+    assert_eq!(graphs.total_via_edges, 0, "met1 box dropped must go red");
     let graphs = build_route_graphs(&db, &tech, &tracks, &guide(full));
     assert_eq!(graphs.total_via_edges, 1, "restored guide must go green");
 
@@ -1236,7 +1293,10 @@ fn load_routed_inputs(
 /// rect on crossing (1000,1000), `u1/B` a met2 pin on (4000,3000),
 /// `u2/C` a met1 rect holding no track at all (the `Unattachable`
 /// class), and `blk`'s macro `OBS` covers the direct met1 line at
-/// y=1000 between x 1500..2500.
+/// y=1000 between x 1500..2500. Each macro's `SIZE` tightly covers
+/// its own pin/OBS rect so instance hulls stay inside the pin
+/// neighborhoods — a die-spanning hull would mask every met1 node
+/// and edge as subcell-internal geometry.
 const MAZE_LEF: &str = r#"
 UNITS
   DATABASE MICRONS 1000 ;
@@ -1265,46 +1325,46 @@ LAYER met2
 END met2
 MACRO CELL
   CLASS CORE ;
-  SIZE 5.0 BY 5.0 ;
+  SIZE 0.4 BY 0.4 ;
   PIN A
     DIRECTION INPUT ;
     USE SIGNAL ;
     PORT
       LAYER met1 ;
-        RECT 0.9 0.9 1.1 1.1 ;
+        RECT 0.0 0.0 0.2 0.2 ;
     END
   END A
 END CELL
 MACRO CELLB
   CLASS CORE ;
-  SIZE 5.0 BY 5.0 ;
+  SIZE 0.4 BY 0.4 ;
   PIN B
     DIRECTION INPUT ;
     USE SIGNAL ;
     PORT
       LAYER met2 ;
-        RECT 3.9 2.9 4.1 3.1 ;
+        RECT 0.0 0.0 0.2 0.2 ;
     END
   END B
 END CELLB
 MACRO CELLC
   CLASS CORE ;
-  SIZE 5.0 BY 5.0 ;
+  SIZE 0.4 BY 0.4 ;
   PIN C
     DIRECTION INPUT ;
     USE SIGNAL ;
     PORT
       LAYER met1 ;
-        RECT 1.4 1.4 1.6 1.6 ;
+        RECT 0.0 0.0 0.2 0.2 ;
     END
   END C
 END CELLC
 MACRO BLK
   CLASS CORE ;
-  SIZE 5.0 BY 5.0 ;
+  SIZE 1.2 BY 0.4 ;
   OBS
     LAYER met1 ;
-      RECT 1.5 0.9 2.5 1.1 ;
+      RECT 0.0 0.0 1.0 0.2 ;
   END
 END BLK
 VIA mv12
@@ -1354,10 +1414,15 @@ fn maze_tech() -> TechDb {
 }
 
 fn maze_db(tech: &TechDb, with_blk: bool) -> DesignDb {
+    // The placements put each macro-local rect at the absolute
+    // geometry the case asserts (pin crossings, the OBS band) while
+    // the tight outlines keep every instance hull inside its own pin
+    // neighborhood — the hull mask (`HullMask`) treats a hull
+    // covering the routing area as subcell-internal geometry.
     let comps = if with_blk {
-        "COMPONENTS 4 ;\n- u0 CELL + PLACED ( 0 0 ) N ;\n- u1 CELLB + PLACED ( 0 0 ) N ;\n- u2 CELLC + PLACED ( 0 0 ) N ;\n- blk BLK + PLACED ( 0 0 ) N ;\nEND COMPONENTS\n"
+        "COMPONENTS 4 ;\n- u0 CELL + PLACED ( 900 900 ) N ;\n- u1 CELLB + PLACED ( 3900 2900 ) N ;\n- u2 CELLC + PLACED ( 1400 1400 ) N ;\n- blk BLK + PLACED ( 1500 900 ) N ;\nEND COMPONENTS\n"
     } else {
-        "COMPONENTS 3 ;\n- u0 CELL + PLACED ( 0 0 ) N ;\n- u1 CELLB + PLACED ( 0 0 ) N ;\n- u2 CELLC + PLACED ( 0 0 ) N ;\nEND COMPONENTS\n"
+        "COMPONENTS 3 ;\n- u0 CELL + PLACED ( 900 900 ) N ;\n- u1 CELLB + PLACED ( 3900 2900 ) N ;\n- u2 CELLC + PLACED ( 1400 1400 ) N ;\nEND COMPONENTS\n"
     };
     let text = format!("{MAZE_DEF_HEAD}{comps}{MAZE_DEF_TAIL}");
     parse_def_bytes(text.as_bytes(), tech, None).expect("fixture DEF parses")
@@ -2098,7 +2163,7 @@ fn test_emit_determinism() {
 #[test]
 fn test_emit_unrouted_fixture() {
     let tech = maze_tech();
-    let comps = "COMPONENTS 3 ;\n- u0 CELL + PLACED ( 0 0 ) N ;\n- u1 CELLB + PLACED ( 0 0 ) N ;\n- u2 CELLC + PLACED ( 0 0 ) N ;\nEND COMPONENTS\n";
+    let comps = "COMPONENTS 3 ;\n- u0 CELL + PLACED ( 900 900 ) N ;\n- u1 CELLB + PLACED ( 3900 2900 ) N ;\n- u2 CELLC + PLACED ( 1400 1400 ) N ;\nEND COMPONENTS\n";
     let def_text = format!("{MAZE_DEF_HEAD}{comps}{MAZE_DEF_TAIL}");
     let mut db = parse_def_bytes(def_text.as_bytes(), &tech, None).expect("fixture DEF parses");
     let tracks = layer_tracks(&db, &tech);

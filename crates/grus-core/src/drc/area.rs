@@ -18,7 +18,7 @@ use crate::tech_db::{RectDbu, TechDb};
 /// Deck-pinned fallback for `MINENCLOSEDAREA` — the `rule_name`
 /// literals themselves carry "0.14um^2", so a LEF that omits the
 /// statement still checks 0.14 µm², not a guessed value.
-const HOLE_FALLBACK_DBU2: i64 = 140_000;
+pub(crate) const HOLE_FALLBACK_DBU2: i64 = 140_000;
 
 /// One minimum-area or minimum-hole-area rule.
 pub struct AreaRule {
