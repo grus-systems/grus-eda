@@ -71,3 +71,31 @@ The measurement scripts from the first run are committed on dev:
 - `docs/results.md` (dated entry — full table)
 - `docs/status.md`, `docs/roadmap.md` (E7-style done line for E6's
   native-DRT subset scope)
+
+## Revision note 2 (2026-11-24, external review — mechanism for the residual spacing class)
+
+An outside review of the merged drt module (post-`4c7831b` dev)
+named the exact mechanism that lets a wire land on a foreign pin
+with no router-side record — evaluate it while designing the
+met1.2/met2.2 residual fix:
+
+- `Pin` marks are soft-priced even in `hard` mode —
+  `maze.rs` `hit_verdict` doc: "own free, foreign soft-priced —
+  never a hard block". A wire may cross a foreign pin shape at any
+  iteration, and the final hard pass does not forbid it.
+- `Occupant::Pin` hits are excluded from `Collision` records
+  (`maze.rs` collision collection keeps only `Occupant::Net`), so a
+  pin-overlapping wire never triggers rip-up of the offending net.
+- `project_attach` paints an axis-aligned stub from the attach node
+  to the pin rect (`maze.rs` "Projected-pin access stubs") — a stub
+  clipped to *own* raw pin rect still stops nothing w.r.t. a
+  foreign pin a half-spacing away.
+
+Interpretation aid for the golden: `li.3`/`li.c2` reporting equal
+counts likely double-counts one violation pair under two rules —
+compare bboxes before treating the numbers as independent.
+
+If the residual fix lands this mechanism (foreign-pin footprint
+made a hard block or a recorded collision → wire-side rip-up),
+note it in `docs/results.md`; if it remains open, it becomes its
+own ticket (`kurena/tasks/drt-pin-collision`).
