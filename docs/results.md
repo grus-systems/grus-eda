@@ -9395,9 +9395,187 @@ calls on gcd produce `PartialEq`-equal `RouteDb`s and equal nonzero
 digests (asserted, not sampled). picorv32 double-run lives in the
 ignored companion test.
 
+**Digest addendum (v0.12.5)**: `e6-drt-emit`'s occupancy premark
+extension (PDN `SPECIALNETS` wire rects + via stacks as
+`Obs(u32::MAX)`, io-port rects as `Pin(own_net)`) re-routes gcd to
+digest `0x48593d441074229b` — the `0xfbb3…` digest above is the
+pre-premark measurement. Every count is unchanged (269/269, 0
+unrouted, 17 projected, 0 collisions, 8 iters); the occupancy
+fail-proof re-measures as enabled `0x48593d441074229b` census=0 vs
+disabled `0x362ddadaa71f1f80` census=6,226.
+
 **Checks run**: `cargo test --release -p grus-core --test drt`
 (16/16, 2 ignored — the picorv32 companions), `cargo clippy
 -p grus-core --all-targets` clean; `cargo test --workspace` per the
 kurena gate. `build_route_graphs_ext`'s `spare_above = 1` is the
 pin-pocket escape (OpenROAD `_038_` precedent, `docs/e6-drt.md` §7).
 Version `0.12.3 → 0.12.4` (feature, patch on 0.x).
+
+### 2026-11-24 — e6-drt-emit: routed DEF emission + self-DRC (v0.12.5)
+
+`drt::emit` lands routed DEF emission: `apply_routes` maps each
+`NetRoute` into `db.net_geoms` (square-cap `seg ± w/2` rects —
+identical to `parse_net_wire`'s expansion and `commit_route`'s
+occupancy rasterization — plus `PdnVia`s naming the `ViaTable` pair
+default verbatim), and `write_routed_def` splices a canonical
+zero-width `NETS` section into the placed-DEF template, every byte
+outside `NETS`…`END NETS` verbatim. `grus-eda drt` is the
+delegation-replacement CLI (`--tlef/--lef/--def/--guide/--out-def`,
+`--reference`, `--self-drc`, `--occ`, `--max-iters`). Emit-driven
+maze fixes in the same change: PDN `SPECIALNETS` wire rects + via
+stacks premark as `Obs(u32::MAX)`, io-port rects mark
+`Pin(own_net)` (the `met3.2` `req_msg`/`resp_msg` class the first
+gate run surfaced), and `route_one_net` paints projected-pin access
+stubs.
+
+**Self-DRC gate** (`test_emit_selfdrc_gcd`, release
+`cargo test --release -p grus-core --test drt emit`): write →
+re-parse → `assemble` → `run_all` — all 50 `lef_expressible` rules
+report `findings_total=0` on our own emitted gcd DEF, the same bar
+`tests/drc.rs` puts on TritonRoute's output (claim boundary: our
+subset on our DEF; the full Magic deck check on our DEF is
+`e6-drt-e2e`). Non-vacuity: `wire_rects=1,821`, `vias=1,250`, and
+every Width/Spacing/Enclosure/Area family saw `candidates > 0`.
+
+**Roundtrip**: `write_routed_def` → `parse_def` → `net_geoms`
+equality → re-write → byte-identical (`test_emit_roundtrip_gcd`);
+the same write → parse → write → identical check runs inside
+`emit_gate` for both designs.
+
+**Emit census** (fresh `route_nets` under the new PDN/io-port
+premark — gcd counts match the pinned maze entry: 269/269 routed,
+unrouted=0, projected=17, collisions=0, iters=8):
+
+```
+== drt emit: gcd ==
+guided=269 routed=269 unrouted=0 projected=17 collisions=0 iterations=8 route_ms=2113
+wirelength_um ours=7153.025 delegated=6046.305 delta=+1106.720 baseline=6154.505
+via.mcon   ours=661 delegated=879 delta=-218 baseline=884
+via.via    ours=472 delegated=901 delta=-429 baseline=883
+via.via2   ours=117 delegated=27 delta=+90 baseline=28
+via.via3   ours=0 delegated=- delta=- baseline=2
+self_drc findings_total=0
+```
+
+| metric | ours | delegated | baseline | delta vs delegated |
+|---|---|---|---|---|
+| wirelength (µm) | 7,153.025 | 6,046.305 | 6,154.505 | +1,106.720 (+18.3%) |
+| vias mcon/via/via2/via3 | 661/472/117/0 | 879/901/27/0 | 884/883/28/2 | −218/−429/+90/±0 |
+
+Informational deltas, not pass/fail — different router on the same
+guides (ours routes higher on via2 because the §6 met2–met3 domain
+gap pushes transitions onto relaxed edges; topology divergence is
+expected).
+
+**Fail-proof** (`test_emit_fail_proof`, both arms — AGENTS §7.7):
+arm A stretches net `_007_`'s met1 rect `xh → 72,839` leaving a
+positive 1-DBU gap vs foreign `_126_` (bound 140) → `met1.2`
+reports exactly **1 finding** — the emit→parse→check path detects
+what we emit. Arm B routes with `occ: Disabled` → **135 findings**
+(`mcon.2`×4, `met1.2`×70, `met2.2`×53, `met3.2`×8): occupancy-off
+geometry reaches the checker through our emitted text.
+
+**Determinism** (`test_emit_determinism`): two full route+emit
+passes produce `PartialEq`-equal `RouteDb`s, equal `EmitReport`s,
+equal `net_geoms`, and byte-identical emitted DEFs; a second
+`run_all` on the same assembled design repeats the `SubsetReport`
+verbatim.
+
+**Runtime**: emit is trivial (ms-scale write); `route_ms=2113` on
+gcd (release binary, under parallel build load vs the pinned 1,886
+ms maze measurement — same class). The picorv32 gate leg runs
+detached: `cargo test --release -p grus-core --test drt
+test_emit_selfdrc_picorv32 -- --ignored --nocapture`, started
+2026-11-24T01:50, stdout at `/tmp/emit-picorv32.log` — route ≈135
+min release CPU (slower under ambient load) + emit + parse +
+`run_all`; its unrouted residual re-measures under the new premark
+(the maze entry pinned 108 = 43 met3-bridge + 65 met2-connected).
+The measurement is in flight at this entry's commit; its outcome
+appends below the line when the log lands.
+
+**picorv32 gate landed 2026-11-24 (30,658 s wall — ambient-load
+slowdown vs the ~135 min clean route)**: `routed=6,628` (8 fewer
+than the pre-premark 6,636), `unrouted=116` (108 + 8 — the new
+PDN/io-port obstacles push 8 more nets to `NoPath`, consistent),
+`wire_rects=52,145`, `vias=38,147`, emit census vs delegated:
+wirelength +62,480 µm, via `mcon −8,012` / `via −17,625` /
+`via2 +2,150` / `via3 +200` / `via4 127`. **Self-DRC reports 42
+findings — the gate caught a real router bug, not an emit bug**:
+`li.6`×3 (component area 28,900 < bound 56,100) and `met3.6`×39
+(190,500–237,000 < bound 240,000) — every finding is a min-area
+shortfall on a stub-class component, the class the relaxed-via and
+projected-pin stubs create when the connected metal is one via
+plus a short stub. TritonRoute's equivalent is a post-route
+min-area patch pass; that fix and its fixture-pinned regression
+are the next revision's work — the picorv32 leg stays `#[ignore]`d.
+
+**Checks run**: `cargo test --release -p grus-core --test drt emit`
+(6/6, 1 ignored — the picorv32 gate), `cargo test --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
+Version `0.12.4 → 0.12.5` (feature, patch on 0.x).
+### 2026-11-24 — e6-drt-emit r2: post-route min-area patch (v0.12.6)
+
+The picorv32 self-DRC gate's 42 `*.6` findings (see the v0.12.5
+entry — `li.6`×3, `met3.6`×39, all stub-class min-area shortfalls)
+get their fix: `patch_net_min_area` runs once per committed net
+after the `route_nets` iteration loop, when occupancy holds the
+final foreign picture. Per routing layer with `AREA` declared the
+net's metal is rebuilt through `net_layer_shapes` — wires `± w/2`
+as `SignalWire`, pair-default via routing-layer rects as `Via`,
+member-pin shapes as `MacroPin`/`IoPort` — so
+`union::components` + `is_drawn` reproduce `check_area_report`'s
+component model restricted to one net (`area_ours ≤ area_checker`:
+foreign metal touching ours can only help, never hide a violation;
+a `MacroPin`-only island is never evaluated, mirroring the
+checker). `patch_component` walks `+pref`/`−pref` over adjacent
+covered nodes from each in-rect node — every step is one in-plane
+`g.edges` span, so patch metal stays inside the guide region and
+on-track — and commits only while `scan_wire` reports own-net hits
+exclusively (**occupancy-strict**: `Obs` blocks, no host-cell
+carve, strict even under `OccMode::Disabled`; the design's
+decisions 8/9). On `union_area ≥ bound` the span commits as one
+`WireSeg` marked `Net(own)`; the layer re-derives so a patch can
+merge two sub-bound components into a cleared union. What no walk
+fixes lands in `RouteDb.area_residuals` —
+`AreaResidual{net, layer, region, area_dbu2, bound_dbu2}` — the
+named decline arm paired 1:1 with `*.6` gate findings; a `*.6`
+finding with no matching residual is a model bug. Census surface:
+`RouteDb.area_patches`/`area_residuals` print in the `emit_gate`
+and CLI census lines plus one `area_residual <net> <layer>
+area=… bound=… region=…` line each, and `test_emit_selfdrc_gcd`
+asserts `area_residuals.is_empty()`.
+
+**Unit fixtures** (5, `maze.rs` mod tests, `toy_tech_area(bound)`
+param + `line_graph()` + `component_area` non-vacuity probe — each
+asserts the component *is* sub-bound before patching, AGENTS §7.7):
+`test_min_area_patch_fills` (walk reaches bound),
+`test_min_area_patch_pin_merges` (pin metal counts toward the
+component), `test_min_area_patch_occupancy_blocked` (foreign mark
+stops the walk → named residual), `test_min_area_patch_region_bound`
+(walk cannot leave the guide region → residual),
+`test_min_area_patch_in_route_nets` (post-loop hook fires,
+`area_patches=1`, residuals empty).
+
+**gcd**: the patch is a **no-op** — `routed=269 unrouted=0
+wire_rects=1821 vias=1250 area_patches=0 area_residuals=0`,
+self-DRC `findings_total=0`, route digest unchanged
+`0x48593d441074229b` (`test_maze_census`), determinism/roundtrip/
+fail-proof legs green (`cargo test --release -p grus-core --test
+drt emit` 6/6, 1 ignored). Census deltas vs `delegated`/`baseline`
+unchanged from the v0.12.5 entry (wirelength ours 7,153.025 µm vs
+delegated 6,046.305).
+
+**picorv32 re-run detached**: `cargo test --release -p grus-core
+--test drt test_emit_selfdrc_picorv32 -- --ignored --nocapture`,
+started 2026-11-24T03:45Z, stdout `/tmp/emit-picorv32-patch.log` —
+route ≈135 min release CPU + emit + parse + `run_all`. The gate
+verdict is the patch's real test: the 42 `*.6` findings should map
+to `area_residuals` rows (and drop toward zero on whatever the
+walk could lift), with `area_patches`/`area_residuals` counted in
+the census line. In flight at this entry's write; outcome appends
+below when the log lands.
+
+**Checks run**: the 5 fixtures + `cargo test -p grus-core --lib
+drt` (20/20), `cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings` clean, the gcd emit suite above.
+Version `0.12.5 → 0.12.6` (feature, patch on 0.x).

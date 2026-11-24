@@ -78,6 +78,10 @@ enum Commands {
     /// E7: LEF+DEF DRC subset checker — the 50 lef_expressible rules of the Magic deck
     #[command(name = "drc")]
     Drc(DrcArgs),
+
+    /// E6: Detailed routing — guide-bounded maze router + routed DEF emission
+    #[command(name = "drt")]
+    Drt(DrtArgs),
 }
 
 #[derive(Args, Debug)]
@@ -649,6 +653,53 @@ struct DrcArgs {
         help = "Write the full DRC report (per-rule findings + bboxes) as JSON to this path"
     )]
     json: Option<PathBuf>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum OccArg {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Args, Debug)]
+struct DrtArgs {
+    #[arg(long, help = "Path to technology LEF (.tlef) file")]
+    tlef: PathBuf,
+
+    #[arg(long, help = "Path to standard cell LEF (.lef) file")]
+    lef: PathBuf,
+
+    #[arg(long, help = "Path to placed DEF (.def) file — also the emit template")]
+    def: PathBuf,
+
+    #[arg(long, help = "Path to OpenROAD-format guide file")]
+    guide: PathBuf,
+
+    #[arg(long, help = "Path to routed DEF output")]
+    out_def: PathBuf,
+
+    #[arg(
+        long,
+        help = "<design>.drt.reference.json; prints delegated/baseline deltas"
+    )]
+    reference: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Re-parse the emitted DEF, assemble, and run the 50-rule subset checker"
+    )]
+    self_drc: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OccArg::Enabled,
+        help = "Occupancy mode — `disabled` is the fail-proof knob, not a real route mode"
+    )]
+    occ: OccArg,
+
+    #[arg(long, default_value_t = 8, help = "Maze rip-up iteration cap")]
+    max_iters: u32,
 }
 
 /// Shared load path of the `congestion` and `route` arms: tech + placed DEF
@@ -1957,6 +2008,180 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 grus_core::timing::print_report();
             }
         }
+        Commands::Drt(args) => {
+            let loaded = load_congestion_inputs(&args.tlef, &args.lef, &args.def, None, None)?;
+            let mut design_db = loaded.design_db;
+            let tech_db = &loaded.tech_db;
+
+            let guide_text = std::fs::read_to_string(&args.guide)
+                .map_err(|e| anyhow::anyhow!("read {:?}: {e}", args.guide))?;
+            let parsed = grus_core::congestion::guide::parse_guides(&guide_text, tech_db)?;
+            let join = grus_core::drt::graph::join_guides(&design_db, tech_db, &parsed)?;
+            let tracks = grus_core::drt::tracks::layer_tracks(&design_db, tech_db);
+            // One spare layer above each net's topmost guided layer —
+            // the OBS-sealed pin-pocket escape (`docs/e6-drt.md` §7).
+            let graphs = grus_core::drt::graph::build_route_graphs_ext(
+                &design_db, tech_db, &tracks, &join, 1,
+            );
+            let vias = grus_core::drt::via::via_table(tech_db, &design_db)?;
+
+            let occ = match args.occ {
+                OccArg::Enabled => grus_core::drt::OccMode::Enabled,
+                OccArg::Disabled => grus_core::drt::OccMode::Disabled,
+            };
+            let t_route = std::time::Instant::now();
+            let route_db = grus_core::drt::maze::route_nets(
+                &design_db,
+                tech_db,
+                &tracks,
+                &graphs,
+                &vias,
+                &grus_core::drt::MazeConfig {
+                    occ,
+                    max_iters: args.max_iters,
+                },
+            );
+            let elapsed_route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
+
+            let report = grus_core::drt::emit::apply_routes(
+                &mut design_db, tech_db, &graphs, &route_db, &vias,
+            )?;
+            grus_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
+
+            let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
+            println!("== drt emit: {} ==", design_db.design_name);
+            println!(
+                "guided={} routed={} unrouted={} projected={projected} collisions={} \
+                 area_patches={} area_residuals={} iterations={} route_ms={:.0}",
+                join.nets.len(),
+                report.routed,
+                report.unrouted.len(),
+                route_db.collisions.len(),
+                route_db.area_patches,
+                route_db.area_residuals.len(),
+                route_db.iterations,
+                elapsed_route_ms,
+            );
+            for name in &report.unrouted {
+                println!("  unrouted {name}");
+            }
+            for r in &route_db.area_residuals {
+                println!(
+                    "  area_residual {} {} area={} bound={} region={:?}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    tech_db
+                        .strings
+                        .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
+                    r.area_dbu2,
+                    r.bound_dbu2,
+                    r.region,
+                );
+            }
+
+            let reference: Option<serde_json::Value> = args
+                .reference
+                .as_ref()
+                .map(|path| -> anyhow::Result<serde_json::Value> {
+                    let bytes = std::fs::read(path)
+                        .map_err(|e| anyhow::anyhow!("read {:?}: {e}", path))?;
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| anyhow::anyhow!("parse {:?}: {e}", path))
+                })
+                .transpose()?;
+            let variant = |key: &str| -> Option<&serde_json::Value> {
+                reference.as_ref().map(|r| &r["variants"][key])
+            };
+            let ref_um = |v: Option<&serde_json::Value>| {
+                v.and_then(|v| v["total_wirelength_um"].as_f64())
+            };
+            let ours_um = report.wire_length_dbu as f64
+                / design_db.dbu_per_micron.max(1) as f64;
+            let delegated_um = ref_um(variant("delegated"));
+            let baseline_um = ref_um(variant("baseline"));
+            println!(
+                "wirelength_um ours={ours_um:.3} delegated={} delta={} baseline={}",
+                delegated_um.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                delegated_um
+                    .map(|v| format!("{:+.3}", ours_um - v))
+                    .unwrap_or_else(|| "-".into()),
+                baseline_um.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+            );
+
+            // The reference census keys via counts by via-def name;
+            // `via_names_meaning` re-buckets them under cut layers to
+            // join our `vias_per_cut` key space.
+            let ref_by_cut = |v: Option<&serde_json::Value>| {
+                let mut out: std::collections::BTreeMap<String, u64> =
+                    std::collections::BTreeMap::new();
+                if let Some(v) = v
+                    && let (Some(census), Some(meaning)) = (
+                        v["vias_per_cut_layer"].as_object(),
+                        v["via_names_meaning"].as_object(),
+                    )
+                {
+                    for (via_name, count) in census {
+                        let cut = meaning
+                            .get(via_name)
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("<unknown>");
+                        *out.entry(cut.to_string()).or_default() +=
+                            count.as_u64().unwrap_or(0);
+                    }
+                }
+                out
+            };
+            let delegated_cut = ref_by_cut(variant("delegated"));
+            let baseline_cut = ref_by_cut(variant("baseline"));
+            let mut cuts: std::collections::BTreeSet<String> =
+                report.vias_per_cut.keys().cloned().collect();
+            cuts.extend(delegated_cut.keys().cloned());
+            cuts.extend(baseline_cut.keys().cloned());
+            for cut in &cuts {
+                let ours = report.vias_per_cut.get(cut).copied().unwrap_or(0) as i64;
+                let del = delegated_cut.get(cut).copied();
+                let base = baseline_cut.get(cut).copied();
+                println!(
+                    "via.{cut:<6} ours={ours} delegated={} delta={} baseline={}",
+                    del.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                    del.map(|v| format!("{:+}", ours - v as i64))
+                        .unwrap_or_else(|| "-".into()),
+                    base.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                );
+            }
+
+            if args.self_drc {
+                let reparsed = grus_core::readers::parse_def(&args.out_def, tech_db, None)?;
+                let drc_design = grus_core::drc::geom::assemble(&reparsed, tech_db)?;
+                let subset =
+                    grus_core::drc::report::run_all(&drc_design, tech_db, &reparsed.strings);
+                let findings_total: usize =
+                    subset.rules.iter().map(|o| o.findings.len()).sum();
+                println!("self_drc findings_total={findings_total}");
+                for o in &subset.rules {
+                    if o.findings.is_empty() {
+                        continue;
+                    }
+                    println!(
+                        "  rule={} family={} layer={} findings={}",
+                        o.rule,
+                        drc_family_name(o.family),
+                        o.layer.as_deref().unwrap_or("-"),
+                        o.findings.len(),
+                    );
+                    for f in &o.findings {
+                        println!("    {}", drc_finding_line(o.rule, f));
+                    }
+                }
+                println!(
+                    "self_drc scope: 50-rule lef_expressible subset on our emitted DEF — \
+                     the full Magic deck check on our DEF belongs to e6-drt-e2e"
+                );
+            }
+            println!("wrote routed DEF to {:?}", args.out_def);
+            if grus_core::timing::enabled() {
+                grus_core::timing::print_report();
+            }
+        }
     }
     Ok(())
 }
@@ -2198,6 +2423,46 @@ mod tests {
                 "--sdc", "e", "--vcd", "v", "--saif", "s"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_drt_parses() {
+        let cli = Cli::try_parse_from([
+            "grus-eda",
+            "drt",
+            "--tlef",
+            "a",
+            "--lef",
+            "b",
+            "--def",
+            "c",
+            "--guide",
+            "g",
+            "--out-def",
+            "o",
+            "--self-drc",
+            "--occ",
+            "disabled",
+            "--reference",
+            "r.json",
+            "--max-iters",
+            "3",
+        ])
+        .expect("drt argv parses");
+        let Commands::Drt(args) = cli.command else {
+            panic!("expected Commands::Drt");
+        };
+        assert_eq!(args.out_def, PathBuf::from("o"));
+        assert!(args.self_drc);
+        assert!(matches!(args.occ, OccArg::Disabled));
+        assert_eq!(args.reference, Some(PathBuf::from("r.json")));
+        assert_eq!(args.max_iters, 3);
+
+        assert!(
+            Cli::try_parse_from(["grus-eda", "drt", "--tlef", "a", "--lef", "b", "--def", "c"])
+                .is_err(),
+            "drt without --guide/--out-def must fail"
         );
     }
 

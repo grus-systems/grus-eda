@@ -834,6 +834,30 @@ surface, from the first large-design run's feedback
   6,636/6,744 routed, 0 collisions, 108 `NoPath` nets classified
   43 met3-bridge + 65 met2-connected, pinned in `docs/results.md`.
   Remaining: routed-DEF emission, e2e vs the TritonRoute reference.
+- Progress 2026-11-24 (`v0.12.5`, ticket `e6-drt-emit`): routed DEF
+  emission + self-DRC gate — `drt::emit` maps `RouteDb` into
+  `db.net_geoms` (square-cap `seg ± w/2` model, `ViaTable`-default
+  vias, conns-only unrouted records) and `write_routed_def` splices a
+  canonical zero-width `NETS` section into the placed template —
+  write → parse → write byte-stable. `grus-eda drt` replaces the
+  delegation path (placed DEF + guide → routed DEF; `--reference`
+  census deltas, `--self-drc`). Emit-driven maze fixes: PDN metal as
+  `Obs(u32::MAX)`, io-port rects as `Pin(own_net)`, projected-pin
+  access stubs. Verdict: `run_all`'s 50-rule subset on our own
+  re-parsed DEF reports **0 findings on gcd** (picorv32 leg detached
+  under `--ignored`); census deltas vs `delegated`/`baseline`
+  recorded as informational. Remaining: `e6-drt-e2e` (full Magic
+  deck on our DEF in the container).
+- Progress 2026-11-24 (`v0.12.6`, ticket `e6-drt-emit` r2):
+  post-route min-area patch — the picorv32 gate's 42 `*.6`
+  findings' fix. `patch_net_min_area` rebuilds each `AREA`-bound
+  layer's metal through the checker's `union::components` +
+  `is_drawn` model and extends sub-bound components along in-plane
+  `g.edges` spans, occupancy-strict and guide-region-bound;
+  unfixable components land in `RouteDb.area_residuals`
+  (`AreaResidual`), the decline arm paired 1:1 with `*.6` findings.
+  No-op on gcd (digest `0x48593d441074229b` stands); picorv32
+  emit-gate re-run detached under `--ignored`.
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset

@@ -6,7 +6,10 @@
 //! claim boundary.
 
 use crate::design_db::{DesignDb, PlacementStatus};
-use crate::drc::DrcLayer;
+use crate::drc::area::is_drawn;
+use crate::drc::geom::expand_via;
+use crate::drc::union;
+use crate::drc::{DrcLayer, LayerShapes, ShapeRect, ShapeSrc};
 use crate::drt::access::pin_shapes;
 use crate::drt::graph::{NetGraph, RouteGraphs};
 use crate::drt::tracks::{Axis, LayerTracks};
@@ -123,6 +126,18 @@ pub struct Collision {
     pub hi: i32,
 }
 
+/// A connected component that stayed under its layer's `AREA`
+/// bound after the patch pass — the named-residual record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AreaResidual {
+    pub net: NetId,
+    pub layer: LayerId,
+    /// Sub-bound component's bbox.
+    pub region: RectDbu,
+    pub area_dbu2: i64,
+    pub bound_dbu2: i64,
+}
+
 /// The router's complete deterministic output.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RouteDb {
@@ -135,6 +150,12 @@ pub struct RouteDb {
     pub collisions: Vec<Collision>,
     /// Iterations actually run (≤ `max_iters`).
     pub iterations: u32,
+    /// Components the min-area patch brought to bound.
+    pub area_patches: usize,
+    /// Components it could not — named with layer/bbox/area/bound;
+    /// every residual maps to a `*.6` self-DRC finding if the gate
+    /// fires, and every `*.6` finding must map back to one of these.
+    pub area_residuals: Vec<AreaResidual>,
 }
 
 // ---------------------------------------------------------------------------
@@ -445,14 +466,18 @@ impl Occupancy {
 
 /// Pre-marks every placed cell's macro `obs_rects` as `Obs` (the
 /// `drc::geom` source-4 convention: `{Placed, Fixed, Cover}` gate +
-/// `orient_rect` + translate, replicated for OBS only), and every
+/// `orient_rect` + translate, replicated for OBS only), every
 /// instance pin's shapes as `Pin(own_net)` — a pin's metal is free to
 /// its own net, soft-priced for foreign nets, and never a hard block
 /// (rip-up cannot move it; a landing wire is an emit-time DRC
-/// finding). Pins without a net get `Obs(u32::MAX)` — immovable
-/// blockage with no exempting host. io-port rects are not marked
-/// (recorded simplification — pin-access DRC is the emit/e2e tickets'
-/// job).
+/// finding) — and every PDN `SPECIALNETS` wire rect and via stack
+/// metal as `Obs(u32::MAX)`. Pins without a net and PDN metal get
+/// `Obs(u32::MAX)` — immovable blockage with no exempting host:
+/// signal routes must hold the `w/2 + s` band off the power grid.
+/// io-port rects mark as `Pin(own_net)` like instance pins — a
+/// foreign wire inside a port's spacing band is a real emit-time
+/// finding (the gcd `met3.2` `req_msg`/`resp_msg` class), so the
+/// band is priced even though it never hard-blocks.
 fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut Occupancy) {
     for c in 0..db.num_cells() {
         if !matches!(
@@ -474,13 +499,12 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
         }
     }
     for p in 0..db.pin_names.len() {
-        let Some(c) = db.pin_cells[p] else {
-            continue; // io-port rects unmarked (recorded above)
-        };
-        if !matches!(
-            db.cell_status[c.0 as usize],
-            PlacementStatus::Placed | PlacementStatus::Fixed | PlacementStatus::Cover
-        ) {
+        if let Some(c) = db.pin_cells[p]
+            && !matches!(
+                db.cell_status[c.0 as usize],
+                PlacementStatus::Placed | PlacementStatus::Fixed | PlacementStatus::Cover
+            )
+        {
             continue;
         }
         let pin = PinId(p as u32);
@@ -488,6 +512,25 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
         for (lid, r) in pin_shapes(db, tech, pin) {
             if (lid.0 as usize) < occ.lines_x.len() {
                 occ.rasterize(tracks, lid.0, &r, who, None);
+            }
+        }
+    }
+    // PDN stripes and via stacks: fixed metal every signal net must
+    // clear — the emit-time self-DRC measures spacing against these
+    // shapes, so the router has to price them.
+    for pdn in &db.pdn_nets {
+        for &(lid, r) in &pdn.wire_rects {
+            if (lid.0 as usize) < occ.lines_x.len() {
+                occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
+            }
+        }
+        for via in &pdn.vias {
+            for (dl, r) in expand_via(via, tech).expect("pdn via resolved at parse") {
+                if let DrcLayer::Routing(lid) = dl
+                    && (lid.0 as usize) < occ.lines_x.len()
+                {
+                    occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
+                }
             }
         }
     }
@@ -1453,6 +1496,44 @@ fn route_one_net(
             }
         }
     }
+    // Projected-pin access stubs: `project_attach` attaches at an
+    // in-region node within one track of the pin rect, but the pin's
+    // metal may not reach the shape committed at that node — paint
+    // the single-axis stub closing the gap (the node's x or y lies
+    // inside the rect's covered range by `project_attach`
+    // construction, so the stub is always axis-aligned).
+    for (pi, &(pin, _)) in g.pin_nodes.iter().enumerate() {
+        if !run.connected[pi] || !topo.projected[pi] {
+            continue;
+        }
+        'shapes: for &(lid, r) in &pin_shapes(db, tech, pin) {
+            for &v in &topo.attach[pi] {
+                if g.nodes[v as usize].layer != lid || !run.in_tree[v as usize] {
+                    continue;
+                }
+                let (x, y) = node_xy(g, tracks, v);
+                let (cx, cy) = (x.clamp(r.xl, r.xh), y.clamp(r.yl, r.yh));
+                if x == cx {
+                    if y != cy {
+                        vlines
+                            .entry((lid.0, x))
+                            .or_default()
+                            .push((cy.min(y), cy.max(y)));
+                    }
+                    break 'shapes;
+                }
+                if y == cy {
+                    hlines
+                        .entry((lid.0, y))
+                        .or_default()
+                        .push((cx.min(x), cx.max(x)));
+                    break 'shapes;
+                }
+                // This node is not adjacent to this shape — another
+                // of the pin's shapes produced it.
+            }
+        }
+    }
     let mut wires: Vec<WireSeg> = Vec::new();
     let mut emit = |l: u8, t: i32, mut ivs: Vec<(i32, i32)>, vertical: bool| {
         ivs.sort_unstable();
@@ -1558,6 +1639,347 @@ fn commit_route(
             occ.rasterize(tracks, lid.0, &shift, Occupant::Net(route.net.0), Some(marks));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Post-route min-area patch
+// ---------------------------------------------------------------------------
+
+/// This net's member metal on routing layer `l`, tagged the way
+/// `drc::geom` would — wires `± w/2` as `SignalWire`, pair-default
+/// via metal as `Via`, member-pin shapes as `MacroPin`/`IoPort` — so
+/// `union::components` + `is_drawn` reproduce `check_area_report`'s
+/// component model restricted to one net. That tagging matters: a
+/// `MacroPin`-only island is never evaluated by the checker, so it
+/// must never become a residual here either.
+fn net_layer_shapes(
+    db: &DesignDb,
+    tech: &TechDb,
+    g: &NetGraph,
+    vias: &ViaTable,
+    route: &NetRoute,
+    l: u8,
+    w2: i32,
+) -> Vec<ShapeRect> {
+    let sh = |rect: RectDbu, src: ShapeSrc| ShapeRect {
+        rect,
+        src,
+        net: None,
+        group: 0,
+    };
+    let mut out = Vec::new();
+    for w in &route.wires {
+        if w.layer.0 != l {
+            continue;
+        }
+        out.push(sh(
+            RectDbu::new(
+                w.x1.min(w.x2) - w2,
+                w.y1.min(w.y2) - w2,
+                w.x1.max(w.x2) + w2,
+                w.y1.max(w.y2) + w2,
+            ),
+            ShapeSrc::SignalWire,
+        ));
+    }
+    for vp in &route.vias {
+        let pair = &vias.pairs[vp.lower.0 as usize];
+        let Some(di) = pair.default else {
+            continue;
+        };
+        let cand = &vias.candidates[pair.candidates[di as usize] as usize];
+        for (dl, r) in &cand.rects {
+            let DrcLayer::Routing(lid) = dl else {
+                continue;
+            };
+            if lid.0 != l {
+                continue;
+            }
+            out.push(sh(
+                RectDbu::new(vp.x + r.xl, vp.y + r.yl, vp.x + r.xh, vp.y + r.yh),
+                ShapeSrc::Via,
+            ));
+        }
+    }
+    for &(pin, _) in &g.pin_nodes {
+        let src = if db.pin_cells[pin.0 as usize].is_some() {
+            ShapeSrc::MacroPin
+        } else {
+            ShapeSrc::IoPort
+        };
+        for (lid, r) in pin_shapes(db, tech, pin) {
+            if lid.0 == l {
+                out.push(sh(r, src));
+            }
+        }
+    }
+    out
+}
+
+/// One component's member rects (index list → geometry) — the
+/// `union_area`/`bbox` input shared by the probe and the residual.
+fn comp_rects(ls: &LayerShapes, members: &[u32]) -> Vec<RectDbu> {
+    members.iter().map(|&i| ls.rects[i as usize].rect).collect()
+}
+
+fn rect_bbox(rects: &[RectDbu]) -> RectDbu {
+    let mut b = rects[0];
+    for r in &rects[1..] {
+        b = RectDbu::new(
+            b.xl.min(r.xl),
+            b.yl.min(r.yl),
+            b.xh.max(r.xh),
+            b.yh.max(r.yh),
+        );
+    }
+    b
+}
+
+/// A patch span `± w/2` — the same square-cap expansion wires get.
+fn span_rect(axis: Axis, w2: i32, line_t: i32, lo: i32, hi: i32) -> RectDbu {
+    match axis {
+        Axis::X => RectDbu::new(lo - w2, line_t - w2, hi + w2, line_t + w2),
+        Axis::Y => RectDbu::new(line_t - w2, lo - w2, line_t + w2, hi + w2),
+    }
+}
+
+/// Try to lift one sub-bound component to `bound`: per candidate node
+/// inside the component's member rects (g order), walk `+pref` then
+/// `−pref` over adjacent covered nodes on its line — every step is one
+/// in-plane `g.edges` span, so patch metal stays inside the guide
+/// region and on-track by construction. A step commits only when
+/// `scan_wire` reports own-net `Net`/`Pin` hits exclusively: the
+/// patch is occupancy-strict — any `Obs` (the host-cell carve is not
+/// inherited; patch metal is optional) or foreign `Net`/`Pin` hit
+/// stops that direction. On reaching bound the accumulated span
+/// commits as a single `WireSeg` rasterized as `Net(own)`; returns
+/// whether it committed.
+#[allow(clippy::too_many_arguments)]
+fn patch_component(
+    tracks: &[LayerTracks],
+    g: &NetGraph,
+    occ: &mut Occupancy,
+    route: &mut NetRoute,
+    l: u8,
+    pref: Axis,
+    lines: &BTreeMap<u32, BTreeSet<u32>>,
+    mrects: &[RectDbu],
+    bound: i64,
+    w2: i32,
+) -> bool {
+    let lt = &tracks[l as usize];
+    let own = route.net.0;
+    let coord = |pos: u32| -> i32 {
+        match pref {
+            Axis::X => lt.tracks_x[pos as usize],
+            Axis::Y => lt.tracks_y[pos as usize],
+        }
+    };
+    let line_at = |line: u32| -> i32 {
+        match pref {
+            Axis::X => lt.tracks_y[line as usize],
+            Axis::Y => lt.tracks_x[line as usize],
+        }
+    };
+    let mut hits = Vec::new();
+    for (ni, n) in g.nodes.iter().enumerate() {
+        if n.layer.0 != l {
+            continue;
+        }
+        let (x, y) = node_xy(g, tracks, ni as u32);
+        let inside = mrects
+            .iter()
+            .any(|r| x >= r.xl && x <= r.xh && y >= r.yl && y <= r.yh);
+        if !inside {
+            continue;
+        }
+        let (line, pos) = match pref {
+            Axis::X => (n.iy, n.ix),
+            Axis::Y => (n.ix, n.iy),
+        };
+        let Some(set) = lines.get(&line) else {
+            continue;
+        };
+        let (mut lo, mut hi) = (pos, pos);
+        let mut reached = false;
+        for forward in [true, false] {
+            loop {
+                let (c, d, next) = if forward {
+                    let Some(&next) = set.range(hi + 1..).next() else {
+                        break;
+                    };
+                    // An index gap is a corridor the guide does not
+                    // cover — not an edge span, so the walk stops.
+                    if next != hi + 1 {
+                        break;
+                    }
+                    (coord(hi), coord(next), next)
+                } else {
+                    let Some(&prev) = set.range(..lo).next_back() else {
+                        break;
+                    };
+                    if prev + 1 != lo {
+                        break;
+                    }
+                    (coord(prev), coord(lo), prev)
+                };
+                hits.clear();
+                occ.scan_wire(pref, l, line_at(line), c, d, &mut hits);
+                if !hits
+                    .iter()
+                    .all(|h| matches!(h.iv.who, Occupant::Net(m) | Occupant::Pin(m) if m == own))
+                {
+                    break;
+                }
+                if forward {
+                    hi = next;
+                } else {
+                    lo = next;
+                }
+                let mut all = mrects.to_vec();
+                all.push(span_rect(pref, w2, line_at(line), coord(lo), coord(hi)));
+                if union::union_area(&all) >= bound {
+                    reached = true;
+                    break;
+                }
+            }
+            if reached {
+                break;
+            }
+        }
+        if !reached {
+            continue;
+        }
+        let seg = match pref {
+            Axis::X => WireSeg {
+                layer: LayerId(l),
+                x1: coord(lo),
+                y1: line_at(line),
+                x2: coord(hi),
+                y2: line_at(line),
+            },
+            Axis::Y => WireSeg {
+                layer: LayerId(l),
+                x1: line_at(line),
+                y1: coord(lo),
+                x2: line_at(line),
+                y2: coord(hi),
+            },
+        };
+        route.wires.push(seg);
+        let r = span_rect(pref, w2, line_at(line), coord(lo), coord(hi));
+        occ.rasterize(tracks, l, &r, Occupant::Net(own), None);
+        return true;
+    }
+    false
+}
+
+/// Patch one committed net's sub-bound components toward its layers'
+/// `AREA` bounds; returns the number of components fixed. Mirrors
+/// `check_area_report`: per layer with `AREA` declared, member rects
+/// merge via the checker's own `union::components` and a component is
+/// evaluated only when it holds a drawn member — conservative in the
+/// checker's direction (`area_ours ≤ area_checker`: foreign metal
+/// touching ours can only help, never hide a real violation). The
+/// extension walk is preferred-axis, in-region, and occupancy-strict;
+/// a component it cannot fix lands in `residuals` with its final
+/// geometry — a `*.6` gate finding without one is a model
+/// divergence, i.e. a bug, not a tolerance.
+#[allow(clippy::too_many_arguments)]
+fn patch_net_min_area(
+    db: &DesignDb,
+    tech: &TechDb,
+    tracks: &[LayerTracks],
+    g: &NetGraph,
+    vias: &ViaTable,
+    occ: &mut Occupancy,
+    route: &mut NetRoute,
+    residuals: &mut Vec<AreaResidual>,
+) -> usize {
+    let mut patches = 0;
+    for l in 0..tech.routing_layers.len() {
+        let bound = tech.routing_layers[l].area_dbu2;
+        if bound <= 0 {
+            continue;
+        }
+        let l = l as u8;
+        let w2 = tech.routing_layers[l as usize].width_dbu / 2;
+        let pref = pref_axis(tech.routing_layers[l as usize].dir);
+        // Step domain along the preferred axis: line index → sorted
+        // covered track indices. Adjacent-index entries are exactly
+        // the in-plane `g.edges` spans (built once per call).
+        let mut lines: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        for n in &g.nodes {
+            if n.layer.0 != l {
+                continue;
+            }
+            let (line, pos) = match pref {
+                Axis::X => (n.iy, n.ix),
+                Axis::Y => (n.ix, n.iy),
+            };
+            lines.entry(line).or_default().insert(pos);
+        }
+        'layer: loop {
+            let ls = LayerShapes::from_rects(net_layer_shapes(
+                db, tech, g, vias, route, l, w2,
+            ));
+            if ls.rects.is_empty() {
+                break;
+            }
+            let comps = union::components(&ls);
+            let mut committed = false;
+            for members in &comps.members {
+                if !members
+                    .iter()
+                    .any(|&i| is_drawn(ls.rects[i as usize].src))
+                {
+                    continue;
+                }
+                let mrects = comp_rects(&ls, members);
+                if union::union_area(&mrects) >= bound {
+                    continue;
+                }
+                if patch_component(
+                    tracks, g, occ, route, l, pref, &lines, &mrects, bound, w2,
+                ) {
+                    patches += 1;
+                    // Re-derive: the patch can merge two sub-bound
+                    // components into one that already clears.
+                    committed = true;
+                    break;
+                }
+            }
+            if committed {
+                continue 'layer;
+            }
+            // A full sweep accepted nothing — the residuals describe
+            // final geometry, so a component a later patch rescued is
+            // never stale-recorded.
+            for members in &comps.members {
+                if !members
+                    .iter()
+                    .any(|&i| is_drawn(ls.rects[i as usize].src))
+                {
+                    continue;
+                }
+                let mrects = comp_rects(&ls, members);
+                let area = union::union_area(&mrects);
+                if area < bound {
+                    residuals.push(AreaResidual {
+                        net: route.net,
+                        layer: LayerId(l),
+                        region: rect_bbox(&mrects),
+                        area_dbu2: area,
+                        bound_dbu2: bound,
+                    });
+                }
+            }
+            break 'layer;
+        }
+    }
+    // Restore canonical `WireSeg` order for emit and `route_digest`.
+    route.wires.sort_unstable();
+    patches
 }
 
 /// Sequential maze routing over `graphs`: per net, pathfinder-style
@@ -1681,6 +2103,40 @@ pub fn route_nets(
         }
     }
 
+    // Post-route min-area patch: `occ` at loop exit holds exactly the
+    // committed set (premarks plus `Net(own)` marks of every
+    // `routes[i] = Some` net — re-queued nets were unmarked, hard-mode
+    // failures never committed), so patches see the final foreign
+    // picture, run once per net, and rasterize straight into `occ` so
+    // later nets' patches respect earlier patches. Runs here, not in
+    // `route_one_net`: the `graphs.nets[i]` ↔ `routes[i]` pairing is
+    // still live and each net is patched once, not once per rip-up.
+    let tp = std::time::Instant::now();
+    let mut area_residuals = Vec::new();
+    let mut area_patches = 0;
+    for (i, g) in graphs.nets.iter().enumerate() {
+        let Some(route) = &mut routes[i] else {
+            continue;
+        };
+        area_patches += patch_net_min_area(
+            db,
+            tech,
+            tracks,
+            g,
+            vias,
+            &mut occ,
+            route,
+            &mut area_residuals,
+        );
+    }
+    if timing {
+        eprintln!(
+            "drt: min-area patch patches={area_patches} residuals={} {:?}",
+            area_residuals.len(),
+            tp.elapsed()
+        );
+    }
+
     let nets: Vec<NetRoute> = routes.into_iter().flatten().collect();
     RouteDb {
         collisions: if cfg.occ == OccMode::Enabled {
@@ -1691,6 +2147,8 @@ pub fn route_nets(
         nets,
         unrouted,
         iterations,
+        area_patches,
+        area_residuals,
     }
 }
 
@@ -1819,7 +2277,7 @@ mod tests {
     use crate::interner::SymbolId;
     use crate::tech_db::RoutingLayer;
 
-    fn toy_tech() -> TechDb {
+    fn toy_tech_area(area_dbu2: i64) -> TechDb {
         let mut tech = TechDb::new();
         tech.routing_layers.push(RoutingLayer {
             name: SymbolId(0),
@@ -1834,10 +2292,46 @@ mod tests {
             edge_cap_per_um: 0.0,
             spacing_dbu: 140,
             spacing_table: vec![],
-            area_dbu2: 0,
+            area_dbu2,
             min_enclosed_area_dbu2: 0,
         });
         tech
+    }
+
+    fn toy_tech() -> TechDb {
+        toy_tech_area(0)
+    }
+
+    /// Two io pins `a` (driver) / `b` on net 0 — the square_graph
+    /// fixture's design side.
+    fn toy_db() -> DesignDb {
+        let mut db = DesignDb::new();
+        db.pin_names.push(db.strings.intern("a"));
+        db.pin_names.push(db.strings.intern("b"));
+        db.pin_dirs.push(crate::interner::PinDir::Output);
+        db.pin_dirs.push(crate::interner::PinDir::Input);
+        db.pin_cells.push(None);
+        db.pin_cells.push(None);
+        db.pin_macro_pins.push(None);
+        db.pin_macro_pins.push(None);
+        db.pin_lib_pins.push(None);
+        db.pin_lib_pins.push(None);
+        db.pin_nets.push(Some(NetId(0)));
+        db.pin_nets.push(Some(NetId(0)));
+        db.pin_offset_x_dbu.push(0);
+        db.pin_offset_x_dbu.push(0);
+        db.pin_offset_y_dbu.push(0);
+        db.pin_offset_y_dbu.push(0);
+        db.pin_io_layer.push(None);
+        db.pin_io_layer.push(None);
+        db.pin_io_rects.push(vec![]);
+        db.pin_io_rects.push(vec![]);
+        db.pin_is_driver.push(true);
+        db.pin_is_driver.push(false);
+        db.net_names.push(db.strings.intern("n1"));
+        db.net_pin_offsets = vec![0, 2];
+        db.net_pin_ids = vec![PinId(0), PinId(1)];
+        db
     }
 
     fn toy_tracks() -> Vec<LayerTracks> {
@@ -2093,5 +2587,351 @@ mod tests {
             ]
         );
         assert_eq!(route.connected, vec![PinId(0), PinId(1)]);
+    }
+
+    /// Nodes `(0,0)..(3,0)` on the single toy layer — the patch
+    /// fixtures' line graph (x-track grid 0/1000/2000/3000).
+    fn line_graph() -> NetGraph {
+        NetGraph {
+            net: NetId(0),
+            nodes: (0..4)
+                .map(|ix| RouteNode {
+                    layer: LayerId(0),
+                    ix,
+                    iy: 0,
+                })
+                .collect(),
+            edges: vec![
+                crate::drt::graph::RouteEdge {
+                    a: 0,
+                    b: 1,
+                    axis: Axis::X,
+                },
+                crate::drt::graph::RouteEdge {
+                    a: 1,
+                    b: 2,
+                    axis: Axis::X,
+                },
+                crate::drt::graph::RouteEdge {
+                    a: 2,
+                    b: 3,
+                    axis: Axis::X,
+                },
+            ],
+            via_edges: vec![],
+            pin_nodes: vec![],
+        }
+    }
+
+    fn one_wire_route(x1: i32, x2: i32) -> NetRoute {
+        NetRoute {
+            net: NetId(0),
+            wires: vec![WireSeg {
+                layer: LayerId(0),
+                x1,
+                y1: 0,
+                x2,
+                y2: 0,
+            }],
+            vias: vec![],
+            connected: vec![],
+            projected: vec![],
+        }
+    }
+
+    /// The component area `patch_net_min_area` would measure on
+    /// `route`'s layer 0 — the fixtures' non-vacuity probe (§7.7).
+    fn component_area(
+        db: &DesignDb,
+        tech: &TechDb,
+        g: &NetGraph,
+        vias: &ViaTable,
+        route: &NetRoute,
+    ) -> i64 {
+        let ls =
+            LayerShapes::from_rects(net_layer_shapes(db, tech, g, vias, route, 0, 70));
+        union::union_area(&ls.rects.iter().map(|s| s.rect).collect::<Vec<_>>())
+    }
+
+    /// Sub-bound stub (wire `[0,1000] @ y=0`, area 159,600 < bound
+    /// 250,000): the +x walk from node (0,0) accumulates to (2,0) and
+    /// commits one `WireSeg` `(0,0)–(2000,0)` → union 299,600 ≥ bound.
+    #[test]
+    fn test_min_area_patch_fills() {
+        let tech = toy_tech_area(250_000);
+        let tracks = toy_tracks();
+        let g = line_graph();
+        let vias = ViaTable::default();
+        let db = DesignDb::new();
+        let mut route = one_wire_route(0, 1000);
+        assert_eq!(component_area(&db, &tech, &g, &vias, &route), 159_600);
+        let mut occ = toy_occ(&tech);
+        occ.rasterize(
+            &tracks,
+            0,
+            &RectDbu::new(-70, -70, 1070, 70),
+            Occupant::Net(0),
+            None,
+        );
+        let mut residuals = Vec::new();
+        let patches = patch_net_min_area(
+            &db,
+            &tech,
+            &tracks,
+            &g,
+            &vias,
+            &mut occ,
+            &mut route,
+            &mut residuals,
+        );
+        assert_eq!(patches, 1);
+        assert!(residuals.is_empty(), "{residuals:?}");
+        assert_eq!(
+            route.wires,
+            vec![
+                WireSeg {
+                    layer: LayerId(0),
+                    x1: 0,
+                    y1: 0,
+                    x2: 1000,
+                    y2: 0
+                },
+                WireSeg {
+                    layer: LayerId(0),
+                    x1: 0,
+                    y1: 0,
+                    x2: 2000,
+                    y2: 0
+                },
+            ]
+        );
+        // The patch metal is committed: own-net hits on the extension.
+        let mut hits = Vec::new();
+        occ.scan_wire(Axis::X, 0, 0, 1500, 1800, &mut hits);
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter()
+                .all(|h| matches!(h.iv.who, Occupant::Net(0)))
+        );
+    }
+
+    /// A member pin's io-port rect merges into the component like the
+    /// checker's plane merge: bound 230,000 sits under `wire + pin`
+    /// (233,800) but over wire alone (159,600) — the patch fires only
+    /// when the bound clears the pin-inclusive area.
+    #[test]
+    fn test_min_area_patch_pin_merges() {
+        let tracks = toy_tracks();
+        let mut g = line_graph();
+        g.pin_nodes = vec![(PinId(0), vec![0])];
+        let vias = ViaTable::default();
+        let mut db = DesignDb::new();
+        db.pin_names.push(db.strings.intern("p0"));
+        db.pin_dirs.push(crate::interner::PinDir::Input);
+        db.pin_cells.push(None);
+        db.pin_macro_pins.push(None);
+        db.pin_lib_pins.push(None);
+        db.pin_nets.push(Some(NetId(0)));
+        db.pin_offset_x_dbu.push(0);
+        db.pin_offset_y_dbu.push(0);
+        db.pin_io_layer.push(None);
+        db.pin_io_rects
+            .push(vec![(LayerId(0), RectDbu::new(1070, -70, 1600, 70))]);
+        db.pin_is_driver.push(true);
+        let route = one_wire_route(0, 1000);
+        // wire [-70,1070] + pin [1070,1600] → [-70,1600]×140 = 233,800.
+        assert_eq!(component_area(&db, &toy_tech(), &g, &vias, &route), 233_800);
+
+        let run = |area_dbu2: i64, route: &mut NetRoute| {
+            let tech = toy_tech_area(area_dbu2);
+            let mut occ = toy_occ(&tech);
+            occ.rasterize(
+                &tracks,
+                0,
+                &RectDbu::new(-70, -70, 1070, 70),
+                Occupant::Net(0),
+                None,
+            );
+            let mut residuals = Vec::new();
+            let n = patch_net_min_area(
+                &db,
+                &tech,
+                &tracks,
+                &g,
+                &vias,
+                &mut occ,
+                route,
+                &mut residuals,
+            );
+            (n, residuals)
+        };
+
+        // Under pin-inclusive area → already at bound, patch is a
+        // no-op (without the pin it would have patched).
+        let mut route = route.clone();
+        let (patches, residuals) = run(230_000, &mut route);
+        assert_eq!((patches, residuals.len()), (0, 0));
+        assert_eq!(route.wires.len(), 1);
+        // Just over → the same two-step extension commits.
+        let mut route = one_wire_route(0, 1000);
+        let (patches, residuals) = run(240_000, &mut route);
+        assert_eq!(patches, 1);
+        assert!(residuals.is_empty(), "{residuals:?}");
+        assert!(route.wires.contains(&WireSeg {
+            layer: LayerId(0),
+            x1: 0,
+            y1: 0,
+            x2: 2000,
+            y2: 0
+        }));
+    }
+
+    /// Occupancy-strict (decision 8): foreign `Net` marks on the +x
+    /// span and an `Obs(u32::MAX)` mark covering −x reject every
+    /// candidate walk → exactly one named residual, wires untouched.
+    #[test]
+    fn test_min_area_patch_occupancy_blocked() {
+        let tech = toy_tech_area(250_000);
+        let tracks = toy_tracks();
+        let g = line_graph();
+        let vias = ViaTable::default();
+        let db = DesignDb::new();
+        let mut route = one_wire_route(1000, 2000);
+        assert_eq!(component_area(&db, &tech, &g, &vias, &route), 159_600);
+        let mut occ = toy_occ(&tech);
+        occ.rasterize(
+            &tracks,
+            0,
+            &RectDbu::new(930, -70, 2070, 70),
+            Occupant::Net(0),
+            None,
+        );
+        // Foreign metal inside the [2000,3000] step's band; an Obs
+        // mark inside every −x step's band.
+        occ.rasterize(
+            &tracks,
+            0,
+            &RectDbu::new(2280, -70, 3000, 70),
+            Occupant::Net(42),
+            None,
+        );
+        occ.rasterize(
+            &tracks,
+            0,
+            &RectDbu::new(-500, -70, -100, 70),
+            Occupant::Obs(u32::MAX),
+            None,
+        );
+        let mut residuals = Vec::new();
+        let patches = patch_net_min_area(
+            &db,
+            &tech,
+            &tracks,
+            &g,
+            &vias,
+            &mut occ,
+            &mut route,
+            &mut residuals,
+        );
+        assert_eq!(patches, 0);
+        assert_eq!(route.wires.len(), 1, "blocked patch must not emit");
+        assert_eq!(
+            residuals,
+            vec![AreaResidual {
+                net: NetId(0),
+                layer: LayerId(0),
+                region: RectDbu::new(930, -70, 2070, 70),
+                area_dbu2: 159_600,
+                bound_dbu2: 250_000,
+            }]
+        );
+    }
+
+    /// The patch never leaves the guide region (decision 9): the wire
+    /// ends at the last covered node on its line — no in-region step
+    /// exists → named residual, wires unchanged.
+    #[test]
+    fn test_min_area_patch_region_bound() {
+        let tech = toy_tech_area(250_000);
+        let tracks = toy_tracks();
+        let g = NetGraph {
+            net: NetId(0),
+            nodes: vec![
+                RouteNode {
+                    layer: LayerId(0),
+                    ix: 0,
+                    iy: 0,
+                },
+                RouteNode {
+                    layer: LayerId(0),
+                    ix: 1,
+                    iy: 0,
+                },
+            ],
+            edges: vec![crate::drt::graph::RouteEdge {
+                a: 0,
+                b: 1,
+                axis: Axis::X,
+            }],
+            via_edges: vec![],
+            pin_nodes: vec![],
+        };
+        let vias = ViaTable::default();
+        let db = DesignDb::new();
+        let mut route = one_wire_route(0, 1000);
+        assert_eq!(component_area(&db, &tech, &g, &vias, &route), 159_600);
+        let mut occ = toy_occ(&tech);
+        let mut residuals = Vec::new();
+        let patches = patch_net_min_area(
+            &db,
+            &tech,
+            &tracks,
+            &g,
+            &vias,
+            &mut occ,
+            &mut route,
+            &mut residuals,
+        );
+        assert_eq!(patches, 0);
+        assert_eq!(route.wires.len(), 1);
+        assert_eq!(residuals.len(), 1);
+        assert_eq!(residuals[0].region, RectDbu::new(-70, -70, 1070, 70));
+    }
+
+    /// The post-loop hook, not just the function: `route_nets` on the
+    /// square fixture with a bound the routed L (union 299,600) cannot
+    /// meet alone → one patch closes the square's top edge.
+    #[test]
+    fn test_min_area_patch_in_route_nets() {
+        let tech = toy_tech_area(400_000);
+        let tracks = toy_tracks();
+        let db = toy_db();
+        let graphs = RouteGraphs {
+            nets: vec![square_graph()],
+            ..Default::default()
+        };
+        let vias = ViaTable {
+            candidates: Vec::<ViaCandidate>::new(),
+            pairs: vec![ViaPair {
+                lower: LayerId(0),
+                upper: LayerId(1),
+                cut: None,
+                candidates: vec![],
+                default: None,
+            }],
+            gaps: vec![],
+            unmatched: vec![],
+        };
+        let route_db = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+        assert_eq!(route_db.area_patches, 1, "{:?}", route_db.area_residuals);
+        assert!(route_db.area_residuals.is_empty());
+        let route = &route_db.nets[0];
+        assert!(route.wires.contains(&WireSeg {
+            layer: LayerId(0),
+            x1: 0,
+            y1: 1000,
+            x2: 1000,
+            y2: 1000
+        }));
     }
 }

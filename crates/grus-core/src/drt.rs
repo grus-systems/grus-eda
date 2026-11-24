@@ -7,14 +7,17 @@
 //! adjacent-pair candidate defs and names each pair's default pick;
 //! `maze` routes each guided net inside its region by sequential tree
 //! extension under interval occupancy, and names whatever it cannot
-//! connect.
+//! connect; `emit` turns committed routes into routed `NETS` DEF
+//! geometry the rest of the toolchain already reads.
 
 pub mod access;
+pub mod emit;
 pub mod graph;
 pub mod maze;
 pub mod tracks;
 pub mod via;
 
 pub use maze::{
-    Collision, FailKind, MazeConfig, NetRoute, OccMode, RouteDb, UnroutedNet, ViaPlace, WireSeg,
+    AreaResidual, Collision, FailKind, MazeConfig, NetRoute, OccMode, RouteDb, UnroutedNet,
+    ViaPlace, WireSeg,
 };
