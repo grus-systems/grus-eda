@@ -11,7 +11,7 @@ use crate::drc::geom::expand_via;
 use crate::drc::union;
 use crate::drc::{DrcLayer, LayerShapes, ShapeRect, ShapeSrc};
 use crate::drt::access::pin_shapes;
-use crate::drt::graph::{NetGraph, RouteGraphs};
+use crate::drt::graph::{pin_cover, HullMask, NetGraph, PinCover, RouteGraphs};
 use crate::drt::tracks::{Axis, LayerTracks};
 use crate::drt::via::ViaTable;
 use crate::interner::{LayerId, NetId, PinId};
@@ -156,6 +156,12 @@ pub struct RouteDb {
     /// every residual maps to a `*.6` self-DRC finding if the gate
     /// fires, and every `*.6` finding must map back to one of these.
     pub area_residuals: Vec<AreaResidual>,
+    /// Pins whose projected access stubs were suppressed by the
+    /// hull-confinement check — the net landed in `unrouted` with
+    /// the pin marked `Unattachable`. Expected empty (`project_attach`
+    /// admission pre-filters); a nonempty list is a bug to name, not
+    /// a residual to tolerate.
+    pub stub_outside_cover: Vec<(NetId, PinId)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +186,12 @@ enum Occupant {
     /// that lands on it is a pin-access finding for the emit/e2e
     /// DRC, not a maze-time wall (`docs/e6-drt.md` §7).
     Pin(u32), // NetId.0
+    /// An instance pin's placed metal — free to its own net, a hard
+    /// block to every other net. Unlike a `Pin` mark (io-port rects,
+    /// outside every hull) instance-pin metal sits inside a cell
+    /// hull where Magic reports any foreign landing as a subcell
+    /// overlap — soft-pricing cannot move a pin, so it must wall.
+    ObsPin(u32), // NetId.0
 }
 
 /// A committed shape's extent along one track line, tagged with its
@@ -243,6 +255,7 @@ struct Occupancy {
 struct Hit {
     iv: Interval,
     line: i32,
+    layer: u8,
     lo: i32,
     hi: i32,
 }
@@ -402,6 +415,7 @@ impl Occupancy {
                     out.push(Hit {
                         iv: *iv,
                         line: t,
+                        layer,
                         lo: iv.lo.max(slo),
                         hi: iv.hi.min(shi),
                     });
@@ -434,6 +448,7 @@ impl Occupancy {
                         out.push(Hit {
                             iv: *iv,
                             line: t,
+                            layer,
                             lo: iv.lo.max(r.xl),
                             hi: iv.hi.min(r.xh),
                         });
@@ -454,6 +469,7 @@ impl Occupancy {
                         out.push(Hit {
                             iv: *iv,
                             line: t,
+                            layer,
                             lo: iv.lo.max(r.yl),
                             hi: iv.hi.min(r.yh),
                         });
@@ -492,7 +508,11 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
             let r = DesignDb::orient_rect(r, mac.width_dbu, mac.height_dbu, orient);
             RectDbu::new(cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh)
         };
-        for &(lid, r) in &mac.obs_rects_raw {
+        for &(lid, r) in mac
+            .obs_rects_raw
+            .iter()
+            .chain(mac.pin_obs_rects.iter())
+        {
             if (lid.0 as usize) < occ.lines_x.len() {
                 occ.rasterize(tracks, lid.0, &place(r), Occupant::Obs(c as u32), None);
             }
@@ -508,7 +528,15 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
             continue;
         }
         let pin = PinId(p as u32);
-        let who = db.pin_nets[p].map_or(Occupant::Obs(u32::MAX), |n| Occupant::Pin(n.0));
+        let who = match db.pin_nets[p] {
+            None => Occupant::Obs(u32::MAX),
+            // Instance-pin metal sits inside a hull — foreign wires
+            // must wall off it, not soft-price past it; io-port rects
+            // live outside hulls and keep the soft `Pin` price (the
+            // met3.2 port-band finding class).
+            Some(n) if db.pin_cells[p].is_some() => Occupant::ObsPin(n.0),
+            Some(n) => Occupant::Pin(n.0),
+        };
         for (lid, r) in pin_shapes(db, tech, pin) {
             if (lid.0 as usize) < occ.lines_x.len() {
                 occ.rasterize(tracks, lid.0, &r, who, None);
@@ -559,7 +587,18 @@ fn covered_range(list: &[i32], lo: i32, hi: i32) -> (usize, usize) {
 /// covered line can coincide with *another* pin's attach node, which
 /// `absorb_taps` would then claim as a zero-edge connection.
 /// Computed on the sorted node order — deterministic, no re-sort.
-fn project_attach(g: &NetGraph, shapes: &[(LayerId, RectDbu)], tracks: &[LayerTracks]) -> Vec<u32> {
+///
+/// Hull confinement: the stub a projected node implies — node → pin
+/// rect clamp — is committed metal, so a candidate whose stub would
+/// cross an uncovered hull is never admitted (the emit-side check in
+/// `route_one_net` is the matching guard).
+fn project_attach(
+    g: &NetGraph,
+    shapes: &[(LayerId, RectDbu)],
+    tracks: &[LayerTracks],
+    mask: &HullMask,
+    cover: &PinCover,
+) -> Vec<u32> {
     let mut out = BTreeSet::new();
     for &(lid, r) in shapes {
         let l = lid.0 as usize;
@@ -578,9 +617,21 @@ fn project_attach(g: &NetGraph, shapes: &[(LayerId, RectDbu)], tracks: &[LayerTr
         for (i, n) in g.nodes[lo..hi].iter().enumerate() {
             let covered = (x0..x1).contains(&(n.ix as usize))
                 || (y0..y1).contains(&(n.iy as usize));
-            if covered && xs.contains(&(n.ix as usize)) && ys.contains(&(n.iy as usize)) {
-                out.insert((lo + i) as u32);
+            if !covered || !xs.contains(&(n.ix as usize)) || !ys.contains(&(n.iy as usize)) {
+                continue;
             }
+            let (x, y) = (lt.tracks_x[n.ix as usize], lt.tracks_y[n.iy as usize]);
+            if !mask.seg_allowed(
+                cover,
+                lid.0,
+                x,
+                y,
+                x.clamp(r.xl, r.xh),
+                y.clamp(r.yl, r.yh),
+            ) {
+                continue;
+            }
+            out.insert((lo + i) as u32);
         }
     }
     out.into_iter().collect()
@@ -615,29 +666,39 @@ fn pref_axis(dir: LayerDir) -> Axis {
 /// Host-cell carve: an `Obs(cell)` mark is invisible to the candidate
 /// net whenever the net has a member pin hosted by `cell` — the
 /// rasterized form of OpenROAD's "an access shape ignores
-/// own-instance OBS" rule, applied unconditionally (the earlier
-/// pin-halo version left pockets walled: the approach edge hit host
-/// OBS before reaching the halo — measured on gcd's 48 `NoPath`s).
-/// Recorded looseness: the net may cross the host cell's OBS anywhere,
-/// not just near the pin — connectivity-level acceptable; the
-/// emit/e2e DRC owns the real check. `Obs(u32::MAX)` (net-less pin
-/// metal) has no exempting host and always blocks.
+/// own-instance OBS" rule — but only on `mask.carve` layers: where
+/// the strict own-pin cover carries in-hull legality (li1, whose
+/// internals are too dense to navigate), the carve keeps the pocket
+/// reachable. On host-open layers (met1) the marks block the host
+/// too — the OBS-free channels are the legal routes, matching what
+/// the delegated router does inside its own cells. `Obs(u32::MAX)`
+/// (net-less pin metal, PDN) has no exempting host and always blocks.
 ///
 /// `Pin` marks: own free, foreign soft-priced — never a hard block
 /// (rip-up cannot move a pin; a landing wire is an emit-time finding).
+/// `ObsPin` marks (instance-pin metal inside hulls): own free,
+/// foreign hard-blocked — a soft price there is a Magic
+/// subcell-overlap finding the maze cannot otherwise see.
 fn hit_verdict(
     hits: &[Hit],
     host_cells: &[u32],
+    mask: &HullMask,
     own: u32,
     hist: u32,
     hard: bool,
     mode: OccMode,
 ) -> Option<u32> {
     for h in hits {
-        if let Occupant::Obs(cell) = h.iv.who
-            && host_cells.binary_search(&cell).is_err()
-        {
-            return None;
+        match h.iv.who {
+            Occupant::Obs(cell) => {
+                if !(mask.carve(h.layer) && host_cells.binary_search(&cell).is_ok()) {
+                    return None;
+                }
+            }
+            Occupant::ObsPin(m) if m != own => {
+                return None;
+            }
+            _ => {}
         }
     }
     if mode == OccMode::Disabled {
@@ -675,6 +736,7 @@ fn edge_cost(
     occ: &Occupancy,
     relax: &[RelaxedVia],
     host_cells: &[u32],
+    mask: &HullMask,
     eidx: u32,
     own: u32,
     hist: u32,
@@ -738,7 +800,7 @@ fn edge_cost(
             occ.scan_rect(lid.0, &abs, hits);
         }
     }
-    hit_verdict(hits, host_cells, own, hist, hard, mode).map(|extra| base + extra)
+    hit_verdict(hits, host_cells, mask, own, hist, hard, mode).map(|extra| base + extra)
 }
 
 /// Scans the wire stub a relaxed via implies between node `n`'s
@@ -872,18 +934,50 @@ struct RelaxedVia {
     lower: u8,
 }
 
-/// Index of the `list` value nearest `v` (nonempty lists only).
-fn nearest_track(list: &[i32], v: i32) -> usize {
-    let i = list.partition_point(|&t| t < v);
-    if i == 0 {
-        0
-    } else if i == list.len() {
-        list.len() - 1
-    } else if v - list[i - 1] <= list[i] - v {
-        i - 1
-    } else {
-        i
+/// Up to `n` elements of `xs` (key-sorted ascending) nearest `v`,
+/// nearest first — a bounded candidate list for the relaxed-via
+/// confinement probe.
+fn nearest_k<T: Copy>(xs: &[T], key: impl Fn(T) -> i32, v: i32, n: usize) -> Vec<T> {
+    let p = xs.partition_point(|&x| key(x) < v);
+    let (mut a, mut b) = (p, p);
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let la = a.checked_sub(1).map_or(i32::MAX, |i| v - key(xs[i]));
+        let lb = xs.get(b).map_or(i32::MAX, |&x| key(x) - v);
+        if la == i32::MAX && lb == i32::MAX {
+            break;
+        }
+        if la <= lb {
+            a -= 1;
+            out.push(xs[a]);
+        } else {
+            out.push(xs[b]);
+            b += 1;
+        }
     }
+    out
+}
+
+/// Up to `n` indices into sorted `list` nearest `v`, nearest first.
+fn nearest_idx(list: &[i32], v: i32, n: usize) -> Vec<u32> {
+    let p = list.partition_point(|&t| t < v);
+    let (mut a, mut b) = (p, p);
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let la = a.checked_sub(1).map_or(i32::MAX, |i| v - list[i]);
+        let lb = list.get(b).map_or(i32::MAX, |&t| t - v);
+        if la == i32::MAX && lb == i32::MAX {
+            break;
+        }
+        if la <= lb {
+            a -= 1;
+            out.push(a as u32);
+        } else {
+            out.push(b as u32);
+            b += 1;
+        }
+    }
+    out
 }
 
 /// Per-net relaxed via edges: for every node `v` on routing layer `k`
@@ -898,11 +992,18 @@ fn nearest_track(list: &[i32], v: i32) -> usize {
 /// is the same wire a track step away at most. Emitted in node order —
 /// deterministic; parallel strict/relaxed edges are left alone (the
 /// search takes the cheaper, extraction dedupes the placement).
+///
+/// Hull confinement: a strict `ViaEdge` sits on two surviving nodes,
+/// but a relaxed position/stubs can paint metal a strict node could
+/// not — the position must be legal on both layers and each implied
+/// stub must stay inside the net's own cover on masked layers.
 fn relaxed_vias(
     g: &NetGraph,
     tech: &TechDb,
     tracks: &[LayerTracks],
     vias: &ViaTable,
+    mask: &HullMask,
+    cover: &PinCover,
 ) -> Vec<RelaxedVia> {
     let nl = tracks.len();
     // layer → line → sorted in-region indices: `iy → [ix]` for
@@ -926,6 +1027,7 @@ fn relaxed_vias(
         lo as u32
     };
     let mut out = Vec::new();
+    let mut scratch = Vec::new();
     for (i, n) in g.nodes.iter().enumerate() {
         let k = n.layer.0 as usize;
         if k + 1 >= nl || vias.pairs[k].default.is_none() {
@@ -934,52 +1036,57 @@ fn relaxed_vias(
         let lt = &tracks[k];
         let up = &tracks[k + 1];
         let (x, y) = (lt.tracks_x[n.ix as usize], lt.tracks_y[n.iy as usize]);
-        match tech.routing_layers[k + 1].dir {
-            LayerDir::Horizontal => {
-                if up.tracks_y.is_empty() {
-                    continue;
-                }
-                let jy = nearest_track(&up.tracks_y, y) as u32;
-                let Some(ixs) = lines_h[k + 1].get(&jy) else {
-                    continue;
-                };
-                let pos = ixs.partition_point(|&jx| up.tracks_x[jx as usize] < x);
-                let jx = [pos.wrapping_sub(1), pos]
-                    .into_iter()
-                    .filter(|&j| j < ixs.len())
-                    .min_by_key(|&j| (up.tracks_x[ixs[j] as usize] - x).abs())
-                    .expect("nonempty line");
-                out.push(RelaxedVia {
-                    a: i as u32,
-                    b: node_id((k + 1) as u8, ixs[jx], jy),
-                    x,
-                    y: up.tracks_y[jy as usize],
-                    lower: n.layer.0,
-                });
-            }
-            LayerDir::Vertical => {
-                if up.tracks_x.is_empty() {
-                    continue;
-                }
-                let jx = nearest_track(&up.tracks_x, x) as u32;
-                let Some(iys) = lines_v[k + 1].get(&jx) else {
-                    continue;
-                };
-                let pos = iys.partition_point(|&jy| up.tracks_y[jy as usize] < y);
-                let jy = [pos.wrapping_sub(1), pos]
-                    .into_iter()
-                    .filter(|&j| j < iys.len())
-                    .min_by_key(|&j| (up.tracks_y[iys[j] as usize] - y).abs())
-                    .expect("nonempty line");
-                out.push(RelaxedVia {
-                    a: i as u32,
-                    b: node_id((k + 1) as u8, jx, iys[jy]),
-                    x: up.tracks_x[jx as usize],
-                    y,
-                    lower: n.layer.0,
-                });
-            }
-        }
+        let lower = n.layer.0;
+        // Candidate (via position, b) pairs nearest-first, bounded —
+        // on a masked layer the nearest track can sit outside a
+        // narrow pin corridor while the next one over lands inside
+        // it, so the first *confined* candidate wins rather than the
+        // unconditionally nearest. Unmasked layers answer `true` at
+        // once, preserving the previous single-candidate behavior.
+        let found = match tech.routing_layers[k + 1].dir {
+            LayerDir::Horizontal => nearest_idx(&up.tracks_y, y, 4)
+                .into_iter()
+                .find_map(|jy| {
+                    let ixs = lines_h[k + 1].get(&jy)?;
+                    let vy = up.tracks_y[jy as usize];
+                    nearest_k(ixs, |jx| up.tracks_x[jx as usize], x, 3)
+                        .into_iter()
+                        .find_map(|jx| {
+                            let bx = up.tracks_x[jx as usize];
+                            (mask.point_allowed(cover, &mut scratch, lower, x, vy)
+                                && mask.point_allowed(cover, &mut scratch, lower + 1, x, vy)
+                                && mask.seg_allowed(cover, lower, x, y, x, vy)
+                                && mask.seg_allowed(cover, lower + 1, x, vy, bx, vy))
+                            .then_some((x, vy, jx, jy))
+                        })
+                }),
+            LayerDir::Vertical => nearest_idx(&up.tracks_x, x, 4)
+                .into_iter()
+                .find_map(|jx| {
+                    let iys = lines_v[k + 1].get(&jx)?;
+                    let vx = up.tracks_x[jx as usize];
+                    nearest_k(iys, |jy| up.tracks_y[jy as usize], y, 3)
+                        .into_iter()
+                        .find_map(|jy| {
+                            let by = up.tracks_y[jy as usize];
+                            (mask.point_allowed(cover, &mut scratch, lower, vx, y)
+                                && mask.point_allowed(cover, &mut scratch, lower + 1, vx, y)
+                                && mask.seg_allowed(cover, lower, x, y, vx, y)
+                                && mask.seg_allowed(cover, lower + 1, vx, y, vx, by))
+                            .then_some((vx, y, jx, jy))
+                        })
+                }),
+        };
+        let Some((vx, vy, bix, biy)) = found else {
+            continue;
+        };
+        out.push(RelaxedVia {
+            a: i as u32,
+            b: node_id((k + 1) as u8, bix, biy),
+            x: vx,
+            y: vy,
+            lower,
+        });
     }
     out
 }
@@ -1003,7 +1110,15 @@ fn other_end(g: &NetGraph, relax: &[RelaxedVia], eidx: u32, v: u32) -> u32 {
 /// One routed net's outcome.
 enum NetOutcome {
     Routed(NetRoute, Vec<Collision>),
-    Failed(UnroutedNet),
+    Failed {
+        unrouted: UnroutedNet,
+        /// Pins whose only projected access stubs crossed an
+        /// uncovered hull — suppressed by the confinement check.
+        /// `route_nets` collects them into
+        /// `RouteDb::stub_outside_cover` (expected empty: admission
+        /// pre-filters them; nonzero is a bug, not a residual).
+        stub_blocked: Vec<PinId>,
+    },
 }
 
 /// Per-net topology: everything `route_one_net` needs that does not
@@ -1025,6 +1140,10 @@ struct NetTopo {
     members: BTreeMap<u32, Vec<u32>>,
     /// Per-net relaxed via edges (`relaxed_vias` output).
     relax: Vec<RelaxedVia>,
+    /// Own-pin cover for the hull mask — the confinement checks in
+    /// `relaxed_vias`/`project_attach` and the stub guard in
+    /// `route_one_net`.
+    cover: PinCover,
     adj_start: Vec<u32>,
     adj_to: Vec<u32>,
     adj_eidx: Vec<u32>,
@@ -1044,7 +1163,12 @@ impl NetTopo {
         tracks: &[LayerTracks],
         g: &NetGraph,
         vias: &ViaTable,
+        mask: &HullMask,
     ) -> Self {
+        // Own-pin cover for the hull mask — every member pin's shape
+        // XY unioned per host cell (all member pins, not only those
+        // that survived masking into `g.pin_nodes`).
+        let cover = pin_cover(db, tech, tracks, g.net);
         // Attach sets: strict `pin_nodes`, else the projection
         // fallback. `host_cells` collects the cells hosting member
         // pins for the unconditional host-cell OBS carve in
@@ -1063,7 +1187,7 @@ impl NetTopo {
                 continue;
             }
             let shapes = pin_shapes(db, tech, pin);
-            let nodes = project_attach(g, &shapes, tracks);
+            let nodes = project_attach(g, &shapes, tracks, mask, &cover);
             projected[pi] = !nodes.is_empty();
             attachable[pi] = !nodes.is_empty();
             attach.push(nodes);
@@ -1077,7 +1201,7 @@ impl NetTopo {
             }
         }
 
-        let relax = relaxed_vias(g, tech, tracks, vias);
+        let relax = relaxed_vias(g, tech, tracks, vias, mask, &cover);
         let n = g.nodes.len();
         let e_plane = g.edges.len() as u32;
         let mut deg = vec![0u32; n + 1];
@@ -1126,6 +1250,7 @@ impl NetTopo {
             host_cells,
             members,
             relax,
+            cover,
             adj_start: deg,
             adj_to,
             adj_eidx,
@@ -1203,6 +1328,7 @@ impl<'t> NetRun<'t> {
         tech: &TechDb,
         vias: &ViaTable,
         occ: &Occupancy,
+        mask: &HullMask,
         own: u32,
         hist: u32,
         hard: bool,
@@ -1268,8 +1394,8 @@ impl<'t> NetRun<'t> {
                 }
                 let eidx = topo.adj_eidx[pos];
                 let Some(ec) = edge_cost(
-                    g, tracks, tech, vias, occ, &topo.relax, &topo.host_cells, eidx, own,
-                    hist, hard, mode, &mut hits,
+                    g, tracks, tech, vias, occ, &topo.relax, &topo.host_cells, mask,
+                    eidx, own, hist, hard, mode, &mut hits,
                 ) else {
                     continue;
                 };
@@ -1324,17 +1450,21 @@ fn route_one_net(
     topo: &NetTopo,
     vias: &ViaTable,
     occ: &Occupancy,
+    mask: &HullMask,
     hist: u32,
     hard: bool,
     mode: OccMode,
 ) -> NetOutcome {
     let m = g.pin_nodes.len();
     let fail = |connected: Vec<PinId>, failed: Vec<(PinId, FailKind)>| {
-        NetOutcome::Failed(UnroutedNet {
-            net: g.net,
-            connected,
-            failed,
-        })
+        NetOutcome::Failed {
+            unrouted: UnroutedNet {
+                net: g.net,
+                connected,
+                failed,
+            },
+            stub_blocked: Vec::new(),
+        }
     };
     if g.nodes.is_empty() || m == 0 {
         // Defensive — `join.nets` only holds guided ≥2-pin nets with
@@ -1410,9 +1540,109 @@ fn route_one_net(
         .any(|(pi, &c)| !c && topo.attachable[pi])
     {
         if run
-            .extend_once(g, tracks, tech, vias, occ, g.net.0, hist, hard, mode)
+            .extend_once(g, tracks, tech, vias, occ, mask, g.net.0, hist, hard, mode)
             .is_none()
         {
+            if std::env::var_os("DRT_DEBUG_NET").is_some_and(|v| {
+                v.to_string_lossy() == db.strings.resolve(db.net_names[g.net.0 as usize])
+            }) {
+                // Graph-only reachability from the tree — separates a
+                // disconnected pocket from occupancy-blocked search.
+                let mut seen = vec![false; g.nodes.len()];
+                let mut q: VecDeque<u32> = run.tree_nodes.iter().copied().collect();
+                for &v in &q {
+                    seen[v as usize] = true;
+                }
+                while let Some(v) = q.pop_front() {
+                    let r = topo.adj_start[v as usize] as usize
+                        ..topo.adj_start[v as usize + 1] as usize;
+                    for &to in &topo.adj_to[r] {
+                        if !seen[to as usize] {
+                            seen[to as usize] = true;
+                            q.push_back(to);
+                        }
+                    }
+                }
+                let e_plane = g.edges.len() as u32;
+                let v_plane = e_plane + g.via_edges.len() as u32;
+                for (pi, ids) in topo.attach.iter().enumerate() {
+                    if !topo.attachable[pi] {
+                        continue;
+                    }
+                    let reach = ids.iter().filter(|&&v| seen[v as usize]).count();
+                    eprintln!(
+                        "DBG pin#{pi} attach={} reachable={reach} connected={}",
+                        ids.len(),
+                        run.connected[pi]
+                    );
+                    for &v in ids {
+                        let n = &g.nodes[v as usize];
+                        let (x, y) = node_xy(g, tracks, v);
+                        let r = topo.adj_start[v as usize] as usize
+                            ..topo.adj_start[v as usize + 1] as usize;
+                        let mut cls = [0usize; 3];
+                        for &e in &topo.adj_eidx[r.clone()] {
+                            let c = if e < e_plane {
+                                0
+                            } else if e < v_plane {
+                                1
+                            } else {
+                                2
+                            };
+                            cls[c] += 1;
+                        }
+                        eprintln!(
+                            "DBG   node l={} ({x},{y}) edges={} via={} relax={} seen={}",
+                            n.layer.0, cls[0], cls[1], cls[2], seen[v as usize]
+                        );
+                        for pos in r {
+                            let e = topo.adj_eidx[pos];
+                            if e < v_plane {
+                                continue;
+                            }
+                            let to = topo.adj_to[pos];
+                            let tn = &g.nodes[to as usize];
+                            let (tx, ty) = node_xy(g, tracks, to);
+                            let rv = &topo.relax[(e - v_plane) as usize];
+                            eprintln!(
+                                "DBG     relax to l={} ({tx},{ty}) via ({},{}) seen={}",
+                                tn.layer.0, rv.x, rv.y, seen[to as usize]
+                            );
+                            let tr = topo.adj_start[to as usize] as usize
+                                ..topo.adj_start[to as usize + 1] as usize;
+                            let mut tc = [0usize; 3];
+                            for &e2 in &topo.adj_eidx[tr.clone()] {
+                                tc[if e2 < e_plane {
+                                    0
+                                } else if e2 < v_plane {
+                                    1
+                                } else {
+                                    2
+                                }] += 1;
+                            }
+                            eprintln!("DBG       target edges={} via={} relax={}", tc[0], tc[1], tc[2]);
+                            for pos2 in tr {
+                                let e2 = topo.adj_eidx[pos2];
+                                let t2 = topo.adj_to[pos2];
+                                let n2 = &g.nodes[t2 as usize];
+                                let (x2, y2) = node_xy(g, tracks, t2);
+                                eprintln!(
+                                    "DBG       arc cls={} to l={} ({x2},{y2}) seen={}",
+                                    if e2 < e_plane {
+                                        0
+                                    } else if e2 < v_plane {
+                                        1
+                                    } else {
+                                        2
+                                    },
+                                    n2.layer.0,
+                                    seen[t2 as usize]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             return fail(
                 ordered_pins(&run.connected),
                 ordered_failed(&run.connected, &topo.attachable),
@@ -1502,10 +1732,12 @@ fn route_one_net(
     // the single-axis stub closing the gap (the node's x or y lies
     // inside the rect's covered range by `project_attach`
     // construction, so the stub is always axis-aligned).
+    let mut stub_blocked: Vec<u32> = Vec::new();
     for (pi, &(pin, _)) in g.pin_nodes.iter().enumerate() {
         if !run.connected[pi] || !topo.projected[pi] {
             continue;
         }
+        let mut legal = false;
         'shapes: for &(lid, r) in &pin_shapes(db, tech, pin) {
             for &v in &topo.attach[pi] {
                 if g.nodes[v as usize].layer != lid || !run.in_tree[v as usize] {
@@ -1513,26 +1745,67 @@ fn route_one_net(
                 }
                 let (x, y) = node_xy(g, tracks, v);
                 let (cx, cy) = (x.clamp(r.xl, r.xh), y.clamp(r.yl, r.yh));
+                // The access stub is committed metal: on a masked
+                // layer it must stay inside this net's own pin
+                // cover — a stub through uncovered hull is the exact
+                // class the mask exists to kill, so the candidate is
+                // skipped rather than emitted (admission in
+                // `project_attach` pre-filters; this is the guard).
                 if x == cx {
                     if y != cy {
+                        if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
+                            continue;
+                        }
                         vlines
                             .entry((lid.0, x))
                             .or_default()
                             .push((cy.min(y), cy.max(y)));
                     }
+                    legal = true;
                     break 'shapes;
                 }
                 if y == cy {
-                    hlines
-                        .entry((lid.0, y))
-                        .or_default()
-                        .push((cx.min(x), cx.max(x)));
+                    if x != cx {
+                        if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
+                            continue;
+                        }
+                        hlines
+                            .entry((lid.0, y))
+                            .or_default()
+                            .push((cx.min(x), cx.max(x)));
+                    }
+                    legal = true;
                     break 'shapes;
                 }
                 // This node is not adjacent to this shape — another
                 // of the pin's shapes produced it.
             }
         }
+        if !legal {
+            stub_blocked.push(pi as u32);
+        }
+    }
+    // A connected pin whose every access stub violated hull
+    // confinement is unattachable-in-fact: the net lands in the
+    // unrouted report with the pin named, and `route_nets` records
+    // it in `stub_outside_cover`.
+    if !stub_blocked.is_empty() {
+        let mut attachable = topo.attachable.clone();
+        for &pi in &stub_blocked {
+            run.connected[pi as usize] = false;
+            attachable[pi as usize] = false;
+        }
+        return NetOutcome::Failed {
+            unrouted: UnroutedNet {
+                net: g.net,
+                connected: ordered_pins(&run.connected),
+                failed: ordered_failed(&run.connected, &attachable),
+            },
+            stub_blocked: stub_blocked
+                .iter()
+                .map(|&pi| g.pin_nodes[pi as usize].0)
+                .collect(),
+        };
     }
     let mut wires: Vec<WireSeg> = Vec::new();
     let mut emit = |l: u8, t: i32, mut ivs: Vec<(i32, i32)>, vertical: bool| {
@@ -1827,7 +2100,12 @@ fn patch_component(
                 occ.scan_wire(pref, l, line_at(line), c, d, &mut hits);
                 if !hits
                     .iter()
-                    .all(|h| matches!(h.iv.who, Occupant::Net(m) | Occupant::Pin(m) if m == own))
+                    .all(|h| {
+                        matches!(
+                            h.iv.who,
+                            Occupant::Net(m) | Occupant::Pin(m) | Occupant::ObsPin(m) if m == own
+                        )
+                    })
                 {
                     break;
                 }
@@ -2000,6 +2278,7 @@ pub fn route_nets(
     let timing = std::env::var_os("GRUS_DRT_TIMING").is_some();
     let t0 = std::time::Instant::now();
     let n = graphs.nets.len();
+    let hull = HullMask::new(db, tech);
     let mut occ = Occupancy::new(tech);
     premark_obs(db, tech, tracks, &mut occ);
     if timing {
@@ -2012,7 +2291,7 @@ pub fn route_nets(
     let topos: Vec<NetTopo> = graphs
         .nets
         .iter()
-        .map(|g| NetTopo::new(db, tech, tracks, g, vias))
+        .map(|g| NetTopo::new(db, tech, tracks, g, vias, &hull))
         .collect();
     if timing {
         eprintln!("drt: topos {:?}", t1.elapsed());
@@ -2032,6 +2311,7 @@ pub fn route_nets(
 
     let cap = cfg.max_iters.max(1);
     let mut it = 0u32;
+    let mut stub_outside_cover: Vec<(NetId, PinId)> = Vec::new();
     while it < cap && !bad.is_empty() {
         it += 1;
         iterations = it;
@@ -2042,8 +2322,9 @@ pub fn route_nets(
         for (bi, &i) in bad.iter().enumerate() {
             let g = &graphs.nets[i];
             let tn = std::time::Instant::now();
-            match route_one_net(db, tech, tracks, g, &topos[i], vias, &occ, hist[i], hard, cfg.occ)
-            {
+            match route_one_net(
+                db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i], hard, cfg.occ,
+            ) {
                 NetOutcome::Routed(route, hits) => {
                     commit_route(&mut occ, tracks, vias, &route, &mut marks[i]);
                     if !hard && cfg.occ == OccMode::Enabled {
@@ -2051,7 +2332,15 @@ pub fn route_nets(
                     }
                     routes[i] = Some(route);
                 }
-                NetOutcome::Failed(u) => failed.push((i, u)),
+                NetOutcome::Failed {
+                    unrouted,
+                    stub_blocked,
+                } => {
+                    for &p in &stub_blocked {
+                        stub_outside_cover.push((g.net, p));
+                    }
+                    failed.push((i, unrouted));
+                }
             }
             if timing {
                 let el = tn.elapsed();
@@ -2137,6 +2426,11 @@ pub fn route_nets(
         );
     }
 
+    // One entry per (net, pin) — a net re-queued across iterations
+    // can re-report the same blocked pin.
+    stub_outside_cover.sort_unstable();
+    stub_outside_cover.dedup();
+
     let nets: Vec<NetRoute> = routes.into_iter().flatten().collect();
     RouteDb {
         collisions: if cfg.occ == OccMode::Enabled {
@@ -2149,6 +2443,7 @@ pub fn route_nets(
         iterations,
         area_patches,
         area_residuals,
+        stub_outside_cover,
     }
 }
 
@@ -2260,6 +2555,11 @@ pub fn route_digest(routed: &RouteDb) -> u64 {
         put(c.lo as u32);
         put(c.hi as u32);
     }
+    put(routed.stub_outside_cover.len() as u32);
+    for (n, p) in &routed.stub_outside_cover {
+        put(n.0);
+        put(p.0);
+    }
     put(routed.iterations);
     xxh3_64(&buf)
 }
@@ -2279,8 +2579,9 @@ mod tests {
 
     fn toy_tech_area(area_dbu2: i64) -> TechDb {
         let mut tech = TechDb::new();
+        let name = tech.strings.intern("li1");
         tech.routing_layers.push(RoutingLayer {
-            name: SymbolId(0),
+            name,
             dir: LayerDir::Horizontal,
             pitch_dbu: 340,
             width_dbu: 140,
@@ -2441,11 +2742,15 @@ mod tests {
         // x-lines at the adjacent y-line; the same x-lines two rows
         // away are out of the pin's neighborhood.
         let shapes = vec![(LayerId(0), RectDbu::new(1900, 3100, 3100, 3400))];
-        let got = project_attach(&g, &shapes, &tracks);
+        let db = DesignDb::new();
+        let tech = toy_tech();
+        let mask = HullMask::new(&db, &tech);
+        let cover = PinCover::new();
+        let got = project_attach(&g, &shapes, &tracks, &mask, &cover);
         assert_eq!(got, vec![3, 4], "nodes adjacent to the pin on covered lines");
         // No covered track at all → Unattachable (empty set).
         let shapes = vec![(LayerId(0), RectDbu::new(150, 3100, 250, 3400))];
-        assert!(project_attach(&g, &shapes, &tracks).is_empty());
+        assert!(project_attach(&g, &shapes, &tracks, &mask, &cover).is_empty());
     }
 
     #[test]
@@ -2558,9 +2863,10 @@ mod tests {
 
         let occ = Occupancy::new(&tech);
         let cfg = MazeConfig::default();
-        let topo = NetTopo::new(&db, &tech, &tracks, &g, &vias);
+        let mask = HullMask::new(&db, &tech);
+        let topo = NetTopo::new(&db, &tech, &tracks, &g, &vias, &mask);
         let outcome = route_one_net(
-            &db, &tech, &tracks, &g, &topo, &vias, &occ, 0, false, cfg.occ,
+            &db, &tech, &tracks, &g, &topo, &vias, &occ, &mask, 0, false, cfg.occ,
         );
         let NetOutcome::Routed(route, _) = outcome else {
             panic!("square must route");

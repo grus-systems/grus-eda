@@ -2052,7 +2052,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             println!("== drt emit: {} ==", design_db.design_name);
             println!(
                 "guided={} routed={} unrouted={} projected={projected} collisions={} \
-                 area_patches={} area_residuals={} iterations={} route_ms={:.0}",
+                 area_patches={} area_residuals={} iterations={} route_ms={:.0} hull_masked={}",
                 join.nets.len(),
                 report.routed,
                 report.unrouted.len(),
@@ -2061,9 +2061,26 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 route_db.area_residuals.len(),
                 route_db.iterations,
                 elapsed_route_ms,
+                graphs.hull_masked.iter().sum::<usize>(),
             );
             for name in &report.unrouted {
                 println!("  unrouted {name}");
+            }
+            for &(net, pin) in &route_db.stub_outside_cover {
+                let pname = design_db
+                    .strings
+                    .resolve(design_db.pin_names[pin.0 as usize]);
+                let label = match design_db.pin_cells[pin.0 as usize] {
+                    Some(c) => format!(
+                        "{}/{pname}",
+                        design_db.strings.resolve(design_db.cell_names[c.0 as usize])
+                    ),
+                    None => pname.to_string(),
+                };
+                println!(
+                    "  stub_outside_cover {} {label}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, net),
+                );
             }
             for r in &route_db.area_residuals {
                 println!(

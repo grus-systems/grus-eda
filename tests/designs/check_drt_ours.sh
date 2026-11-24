@@ -831,9 +831,20 @@ ref_by_id, ref_uncl = count_by_id(routed_ref_per_rule)
 # Rendered names the committed taxonomy cannot classify: on a clean
 # DEF this set never fires (Magic's generic overlap/abutment messages
 # have no tech-file rule id, so the deck extraction never saw them).
-# On ours they do fire — real findings, so they are recorded with
-# per-input counts instead of aborting the assembly.
+# Exactly two such names exist — Magic's built-in hierarchy-boundary
+# messages (drcOverlapCookie / drcSubcellCookie literals). They stay
+# recorded with per-input counts (the gate asserts `ours == 0`
+# post-fix), but any *new* unclassified name is a deck change or a new
+# violation class — abort loudly rather than grow the set silently.
+ALLOWED_UNCLASSIFIED = {
+    "Can't overlap those layers",
+    "This layer can't abut or partially overlap between subcells",
+}
 unclassified_names = sorted(set(ours_uncl) | set(placed_uncl) | set(ref_uncl))
+new_uncl = sorted(set(unclassified_names) - ALLOWED_UNCLASSIFIED)
+if new_uncl:
+    fail(f"unclassified Magic rule names outside the pinned allowlist: "
+         f"{new_uncl}")
 unclassified_fired = [
     {
         "name": name,
@@ -907,6 +918,7 @@ ours_router = {
     "collisions": None,
     "area_patches": None,
     "area_residuals": None,
+    "hull_masked": None,
 }
 if ours_router["emit_log_present"]:
     elog = open(emit_log_abs).read()
@@ -916,14 +928,21 @@ if ours_router["emit_log_present"]:
         if (s.startswith("== drt emit") or s.startswith("guided=")
                 or s.lstrip().startswith("unrouted ")
                 or s.lstrip().startswith("area_residual ")
-                or s.startswith("self_drc")
-                or s.startswith("wrote routed DEF")):
+                or s.lstrip().startswith("stub_outside_cover ")
+                or s.startswith("self_drc")):
             cli.append(s)
+    # The golden must byte-reproduce on any checkout: the `wrote routed
+    # DEF` line is dropped above (checkout-absolute path, redundant with
+    # `input_def`), and any other path-bearing line slipping into the
+    # keep-list is a loud failure, not a committed diff.
+    if any(re.search(r"(?<![A-Za-z_.])/", ln) for ln in cli):
+        fail("cli_lines carries an absolute path — golden would not "
+             "byte-reproduce")
     ours_router["cli_lines"] = cli
     mg = re.search(
         r"^guided=(\d+) routed=(\d+) unrouted=(\d+) projected=(\d+) "
         r"collisions=(\d+) area_patches=(\d+) area_residuals=(\d+) "
-        r"iterations=(\d+) route_ms=(\d+)", elog, re.M)
+        r"iterations=(\d+) route_ms=(\d+) hull_masked=(\d+)", elog, re.M)
     if mg is None:
         fail("emit log present but its guided= census line is missing")
     ours_router["routed"] = int(mg.group(2))
@@ -931,6 +950,7 @@ if ours_router["emit_log_present"]:
     ours_router["collisions"] = int(mg.group(5))
     ours_router["area_patches"] = int(mg.group(6))
     ours_router["area_residuals"] = int(mg.group(7))
+    ours_router["hull_masked"] = int(mg.group(10))
     ours_router["unrouted"] = re.findall(r"^\s+unrouted (\S+)$", elog, re.M)
 
 # ---------- sanity control -------------------------------------------
