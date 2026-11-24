@@ -9565,15 +9565,22 @@ drt emit` 6/6, 1 ignored). Census deltas vs `delegated`/`baseline`
 unchanged from the v0.12.5 entry (wirelength ours 7,153.025 µm vs
 delegated 6,046.305).
 
-**picorv32 re-run detached**: `cargo test --release -p grus-core
---test drt test_emit_selfdrc_picorv32 -- --ignored --nocapture`,
-started 2026-11-24T03:45Z, stdout `/tmp/emit-picorv32-patch.log` —
-route ≈135 min release CPU + emit + parse + `run_all`. The gate
-verdict is the patch's real test: the 42 `*.6` findings should map
-to `area_residuals` rows (and drop toward zero on whatever the
-walk could lift), with `area_patches`/`area_residuals` counted in
-the census line. In flight at this entry's write; outcome appends
-below when the log lands.
+**picorv32 re-run verdict** (completed on the `mini` remote, Apple
+M4, 5,514.82 s wall — the M1-Pro attempt was killed during the
+offload move): `routed=6628 unrouted=116 wire_rects=52184
+vias=38147 wirelength_dbu=375923150 area_patches=39
+area_residuals=3`. self-DRC `findings_total=3`, all `li.6` at
+measured 28,900 &lt; bound 56,100 — i.e. the walk lifted 39 of the
+42 `*.6` findings and the 3 it could not reach are **named
+residuals, not hidden**: `_02450_` (375965,337705), `_02905_`
+(427485,337705), `_04490_` (208525,227885), each a minimum-size
+island with no in-region node to extend over. `unrouted=116`
+unchanged — the patch touches only drawn geometry, not routing.
+The ignored test stays red at `findings_total=0`: those 3 li.6
+residuals are the open named item (candidates: merge the stub into
+a same-net component, or stop emitting the disconnected stub at
+all — being re-measured under the e6-drt-e2e hull model which
+changes the occupancy these stubs land in).
 
 **Checks run**: the 5 fixtures + `cargo test -p grus-core --lib
 drt` (20/20), `cargo test --workspace`, `cargo clippy --workspace
