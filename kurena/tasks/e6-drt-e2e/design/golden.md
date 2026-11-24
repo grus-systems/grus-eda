@@ -1,7 +1,8 @@
-# e6-drt-e2e — `<d>.drt.ours.reference.json` schema (r3)
+# e6-drt-e2e — `<d>.drt.ours.reference.json` schema (r4)
 
 Emitted by `check_drt_ours.sh` step E inside the pinned container;
-committed for both designs. `json.dump(indent=2) + "\n"` — the file
+committed per design (picorv32 deferred — `steps.md` §D).
+`json.dump(indent=2) + "\n"` — the file
 must byte-reproduce across checkouts, so nothing in it may carry an
 absolute path or wall-clock field. Fields exempt from
 byte-reproduction by construction (recorded, not asserted):
@@ -42,13 +43,18 @@ non-null/non-empty, not its value), `input_def_sha_prefix`,
                  "unrouted_kinds NoPath=… Unattachable=…",
                  "unrouted_blockers l1Obs=… l1Net=…",
                  "  unrouted <name>", "  area_residual …",
+                 "  notch_residual <net> <layer> a=… b=…",
+                 "  hole_residual <net> <layer> area=… bound=… region=…",
                  "  stub_outside_cover <net> <pin>",
-                 "self_drc findings_total=0", "self_drc scope: …" ],
+                 "self_drc findings_total=<n>", "self_drc scope: …",
+                 "  rule=<id> family=… layer=… findings=<n>",
+                 "    <rule-id> [x,y,x,y] … bound=… nets=…" ],
   "routed": n, "unrouted_count": n, "unrouted": ["…"],
   "unrouted_kinds": {"NoPath": n, "Unattachable": n},
   "unrouted_blockers": {"l1Obs": n, "l1Net": n, "l2Net": n} | null,
   "collisions": n, "area_patches": n, "area_residuals": n,
-  "hull_masked": n, "notch_fills": n
+  "hull_masked": n, "notch_fills": n,
+  "notch_residuals": n, "hole_residuals": n
 }
 ```
 
@@ -73,9 +79,19 @@ Field semantics:
   access model). Target empty post-recovery; the gate asserts every
   entry's net appears in `unrouted` (`gate.md`).
 - `hull_masked` — nodes removed per mask; `> 0` is a gate assertion.
-- `notch_fills` — self-spacing fill rects emitted (new field,
-  appended to the `guided=` census line — `self-spacing.md`;
-  recorded `>= 0`, never a target to optimize toward).
+- `notch_fills` — self-spacing fill rects emitted (appended to the
+  `guided=` census line — `self-spacing.md`; recorded `>= 0`, never
+  a target to optimize toward). Post-dedup (`residuals.md` §1) it
+  counts distinct rects — a drop vs the pre-dedup 296 is the bugfix,
+  not an optimization.
+- `notch_residuals` / `hole_residuals` — counts of the
+  `notch_residual` / `hole_residual` evidence lines (r4 — the
+  residual classes `residuals.md` §4/§3; the gate cross-asserts each
+  count against its own `cli_lines` rows so no residual can exist
+  un-named).
+- `  rule=<id> …` / `    <rule-id> […]` self-DRC detail lines in
+  `cli_lines` (r4 keep-list extension) — the emit's own site-level
+  evidence for anything Magic also flags (`residuals.md` §5).
 
 ## `openroad`
 
@@ -94,7 +110,10 @@ as a missing check). Antenna fields mirror the baseline variant's.
   `count_flat == 0` in docs — the gate reads `lef_expressible` /
   `per_rule` only (E7 counting-surfaces lesson).
 - `per_rule` — raw rendered `drc listall why` name → count on ours.
-- `lef_expressible` — the full 50-rule-id map, explicit zeros:
+- `lef_expressible` — the full 50-rule-id map, explicit entries
+  (r4: `ours` may be nonzero on a `PINNED_LEF_RESIDUALS` rule —
+  `gate.md`; every nonzero `ours` maps to a named site per
+  `residuals.md` §5):
 
   ```json
   "li.3": {"ours": 0, "placed": 0, "routed_ref": 0, "inherited": true}
@@ -145,6 +164,6 @@ the one expected change; record the current digest, don't gate on it.
 ## Files
 
 - `tests/designs/gcd/gcd.drt.ours.reference.json` (committed)
-- `tests/designs/picorv32/picorv32.drt.ours.reference.json` (committed)
+- `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred — `steps.md` §D)
 - `tests/designs/gcd/gcd.drt.ours.routed.def` (committed, <1 MB)
 - `tests/designs/check_drt_ours.sh` (emitter)

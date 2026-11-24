@@ -1,100 +1,113 @@
-# e6-drt-e2e — steps (r3, from checkpoint 4c5e2cb)
+# e6-drt-e2e — steps (r4, from checkpoint b372d5e)
 
-Scripts landed, mask model landed, WIP measurement committed. Order
-is the memo's: fix emit geometry until Magic reads clean, then
-recover connectivity, then finish the pipeline. Each leg re-runs
-the container check and records the delta — a step is done when its
-measured number moves, not when code compiles.
+Scripts landed, mask model landed, self-spacing closure + union-exact
+cover + `RECT` emission landed, routed DEF regenerated and committed.
+**The golden was never re-measured** — the committed
+`gcd.drt.ours.reference.json` still reads the pre-fix 514 against a
+superseded DEF sha. This revision is verification-completion in the
+memo order: close the three evidenced residual classes, re-emit,
+measure in-container, pin, document, gate.
 
 Container: image `ghcr.io/librelane/librelane:3.0.16` is cached
 locally; start `colima start --memory 12 --cpu 8` if the daemon is
-down. Probe artifacts from the root-cause work (`who*.tcl`,
+down. Probe artifacts from the r3 root-cause work (`who*.tcl`,
 `region.mag`, `gcd.whofix.def` in `tests/designs/gcd/runs/drt-ours/`)
-are in the gitignored runs dir — keep for reference, they carry no
-commit obligation; note their existence in `docs/results.md` so the
-evidence trail is reproducible.
+are in the gitignored runs dir — keep for reference; name them in
+`docs/results.md` so the evidence trail is reproducible.
 
-## A. Same-net self-spacing closure + met1 confinement (`self-spacing.md`)
+## A. Bounded residual closure (`residuals.md`) — no container needed
 
-1. Union-exact pin cover in `graph.rs`: merge each cell's cover
-   rects into components (overlap-chain); `rect_allowed`/`seg_allowed`
-   covered-part test = residual-empty after `rect_minus` over the
-   cell's cover union.
-2. Closure pass in `route_one_net` extraction (after hlines/vlines/
-   vplaced merge + pin attach, before `NetOutcome::Routed`): per
-   layer, pairwise facing-edge disjointness < `s_l`; fill = gap-span
-   rect (±1 into prongs) admitted iff `occ.scan_rect`+`exempt_obs`
-   clean and `rect_allowed` passes; iterate to fixpoint; emit via
-   new `NetRoute.fills` → `NetGeom.rects` → `RECT` DEF records;
-   rasterize in `commit_route`. Fallback: reject the emitting
-   access/stub element, next candidate (`self-spacing.md` Rule B).
-3. Assert pin-touch paint ⊆ cover-union on masked layers (mcon +
-   pin-side stub) — Rule A's cheap half; transit stays host-open
-   `≥ s` (no change needed — occupancy already enforces).
-4. `notch_fills=<n>` appended to the `guided=` census line; script
-   regex + `ours_router` field (`scripts.md`).
-5. Re-emit gcd + `check_drt_ours.sh` → target `lef_expressible`
-   ours == placed on all 50 rules (i.e. met1.2/met2.2 → 0). Any
-   residual site gets the `drc why` + flattened-dump treatment;
-   the strict-confinement escalation (`self-spacing.md`) is the
-   named next rung, not a parallel attempt.
-6. `cargo test --workspace` between legs; re-pin digests only to
-   measured values.
+All three fixes are evidenced in the committed DEF/emit log; each
+lands with a unit fixture or an existing-test re-pin, and the emit
+is re-measured by self-DRC (`grus-eda drt --self-drc`, seconds) —
+not Magic — before touching the container.
 
-## B. Access-model expansion (`pin-access.md`)
+1. **Fill dedup** (`residuals.md` §1): `fills` deduplicated before
+   commit; `notch_fills` re-counts. Fixture: collinear three-piece
+   notch → one fill.
+2. **Patch same-net guard** (`residuals.md` §2): confirm `_007_` is
+   the `area_patches=1` net (temporary instrumentation or
+   edge-coordinate match); `patch_component` admission then requires
+   merge-or-`≥ s` vs the net's own other components. If the site is
+   *not* the patch, chase the secondary suspect (non-default via
+   candidate scan) — the site must be attributed either way.
+3. **Void-closure pass** (`residuals.md` §3): `enclosed_voids` over
+   committed pieces + fills per layer, under-`min_enclosed_area`
+   voids filled all-or-nothing under the existing admission scans;
+   unfillable → `route_db.hole_residuals` + `  hole_residual` line.
+4. **Census contract** (`scripts.md`): `guided=` gains
+   `notch_residuals=<n>` (and `hole_residuals=<n>` if §3 ships);
+   emit binary and check-script regex land in the same change
+   (version-locked). Keep-list gains the self-DRC `rule=` + site
+   lines so `cli_lines` carries residual evidence.
+5. `_099_` re-check (`residuals.md` §4): if the residual line
+   persists after 1–3, it is the pinned named residual — record the
+   blocking class once (occupancy probe or `drc why`), no reroute.
+6. `cargo test --workspace` between legs; existing tests that pin
+   pre-fix geometry re-pin to measured values only (`gate.md` §4).
 
-7. Land rungs A1–A4 in order, re-emit after each, record `unrouted`,
-   `unrouted_kinds`, `unrouted_blockers`, `stub_outside_cover` per
-   rung in `docs/results.md`. Stop when `unrouted` is empty or the
-   residual is provably unattachable (named per net + blocking class).
-8. `stub_outside_cover` code comment updated to the r3 semantics
-   (`golden.md`); the emit keeps printing it.
+## B. Re-emit + quick gate
 
-## C. Golden + DEF commits (only when clean)
+7. `generate_drt_ours.sh gcd` → committed
+   `gcd.drt.ours.routed.def` regenerated (fills dedup'd, void fills
+   present, patch guard applied). `--verify` arm covers
+   byte-stability; the emit census goes into `docs/results.md`.
+8. `grus-eda drt --self-drc` on the new DEF: `findings_total`
+   target 0 or exactly the named residuals — anything else is an
+   unattributed site → §5 probe loop in `residuals.md` before the
+   container run (the fast local check is the iteration vehicle;
+   the container is the authority, not the iterator).
 
-9. `generate_drt_ours.sh gcd` → commit `gcd.drt.ours.routed.def` iff
-   the emit census reads clean (or unrouted == named residuals only).
-10. `check_drt_ours.sh gcd` in-container → `lef_expressible` all
-    `inherited`, `unclassified_fired` empty-or-pinned,
-    `sanity_control.new_rules_vs_clean` non-empty → commit
-    `gcd.drt.ours.reference.json`. **Never rebaseline** — a RED gate
-    is chased, not committed (the WIP 514 file is superseded, not
-    amended).
+## C. Container re-measure + golden commit
 
-## D. picorv32 leg
+9. `check_drt_ours.sh gcd` inside the pinned image →
+   `lef_expressible` per-rule ours/placed/routed_ref + `magic_only`
+   decomposition + `unclassified_fired` + `sanity_control`. Every
+   nonzero `ours` must map to a named site (`residuals.md` §5);
+   unexplained → `drc why` + flattened dump, root-cause, fix-or-name.
+10. Commit `gcd.drt.ours.reference.json` iff the outcome is
+    zero-or-named-residuals **and** `input_def_sha_prefix` matches
+    the committed DEF — the stale-514 file is superseded, not
+    amended. Never rebaseline: a RED gate is chased, not committed.
 
-11. `generate_drt_ours.sh picorv32` + `check_drt_ours.sh picorv32`
-    (the `[design]` arg path already exists; picorv32 DEF is not
-    committed per the existing comment). Commit
-    `picorv32.drt.ours.reference.json` iff clean or with residuals
-    named in `docs/results.md` (the `gate.md` #[ignore]d test takes
-    the pinned values).
+## D. picorv32 leg — deferred (r4 memo)
+
+11. `generate_drt_ours.sh picorv32` / `check_drt_ours.sh picorv32`
+    stay un-run this revision per the memo; `docs/results.md` states
+    the deferral explicitly (E0 rule: say what ran). The ignored
+    gate test keeps the schema joins ready (`gate.md` §3);
+    `picorv32.drt.ours.reference.json` is *not* committed — the
+    acceptance's "both designs" item is honestly open, flagged on
+    the card.
 
 ## E. Gate tests + docs + verify
 
-12. `drt.rs` additions per `gate.md`; restore `test_emit_roundtrip_gcd`.
-13. `docs/results.md` full dated entry (trajectory 3025→847→514→final,
-    root-cause narrative, rung-by-rung numbers, delta tables,
-    what-ran per E0 rule 9 — name partial reruns);
-    `docs/e6-drt.md` e2e section + §7 self-DRC scope correction;
-    `docs/status.md` + `docs/roadmap.md` E7-style honest line.
+12. `drt.rs` additions + re-pins per `gate.md`:
+    `test_e2e_ours_reference_gcd`, `test_e2e_ours_def_deterministic_gcd`,
+    `test_emit_roundtrip_gcd` unrouted pin, `test_emit_selfdrc_gcd`
+    firing pin, `PINNED_LEF_RESIDUALS` if any.
+13. `docs/results.md` full dated entry per `docs.md` (trajectory
+    ~3025 → 847 → 514 → final; the three-site decomposition with
+    mechanisms; unrouted 73→81 explained and all 81 named; the
+    `notch_fills` dedup'd count; delta tables; picorv32 deferral;
+    what-ran per E0 rule 9).
+    `docs/e6-drt.md` e2e section + self-DRC scope correction;
+    `docs/status.md` + `docs/roadmap.md` honest E6 line.
 14. `[workspace.package] version` bump in root `Cargo.toml` in the
-    same commit as the functional change (patch — bug-fix class).
-15. `cargo test --workspace` + `cargo clippy --workspace -- -D warnings`
-    clean before the card.
+    same commit as the functional change (`0.12.6` → patch —
+    repair/gate class).
+15. `cargo test --workspace` + `cargo clippy --workspace -- -D
+    warnings` clean before the card.
 
 ## Files
 
-- `crates/grus-core/src/drt/graph.rs`
 - `crates/grus-core/src/drt/maze.rs`
-- `crates/grus-core/src/drt/emit.rs`
 - `crates/grus-eda/src/main.rs`
 - `crates/grus-core/tests/drt.rs`
 - `tests/designs/check_drt_ours.sh`
 - `tests/designs/generate_drt_ours.sh`
 - `tests/designs/gcd/gcd.drt.ours.routed.def`
 - `tests/designs/gcd/gcd.drt.ours.reference.json`
-- `tests/designs/picorv32/picorv32.drt.ours.reference.json`
-- `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`,
-  `docs/roadmap.md`
+- `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred)
+- `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`, `docs/roadmap.md`
 - `Cargo.toml`

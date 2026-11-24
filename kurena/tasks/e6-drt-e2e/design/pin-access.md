@@ -1,5 +1,15 @@
 # e6-drt-e2e r3 — pin access / unrouted recovery
 
+> **r4 status — PARTIAL, remainder deferred.** A1 (union-cover
+> probing) and the A3 `ACCESS_K` 3→8 widening landed at `b372d5e`;
+> measured `unrouted` 73 → 81 (`NoPath` 57→45, `Unattachable` 33→57
+> — the closure's notch rejections push pins out, exactly the
+> interaction this file predicted). Per the r4 memo the remaining
+> rungs are not in this revision: the 81 nets are the ticket's named
+> connectivity residual (pinned in `gate.md`, listed in
+> `docs/results.md`). The ladder below stays documented for the
+> follow-up ticket.
+
 The connectivity bill: `unrouted=73` on gcd at `4c5e2cb`
 (`unrouted_kinds NoPath=57 Unattachable=33` — kinds overlap;
 `unrouted_blockers l1Obs=4 l1Net=48 l2Net=1`;

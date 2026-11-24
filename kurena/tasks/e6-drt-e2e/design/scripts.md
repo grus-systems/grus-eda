@@ -1,62 +1,70 @@
-# e6-drt-e2e — script deltas (r3)
+# e6-drt-e2e — script deltas (r4)
 
-Both scripts are committed on dev and stay — r3 changes are
-surgical, matching the "fix, don't rewrite" directive. The emit
-binary and check script are version-locked (the census-line contract
-below): they land in the same change.
+Both scripts are committed on dev and stay — changes are surgical,
+matching the "fix, don't rewrite" directive. The emit binary and
+check script are version-locked (the census-line contract below):
+they land in the same change.
 
 ## `tests/designs/check_drt_ours.sh`
 
-Landed at `4c5e2cb` (already in the WIP golden): `unrouted_kinds` /
-`unrouted_blockers` objects (non-empty `unrouted` without kinds is
-`fail`, not `null`), `cli_lines` absolute-path guard, `unrouted` /
-`stub_outside_cover` / `area_residual` keep-list, pinned
-`ALLOWED_UNCLASSIFIED` two-name + abort, `sanity_control` block,
-`hull_masked` field, `[design]` arg defaulting to gcd.
+Landed at `4c5e2cb` + `b372d5e` (already in the emit contract):
+`unrouted_kinds` / `unrouted_blockers` objects (non-empty `unrouted`
+without kinds is `fail`, not `null`), `cli_lines` absolute-path
+guard, `unrouted` / `stub_outside_cover` / `area_residual` /
+`notch_residual` keep-list, pinned `ALLOWED_UNCLASSIFIED` two-name +
+abort, `sanity_control` block, `hull_masked` + `notch_fills` fields
+(`guided=` regex requires `notch_fills=` — version-locked),
+`[design]` arg defaulting to gcd.
 
-r3 delta — one parse + one field:
+r4 delta — census tokens, residual fields, evidence keep-list:
 
-- The `guided=` census line gains `notch_fills=<n>` (appended after
-  `hull_masked=` — the anchored regex keeps matching the prefix;
-  extend it anyway so the golden parses, not just survives).
-  `ours_router.notch_fills: int` added to `golden.md`'s schema.
-  An emit log without the token → `fail` (version-locked), same
-  rule as `unrouted_kinds`.
-- `def_metrics`: if the wire-segment parser counts routed pieces,
-  teach it `RECT ( dx dy dx dy )` statements exist and are paint
-  (perimeter paint, not wire-length contributions and not vias) —
-  delegated's reference DEF already emits them, so the baseline
-  parser should already treat them; verify the ours-side parser does
-  the same rather than double-counting.
+- `guided=` gains `notch_residuals=<n>` and (with `residuals.md` §3)
+  `hole_residuals=<n>`, appended after `notch_fills=` — the anchored
+  regex is extended for both tokens; an emit log without them →
+  `fail` (version lock, same rule as `notch_fills`). Golden fields
+  `ours_router.notch_residuals` / `ours_router.hole_residuals` per
+  `golden.md`.
+- `hole_residual` added to the `cli_lines` keep-list (r4 residual
+  class — `residuals.md` §3).
+- Keep-list gains the self-DRC detail lines (`  rule=<id> family=…`
+  + `    <rule-id> [bbox] …`) so `cli_lines` carries the emit's own
+  site evidence alongside `self_drc findings_total=` — the gate and
+  `docs/results.md` cross-name residuals from it (`residuals.md` §5).
+- `def_metrics`: verify the wire-segment parser treats `RECT
+  ( dx dy dx dy )` records as paint, not wire-length or vias — the
+  delegated reference DEF already emits them, so the ours-side
+  parser should match; fix only if it double-counts.
 - No change to the pinned allowlist, sanity control, or Magic
   invocation blocks.
 
 ## `tests/designs/generate_drt_ours.sh`
 
 No functional delta — it just runs `grus-eda drt`. The emit's new
-geometry (`RECT` fills, wider `access_vias` candidates) flows through
-it unchanged; the `--verify` double-emit arm still covers
-determinism.
+geometry (`RECT` fills — deduplicated, void fills) flows through it
+unchanged; the `--verify` double-emit arm still covers determinism.
 
 ## `crates/grus-eda/src/main.rs` (emit side of the contract)
 
-- `guided=` census line: append `notch_fills=<total>` (sum over
-  routed nets' `NetRoute.fills.len()`).
-- `stub_outside_cover` comment updated: "pins that got no legal
-  paint — the Unattachable census" (r3 semantics; the "should be
-  empty" framing is gone — `pin-access.md`).
+- `guided=` census line: append `notch_residuals=<n>`
+  (`route_db.notch_residuals.len()`) and `hole_residuals=<n>` once
+  `route_db.hole_residuals` exists (`residuals.md` §3) — same
+  version-lock: both sides land together.
+- `  hole_residual <net> <layer> area=… bound=… region=…` print per
+  unfillable under-bound void — the `area_residual` line convention.
+- `notch_fills=` semantics unchanged (sum over routed nets'
+  `NetRoute.fills.len()`) — post-dedup it is the true distinct-rect
+  count.
 - No other print changes: `unrouted_kinds`, `unrouted_blockers`,
-  `stub_outside_cover`, `area_residual` lines all keep their current
-  formats (the script's keep-list regexes already match them).
+  `notch_residual`, `stub_outside_cover`, `area_residual`,
+  `self_drc` lines keep their current formats.
 
 ## Probe scripts (no commit obligation)
 
 `tests/designs/gcd/runs/drt-ours/who1.tcl`–`who5.tcl` +
-`who1-who5.log`, `region.mag`, `gcd.whofix.def` — the root-cause
-probes (region anatomy, move-via causality) live in the gitignored
-runs dir. `docs/results.md` names them so the experiment is
-reproducible; they are not committed and the check script does not
-reference them.
+`who1-who5.log`, `region.mag`, `gcd.whofix.def` — the r3 root-cause
+probes live in the gitignored runs dir. `docs/results.md` names them
+so the experiment is reproducible; they are not committed and the
+check script does not reference them.
 
 ## Files
 

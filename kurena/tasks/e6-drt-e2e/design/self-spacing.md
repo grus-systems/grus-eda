@@ -1,5 +1,14 @@
 # e6-drt-e2e — same-net self-spacing (the measured residual class)
 
+> **r4 status — LANDED at `b372d5e`.** `close_self_spacing` +
+> `PaintSrc` provenance + `try_fill` shrink-retry + `RECT` emission +
+> `notch_fills`/`notch_residual` census all shipped; the routed DEF
+> was regenerated. What the emit's own diagnostics then surfaced —
+> duplicate fills, a fill-induced `met1.7` hole, one post-closure
+> `_007_` pair, one undroppable `_099_` residual — is the r4
+> residual work in `residuals.md`. This file stays as the r3
+> root-cause record.
+
 This file records the r3 root-cause measurement for the committed WIP
 goldens' remaining `lef_expressible` findings (`met1.2=740`,
 `met2.2=56` at `4c5e2cb`) and the fix it implies. **It corrects the
