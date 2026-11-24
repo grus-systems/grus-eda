@@ -1,117 +1,146 @@
-# e6-drt-e2e — steps (r5, from checkpoint fba5f85)
+# e6-drt-e2e — steps (r6, as-built at 0d113ba)
 
-Code landed, routed DEF committed (`sha256 1534c323855a6029`), the
-post-closure measurement ran at 20:07 — **but the golden JSON was
-never persisted**: the driver timed out between the Magic runs and
-step-E assembly, and `tests/designs/gcd/gcd.drt.ours.reference.json`
-in the worktree is byte-identical to the stale committed golden
-(`count_total=514`, `met1.2=740`, `met2.2=56`,
-`input_def_sha_prefix=6671d184`, `unrouted=73` — measured on a DEF
-that no longer exists). **Do not commit the file as it sits.** The
-317/`met1.2=32` numbers live only in the gitignored run logs
-(`ours_magic.log`, `placed_magic.log`, `broken_magic.log`,
-`antenna.log`, `mutation.json` — all 2026-11-24 20:07). This
-revision is finish-the-record in the memo order: attribute the 32,
-regenerate the golden via one fresh script run, close the test gap,
-document, commit.
+**All r5 steps landed.** This file is now the landed-step record plus
+the verify/diffreview checklist — the human memo confirms nothing is
+left to implement. Commit `0d113ba` carries the final hop on top of
+the `d8d0c6c`/`4c5e2cb`/`b372d5e`/`fba5f85` mechanism checkpoints.
 
-Container: image `ghcr.io/librelane/librelane:3.0.16` is cached
-locally; start `colima start --memory 12 --cpu 8` if the daemon is
-down. Probe artifacts live in the gitignored
-`tests/designs/gcd/runs/drt-ours/` dir (`who1`–`who5.tcl`,
-`region.mag`, `gcd_flat.mag` extraction from r3 — reuse the workdir).
+Container: image `ghcr.io/librelane/librelane:3.0.16` cached locally
+(`image_id sha256:02d50f259d483979e126ef188a50f5b61e1d285b9d538312f280b087439b0302`
+— recorded in the golden). Probe artifacts live in the gitignored
+`tests/designs/gcd/runs/drt-ours/` workdir (`who1`–`who7.tcl`,
+`region.mag`, `gcd_flat.mag`, mutation DEF).
 
-## A. met1.2 attribution (`met12-attribution.md`)
+## A. met1.2 attribution — LANDED (X3 arm fired, all 7 sites closed)
 
-1. Site table: **already decomposed** — 32 fragments → 7 sites
-   (`_099_` named + 6 fill-adjacent sites on `resp_val`, `_084_`,
-   `_131_`, `_122_`, `_070_`, `_066_`); per-site DEF anatomy is in
-   `met12-attribution.md` §1–§2. No re-parse needed.
-2. In-container `drc why` + flattened tile dump on **≥2 sites**
-   (D `_131_` — the D/F repeated y-band pattern — and E `_122_` —
-   different fragment shape): name the partner edge's owner + class
-   (X1–X4). `who6.tcl`+ convention; name the files in results.md.
-3. Decision per `met12-attribution.md` §4:
-   - **X3/X4 (closure gap)** → bounded fix (≤2 iterations): extend
-     the scan, add a unit fixture reproducing the site pattern,
-     re-emit, re-run `check_drt_ours.sh gcd`, regenerate the golden.
-     The 317 measurement is then superseded — record its numbers in
-     the trajectory, commit only the final measurement.
-   - **X1/X2 (invisible geometry)** → pin `("met1.2", measured)` in
-     `PINNED_LEF_RESIDUALS` with every site named; the §B golden
-     lands as measured.
-   - **Mixed** → fix first, then pin survivors.
+`met12-attribution.md`'s protocol ran: `who6.tcl` (site D — `_131_`
+inside `_338_` `a22o_2`) and `who7.tcl` (site E — `_122_` inside
+`_321_`, same cell) ran `drc why` + flattened tile dumps in-container.
+The partner edge was **our own fill paint, not foreign or invisible
+geometry** — every site classified **X3** (within-island notch our own
+scan produced), not X1/X2:
 
-## B. Golden regeneration
+- The `L1M1`/`M1M2_PR` met1 plates of one attach faced across a 5–15
+  DBU gap; the emitted `RECT` fill stopped 20–30 DBU **short of the
+  facing band** (e.g. `_131_`: fill emitted `(47436,25925)-(47451,26125)`
+  while the plates faced down to y=25895).
+- Root cause: `try_fill`'s mask branch decomposed the candidate gap
+  against `fin − cover_rects` blockers on *every* masked layer, but
+  met1 is `hull_host_open` — `rect_allowed` already admits the whole
+  member-hull interior there, so the li1 pin-cover rect must not carve
+  the fill. `if mask.host_open(l) { continue; }` skips the carve
+  (`maze.rs`); li1 stays cover-strict.
+- Post-fix `_131_` emits `(47436,25895)-(47451,26125)` — spans the
+  facing band. `met1.2` 32 → 0, `notch_fills` 221 → 343, the `_099_`
+  `notch_residual` closed by the same arm, `routed` 187 → 188 /
+  `unrouted` 82 → 81. `PINNED_LEF_RESIDUALS` is **empty** — no pin was
+  needed (the X1/X2 pin arm never fired).
 
-4. **Regenerate**: run `tests/designs/check_drt_ours.sh gcd` fresh in
-   the pinned image (steps A–E on the committed DEF — there is no
-   assemble-only arm, and a full run re-verifies the placed baseline
-   and the mutation control in the same pass). The committed script
-   is the only emitter of the golden — never hand-write the JSON.
-   If the rerun diffs from the 20:07 measurement (317 total,
-   `met1.2=32`, `routed=187 unrouted=82`) on the same DEF + image,
-   that diff is a finding to record in `docs/results.md`, not to
-   silently ship. If step E aborts, read its message — the
-   assembler's strict expectations name the real mismatch; fix the
-   flagged issue in the script, don't rewrite it.
-   This precedes the test work because §C's gate tests join against
-   the committed golden — running them against the stale file would
-   fail on the sha/count joins for the wrong reason.
+## B. Golden regeneration — LANDED
 
-## C. Test work (`gate.md`)
+One fresh full `check_drt_ours.sh gcd` run (steps A–E, no assemble-only
+arm exists) emitted the committed `gcd.drt.ours.reference.json` on the
+regenerated committed DEF — `input_def_sha_prefix=635f19a9aae86a44`
+matches `sha256(gcd.drt.ours.routed.def)`. It supersedes the 20:07
+`fba5f85` transcripts whose step-E output was lost to the driver
+timeout (recorded in `docs/results.md`). Never hand-edited, never
+rebaselined.
 
-5. Two maze.rs fixtures: `test_closure_reject_droppable`,
-   `test_closure_notch_residual` (the two uncovered arms).
-6. `drt.rs`: `load_ours_ref` helper + `PINNED_LEF_RESIDUALS`;
-   `test_e2e_ours_reference_gcd`; `test_e2e_ours_def_deterministic_gcd`
-   (byte-equal vs committed DEF); `test_emit_roundtrip_gcd` unrouted
-   → golden-join re-pin; `#[ignore]`d
-   `test_e2e_ours_reference_picorv32`.
-7. `cargo test --workspace` between legs; `generate_drt_ours.sh gcd
-   --verify` covers byte-stability script-side.
+## C. Test work — LANDED (`crates/grus-core/tests/drt.rs` + `maze.rs::tests`)
 
-## D. Golden commit
+- `load_ours_ref`/`load_drc_ref` helpers (`require`'d — loud failure,
+  never skip) + `magic_rule_id`/`j_*` extractors.
+- `ours_reference_gate(name)` — the shared join:
+  - `lef_expressible` key set == the `drc.reference.json`
+    `classification` `lef_expressible` subset (50 rules, derived not
+    constant); per rule strict `ours == placed`, or the
+    `PINNED_LEF_RESIDUALS` arm (`ours == pin && placed == 0`) —
+    currently empty; `inherited == (ours == placed)` asserted.
+  - `magic_only` every row `inherited`; `unclassified_fired` ⊆ the
+    two-name `ALLOWED_UNCLASSIFIED`; `sanity_control`
+    `violated_rules_in_checked_deck` + non-pinned `new_rules_vs_clean`
+    non-empty (vacuous-control guard).
+  - `ours_router`: `hull_masked > 0`; `notch_residuals` /
+    `hole_residuals` == their `cli_lines` evidence-line counts;
+    `unrouted` == its `cli_lines` set == `unrouted_count`;
+    `unrouted_kinds` sum ≥ `unrouted_count` (per-pin failures);
+    `unrouted_blockers` all-positive; `stub_outside_cover` lines ≥
+    `Unattachable` (records accumulate across iterations — `_165_`
+    re-attached, so ⊆-unrouted is wrong by construction).
+  - `openroad.drt_report_source == "not_applicable_native_router"`;
+    viability floor `signal_nets_routed == routed == in_def − unrouted`.
+- `test_e2e_ours_reference_gcd` — runs the gate.
+- `test_e2e_ours_def_deterministic_gcd` — fresh `emit_leg` +
+  `write_routed_def` byte-equals the committed DEF.
+- `test_emit_roundtrip_gcd` — re-pinned: `report.unrouted` (BTreeSet)
+  == golden `ours_router.unrouted` (the 82→81 drift names nets in the
+  failure, never a re-baselined count).
+- `test_emit_selfdrc_gcd` — strict: `findings` + `area_residuals` +
+  `notch_residuals` + `hole_residuals` all empty.
+- `test_closure_reject_droppable` / `test_closure_notch_residual` —
+  the two previously-uncovered closure arms (Reject on a droppable
+  `ProjStub` prong; named `NotchResidual` on undroppable
+  `Tree`/`PinShape` prongs over a walled gap).
+- `test_e2e_ours_reference_picorv32` — `#[ignore]`d, same joins.
 
-8. Commit `gcd.drt.ours.reference.json` iff every nonzero `ours`
-   maps to a named site **and** `input_def_sha_prefix` matches the
-   committed DEF (`1534c323855a6029` — re-verify if a fix re-emits).
-   Routed DEF is already committed at `fba5f85`; recommit only if
-   step 3's fix changes it. Never rebaseline.
+## D. Golden + DEF commit — LANDED
 
-## E. picorv32 leg — deferred (memo)
+`gcd.drt.ours.routed.def` regenerated post-fix and committed;
+`gcd.drt.ours.reference.json` committed with every `ours` count at 0
+or inherited — no pins needed, no unexplained counts.
 
-9. `generate_drt_ours.sh picorv32` / `check_drt_ours.sh picorv32`
-   stay un-run; `docs/results.md` states the deferral explicitly
-   (E0 rule 9). The `#[ignore]`d gate test keeps the joins ready;
-   `picorv32.drt.ours.reference.json` is *not* committed — the
-   acceptance's "both designs" item is honestly open, flagged on
-   the card.
+## E. picorv32 leg — DEFERRED (memo), honestly open
 
-## F. Docs + verify
+Un-run by design. No `picorv32.drt.ours.routed.def`, no golden;
+`docs/results.md` states the deferral; the `#[ignore]`d test fails
+loudly on `load_ours_ref` under `--ignored`. The acceptance's "both
+designs" item remains open — flagged on the card, not silently green.
 
-10. `docs/results.md` dated r3 entry per `docs.md` (trajectory
-    ~3025 → 847 → 514 → 317; 7-site table + probe record; 82 unrouted
-    named via the golden join; emit census verbatim; delta tables;
-    picorv32 deferral; what-ran per E0 rule 9).
-    `docs/e6-drt.md` e2e section + self-DRC scope correction;
-    `docs/status.md` + `docs/roadmap.md` honest E6 line.
-11. `[workspace.package] version` 0.12.6 → **patch bump** in root
-    `Cargo.toml` in the same commit as the functional change (any
-    X3/X4 fix or the gate/test work).
-12. `cargo test --workspace` + `cargo clippy --workspace
-    --all-targets -- -D warnings` clean before the card — expect the
-    baseline to be red first (`test_emit_roundtrip_gcd` asserts
-    `unrouted.is_empty()` against the measured 82; `gate.md` §4's
-    re-pin is the fix).
+## F. Docs + version — LANDED
 
-## Files
+- `docs/results.md` — dated 2026-11-24 entry: trajectory
+  ~3025 → 847 → 514 → 317 → 305/0, the X3 attribution record with
+  `who6/who7` probe names, gate table, connectivity record (81
+  unrouted named via the golden join, `stub_outside_cover` semantics
+  corrected — accumulated across iterations), comparison table with
+  the wirelength-rise explanation (fills unlocked → occupancy shift →
+  +1 routed net; fills are `RECT` paint, not wire), picorv32
+  deferral, full what-ran per E0 rule 9.
+- `docs/e6-drt.md` — new §9 e2e section (script → schema → gcd
+  outcome → gate tests) + §8 self-DRC scope correction (island-merge
+  blind spot = the measured met1.2 class).
+- `docs/status.md`, `docs/roadmap.md` — honest E6 line (unrouted=81
+  carried, no "fully routed" claim, deferral named).
+- `Cargo.toml` `0.12.6 → 0.12.7` (patch — bug fix) in the same commit.
 
-- `crates/grus-core/src/drt/maze.rs` (two fixtures; closure
-  extension only if X3/X4)
+## Verify / diffreview checklist (what remains)
+
+1. `cargo test --workspace` — expect green; the picorv32 leg stays
+   `#[ignore]`d (a `--ignored` run fails loudly on the missing
+   golden — that is the designed state, not a bug).
+2. `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+3. Golden-vs-DEF join: `sha256(gcd.drt.ours.routed.def)[:16]` ==
+   golden `input_def_sha_prefix` (`635f19a9aae86a44`) — verified in
+   planning; re-check in verify.
+4. Diff audit vs this design: `maze.rs` delta is the `host_open`
+   carve skip + `stub_outside_cover`/`stub_blocked` comment
+   corrections + `ClosureResult` `Debug` + two fixtures — nothing
+   else moved; `drt.rs` delta is additive gate/tests plus the two
+   re-pins; no mask/spacing/hard-block relaxation anywhere (the
+   non-goals audit).
+5. Golden audit vs `golden.md` schema: no absolute paths in
+   `cli_lines`, no wall-clock fields, `image_id` recorded not gated,
+   `count_flat` never claimed as a signal.
+6. `docs/results.md` numbers must equal the golden's (they were
+   transcribed from the same file) — spot-check the comparison table
+   against `delta.vs_*`.
+
+## Files (as actually touched at 0d113ba)
+
+- `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/tests/drt.rs`
 - `tests/designs/gcd/gcd.drt.ours.reference.json`
-- `tests/designs/gcd/gcd.drt.ours.routed.def` (only if a fix re-emits)
-- `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred)
+- `tests/designs/gcd/gcd.drt.ours.routed.def`
 - `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`, `docs/roadmap.md`
-- `Cargo.toml`
+- `Cargo.toml`, `Cargo.lock`
+- `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred — intentionally absent)

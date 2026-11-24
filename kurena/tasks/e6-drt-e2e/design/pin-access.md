@@ -14,6 +14,14 @@
 > more — `unrouted=82` (`NoPath=44 Unattachable=58`). The pin is the
 > golden's `ours_router.unrouted` list itself (`gate.md` §4 — a join,
 > not a literal), so the residual moves with re-measurement.
+>
+> **r6 final**: `unrouted=81` (`NoPath=46 Unattachable=52`,
+> `unrouted_blockers l0ObsPin=1 l1Obs=4 l1Net=39`) — the X3 fill fix
+> recovered one net. `stub_outside_cover` = 142 records accumulated
+> across rip-up iterations (`_165_` re-attached on a later pass — the
+> gate join is `stub_lines ≥ Unattachable`, not `⊆ unrouted`; the
+> `stub_outside_cover`/`stub_blocked` doc comments were corrected to
+> match at `0d113ba`). The 81 stay the named connectivity residual.
 
 The connectivity bill: `unrouted=73` on gcd at `4c5e2cb`
 (`unrouted_kinds NoPath=57 Unattachable=33` — kinds overlap;

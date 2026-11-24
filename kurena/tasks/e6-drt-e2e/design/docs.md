@@ -1,81 +1,73 @@
-# e6-drt-e2e — doc updates (r5)
+# e6-drt-e2e — doc updates (r6, landed at 0d113ba)
 
-All in `docs/`, written at the end of implementation with the final
-measured numbers — not pre-written claims.
+All docs below landed with the **final measured numbers** — the X3
+fix superseded the r5 pinned-residual draft (no `met1.2=32` entry
+exists in the committed docs).
 
-## `docs/results.md` — dated r3 entry
+## `docs/results.md` — dated 2026-11-24 entry (landed)
 
-Structure (E7-style, plus the fix trajectory):
+Structure as designed (E7-style, plus the fix trajectory):
 
-- **Trajectory line**: `lef_expressible` violations on our DEF
-  ~3025 (first contact) → 847 (`d8d0c6c` mask) → 514 (`4c5e2cb`
-  confinement WIP) → **317 total / `met1.2=32`** (`fba5f85`
-  self-spacing closure + residual fixes, measured in the pinned
-  image on the committed DEF `1534c323855a6029`). Each hop names
-  what landed and what was measured; the `fba5f85` emit census
-  (`routed=187 unrouted=82 notch_fills=221` dedup'd) recorded
-  verbatim.
-- **met1.2 site table** (`met12-attribution.md` §1 transcribed):
-  32 fragments → 7 sites — `_099_` (4, the named `notch_residual`
-  census site) + `resp_val`/`_084_`/`_131_`/`_122_`/`_070_`/`_066_`
-  (28, all adjacent to emitted met1 `RECT` fills). Probe record:
-  which sites `drc why` ran on, partner-edge class found
-  (X1–X4), the fix-or-pin outcome per site. Probe files named
-  (`runs/drt-ours/who6.tcl`+ — gitignored).
-- **Gate table** (final): per-rule `lef_expressible` ours vs placed
-  vs routed_ref — `PINNED_LEF_RESIDUALS` entries named per site;
-  `magic_only` decomposition (nwell rows all inherited);
-  `unclassified_fired` **empty** (the two first-contact names
-  closed by the fixes — record that, don't just omit);
-  `sanity_control` result (`met2.2` new-vs-clean).
-- **Comparison table**: `delta.vs_baseline`/`vs_delegated` —
-  wirelength (−48.5%/−49.4% restated "on the 187 routed nets", the
-  82 unrouted emit conns-only), per-cut via census, antenna counts,
-  signal nets routed; named outlier explanations.
-- **Connectivity record**: `unrouted` final list (82, named via the
-  golden's `ours_router.unrouted`) + `unrouted_kinds` (NoPath=44
-  Unattachable=58) + `unrouted_blockers` census +
-  `stub_outside_cover` state; `notch_fills=221` (dedup'd from 296 —
-  the dedup is recorded, the count is never a target);
-  `notch_residuals=1`/`hole_residuals=0`; `area_patches=1
-  area_residuals=0` (the `_007_`/`_055_` classes closed — name what
-  the §2/§3 fixes did).
-- **picorv32 deferral — explicit** (memo): the leg is un-run;
-  `picorv32.drt.ours.reference.json` is not committed; the ignored
-  gate test carries the schema joins for when the leg runs.
-- **What ran** (E0 rule 9): which script steps, which legs, which
-  container digest (`image_id` recorded), which probes, any partial
-  reruns named — record honestly that the post-closure measurement
-  ran at `fba5f85` (20:07, transcripts in `runs/drt-ours/`) but its
-  step-E output was lost to the driver timeout, so the committed
-  golden is emitted by a **fresh full `check_drt_ours.sh gcd` run**
-  on the committed DEF (or the post-fix run if attribution lands
-  X3/X4). `generate_drt_ours.sh gcd --verify` already demonstrated
-  byte-stability at `fba5f85` (`rerun.def` == committed DEF) — name
-  that executed arm.
+- **Trajectory**: `lef_expressible` findings on our DEF
+  ~3025 → 847 (`d8d0c6c` mask) → 514 (`4c5e2cb` confinement) →
+  317 merged regions / `met1.2`=32 (`fba5f85` closure + residuals,
+  DEF `1534c323855a6029`) → **305 merged regions / `lef_expressible`
+  = 0 on all 50 rules** (`0d113ba`, DEF `635f19a9aae86a44`). Emit
+  censuses recorded verbatim per hop.
+- **met1.2 attribution record**: the 7-site table transcribed
+  (`_099_` + `resp_val`/`_084_`/`_131_`/`_122_`/`_070_`/`_066_`), the
+  `who6.tcl`/`who7.tcl` probe outcome — all X3, `try_fill`'s
+  host-open carve bug — and the fix (fills spanning the facing band,
+  `notch_fills` 221 → 343, `_099_` closed, `routed` 187 → 188).
+  Magic-unit → DBU conversions documented (`×5`, `box` takes lambda).
+- **Gate table**: all 50 rules `ours=placed=routed_ref=0`;
+  `magic_only` 3 nwell rows all inherited; `unclassified_fired`
+  **empty** (the two first-contact names closed — recorded, not
+  omitted); `sanity_control` `met2.2` new-vs-clean, control live.
+- **Self-DRC scope correction**: why the subset missed the class
+  (spacing family compares connectivity islands — the too-short fill
+  bridged each site's prongs into one island; `drc(full)` measures
+  edge-to-edge inside the island).
+- **Connectivity record**: `unrouted=81` named via the golden's
+  `ours_router.unrouted` (the test joins it — no inline count);
+  `unrouted_kinds NoPath=46 Unattachable=52` (per-pin failures, sum >
+  net count explained); `unrouted_blockers`; `stub_outside_cover` =
+  142 records accumulated across iterations — `_165_` re-attached, so
+  the gate join is `stub_lines ≥ Unattachable`, not `⊆ unrouted`;
+  `notch_fills=343` recorded, never a target.
+- **Comparison table**: wirelength 4081.929 µm (−32.49% vs delegated,
+  −33.68% vs baseline — restated "on the 188 routed nets"), per-cut
+  via census 327/500/144/10 with the via2/via3 positive deltas,
+  antenna 0 everywhere, `signal_nets_routed` −81. Named outlier:
+  wirelength rose vs the r4 emit (3114 → 4082) because un-vetoed
+  fills changed occupancy for later nets (+1 net routed); fills are
+  `RECT` paint, not wire.
+- **picorv32 deferral — explicit**: leg un-run; no golden commits;
+  the `#[ignore]`d test carries the joins.
+- **What ran** (E0 rule 9): probe names, the `--verify` arm's
+  `OURS-DETERMINISTIC` sha, the one fresh `check_drt_ours.sh gcd`
+  that emitted the golden (superseding the timeout-lost 20:07
+  transcripts), the test list, `0.12.6 → 0.12.7`.
 
-## `docs/e6-drt.md` — e2e section + self-DRC scope correction
+## `docs/e6-drt.md` — §9 e2e section + §8 scope correction (landed)
 
-- e2e section: gate outcome on gcd — the measured trajectory and
-  the named residual set at summary level; mechanisms point at
-  `kurena/tasks/e6-drt-e2e/design/` docs, results.md has the numbers;
-  picorv32 deferral stated.
-- **Self-DRC scope — corrected**: §8's inventory gets precision.
-  Post-fix measurement: `findings_total=0` while Magic reports
-  `met1.2=32` — the residual class is whatever `drc why` attributes
-  (X1/X2 = geometry outside our LEF+DEF model; X3/X4 would mean a
-  checker-model gap to name). Amend the scope sentence to exactly
-  the measured gap; the claim boundary stands: self-DRC is a fast
-  pre-gate, not the deck.
+- §9: script → golden schema → gcd outcome (trajectory, all-0 gate,
+  inherited nwell rows, unrouted=81, mechanisms pointer to
+  `kurena/tasks/e6-drt-e2e/design/`) → picorv32 deferral → the
+  `tests/drt.rs` gate description.
+- §8: self-DRC scope sentence corrected to the measured gap — the
+  spacing family's island-merge blind spot, named as the r5 `met1.2`
+  class closed at emit. Claim boundary stands: subset on our DEF,
+  not the deck.
 
-## `docs/status.md` + `docs/roadmap.md`
+## `docs/status.md` + `docs/roadmap.md` (landed)
 
-E7-style done line scoped honestly: "native DRT under committed
-guides — Magic `drc(full)` `lef_expressible` on gcd: clean except
-`met1.2` = N named sites (per-site in results.md); 82 unrouted nets
-named; deltas vs baseline/delegated in results.md; picorv32 leg
-deferred". No "fully routed" claim — the line carries the unrouted
-count and the residual count.
+E7-style done line scoped honestly: native DRT under committed
+guides — Magic `drc(full)` `lef_expressible` on gcd **0 on all 50
+rules**, `magic_only` inherited, unclassified empty, antenna 0,
+sanity live; `routed=188 unrouted=81` carried (named via the golden
+join — no "fully routed" claim); wirelength deltas stated;
+**picorv32 leg deferred** named in the same line.
 
 ## Files
 

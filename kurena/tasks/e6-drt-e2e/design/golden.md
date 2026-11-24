@@ -1,14 +1,14 @@
 # e6-drt-e2e — `<d>.drt.ours.reference.json` schema (r4)
 
-> **r5 status — schema confirmed by the 20:07 transcripts; the JSON
-> itself is owed.** The post-closure run's logs carry every value the
-> schema describes (`notch_fills=221`, `notch_residuals=1`,
-> `hole_residuals=0`, `unclassified_fired` empty, `met1.2=32`) but the
-> driver timed out before step E persisted the file — the committed
-> golden is still the pre-closure 514 measurement. One fresh
-> `check_drt_ours.sh gcd` run emits the commit candidate
-> (`steps.md` §B). No schema delta this revision.
-> `count_flat=0` is recorded as usual and stays a non-signal.
+> **r6 status — LANDED, schema unchanged.** The committed
+> `gcd.drt.ours.reference.json` is one fresh full
+> `check_drt_ours.sh gcd` run's step-E output inside the pinned image
+> (`image_id sha256:02d50f…`, `input_def_sha_prefix=635f19a9aae86a44`
+> = the committed DEF). The r5 owed-state is resolved: `met1.2` 32 →
+> 0 by the X3 fix before the golden emitted, so no
+> `PINNED_LEF_RESIDUALS` entry was needed; `notch_fills=343`,
+> `notch_residuals=0`, `hole_residuals=0`, `unclassified_fired`
+> empty. `count_flat=0` is recorded as usual and stays a non-signal.
 
 Emitted by `check_drt_ours.sh` step E inside the pinned container;
 committed per design (picorv32 deferred — `steps.md` §E).

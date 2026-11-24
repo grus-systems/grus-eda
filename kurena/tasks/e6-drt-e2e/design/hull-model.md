@@ -8,6 +8,11 @@
 > except `met1.2=32` — the mask's foreign-shape class is closed.
 > Whether the 6 new sites are the mask's invisible-geometry edge
 > (X1/X2) or an emit-side class is `met12-attribution.md`'s probe.
+>
+> **r6 outcome**: emit-side, not the mask. All 7 sites were X3 — the
+> `try_fill` host-open carve bug truncated fills inside member hulls
+> (`met12-attribution.md` r6). The mask model stands unchanged;
+> `lef_expressible` is 0 on all 50 rules on the committed DEF.
 
 The core fix, **landed at `d8d0c6c` and tightened at `4c5e2cb`**: make
 the maze's occupancy model conservative w.r.t. subcell-internal

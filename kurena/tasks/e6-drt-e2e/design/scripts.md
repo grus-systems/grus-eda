@@ -1,5 +1,12 @@
 # e6-drt-e2e — script deltas (r4)
 
+> **r6 status — COMPLETE, no script delta at `0d113ba`.** The owed
+> fresh `check_drt_ours.sh gcd` run executed on the regenerated
+> committed DEF and emitted the committed golden
+> (`input_def_sha_prefix=635f19a9aae86a44`); `generate_drt_ours.sh
+> gcd --verify` demonstrated byte-stability (`OURS-DETERMINISTIC
+> 635f19a9…`). `who6.tcl`/`who7.tcl` joined the gitignored probe set.
+>
 > **r5 status — LANDED at `fba5f85`, no further delta.** The census
 > contract below is what the 20:07 transcripts carry
 > (`notch_residuals`/`hole_residuals` tokens + fields + evidence

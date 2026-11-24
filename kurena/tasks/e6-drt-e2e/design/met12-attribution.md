@@ -1,5 +1,20 @@
 # e6-drt-e2e — met1.2 residual attribution (r5, the memo's central item)
 
+> **r6 outcome — RESOLVED, X3 arm fired.** `who6.tcl` (site D) +
+> `who7.tcl` (site E) ran in-container per §3: `drc why` names
+> `met1.2`, the flattened tile dump shows only own-net met1 paint —
+> the partner edge was **our own `RECT` fill stopped 20–30 DBU short
+> of the facing band**. Root cause: `try_fill` ran the li1-strict
+> `fin − cover_rects` blocker carve on `hull_host_open` met1, where
+> `rect_allowed` already admits the whole member-hull interior — the
+> pin-cover rect carved the uncovered band out of every member-hull
+> fill. Fix = `if mask.host_open(l) { continue; }` in `try_fill`'s
+> mask branch (`maze.rs`); li1 keeps the carve. All 7 sites
+> re-measure clean (`met1.2` 32 → 0), the `_099_` `notch_residual`
+> closed by the same arm, `routed` 187 → 188. §4's fix arm ran; the
+> pin arm never did — `PINNED_LEF_RESIDUALS` is empty. The §1–§3
+> record below stays as designed.
+
 The post-closure measurement (run inside the pinned image at
 `fba5f85`, 2026-11-24 20:07 — transcripts in the gitignored
 `runs/drt-ours/` workdir; the step-E JSON it should have fed was

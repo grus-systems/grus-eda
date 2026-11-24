@@ -1,5 +1,14 @@
 # e6-drt-e2e — residual decomposition + bounded closure (r4)
 
+> **r6 status — FULLY CLOSED at `0d113ba`.** §4's `_099_` did **not**
+> survive to a pin: the `met12-attribution.md` probes classified it
+> X3 alongside the 6 fill sites — the same `try_fill` host-open carve
+> bug had starved its residual-slab fill. Post-fix every residual
+> vector is empty (`notch_residuals=0 hole_residuals=0
+> area_residuals=0`, `self_drc findings_total=0`) and
+> `PINNED_LEF_RESIDUALS` is `[]` — the §5 protocol remains the
+> contract for any future count, exercised but unused.
+>
 > **r5 status — LANDED at `fba5f85`, partially superseded.** §1 dedup
 > (`notch_fills` 296 → 221), §2 patch same-net guard, §3
 > `close_voids` all shipped and measured in the 20:07 transcripts:

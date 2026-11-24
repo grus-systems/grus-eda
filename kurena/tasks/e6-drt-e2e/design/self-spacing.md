@@ -15,6 +15,17 @@
 > but overshoots: one site is `_099_`; the other six are
 > fill-adjacent anatomy the closure model does not reach —
 > decomposed and attributed in `met12-attribution.md`.
+>
+> **r6 addendum — CLOSED at `0d113ba` (`met1.2` 32 → 0).** The 7
+> sites were not a scan-reach gap (X1/X2/X4) — `try_fill` *found*
+> every notch but carved the candidate slab against li1-strict
+> `fin − cover_rects` blockers on `hull_host_open` met1, so each fill
+> committed 20–30 DBU short of the facing band and the notch edges
+> survived at < s. The fix skips the carve on `mask.host_open(l)`
+> layers (li1 keeps it): fills now span the full facing band, and the
+> `_099_` `notch_residual` — walled by the same carve, not by foreign
+> geometry — closed too. The Rule B model below is unchanged; the
+> admission scan it describes was the bug site.
 
 This file records the r3 root-cause measurement for the committed WIP
 goldens' remaining `lef_expressible` findings (`met1.2=740`,
