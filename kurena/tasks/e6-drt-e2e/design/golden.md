@@ -1,5 +1,8 @@
 # e6-drt-e2e — `<d>.drt.ours.reference.json` schema (r4)
 
+> **r9 status — unchanged.** Verify-evidence revision only (r9
+> memo — `verify-timing.md`); no schema or golden delta.
+
 > **r7 status — unchanged at `5d1502b`.** The alias refactor
 > (`LineNodes`/`PaintLines`) emits identical bytes; the committed
 > golden below remains the one fresh `check_drt_ours.sh gcd` output.

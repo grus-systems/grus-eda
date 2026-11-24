@@ -1,5 +1,13 @@
 # e6-drt-e2e — doc updates (r7, landed; head `5d1502b`)
 
+> **r9 note — no doc delta.** The r9 revision is verify-evidence
+> only (`verify-timing.md` — the memo rules the second verify
+> timeout structural and designates the completed
+> `cargo test --workspace --release` log as the artifact). The
+> committed `docs/results.md` what-ran already records the clean
+> `cargo test --workspace` + clippy runs the memo cites; the
+> verify-time logs stay gitignored artifacts, not committed docs.
+
 All docs below landed with the **final measured numbers** — the X3
 fix superseded the r5 pinned-residual draft (no `met1.2=32` entry
 exists in the committed docs). `5d1502b` touched only `maze.rs`

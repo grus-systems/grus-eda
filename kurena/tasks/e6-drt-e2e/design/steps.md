@@ -1,9 +1,16 @@
-# e6-drt-e2e — steps (r8, verify-retry; head `8d96fd7`)
+# e6-drt-e2e — steps (r9, verify-evidence; implementation head `5d1502b`)
 
-**All steps landed; `5d1502b` is the implementation head.** The r8
-memo adds exactly one revision step — step 0 below (`verify-timing.md`,
-the background-suite start) — and re-confirms nothing else is left to
-implement. `5d1502b` carries only
+**All steps landed; `5d1502b` is the implementation head.** The r9
+memo adds no implementation step either — it rules the second
+verify timeout **structural** (dev-profile `cargo test
+--workspace` ~2h+ vs `timeout_sec = 1800`) and redirects the
+*evidence source*: collect the completed `cargo test --workspace
+--release` log (`/tmp/e2e-ws-release-test.log` → gitignored runs
+dir) plus the already-completed r8 dev-profile background log;
+**do not re-run dev-profile `cargo test --workspace` in verify**;
+flag `workflow.toml` for the human if the driver still demands the
+literal command. `verify-timing.md` (r9) carries the procedure.
+`5d1502b` carries only
 doc-sync and the `LineNodes`/`PaintLines` alias refactor on top of
 `0d113ba`'s final hop — **no functional delta**: the committed DEF
 (`635f19a9aae86a44`), the golden and every measured number below are
@@ -120,25 +127,37 @@ designs" item remains open — flagged on the card, not silently green.
 
 ## Verify / diffreview checklist (what remains)
 
-0. **T0 — start `cargo test --workspace` detached** per
-   `verify-timing.md` (nohup → `tests/designs/gcd/runs/
-   cargo-test-workspace.log`, pid recorded). The r7 verify died on
-   the driver's 1800 s window at ~112 CPU-min, not on a test
-   failure; the background run gets the suite's full ~2h. Its
-   collected log (`test result: ok.` lines + exit status) is the
-   `cargo test --workspace` evidence — an in-window verify
-   invocation that still times out is the known-infra limit, and
-   the `--release`/`workflow.toml` alternative is flagged for the
-   human, never edited by us.
-1. `cargo test --workspace` — expect green; the picorv32 leg stays
-   `#[ignore]`d (a `--ignored` run fails loudly on the missing
-   golden — that is the designed state, not a bug).
-2. `cargo clippy --workspace --all-targets -- -D warnings` — clean
-   (in-window; compile-only, it fits).
-3. Golden-vs-DEF join: `sha256(gcd.drt.ours.routed.def)[:16]` ==
+0. **Verify evidence — collected, not launched** (`verify-timing.md`
+   r9):
+   - **Release artifact (the memo's designated evidence)** —
+     `cargo test --workspace --release` ran detached →
+     `/tmp/e2e-ws-release-test.log`, **already complete and green**
+     (601 passed / 0 failed / 6 ignored; suite ~121 s after a
+     20.77 s warm compile). Copy it to
+     `tests/designs/gcd/runs/release-test-workspace.log`
+     (gitignored) and quote the `test result: ok.` totals in the
+     card report. Still-running ⇒ wait on the pid (minutes); dead
+     mid-log ⇒ restart detached `--release`, never dev-profile.
+   - **Dev-profile evidence already on record** — `docs/results.md`
+     what-ran (clean at `0d113ba`, confirmed post-`5d1502b`) +
+     the completed r8 background log
+     `tests/designs/gcd/runs/cargo-test-workspace.log` (601 passed,
+     6 ignored, every binary `ok`). **No dev-profile re-run in any
+     form** — the second driver timeout was structural.
+   - **Driver-side literal `cargo test --workspace`** — if it fires
+     in-window it times out: the known-structural limit, flagged
+     on the card for a human `workflow.toml` decision
+     (`--release`, `timeout_sec`, or an artifact convention) — no
+     fix loop, no edit by us.
+1. `cargo clippy --workspace --all-targets -- -D warnings` — clean
+   (in-window; compile-only, it fits — after the release run frees
+   the `target/` lock). The picorv32 leg stays `#[ignore]`d in
+   every test surface (a `--ignored` run fails loudly on the
+   missing golden — that is the designed state, not a bug).
+2. Golden-vs-DEF join: `sha256(gcd.drt.ours.routed.def)[:16]` ==
    golden `input_def_sha_prefix` (`635f19a9aae86a44`) — verified in
    planning; re-check in verify.
-4. Diff audit vs this design (`dev...5d1502b`): `maze.rs` delta is
+3. Diff audit vs this design (`dev...5d1502b`): `maze.rs` delta is
    the `host_open` carve skip + `stub_outside_cover`/`stub_blocked`
    comment corrections + `ClosureResult` `Debug` + two fixtures +
    the `5d1502b` pure refactor (`LineNodes`/`PaintLines` aliases,
@@ -149,14 +168,14 @@ designs" item remains open — flagged on the card, not silently green.
    lines); `drt.rs` delta is additive gate/tests plus the two
    re-pins; no mask/spacing/hard-block relaxation anywhere (the
    non-goals audit).
-5. Golden audit vs `golden.md` schema: no absolute paths in
+4. Golden audit vs `golden.md` schema: no absolute paths in
    `cli_lines`, no wall-clock fields, `image_id` recorded not gated,
    `count_flat` never claimed as a signal.
-6. `docs/results.md` numbers must equal the golden's (they were
+5. `docs/results.md` numbers must equal the golden's (they were
    transcribed from the same file) — spot-check the comparison table
    against `delta.vs_*`.
 
-## Files (as actually touched on the branch, head `5d1502b`; r8 adds no committed paths)
+## Files (as actually touched on the branch, head `5d1502b`; r9 adds no committed paths)
 
 - `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/tests/drt.rs`
@@ -165,4 +184,4 @@ designs" item remains open — flagged on the card, not silently green.
 - `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`, `docs/roadmap.md`
 - `Cargo.toml`, `Cargo.lock`
 - `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred — intentionally absent)
-- `tests/designs/gcd/runs/` (r8, gitignored — `cargo-test-workspace.log`, `cargo-test-workspace.pid`; never committed)
+- `tests/designs/gcd/runs/` (gitignored — `cargo-test-workspace.log`/`cargo-test-workspace.pid` from r8, `release-test-workspace.log` copied at r9 verify; never committed)

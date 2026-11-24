@@ -1,5 +1,10 @@
 # e6-drt-e2e — integration gate (r7, landed; head `5d1502b`)
 
+> **r9 note — unchanged.** Verify-evidence revision only (the r9
+> memo: no dev-profile `cargo test --workspace` re-run in verify —
+> the completed `--release` log is the artifact; `verify-timing.md`).
+> No gate, join, or test changed.
+
 > **r7 note** — `5d1502b` is refactor-only (`LineNodes`/`PaintLines`
 > aliases + a clippy allow in `maze.rs`); no test or golden join
 > changed. `test_e2e_ours_def_deterministic_gcd`'s byte-equality is

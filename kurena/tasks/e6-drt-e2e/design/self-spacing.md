@@ -1,5 +1,8 @@
 # e6-drt-e2e — same-net self-spacing (the measured residual class)
 
+> **r9 note — unchanged.** Verify-evidence revision only (r9 memo —
+> `verify-timing.md`); the closure model and emitted bytes stand.
+
 > **r7 note — `5d1502b` renamed the ledger type only**: the
 > `hlines`/`vlines` maps below are now spelled `PaintLines`
 > (`(layer, line) → [(lo, hi, PaintSrc)]`); semantics, admission

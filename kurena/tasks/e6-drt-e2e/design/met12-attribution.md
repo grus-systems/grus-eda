@@ -1,5 +1,8 @@
 # e6-drt-e2e — met1.2 residual attribution (r5, the memo's central item)
 
+> **r9 note — unchanged.** Verify-evidence revision only (r9 memo —
+> `verify-timing.md`); the X3 fix and all-0 outcome stand.
+
 > **r7 note — unchanged at `5d1502b`** (alias refactor only; the X3
 > fix and all-0 outcome stand).
 >

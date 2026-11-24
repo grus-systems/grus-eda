@@ -1,5 +1,8 @@
 # e6-drt-e2e — script deltas (r4)
 
+> **r9 status — still no script delta.** Verify-evidence revision
+> only (r9 memo — `verify-timing.md`); neither script moved.
+
 > **r7 status — still no script delta at `5d1502b`.** The checkpoint
 > is `maze.rs`-internal (alias refactor); neither script moved.
 >

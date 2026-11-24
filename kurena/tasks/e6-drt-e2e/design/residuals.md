@@ -1,5 +1,9 @@
 # e6-drt-e2e — residual decomposition + bounded closure (r4)
 
+> **r9 status — unchanged.** Verify-evidence revision only (r9
+> memo — `verify-timing.md`); every residual vector still empty,
+> `PINNED_LEF_RESIDUALS = []`.
+
 > **r7 status — unchanged at `5d1502b`** (alias refactor only; every
 > residual vector still empty, `PINNED_LEF_RESIDUALS = []`).
 >
