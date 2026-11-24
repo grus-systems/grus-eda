@@ -58,9 +58,11 @@ fn seg_rect(w: &WireSeg, tech: &TechDb) -> RectDbu {
 /// `pairs[vp.lower].default` — the emitter never reselects a via
 /// (the placed shape must be the one the router priced). Every
 /// `route_db.unrouted` net is reset to an empty `NetGeom` (conns-only
-/// record — never stale geometry). `db.net_geoms` is resized to
-/// `num_nets` first: `parse_def` fills it on the DEF-input path but
-/// the field is not guaranteed populated otherwise.
+/// record — never stale geometry). `db.net_geoms` is grown to
+/// `num_nets` first — `parse_def` fills it on the DEF-input path but
+/// the field is not guaranteed populated otherwise — and only the
+/// routed/unrouted entries are overwritten, so unguided nets keep
+/// their geometry verbatim.
 ///
 /// A guided net absent from both lists means graphs/route_db
 /// disagree — bail. Unguided nets keep whatever geometry they had
@@ -78,8 +80,9 @@ pub fn apply_routes(
     route_db: &RouteDb,
     via_table: &ViaTable,
 ) -> Result<EmitReport> {
-    db.net_geoms.clear();
-    db.net_geoms.resize_with(db.num_nets(), NetGeom::default);
+    if db.net_geoms.len() < db.num_nets() {
+        db.net_geoms.resize_with(db.num_nets(), NetGeom::default);
+    }
 
     let mut report = EmitReport {
         routed: route_db.nets.len(),
@@ -203,10 +206,10 @@ fn find_section(template: &str, section: &str) -> Option<usize> {
 /// factor.
 fn centerline(lid: LayerId, r: &RectDbu, tech: &TechDb) -> Option<(i32, i32, i32, i32)> {
     let w2 = tech.routing_layers[lid.0 as usize].width_dbu / 2;
-    if r.yl + w2 == r.yh - w2 {
+    if r.yl + w2 == r.yh - w2 && r.xl + w2 <= r.xh - w2 {
         // Horizontal wire or point: (xl+w2, y) – (xh−w2, y).
         Some((r.xl + w2, r.yl + w2, r.xh - w2, r.yh - w2))
-    } else if r.xl + w2 == r.xh - w2 {
+    } else if r.xl + w2 == r.xh - w2 && r.yl + w2 <= r.yh - w2 {
         // Vertical wire: (x, yl+w2) – (x, yh−w2).
         Some((r.xl + w2, r.yl + w2, r.xh - w2, r.yh - w2))
     } else {
