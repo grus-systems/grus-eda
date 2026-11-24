@@ -216,6 +216,18 @@ The emitted DEF (§8) is *not*:
 a skip. `net_names` nets with no block classify into `missing_signal`
 / `absent_expected` (§3) in net order.
 
+*Flow contract — clock nets*: the CTS-inserted tree (`clkbuf_*` cells
+driving `clknet_*` nets plus the clock root net) lives in `NETS` as
+ordinary signal nets and **is routed by `drt`** — the same flow
+contract as TritonRoute (detail routing does not alter the CTS-fixed
+tree topology). There is no clock-net exclusion: dropping the clock
+tree from routing would leave it unmetaled, and the clock is usually
+the highest-fanout net in the design — removing it would understate
+measured congestion. Clock-specific quality treatment (route-first
+ordering, non-default width/spacing rules) is deliberately deferred:
+it binds against skew/EM concerns that only become measurable once
+STA closure exists.
+
 **Region**: per (net, layer), the union of the net's guide boxes on
 that layer clipped to the track grid — a set of covered `(ix, iy)`
 track-index pairs. Per box, two `partition_point`s on `tracks_x`/
