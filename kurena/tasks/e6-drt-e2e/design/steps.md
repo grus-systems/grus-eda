@@ -1,8 +1,9 @@
-# e6-drt-e2e — steps (r7, as-built at `5d1502b`)
+# e6-drt-e2e — steps (r8, verify-retry; head `8d96fd7`)
 
-**All steps landed; `5d1502b` is the head.** This file is the
-landed-step record plus the verify/diffreview checklist — the human
-memo confirms nothing is left to implement. `5d1502b` carries only
+**All steps landed; `5d1502b` is the implementation head.** The r8
+memo adds exactly one revision step — step 0 below (`verify-timing.md`,
+the background-suite start) — and re-confirms nothing else is left to
+implement. `5d1502b` carries only
 doc-sync and the `LineNodes`/`PaintLines` alias refactor on top of
 `0d113ba`'s final hop — **no functional delta**: the committed DEF
 (`635f19a9aae86a44`), the golden and every measured number below are
@@ -119,10 +120,21 @@ designs" item remains open — flagged on the card, not silently green.
 
 ## Verify / diffreview checklist (what remains)
 
+0. **T0 — start `cargo test --workspace` detached** per
+   `verify-timing.md` (nohup → `tests/designs/gcd/runs/
+   cargo-test-workspace.log`, pid recorded). The r7 verify died on
+   the driver's 1800 s window at ~112 CPU-min, not on a test
+   failure; the background run gets the suite's full ~2h. Its
+   collected log (`test result: ok.` lines + exit status) is the
+   `cargo test --workspace` evidence — an in-window verify
+   invocation that still times out is the known-infra limit, and
+   the `--release`/`workflow.toml` alternative is flagged for the
+   human, never edited by us.
 1. `cargo test --workspace` — expect green; the picorv32 leg stays
    `#[ignore]`d (a `--ignored` run fails loudly on the missing
    golden — that is the designed state, not a bug).
-2. `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+2. `cargo clippy --workspace --all-targets -- -D warnings` — clean
+   (in-window; compile-only, it fits).
 3. Golden-vs-DEF join: `sha256(gcd.drt.ours.routed.def)[:16]` ==
    golden `input_def_sha_prefix` (`635f19a9aae86a44`) — verified in
    planning; re-check in verify.
@@ -144,7 +156,7 @@ designs" item remains open — flagged on the card, not silently green.
    transcribed from the same file) — spot-check the comparison table
    against `delta.vs_*`.
 
-## Files (as actually touched on the branch, head `5d1502b`)
+## Files (as actually touched on the branch, head `5d1502b`; r8 adds no committed paths)
 
 - `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/tests/drt.rs`
@@ -153,3 +165,4 @@ designs" item remains open — flagged on the card, not silently green.
 - `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`, `docs/roadmap.md`
 - `Cargo.toml`, `Cargo.lock`
 - `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred — intentionally absent)
+- `tests/designs/gcd/runs/` (r8, gitignored — `cargo-test-workspace.log`, `cargo-test-workspace.pid`; never committed)

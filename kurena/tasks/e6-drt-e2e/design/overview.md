@@ -1,11 +1,22 @@
-# e6-drt-e2e — overview (r7, as-built at `5d1502b`)
+# e6-drt-e2e — overview (r8, verify-retry; head `8d96fd7`)
 
 E6 stage gate: run the real Magic `drc(full)` / OpenROAD antenna deck
 on **our** natively-routed DEF (`grus-eda drt`) inside the pinned
 LibreLane container, against the committed `e6-drt-ref` surfaces.
 Depends on `e6-drt-emit`.
 
-**This revision is as-built at `5d1502b`.** The human memo on the r6
+**r8 — verify-retry, no code delta.** The r7 rejection memo ruled the
+verify-stage failure an **infra timeout, not a failure**: `cargo test
+--workspace` was ~112 CPU-min in when the driver's 1800 s window
+closed (debug-mode `drt` tests dominate; prior identical runs took
+~110–120 CPU-min and passed). Implementation at `5d1502b` + design at
+`8d96fd7` is confirmed complete — **nothing to implement**. The
+revision's only delta is `verify-timing.md`: start the suite
+backgrounded at T0 (nohup → gitignored log), collect the log as the
+verify evidence; the `--release`/`workflow.toml` alternative is
+flagged as a human decision, not edited.
+
+**r7 record — as-built at `5d1502b`.** The human memo on the r6
 design confirms that checkpoint is complete and correct — doc-sync
 plus the `LineNodes`/`PaintLines` type-alias refactor in `maze.rs`
 (`#[allow(clippy::too_many_arguments)]` on `access_vias`), a pure
@@ -15,10 +26,9 @@ determinism byte-join re-proves it in verify. The gate stays green
 (`lef_expressible` ours all-0, `unclassified` 0, antenna 0), the
 comparison table, determinism and what-ran records are in
 `docs/results.md`, tests + docs + the version bump are done.
-**Nothing remains to implement** — what remains is
-verify/diffreview against this record. The r5 "what remains" items
-all landed, including the central one (met1.2 attribution → X3 fix →
-`PINNED_LEF_RESIDUALS` empty, not pinned).
+The r5 "what remains" items all landed, including the central one
+(met1.2 attribution → X3 fix → `PINNED_LEF_RESIDUALS` empty, not
+pinned). Every other design file stands unchanged from r7.
 
 ## What landed (checkpoint trajectory)
 
@@ -72,9 +82,11 @@ byte-compares a fresh emit against the committed DEF test-side.
 
 ## What remains
 
-1. **Verify/diffreview only** — `steps.md` carries the checklist:
-   `cargo test --workspace` + clippy `-D warnings`, the
-   golden-vs-DEF sha join, and the diff audit against this design.
+1. **Verify/diffreview only** — `steps.md` carries the checklist;
+   `verify-timing.md` (r8) carries *how* `cargo test --workspace`
+   gets its evidence (T0 background run → collected log). clippy
+   `-D warnings`, the golden-vs-DEF sha join, and the diff audit are
+   unchanged.
 2. **picorv32 leg — honestly open.** Deferred per the r4/r5 memo and
    flagged on the card: `picorv32.drt.ours.reference.json` is not
    committed; `test_e2e_ours_reference_picorv32` ships `#[ignore]`d
@@ -90,7 +102,7 @@ byte-compares a fresh emit against the committed DEF test-side.
 | Magic `listall why` 0 on every `lef_expressible` on ours; `magic_only` decomposed to baseline class | green — all 50 at 0; 3 nwell rows all `inherited`; `unclassified_fired` empty |
 | `generate_drt_ours.sh` byte-identical reruns | green — `--verify` arm + committed-DEF byte-equal test |
 | wirelength/via/antenna deltas in `docs/results.md`, named outliers | landed — dated 2026-11-24 entry, via2/via3 +wirelength-rise named |
-| `cargo test --workspace`, clippy `-D warnings` | reported clean at 5d1502b — verify re-runs |
+| `cargo test --workspace`, clippy `-D warnings` | reported clean at 5d1502b — r8 evidence = the T0 background run's collected log (`verify-timing.md`); clippy re-runs in-window |
 | `docs/status.md` honest E6 state | landed — carries unrouted=81 + picorv32 deferral |
 
 ## Non-goals (held — nothing was relaxed)
