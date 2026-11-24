@@ -8,6 +8,13 @@
 > `_007_` pair, one undroppable `_099_` residual — is the r4
 > residual work in `residuals.md`. This file stays as the r3
 > root-cause record.
+>
+> **r5 addendum — measured (20:07 transcripts)**: `met1.2` 740 →
+> **32** (7 sites), `met2.2` 56 → 0. The "expected outcome" below
+> holds in direction
+> but overshoots: one site is `_099_`; the other six are
+> fill-adjacent anatomy the closure model does not reach —
+> decomposed and attributed in `met12-attribution.md`.
 
 This file records the r3 root-cause measurement for the committed WIP
 goldens' remaining `lef_expressible` findings (`met1.2=740`,

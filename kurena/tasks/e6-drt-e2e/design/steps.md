@@ -1,113 +1,117 @@
-# e6-drt-e2e — steps (r4, from checkpoint b372d5e)
+# e6-drt-e2e — steps (r5, from checkpoint fba5f85)
 
-Scripts landed, mask model landed, self-spacing closure + union-exact
-cover + `RECT` emission landed, routed DEF regenerated and committed.
-**The golden was never re-measured** — the committed
-`gcd.drt.ours.reference.json` still reads the pre-fix 514 against a
-superseded DEF sha. This revision is verification-completion in the
-memo order: close the three evidenced residual classes, re-emit,
-measure in-container, pin, document, gate.
+Code landed, routed DEF committed (`sha256 1534c323855a6029`), the
+post-closure measurement ran at 20:07 — **but the golden JSON was
+never persisted**: the driver timed out between the Magic runs and
+step-E assembly, and `tests/designs/gcd/gcd.drt.ours.reference.json`
+in the worktree is byte-identical to the stale committed golden
+(`count_total=514`, `met1.2=740`, `met2.2=56`,
+`input_def_sha_prefix=6671d184`, `unrouted=73` — measured on a DEF
+that no longer exists). **Do not commit the file as it sits.** The
+317/`met1.2=32` numbers live only in the gitignored run logs
+(`ours_magic.log`, `placed_magic.log`, `broken_magic.log`,
+`antenna.log`, `mutation.json` — all 2026-11-24 20:07). This
+revision is finish-the-record in the memo order: attribute the 32,
+regenerate the golden via one fresh script run, close the test gap,
+document, commit.
 
 Container: image `ghcr.io/librelane/librelane:3.0.16` is cached
 locally; start `colima start --memory 12 --cpu 8` if the daemon is
-down. Probe artifacts from the r3 root-cause work (`who*.tcl`,
-`region.mag`, `gcd.whofix.def` in `tests/designs/gcd/runs/drt-ours/`)
-are in the gitignored runs dir — keep for reference; name them in
-`docs/results.md` so the evidence trail is reproducible.
+down. Probe artifacts live in the gitignored
+`tests/designs/gcd/runs/drt-ours/` dir (`who1`–`who5.tcl`,
+`region.mag`, `gcd_flat.mag` extraction from r3 — reuse the workdir).
 
-## A. Bounded residual closure (`residuals.md`) — no container needed
+## A. met1.2 attribution (`met12-attribution.md`)
 
-All three fixes are evidenced in the committed DEF/emit log; each
-lands with a unit fixture or an existing-test re-pin, and the emit
-is re-measured by self-DRC (`grus-eda drt --self-drc`, seconds) —
-not Magic — before touching the container.
+1. Site table: **already decomposed** — 32 fragments → 7 sites
+   (`_099_` named + 6 fill-adjacent sites on `resp_val`, `_084_`,
+   `_131_`, `_122_`, `_070_`, `_066_`); per-site DEF anatomy is in
+   `met12-attribution.md` §1–§2. No re-parse needed.
+2. In-container `drc why` + flattened tile dump on **≥2 sites**
+   (D `_131_` — the D/F repeated y-band pattern — and E `_122_` —
+   different fragment shape): name the partner edge's owner + class
+   (X1–X4). `who6.tcl`+ convention; name the files in results.md.
+3. Decision per `met12-attribution.md` §4:
+   - **X3/X4 (closure gap)** → bounded fix (≤2 iterations): extend
+     the scan, add a unit fixture reproducing the site pattern,
+     re-emit, re-run `check_drt_ours.sh gcd`, regenerate the golden.
+     The 317 measurement is then superseded — record its numbers in
+     the trajectory, commit only the final measurement.
+   - **X1/X2 (invisible geometry)** → pin `("met1.2", measured)` in
+     `PINNED_LEF_RESIDUALS` with every site named; the §B golden
+     lands as measured.
+   - **Mixed** → fix first, then pin survivors.
 
-1. **Fill dedup** (`residuals.md` §1): `fills` deduplicated before
-   commit; `notch_fills` re-counts. Fixture: collinear three-piece
-   notch → one fill.
-2. **Patch same-net guard** (`residuals.md` §2): confirm `_007_` is
-   the `area_patches=1` net (temporary instrumentation or
-   edge-coordinate match); `patch_component` admission then requires
-   merge-or-`≥ s` vs the net's own other components. If the site is
-   *not* the patch, chase the secondary suspect (non-default via
-   candidate scan) — the site must be attributed either way.
-3. **Void-closure pass** (`residuals.md` §3): `enclosed_voids` over
-   committed pieces + fills per layer, under-`min_enclosed_area`
-   voids filled all-or-nothing under the existing admission scans;
-   unfillable → `route_db.hole_residuals` + `  hole_residual` line.
-4. **Census contract** (`scripts.md`): `guided=` gains
-   `notch_residuals=<n>` (and `hole_residuals=<n>` if §3 ships);
-   emit binary and check-script regex land in the same change
-   (version-locked). Keep-list gains the self-DRC `rule=` + site
-   lines so `cli_lines` carries residual evidence.
-5. `_099_` re-check (`residuals.md` §4): if the residual line
-   persists after 1–3, it is the pinned named residual — record the
-   blocking class once (occupancy probe or `drc why`), no reroute.
-6. `cargo test --workspace` between legs; existing tests that pin
-   pre-fix geometry re-pin to measured values only (`gate.md` §4).
+## B. Golden regeneration
 
-## B. Re-emit + quick gate
+4. **Regenerate**: run `tests/designs/check_drt_ours.sh gcd` fresh in
+   the pinned image (steps A–E on the committed DEF — there is no
+   assemble-only arm, and a full run re-verifies the placed baseline
+   and the mutation control in the same pass). The committed script
+   is the only emitter of the golden — never hand-write the JSON.
+   If the rerun diffs from the 20:07 measurement (317 total,
+   `met1.2=32`, `routed=187 unrouted=82`) on the same DEF + image,
+   that diff is a finding to record in `docs/results.md`, not to
+   silently ship. If step E aborts, read its message — the
+   assembler's strict expectations name the real mismatch; fix the
+   flagged issue in the script, don't rewrite it.
+   This precedes the test work because §C's gate tests join against
+   the committed golden — running them against the stale file would
+   fail on the sha/count joins for the wrong reason.
 
-7. `generate_drt_ours.sh gcd` → committed
-   `gcd.drt.ours.routed.def` regenerated (fills dedup'd, void fills
-   present, patch guard applied). `--verify` arm covers
-   byte-stability; the emit census goes into `docs/results.md`.
-8. `grus-eda drt --self-drc` on the new DEF: `findings_total`
-   target 0 or exactly the named residuals — anything else is an
-   unattributed site → §5 probe loop in `residuals.md` before the
-   container run (the fast local check is the iteration vehicle;
-   the container is the authority, not the iterator).
+## C. Test work (`gate.md`)
 
-## C. Container re-measure + golden commit
+5. Two maze.rs fixtures: `test_closure_reject_droppable`,
+   `test_closure_notch_residual` (the two uncovered arms).
+6. `drt.rs`: `load_ours_ref` helper + `PINNED_LEF_RESIDUALS`;
+   `test_e2e_ours_reference_gcd`; `test_e2e_ours_def_deterministic_gcd`
+   (byte-equal vs committed DEF); `test_emit_roundtrip_gcd` unrouted
+   → golden-join re-pin; `#[ignore]`d
+   `test_e2e_ours_reference_picorv32`.
+7. `cargo test --workspace` between legs; `generate_drt_ours.sh gcd
+   --verify` covers byte-stability script-side.
 
-9. `check_drt_ours.sh gcd` inside the pinned image →
-   `lef_expressible` per-rule ours/placed/routed_ref + `magic_only`
-   decomposition + `unclassified_fired` + `sanity_control`. Every
-   nonzero `ours` must map to a named site (`residuals.md` §5);
-   unexplained → `drc why` + flattened dump, root-cause, fix-or-name.
-10. Commit `gcd.drt.ours.reference.json` iff the outcome is
-    zero-or-named-residuals **and** `input_def_sha_prefix` matches
-    the committed DEF — the stale-514 file is superseded, not
-    amended. Never rebaseline: a RED gate is chased, not committed.
+## D. Golden commit
 
-## D. picorv32 leg — deferred (r4 memo)
+8. Commit `gcd.drt.ours.reference.json` iff every nonzero `ours`
+   maps to a named site **and** `input_def_sha_prefix` matches the
+   committed DEF (`1534c323855a6029` — re-verify if a fix re-emits).
+   Routed DEF is already committed at `fba5f85`; recommit only if
+   step 3's fix changes it. Never rebaseline.
 
-11. `generate_drt_ours.sh picorv32` / `check_drt_ours.sh picorv32`
-    stay un-run this revision per the memo; `docs/results.md` states
-    the deferral explicitly (E0 rule: say what ran). The ignored
-    gate test keeps the schema joins ready (`gate.md` §3);
-    `picorv32.drt.ours.reference.json` is *not* committed — the
-    acceptance's "both designs" item is honestly open, flagged on
-    the card.
+## E. picorv32 leg — deferred (memo)
 
-## E. Gate tests + docs + verify
+9. `generate_drt_ours.sh picorv32` / `check_drt_ours.sh picorv32`
+   stay un-run; `docs/results.md` states the deferral explicitly
+   (E0 rule 9). The `#[ignore]`d gate test keeps the joins ready;
+   `picorv32.drt.ours.reference.json` is *not* committed — the
+   acceptance's "both designs" item is honestly open, flagged on
+   the card.
 
-12. `drt.rs` additions + re-pins per `gate.md`:
-    `test_e2e_ours_reference_gcd`, `test_e2e_ours_def_deterministic_gcd`,
-    `test_emit_roundtrip_gcd` unrouted pin, `test_emit_selfdrc_gcd`
-    firing pin, `PINNED_LEF_RESIDUALS` if any.
-13. `docs/results.md` full dated entry per `docs.md` (trajectory
-    ~3025 → 847 → 514 → final; the three-site decomposition with
-    mechanisms; unrouted 73→81 explained and all 81 named; the
-    `notch_fills` dedup'd count; delta tables; picorv32 deferral;
-    what-ran per E0 rule 9).
+## F. Docs + verify
+
+10. `docs/results.md` dated r3 entry per `docs.md` (trajectory
+    ~3025 → 847 → 514 → 317; 7-site table + probe record; 82 unrouted
+    named via the golden join; emit census verbatim; delta tables;
+    picorv32 deferral; what-ran per E0 rule 9).
     `docs/e6-drt.md` e2e section + self-DRC scope correction;
     `docs/status.md` + `docs/roadmap.md` honest E6 line.
-14. `[workspace.package] version` bump in root `Cargo.toml` in the
-    same commit as the functional change (`0.12.6` → patch —
-    repair/gate class).
-15. `cargo test --workspace` + `cargo clippy --workspace -- -D
-    warnings` clean before the card.
+11. `[workspace.package] version` 0.12.6 → **patch bump** in root
+    `Cargo.toml` in the same commit as the functional change (any
+    X3/X4 fix or the gate/test work).
+12. `cargo test --workspace` + `cargo clippy --workspace
+    --all-targets -- -D warnings` clean before the card — expect the
+    baseline to be red first (`test_emit_roundtrip_gcd` asserts
+    `unrouted.is_empty()` against the measured 82; `gate.md` §4's
+    re-pin is the fix).
 
 ## Files
 
-- `crates/grus-core/src/drt/maze.rs`
-- `crates/grus-eda/src/main.rs`
+- `crates/grus-core/src/drt/maze.rs` (two fixtures; closure
+  extension only if X3/X4)
 - `crates/grus-core/tests/drt.rs`
-- `tests/designs/check_drt_ours.sh`
-- `tests/designs/generate_drt_ours.sh`
-- `tests/designs/gcd/gcd.drt.ours.routed.def`
 - `tests/designs/gcd/gcd.drt.ours.reference.json`
+- `tests/designs/gcd/gcd.drt.ours.routed.def` (only if a fix re-emits)
 - `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred)
 - `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`, `docs/roadmap.md`
 - `Cargo.toml`

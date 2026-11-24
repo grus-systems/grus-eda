@@ -1,5 +1,13 @@
 # e6-drt-e2e — script deltas (r4)
 
+> **r5 status — LANDED at `fba5f85`, no further delta.** The census
+> contract below is what the 20:07 transcripts carry
+> (`notch_residuals`/`hole_residuals` tokens + fields + evidence
+> keep-list). `generate_drt_ours.sh` stays unchanged. One fresh
+> `check_drt_ours.sh gcd` run is owed regardless — the checkpoint
+> run's step-E output was never persisted (`steps.md` §B); further
+> reruns only if `met12-attribution.md`'s fix arm fires.
+
 Both scripts are committed on dev and stay — changes are surgical,
 matching the "fix, don't rewrite" directive. The emit binary and
 check script are version-locked (the census-line contract below):

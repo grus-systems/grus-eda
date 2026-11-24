@@ -1,106 +1,105 @@
-# e6-drt-e2e — overview (r4)
+# e6-drt-e2e — overview (r5)
 
 E6 stage gate: run the real Magic `drc(full)` / OpenROAD antenna deck
 on **our** natively-routed DEF (`grus-eda drt`) inside the pinned
-LibreLane container, against the committed `e6-drt-ref` surfaces —
-and finish the verification so the gate records an honest verdict.
+LibreLane container, against the committed `e6-drt-ref` surfaces.
 Depends on `e6-drt-emit`. This revision continues from checkpoint
-`b372d5e` (review memo, 2026-11-24): **the self-spacing closure is
-implemented; what remains is measurement, residual bookkeeping, and
-the workspace gate — the previous driver timed out mid-verification,
-not mid-design.**
+`fba5f85` (review memo, 2026-11-24): **the code work is done and the
+post-fix measurement exists — what remains is attribution of the 32
+`met1.2` fragments, the workspace gate, and the record. The previous
+driver timed out post-measurement, pre-commit; the numbers are
+generated, this revision finishes them.**
 
-## What b372d5e already landed
+## What fba5f85 already landed (code complete)
 
-- `crates/grus-core/src/drt/maze.rs` — `close_self_spacing` (Rule-B
-  repair pass, `self-spacing.md`): pairwise notch detection over the
-  committed piece set (merged wire spans, `pair.default` via plates,
-  member pin shapes), `try_fill` with shrink-retry against mask +
-  occupancy blockers, `PaintSrc` provenance (`Tree`/`ProjStub(pi)`/
-  `Access(pi)`/`PinShape`) so a failing fill rejects the *attach
-  element* that painted the notch and the pin re-attaches on its next
-  candidate; undroppable-prong notches land in
-  `RouteDb.notch_residuals`. Also: `ACCESS_K = 8` and union-cover
-  probing (`pin-access.md` rungs A1 + A3-partial).
-- `crates/grus-core/src/drc/union.rs` — `rect_minus` +
-  `rect_covered` (union-exact cover, the L-shaped-pin class).
-- `crates/grus-core/src/drt/emit.rs` — `NetRoute.fills` →
-  `NetGeom.wire_rects` → `metN ( x y ) RECT ( 0 0 w h )` records
-  (non-square-cap rects emit as `RECT`, parser round-trips them).
-- `crates/grus-eda/src/main.rs` — `notch_fills=<n>` on the `guided=`
-  census line; `  notch_residual <net> <layer> a=… b=…` per
-  unrepaired notch.
-- `tests/designs/check_drt_ours.sh` — `notch_fills` parsed (emit log
-  without the token → `fail`, version-locked); `notch_residual`
-  lines kept in `cli_lines`.
-- `tests/designs/gcd/gcd.drt.ours.routed.def` — **regenerated**
-  (post-closure geometry, fills included).
+- `crates/grus-core/src/drt/maze.rs` (+692) — the full residual
+  closure: `close_self_spacing` fill-dedup (`residuals.md` §1),
+  `patch_net_min_area` same-net guard (§2), `close_voids` enclosed-void
+  pass + `hole_residuals` (§3), `PaintSrc`/`ClosureResult::{Done,
+  Reject}` mechanics.
+- Unit coverage in `maze.rs::tests` — `test_closure_fill_dedup`,
+  `test_min_area_patch_same_net_guard`,
+  `test_min_area_patch_same_net_residual`,
+  `test_close_voids_fill_and_residual` (fill + residual arms).
+- `crates/grus-eda/src/main.rs` — `guided=` gains
+  `notch_fills/notch_residuals/hole_residuals`; `  notch_residual` /
+  `  hole_residual` evidence lines.
+- `tests/designs/check_drt_ours.sh` — version-locked census regex +
+  residual keep-list (r4 contract, landed).
+- `tests/designs/gcd/gcd.drt.ours.routed.def` — regenerated
+  post-closure, committed; sha256 prefix `1534c323855a6029`.
 
-## Measured state at b372d5e (emit log, not yet re-measured by Magic)
+## Measured state (logs generated; JSON never persisted)
 
-`guided=269 routed=188 unrouted=81 projected=11 collisions=0
-area_patches=1 area_residuals=0 iterations=8 route_ms=14224
-hull_masked=227182 notch_fills=296`; `unrouted_kinds NoPath=45
-Unattachable=57`; `unrouted_blockers l0Obs=1 l1Obs=4 l1Net=38
-l2Net=2`; `stub_outside_cover` = 155 pins; `self_drc
-findings_total=2`:
+`check_drt_ours.sh gcd` ran in the pinned image on the committed DEF
+at 20:07 on 2026-11-24 — all four transcripts + `mutation.json` are
+in the gitignored `tests/designs/gcd/runs/drt-ours/` workdir — **but
+step E's JSON output was never persisted**: the driver timed out
+between measurement and assembly, and the committed
+`gcd.drt.ours.reference.json` still holds the *pre-closure* golden
+(`count_total=514`, `met1.2=740`, `met2.2=56`,
+`input_def_sha_prefix=6671d184`, `unrouted=73` — byte-identical to
+HEAD, measuring a DEF that no longer exists). One fresh full
+`check_drt_ours.sh gcd` run on the committed DEF is owed to emit the
+commit-candidate JSON (`steps.md` §B); a rerun that diffs from the
+numbers below on the same DEF + image is itself a finding to record.
 
-- `met1.2 [70450,55460,70770,55720] x [70820,55520,71300,55660]
-  gap=(50,0) bound=140 nets=_007_,_007_` — a same-net
-  *separated-islands* pair the closure never saw (`residuals.md` §2:
-  the `area_patches=1` post-closure growth is the primary suspect).
-- `met1.7 [74360,42400,74652,42600] area=54680 bound=140000
-  nets=_055_` — an enclosed hole **the fills created** (`residuals.md`
-  §3: the emitted `RECT`s seal the right side of a wire U-shape).
-- `  notch_residual _099_ met1 a=…{41240,34170,41380,34510}
-  b=…{41470,34380,41790,34640}` — one undroppable-prong notch whose
-  gap (90×130) is fully blocked (`residuals.md` §4).
-- `_055_`'s DEF also shows **triplicated identical `RECT` fills**
-  (`residuals.md` §1 — a fill-dedup bug; harmless paint, wrong count).
+The 20:07 transcripts measure:
 
-Committed `gcd.drt.ours.reference.json` is **stale**: it still reads
-the pre-fix 514 (`met1.2=740`, `met2.2=56`) and its
-`input_def_sha_prefix` no longer matches the committed DEF — the
-memo calls this out; the refresh is this ticket's core step.
+| surface | value |
+|---|---|
+| `lef_expressible` ours | **`met1.2 = 32` fragments only; 49/50 rules at 0** (`ours==placed` elsewhere) |
+| `magic_only` | nwell.1=6, nwell.2a=120, nwell.4=300 — all `ours == placed == routed_ref` (inherited) |
+| `unclassified_fired` | **empty** — the two first-contact names are gone |
+| `self_drc` | `findings_total=0` (was met1.2 `_007_` + met1.7 `_055_` — both closed) |
+| `ours_router` | `routed=187 unrouted=82 notch_fills=221` (dedup'd from 296) `notch_residuals=1` (`_099_`) `hole_residuals=0` `area_patches=1 area_residuals=0` |
+| `sanity_control` | probe fired `met2.2` (new vs clean) — control live |
+| `delta` | wirelength −48.5% / −49.4% vs delegated/baseline (restated "on the 187 routed nets"), via/antenna deltas recorded |
+| `drc count total` | 317 (was ~3025 → 847 → 514 across the fix trajectory) |
 
-Unrouted moved 73 → 81 (`NoPath` 57→45, `Unattachable` 33→57) — the
-expected notch-rejection cost (`pin-access.md` interaction section);
-the 81 are the ticket's named connectivity residual per the memo
-(remaining access rungs are not part of this revision).
+The 32 `met1.2` fragments cluster into **7 sites**: 4 fragments on the
+already-named `_099_` `notch_residual`, **28 fragments on 6 new
+sites, each adjacent to an emitted met1 `RECT` fill on a different
+net** — `met12-attribution.md` has the per-site table and the
+fix-vs-pin decision rule.
 
 ## What remains (memo order)
 
-1. **Bounded residual closure** (`residuals.md`) — three small fixes
-   whose mechanisms are already evidenced in the committed DEF, plus
-   the census/script contract for naming residuals: fill dedup,
-   void-closure pass, same-net guard on the min-area patch walk.
-   Each surviving finding then maps to a named site + mechanism —
-   `notch_residual`/`hole_residual` census lines carry the sites
-   Magic is expected to flag.
-2. **Re-emit + container re-measure** (`steps.md`): `generate_drt_ours.sh`
-   → `check_drt_ours.sh gcd` in the pinned image → commit the
-   regenerated DEF + refreshed `gcd.drt.ours.reference.json` iff the
-   `lef_expressible` outcome is zero-or-named-residuals. The memo's
-   expectation: `met1.2 ~740 → small named residuals`.
-3. **Gate tests + re-pins** (`gate.md`): the new e2e test joins the
-   ours reference with a residual-pinning mechanism; the two tests
-   currently red (`test_emit_roundtrip_gcd` on unrouted=81,
-   `test_emit_selfdrc_gcd` on 2 findings) get fixed geometry or
-   measured pins — never blanket-tolerated.
-4. **Docs + verify** (`docs.md`): `docs/results.md` dated r3/r4 entry
-   (trajectory ~3025 → 847 → 514 → final, per-site decomposition,
-   unrouted-81 named, **picorv32 leg explicitly deferred** per the
-   memo), `docs/e6-drt.md` e2e + self-DRC scope correction,
-   `docs/status.md`/`docs/roadmap.md` honest line, version bump,
-   `cargo test --workspace` + clippy `-D warnings`.
+1. **Attribute + name the 32** (`met12-attribution.md`): site table
+   measured; in-container `drc why` on ≥2 sites names the partner
+   class (X1 invisible subcell / X2 LEF-vs-mag pin / X3 masked
+   within-island / X4 euclidean pair). X3/X4 → bounded closure fix +
+   re-measure; X1/X2 → `PINNED_LEF_RESIDUALS` with every site named.
+   Then **one fresh `check_drt_ours.sh gcd` run** emits the golden on
+   the final committed DEF → commit `gcd.drt.ours.reference.json`
+   (+ regenerated DEF if a fix lands) — never rebaseline.
+2. **maze.rs closure unit coverage** — dedup/guard/void arms exist;
+   the `Reject` arm (droppable prong) and the `notch_residuals`
+   production arm (undroppable notch → named residual) have no direct
+   fixture. Two small fixtures close the gap (`gate.md` §4).
+3. **Gate tests** (`gate.md`): `test_e2e_ours_reference_gcd` (new —
+   taxonomy join + pinned-residual mechanism + `unrouted` golden
+   join), `test_e2e_ours_def_deterministic_gcd` (byte-equal vs
+   committed DEF), `test_emit_roundtrip_gcd` re-pin (unrouted →
+   golden `ours_router.unrouted` join), `#[ignore]`d picorv32 leg.
+4. **Docs + verify** (`docs.md`): `docs/results.md` dated r3 entry
+   (trajectory ~3025 → 847 → 514 → 317, 7-site table, 82 unrouted
+   named, **picorv32 leg explicitly deferred**), `docs/e6-drt.md` e2e
+   + self-DRC scope, `docs/status.md`/`docs/roadmap.md` honest E6
+   line, `Cargo.toml` 0.12.6 → patch bump,
+   `cargo test --workspace` + clippy `-D warnings` — **the workspace
+   is red at `fba5f85`**: `test_emit_roundtrip_gcd` still asserts
+   `unrouted.is_empty()` against the measured 82; the §2 re-pins are
+   what turn it green, so a red baseline before the test work is the
+   expected state, not a surprise.
 
 ## Acceptance traceability
 
 | acceptance item | where |
 |---|---|
-| `<d>.drt.ours.reference.json` generated by committed script in pinned image, committed both designs | `golden.md`, `steps.md` — **picorv32 deferred per r4 memo, noted in `docs/results.md`** |
-| Magic `listall why` 0 on every `lef_expressible` rule on ours; `magic_only` decomposed, baseline-matched | `residuals.md` (close the measured sites), `gate.md` (asserts + pinned-residual mechanism) |
-| `generate_drt_ours.sh` byte-identical reruns | `gate.md` (committed-DEF byte-equal + `--verify`) |
+| `<d>.drt.ours.reference.json` generated by committed script in pinned image, committed both designs | `golden.md`, `steps.md` — **picorv32 deferred per r4/r5 memo, noted in `docs/results.md` and on the card** |
+| Magic `listall why` 0 on every `lef_expressible` rule on ours; `magic_only` decomposed, baseline-matched | `met12-attribution.md` (close or name the 7 sites), `gate.md` (strict + pinned asserts) |
+| `generate_drt_ours.sh` byte-identical reruns | `gate.md` (committed-DEF byte-equal test + `--verify` arm) |
 | wirelength/via/antenna deltas in `docs/results.md`, named outliers | `docs.md`, `golden.md` (`vs_baseline`/`vs_delegated`) |
 | `cargo test --workspace`, clippy `-D warnings` | `steps.md` |
 | `docs/status.md` honest E6 state (native-DRT subset scope / named residuals) | `docs.md` |
@@ -108,26 +107,20 @@ the 81 are the ticket's named connectivity residual per the memo
 ## Non-goals
 
 - No relaxation of the hull mask, `ObsPin`/`Obs` hard blocks,
-  `w/2 + s` scans, or `s_l` to clean the gate — repairs add scanned
-  paint or drop candidates, never loosen a check.
-- No further access-ladder rungs this revision — the 81 unrouted are
-  the named residual the memo records (the memo supersedes r3's
-  "recover to 0" push; the ladder stays documented in
-  `pin-access.md` for a later ticket).
+  `w/2 + s` scans, or `s_l` to clean the gate.
+- No further access-ladder rungs — the 82 unrouted are the named
+  connectivity residual (ladder documented in `pin-access.md`).
 - No new Magic rules; the `lef_expressible` gate is unchanged.
 - No claiming `count_flat` as a routing-level signal.
-- No route-surgery repair for the `_099_`-class residual — a named,
-  evidence-pinned residual is the honest call inside this ticket.
+- No route-surgery repair for confirmed X1/X2 sites — named,
+  evidence-pinned residuals are the honest call inside this ticket.
 
 ## Files
 
-- `crates/grus-core/src/drt/maze.rs`
-- `crates/grus-eda/src/main.rs`
+- `crates/grus-core/src/drt/maze.rs` (attribution-driven fix only + two fixtures)
 - `crates/grus-core/tests/drt.rs`
-- `tests/designs/check_drt_ours.sh`
-- `tests/designs/generate_drt_ours.sh`
-- `tests/designs/gcd/gcd.drt.ours.routed.def`
 - `tests/designs/gcd/gcd.drt.ours.reference.json`
+- `tests/designs/gcd/gcd.drt.ours.routed.def` (only if a fix re-emits)
 - `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred — `docs/results.md` notes it)
 - `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`, `docs/roadmap.md`
 - `Cargo.toml`

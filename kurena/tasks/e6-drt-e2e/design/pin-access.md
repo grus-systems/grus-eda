@@ -9,6 +9,11 @@
 > connectivity residual (pinned in `gate.md`, listed in
 > `docs/results.md`). The ladder below stays documented for the
 > follow-up ticket.
+>
+> **r5 note**: the `fba5f85` residual fixes shifted the set once
+> more — `unrouted=82` (`NoPath=44 Unattachable=58`). The pin is the
+> golden's `ours_router.unrouted` list itself (`gate.md` §4 — a join,
+> not a literal), so the residual moves with re-measurement.
 
 The connectivity bill: `unrouted=73` on gcd at `4c5e2cb`
 (`unrouted_kinds NoPath=57 Unattachable=33` — kinds overlap;

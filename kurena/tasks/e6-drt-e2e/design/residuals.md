@@ -1,5 +1,16 @@
 # e6-drt-e2e — residual decomposition + bounded closure (r4)
 
+> **r5 status — LANDED at `fba5f85`, partially superseded.** §1 dedup
+> (`notch_fills` 296 → 221), §2 patch same-net guard, §3
+> `close_voids` all shipped and measured in the 20:07 transcripts:
+> `self_drc findings_total=0`, `hole_residuals=0` (the step-E JSON
+> was never persisted — `steps.md` §B regenerates it).
+> §4's `_099_` is confirmed as `notch_residuals=1` — **but the
+> container measure surfaced 6 further `met1.2` sites the census did
+> not predict** (28 of the 32 fragments): the residual decomposition
+> continues in `met12-attribution.md`. This file stays as the §1–§4
+> mechanism record.
+
 The `b372d5e` emit already carries its own diagnostics: one
 `notch_residual` line, two `self_drc` findings, and visibly
 duplicated `RECT` fills in the committed DEF. This file decomposes

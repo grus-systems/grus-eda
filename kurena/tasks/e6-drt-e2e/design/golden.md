@@ -1,7 +1,17 @@
 # e6-drt-e2e — `<d>.drt.ours.reference.json` schema (r4)
 
+> **r5 status — schema confirmed by the 20:07 transcripts; the JSON
+> itself is owed.** The post-closure run's logs carry every value the
+> schema describes (`notch_fills=221`, `notch_residuals=1`,
+> `hole_residuals=0`, `unclassified_fired` empty, `met1.2=32`) but the
+> driver timed out before step E persisted the file — the committed
+> golden is still the pre-closure 514 measurement. One fresh
+> `check_drt_ours.sh gcd` run emits the commit candidate
+> (`steps.md` §B). No schema delta this revision.
+> `count_flat=0` is recorded as usual and stays a non-signal.
+
 Emitted by `check_drt_ours.sh` step E inside the pinned container;
-committed per design (picorv32 deferred — `steps.md` §D).
+committed per design (picorv32 deferred — `steps.md` §E).
 `json.dump(indent=2) + "\n"` — the file
 must byte-reproduce across checkouts, so nothing in it may carry an
 absolute path or wall-clock field. Fields exempt from
@@ -164,6 +174,6 @@ the one expected change; record the current digest, don't gate on it.
 ## Files
 
 - `tests/designs/gcd/gcd.drt.ours.reference.json` (committed)
-- `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred — `steps.md` §D)
+- `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred — `steps.md` §E)
 - `tests/designs/gcd/gcd.drt.ours.routed.def` (committed, <1 MB)
 - `tests/designs/check_drt_ours.sh` (emitter)

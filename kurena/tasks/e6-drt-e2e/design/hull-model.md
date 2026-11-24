@@ -3,6 +3,11 @@
 > **r4 status — LANDED.** The union-exact cover (`rect_covered` /
 > `rect_minus` in `drc/union.rs`) shipped at `b372d5e` with the
 > closure; no r4 changes here. This file stays as the model record.
+>
+> **r5 note**: the 20:07 transcripts read `lef_expressible` clean
+> except `met1.2=32` — the mask's foreign-shape class is closed.
+> Whether the 6 new sites are the mask's invisible-geometry edge
+> (X1/X2) or an emit-side class is `met12-attribution.md`'s probe.
 
 The core fix, **landed at `d8d0c6c` and tightened at `4c5e2cb`**: make
 the maze's occupancy model conservative w.r.t. subcell-internal
