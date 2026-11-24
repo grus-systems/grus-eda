@@ -178,10 +178,14 @@ The via model (§6) is *not*:
 The routed result (§7) is *not*:
 
 - **DRC-clean** — the occupancy model is spacing-lite: `w/2 + s`
-  bands on track lines, no enclosure/min-area/cut rules, unmerged
+  bands on track lines, no enclosure/cut rules, unmerged
   OBS marks with an unconditional host-cell carve, and `Pin` marks
   that never hard-block. A foreign wire landing on pin metal is an
-  emit/e2e finding, not a search-time error.
+  emit/e2e finding, not a search-time error. Min-area is the one
+  rule family with a post-pass: §7's occupancy-strict patch lifts
+  sub-bound components along in-plane edges and names what it cannot
+  fix in `RouteDb.area_residuals` — residuals the emit gate surfaces
+  as `*.6` findings, not a claim of min-area cleanliness.
 - **A TritonRoute reproduction** — the search is a pathfinder-style
   tree extension over our own region graph with relaxed (non-strict-
   crossing) via transitions, not a port of `FlexGridGraph`/`drWorker`;
@@ -553,6 +557,39 @@ wire rects and via footprints into a fresh occupancy (no OBS) and
 reports each cross-net pair whose `R + s`-intersect rule violates —
 the exact `RouteDb.collisions` list (`Enabled` only).
 
+**Min-area patch** (`patch_net_min_area`, once per committed net
+after the iteration loop — occupancy then holds the final foreign
+picture, and patches rasterize straight into it so later nets'
+patches respect earlier ones): the picorv32 self-DRC gate surfaced
+`*.6` findings the search's spacing-lite model never priced — TritonRoute's
+equivalent is a post-route min-area patch pass, and this is ours.
+Per routing layer with `AREA` declared the net's metal is rebuilt
+exactly the way `check_area_report` sees it — wires `± w/2` as
+`SignalWire`, pair-default via routing-layer rects as `Via`,
+member-pin shapes as `MacroPin`/`IoPort` — merged by
+`union::components`, evaluated only when a component holds a drawn
+member (a `MacroPin`-only island is never evaluated, mirroring the
+checker's `is_drawn` gate). A sub-bound component tries
+`patch_component`: from each in-rect node it walks `+pref` then
+`−pref` along adjacent covered nodes on its line — every step is one
+in-plane `g.edges` span, so patch metal stays inside the guide
+region and on-track by construction. A step commits only when
+`scan_wire` reports own-net `Net`/`Pin` hits exclusively —
+**occupancy-strict**: any `Obs` hit (the host-cell carve is not
+inherited; patch metal is optional, not access) or foreign hit stops
+that direction, and the strictness holds even under
+`OccMode::Disabled`. On reaching `union_area ≥ bound` the
+accumulated span commits as one `WireSeg` marked `Net(own)`; the
+layer re-derives because one patch can merge two sub-bound
+components into a cleared union. A component no walk lifts lands in
+`RouteDb.area_residuals` — `AreaResidual{net, layer, region,
+area_dbu2, bound_dbu2}` — the named decline arm: every residual
+maps to a `*.6` self-DRC finding if the gate fires, and a `*.6`
+finding with no matching residual is a model divergence (a bug, not
+a tolerance). Recorded step-domain gap: the walk follows in-plane
+edges only — a component needing off-axis metal or a detour through
+an index gap is residual-bound even when legal metal could reach.
+
 **Unrouted taxonomy**: `UnroutedNet` names `connected` pins plus
 `failed` per-pin `(PinId, FailKind)` — `Unattachable` (strict +
 projection attach empty) vs `NoPath` (attachable but unreachable:
@@ -646,8 +683,10 @@ grus-eda drt --tlef <t> --lef <l> --def <placed.def> \
 ```
 
 prints the emit census (`guided/routed/unrouted/projected/
-collisions/iterations/route_ms`, one `unrouted <name>` line per
-unrouted net), the informational `wirelength_um` + `via.<cut>`
+collisions/area_patches/area_residuals/iterations/route_ms`, one
+`unrouted <name>` line per unrouted net and one `area_residual
+<net> <layer> area=… bound=… region=…` line per unfixable §7
+component), the informational `wirelength_um` + `via.<cut>`
 deltas vs `variants.delegated`/`baseline`, and — under `--self-drc`
 — the re-parse→assemble→`run_all` verdict. The CLI reports and
 never exits nonzero on findings; the gate is `tests/drt.rs`.

@@ -2051,16 +2051,31 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
             println!("== drt emit: {} ==", design_db.design_name);
             println!(
-                "guided={} routed={} unrouted={} projected={projected} collisions={} iterations={} route_ms={:.0}",
+                "guided={} routed={} unrouted={} projected={projected} collisions={} \
+                 area_patches={} area_residuals={} iterations={} route_ms={:.0}",
                 join.nets.len(),
                 report.routed,
                 report.unrouted.len(),
                 route_db.collisions.len(),
+                route_db.area_patches,
+                route_db.area_residuals.len(),
                 route_db.iterations,
                 elapsed_route_ms,
             );
             for name in &report.unrouted {
                 println!("  unrouted {name}");
+            }
+            for r in &route_db.area_residuals {
+                println!(
+                    "  area_residual {} {} area={} bound={} region={:?}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    tech_db
+                        .strings
+                        .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
+                    r.area_dbu2,
+                    r.bound_dbu2,
+                    r.region,
+                );
             }
 
             let reference: Option<serde_json::Value> = args

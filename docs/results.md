@@ -9513,3 +9513,69 @@ are the next revision's work — the picorv32 leg stays `#[ignore]`d.
 (6/6, 1 ignored — the picorv32 gate), `cargo test --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 Version `0.12.4 → 0.12.5` (feature, patch on 0.x).
+### 2026-11-24 — e6-drt-emit r2: post-route min-area patch (v0.12.6)
+
+The picorv32 self-DRC gate's 42 `*.6` findings (see the v0.12.5
+entry — `li.6`×3, `met3.6`×39, all stub-class min-area shortfalls)
+get their fix: `patch_net_min_area` runs once per committed net
+after the `route_nets` iteration loop, when occupancy holds the
+final foreign picture. Per routing layer with `AREA` declared the
+net's metal is rebuilt through `net_layer_shapes` — wires `± w/2`
+as `SignalWire`, pair-default via routing-layer rects as `Via`,
+member-pin shapes as `MacroPin`/`IoPort` — so
+`union::components` + `is_drawn` reproduce `check_area_report`'s
+component model restricted to one net (`area_ours ≤ area_checker`:
+foreign metal touching ours can only help, never hide a violation;
+a `MacroPin`-only island is never evaluated, mirroring the
+checker). `patch_component` walks `+pref`/`−pref` over adjacent
+covered nodes from each in-rect node — every step is one in-plane
+`g.edges` span, so patch metal stays inside the guide region and
+on-track — and commits only while `scan_wire` reports own-net hits
+exclusively (**occupancy-strict**: `Obs` blocks, no host-cell
+carve, strict even under `OccMode::Disabled`; the design's
+decisions 8/9). On `union_area ≥ bound` the span commits as one
+`WireSeg` marked `Net(own)`; the layer re-derives so a patch can
+merge two sub-bound components into a cleared union. What no walk
+fixes lands in `RouteDb.area_residuals` —
+`AreaResidual{net, layer, region, area_dbu2, bound_dbu2}` — the
+named decline arm paired 1:1 with `*.6` gate findings; a `*.6`
+finding with no matching residual is a model bug. Census surface:
+`RouteDb.area_patches`/`area_residuals` print in the `emit_gate`
+and CLI census lines plus one `area_residual <net> <layer>
+area=… bound=… region=…` line each, and `test_emit_selfdrc_gcd`
+asserts `area_residuals.is_empty()`.
+
+**Unit fixtures** (5, `maze.rs` mod tests, `toy_tech_area(bound)`
+param + `line_graph()` + `component_area` non-vacuity probe — each
+asserts the component *is* sub-bound before patching, AGENTS §7.7):
+`test_min_area_patch_fills` (walk reaches bound),
+`test_min_area_patch_pin_merges` (pin metal counts toward the
+component), `test_min_area_patch_occupancy_blocked` (foreign mark
+stops the walk → named residual), `test_min_area_patch_region_bound`
+(walk cannot leave the guide region → residual),
+`test_min_area_patch_in_route_nets` (post-loop hook fires,
+`area_patches=1`, residuals empty).
+
+**gcd**: the patch is a **no-op** — `routed=269 unrouted=0
+wire_rects=1821 vias=1250 area_patches=0 area_residuals=0`,
+self-DRC `findings_total=0`, route digest unchanged
+`0x48593d441074229b` (`test_maze_census`), determinism/roundtrip/
+fail-proof legs green (`cargo test --release -p grus-core --test
+drt emit` 6/6, 1 ignored). Census deltas vs `delegated`/`baseline`
+unchanged from the v0.12.5 entry (wirelength ours 7,153.025 µm vs
+delegated 6,046.305).
+
+**picorv32 re-run detached**: `cargo test --release -p grus-core
+--test drt test_emit_selfdrc_picorv32 -- --ignored --nocapture`,
+started 2026-11-24T03:45Z, stdout `/tmp/emit-picorv32-patch.log` —
+route ≈135 min release CPU + emit + parse + `run_all`. The gate
+verdict is the patch's real test: the 42 `*.6` findings should map
+to `area_residuals` rows (and drop toward zero on whatever the
+walk could lift), with `area_patches`/`area_residuals` counted in
+the census line. In flight at this entry's write; outcome appends
+below when the log lands.
+
+**Checks run**: the 5 fixtures + `cargo test -p grus-core --lib
+drt` (20/20), `cargo test --workspace`, `cargo clippy --workspace
+--all-targets -- -D warnings` clean, the gcd emit suite above.
+Version `0.12.5 → 0.12.6` (feature, patch on 0.x).

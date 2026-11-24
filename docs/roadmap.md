@@ -848,6 +848,16 @@ surface, from the first large-design run's feedback
   under `--ignored`); census deltas vs `delegated`/`baseline`
   recorded as informational. Remaining: `e6-drt-e2e` (full Magic
   deck on our DEF in the container).
+- Progress 2026-11-24 (`v0.12.6`, ticket `e6-drt-emit` r2):
+  post-route min-area patch — the picorv32 gate's 42 `*.6`
+  findings' fix. `patch_net_min_area` rebuilds each `AREA`-bound
+  layer's metal through the checker's `union::components` +
+  `is_drawn` model and extends sub-bound components along in-plane
+  `g.edges` spans, occupancy-strict and guide-region-bound;
+  unfixable components land in `RouteDb.area_residuals`
+  (`AreaResidual`), the decline arm paired 1:1 with `*.6` findings.
+  No-op on gcd (digest `0x48593d441074229b` stands); picorv32
+  emit-gate re-run detached under `--ignored`.
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset

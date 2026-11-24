@@ -111,8 +111,9 @@ pub struct RuleReport {
 
 /// Sources that count as drawn metal for the evaluation gate —
 /// `MacroPin` makes a component *real* (it merges, it fills a hole's
-/// solid set) but cannot be the reason one is checked.
-fn is_drawn(src: ShapeSrc) -> bool {
+/// solid set) but cannot be the reason one is checked. `drt::maze`'s
+/// min-area patch reuses the same gate for its component model.
+pub(crate) fn is_drawn(src: ShapeSrc) -> bool {
     matches!(
         src,
         ShapeSrc::SignalWire | ShapeSrc::SpecialWire | ShapeSrc::Via | ShapeSrc::IoPort

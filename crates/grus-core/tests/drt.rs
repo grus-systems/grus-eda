@@ -1852,18 +1852,32 @@ fn print_emit_census(name: &str, tech: &TechDb, db: &DesignDb, report: &EmitRepo
 }
 
 /// Route → emit → write → re-parse → `run_all` on `name` — the shared
-/// body of the gcd/picorv32 gate tests.
-fn emit_gate(name: &str) {
-    let (tech, db, _route_db, _vias, report) = emit_leg(name, &MazeConfig::default());
+/// body of the gcd/picorv32 gate tests. Returns the `RouteDb` so a
+/// caller can assert on the min-area patch census.
+fn emit_gate(name: &str) -> RouteDb {
+    let (tech, db, route_db, _vias, report) = emit_leg(name, &MazeConfig::default());
     let (rects, vias) = geom_totals(&db);
     println!(
-        "{name}: routed={} unrouted={} wire_rects={rects} vias={vias} wirelength_dbu={}",
+        "{name}: routed={} unrouted={} wire_rects={rects} vias={vias} wirelength_dbu={} area_patches={} area_residuals={}",
         report.routed,
         report.unrouted.len(),
-        report.wire_length_dbu
+        report.wire_length_dbu,
+        route_db.area_patches,
+        route_db.area_residuals.len(),
     );
     for n in &report.unrouted {
         println!("  unrouted {n}");
+    }
+    for r in &route_db.area_residuals {
+        println!(
+            "  area_residual {} {} area={} bound={} region={:?}",
+            net_name(&db, r.net),
+            tech.strings
+                .resolve(tech.routing_layers[r.layer.0 as usize].name),
+            r.area_dbu2,
+            r.bound_dbu2,
+            r.region,
+        );
     }
     assert!(rects > 0 && vias > 0, "{name}: empty emission — vacuous gate");
     print_emit_census(name, &tech, &db, &report);
@@ -1915,6 +1929,7 @@ fn emit_gate(name: &str) {
         firing.is_empty(),
         "{name}: self-DRC findings on our emitted DEF: {firing:?}"
     );
+    route_db
 }
 
 /// The byte-stable roundtrip — the acceptance's write → parse → write
@@ -1951,7 +1966,14 @@ fn test_emit_roundtrip_gcd() {
 /// on our DEF; the full Magic deck check belongs to `e6-drt-e2e`.
 #[test]
 fn test_emit_selfdrc_gcd() {
-    emit_gate("gcd");
+    let route_db = emit_gate("gcd");
+    // gcd's gate was 0 before the patch — a residual appearing here
+    // is a patch regression to investigate, not a count to re-pin.
+    assert!(
+        route_db.area_residuals.is_empty(),
+        "gcd: min-area residuals on a clean gate: {:?}",
+        route_db.area_residuals
+    );
 }
 
 /// Ignored for wall clock (`route_nets` ≈ 135 min release) — run
