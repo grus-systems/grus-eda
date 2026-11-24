@@ -1117,14 +1117,15 @@ fn nearest_idx(list: &[i32], v: i32, n: usize) -> Vec<u32> {
     out
 }
 
+/// layer → line → sorted in-region node indices (`layer_line_maps`'s
+/// pair).
+type LineNodes = Vec<BTreeMap<u32, Vec<u32>>>;
+
 /// layer → line → sorted in-region node indices: `iy → [ix]` for
 /// horizontal landings, `ix → [iy]` for vertical.
-fn layer_line_maps(
-    g: &NetGraph,
-    nl: usize,
-) -> (Vec<BTreeMap<u32, Vec<u32>>>, Vec<BTreeMap<u32, Vec<u32>>>) {
-    let mut lines_h: Vec<BTreeMap<u32, Vec<u32>>> = vec![BTreeMap::new(); nl];
-    let mut lines_v: Vec<BTreeMap<u32, Vec<u32>>> = vec![BTreeMap::new(); nl];
+fn layer_line_maps(g: &NetGraph, nl: usize) -> (LineNodes, LineNodes) {
+    let mut lines_h: LineNodes = vec![BTreeMap::new(); nl];
+    let mut lines_v: LineNodes = vec![BTreeMap::new(); nl];
     for n in &g.nodes {
         let l = n.layer.0 as usize;
         lines_h[l].entry(n.iy).or_default().push(n.ix);
@@ -1303,6 +1304,7 @@ struct AccessVia {
 /// candidate's `b` is the nearest surviving upper node on that line;
 /// positions are confinement-checked (point, stub, every masked via
 /// rect) at generation and occupancy-checked at extraction.
+#[allow(clippy::too_many_arguments)]
 fn access_vias(
     db: &DesignDb,
     tech: &TechDb,
@@ -2321,8 +2323,8 @@ fn route_one_net(
     // and via placement carries its `PaintSrc` so the self-spacing
     // closure can reject the access element that painted a notch
     // prong (`self-spacing.md`).
-    let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> = BTreeMap::new();
-    let mut vlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> = BTreeMap::new();
+    let mut hlines: PaintLines = BTreeMap::new();
+    let mut vlines: PaintLines = BTreeMap::new();
     let mut vplaced: BTreeMap<(u8, i32, i32), PaintSrc> = BTreeMap::new();
     let e_plane = g.edges.len() as u32;
     let v_plane = e_plane + g.via_edges.len() as u32;
@@ -2596,6 +2598,12 @@ impl PaintSrc {
     }
 }
 
+/// The extraction ledger: `(layer, line index) → sorted
+/// `(lo, hi, src)` intervals on that line — every committed wire
+/// segment, stub, fill and via plate carries its `PaintSrc` so the
+/// closure can name (and reject) the element that painted a prong.
+type PaintLines = BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>;
+
 /// The attach element a pin's legal paint came from — recorded so a
 /// rejected element lands in that pin's tried-set.
 #[derive(Clone, Copy, Debug)]
@@ -2642,8 +2650,8 @@ fn try_pin_paint(
     run: &NetRun,
     debug: bool,
     pi: usize,
-    hlines: &mut BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
-    vlines: &mut BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    hlines: &mut PaintLines,
+    vlines: &mut PaintLines,
     vplaced: &mut BTreeMap<(u8, i32, i32), PaintSrc>,
     tried_proj: &mut BTreeSet<(usize, u32)>,
     tried_arc: &mut BTreeSet<usize>,
@@ -2772,8 +2780,8 @@ fn try_pin_paint(
 /// it.
 fn remove_paint(
     src: PaintSrc,
-    hlines: &mut BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
-    vlines: &mut BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    hlines: &mut PaintLines,
+    vlines: &mut PaintLines,
     vplaced: &mut BTreeMap<(u8, i32, i32), PaintSrc>,
 ) {
     for ivs in hlines.values_mut() {
@@ -2803,8 +2811,8 @@ fn close_self_spacing(
     mask: &HullMask,
     cover: &PinCover,
     vias: &ViaTable,
-    hlines: &BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
-    vlines: &BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>>,
+    hlines: &PaintLines,
+    vlines: &PaintLines,
     vplaced: &BTreeMap<(u8, i32, i32), PaintSrc>,
 ) -> ClosureResult {
     let mut pieces: BTreeMap<u8, Vec<(RectDbu, BTreeSet<PaintSrc>)>> = BTreeMap::new();
@@ -4737,7 +4745,7 @@ mod tests {
         // t=1000 line; the via at (600,1000) plates
         // C [600,930,700,1070] — C faces A across the identical
         // [500,600]×[930,1070] gap B does (gap 100 < s=140).
-        let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+        let mut hlines: PaintLines =
             BTreeMap::new();
         hlines.insert(
             (0, 1000),
@@ -4786,7 +4794,7 @@ mod tests {
         let mask = HullMask::new(&db, &tech);
         let cover = PinCover::new();
         let vias = ViaTable::default();
-        let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+        let mut hlines: PaintLines =
             BTreeMap::new();
         hlines.insert(
             (0, 1000),
@@ -4840,7 +4848,7 @@ mod tests {
         let mask = HullMask::new(&db, &tech);
         let cover = PinCover::new();
         let vias = ViaTable::default();
-        let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+        let mut hlines: PaintLines =
             BTreeMap::new();
         hlines.insert(
             (0, 1000),
@@ -4979,11 +4987,11 @@ mod tests {
         // Wall pieces ± w2 = 70: void (140,140)-(860,860) =
         // 518,400 < bound 600,000.
         let donut = || {
-            let mut hlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+            let mut hlines: PaintLines =
                 BTreeMap::new();
             hlines.insert((0, 70), vec![(0, 1000, PaintSrc::Tree)]);
             hlines.insert((0, 930), vec![(0, 1000, PaintSrc::Tree)]);
-            let mut vlines: BTreeMap<(u8, i32), Vec<(i32, i32, PaintSrc)>> =
+            let mut vlines: PaintLines =
                 BTreeMap::new();
             vlines.insert((0, 70), vec![(0, 1000, PaintSrc::Tree)]);
             vlines.insert((0, 930), vec![(0, 1000, PaintSrc::Tree)]);
