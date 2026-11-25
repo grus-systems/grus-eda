@@ -114,6 +114,12 @@ pub enum FailKind {
 pub struct UnroutedNet {
     pub net: NetId,
     pub connected: Vec<PinId>,
+    /// Final hard-iteration classification in `pin_nodes` order —
+    /// `route_db.unrouted` is written once on the last iteration, so
+    /// this is the emitted DEF's connectivity truth. The ever-failed
+    /// census (every pin that saw no legal paint on any iteration,
+    /// including pins that later re-attached) is
+    /// `RouteDb::stub_outside_cover`, not this field.
     pub failed: Vec<(PinId, FailKind)>,
     /// Wave-death postmortem — `(layer, kind)` of the first blocking
     /// mark found on each failed pin's pocket-reachable attach arcs,

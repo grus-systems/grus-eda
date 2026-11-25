@@ -706,7 +706,12 @@ collisions/area_patches/area_residuals/iterations/route_ms`, one
 <net> <layer> area=… bound=… region=…` line per unfixable §7
 component), the informational `wirelength_um` + `via.<cut>`
 deltas vs `variants.delegated`/`baseline`, and — under `--self-drc`
-— the re-parse→assemble→`run_all` verdict. The CLI reports and
+— the re-parse→assemble→`run_all` verdict. Under each `unrouted`
+line one `    fail <inst>/<pin> <FailKind>[ region_escape]` line
+names every member pin's *final* classification (`u.failed`; the
+`region_escape` suffix marks a pin whose shapes held no in-region
+strict node at graph build — an ever-failed alternative census is
+`stub_outside_cover`). The CLI reports and
 never exits nonzero on findings; the gate is `tests/drt.rs`.
 
 ## 9. End-to-end Magic gate (`e6-drt-e2e`)
