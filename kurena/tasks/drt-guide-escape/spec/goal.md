@@ -1,7 +1,9 @@
 # drt-guide-escape: pins with no in-region attach point
 
-External review (S2, most likely root cause of a large-scale
-42-net consecutive-unrouted cluster): the route graph covers the
+External review (S2), confirmed as real by the picorv32 leg
+(v0.12.9 recount: unrouted no-stub nets carrying met3+ guide
+boxes exist — 48 bridged in the no-stub census; see
+`docs/results.md` 2026-11-25): the route graph covers the
 guide region plus the topmost layer only. A pin whose metal lies
 outside the guide region — or whose in-region attach nodes are
 walled by OBS — has no attach point and goes

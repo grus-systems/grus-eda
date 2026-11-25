@@ -1,9 +1,10 @@
 # drt-unrouted-census: surface per-pin failure classification
 
-External review (large-scale run, ~8k unrouted): the operator
+External review, and concrete at public scale too (the picorv32
+leg measured unrouted=2,016 — v0.12.9): the operator
 cannot tell whether unrouted nets died `Unattachable` or `NoPath`,
-so a class of failure (e.g. 42 consecutive unrouted nets sharing a
-guide region) cannot be root-caused without a debugger. The
+so a cluster of unrouted nets sharing a cause cannot be
+root-caused without a debugger. The
 classification already exists — `UnroutedNet.failed` carries
 per-pin `FailKind` — it is simply never printed.
 
