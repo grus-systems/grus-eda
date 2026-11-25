@@ -324,9 +324,13 @@ pub enum LayerDir {
 pub struct RoutingLayer {
     pub name: SymbolId,
     pub dir: LayerDir,
-    pub pitch_dbu: i32,
+    pub pitch_dbu: i32,        // preferred-direction pitch
     pub width_dbu: i32,
-    pub offset_dbu: i32,
+    pub offset_dbu: i32,       // preferred-direction offset
+    pub pitch_x_dbu: i32,      // per-axis LEF PITCH/OFFSET (y defaults to x)
+    pub pitch_y_dbu: i32,
+    pub offset_x_dbu: i32,
+    pub offset_y_dbu: i32,
     pub res_per_sq: f32,       // Ohms per square
     pub cap_per_sq_um: f32,    // pF per um^2
     pub edge_cap_per_um: f32,  // pF per um
@@ -437,7 +441,7 @@ pub struct TrackGrid {
 pub struct GCellGridDef {
     pub is_x: bool, // true = GCELLGRID X, false = GCELLGRID Y
     pub start_dbu: i32,
-    pub num_boundaries: i32,
+    pub num_cells: i32,
     pub step_dbu: i32,
 }
 

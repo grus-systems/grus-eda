@@ -5,9 +5,9 @@
 //! designs the LEF side is always empty — the effective grid is
 //! entirely DEF-sourced.
 
-use crate::design_db::DesignDb;
+use crate::design_db::{DesignDb, TrackGrid};
 use crate::interner::LayerId;
-use crate::tech_db::{LayerDir, TechDb};
+use crate::tech_db::{LayerDir, RectDbu, TechDb};
 
 /// Which coordinate list a track set populates: `X` = vertical lines
 /// (x-coordinates), `Y` = horizontal lines (y-coordinates) — the same
@@ -73,6 +73,49 @@ pub fn layer_tracks(db: &DesignDb, tech: &TechDb) -> Vec<LayerTracks> {
     out
 }
 
+/// DEF `TRACKS` grids for a (tech, die) pair when the design DB
+/// carries none — the emit-side inverse of `layer_tracks` expansion.
+/// One grid per routing layer per axis (X then Y), `start`/`step` the
+/// layer's per-axis `OFFSET`/`PITCH` (sky130 li1's split 460/340 pair
+/// only reproduces OpenROAD's grid this way), count = the track
+/// coordinates whose centred min-width wire fits inside the die:
+/// `die_lo + w/2 <= start + k·step <= die_hi - w/2`. Reproduces
+/// OpenROAD's emitted `DO` counts exactly (verified against every
+/// OpenROAD DEF in `tests/designs` — `docs/results.md`). Grids with
+/// zero fitting tracks are omitted.
+pub fn default_track_grids(tech: &TechDb, die: RectDbu) -> Vec<TrackGrid> {
+    let mut out = Vec::with_capacity(tech.routing_layers.len() * 2);
+    for (i, layer) in tech.routing_layers.iter().enumerate() {
+        let w2 = layer.width_dbu / 2;
+        for (is_vertical, lo, hi) in [(true, die.xl, die.xh), (false, die.yl, die.yh)] {
+            let (start, step) = if is_vertical {
+                (layer.offset_x_dbu, layer.pitch_x_dbu)
+            } else {
+                (layer.offset_y_dbu, layer.pitch_y_dbu)
+            };
+            // Lower-edge check gates the whole grid; it is symmetric
+            // with the verified upper-edge rule and unexercised by
+            // in-tree inputs (every die starts at 0).
+            let room = hi - w2 - start;
+            let num = if room >= 0 && start - w2 >= lo && step > 0 {
+                room / step + 1
+            } else {
+                0
+            };
+            if num > 0 {
+                out.push(TrackGrid {
+                    is_vertical_tracks: is_vertical,
+                    start_dbu: start,
+                    num_tracks: num,
+                    step_dbu: step,
+                    layers: vec![LayerId(i as u8)],
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Preferred-axis coverage: a `Horizontal` layer routes along
 /// horizontal lines, so it needs `tracks_y`; a `Vertical` layer needs
 /// `tracks_x` (the direction-to-axis flip is easy to get backwards).
@@ -112,6 +155,10 @@ mod tests {
             pitch_dbu: 340,
             width_dbu: 140,
             offset_dbu: 170,
+            pitch_x_dbu: 340,
+            pitch_y_dbu: 340,
+            offset_x_dbu: 170,
+            offset_y_dbu: 170,
             tracks_x: Vec::new(),
             tracks_y: Vec::new(),
             res_per_sq: 0.0,
@@ -159,6 +206,85 @@ mod tests {
         assert_eq!(tracks[0].tracks_y, vec![170, 510]);
         assert_eq!(tracks[1].tracks_y, vec![170, 510]);
         assert!(tracks[1].tracks_x.is_empty());
+    }
+
+    /// Synthetic 2-layer tech (offset 170, step 340, w2 70 on both).
+    /// Die hi = 920 puts the k=2 coordinate 850 flush against the edge
+    /// (850 + 70 == 920 — included); one DBU tighter drops it; a die
+    /// edge that leaves no room for the first centred wire omits that
+    /// axis's grids entirely.
+    #[test]
+    fn test_default_track_grids_counts() {
+        let tech = two_layer_tech();
+
+        let grids = default_track_grids(&tech, RectDbu::new(0, 0, 920, 920));
+        assert_eq!(
+            grids,
+            vec![
+                TrackGrid {
+                    is_vertical_tracks: true,
+                    start_dbu: 170,
+                    num_tracks: 3,
+                    step_dbu: 340,
+                    layers: vec![LayerId(0)],
+                },
+                TrackGrid {
+                    is_vertical_tracks: false,
+                    start_dbu: 170,
+                    num_tracks: 3,
+                    step_dbu: 340,
+                    layers: vec![LayerId(0)],
+                },
+                TrackGrid {
+                    is_vertical_tracks: true,
+                    start_dbu: 170,
+                    num_tracks: 3,
+                    step_dbu: 340,
+                    layers: vec![LayerId(1)],
+                },
+                TrackGrid {
+                    is_vertical_tracks: false,
+                    start_dbu: 170,
+                    num_tracks: 3,
+                    step_dbu: 340,
+                    layers: vec![LayerId(1)],
+                },
+            ]
+        );
+
+        let grids = default_track_grids(&tech, RectDbu::new(0, 0, 919, 919));
+        assert_eq!(grids.len(), 4);
+        assert!(grids.iter().all(|g| g.num_tracks == 2));
+
+        let grids = default_track_grids(&tech, RectDbu::new(0, 0, 920, 200));
+        assert_eq!(grids.len(), 2);
+        assert!(grids.iter().all(|g| g.is_vertical_tracks));
+
+        let grids = default_track_grids(&tech, RectDbu::new(200, 0, 920, 920));
+        assert_eq!(grids.len(), 2);
+        assert!(grids.iter().all(|g| !g.is_vertical_tracks));
+    }
+
+    /// Derivation fidelity: `default_track_grids` on the real tech LEF
+    /// and gcd's die must reproduce `gcd.placed.def`'s `db.tracks`
+    /// field-for-field — i.e. byte-equal to what OpenROAD emits.
+    #[test]
+    fn test_default_track_grids_sky130_gcd() {
+        use crate::readers::def::parse_def;
+        use crate::readers::lef::load_tech_db;
+        use crate::test_support::{design_dir, require, sky130_hd};
+
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let def_path = require(design_dir("gcd").join("gcd.placed.def"));
+
+        let mut interner = StringInterner::new();
+        let tech = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let db = parse_def(&def_path, &tech, None).expect("Failed to parse gcd.placed.def");
+
+        assert_eq!(default_track_grids(&tech, db.die_area), db.tracks);
     }
 
     #[test]

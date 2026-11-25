@@ -30,6 +30,8 @@ on its own:
 
 - `crates/grus-core/src/drt/tracks.rs`
 - `crates/grus-core/src/readers/def.rs`
+- `crates/grus-core/src/readers/lef.rs` (per-axis `PITCH`/`OFFSET` retention)
+- `crates/grus-core/src/tech_db.rs` (`pitch_{x,y}_dbu`/`offset_{x,y}_dbu` fields)
 - `crates/grus-core/src/design_db.rs`
 - `crates/grus-core/src/congestion/gcell.rs`
 - `crates/grus-core/tests/`

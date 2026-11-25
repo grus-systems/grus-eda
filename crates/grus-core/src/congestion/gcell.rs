@@ -118,8 +118,10 @@ impl GCellGrid {
                     let oy = y_grid.start_dbu;
                     let gw = x_grid.step_dbu;
                     let gh = y_grid.step_dbu;
-                    let num_x = (x_grid.num_boundaries - 1).max(1) as usize;
-                    let num_y = (y_grid.num_boundaries - 1).max(1) as usize;
+                    // `DO` is the column/row count in OpenROAD's
+                    // convention (`getGridX` has one entry per column).
+                    let num_x = x_grid.num_cells.max(1) as usize;
+                    let num_y = y_grid.num_cells.max(1) as usize;
                     (ox, oy, gw, gh, num_x, num_y)
                 } else {
                     Self::compute_default_grid(design_db, tech_db, gcell_tracks_override)
@@ -417,7 +419,11 @@ impl GCellGrid {
         grid
     }
 
-    fn compute_default_grid(
+    /// The grid used when the DEF is silent (or an axis is missing):
+    /// die lower-left origin, `step = gcell_tracks_override.unwrap_or(15)
+    /// × routing_layers[2].pitch_dbu`, `n = max(1, floor(span/step))`.
+    /// `write_def_full` emits these numbers as the default `GCELLGRID`.
+    pub fn compute_default_grid(
         design_db: &DesignDb,
         tech_db: &TechDb,
         gcell_tracks_override: Option<i32>,

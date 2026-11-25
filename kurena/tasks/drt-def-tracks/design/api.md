@@ -8,8 +8,9 @@ All in `grus-core`. `write_def_full`'s signature is unchanged.
 /// DEF `TRACKS` grids for a (tech, die) pair when the design DB
 /// carries none — the emit-side inverse of `layer_tracks`
 /// expansion. One grid per routing layer per axis (X then Y),
-/// `start = offset_dbu`, `step = pitch_dbu`, count = the track
-/// coordinates whose centred min-width wire fits inside the die:
+/// `start`/`step` the axis-matched `offset_{x,y}_dbu`/
+/// `pitch_{x,y}_dbu`, count = the track coordinates whose
+/// centred min-width wire fits inside the die:
 /// `die_lo + w/2 <= start + k·step <= die_hi - w/2`.
 /// Reproduces OpenROAD's emitted DO counts exactly (see
 /// kurena/tasks/drt-def-tracks/design/tracks.md for evidence).
@@ -19,6 +20,17 @@ pub fn default_track_grids(tech: &TechDb, die: RectDbu) -> Vec<TrackGrid>
 
 Layer id for each grid comes from the routing-layer index:
 `layers: vec![LayerId(i as u8)]`.
+
+## `crates/grus-core/src/tech_db.rs` + `readers/lef.rs` — per-axis pitch/offset
+
+`RoutingLayer` gains `pitch_x_dbu`, `pitch_y_dbu`,
+`offset_x_dbu`, `offset_y_dbu` (`#[serde(default)]`; nothing
+persists `TechDb`). The LEF reader keeps both `PITCH <x> [<y>]`
+values (y defaults to x); `pitch_dbu`/`offset_dbu` remain the
+preferred-direction pair, so every existing consumer is
+unchanged. Needed because sky130 `li1` splits the pair
+(`PITCH 0.46 0.34` / `OFFSET 0.23 0.17`) and OpenROAD writes
+the axis-correct `TRACKS Y 170 STEP 340 LAYER li1`.
 
 ## `crates/grus-core/src/design_db.rs`
 

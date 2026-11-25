@@ -683,20 +683,18 @@ fn parse_layer(
         let dbu = tech_db.dbu_per_micron as f32;
         let width_um =
             width_um.with_context(|| format!("LEF: routing layer {layer_name} has no WIDTH"))?;
-        let pitch_um = match dir {
-            LayerDir::Vertical => pitch_x_um.or(pitch_y_um),
-            LayerDir::Horizontal => pitch_y_um.or(pitch_x_um),
-        }
-        .with_context(|| format!("LEF: routing layer {layer_name} has no PITCH"))?;
-        // OFFSET is optional; an absent OFFSET is the LEF default of 0.
-        let offset_um = match dir {
-            LayerDir::Vertical => offset_x_um.or(offset_y_um),
-            LayerDir::Horizontal => offset_y_um.or(offset_x_um),
-        }
-        .unwrap_or(0.0);
-
-        let pitch_dbu = (pitch_um * dbu).round() as i32;
-        let offset_dbu = (offset_um * dbu).round() as i32;
+        let pitch_x = pitch_x_um
+            .with_context(|| format!("LEF: routing layer {layer_name} has no PITCH"))?;
+        // A single `PITCH`/`OFFSET` value applies to both axes; an
+        // absent `OFFSET` is the LEF default of 0.
+        let pitch_x_dbu = (pitch_x * dbu).round() as i32;
+        let pitch_y_dbu = (pitch_y_um.unwrap_or(pitch_x) * dbu).round() as i32;
+        let offset_x_dbu = (offset_x_um.unwrap_or(0.0) * dbu).round() as i32;
+        let offset_y_dbu = (offset_y_um.or(offset_x_um).unwrap_or(0.0) * dbu).round() as i32;
+        let (pitch_dbu, offset_dbu) = match dir {
+            LayerDir::Vertical => (pitch_x_dbu, offset_x_dbu),
+            LayerDir::Horizontal => (pitch_y_dbu, offset_y_dbu),
+        };
         let width_dbu = (width_um * dbu).round() as i32;
 
         let layer_sym = interner.intern(&layer_name);
@@ -709,6 +707,10 @@ fn parse_layer(
             pitch_dbu,
             width_dbu,
             offset_dbu,
+            pitch_x_dbu,
+            pitch_y_dbu,
+            offset_x_dbu,
+            offset_y_dbu,
             tracks_x: Vec::new(),
             tracks_y: Vec::new(),
             res_per_sq,

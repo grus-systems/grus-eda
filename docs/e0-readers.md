@@ -115,7 +115,7 @@ Parse `.tlef` (technology LEF) followed by `.lef` (macro cell LEF) into `TechDb`
 3. **`LAYER <name>`**:
    - Only record layers with `TYPE ROUTING ;` in `routing_layers`.
    - `DIRECTION HORIZONTAL | VERTICAL ;`
-   - `PITCH <p_um> ;` (or `PITCH <px_um> <py_um> ;`), `WIDTH <w_um> ;`, `OFFSET <o_um> ;` $\rightarrow$ convert to `i32` DBU.
+   - `PITCH <p_um> ;` (or `PITCH <px_um> <py_um> ;`), `WIDTH <w_um> ;`, `OFFSET <o_um> ;` $\rightarrow$ convert to `i32` DBU. Both axes are retained (`pitch_{x,y}_dbu` / `offset_{x,y}_dbu`, y defaulting to x); `pitch_dbu`/`offset_dbu` are the preferred-direction pair. sky130 `li1` splits them (`PITCH 0.46 0.34` / `OFFSET 0.23 0.17`) — the `TRACKS` grids OpenROAD emits are axis-correct.
    - `RESISTANCE RPERSQ <f32> ;`
    - `CAPACITANCE CPERSQDIST <f32> ;` and `EDGECAPACITANCE <f32> ;`
    - `TYPE CUT ;` layers are recorded in `cut_layers`, keyed on the routing layer parsed just before them (`CutLayer::above`); a bare `RESISTANCE <ohms> ;` on a CUT layer is the per-cut via resistance, folded into `via_res_ohm_above[above]` by `load_tech_db` (first CUT above a routing layer wins). `licon`, which precedes the first routing layer, is intentionally not recorded — it has no `above`.
@@ -179,7 +179,7 @@ struct YosysFile {
 - Parse `DIEAREA ( xl yl ) ( xh yh ) ;`.
 - Parse `ROW <row_name> <site_name> <orig_x> <orig_y> <orient> DO <num_x> BY <num_y> STEP <step_x> <step_y> ;`.
 - Parse `TRACKS ( X | Y ) <start> DO <num> STEP <step> LAYER <layer_names...> ;`.
-- Parse `GCELLGRID ( X | Y ) <start> DO <num> STEP <step> ;` into `DesignDb::gcell_grids` if present.
+- Parse `GCELLGRID ( X | Y ) <start> DO <num> STEP <step> ;` into `DesignDb::gcell_grids` if present. `DO` is stored as `num_cells` — the gcell column/row count in OpenROAD's convention (`getGridX` returns one entry per column; strict DEF 5.8 would read it as boundary lines, but every in-tree DEF is OpenROAD's or ours).
 - Parse `COMPONENTS <n> ;`:
   - `- <inst_name> <macro_name> + ( PLACED | FIXED | UNPLACED ) ( <x> <y> ) <orient> ;`
   - Unescape DEF backslash sequences if present so instance names match Yosys JSON / Verilog.

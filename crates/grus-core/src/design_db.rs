@@ -168,7 +168,10 @@ pub struct NetGeom {
 pub struct GCellGridDef {
     pub is_x: bool, // true = GCELLGRID X, false = GCELLGRID Y
     pub start_dbu: i32,
-    pub num_boundaries: i32,
+    /// `GCELLGRID DO` value — the gcell column/row count in the
+    /// OpenROAD convention this codebase follows (strict DEF 5.8 reads
+    /// `DO` as grid *lines*; the reference tool writes cells).
+    pub num_cells: i32,
     pub step_dbu: i32,
 }
 

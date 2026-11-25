@@ -40,10 +40,19 @@ else:
 
 ## The derivation — `default_track_grids(tech, die) -> Vec<TrackGrid>`
 
+Correction during implementation: `RoutingLayer::pitch_dbu`/
+`offset_dbu` are the *preferred-direction* pair only — sky130
+`li1` declares a split `PITCH 0.46 0.34` / `OFFSET 0.23 0.17`
+and OpenROAD emits the axis-correct values (`TRACKS Y 170 STEP
+340 LAYER li1`). `RoutingLayer` gained per-axis fields
+`pitch_{x,y}_dbu` / `offset_{x,y}_dbu` (single-value `PITCH`/
+`OFFSET` fills both; the preferred pair is unchanged for all
+existing consumers).
+
 For each `RoutingLayer l` in `tech.routing_layers` order, emit
 two grids (`is_vertical_tracks` true = `TRACKS X`, false =
-`TRACKS Y`), each `layers: vec![lid]`, `start_dbu =
-l.offset_dbu`, `step_dbu = l.pitch_dbu`, and
+`TRACKS Y`), each `layers: vec![lid]`, `start_dbu`/`step_dbu`
+the axis-matched `offset_{x,y}_dbu`/`pitch_{x,y}_dbu`, and
 
 ```
 w2   = l.width_dbu / 2                       (integer)
