@@ -1694,7 +1694,10 @@ pub fn parse_def_bytes(bytes: &[u8], tech_db: &TechDb, lib_db: Option<&LibDb>) -
                 db.gcell_grids.push(GCellGridDef {
                     is_x: axis(dir, "GCELLGRID", line)?,
                     start_dbu: number(start, "GCELLGRID start", line)?,
-                    num_boundaries: number(num, "GCELLGRID count", line)?,
+                    // OpenROAD convention: `DO` is the gcell column/row
+                    // count (one `getGridX`/`getGridY` entry per cell),
+                    // not the strict-DEF boundary count.
+                    num_cells: number(num, "GCELLGRID count", line)?,
                     step_dbu: number(step, "GCELLGRID step", line)?,
                 });
             }
@@ -1922,10 +1925,17 @@ pub fn write_def(
     Ok(())
 }
 
-/// Serializes a complete DEF — header, DIEAREA, ROWs, COMPONENTS, PINS, NETS —
-/// with no template. Used by floorplan generation where no DEF exists yet.
-/// TRACKS/GCELLGRID/VIAS/SPECIALNETS are omitted: they constrain detailed
-/// routing and power, which this database does not model.
+/// Serializes a complete DEF — header, DIEAREA, ROWs, TRACKS, GCELLGRID,
+/// COMPONENTS, PINS, NETS — with no template. Used by floorplan
+/// generation where no DEF exists yet.
+/// TRACKS re-emits `db.tracks` verbatim or derives the per-layer grids
+/// `drt::tracks::default_track_grids` computes from the tech and die;
+/// GCELLGRID likewise (`GCellGrid::compute_default_grid`), so the file
+/// carries the track model and the gcell grid the congestion model
+/// assumes. VIAS and SPECIALNETS remain omitted: `db.def_vias` cannot
+/// rebuild a faithful section (the `+ VIARULE` name is not retained at
+/// parse and inline `+ RECT`/`+ POLYGON` records store nothing) and the
+/// PDN is outside this model.
 pub fn write_def_full(db: &DesignDb, tech_db: &TechDb, out_def_path: &Path) -> Result<()> {
     let name = |sym: crate::interner::SymbolId| escape_def_name(db.strings.resolve(sym));
     let mut out = String::with_capacity(1 << 20);
@@ -1947,6 +1957,52 @@ pub fn write_def_full(db: &DesignDb, tech_db: &TechDb, out_def_path: &Path) -> R
             r.num_x,
             r.step_x_dbu
         ));
+    }
+
+    let derived_tracks;
+    let tracks = if db.tracks.is_empty() {
+        derived_tracks = crate::drt::tracks::default_track_grids(tech_db, db.die_area);
+        &derived_tracks
+    } else {
+        &db.tracks
+    };
+    for tg in tracks {
+        if tg.num_tracks <= 0 {
+            continue;
+        }
+        out.push_str(&format!(
+            "TRACKS {} {} DO {} STEP {}",
+            if tg.is_vertical_tracks { "X" } else { "Y" },
+            tg.start_dbu,
+            tg.num_tracks,
+            tg.step_dbu
+        ));
+        for lid in &tg.layers {
+            if let Some(layer) = tech_db.routing_layers.get(lid.0 as usize) {
+                out.push_str(&format!(
+                    " LAYER {}",
+                    escape_def_name(tech_db.strings.resolve(layer.name))
+                ));
+            }
+        }
+        out.push_str(" ;\n");
+    }
+
+    if db.gcell_grids.is_empty() {
+        let (ox, oy, gw, gh, nx, ny) =
+            crate::congestion::GCellGrid::compute_default_grid(db, tech_db, None);
+        out.push_str(&format!("GCELLGRID X {ox} DO {nx} STEP {gw} ;\n"));
+        out.push_str(&format!("GCELLGRID Y {oy} DO {ny} STEP {gh} ;\n"));
+    } else {
+        for g in &db.gcell_grids {
+            out.push_str(&format!(
+                "GCELLGRID {} {} DO {} STEP {} ;\n",
+                if g.is_x { "X" } else { "Y" },
+                g.start_dbu,
+                g.num_cells,
+                g.step_dbu
+            ));
+        }
     }
 
     out.push_str(&format!("COMPONENTS {} ;\n", db.num_cells()));
@@ -3367,5 +3423,156 @@ END DESIGN
             ),
             (85, 165, 55, 85)
         );
+    }
+
+    /// `(TechDb, DesignDb)` for `gcd.placed.def` — the real tech LEF and
+    /// the committed placed DEF, both required (no silent skips).
+    fn gcd_placed_db() -> (TechDb, DesignDb) {
+        let tlef_path = require(sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef_path = require(sky130_hd().join("lef/sky130_fd_sc_hd.lef"));
+        let def_path = require(design_dir("gcd").join("gcd.placed.def"));
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
+        (tech_db, db)
+    }
+
+    /// `write_def_full` re-emits a populated `db.tracks` verbatim and
+    /// appends the derived default GCELLGRID; re-parsing reproduces both.
+    #[test]
+    fn test_write_def_full_tracks_verbatim() {
+        let (tech_db, db) = gcd_placed_db();
+        let input = std::fs::read_to_string(design_dir("gcd").join("gcd.placed.def")).unwrap();
+        let want_tracks: Vec<&str> = input
+            .lines()
+            .filter(|l| l.starts_with("TRACKS"))
+            .collect();
+        assert_eq!(want_tracks.len(), db.tracks.len());
+
+        let out_path = std::env::temp_dir().join(format!(
+            "grus_def_full_verbatim_{}.def",
+            std::process::id()
+        ));
+        write_def_full(&db, &tech_db, &out_path).expect("write_def_full");
+        let emitted = std::fs::read_to_string(&out_path).unwrap();
+        let got_tracks: Vec<&str> = emitted
+            .lines()
+            .filter(|l| l.starts_with("TRACKS"))
+            .collect();
+        assert_eq!(got_tracks, want_tracks);
+
+        let db2 = parse_def(&out_path, &tech_db, None).expect("re-parse emitted DEF");
+        assert_eq!(db2.tracks, db.tracks);
+        // gcd's placed DEF carries no GCELLGRID: the emitter derives the
+        // default grid — 13×14 cells of 6900 DBU on this die, the same
+        // numbers OpenROAD writes into gcd.routed.def.
+        assert_eq!(
+            db2.gcell_grids,
+            vec![
+                GCellGridDef {
+                    is_x: true,
+                    start_dbu: 0,
+                    num_cells: 13,
+                    step_dbu: 6900,
+                },
+                GCellGridDef {
+                    is_x: false,
+                    start_dbu: 0,
+                    num_cells: 14,
+                    step_dbu: 6900,
+                },
+            ]
+        );
+        let _ = std::fs::remove_file(out_path);
+    }
+
+    /// With `db.tracks` cleared the emitter derives the grids itself; on
+    /// gcd the derived lines are byte-identical to the verbatim case.
+    #[test]
+    fn test_write_def_full_tracks_derived() {
+        let (tech_db, mut db) = gcd_placed_db();
+        db.tracks.clear();
+        let out_path = std::env::temp_dir().join(format!(
+            "grus_def_full_derived_{}.def",
+            std::process::id()
+        ));
+        write_def_full(&db, &tech_db, &out_path).expect("write_def_full");
+        let emitted = std::fs::read_to_string(&out_path).unwrap();
+        let input = std::fs::read_to_string(design_dir("gcd").join("gcd.placed.def")).unwrap();
+        let want: Vec<&str> = input
+            .lines()
+            .filter(|l| l.starts_with("TRACKS"))
+            .collect();
+        let got: Vec<&str> = emitted
+            .lines()
+            .filter(|l| l.starts_with("TRACKS"))
+            .collect();
+        assert_eq!(got, want);
+        let _ = std::fs::remove_file(out_path);
+    }
+
+    /// The emitted GCELLGRID reconstructs the grid `GCellGrid::build`
+    /// assumed on the statement-free input — emitting it changes nothing
+    /// downstream.
+    #[test]
+    fn test_write_def_full_gcellgrid_rebuilds_default() {
+        let (tech_db, db) = gcd_placed_db();
+        assert!(db.gcell_grids.is_empty());
+        let want = crate::congestion::GCellGrid::compute_default_grid(&db, &tech_db, None);
+        assert_eq!(want, (0, 0, 6900, 6900, 13, 14));
+
+        let out_path = std::env::temp_dir().join(format!(
+            "grus_def_full_gcell_{}.def",
+            std::process::id()
+        ));
+        write_def_full(&db, &tech_db, &out_path).expect("write_def_full");
+        let db2 = parse_def(&out_path, &tech_db, None).expect("re-parse emitted DEF");
+        let grid = crate::congestion::GCellGrid::build(&db2, &tech_db, None, None);
+        assert_eq!(
+            (
+                grid.origin_x_dbu,
+                grid.origin_y_dbu,
+                grid.gcell_w_dbu,
+                grid.gcell_h_dbu,
+                grid.nx,
+                grid.ny
+            ),
+            want
+        );
+        let _ = std::fs::remove_file(out_path);
+    }
+
+    /// `GCELLGRID DO n` is the column/row count in OpenROAD's convention,
+    /// not the strict-DEF boundary count: `DO 13` builds a 13-column grid.
+    #[test]
+    fn test_gcellgrid_do_is_column_count() {
+        let def = MINI_DEF.replace(
+            "TRACKS X 170 DO 100 STEP 340 LAYER met1 ;",
+            "TRACKS X 170 DO 100 STEP 340 LAYER met1 ;\n\
+             GCELLGRID X 0 DO 13 STEP 300 ;\n\
+             GCELLGRID Y 0 DO 9 STEP 300 ;",
+        );
+        let tech = mini_tech();
+        let db = parse_def_bytes(def.as_bytes(), &tech, None).expect("must parse");
+        let grid = crate::congestion::GCellGrid::build(&db, &tech, None, None);
+        assert_eq!((grid.nx, grid.ny), (13, 9));
+    }
+
+    /// Identical input produces a byte-identical DEF.
+    #[test]
+    fn test_write_def_full_deterministic() {
+        let (tech_db, db) = gcd_placed_db();
+        let p1 = std::env::temp_dir().join(format!("grus_def_full_d1_{}.def", std::process::id()));
+        let p2 = std::env::temp_dir().join(format!("grus_def_full_d2_{}.def", std::process::id()));
+        write_def_full(&db, &tech_db, &p1).expect("write_def_full");
+        write_def_full(&db, &tech_db, &p2).expect("write_def_full");
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            std::fs::read(&p2).unwrap()
+        );
+        let _ = std::fs::remove_file(p1);
+        let _ = std::fs::remove_file(p2);
     }
 }

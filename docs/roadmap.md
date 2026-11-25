@@ -424,9 +424,13 @@ Remaining:
   pitch; inputs go on the left edge, outputs on the right, names
   sorted naturally so buses read in order.
 - `readers/def.rs::write_def_full` serializes a whole DesignDb (no
-  template): header, DIEAREA, ROWs, COMPONENTS, PINS, NETS. TRACKS/
-  GCELLGRID/VIAS/SPECIALNETS are omitted — they constrain detailed
-  routing/power, which the database does not model. Names go through
+  template): header, DIEAREA, ROWs, TRACKS, GCELLGRID, COMPONENTS,
+  PINS, NETS. TRACKS re-emits `db.tracks` verbatim or derives the
+  per-axis grids OpenROAD writes (`drt::tracks::default_track_grids`);
+  GCELLGRID likewise (the congestion default grid, 15 met2
+  tracks/GCell). VIAS/SPECIALNETS remain omitted — DEF via defs
+  cannot be rebuilt faithfully and the PDN is outside this model.
+  Names go through
   `escape_def_name`, which escapes only the lexer delimiters and `\`
   itself; `[N]` bus-bit syntax stays literal so external readers see
   the same names OpenROAD-flow-scripts emits. The DEF lexer was

@@ -628,9 +628,10 @@ opt-in, zero cost unset; it feeds `docs/results.md` runtime evidence.
 `write_routed_def` splices a canonical `NETS` section into the placed
 DEF template — everything outside `NETS n ;` … `END NETS` passes
 through verbatim (`VIAS`, the `SPECIALNETS` PDN, `TRACKS`, `PINS`,
-`GCELLGRID` all survive; that survival is why `write_def_full` was
-rejected — it regenerates only `COMPONENTS`+`NETS` and drops the PDN
-shapes the self-DRC picture needs).
+`GCELLGRID` all survive; the PDN is why `write_def_full` was
+rejected — it now emits `TRACKS`/`GCELLGRID` but still regenerates
+only `COMPONENTS`+`NETS` and drops the PDN shapes the self-DRC
+picture needs).
 
 **Geometry mapping**: every `WireSeg` expands to the square-cap rect
 `seg ± w/2` — identical to `parse_net_wire`'s two-point expansion and

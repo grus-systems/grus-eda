@@ -21,9 +21,23 @@ pub struct SpacingTableRow {
 pub struct RoutingLayer {
     pub name: SymbolId,
     pub dir: LayerDir,
+    /// Preferred-direction pitch: the x `PITCH` for a `Vertical`
+    /// layer, the y `PITCH` for a `Horizontal` one.
     pub pitch_dbu: i32,
     pub width_dbu: i32,
+    /// Preferred-direction `OFFSET` (same axis rule as `pitch_dbu`).
     pub offset_dbu: i32,
+    /// Per-axis LEF `PITCH`/`OFFSET` (`PITCH <x> [<y>]`, y defaulting
+    /// to x). `TRACKS` grid derivation needs the axis-correct value —
+    /// sky130 li1 splits 460/340 and 230/170.
+    #[serde(default)]
+    pub pitch_x_dbu: i32,
+    #[serde(default)]
+    pub pitch_y_dbu: i32,
+    #[serde(default)]
+    pub offset_x_dbu: i32,
+    #[serde(default)]
+    pub offset_y_dbu: i32,
     /// LEF `TRACKS X` coordinates, expanded and sorted. Empty when the
     /// tech LEF declares none (sky130: always empty — the DEF supplies
     /// the grid; `drt::tracks::layer_tracks` merges both sources).

@@ -9781,3 +9781,99 @@ fixtures (the two previously-uncovered closure arms), `cargo test
 --workspace`, `cargo clippy --workspace --all-targets --
 -D warnings` clean. Version `0.12.6 → 0.12.7` (bug fix, patch on
 0.x).
+
+### 2026-11-25 — drt-def-tracks: `write_def_full` emits TRACKS + GCELLGRID (v0.12.8)
+
+**What changed.** `write_def_full` (the template-free DEF writer
+behind `floorplan` and `cts --def-out`) now emits `TRACKS` per
+routing layer and a `GCELLGRID` pair between `ROW`s and
+`COMPONENTS`, so a self-contained `floorplan → place → route →
+drt` chain re-derives the track model and the gcell grid from our
+own DEF text instead of requiring the LEF at every consumer.
+Policy: `db.tracks`/`db.gcell_grids` re-emit verbatim when
+populated (lossless round-trip of foreign grids), else derived.
+
+**TRACKS derivation** (`drt::tracks::default_track_grids`): per
+routing layer per axis, `start`/`step` = the layer's *axis-matched*
+`OFFSET`/`PITCH` (new `RoutingLayer::pitch_{x,y}_dbu`/
+`offset_{x,y}_dbu` — the preferred-direction `pitch_dbu`/
+`offset_dbu` pair alone cannot reproduce sky130 `li1`'s split
+`PITCH 0.46 0.34` / `OFFSET 0.23 0.17`), `DO` = track coords whose
+centred min-width wire fits: `floor((die_hi − w/2 − start)/step) +
+1`, gated by `start − w/2 ≥ die_lo` (unverified lower bound — all
+in-tree dies start at 0). Verified: all 348 `TRACKS` statements
+across the 45 OpenROAD-produced DEFs in `tests/designs/`
+reproduce exactly; the 40 statements in hand-written fixtures
+(`microbench/`, `sta_clocks/`, `sta_edge/`, `sta_exceptions/`)
+follow no rule and are excluded, matching the design's scope.
+`test_default_track_grids_sky130_gcd` pins the derivation
+field-for-field against `gcd.placed.def`'s parsed `db.tracks`.
+Red-check: dropping the `w/2` term breaks the gcd met4 Y count
+(112 vs the correct 111).
+
+**GCELLGRID** emits the grid the congestion model already assumes
+(`GCellGrid::compute_default_grid`, now `pub`): die lower-left
+origin, `step = 15 × met2 pitch` = 6900 DBU, `n = max(1,
+floor(span/step))` — the only statement guaranteed to reproduce
+the grid every consumer falls back to when it is absent. gcd
+emits exactly what OpenROAD writes into `gcd.routed.def` lines
+48–49:
+
+```
+GCELLGRID X 0 DO 13 STEP 6900 ;
+GCELLGRID Y 0 DO 14 STEP 6900 ;
+```
+
+**Read-side `DO` fix.** `GCELLGRID DO` is now read as the gcell
+column/row count (OpenROAD's convention — `gcd.routed.def`'s
+`DO 13` is the 13-column FastRoute grid, pinned by `GRT-0053`
+met1 raw 3624 = 12 × 302; strict DEF 5.8 reads `DO` as boundary
+lines). `GCellGridDef::num_boundaries` renamed `num_cells`;
+`GCellGrid::build` drops the `− 1`. This fixes a latent
+off-by-one: parsing OpenROAD's own routed DEFs previously yielded
+12 columns where the reference builds 13. Red-check: restoring
+`- 1` fails `test_gcellgrid_do_is_column_count` and
+`test_write_def_full_gcellgrid_rebuilds_default` (nx 12 vs 13).
+
+**VIAS** stays a non-goal: `db.def_vias` cannot rebuild a
+faithful section (the `+ VIARULE` name is discarded at parse;
+inline `+ RECT`/`+ POLYGON` records store nothing), and a
+conns-only placed DEF needs none. SPECIALNETS untouched.
+
+**What ran** (E0 rule 9): `cargo test --workspace` — 557 lib
+tests pass (2 pre-existing `#[ignore]`), 44 integration tests
+pass (4 pre-existing `#[ignore]`, all picorv32 drt/picorv32
+selfdrc legs), including the seven new ones
+(`test_default_track_grids_{counts,sky130_gcd}`,
+`test_write_def_full_{tracks_verbatim,tracks_derived,
+gcellgrid_rebuilds_default,deterministic}`,
+`test_gcellgrid_do_is_column_count`); `cargo clippy --workspace
+--all-targets -- -D warnings` clean. `gcd.cts.ours.def`
+regenerated via `tests/designs/generate_cts_ours.sh gcd` — diff
+is the added header block only (`report.json` unchanged) and
+`test_gcd_cts_ours_def_deterministic` is green again. The block
+`write_def_full` now inserts between `ROW`s and `COMPONENTS` on
+gcd (byte-identical to `gcd.placed.def`/`gcd.routed.def`'s
+header):
+
+```
+TRACKS X 230 DO 200 STEP 460 LAYER li1 ;
+TRACKS Y 170 DO 302 STEP 340 LAYER li1 ;
+TRACKS X 170 DO 270 STEP 340 LAYER met1 ;
+TRACKS Y 170 DO 302 STEP 340 LAYER met1 ;
+TRACKS X 230 DO 200 STEP 460 LAYER met2 ;
+TRACKS Y 230 DO 223 STEP 460 LAYER met2 ;
+TRACKS X 340 DO 135 STEP 680 LAYER met3 ;
+TRACKS Y 340 DO 151 STEP 680 LAYER met3 ;
+TRACKS X 460 DO 100 STEP 920 LAYER met4 ;
+TRACKS Y 460 DO 111 STEP 920 LAYER met4 ;
+TRACKS X 1700 DO 27 STEP 3400 LAYER met5 ;
+TRACKS Y 1700 DO 30 STEP 3400 LAYER met5 ;
+GCELLGRID X 0 DO 13 STEP 6900 ;
+GCELLGRID Y 0 DO 14 STEP 6900 ;
+```
+
+This unblocks a self-contained `floorplan → place → route → drt`
+chain: a consumer reading only our emitted DEF can now rebuild
+the exact track model and gcell grid without holding the LEF or
+a side-channel grid convention.
