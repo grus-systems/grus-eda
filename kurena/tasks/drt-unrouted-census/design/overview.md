@@ -3,7 +3,8 @@
 E6 print-path ticket. The unrouted census already knows *why* each
 pin failed — `UnroutedNet.failed` carries `(PinId, FailKind)` and
 `RouteGraphs.region_escape` names the pre-maze escapes — but the
-`== drt emit:` block prints only net names. On a ~8k-unrouted run an
+`== drt emit:` block prints only net names. At picorv32 scale
+(2,016 unrouted — the v0.12.9 leg) an
 operator cannot tell `Unattachable` (no legal paint / no attach
 candidate) from `NoPath` (attachable, unreachable) without a
 debugger. This ticket surfaces the per-pin classification and the
