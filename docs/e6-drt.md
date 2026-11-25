@@ -751,7 +751,9 @@ io-pin-only nets the guide never covers — the delegated reference
 shows the identical gap); `notch_fills=15236`, all residual vectors
 empty. `test_e2e_ours_reference_picorv32` runs the same joins; no
 determinism byte-compare test — the ~4.9 MB routed DEF stays
-gitignored and `--verify` is the recorded demonstration.
+gitignored; the `--verify` double-emit + `cmp` arm ran clean —
+`OURS-DETERMINISTIC` sha256 `505baea2f937702f` (byte-identical
+second emit, `docs/results.md`).
 
 **Test gate** (`tests/drt.rs`): `test_e2e_ours_reference_gcd` joins
 the golden to the `drc.reference.json` taxonomy — strict

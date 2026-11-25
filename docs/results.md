@@ -9881,27 +9881,56 @@ a side-channel grid convention.
 ### 2026-11-25 — e6-drt-e2e-picorv32: picorv32 leg of the full Magic gate (v0.12.9)
 
 **Emit leg.** `generate_drt_ours.sh picorv32 --verify` produced
-`runs/drt-ours/picorv32.drt.ours.routed.def` (4,927,300 bytes, sha256
-`505baea2f937702f`, gitignored) in `route_ms=8,206,939` (~2.3 h,
-8 iterations). Emit census (`cli_lines` in the golden): `guided=6744
+`runs/drt-ours/picorv32.drt.ours.routed.def` (4,927,300 bytes,
+`OURS-SHA 505baea2f937702f81188c117107b7282c3b1f2ca6df87cb9d0d246b3a764ace`,
+gitignored) in `route_ms=8,206,939` (~2.3 h, 8 iterations). Emit census (`cli_lines` in the golden): `guided=6744
 routed=4728 unrouted=2016 projected=134 collisions=0
 area_patches=12 area_residuals=0 hull_masked=8912407
 notch_fills=15236 notch_residuals=0 hole_residuals=0`. Unrouted
 kinds `NoPath=2225 Unattachable=1480` (kinds count findings, not
 distinct nets); blockers `l0Obs=10 l0ObsPin=33 l1Obs=444 l1ObsPin=2
-l1Net=1194 l2Obs=4 l2Net=286`. Of the 2,016 unrouted nets 1,039 are
-named — `clk`, `count_cycle[*]`, `alu_out[*]` among them — and the
-emit log names `stub_outside_cover` on 1,988 distinct nets (pins
-whose guide box never overlaps a reachable track/hull entry, so the
-net emits conns-only). The `--verify` second route + byte-`cmp` arm
-is recorded below once it lands.
+l1Net=1194 l2Obs=4 l2Net=286`. The emit log names
+`stub_outside_cover` on 1,988 distinct nets — pins whose every
+legal access option failed (projected stub crossing an uncovered
+hull, or `access_vias` arc blocked by a foreign mark; the
+`Unattachable` diagnostic per `e6-drt-e2e/design/pin-access.md`).
+The `--verify` second route emitted a byte-identical DEF:
+`OURS-DETERMINISTIC 505baea2f937702f81188c117107b7282c3b1f2ca6df87cb9d0d246b3a764ace`
+(sha256 of `rerun.def` == arm-1's `OURS-SHA`, `cmp` clean — see
+"Determinism decision").
+
+**Unrouted census decomposition** (the 116 → 2,016 growth vs the
+v0.12.6 mini emit, named): the last recorded emit predates every
+e2e mechanism commit (`d8d0c6c` hull mask, `4c5e2cb` confinement,
+`b372d5e` Rule A/B — the pin-access contract that refuses stubs
+painted outside the covered hull). The fresh 2,016 split by class,
+counted from the census: **1,820 nets** carry a `stub_outside_cover`
+record — the `Unattachable` class — and **196 nets** carry none and
+are the `NoPath` class; every one of the 196 has a met1/met2-only
+guide union (no met3+ box), i.e. the met2-connected stranded-pocket
+class whose wave dies on foreign met1 paint (`l1Net=1194` is the
+dominant blocker attribution, same signature as gcd's NoPath class);
+the v0.12.4 met3-bridge class does not appear. The 17× growth is
+thus the access-model refusal, not a new maze regression —
+pre-confinement emits painted those stubs anyway (the illegal paint
+the r-series hull/confinement work removed; v0.12.6 self-DRC counted
+only `li.6`×3 because the subset cannot see most of them). The
+measured trade: 2,016 unrouted + 165 `lef_expressible` bboxes vs
+v0.12.6's 116 unrouted + the violations the old emit produced. 168
+further nets carry stub records yet routed on a later rip-up
+iteration (the `_165_` re-attach precedent — records accumulate
+across iterations, so `stub_lines ≥ Unattachable`, never
+`⊆ unrouted`). Of the 2,016 unrouted nets 1,039 are named — `clk`,
+`count_cycle[*]`, `alu_out[*]` among them.
 
 **Check leg.** `check_drt_ours.sh picorv32` (pinned LibreLane image,
 Magic `drc(full)` on our DEF) →
 `picorv32.drt.ours.reference.json` (334 KB, committed). `DRC-SUMMARY
 ours count_flat=0 count_total=8102 lef_expressible_nonzero=2
 magic_only_rows=3 unclassified=0 antenna=106
-wirelength_um=117930.918 vias=26036`.
+wirelength_um=117930.918 vias=26036`. Check-leg wall seconds
+(`runtime.json`): `{"antenna": 2, "assembly": 1, "magic_broken": 6,
+"magic_ours": 6, "magic_placed": 2}` — minutes, as projected.
 
 **Gate table.** `lef_expressible` non-inherited rows are exactly
 two: `li.3` ours=19, `met1.2` ours=146 — both `placed=0`, so both
@@ -9963,14 +9992,31 @@ fails (silent-connectivity-loss arm). The gate invariant is now
 `M2M3_PR` 3,868 / `M3M4_PR` 79 / `M4M5_PR` 54). Delta vs delegated:
 −62.37% wirelength, −35,271 vias, `signal_nets_routed` −2,016 — the
 unrouted census, so wirelength/via deltas are informational only.
+Two wirelength numbers exist by construction: the emit log's
+`wirelength_um ours=117928.362` is our router's own segment sum;
+`def_metrics.total_wirelength_um=117930.918` is step-E's DEF-text
+re-derivation (stub/`RECT` fill accounting differs by ~2.6 µm —
+recorded, both cited where each belongs).
 
-**What ran** (E0 rule 9): emit arm 1 done + `--verify` arm 2 in
-flight (byte-`cmp` pending — see status note); `check_drt_ours.sh
-picorv32` twice (first build failed loud on the unguided gap — the
-fail-arm exercised by accident, second build exit 0);
-`check_drt_ours.sh gcd` re-run → `gcd.drt.ours.reference.json`
-regenerated with `unguided: []`, inert otherwise; probes
-`runs/drt-ours/who1.tcl` (25 sites, `select area` naming
+**What ran** (E0 rule 9): emit arms 1+2 both done — `--verify`
+`cmp` byte-identical (`OURS-DETERMINISTIC` above);
+`check_drt_ours.sh
+picorv32` three times — build 1 `fail`ed at step-E on net `irq[0]`
+(the new unguided verifier's conn check tripped on `( PIN irq[0] )`'s
+whitespace — a bug in the new check itself, fixed by stripping conn
+fields before compare; the fail arm it accidentally exercised is the
+mechanism proof), build 2 exit 0 → committed golden, build 3 the
+doctored-log run below; `check_drt_ours.sh gcd` re-run →
+`gcd.drt.ours.reference.json` regenerated with `unguided: []`, inert
+otherwise. Fail/red exercises (E0 rule 7): **unrouted_kinds fail
+arm** — `unrouted_kinds` line deleted from a copy of the emit log →
+full `check_drt_ours.sh` run exits 1 naming "emit/script version
+lock" (`step-E assembly failed: emit log present but its
+unrouted_kinds line is missing or malformed`), log restored;
+**pin-scoping red-check** — `("picorv32","li.3",19)` retargeted to
+`("gcd","li.3",19)` → `test_e2e_ours_reference_gcd` goes red
+(`pinned residual li.3 moved (ours=0, pinned=19)`), reverted.
+Probes `runs/drt-ours/who1.tcl` (25 sites, `select area` naming
 nets/instances) + flat `.mag` overlay; `cargo test --workspace` —
 557 lib + 18 drc + 25 drt (3 pre-existing `#[ignore]`d detached
 picorv32 legs) + 2 irdrop + 7 grus-eda all pass,
@@ -9980,6 +10026,11 @@ clippy --workspace --all-targets -- -D warnings` clean.
 **Determinism decision.** No
 `test_e2e_ours_def_deterministic_picorv32`: the routed DEF is ~4.9
 MB and stays gitignored — there is no committed golden to
-byte-compare, and `generate_drt_ours.sh picorv32 --verify` (route
-twice + `cmp`) is the recorded demonstration of the property at
-this size.
+byte-compare. `generate_drt_ours.sh picorv32 --verify` (route twice
++ `cmp`) is the chosen arm and ran clean: `OURS-DETERMINISTIC
+505baea2f937702f81188c117107b7282c3b1f2ca6df87cb9d0d246b3a764ace`
+— the second ~2.3 h emit is byte-identical to the first (sha256
+`rerun.def` == `routed.def`, verified independently with
+`shasum -a 256`). The `#[ignore]`d `test_maze_determinism_picorv32`
+(two in-process `route_nets` runs) is the cited corroborating arm,
+not re-run.
