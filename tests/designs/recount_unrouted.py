@@ -16,6 +16,11 @@ Semantics (what each golden field actually is):
   the final `Unattachable` class).
 - `unrouted_kinds` — per-pin *final* failure counts (`UnroutedNet.failed`);
   a net may carry pins of both kinds and no per-net kind is recorded.
+- `cli_lines` `    fail <inst>/<pin> <Kind>[ region_escape]` — the same
+  per-pin *final* `FailKind` nested under its `  unrouted <net>` line
+  (`u.failed` order); a ` region_escape` suffix marks graph-build
+  provenance (the pin's shapes held no in-region strict node). Present
+  only in goldens regenerated after the census print landed.
 - `unrouted_blockers` — aggregate per-pin blocker attribution.
 
 Guide-union census: union-find over each net's guide boxes; two boxes
@@ -173,10 +178,19 @@ def main():
     stub_nets = set()
     stub_pins = set()
     stub_lines = 0
+    fail_lines = 0
+    fail_net = None
     for line in cli:
         parts = line.split()
         if parts[0] == "unrouted" and len(parts) == 2:
-            cli_unrouted.add(parts[1])
+            fail_net = parts[1]
+            cli_unrouted.add(fail_net)
+        elif parts[0] == "fail":
+            fail_lines += 1
+            if fail_net not in u:
+                fail(f"cli `fail` line {line!r} outside a known unrouted net")
+            if len(parts) not in (3, 4) or parts[2] not in ("NoPath", "Unattachable"):
+                fail(f"malformed cli `fail` line {line!r}")
         elif parts[0] == "stub_outside_cover":
             stub_lines += 1
             stub_nets.add(parts[1])
@@ -191,6 +205,8 @@ def main():
     nopath = kinds["NoPath"]
     if stub_lines < unatt:
         fail(f"stub_outside_cover lines {stub_lines} < Unattachable {unatt}")
+    if fail_lines and fail_lines != nopath + unatt:
+        fail(f"cli `fail` lines {fail_lines} != unrouted_kinds sum {nopath + unatt}")
 
     s_in_u = u & stub_nets
     s_not_u = stub_nets - u
@@ -200,7 +216,10 @@ def main():
     named = sorted(n for n in u if not re.fullmatch(r"_\d+_", n))
 
     print(f"== {d} unrouted census recount ==")
-    print(f"unrouted={len(u)} unrouted_kinds NoPath={nopath} Unattachable={unatt}")
+    print(
+        f"unrouted={len(u)} unrouted_kinds NoPath={nopath} Unattachable={unatt} "
+        f"fail_lines={fail_lines}"
+    )
     print(
         f"stub_outside_cover lines={stub_lines} distinct_pins={len(stub_pins)} "
         f"distinct_nets={len(stub_nets)}"

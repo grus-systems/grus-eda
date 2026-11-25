@@ -10073,3 +10073,78 @@ Re-verified after the correction: `cargo test --workspace` green
 (same census as the landed state — the recount adds no tests) and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. No
 `.rs`, `.sh`, golden, or `.gitignore` delta.
+
+### 2026-11-25 — drt-unrouted-census: per-pin failure detail in drt emit (v0.12.10)
+
+Print-path ticket — no routing change. Each `  unrouted <net>` block
+in the `== drt emit:` census now carries one nested `    fail
+<inst>/<pin> <FailKind>[ region_escape]` line per `u.failed` entry
+(pin label identical to `stub_outside_cover`'s `<cell>/<pin>`
+convention, factored into a shared `pin_label` in `main.rs`). The
+`unrouted` line itself stays exactly two tokens — `check_drt_ours.sh`
+step-E anchors `^\s+unrouted (\S+)$` and `recount_unrouted.py`
+requires `len(parts) == 2`.
+
+**Semantics resolution** (the ticket's open question): `u.failed`
+is the *final* hard-iteration classification — `route_db.unrouted`
+is written once on the last iteration — and is what the emitted
+DEF's connectivity truth reflects. The accumulating ever-failed
+census is `stub_outside_cover` (picorv32: 3,288 pins on 1,988 nets,
+168 of which re-attached). Doc comment on `UnroutedNet.failed`
+records the distinction.
+
+**gcd emit leg** (`grus-eda drt` on `gcd.placed.def` +
+`gcd.guide`, route_ms=12936): census lines identical to the
+v0.12.7 record (`unrouted=81`, `NoPath=46 Unattachable=52`,
+`unrouted_blockers l0ObsPin=1 l1Obs=4 l1Net=39`,
+`stub_outside_cover` 142 lines). Self-check: `#fail lines = 98 ==
+46 + 52`. Sample:
+
+```
+unrouted_kinds NoPath=46 Unattachable=52
+unrouted_blockers l0ObsPin=1 l1Obs=4 l1Net=39
+  unrouted _132_
+    fail _356_/A2 NoPath
+    fail _323_/B1 NoPath
+    fail _305_/B1 NoPath
+  unrouted _134_
+    fail _301_/B1 Unattachable region_escape
+  unrouted _138_
+    fail _307_/B1 Unattachable region_escape
+```
+
+**`region_escape` flags: 2** on gcd — `_134_`/`_138_` ended final
+`Unattachable` with graph-build provenance (no in-region strict
+node ever existed); the other 15 of gcd's 17 pinned escapes
+re-attached via projection/access arcs and carry no flag. The flag
+is not vacuous on gcd; the picorv32 leg (592 escapes) is the real
+coverage and stays deferred like every ~2.3 h picorv32 emit leg.
+
+**Digest arm**: `route_digest` is print-external by construction
+(serializes `u.failed` already), verified not assumed —
+`test_maze_census --release` prints `digest=0xab23bcc1997e4484`
+on this change and `0xab23bcc1997e4484` on a detached-HEAD
+worktree of `fed0cac`. Identical.
+
+**Consumers**: `check_drt_ours.sh` step-E keep-list gains
+`s.lstrip().startswith("fail ")` so the next golden regeneration
+carries the per-pin evidence (committed goldens unchanged — no
+assert reads `fail` lines). Absolute-path guard checked on this
+emit log: every `inst/pin` label on `fail`/`stub_outside_cover`
+lines uses `_NNNN_`-style insts (all `/` preceded by `[A-Za-z_.]`)
+— zero hits for `(?<![A-Za-z_.])/`. `recount_unrouted.py` extends
+its semantics docstring and adds a tolerant join: when `fail`
+lines exist, `#fail == NoPath + Unattachable` and every `fail`'s
+enclosing net must be in the unrouted set; absent → skipped
+silently (both committed goldens recount clean, `fail_lines=0`).
+
+**Fail-proof** (E0 rule 7): one `fail` line injected into the gcd
+golden's `cli_lines` → `recount_unrouted.py gcd` exits 1
+(`cli 'fail' lines 1 != unrouted_kinds sum 98`); golden restored.
+
+**What ran** (E0 rule 9): `cargo test --workspace` — 557 lib +
+18 drc + 25 drt (3 `#[ignore]`d picorv32 legs) + 2 irdrop +
+7 grus-eda, all green; `cargo clippy --workspace --all-targets --
+-D warnings` clean; `cargo build --release -p grus-eda`; the gcd
+emit run above; the detached-HEAD digest arm; the doctored-golden
+recount arm.

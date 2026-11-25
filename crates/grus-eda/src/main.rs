@@ -774,6 +774,20 @@ fn print_congestion_summary(
     );
 }
 
+/// `cell/pin` for instance pins, the bare port name for io pins —
+/// the label the emit census prints (`fail`, `stub_outside_cover`).
+fn pin_label(db: &grus_core::design_db::DesignDb, pin: grus_core::interner::PinId) -> String {
+    let i = pin.0 as usize;
+    let pname = db.strings.resolve(db.pin_names[i]);
+    match db.pin_cells[i] {
+        Some(c) => format!(
+            "{}/{pname}",
+            db.strings.resolve(db.cell_names[c.0 as usize])
+        ),
+        None => pname.to_string(),
+    }
+}
+
 fn top_name_matches(requested: &str, actual: &str) -> bool {
     !requested.is_empty()
         && (requested == actual || actual.rsplit('\\').next() == Some(requested))
@@ -2095,23 +2109,33 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     println!("unrouted_blockers {s}");
                 }
             }
-            for name in &report.unrouted {
-                println!("  unrouted {name}");
+            // `(net, pin)` pairs whose shapes held no in-region strict
+            // node at graph build — provenance for a `fail` line, not a
+            // `FailKind` (`docs/e6-drt.md` §8).
+            let escapes: std::collections::BTreeSet<(u32, u32)> = graphs
+                .region_escape
+                .iter()
+                .map(|e| (e.net.0, e.pin.0))
+                .collect();
+            for u in &route_db.unrouted {
+                println!(
+                    "  unrouted {}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, u.net)
+                );
+                for &(p, k) in &u.failed {
+                    let esc = if escapes.contains(&(u.net.0, p.0)) {
+                        " region_escape"
+                    } else {
+                        ""
+                    };
+                    println!("    fail {} {k:?}{esc}", pin_label(&design_db, p));
+                }
             }
             for &(net, pin) in &route_db.stub_outside_cover {
-                let pname = design_db
-                    .strings
-                    .resolve(design_db.pin_names[pin.0 as usize]);
-                let label = match design_db.pin_cells[pin.0 as usize] {
-                    Some(c) => format!(
-                        "{}/{pname}",
-                        design_db.strings.resolve(design_db.cell_names[c.0 as usize])
-                    ),
-                    None => pname.to_string(),
-                };
                 println!(
-                    "  stub_outside_cover {} {label}",
+                    "  stub_outside_cover {} {}",
                     grus_core::congestion::guide::guide_net_name(&design_db, net),
+                    pin_label(&design_db, pin),
                 );
             }
             for r in &route_db.area_residuals {
