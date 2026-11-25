@@ -2049,10 +2049,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             grus_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
 
             let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
+            let notch_fills: usize = route_db.nets.iter().map(|n| n.fills.len()).sum();
             println!("== drt emit: {} ==", design_db.design_name);
             println!(
                 "guided={} routed={} unrouted={} projected={projected} collisions={} \
-                 area_patches={} area_residuals={} iterations={} route_ms={:.0}",
+                 area_patches={} area_residuals={} iterations={} route_ms={:.0} hull_masked={} \
+                 notch_fills={notch_fills} notch_residuals={} hole_residuals={}",
                 join.nets.len(),
                 report.routed,
                 report.unrouted.len(),
@@ -2061,13 +2063,83 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 route_db.area_residuals.len(),
                 route_db.iterations,
                 elapsed_route_ms,
+                graphs.hull_masked.iter().sum::<usize>(),
+                route_db.notch_residuals.len(),
+                route_db.hole_residuals.len(),
             );
+            let (mut nopath, mut unatt) = (0usize, 0usize);
+            for u in &route_db.unrouted {
+                for &(_, k) in &u.failed {
+                    match k {
+                        grus_core::drt::maze::FailKind::NoPath => nopath += 1,
+                        grus_core::drt::maze::FailKind::Unattachable => unatt += 1,
+                    }
+                }
+            }
+            println!("unrouted_kinds NoPath={nopath} Unattachable={unatt}");
+            {
+                let kind = ["Obs", "ObsPin", "Net", "Pin"];
+                let mut blk: std::collections::BTreeMap<(u8, u8), usize> =
+                    std::collections::BTreeMap::new();
+                for u in &route_db.unrouted {
+                    for &(l, k) in &u.blockers {
+                        *blk.entry((l, k)).or_default() += 1;
+                    }
+                }
+                if !blk.is_empty() {
+                    let s = blk
+                        .iter()
+                        .map(|(&(l, k), &n)| format!("l{l}{}={n}", kind[k as usize]))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!("unrouted_blockers {s}");
+                }
+            }
             for name in &report.unrouted {
                 println!("  unrouted {name}");
+            }
+            for &(net, pin) in &route_db.stub_outside_cover {
+                let pname = design_db
+                    .strings
+                    .resolve(design_db.pin_names[pin.0 as usize]);
+                let label = match design_db.pin_cells[pin.0 as usize] {
+                    Some(c) => format!(
+                        "{}/{pname}",
+                        design_db.strings.resolve(design_db.cell_names[c.0 as usize])
+                    ),
+                    None => pname.to_string(),
+                };
+                println!(
+                    "  stub_outside_cover {} {label}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, net),
+                );
             }
             for r in &route_db.area_residuals {
                 println!(
                     "  area_residual {} {} area={} bound={} region={:?}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    tech_db
+                        .strings
+                        .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
+                    r.area_dbu2,
+                    r.bound_dbu2,
+                    r.region,
+                );
+            }
+            for r in &route_db.notch_residuals {
+                println!(
+                    "  notch_residual {} {} a={:?} b={:?}",
+                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    tech_db
+                        .strings
+                        .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
+                    r.a,
+                    r.b,
+                );
+            }
+            for r in &route_db.hole_residuals {
+                println!(
+                    "  hole_residual {} {} area={} bound={} region={:?}",
                     grus_core::congestion::guide::guide_net_name(&design_db, r.net),
                     tech_db
                         .strings

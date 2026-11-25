@@ -858,6 +858,21 @@ surface, from the first large-design run's feedback
   (`AreaResidual`), the decline arm paired 1:1 with `*.6` findings.
   No-op on gcd (digest `0x48593d441074229b` stands); picorv32
   emit-gate re-run detached under `--ignored`.
+- Progress 2026-11-24 (`v0.12.7`, ticket `e6-drt-e2e`): the full
+  Magic `drc(full)` deck on our routed DEF —
+  `tests/designs/check_drt_ours.sh gcd` scores the committed
+  `gcd.drt.ours.routed.def` in the pinned image and commits
+  `gcd.drt.ours.reference.json`: **`lef_expressible` = 0 on all 50
+  rules** (~3025 → 847 → 514 → 317 → 0; the 32-fragment `met1.2`
+  residual was one X3 mechanism — `try_fill` carved li1-strict cover
+  blockers on `hull_host_open` met1, truncating fills inside
+  member-pin hulls — closed alongside the `_099_`
+  `notch_residual`), `magic_only` all inherited, `unclassified`
+  empty, antenna 0, sanity mutation live. Emit `routed=188
+  unrouted=81` (named via the golden join), wirelength −33.7% vs
+  baseline on the routed nets; picorv32 leg deferred — no golden,
+  the `#[ignore]`d gate test carries the joins. Numbers:
+  `docs/results.md`.
 - **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
   under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
   routed DEFs in this image), or independently as a LEF-rule subset

@@ -9586,3 +9586,198 @@ changes the occupancy these stubs land in).
 drt` (20/20), `cargo test --workspace`, `cargo clippy --workspace
 --all-targets -- -D warnings` clean, the gcd emit suite above.
 Version `0.12.5 → 0.12.6` (feature, patch on 0.x).
+### 2026-11-24 — e6-drt-e2e r2 step 1: mask verification on the checkpoint DEF (measurement only)
+
+`tests/designs/check_drt_ours.sh gcd` inside the pinned
+`ghcr.io/librelane/librelane:3.0.16` container, run on the committed
+checkpoint `gcd.drt.ours.routed.def` (emit log `guided=269 routed=202
+unrouted=67 projected=10 collisions=0 area_patches=1
+hull_masked=227033`). Measurement only — the JSON is not committed
+(step 1: the golden's `input_def_sha_prefix` must match the final
+DEF).
+
+**Result**: `lef_expressible` ours = **847 fragments** (down from
+~3025 at first contact): `li.3`=527, `li.c2`=310, `met1.2`=3,
+`met2.2`=4, `met3.2`=3 — every row `inherited=false` (real findings,
+not baseline). `magic_only` rows all inherited (nwell.1=6/120/300
+matching the placed DEF exactly). `unclassified` ours = 0, antenna
+= 0, sanity control passed. Delta vs delegated: wirelength −28.5%,
+vias −568, `signal_nets_routed` −67 (the unrouted nets emit no
+wires). Verdict per steps.md: `lef_expressible` dirty → chase
+per-rule before connectivity work.
+
+**Root-cause analysis** (flat-`drc listall why` bboxes ×5 = DEF DBU,
+localized against a flattened `gcd_flat.mag` tile dump and a minimal
+hand-built DEF probe):
+
+- **li.3/li.c2 (~837 frags) — masked-layer paint outside raw pin
+  rects.** ~806 inside instance hulls: our mcon `L1M1` plates and
+  li1 stubs land inside the *grown* `PinCover` but outside the *raw*
+  pin rect, colliding with subcell-internal li1 paint (mostly the
+  LEF-declared OBS `obsli1` tiles — carved away for host cells —
+  plus undeclared internals Magic paints from `.mag`). Example
+  `_389_` (dfxtp_2): our mcon at x=15410 → plate `[15325,15495]`
+  pokes 45 DBU past pin rect xh=15450; counterpart `obsli1` at
+  x=15620 (gap 125 < 170). The delegated mcon at x=15365 keeps its
+  plate `[15280,15450]` exactly inside — **all 884 delegated mcon
+  centres sit inside a target pin rect (760 plates fully contained)
+  and the delegated DEF emits zero li1 wire segments**. Off-track
+  via positions: the delegated point is on a met1 track, off-track
+  on li1 — the pin access-point model, not a track crossing.
+  ~31 fragments sit in placement gaps just outside hulls: our li1
+  wires within `s` of the *host* cell's own OBS li1 — the host
+  carve removes the `Obs(cell)` band globally, so the wire was
+  never priced (`_153_` li1 vertical at x=25070 vs `_331_`'s OBS
+  edge at 24840, gap 145 < 170).
+- **met1.2/met2.2/met3.2 (3 sites, 10 frags) — same-net disjoint
+  tiles inside `s`.** Each site is our via plate vs our own wire of
+  the *same* net, separated `< s` without overlapping: `clk` M1M2
+  plate edge x=27530 vs its met1 stub edge x=27640 (gap 110 < 140);
+  `_127_` M2M3 plate bottom y=34835 vs its met2 wire top y=34800
+  (gap 35 < 140); `_122_` M2M3 met3 plate edge x=35355 vs its met3
+  stub edge x=35550 (gap 195 < 300). A hand-built two-segment DEF
+  proves **Magic's spacing deck is net-agnostic** — disjoint
+  same-net tiles inside `s` are flagged identically to cross-net
+  ones, so emitted geometry must be merge-or-`s`-separated even
+  within one net.
+- **Census on the committed DEF**: 232/531 in-hull `L1M1` plates
+  and 31/31 in-hull li1 wire segments paint outside the net's own
+  pin rects — the grown cover admits them; confinement must tighten
+  to painted-footprint ⊆ own-pin-rect, and pin access needs
+  off-track mcon positions (the delegated access-point model) to
+  keep connectivity.
+
+**Fix direction** (design docs update pending with the code): li1
+paint inside a host hull ⊆ the net's own pin rects (raw, ungrown);
+`Obs(cell)` carve scoped to footprints inside own pin rects instead
+of host-global; pin-anchored off-track `mcon` access arcs
+(`pin ↔ mcon ⊆ rect ↔ met1 stub`) per delegated geometry; a
+post-route same-net self-spacing merge on unmasked layers.
+
+### 2026-11-24 — e6-drt-e2e: full Magic deck on our routed DEF, gcd clean (v0.12.7)
+
+`tests/designs/check_drt_ours.sh gcd` inside the pinned
+`ghcr.io/librelane/librelane:3.0.16` image (`image_id
+sha256:02d50f259d483979e126ef188a50f5b61e1d285b9d538312f280b087439b0302`),
+run on the committed `gcd.drt.ours.routed.def`
+(`input_def_sha_prefix=635f19a9aae86a44`); the golden
+`gcd.drt.ours.reference.json` commits with this entry.
+
+**Trajectory** (`lef_expressible` findings on our DEF):
+~3025 first contact → 847 (`d8d0c6c` hull mask, r2 step 1 above) →
+514 (`4c5e2cb` confinement WIP) → 317 merged regions / `met1.2`=32
+bbox fragments (`fba5f85` self-spacing closure + residuals, DEF sha
+`1534c323855a6029`, emit `routed=187 unrouted=82 notch_fills=221
+notch_residuals=1` — the `_099_` site) → **305 merged regions,
+`lef_expressible` = 0 on all 50 rules** (this change, DEF sha
+`635f19a9aae86a44`, emit `guided=269 routed=188 unrouted=81
+projected=9 collisions=0 area_patches=1 area_residuals=0
+iterations=8 hull_masked=227182 notch_fills=343 notch_residuals=0
+hole_residuals=0`).
+
+**met1.2 attribution — all 7 sites one X3 mechanism, fixed.** The
+32 fragments decompose to 7 sites (transcribed from
+`met12-attribution.md` §1): `_099_` (4, the census-named
+`notch_residual`), `resp_val` (5), `_084_` (5), `_131_` (5),
+`_122_` (5), `_070_` (5), `_066_` (3) — every one adjacent to an
+emitted met1 `RECT` fill inside a member-pin host hull. In-container
+probes `runs/drt-ours/who6.tcl` (site D: `_131_` inside `_338_`
+`sky130_fd_sc_hd__a22o_2`) and `who7.tcl` (site E: `_122_` inside
+`_321_`, same cell — `drc why` → `met1.2`, flattened tile dump shows
+only own-net met1 paint) found the mechanism: the `L1M1` and
+`M1M2_PR` met1 plates of one attach face each other across a 5–15
+DBU gap, and the emitted fill stopped 20–30 DBU short of the facing
+band — e.g. `_131_` fill emitted `(47436,25925)-(47451,26125)`
+while the plates faced down to y=25895. **X3, not X1/X2**: the
+geometry was fully inside our model — `try_fill`'s mask branch
+decomposed the gap against `fin − cover_rects` blockers on *every*
+masked layer, but met1 is `hull_host_open` (its whole member-hull
+interior is legal paint — `rect_allowed` already returns true there
+without cover confinement); the li1 pin cover rect carved the
+uncovered bottom band out of each fill. Fix: skip the carve on
+`mask.host_open(l)` layers (li1 stays cover-strict) — fills now
+span the full facing band (`_131_` fill emitted
+`(47436,25895)-(47451,26125)`), `notch_fills` 221 → 343, the `_099_`
+`notch_residual` closed by the same arm, `routed` 187 → 188. The
+remaining 5 sites share the signature and re-measure clean.
+
+**Gate table** (`gcd.drt.ours.reference.json`, fresh full run):
+`lef_expressible` — all 50 rules `ours=placed=routed_ref=0`
+(`PINNED_LEF_RESIDUALS` in `tests/drt.rs` is empty; a residual
+reappears only by re-pinning with a named site). `magic_only` — the
+3 nwell rows all inherited (`nwell.1` 6/6/6, `nwell.2a` 120/120/120,
+`nwell.4` 300/300/300 ours/placed/routed_ref — cell-master paint,
+identical on every input). `unclassified_fired` — **empty**: the
+two first-contact hierarchy-boundary names (`Can't overlap those
+layers`, `This layer can't abut or partially overlap between
+subcells`) are closed. `sanity_control` — the injected met2 probe
+wire mutation fires exactly `met2.2` `new_rules_vs_clean`,
+`violated_rules_in_checked_deck=true`. Antenna `check_antennas` =
+0/0.
+
+**Why self-DRC missed it** (scope correction for `docs/e6-drt.md`
+§8): the subset's spacing family measures between *connectivity
+islands* — same-net touching paint merges into one component, and a
+component never self-checks its internal concavities. Each met1.2
+site's prongs were bridged by the too-short fill into one island, so
+the subset saw nothing while `drc(full)` measures edge-to-edge
+inside the island. Post-fix both gates are 0; a recurrence surfaces
+as a `notch_residual`/`hole_residual` census line, and
+`test_emit_selfdrc_gcd` now asserts those vectors empty.
+
+**Connectivity record**: `unrouted=81` — the named list lives in the
+golden's `ours_router.unrouted` and `test_emit_roundtrip_gcd` joins
+`report.unrouted` to it (no inline count); `unrouted_kinds
+NoPath=46 Unattachable=52` (per-pin failures — a net fails per-pin,
+so the sum exceeds the net count); `unrouted_blockers l0ObsPin=1
+l1Obs=4 l1Net=39` (postmortem on NoPath pockets only);
+`stub_outside_cover` = 142 records, accumulated across rip-up
+iterations — `_165_` carries a record yet routed (its pin
+re-attached on a later pass), so the gate joins `stub_lines ≥
+Unattachable`, not `⊆ unrouted`. `notch_fills=343` (recorded, never
+a target), `area_patches=1`, `collisions=0`.
+
+**Comparison vs references** (on the 188 routed nets; the 81
+unrouted emit conns-only):
+
+| metric | ours | delegated | baseline | Δ delegated | Δ baseline |
+|---|---|---|---|---|---|
+| wirelength_um | 4081.929 | 6046.305 | 6154.505 | −32.49% | −33.68% |
+| via count | 981 | 1807 | 1797 | −826 | −816 |
+| └ mcon / via / via2 / via3 | 327/500/144/10 | 879/901/27/0 | 884/883/28/2 | −552/−401/+117/+10 | −557/−383/+116/+8 |
+| signal nets routed | 188 | 269 | 269 | −81 | −81 |
+| antenna | 0 | 0 | 0 | — | — |
+
+Wirelength rose vs the r4 emit (3114.249 → 4081.927) — the fix lets
+fills commit where the carve had vetoed them, changing occupancy for
+later nets and re-routing stubs; fills emit as `RECT` paint and do
+not count in the wire metric, so the delta is real wire on the 188
+routed nets (+1 net routed). Per-routed-net wirelength 21.7 µm vs
+delegated's 22.5 µm.
+
+**picorv32 — deferred per the r4/r5 memo**: the leg is un-run;
+`picorv32.drt.ours.reference.json` is **not committed**;
+`test_e2e_ours_reference_picorv32` ships `#[ignore]`d carrying the
+same `ours_reference_gate` joins, so a `--ignored` run fails loudly
+on the missing golden — the honest state.
+
+**What ran** (E0 rule 9): probes `who6.tcl`/`who7.tcl` (sites D/E,
+`drc why` + `select area`/`what` + flatten-tile dump; the
+`drc listall` bboxes are Magic internal units — ×5 = DBU, `box`
+takes lambda = fragment/2); `generate_drt_ours.sh gcd --verify` →
+`OURS-DETERMINISTIC
+635f19a9aae86a4407bd0a61fdda80eec12b9bb16e2cb03646acb035803ec4b3`
+(two emits byte-identical, `rerun.def` == committed DEF); one fresh
+full `check_drt_ours.sh gcd` — the committed golden is its step-E
+output, superseding the 20:07 `fba5f85` transcripts (whose step-E
+JSON was lost to a driver timeout). Test-side:
+`test_e2e_ours_reference_gcd` (taxonomy join + §0 pins + sanity +
+census + viability floor), `test_e2e_ours_def_deterministic_gcd`
+(byte-equal vs the committed DEF), `test_emit_roundtrip_gcd`
+re-pinned to the golden's unrouted join, `test_emit_selfdrc_gcd`
+strict (findings + all three residual vectors empty),
+`test_closure_reject_droppable`/`test_closure_notch_residual`
+fixtures (the two previously-uncovered closure arms), `cargo test
+--workspace`, `cargo clippy --workspace --all-targets --
+-D warnings` clean. Version `0.12.6 → 0.12.7` (bug fix, patch on
+0.x).
