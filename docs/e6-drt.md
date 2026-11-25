@@ -760,8 +760,7 @@ the golden to the `drc.reference.json` taxonomy — strict
 `ours == placed` per unpinned `lef_expressible` rule, the
 `PINNED_LEF_RESIDUALS` mechanism (picorv32 `li.3`/`met1.2`) for
 named residuals, `magic_only` all-inherited, the two-name
-unclassified
-allowlist, the sanity-control liveness asserts, the
+`unclassified` allowlist, the sanity-control liveness asserts, the
 `cli_lines`-evidence census joins, and the viability floor
 (`signal_nets_routed == routed` and `nets_in_def − routed ==
 unrouted_count + unguided` — the `unguided` term names io-pin-only

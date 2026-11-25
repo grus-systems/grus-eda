@@ -9899,29 +9899,58 @@ The `--verify` second route emitted a byte-identical DEF:
 (sha256 of `rerun.def` == arm-1's `OURS-SHA`, `cmp` clean — see
 "Determinism decision").
 
-**Unrouted census decomposition** (the 116 → 2,016 growth vs the
-v0.12.6 mini emit, named): the last recorded emit predates every
-e2e mechanism commit (`d8d0c6c` hull mask, `4c5e2cb` confinement,
-`b372d5e` Rule A/B — the pin-access contract that refuses stubs
-painted outside the covered hull). The fresh 2,016 split by class,
-counted from the census: **1,820 nets** carry a `stub_outside_cover`
-record — the `Unattachable` class — and **196 nets** carry none and
-are the `NoPath` class; every one of the 196 has a met1/met2-only
-guide union (no met3+ box), i.e. the met2-connected stranded-pocket
-class whose wave dies on foreign met1 paint (`l1Net=1194` is the
-dominant blocker attribution, same signature as gcd's NoPath class);
-the v0.12.4 met3-bridge class does not appear. The 17× growth is
-thus the access-model refusal, not a new maze regression —
+**Unrouted census decomposition** *(recounted 2026-11-25 — the
+merged version equated the 1,820 stub-carrying nets with the
+`Unattachable` class and claimed all 196 no-stub nets had met2-only
+guide unions; both wrong on the committed artifacts — recount
+method below)*. `unrouted=2,016`; `unrouted_kinds` counts per-pin
+final failures (`NoPath=2,225`, `Unattachable=1,480` — a net may
+carry pins of both kinds). `stub_outside_cover` records 3,288
+distinct pins on 1,988 nets — every pin that *ever* had no legal
+paint, accumulated across all 8 iterations; 1,820 of those nets are
+unrouted, 168 re-attached on a later rip-up iteration (the `_165_`
+precedent — records accumulate across iterations, so
+`stub_lines ≥ Unattachable`, never `⊆ unrouted`). Stub-carrying is
+**not** the final `Unattachable` class: at most 1,480 nets carry a
+final `Unattachable` pin (all ⊆ the 1,820), so ≥340 stub-carriers
+ended `NoPath`-only and ≥536 unrouted nets' final failures are all
+`NoPath` — including all 196 no-stub nets. The exact per-net kind
+split is not derivable from the golden (per-pin kinds live only in
+`UnroutedNet.failed`; the `#[ignore]`d `test_maze_census_picorv32`
+`pins={kinds:?}` printout or an emit-schema addition would close it
+— follow-up material). Guide-union census (`guide_union_connected`
+semantics, ≤met2 vs all layers): of the 196 no-stub nets 58 carry
+met3+ boxes — **48 `met3_bridge`** (≤met2 union disconnected,
+met3+ rejoins) and 148 `met2_connected`; over all 2,016: **138
+`met3_bridge`**, 1,878 `met2_connected`, 0 disjoint, 0 guide-absent
+— the v0.12.4 met3-bridge class *does* appear at scale (named
+bridged examples `_03824_`, `_00013_`, `decoded_imm[27]` among the
+no-stub nets, `clk`, `instr_jal`, `pcpi_rs1[*]` among
+stub-carriers; `mem_ready` carries met3+ boxes yet stays
+`met2_connected`). The guide-union class is a topology property,
+not a proven failure mechanism — a met2-connected net still fails
+`NoPath` inside its region. Aggregate blocker attribution
+`l1Net=1,194` of 1,973 stays dominant — per-pin, not per-class.
+The 116 → 2,016 growth vs the v0.12.6 mini emit remains the
+access-model refusal story, not a new maze regression —
 pre-confinement emits painted those stubs anyway (the illegal paint
-the r-series hull/confinement work removed; v0.12.6 self-DRC counted
-only `li.6`×3 because the subset cannot see most of them). The
-measured trade: 2,016 unrouted + 165 `lef_expressible` bboxes vs
-v0.12.6's 116 unrouted + the violations the old emit produced. 168
-further nets carry stub records yet routed on a later rip-up
-iteration (the `_165_` re-attach precedent — records accumulate
-across iterations, so `stub_lines ≥ Unattachable`, never
-`⊆ unrouted`). Of the 2,016 unrouted nets 1,039 are named — `clk`,
+the r-series hull/confinement work removed; v0.12.6 self-DRC
+counted only `li.6`×3 because the subset cannot see most of them);
+the measured trade is 2,016 unrouted + 165 `lef_expressible` bboxes
+vs v0.12.6's 116 unrouted + the violations the old emit produced.
+1,039 of the 2,016 unrouted nets are named — `clk`,
 `count_cycle[*]`, `alu_out[*]` among them.
+
+**Recount method.** Every census number above is transcribed from
+`tests/designs/recount_unrouted.py picorv32` (committed, stdlib
+only; `… gcd` is the sanity leg) run on the committed artifacts —
+`picorv32.drt.ours.reference.json` (`ours_router.unrouted`,
+`cli_lines`, `unrouted_kinds`, `unrouted_blockers`) joined to
+`picorv32.guide`: union-find per net, `|Δlayer|≤1` + strict 2D
+overlap, classes per the `guide_union_connected` classifier in
+`tests/drt.rs`. The earlier text's "met3-bridge does not appear"
+claim traces to the v0.12.4-era maze-census run, not to this
+golden — kept here as the record of what the correction fixed.
 
 **Check leg.** `check_drt_ours.sh picorv32` (pinned LibreLane image,
 Magic `drc(full)` on our DEF) →
@@ -10034,3 +10063,13 @@ byte-compare. `generate_drt_ours.sh picorv32 --verify` (route twice
 `shasum -a 256`). The `#[ignore]`d `test_maze_determinism_picorv32`
 (two in-process `route_nets` runs) is the cited corroborating arm,
 not re-run.
+
+**Docs recount (r2, same day).** The census paragraph above is the
+marked correction; `tests/designs/recount_unrouted.py` is the
+committed vehicle (`picorv32` reproduces this table, `gcd` leg
+exits 0). `docs/e6-drt.md` §9's `unclassified` reflow break was
+rejoined; `docs/status.md`'s aggregate census needed no edit.
+Re-verified after the correction: `cargo test --workspace` green
+(same census as the landed state — the recount adds no tests) and
+`cargo clippy --workspace --all-targets -- -D warnings` clean. No
+`.rs`, `.sh`, golden, or `.gitignore` delta.

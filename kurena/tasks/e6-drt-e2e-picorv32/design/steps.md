@@ -64,6 +64,16 @@ Recorded so later audits diff against landed state, not the r1
 plan. Item 4's spirit (no emit-path/router changes, golden joins
 pinned) did hold.
 
+r2 implementation note — one planning-table citation was off:
+`recount.md` §4 / `docs.md` §1 listed `mem_ready` among the named
+*bridged* examples. The committed script measures it as met3+
+carrying but `met2_connected` (its ≤met2 union is already
+connected) — a named met3+ no-stub example, not a `met3_bridge`.
+`docs/results.md` names it correctly; the bridged citations are
+`_03824_`, `_00013_`, `decoded_imm[27]` (no-stub) and `clk`,
+`instr_jal`, `pcpi_rs1[*]` (stub-carrying). Every other number in
+`overview.md`'s verified table reproduced exactly.
+
 ## Verify / diffreview checklist (r2)
 
 0. `python3 tests/designs/recount_unrouted.py picorv32` —
