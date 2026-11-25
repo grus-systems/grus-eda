@@ -1,5 +1,9 @@
 # e6-drt-e2e-picorv32 — emit + check legs (r1)
 
+> **r2 status: landed** (`8496158`/`9788e53`, v0.12.9) — kept as
+> the record of the emit/check work. Remaining scope is the docs
+> recount in `overview.md`/`recount.md`/`docs.md`/`steps.md`.
+
 Same two legs the gcd gate ran: host-side `generate_drt_ours.sh`
 produces the routed DEF + emit census log; container-side
 `check_drt_ours.sh` scores it with Magic `drc(full)` and emits the

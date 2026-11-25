@@ -1,5 +1,9 @@
 # e6-drt-e2e-picorv32 — card #44: `unrouted_kinds` null-vs-fail (r1)
 
+> **r2 status: landed** (`8496158`, v0.12.9) — the `fail` arm
+> shipped and was exercised on a doctored log. Kept as record;
+> remaining scope in `overview.md`/`recount.md`/`docs.md`/`steps.md`.
+
 Medium-severity review item carried in `e6-drt-e2e`: the step-E
 assembly's `unrouted_kinds` fallback violates its own documented
 contract. This ticket fixes it while running the picorv32 leg —

@@ -1,128 +1,91 @@
-# e6-drt-e2e-picorv32 — steps (r1)
+# e6-drt-e2e-picorv32 — steps (r2, docs recount)
 
-Ordered so the committed script predates the golden it emits, and
-the un-ignore lands no earlier than the golden it joins. Container:
-`ghcr.io/librelane/librelane:3.0.16` (cached,
-`image_id sha256:02d50f259d…` recorded in the gcd golden).
+r1 steps A–D landed (commits `8496158` + `9788e53`, v0.12.9).
+This r2 plan is the diffreview-mandated docs correction — no
+re-emit, no golden regen, no `.rs`/`.sh` behavioral change.
 
-## A. Prep commit — script fix + pin mechanism + version
+## R1. Recount script
 
-Commit 1 (`fix:`):
-
-1. `tests/designs/check_drt_ours.sh`: `unrouted_kinds` `mk is
-   None` → `fail` inside the `emit_log_present` branch
-   (`script-fix.md`). Exercise the fail arm on a doctored log
-   copy; record the arm in results.
-2. `crates/grus-core/tests/drt.rs`: `PINNED_LEF_RESIDUALS` →
-   per-design `(design, rule, count)` triples, empty list
-   (`gate.md` §2). Behavior-neutral; no test result moves.
-3. `Cargo.toml` `0.12.8 → 0.12.9` + `Cargo.lock`
-   (`docs.md` §4) — before the check leg so the golden records
-   0.12.9.
-4. `cargo test --workspace` + clippy — the only deltas are the
-   fail arm (never hit on well-formed logs) and an empty const's
-   new shape.
-
-Optional within this commit or a later one: rerun
-`check_drt_ours.sh gcd` — byte-identical JSON expected
-(`image_id` drift aside); the inertness proof for the fix.
-
-## B. Emit leg (detached, hours)
-
-`emit-leg.md` §1 pre-flight; then:
+`tests/designs/recount_unrouted.py` per `recount.md` §5. Run:
 
 ```
-bash tests/designs/generate_drt_ours.sh picorv32 --verify \
-    > tests/designs/picorv32/runs/drt-ours/emit-driver.log 2>&1 &
+python3 tests/designs/recount_unrouted.py picorv32
+python3 tests/designs/recount_unrouted.py gcd        # sanity leg
 ```
 
-Freeze `src/drt/*` + `main.rs` emit-path until the golden
-commits. On completion: `OURS-SHA` (+ `OURS-DETERMINISTIC` if
-`--verify` ran), the `guided=` census, `unrouted_kinds`,
-`unrouted_blockers`, `self_drc findings_total`. If the first
-emit's `route_ms` rules out a second pass, the skip decision is
-recorded per `gate.md` §3 — never silently.
+Check its output against `overview.md`'s verified table — the
+values were reproduced during planning, so any divergence is a
+script bug to fix, not a rebaseline.
 
-## C. Check leg (container, minutes)
+## R2. Doc corrections
 
-```
-bash tests/designs/check_drt_ours.sh picorv32
-```
+Per `docs.md`:
 
-produces `picorv32.drt.ours.reference.json`. Read the verdict:
+1. `docs/results.md` — rewrite the census paragraph (marked
+   correction + method record; numbers transcribe the script
+   output).
+2. `docs/e6-drt.md` — rejoin the `unclassified` reflow break in
+   the §9 "Test gate" paragraph.
+3. `docs/status.md` — read-confirm the aggregate-only census;
+   no edit expected.
+4. This file — the "Post-landing notes" section below is the
+   memo-requested annotation of the stale r1 item 4.
 
-- `lef_expressible` all `ours == placed`, `magic_only` all
-  inherited, `unclassified` ⊆ allowlist → **green leg**.
-- Any `ours != placed` → `residuals.md` §2–§4 decomposition:
-  sites via `drc listall` bboxes + `who*.tcl` probes, mechanism
-  class, fix-or-pin.
-- Step-E `fail` on a new unclassified name → deck change or a
-  new violation class; investigate before anything commits
-  (the abort is the designed loud failure).
+## R3. Gates + commit
 
-## D. Leg commit(s) — golden + un-ignore + docs
+`cargo test --workspace` and `cargo clippy --workspace
+--all-targets -- -D warnings` (untouched code, but the
+acceptance/verify contract wants the runs — record the verdict
+line in the results.md entry's tail). Single `docs:` commit:
+script + results.md/e6-drt.md edits + this annotation.
+Conventional-commit English; trailer per AGENTS §5 (agent
+`Co-Authored-By`; the diffreviewer gets `Reviewed-By` per the
+global review rule).
 
-Commit 2 (`feat:` or `test:`), or split per AGENTS commit
-discipline:
+## Post-landing notes (stale r1 checklist item 4 — the memo item)
 
-1. `picorv32.drt.ours.reference.json` — fresh step-E output,
-   `input_def_sha_prefix` matches `shasum` of the measured DEF.
-2. `picorv32.drt.ours.routed.def` — only if `<1 MB` + the
-   gitignore exception line (`emit-leg.md` §4).
-3. `crates/grus-core/tests/drt.rs` — un-ignore
-   `test_e2e_ours_reference_picorv32`, doc-comment update;
-   picorv32 pin entries if the leg pinned residuals (named
-   reason per entry); `test_e2e_ours_def_deterministic_picorv32`
-   (`#[ignore]`d) only if the DEF committed.
-4. `.gitignore` — the `!tests/designs/picorv32/…routed.def`
-   exception iff the DEF commits (mirror the gcd comment).
-5. `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`
-   (`docs.md`) — entry lands **with** the golden it describes.
+r1 "Verify / diffreview checklist" item 4 read: "`check_drt_ours.sh`
+delta = the `unrouted_kinds` fail arm only; `drt.rs` delta =
+un-ignore + doc comment + per-design pins + optional ignored
+determinism test; no emit-path or router changes; `.gitignore`
+delta = the DEF exception line at most". It is **stale relative to
+what landed** — the real diff additionally carried:
 
-If the leg pinned residuals: `cargo test --workspace` must be
-green with the pins and the pin-scoping red-check (`gate.md` §4)
-recorded. If the leg is red without a named mechanism →
-`residuals.md` §5 escalation arm: commit the golden + the
-measurement, keep `#[ignore]`, card it — do not ship an
-un-pinned red test into the verify gate.
+- step-E's new `unguided` derivation + per-member verifier
+  (io-pin-only + guide-absent) in `check_drt_ours.sh`, plus the
+  conn-whitespace fix the first build's `fail` exposed;
+- `gcd.drt.ours.reference.json` regenerated with `unguided: []`;
+- `drt.rs` `unguided`/viability-join changes and two picorv32
+  `PINNED_LEF_RESIDUALS` entries (`li.3`=19, `met1.2`=146);
+- no `.gitignore` line (the 4.9 MB DEF stayed gitignored, so no
+  determinism byte-compare test — the `--verify` arm instead).
 
-## Verify / diffreview checklist
+Recorded so later audits diff against landed state, not the r1
+plan. Item 4's spirit (no emit-path/router changes, golden joins
+pinned) did hold.
 
-0. `cargo test --workspace` — green; shape ~601+N passed /
-   5–6 ignored (the picorv32 e2e gate now runs; the routing
-   picorv32 legs stay ignored). Fits `timeout_sec = 7200` — the
-   un-ignored test is a seconds-scale JSON join; no worktree
-   `workflow.toml` edit (main-checkout copy binds the driver,
-   `e6-drt-e2e/design/verify-timing.md`).
-1. `cargo clippy --workspace --all-targets -- -D warnings` —
+## Verify / diffreview checklist (r2)
+
+0. `python3 tests/designs/recount_unrouted.py picorv32` —
+   reproduces `overview.md`'s table exactly; `gcd` leg exits 0.
+1. `cargo test --workspace` — green; same test census as the
+   landed state (the recount adds no tests).
+2. `cargo clippy --workspace --all-targets -- -D warnings` —
    clean.
-2. Golden-vs-DEF join: `sha256(picorv32.drt.ours.routed.def)[:16]`
-   == `input_def_sha_prefix`; `image_id` recorded not gated.
-3. `git diff` clean on a step-E re-run (modulo `image_id`) —
-   byte-reproduction per `golden.md`; a diff is a bug to
-   investigate, not a rebaseline.
-4. Diff audit vs this design: `check_drt_ours.sh` delta = the
-   `unrouted_kinds` fail arm only; `drt.rs` delta = un-ignore +
-   doc comment + per-design pins + optional ignored determinism
-   test; no emit-path or router changes outside a `residuals.md`
-   §5 fix arm (named if present); `.gitignore` delta = the
-   DEF exception line at most; `docs/*` = the new entry +
-   §9/status sync; `Cargo.toml`/`Cargo.lock` = 0.12.9.
-5. `docs/results.md` numbers == the golden's (transcribed, not
-   re-typed): spot-check the comparison table vs `delta.vs_*`
-   and the census vs `ours_router`.
+3. Diff audit: only `tests/designs/recount_unrouted.py` (new),
+   `docs/results.md`, `docs/e6-drt.md`, this file. No `Cargo.*`,
+   no `.rs`, no `.sh`, no golden changes, no `.gitignore`.
+4. `docs/results.md` recount numbers == script output verbatim;
+   the wrong claims ("1,820 = Unattachable class", "all 196
+   met2-only", "met3-bridge does not appear") are gone — grep
+   the entry for `1,820`, `196`, `met3` to confirm the rewrite
+   reads as designed.
+5. `git diff` on the goldens is empty — the correction must not
+   touch `*.reference.json`.
 
 ## Files
 
-- `tests/designs/check_drt_ours.sh`
-- `tests/designs/picorv32/picorv32.drt.ours.reference.json`
-- `tests/designs/picorv32/picorv32.drt.ours.routed.def` (only if <1 MB)
-- `crates/grus-core/tests/drt.rs`
-- `.gitignore`
+- `tests/designs/recount_unrouted.py` (new)
 - `docs/results.md`
 - `docs/e6-drt.md`
-- `docs/status.md`
-- `docs/roadmap.md` (optional)
-- `Cargo.toml`
-- `Cargo.lock`
-- `tests/designs/picorv32/runs/` (gitignored — emit/check/probe artifacts)
+- `kurena/tasks/e6-drt-e2e-picorv32/design/steps.md` (this file)

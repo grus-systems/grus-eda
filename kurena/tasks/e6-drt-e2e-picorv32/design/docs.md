@@ -1,104 +1,108 @@
-# e6-drt-e2e-picorv32 — docs updates (r1)
+# e6-drt-e2e-picorv32 — docs corrections (r2)
 
-`docs/results.md` is the measurement log; `docs/e6-drt.md` §9 and
-`docs/status.md` carry the claim boundary. All numbers transcribe
-from the committed golden — never hand-write or round (E0 rules
-1–2, 9–10).
+Docs recount only. The landed r1 doc work stands except the items
+below; every recount number transcribes from the committed
+`recount_unrouted.py` output — never hand-edited (E0 rules 1–2).
 
-## 1. `docs/results.md` — dated entry
+## 1. `docs/results.md` — rewrite the census paragraph
 
-Shape mirrors the gcd `2026-11-24` entry. Sections:
+Inside the existing `### 2026-11-25 — e6-drt-e2e-picorv32` entry,
+replace the **Unrouted census decomposition** paragraph. The
+correction is marked, not silent — AGENTS §2 keeps failed records
+in the log; a one-line header note names what the merged text got
+wrong.
 
-- **Header** — `tests/designs/check_drt_ours.sh picorv32` inside
-  the pinned image (`image_id sha256:…`), run on
-  `picorv32.drt.ours.routed.def` (`input_def_sha_prefix=…`); the
-  golden `picorv32.drt.ours.reference.json` commits with the
-  entry. Emit-side provenance: `generate_drt_ours.sh picorv32
-  [--verify]`, `grus_eda_version`, `route_ms` per arm.
-- **Gate table** — `lef_expressible` nonzero rows (ours/placed/
-  routed_ref, or "0 on all 50"); `magic_only` rows vs the placed
-  baseline (nwell census expected ~8,084 `nwell.4` / 2,756
-  `nwell.2a` / 242 `nwell.1` — the routed reference's counts;
-  cell-master paint is placement-invariant);
-  `unclassified_fired`; `sanity_control` (which rule the probe
-  fired, `violated_rules_in_checked_deck`); antenna net/pin
-  counts — name ours vs the reference's own violations
-  (baseline 19+19, delegated 14+16).
-- **Connectivity record** — `routed`/`unrouted` with the named
-  list living in the golden (no inline dump); `unrouted_kinds`
-  decomposition; `unrouted_blockers`; `stub_outside_cover` census
-  (records ≥ `Unattachable`, accumulation semantics named);
-  `projected`, `collisions`, `area_patches`/`area_residuals`,
-  `notch_fills`/`notch_residuals`/`hole_residuals`,
-  `hull_masked`, `iterations`, `route_ms`. Class decomposition
-  per `residuals.md` §4 (met3-bridge / met2-connected /
-  region_escape / new classes — counted from the census, not
-  presumed).
-- **New-finding decomposition** — for every `ours != placed`
-  finding: site count, the `who*.tcl` probe record (names,
-  `drc why`/`select area`/`what`, Magic-units ×5 note), mechanism
-  class (X1/X2/X3), and the fix-or-pin verdict with the named
-  site(s) the pin covers. Inherited rows state "inherited" with
-  counts; `count_flat` is recorded, never claimed as a signal.
-- **Comparison table** — vs `variants.delegated` and
-  `variants.baseline` (from the golden's `delta` block):
-  `total_wirelength_um` + pct, `via_count_total` +
-  `vias_per_cut_layer`, `signal_nets_routed`,
-  `antenna_violations`. Note ours routes on the *committed guide*
-  while the delta's via/wire comparison is against two different
-  routers' outputs — informational, same convention as gcd.
-- **Determinism record** — `OURS-SHA` / `OURS-DETERMINISTIC` if
-  `--verify` ran, or the explicit skip decision + `route_ms`
-  projection; the DEF's size + commit decision (<1 MB rule).
-- **`unrouted_kinds` fix** — card #44: what changed, the
-  fail-arm exercise (`script-fix.md` §2), the gcd inertness
-  check.
-- **What ran** (E0 rule 9) — exact commands, host, wall times
-  (`runs/drt-ours/runtime.json` transcribed), probe names,
-  test commands, `cargo test --workspace` + clippy verdicts.
+Shape of the replacement:
 
-## 2. `docs/e6-drt.md` §9 — claim boundary update
+> **Unrouted census decomposition** *(recounted 2026-11-25 — the
+> merged version equated the 1,820 stub-carrying nets with the
+> `Unattachable` class and claimed all 196 no-stub nets had
+> met2-only guide unions; both wrong on the committed artifacts —
+> recount method below)*. `unrouted=2,016`; `unrouted_kinds`
+> counts per-pin final failures (`NoPath=2,225`,
+> `Unattachable=1,480` — a net may carry pins of both kinds).
+> `stub_outside_cover` records 3,288 distinct pins on 1,988 nets —
+> every pin that *ever* had no legal paint, accumulated across
+> all 8 iterations; 1,820 of those nets are unrouted, 168
+> re-attached later. Stub-carrying is **not** the final
+> `Unattachable` class: at most 1,480 nets carry a final
+> `Unattachable` pin (all ⊆ the 1,820), so ≥340 stub-carriers
+> ended `NoPath`-only and ≥536 unrouted nets' final failures are
+> all `NoPath` — including all 196 no-stub nets. The exact
+> per-net kind split is not derivable from the golden (per-pin
+> kinds live only in `UnroutedNet.failed`; the `#[ignore]`d
+> `test_maze_census_picorv32` `pins={kinds:?}` printout or an
+> emit-schema addition would close it — follow-up material).
+> Guide-union census (`guide_union_connected` semantics, ≤met2
+> vs all layers): of the 196 no-stub nets, 58 carry met3+ boxes —
+> **48 `met3_bridge`** (≤met2 union disconnected, met3+ rejoins)
+> and 148 `met2_connected`; over all 2,016: **138 `met3_bridge`**,
+> 1,878 `met2_connected`, 0 disjoint, 0 guide-absent — the
+> v0.12.4 met3-bridge class *does* appear at scale (`_03824_`,
+> `mem_ready`, `_00013_`, `decoded_imm[27]` named bridged
+> examples); the guide-union class is a topology property, not a
+> proven failure mechanism. Aggregate blocker attribution
+> `l1Net=1,194` of 1,973 stays dominant — per-pin, not per-class.
+> The 116 → 2,016 growth vs the v0.12.6 mini emit remains the
+> access-model refusal story (pre-confinement emits painted those
+> stubs anyway); 1,039 of the 2,016 unrouted nets are named
+> (`clk`, `count_cycle[*]`, `alu_out[*]`).
 
-Replace the deferred paragraph:
+Append a **Recount method** line: counted by
+`tests/designs/recount_unrouted.py picorv32` (committed; gcd leg
+`sanity`) from `picorv32.drt.ours.reference.json`
+(`ours_router.unrouted`, `cli_lines`, `unrouted_kinds`,
+`unrouted_blockers`) and `picorv32.guide` — union-find per net,
+`|Δlayer|≤1` + strict 2D overlap, classes per the
+`guide_union_connected` classifier.
 
-> **picorv32** — leg deferred (r4/r5 memo): no golden commits;
-> `test_e2e_ours_reference_picorv32` is `#[ignore]`d with the
-> same joins ready.
+Numbers not in `recount.md`'s verified table are filled from the
+script's actual output at write time; a divergence is a bug.
 
-with the measured outcome paragraph — golden committed, what
-`lef_expressible`/`magic_only`/`unclassified`/antenna read, the
-unrouted census summary, pins if any (named), and the determinism
-choice (which arms exist and which ran). Update the "Test gate"
-paragraph: `test_e2e_ours_reference_picorv32` is live; the
-determinism leg's actual shape (byte-compare test iff the DEF
-committed, else `--verify` + `test_maze_determinism_picorv32`).
+Everything else in the entry stands: emit/check-leg numbers,
+gate table, residual decomposition, `unguided` discovery,
+def_metrics, what-ran, determinism decision — all verified by
+the diffreview as consistent.
 
-## 3. `docs/status.md` — sync
+## 2. `docs/e6-drt.md` — reflow fix only
 
-The "Last updated" block names "picorv32 leg deferred — no
-golden, the `#[ignore]`d gate test carries the joins". Update to
-the new state (golden committed, leg measured, pins named if
-any). E0 rule 8: keep `docs/` in step with the code — this is
-the same doc-sync obligation the parent ticket followed for its
-deferral wording.
+§9 "Test gate" paragraph: the wrap broke "the two-name
+unclassified allowlist" into
 
-`docs/roadmap.md` — optional one-line append to the E6 progress
-trail naming the leg's landing; keep it terse like the existing
-2026-11-24 bullet.
+```
+the two-name
+unclassified
+allowlist,
+```
 
-## 4. Version
+Rejoin so `unclassified` sits inline (the two-name `unclassified`
+allowlist). No content change — §9's aggregate census
+(`routed=4728 unrouted=2016 unguided=67`, named pin residuals)
+is correct and stays. The v0.12.4-era met3-bridge mention in the
+maze section is dated historical record, not the v0.12.9 claim —
+untouched.
 
-`Cargo.toml` `[workspace.package] version` `0.12.8 → 0.12.9`
-(patch on 0.x — test un-ignore + script contract fix + golden
-land; no breaking change). Same commit as the functional change,
-`Cargo.lock` regenerated. Bump **before** the check leg runs —
-the golden's `ours_router.grus_eda_version` records the version
-it was generated under.
+## 3. `docs/status.md` — verified, no change
+
+The 2026-11-25 `v0.12.9` block quotes only aggregate census
+numbers (`guided=6744 routed=4728 unrouted=2016`,
+`unguided=67`) — none of the wrong claims appear. Explicitly
+confirm while editing; no edit expected.
+
+## 4. `kurena/tasks/e6-drt-e2e-picorv32/design/steps.md`
+
+Annotated per `steps.md` "Post-landing notes" — the r1
+diff-audit item 4 under-enumerated the landed diff; recorded so
+later audits diff against landed state.
+
+## 5. Version
+
+No `Cargo.toml`/`Cargo.lock` change — docs + a measurement
+script; no shipped functionality moves (v0.12.9 stands).
 
 ## Files
 
 - `docs/results.md`
 - `docs/e6-drt.md`
-- `docs/status.md`
-- `docs/roadmap.md` (optional one-liner)
-- `Cargo.toml`, `Cargo.lock`
+- `docs/status.md` (verify-only)
+- `kurena/tasks/e6-drt-e2e-picorv32/design/steps.md`

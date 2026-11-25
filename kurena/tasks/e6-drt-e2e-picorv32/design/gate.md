@@ -1,5 +1,11 @@
 # e6-drt-e2e-picorv32 — integration gate (r1)
 
+> **r2 status: landed** (`8496158`/`9788e53`, v0.12.9) —
+> `test_e2e_ours_reference_picorv32` un-`#[ignore]`d, per-design
+> `PINNED_LEF_RESIDUALS` with the `li.3`/`met1.2` pins, `--verify`
+> determinism arm ran clean. Kept as record; remaining scope in
+> `overview.md`/`recount.md`/`docs.md`/`steps.md`.
+
 All changes land in `crates/grus-core/tests/drt.rs`, additive to
 the `ours_reference_gate` machinery the gcd leg already exercises.
 **No new test re-routes picorv32 in the default suite** — dev-profile

@@ -1,5 +1,12 @@
 # e6-drt-e2e-picorv32 — residual decomposition protocol (r1)
 
+> **r2 status: landed** (`8496158`/`9788e53`, v0.12.9) — the
+> `li.3`/`met1.2` residuals decomposed and pinned per this
+> protocol. Kept as record. Its §4 suspect list was a
+> pre-registration; the unrouted-census numbers it anticipated are
+> superseded by the `recount.md` measured census (notably: the
+> met3-bridge class appears — 138 nets — not "does not appear").
+
 The leg's outcome is measured, not presumed. Whatever Magic finds
 on `picorv32.drt.ours.routed.def` decomposes like the gcd leg did:
 per-rule deltas → named sites → mechanism class → fix-or-pin.
