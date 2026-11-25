@@ -1262,7 +1262,7 @@ fn test_via_edge_fixture() {
 // ---------------------------------------------------------------------------
 
 use grus_core::drt::maze::{
-    FailKind, MazeConfig, OccMode, overlap_census, route_digest, route_nets,
+    FailKind, IterStat, MazeConfig, OccMode, overlap_census, route_digest, route_nets,
 };
 use grus_core::drt::graph::RouteGraphs;
 
@@ -1638,6 +1638,19 @@ fn maze_census(name: &str) {
             r.iterations,
             route_digest(&r),
         );
+        println!(
+            "{name}: iter_progress={} iter_prov={}",
+            r.iter_stats
+                .iter()
+                .map(|s| s.attempted.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            r.iter_stats
+                .iter()
+                .map(|s| s.prov_collisions.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
         for u in &r.unrouted {
             let kinds: Vec<String> = u
                 .failed
@@ -1663,6 +1676,44 @@ fn maze_census(name: &str) {
             r.nets.iter().all(|n| !n.wires.is_empty()),
             "{name}: routed net with no wires"
         );
+
+        // Convergence record (`IterStat` semantics, `docs/e6-drt.md`
+        // §7): one entry per iteration; entry 0 attempts every guided
+        // net; `attempted` is non-increasing (the re-queue is a
+        // subset); the last entry always has `prov_collisions == 0`
+        // (hard mode reports no provisionals; early convergence has
+        // none) and its failure count is the unrouted census.
+        assert_eq!(
+            r.iter_stats.len(),
+            r.iterations as usize,
+            "{name}: iter_stats len != iterations"
+        );
+        if !r.iter_stats.is_empty() {
+            assert_eq!(
+                r.iter_stats[0].attempted as usize,
+                join.nets.len(),
+                "{name}: iter_stats[0].attempted != guided"
+            );
+            let last = r.iter_stats.last().unwrap();
+            assert_eq!(
+                last.prov_collisions, 0,
+                "{name}: last-iteration prov_collisions != 0"
+            );
+            assert_eq!(
+                (last.attempted - last.routed) as usize,
+                r.unrouted.len(),
+                "{name}: last-iteration failures != unrouted"
+            );
+        }
+        for w in r.iter_stats.windows(2) {
+            assert!(
+                w[0].attempted >= w[1].attempted,
+                "{name}: attempted increased across iterations"
+            );
+        }
+        for s in &r.iter_stats {
+            assert!(s.routed <= s.attempted, "{name}: routed > attempted");
+        }
 
         // Classify `NoPath` nets: `met3_bridge` has a disconnected
         // {li1,met1,met2} box union that only the met3+ boxes rejoin
@@ -1767,6 +1818,24 @@ fn maze_determinism(name: &str) {
     }
 }
 
+/// Digest coverage fail-proof (AGENTS §7.7): `iter_stats` is a
+/// deterministic output serialized into `route_digest` — flip one
+/// field and the digest must move, else the new record is invisible
+/// to the determinism gate.
+#[test]
+fn test_route_digest_covers_iter_stats() {
+    let a = RouteDb {
+        iter_stats: vec![IterStat {
+            attempted: 3,
+            routed: 3,
+            prov_collisions: 0,
+        }],
+        ..RouteDb::default()
+    };
+    let mut b = a.clone();
+    b.iter_stats[0].prov_collisions = 1;
+    assert_ne!(route_digest(&a), route_digest(&b));
+}
 
 // ---------------------------------------------------------------------------
 // Routed DEF emission + self-DRC gate

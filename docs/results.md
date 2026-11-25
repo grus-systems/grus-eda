@@ -10148,3 +10148,85 @@ golden's `cli_lines` → `recount_unrouted.py gcd` exits 1
 -D warnings` clean; `cargo build --release -p grus-eda`; the gcd
 emit run above; the detached-HEAD digest arm; the doctored-golden
 recount arm.
+
+### 2026-11-25 — drt-converge-stats: per-iteration convergence record in the drt census (v0.12.11)
+
+Observability ticket — no routing-behavior change. `route_nets`
+now records one `IterStat{attempted, routed, prov_collisions}` per
+rip-up iteration into `RouteDb.iter_stats` (`attempted` = `bad`-set
+size at entry, `routed` = commits, `prov_collisions` = deduped
+provisional `Collision`s at iteration end; always 0 on the hard
+last iteration, where foreign hits block instead of reporting, and
+everywhere under `OccMode::Disabled`). The `== drt emit:` census
+prints them as `iter_progress=<attempted,…>` /
+`iter_prov=<prov_collisions,…>` lines after `guided=…`, and
+`route_digest` serializes the vector — the record is deterministic
+run output, so it belongs to the digest's own contract.
+
+**gcd census** (`cargo test --release -p grus-core --test drt
+test_maze_census -- --nocapture`, same `MazeConfig::default()`):
+
+```
+gcd: guided=269 routed=188 pins_connected=513 projected=9 unrouted=81 collisions=0 iterations=8 ms=12933 digest=0xa6d8b74a740a7489
+gcd: iter_progress=269,94,87,81,81,81,81,81 iter_prov=25,6,0,0,0,0,0,0
+```
+
+Reading (the measurement this ticket exists for): the bad set
+falls 269→94→87→81 and is flat at 81 from iteration 4 on, with
+`iter_prov` already 0 from iteration 3 — gcd does not flatline on
+collision ping-pong; its 81-net residue is a stable dead-end set
+(met3-bridge ×2 + met2-connected pockets/OBS seals, per the
+existing census classification), so more iterations would not
+converge it. Digest moved `0xab23bcc1997e4484` →
+`0xa6d8b74a740a7489` — expected: a new serialized field, no
+pinned literal anywhere (verified: no test or golden carries a
+digest value).
+
+**gcd emit leg** (`target/release/grus-eda drt` on
+`gcd.placed.def` + `gcd.guide` → scratch `--out-def`,
+route_ms=12,853), verbatim:
+
+```
+guided=269 routed=188 unrouted=81 projected=9 collisions=0 area_patches=1 area_residuals=0 iterations=8 route_ms=12853 hull_masked=227182 notch_fills=343 notch_residuals=0 hole_residuals=0
+iter_progress=269,94,87,81,81,81,81,81
+iter_prov=25,6,0,0,0,0,0,0
+```
+
+`iter_progress` entry count 8 == `iterations=8` (self-checking
+against the existing census field).
+
+**Fail-proof** (E0 rule 7): `test_route_digest_covers_iter_stats`
+flips one `prov_collisions` on a hand-built `RouteDb` and asserts
+the digest moves — proves `iter_stats` reaches the digest without
+routing. Additionally the loop's `iter_stats.push` was removed on
+a scratch edit: `test_maze_census` went red at
+`iter_stats len != iterations` (0 vs 8), restored. The census
+asserts the model invariants (`len == iterations`,
+`attempted[0] == guided`, `attempted` non-increasing,
+`routed ≤ attempted`, last `prov_collisions == 0`,
+`last.attempted − last.routed == unrouted.len()`), and
+`test_maze_determinism`'s `RouteDb` equality covers the field for
+free.
+
+**Consumers**: `check_drt_ours.sh` step-E keep-list gains
+`s.startswith("iter_progress=")` / `s.startswith("iter_prov=")` —
+generation-time snapshots only; committed goldens
+(`gcd`/`picorv32.drt.ours.reference.json`) unchanged, no
+`ours_router` schema change (the series is derivable from
+`cli_lines` on next regen). Absolute-path guard cannot fire
+(digits/commas/`=` only). `recount_unrouted.py gcd` exits 0
+(unknown prefixes ignored by construction).
+
+**picorv32 leg** (`test_maze_census_picorv32 --ignored`,
+~135 min release): running detached; the `iter_progress`/
+`iter_prov` series goes into this entry when it lands. The
+acceptance's picorv32 iteration-profile box stays open until
+then. Prior record (v0.12.9 emit census): `guided=6744
+routed=4728 unrouted=2016`, `iterations=8`.
+
+**What ran** (E0 rule 9): `cargo test --workspace` — 557 lib +
+18 drc + 26 drt (3 `#[ignore]`d picorv32 legs) + 2 irdrop +
+7 grus-eda, all green; `cargo clippy --workspace --all-targets --
+-D warnings` clean; `cargo build --release -p grus-eda`; the gcd
+census and emit runs above; the loop-push fail-proof;
+`recount_unrouted.py gcd`.
