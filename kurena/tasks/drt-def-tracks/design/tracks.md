@@ -80,8 +80,8 @@ in `tests/designs/` (the `??` fixtures under `sta_edge/` /
 | file / line | rule: coord < die | rule: coord + w/2 ≤ die |
 |---|---|---|
 | `gcd.placed` `TRACKS Y met4 DO 111` (die 102670) | 112 | **111** |
-| `picorv32.placed` `TRACKS X met1 DO 1417` (die 481715) | **1417** | 1416 |
-| `jpeg.floorplan` `TRACKS Y met1 DO 3020` (die 1026710) | **3020** | 3019 |
+| `picorv32.placed` `TRACKS X met1 DO 1417` (die 481715) | **1417** | 1417 |
+| `jpeg.floorplan` `TRACKS Y met1 DO 3020` (die 1026710) | **3020** | 3020 |
 | `ibex.placed` `TRACKS X met1 DO 1640` (die 557795) | 1641 | **1640** |
 | `aes.placed` `TRACKS Y met2 DO 1155` (die 531265) | **1155** | 1155 (pitch/2 would give 1154 — rules out pitch/2) |
 

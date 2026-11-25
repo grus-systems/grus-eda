@@ -1978,6 +1978,13 @@ pub fn write_def_full(db: &DesignDb, tech_db: &TechDb, out_def_path: &Path) -> R
             tg.step_dbu
         ));
         for lid in &tg.layers {
+            // An unresolvable id would silently degrade the statement to an
+            // all-layers grid on re-parse; the parser only produces valid ids.
+            debug_assert!(
+                tech_db.routing_layers.get(lid.0 as usize).is_some(),
+                "TRACKS references out-of-range LayerId {}",
+                lid.0
+            );
             if let Some(layer) = tech_db.routing_layers.get(lid.0 as usize) {
                 out.push_str(&format!(
                     " LAYER {}",
