@@ -1,6 +1,6 @@
 # e6-drt-e2e r3 — pin access / unrouted recovery
 
-> **r9 note — unchanged.** Verify-evidence revision only (r9 memo —
+> **r10 note — unchanged.** Verify-bound revision only (r10 memo —
 > `verify-timing.md`); `unrouted=81` stands as the named residual.
 
 > **r7 note — unchanged at `5d1502b`** (alias refactor only;

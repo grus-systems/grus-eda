@@ -1,33 +1,33 @@
-# e6-drt-e2e — overview (r9, verify-evidence; implementation head `5d1502b`)
+# e6-drt-e2e — overview (r10, verify-bound raised; implementation head `5d1502b`)
 
 E6 stage gate: run the real Magic `drc(full)` / OpenROAD antenna deck
 on **our** natively-routed DEF (`grus-eda drt`) inside the pinned
 LibreLane container, against the committed `e6-drt-ref` surfaces.
 Depends on `e6-drt-emit`.
 
-**r9 — verify-evidence, still no code delta.** The second verify
-timeout is ruled **structural, not a code issue**: dev-profile
-`cargo test --workspace` needs ~2h+ on this machine (`drt` tests
-dominate) vs the driver's 1800 s window. The memo's directive:
-**do not re-run it inside the verify step.** Evidence already
-exists — results.md what-ran (clean at `0d113ba`, confirmed
-post-`5d1502b`), the completed r8 detached dev-profile log
-(601 passed / 6 ignored, all `ok`), and the memo's designated
-artifact: the detached `cargo test --workspace --release` run at
-`/tmp/e2e-ws-release-test.log`, **already complete and green**
-(601/0/6; ~121 s of test time). Verify collects it; if the driver
-still demands the literal dev-profile command, `workflow.toml` is
-flagged for a **human decision** — no fix-loop, no edit.
-`verify-timing.md` (r9) carries the procedure; every other design
+**r10 — verify re-run under the raised bound; still no code delta.**
+The r9-flagged `workflow.toml` question is answered: root cause was
+**config, not code** — `timeout_sec` 1800 vs the ~2200 s the
+dev-profile suite needs (`drt.rs` alone 2196 s). The human raised it
+to **7200 on dev (`63735c5`)** — already live for the driver, which
+reads `timeout_sec` from the main checkout's `workflow.toml`; the
+worktree's copy is never consulted and stays untouched at 1800
+(`verify-timing.md` r10 documents the mechanism). Green
+evidence also already exists on disk — the r8 detached dev-profile
+suite (`tests/designs/gcd/runs/cargo-test-workspace.log`, 601/0/6)
+and the r9 detached release suite (`/tmp/e2e-ws-release-test.log`,
+601/0/6). The directive: **re-run verify under the new bound —
+nothing else to implement.** The literal `cargo test --workspace`
+now fits in-window; r9's collect-only stance is superseded.
+`verify-timing.md` (r10) carries the procedure; every other design
 file stands unchanged.
 
-**r8 record (superseded procedure, valid outcome).** r8's directive
-was a T0 detached dev-profile suite — that run *did* complete
-green (`tests/designs/gcd/runs/cargo-test-workspace.log`) and now
-stands as on-record evidence; the r9 memo replaces the
-launch-and-collect procedure with collect-only and adds the
-release-profile artifact. Implementation at `5d1502b` confirmed
-complete — **nothing to implement**.
+**r9 record (superseded procedure, valid evidence).** r9 ruled the
+second verify timeout structural and redirected evidence collection
+to the completed detached logs — those runs *did* complete green and
+remain on record as corroborating evidence; the r10 memo restores
+the in-window dev-profile run as primary. Implementation at
+`5d1502b` confirmed complete — **nothing to implement**.
 
 **r7 record — as-built at `5d1502b`.** The human memo on the r6
 design confirms that checkpoint is complete and correct — doc-sync
@@ -96,13 +96,13 @@ byte-compares a fresh emit against the committed DEF test-side.
 ## What remains
 
 1. **Verify/diffreview only** — `steps.md` carries the checklist;
-   `verify-timing.md` (r9) carries *where* the
-   `cargo test --workspace` evidence comes from (the completed
-   `--release` log + the completed r8 dev-profile log — collected,
-   never re-launched). clippy `-D warnings`, the golden-vs-DEF sha
-   join, and the diff audit are unchanged. The literal in-window
-   `test-workspace` command is a `workflow.toml` question flagged
-   for the human.
+   `verify-timing.md` (r10) carries the procedure: the literal
+   dev-profile `cargo test --workspace` re-runs **in-window** under
+   the human-raised `timeout_sec = 7200` (dev `63735c5`, read from
+   the main checkout's `workflow.toml`), with the two completed
+   green detached logs
+   as corroborating evidence. clippy `-D warnings`, the
+   golden-vs-DEF sha join, and the diff audit are unchanged.
 2. **picorv32 leg — honestly open.** Deferred per the r4/r5 memo and
    flagged on the card: `picorv32.drt.ours.reference.json` is not
    committed; `test_e2e_ours_reference_picorv32` ships `#[ignore]`d
@@ -118,7 +118,7 @@ byte-compares a fresh emit against the committed DEF test-side.
 | Magic `listall why` 0 on every `lef_expressible` on ours; `magic_only` decomposed to baseline class | green — all 50 at 0; 3 nwell rows all `inherited`; `unclassified_fired` empty |
 | `generate_drt_ours.sh` byte-identical reruns | green — `--verify` arm + committed-DEF byte-equal test |
 | wirelength/via/antenna deltas in `docs/results.md`, named outliers | landed — dated 2026-11-24 entry, via2/via3 +wirelength-rise named |
-| `cargo test --workspace`, clippy `-D warnings` | green on record — dev-profile suite completed detached (601/6-ignored) + results.md what-ran at `0d113ba`/post-`5d1502b`; r9 evidence = the completed `--release` log collected at verify (`verify-timing.md`); literal in-window command flagged for human `workflow.toml` decision; clippy re-runs in-window |
+| `cargo test --workspace`, clippy `-D warnings` | green on record — dev-profile suite completed detached (601/6-ignored) + release suite 601/0/6 + results.md what-ran at `0d113ba`/post-`5d1502b`; r10 verify re-runs the literal dev-profile command in-window under `timeout_sec = 7200` (`verify-timing.md`); clippy re-runs in-window |
 | `docs/status.md` honest E6 state | landed — carries unrouted=81 + picorv32 deferral |
 
 ## Non-goals (held — nothing was relaxed)

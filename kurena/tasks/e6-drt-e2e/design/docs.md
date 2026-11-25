@@ -1,9 +1,10 @@
 # e6-drt-e2e — doc updates (r7, landed; head `5d1502b`)
 
-> **r9 note — no doc delta.** The r9 revision is verify-evidence
-> only (`verify-timing.md` — the memo rules the second verify
-> timeout structural and designates the completed
-> `cargo test --workspace --release` log as the artifact). The
+> **r10 note — no doc delta.** The r10 revision is verify-bound
+> only (`verify-timing.md` — the memo confirms the timeouts were
+> config, not code; `timeout_sec` 1800→7200 on dev `63735c5`,
+> read by the driver from the main checkout's `workflow.toml`;
+> verify re-runs the literal dev-profile suite in-window). The
 > committed `docs/results.md` what-ran already records the clean
 > `cargo test --workspace` + clippy runs the memo cites; the
 > verify-time logs stay gitignored artifacts, not committed docs.

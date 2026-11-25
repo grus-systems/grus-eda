@@ -1,6 +1,6 @@
 # e6-drt-e2e — `<d>.drt.ours.reference.json` schema (r4)
 
-> **r9 status — unchanged.** Verify-evidence revision only (r9
+> **r10 status — unchanged.** Verify-bound revision only (r10
 > memo — `verify-timing.md`); no schema or golden delta.
 
 > **r7 status — unchanged at `5d1502b`.** The alias refactor

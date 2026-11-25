@@ -1,6 +1,6 @@
 # e6-drt-e2e — instance-hull occupancy model (shipped v1 + r3 confinement)
 
-> **r9 note — unchanged.** Verify-evidence revision only (r9 memo —
+> **r10 note — unchanged.** Verify-bound revision only (r10 memo —
 > `verify-timing.md`); the mask model and the all-0 gate stand.
 
 > **r7 note — unchanged at `5d1502b`** (alias refactor only; the

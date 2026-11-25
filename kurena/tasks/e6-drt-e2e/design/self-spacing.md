@@ -1,6 +1,6 @@
 # e6-drt-e2e — same-net self-spacing (the measured residual class)
 
-> **r9 note — unchanged.** Verify-evidence revision only (r9 memo —
+> **r10 note — unchanged.** Verify-bound revision only (r10 memo —
 > `verify-timing.md`); the closure model and emitted bytes stand.
 
 > **r7 note — `5d1502b` renamed the ledger type only**: the

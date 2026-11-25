@@ -1,15 +1,19 @@
-# e6-drt-e2e — steps (r9, verify-evidence; implementation head `5d1502b`)
+# e6-drt-e2e — steps (r10, verify-bound raised; implementation head `5d1502b`)
 
-**All steps landed; `5d1502b` is the implementation head.** The r9
-memo adds no implementation step either — it rules the second
-verify timeout **structural** (dev-profile `cargo test
---workspace` ~2h+ vs `timeout_sec = 1800`) and redirects the
-*evidence source*: collect the completed `cargo test --workspace
---release` log (`/tmp/e2e-ws-release-test.log` → gitignored runs
-dir) plus the already-completed r8 dev-profile background log;
-**do not re-run dev-profile `cargo test --workspace` in verify**;
-flag `workflow.toml` for the human if the driver still demands the
-literal command. `verify-timing.md` (r9) carries the procedure.
+**All steps landed; `5d1502b` is the implementation head.** The r10
+memo adds no implementation step — it confirms the verify timeouts
+were **config, not code** (`timeout_sec` 1800 vs the ~2200 s the
+dev-profile suite needs; `drt.rs` alone 2196 s) and records the
+human's fix: `timeout_sec` raised to **7200 on dev (`63735c5`)** —
+live for the driver via the **main checkout's** `workflow.toml`
+(the only copy `Ctx::open` reads; the worktree's stays untouched
+at the branch's committed 1800 — `verify-timing.md` documents the
+mechanism and why touching it breaks the merge). Directive:
+**re-run verify under the new bound — nothing else to implement.** The literal dev-profile
+`cargo test --workspace` is back in-window; the two completed green
+detached logs (dev-profile r8 + release r9) are corroborating
+evidence. `verify-timing.md` (r10) carries the procedure; r9's
+collect-only stance is superseded.
 `5d1502b` carries only
 doc-sync and the `LineNodes`/`PaintLines` alias refactor on top of
 `0d113ba`'s final hop — **no functional delta**: the committed DEF
@@ -127,33 +131,31 @@ designs" item remains open — flagged on the card, not silently green.
 
 ## Verify / diffreview checklist (what remains)
 
-0. **Verify evidence — collected, not launched** (`verify-timing.md`
-   r9):
-   - **Release artifact (the memo's designated evidence)** —
-     `cargo test --workspace --release` ran detached →
-     `/tmp/e2e-ws-release-test.log`, **already complete and green**
-     (601 passed / 0 failed / 6 ignored; suite ~121 s after a
-     20.77 s warm compile). Copy it to
-     `tests/designs/gcd/runs/release-test-workspace.log`
-     (gitignored) and quote the `test result: ok.` totals in the
-     card report. Still-running ⇒ wait on the pid (minutes); dead
-     mid-log ⇒ restart detached `--release`, never dev-profile.
-   - **Dev-profile evidence already on record** — `docs/results.md`
-     what-ran (clean at `0d113ba`, confirmed post-`5d1502b`) +
-     the completed r8 background log
+0. **Verify — re-run in-window under the raised bound**
+   (`verify-timing.md` r10):
+   - **`cargo test --workspace`** — the driver's literal dev-profile
+     `test-workspace` command now fits `timeout_sec = 7200` (dev
+     `63735c5`, read from the main checkout's `workflow.toml`).
+     Expected wall ~40 min; green shape 601 passed / 0 failed /
+     6 ignored. A timeout at this bound is a real anomaly, not the
+     r9 structural misfit — capture the log tail, no fix-loop.
+   - **Corroborating evidence already on record** — `docs/results.md`
+     what-ran (clean at `0d113ba`, confirmed post-`5d1502b`), the
+     completed r8 detached **dev-profile** log
      `tests/designs/gcd/runs/cargo-test-workspace.log` (601 passed,
-     6 ignored, every binary `ok`). **No dev-profile re-run in any
-     form** — the second driver timeout was structural.
-   - **Driver-side literal `cargo test --workspace`** — if it fires
-     in-window it times out: the known-structural limit, flagged
-     on the card for a human `workflow.toml` decision
-     (`--release`, `timeout_sec`, or an artifact convention) — no
-     fix loop, no edit by us.
+     6 ignored, every binary `ok`), and the r9 detached **release**
+     log `/tmp/e2e-ws-release-test.log` (601/0/6) — cite in the card
+     report; copying it to `runs/release-test-workspace.log`
+     (gitignored) is optional now that the in-window run is primary.
+   - **`workflow.toml`** — leave untouched. The driver's bound is
+     the main checkout's copy (7200); the worktree file stays at
+     the branch's committed 1800 — committing a worktree edit
+     would collide textually with dev `63735c5` at merge.
 1. `cargo clippy --workspace --all-targets -- -D warnings` — clean
-   (in-window; compile-only, it fits — after the release run frees
-   the `target/` lock). The picorv32 leg stays `#[ignore]`d in
-   every test surface (a `--ignored` run fails loudly on the
-   missing golden — that is the designed state, not a bug).
+   (in-window; compile-only, it fits). The picorv32 leg stays
+   `#[ignore]`d in every test surface (a `--ignored` run fails
+   loudly on the missing golden — that is the designed state, not
+   a bug).
 2. Golden-vs-DEF join: `sha256(gcd.drt.ours.routed.def)[:16]` ==
    golden `input_def_sha_prefix` (`635f19a9aae86a44`) — verified in
    planning; re-check in verify.
@@ -175,7 +177,7 @@ designs" item remains open — flagged on the card, not silently green.
    transcribed from the same file) — spot-check the comparison table
    against `delta.vs_*`.
 
-## Files (as actually touched on the branch, head `5d1502b`; r9 adds no committed paths)
+## Files (as actually touched on the branch, head `5d1502b`; r10 adds no committed paths)
 
 - `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/tests/drt.rs`
@@ -184,4 +186,4 @@ designs" item remains open — flagged on the card, not silently green.
 - `docs/results.md`, `docs/e6-drt.md`, `docs/status.md`, `docs/roadmap.md`
 - `Cargo.toml`, `Cargo.lock`
 - `tests/designs/picorv32/picorv32.drt.ours.reference.json` (deferred — intentionally absent)
-- `tests/designs/gcd/runs/` (gitignored — `cargo-test-workspace.log`/`cargo-test-workspace.pid` from r8, `release-test-workspace.log` copied at r9 verify; never committed)
+- `tests/designs/gcd/runs/` (gitignored — `cargo-test-workspace.log`/`cargo-test-workspace.pid` from r8, optional `release-test-workspace.log` copy at r10 verify; never committed)
