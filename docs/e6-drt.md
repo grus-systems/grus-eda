@@ -718,9 +718,12 @@ subset — and assembles `<d>.drt.ours.reference.json`: per-rule
 `lef_expressible`/`magic_only`/`unclassified` decompositions across
 {our DEF, the placed baseline, TritonRoute's routed reference}, a
 `sanity_control` mutation arm, the `ours_router` emit census
-(including `cli_lines` evidence), `def_metrics`, `delta` vs both
-references, and OpenROAD antenna counts. `generate_drt_ours.sh <d>
---verify` double-emits and byte-compares.
+(including `cli_lines` evidence and the `unguided` class — DEF
+signal nets with a `( PIN <port> )`-only record that the guide
+never covered, each verified io-pin-only or the script fails),
+`def_metrics`, `delta` vs both references, and OpenROAD antenna
+counts. `generate_drt_ours.sh <d> --verify` double-emits and
+byte-compares.
 
 **gcd outcome** (numbers in `docs/results.md`): `lef_expressible` =
 0 on all 50 rules — trajectory ~3025 → 847 → 514 → 317 → 0, the
@@ -734,17 +737,33 @@ antenna 0. `unrouted=81` — the golden's `ours_router.unrouted` is
 the pinned list; `notch_fills=343`, all residual vectors empty.
 Mechanisms: `kurena/tasks/e6-drt-e2e/design/`.
 
-**picorv32** — leg deferred (r4/r5 memo): no golden commits;
-`test_e2e_ours_reference_picorv32` is `#[ignore]`d with the same
-joins ready.
+**picorv32 outcome** (`v0.12.9`, numbers in `docs/results.md`):
+`lef_expressible` non-inherited rows are `li.3` ours=19 (4 sites —
+our li1 stub vs LEF-declared OBS li1 masked inside host hulls, the
+masked-layer class) and `met1.2` ours=146 (21 sites — same-net
+disjoint met1 edges < 0.14 µm inside pin-access clusters, all X3;
+the emit-time self-DRC sees 3 of them, the other 18 are
+intra-island concavities the island spacing subset cannot see).
+Both pinned in `PINNED_LEF_RESIDUALS`. `magic_only` all inherited,
+`unclassified_fired` empty, antenna 106 net / 152 pin. Census:
+`routed=4728 unrouted=2016 unguided=67` (`irq[*]`/`pcpi_*`
+io-pin-only nets the guide never covers — the delegated reference
+shows the identical gap); `notch_fills=15236`, all residual vectors
+empty. `test_e2e_ours_reference_picorv32` runs the same joins; no
+determinism byte-compare test — the ~4.9 MB routed DEF stays
+gitignored and `--verify` is the recorded demonstration.
 
 **Test gate** (`tests/drt.rs`): `test_e2e_ours_reference_gcd` joins
 the golden to the `drc.reference.json` taxonomy — strict
 `ours == placed` per unpinned `lef_expressible` rule, the
-`PINNED_LEF_RESIDUALS` mechanism (currently empty) for named
-residuals, `magic_only` all-inherited, the two-name unclassified
+`PINNED_LEF_RESIDUALS` mechanism (picorv32 `li.3`/`met1.2`) for
+named residuals, `magic_only` all-inherited, the two-name
+unclassified
 allowlist, the sanity-control liveness asserts, the
 `cli_lines`-evidence census joins, and the viability floor
-(`signal_nets_routed == routed == nets_in_def − unrouted_count`).
+(`signal_nets_routed == routed` and `nets_in_def − routed ==
+unrouted_count + unguided` — the `unguided` term names io-pin-only
+nets outside the guide, picorv32's 67 `irq`/`pcpi` ports).
 `test_e2e_ours_def_deterministic_gcd` byte-compares a fresh emit to
-the committed DEF.
+the committed DEF; `test_e2e_ours_reference_picorv32` applies the
+same gate to the committed picorv32 golden.

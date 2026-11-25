@@ -9877,3 +9877,109 @@ This unblocks a self-contained `floorplan → place → route → drt`
 chain: a consumer reading only our emitted DEF can now rebuild
 the exact track model and gcell grid without holding the LEF or
 a side-channel grid convention.
+
+### 2026-11-25 — e6-drt-e2e-picorv32: picorv32 leg of the full Magic gate (v0.12.9)
+
+**Emit leg.** `generate_drt_ours.sh picorv32 --verify` produced
+`runs/drt-ours/picorv32.drt.ours.routed.def` (4,927,300 bytes, sha256
+`505baea2f937702f`, gitignored) in `route_ms=8,206,939` (~2.3 h,
+8 iterations). Emit census (`cli_lines` in the golden): `guided=6744
+routed=4728 unrouted=2016 projected=134 collisions=0
+area_patches=12 area_residuals=0 hull_masked=8912407
+notch_fills=15236 notch_residuals=0 hole_residuals=0`. Unrouted
+kinds `NoPath=2225 Unattachable=1480` (kinds count findings, not
+distinct nets); blockers `l0Obs=10 l0ObsPin=33 l1Obs=444 l1ObsPin=2
+l1Net=1194 l2Obs=4 l2Net=286`. Of the 2,016 unrouted nets 1,039 are
+named — `clk`, `count_cycle[*]`, `alu_out[*]` among them — and the
+emit log names `stub_outside_cover` on 1,988 distinct nets (pins
+whose guide box never overlaps a reachable track/hull entry, so the
+net emits conns-only). The `--verify` second route + byte-`cmp` arm
+is recorded below once it lands.
+
+**Check leg.** `check_drt_ours.sh picorv32` (pinned LibreLane image,
+Magic `drc(full)` on our DEF) →
+`picorv32.drt.ours.reference.json` (334 KB, committed). `DRC-SUMMARY
+ours count_flat=0 count_total=8102 lef_expressible_nonzero=2
+magic_only_rows=3 unclassified=0 antenna=106
+wirelength_um=117930.918 vias=26036`.
+
+**Gate table.** `lef_expressible` non-inherited rows are exactly
+two: `li.3` ours=19, `met1.2` ours=146 — both `placed=0`, so both
+ours-only and both now pinned in `PINNED_LEF_RESIDUALS`
+(`tests/drt.rs`). `magic_only` rows are the inherited
+cell-master nwell paint (`nwell.1` 242, `nwell.2a` 2756,
+`nwell.4` 8084 — ours==placed==routed_ref on each).
+`unclassified_fired` empty; the sanity mutation fires `met2.2`,
+`violated_rules_in_checked_deck=true`. OpenROAD antenna on our DEF:
+106 net / 152 pin violations (`check_antennas`, `read_def` ok) —
+vs delegated 14 net / 16 pin, the ours surplus sits mostly on
+unrouted-net stub paint; named, not fixed here.
+
+**Residual decomposition** (probe protocol `who1.tcl` → Magic
+`select area` + flat `.mag` tile dump + placed-DEF internal-tile
+overlay; Magic internal units ×5 = DEF DBU):
+
+- **`li.3`, 19 fragments → 4 site-clusters.** All four sites sit
+  inside instance hulls where the placed DEF paints internal
+  `locali`; site 0's facing edge is a rect the `a21bo_2` LEF
+  declares as `OBS` on li1 (`(0.545,0.805)-(0.715,1.445)`) — paint
+  the host-hull carve made invisible to the router's mask model.
+  **X2 class** (declared OBS li1 masked out inside hulls — the same
+  family as gcd's masked-layer class, now surfacing as a spacing
+  violation between our li1 pin-access stub and the declared OBS).
+- **`met1.2`, 146 fragments → 21 site-clusters.** Every site is
+  own-paint vs own-paint — flat tile dump + placed-overlay show
+  zero cell-internal metal1 at any site (**X3**). Signature is
+  uniform: one net's pin-access cluster — `L1M1_PR` plate + met1
+  stub + `M1M2_PR` plate + met1 riser — lands inside the host hull
+  with two disjoint same-net met1 edges < 0.14 µm apart. 12/21
+  sites are `mux4_2` instances. Three sites coincide with the three
+  `self_drc` findings (`_04161_`, `_02942_`, `_03041_` — same-net
+  pairs); the other 18 are intra-island concavities the
+  connectivity-island spacing subset structurally cannot see (the
+  same known blind spot documented in §8). Per `residuals.md` §5 a
+  pin is the recorded arm: the fix would be an emit-hours re-run,
+  deferred to a follow-up ticket.
+
+**New census class — `unguided`.** The first golden build tripped
+the viability join: `signal_nets_in_def(6811) − routed(4728) =
+2083 ≠ unrouted_count(2016)`. The 67-net gap is `irq[0..31]`,
+`pcpi_rd[0..31]`, `pcpi_ready`, `pcpi_wait`, `pcpi_wr` — io-port
+nets whose DEF record is `( PIN <port> )` alone. A single-pin io
+net has nothing to route, is absent from the guide (guide nets =
+6744 = `guided`), and emits a conns-only entry counted in neither
+`routed` nor `unrouted`. The delegated reference shows the
+identical `6811 − 6744 = 67` gap — an upstream guide property, not
+a router failure. `check_drt_ours.sh` step-E now derives the class
+explicitly: any DEF signal net with no `+ ROUTED|COVERED|FIXED`
+section that is absent from the emit unrouted list must verify as
+exactly `( PIN <port> )` conns *and* guide-absent, else the script
+fails (silent-connectivity-loss arm). The gate invariant is now
+`in_def − routed = unrouted + unguided` (`gcd` yields
+`unguided=[]` — its golden updated with the field).
+
+**def_metrics** (`signal_nets_in_def=6811`): routed 4728, wirelength
+117,930.918 µm, vias 26,036 (`L1M1_PR` 8,444 / `M1M2_PR` 13,591 /
+`M2M3_PR` 3,868 / `M3M4_PR` 79 / `M4M5_PR` 54). Delta vs delegated:
+−62.37% wirelength, −35,271 vias, `signal_nets_routed` −2,016 — the
+unrouted census, so wirelength/via deltas are informational only.
+
+**What ran** (E0 rule 9): emit arm 1 done + `--verify` arm 2 in
+flight (byte-`cmp` pending — see status note); `check_drt_ours.sh
+picorv32` twice (first build failed loud on the unguided gap — the
+fail-arm exercised by accident, second build exit 0);
+`check_drt_ours.sh gcd` re-run → `gcd.drt.ours.reference.json`
+regenerated with `unguided: []`, inert otherwise; probes
+`runs/drt-ours/who1.tcl` (25 sites, `select area` naming
+nets/instances) + flat `.mag` overlay; `cargo test --workspace` —
+557 lib + 18 drc + 25 drt (3 pre-existing `#[ignore]`d detached
+picorv32 legs) + 2 irdrop + 7 grus-eda all pass,
+`test_e2e_ours_reference_picorv32` green un-`#[ignore]`d; `cargo
+clippy --workspace --all-targets -- -D warnings` clean.
+
+**Determinism decision.** No
+`test_e2e_ours_def_deterministic_picorv32`: the routed DEF is ~4.9
+MB and stays gitignored — there is no committed golden to
+byte-compare, and `generate_drt_ours.sh picorv32 --verify` (route
+twice + `cmp`) is the recorded demonstration of the property at
+this size.

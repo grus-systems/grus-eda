@@ -13,7 +13,7 @@
     "sha256_16": "516acf877dfd9054"
   },
   "ours_router": {
-    "grus_eda_version": "0.12.6",
+    "grus_eda_version": "0.12.9",
     "guide": {
       "file": "tests/designs/gcd/gcd.guide",
       "size_bytes": 58993,
@@ -23,7 +23,7 @@
     "emit_log_present": true,
     "cli_lines": [
       "== drt emit: gcd ==",
-      "guided=269 routed=188 unrouted=81 projected=9 collisions=0 area_patches=1 area_residuals=0 iterations=8 route_ms=11526 hull_masked=227182 notch_fills=343 notch_residuals=0 hole_residuals=0",
+      "guided=269 routed=188 unrouted=81 projected=9 collisions=0 area_patches=1 area_residuals=0 iterations=8 route_ms=17568 hull_masked=227182 notch_fills=343 notch_residuals=0 hole_residuals=0",
       "unrouted_kinds NoPath=46 Unattachable=52",
       "unrouted_blockers l0ObsPin=1 l1Obs=4 l1Net=39",
       "  unrouted _043_",
@@ -346,6 +346,7 @@
       "resp_msg[9]",
       "resp_rdy"
     ],
+    "unguided": [],
     "collisions": 0,
     "area_patches": 1,
     "area_residuals": 0,
