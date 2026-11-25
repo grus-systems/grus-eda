@@ -9877,3 +9877,199 @@ This unblocks a self-contained `floorplan → place → route → drt`
 chain: a consumer reading only our emitted DEF can now rebuild
 the exact track model and gcell grid without holding the LEF or
 a side-channel grid convention.
+
+### 2026-11-25 — e6-drt-e2e-picorv32: picorv32 leg of the full Magic gate (v0.12.9)
+
+**Emit leg.** `generate_drt_ours.sh picorv32 --verify` produced
+`runs/drt-ours/picorv32.drt.ours.routed.def` (4,927,300 bytes,
+`OURS-SHA 505baea2f937702f81188c117107b7282c3b1f2ca6df87cb9d0d246b3a764ace`,
+gitignored) in `route_ms=8,206,939` (~2.3 h, 8 iterations). Emit census (`cli_lines` in the golden): `guided=6744
+routed=4728 unrouted=2016 projected=134 collisions=0
+area_patches=12 area_residuals=0 hull_masked=8912407
+notch_fills=15236 notch_residuals=0 hole_residuals=0`. Unrouted
+kinds `NoPath=2225 Unattachable=1480` (kinds count findings, not
+distinct nets); blockers `l0Obs=10 l0ObsPin=33 l1Obs=444 l1ObsPin=2
+l1Net=1194 l2Obs=4 l2Net=286`. The emit log names
+`stub_outside_cover` on 1,988 distinct nets — pins whose every
+legal access option failed (projected stub crossing an uncovered
+hull, or `access_vias` arc blocked by a foreign mark; the
+`Unattachable` diagnostic per `e6-drt-e2e/design/pin-access.md`).
+The `--verify` second route emitted a byte-identical DEF:
+`OURS-DETERMINISTIC 505baea2f937702f81188c117107b7282c3b1f2ca6df87cb9d0d246b3a764ace`
+(sha256 of `rerun.def` == arm-1's `OURS-SHA`, `cmp` clean — see
+"Determinism decision").
+
+**Unrouted census decomposition** *(recounted 2026-11-25 — the
+merged version equated the 1,820 stub-carrying nets with the
+`Unattachable` class and claimed all 196 no-stub nets had met2-only
+guide unions; both wrong on the committed artifacts — recount
+method below)*. `unrouted=2,016`; `unrouted_kinds` counts per-pin
+final failures (`NoPath=2,225`, `Unattachable=1,480` — a net may
+carry pins of both kinds). `stub_outside_cover` records 3,288
+distinct pins on 1,988 nets — every pin that *ever* had no legal
+paint, accumulated across all 8 iterations; 1,820 of those nets are
+unrouted, 168 re-attached on a later rip-up iteration (the `_165_`
+precedent — records accumulate across iterations, so
+`stub_lines ≥ Unattachable`, never `⊆ unrouted`). Stub-carrying is
+**not** the final `Unattachable` class: at most 1,480 nets carry a
+final `Unattachable` pin (all ⊆ the 1,820), so ≥340 stub-carriers
+ended `NoPath`-only and ≥536 unrouted nets' final failures are all
+`NoPath` — including all 196 no-stub nets. The exact per-net kind
+split is not derivable from the golden (per-pin kinds live only in
+`UnroutedNet.failed`; the `#[ignore]`d `test_maze_census_picorv32`
+`pins={kinds:?}` printout or an emit-schema addition would close it
+— follow-up material). Guide-union census (`guide_union_connected`
+semantics, ≤met2 vs all layers): of the 196 no-stub nets 58 carry
+met3+ boxes — **48 `met3_bridge`** (≤met2 union disconnected,
+met3+ rejoins) and 148 `met2_connected`; over all 2,016: **138
+`met3_bridge`**, 1,878 `met2_connected`, 0 disjoint, 0 guide-absent
+— the v0.12.4 met3-bridge class *does* appear at scale (named
+bridged examples `_03824_`, `_00013_`, `decoded_imm[27]` among the
+no-stub nets, `clk`, `instr_jal`, `pcpi_rs1[*]` among
+stub-carriers; `mem_ready` carries met3+ boxes yet stays
+`met2_connected`). The guide-union class is a topology property,
+not a proven failure mechanism — a met2-connected net still fails
+`NoPath` inside its region. Aggregate blocker attribution
+`l1Net=1,194` of 1,973 stays dominant — per-pin, not per-class.
+The 116 → 2,016 growth vs the v0.12.6 mini emit remains the
+access-model refusal story, not a new maze regression —
+pre-confinement emits painted those stubs anyway (the illegal paint
+the r-series hull/confinement work removed; v0.12.6 self-DRC
+counted only `li.6`×3 because the subset cannot see most of them);
+the measured trade is 2,016 unrouted + 165 `lef_expressible` bboxes
+vs v0.12.6's 116 unrouted + the violations the old emit produced.
+1,039 of the 2,016 unrouted nets are named — `clk`,
+`count_cycle[*]`, `alu_out[*]` among them.
+
+**Recount method.** Every census number above is transcribed from
+`tests/designs/recount_unrouted.py picorv32` (committed, stdlib
+only; `… gcd` is the sanity leg) run on the committed artifacts —
+`picorv32.drt.ours.reference.json` (`ours_router.unrouted`,
+`cli_lines`, `unrouted_kinds`, `unrouted_blockers`) joined to
+`picorv32.guide`: union-find per net, `|Δlayer|≤1` + strict 2D
+overlap, classes per the `guide_union_connected` classifier in
+`tests/drt.rs`. The earlier text's "met3-bridge does not appear"
+claim traces to the v0.12.4-era maze-census run, not to this
+golden — kept here as the record of what the correction fixed.
+
+**Check leg.** `check_drt_ours.sh picorv32` (pinned LibreLane image,
+Magic `drc(full)` on our DEF) →
+`picorv32.drt.ours.reference.json` (334 KB, committed). `DRC-SUMMARY
+ours count_flat=0 count_total=8102 lef_expressible_nonzero=2
+magic_only_rows=3 unclassified=0 antenna=106
+wirelength_um=117930.918 vias=26036`. Check-leg wall seconds
+(`runtime.json`): `{"antenna": 2, "assembly": 1, "magic_broken": 6,
+"magic_ours": 6, "magic_placed": 2}` — minutes, as projected.
+
+**Gate table.** `lef_expressible` non-inherited rows are exactly
+two: `li.3` ours=19, `met1.2` ours=146 — both `placed=0`, so both
+ours-only and both now pinned in `PINNED_LEF_RESIDUALS`
+(`tests/drt.rs`). `magic_only` rows are the inherited
+cell-master nwell paint (`nwell.1` 242, `nwell.2a` 2756,
+`nwell.4` 8084 — ours==placed==routed_ref on each).
+`unclassified_fired` empty; the sanity mutation fires `met2.2`,
+`violated_rules_in_checked_deck=true`. OpenROAD antenna on our DEF:
+106 net / 152 pin violations (`check_antennas`, `read_def` ok) —
+vs delegated 14 net / 16 pin, the ours surplus sits mostly on
+unrouted-net stub paint; named, not fixed here.
+
+**Residual decomposition** (probe protocol `who1.tcl` → Magic
+`select area` + flat `.mag` tile dump + placed-DEF internal-tile
+overlay; Magic internal units ×5 = DEF DBU):
+
+- **`li.3`, 19 fragments → 4 site-clusters.** All four sites sit
+  inside instance hulls where the placed DEF paints internal
+  `locali`; site 0's facing edge is a rect the `a21bo_2` LEF
+  declares as `OBS` on li1 (`(0.545,0.805)-(0.715,1.445)`) — paint
+  the host-hull carve made invisible to the router's mask model.
+  **X2 class** (declared OBS li1 masked out inside hulls — the same
+  family as gcd's masked-layer class, now surfacing as a spacing
+  violation between our li1 pin-access stub and the declared OBS).
+- **`met1.2`, 146 fragments → 21 site-clusters.** Every site is
+  own-paint vs own-paint — flat tile dump + placed-overlay show
+  zero cell-internal metal1 at any site (**X3**). Signature is
+  uniform: one net's pin-access cluster — `L1M1_PR` plate + met1
+  stub + `M1M2_PR` plate + met1 riser — lands inside the host hull
+  with two disjoint same-net met1 edges < 0.14 µm apart. 12/21
+  sites are `mux4_2` instances. Three sites coincide with the three
+  `self_drc` findings (`_04161_`, `_02942_`, `_03041_` — same-net
+  pairs); the other 18 are intra-island concavities the
+  connectivity-island spacing subset structurally cannot see (the
+  same known blind spot documented in §8). Per `residuals.md` §5 a
+  pin is the recorded arm: the fix would be an emit-hours re-run,
+  deferred to a follow-up ticket.
+
+**New census class — `unguided`.** The first golden build tripped
+the viability join: `signal_nets_in_def(6811) − routed(4728) =
+2083 ≠ unrouted_count(2016)`. The 67-net gap is `irq[0..31]`,
+`pcpi_rd[0..31]`, `pcpi_ready`, `pcpi_wait`, `pcpi_wr` — io-port
+nets whose DEF record is `( PIN <port> )` alone. A single-pin io
+net has nothing to route, is absent from the guide (guide nets =
+6744 = `guided`), and emits a conns-only entry counted in neither
+`routed` nor `unrouted`. The delegated reference shows the
+identical `6811 − 6744 = 67` gap — an upstream guide property, not
+a router failure. `check_drt_ours.sh` step-E now derives the class
+explicitly: any DEF signal net with no `+ ROUTED|COVERED|FIXED`
+section that is absent from the emit unrouted list must verify as
+exactly `( PIN <port> )` conns *and* guide-absent, else the script
+fails (silent-connectivity-loss arm). The gate invariant is now
+`in_def − routed = unrouted + unguided` (`gcd` yields
+`unguided=[]` — its golden updated with the field).
+
+**def_metrics** (`signal_nets_in_def=6811`): routed 4728, wirelength
+117,930.918 µm, vias 26,036 (`L1M1_PR` 8,444 / `M1M2_PR` 13,591 /
+`M2M3_PR` 3,868 / `M3M4_PR` 79 / `M4M5_PR` 54). Delta vs delegated:
+−62.37% wirelength, −35,271 vias, `signal_nets_routed` −2,016 — the
+unrouted census, so wirelength/via deltas are informational only.
+Two wirelength numbers exist by construction: the emit log's
+`wirelength_um ours=117928.362` is our router's own segment sum;
+`def_metrics.total_wirelength_um=117930.918` is step-E's DEF-text
+re-derivation (stub/`RECT` fill accounting differs by ~2.6 µm —
+recorded, both cited where each belongs).
+
+**What ran** (E0 rule 9): emit arms 1+2 both done — `--verify`
+`cmp` byte-identical (`OURS-DETERMINISTIC` above);
+`check_drt_ours.sh
+picorv32` three times — build 1 `fail`ed at step-E on net `irq[0]`
+(the new unguided verifier's conn check tripped on `( PIN irq[0] )`'s
+whitespace — a bug in the new check itself, fixed by stripping conn
+fields before compare; the fail arm it accidentally exercised is the
+mechanism proof), build 2 exit 0 → committed golden, build 3 the
+doctored-log run below; `check_drt_ours.sh gcd` re-run →
+`gcd.drt.ours.reference.json` regenerated with `unguided: []`, inert
+otherwise. Fail/red exercises (E0 rule 7): **unrouted_kinds fail
+arm** — `unrouted_kinds` line deleted from a copy of the emit log →
+full `check_drt_ours.sh` run exits 1 naming "emit/script version
+lock" (`step-E assembly failed: emit log present but its
+unrouted_kinds line is missing or malformed`), log restored;
+**pin-scoping red-check** — `("picorv32","li.3",19)` retargeted to
+`("gcd","li.3",19)` → `test_e2e_ours_reference_gcd` goes red
+(`pinned residual li.3 moved (ours=0, pinned=19)`), reverted.
+Probes `runs/drt-ours/who1.tcl` (25 sites, `select area` naming
+nets/instances) + flat `.mag` overlay; `cargo test --workspace` —
+557 lib + 18 drc + 25 drt (3 pre-existing `#[ignore]`d detached
+picorv32 legs) + 2 irdrop + 7 grus-eda all pass,
+`test_e2e_ours_reference_picorv32` green un-`#[ignore]`d; `cargo
+clippy --workspace --all-targets -- -D warnings` clean.
+
+**Determinism decision.** No
+`test_e2e_ours_def_deterministic_picorv32`: the routed DEF is ~4.9
+MB and stays gitignored — there is no committed golden to
+byte-compare. `generate_drt_ours.sh picorv32 --verify` (route twice
++ `cmp`) is the chosen arm and ran clean: `OURS-DETERMINISTIC
+505baea2f937702f81188c117107b7282c3b1f2ca6df87cb9d0d246b3a764ace`
+— the second ~2.3 h emit is byte-identical to the first (sha256
+`rerun.def` == `routed.def`, verified independently with
+`shasum -a 256`). The `#[ignore]`d `test_maze_determinism_picorv32`
+(two in-process `route_nets` runs) is the cited corroborating arm,
+not re-run.
+
+**Docs recount (r2, same day).** The census paragraph above is the
+marked correction; `tests/designs/recount_unrouted.py` is the
+committed vehicle (`picorv32` reproduces this table, `gcd` leg
+exits 0). `docs/e6-drt.md` §9's `unclassified` reflow break was
+rejoined; `docs/status.md`'s aggregate census needed no edit.
+Re-verified after the correction: `cargo test --workspace` green
+(same census as the landed state — the recount adds no tests) and
+`cargo clippy --workspace --all-targets -- -D warnings` clean. No
+`.rs`, `.sh`, golden, or `.gitignore` delta.

@@ -2219,14 +2219,24 @@ fn test_emit_unrouted_fixture() {
 // ---------------------------------------------------------------------------
 
 /// Measured Magic findings on our DEF that the ticket pinned rather
-/// than closed (`kurena/tasks/e6-drt-e2e/design/gate.md` §0). A pinned
-/// rule asserts `ours == pin && placed == 0` — a residual is
+/// than closed (`kurena/tasks/e6-drt-e2e/design/gate.md` §0), as
+/// `(design, rule, count)` triples — a pin scopes to one design's
+/// golden, so a picorv32-only residual never asserts on gcd's zero.
+/// A pinned rule asserts `ours == pin && placed == 0` — a residual is
 /// ours-only, so the placed baseline firing the same rule means the
 /// pin is wrong, not inherited; unpinned rules assert strict
-/// `ours == placed`. Empty since the r5 met1.2 attribution closed all
-/// 7 sites (`docs/results.md`) — a residual reappears only by
-/// re-pinning it here with a named reason.
-const PINNED_LEF_RESIDUALS: &[(&str, i64)] = &[];
+/// `ours == placed`. `(design, rule_id, ours)` — mechanism-named
+/// ours-only `lef_expressible` residuals; empty for gcd since the r5
+/// met1.2 attribution closed all 7 sites (`docs/results.md`).
+/// picorv32 (v0.12.9 emit, DEF sha `505baea2f937702f`, docs/results.md
+/// 2026-11-25): `li.3` = our li1 pin-access paint vs LEF-declared OBS
+/// li1 inside host hulls — the masked-layer class (4 sites); `met1.2`
+/// = same-net disjoint met1 edges of one net's pin-access cluster
+/// < 0.14um (21 sites, all X3 — no cell-internal metal1 at any site).
+const PINNED_LEF_RESIDUALS: &[(&str, &str, i64)] = &[
+    ("picorv32", "li.3", 19),
+    ("picorv32", "met1.2", 146),
+];
 
 /// Magic's two built-in hierarchy-boundary messages — no tech-file
 /// rule id, so the deck's `classification` never covers them. Mirrors
@@ -2331,9 +2341,9 @@ fn ours_reference_gate(name: &str) {
         let ref_n = j_i64(&entry["routed_ref"], &format!("{rid}.routed_ref"));
         match PINNED_LEF_RESIDUALS
             .iter()
-            .find(|(r, _)| *r == rid.as_str())
+            .find(|(d, r, _)| *d == name && *r == rid.as_str())
         {
-            Some(&(_, pin)) => {
+            Some(&(_, _, pin)) => {
                 assert_eq!(
                     ours_n, pin,
                     "{name}: pinned residual {rid} moved (ours={ours_n}, pinned={pin}) — re-pin or close it"
@@ -2390,8 +2400,11 @@ fn ours_reference_gate(name: &str) {
         sanity["mutation"].is_object(),
         "{name}: sanity_control.mutation missing"
     );
-    let pinned_ids: BTreeSet<&str> =
-        PINNED_LEF_RESIDUALS.iter().map(|(r, _)| *r).collect();
+    let pinned_ids: BTreeSet<&str> = PINNED_LEF_RESIDUALS
+        .iter()
+        .filter(|(d, _, _)| *d == name)
+        .map(|(_, r, _)| *r)
+        .collect();
     let new_unpinned: Vec<&str> = j_arr(
         &sanity["new_rules_vs_clean"],
         "sanity_control.new_rules_vs_clean",
@@ -2502,10 +2515,24 @@ fn ours_reference_gate(name: &str) {
         "{name}: def_metrics.signal_nets_routed != ours_router.routed"
     );
     let in_def = j_u64(&dm["signal_nets_in_def"], "def_metrics.signal_nets_in_def");
+    // `unguided` names nets the guide never covered — single-pin io
+    // nets emitting conns-only entries outside the unrouted census
+    // (picorv32's 67 irq/pcpi ports; the step-E verifier requires each
+    // to be `( PIN <port> )`-only and guide-absent).
+    let unguided = j_arr(&ours["unguided"], "ours_router.unguided");
+    assert!(
+        unguided.iter().all(|v| v.is_string()),
+        "{name}: ours_router.unguided must be a string list"
+    );
+    let unguided_set: BTreeSet<&str> = unguided.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        unguided_set.is_disjoint(&golden_unrouted),
+        "{name}: ours_router.unguided overlaps the unrouted census"
+    );
     assert_eq!(
         in_def - routed,
-        unrouted_count as u64,
-        "{name}: signal_nets_in_def - routed != unrouted_count — the mask would starve the design"
+        unrouted_count as u64 + unguided.len() as u64,
+        "{name}: signal_nets_in_def - routed != unrouted + unguided — the mask would starve the design"
     );
 
     println!(
@@ -2542,11 +2569,13 @@ fn test_e2e_ours_def_deterministic_gcd() {
     );
 }
 
-/// Deferred per the r4/r5 memo: the picorv32 leg has no committed
-/// golden, so a `--ignored` run fails loudly on `load_ours_ref` —
-/// the honest state, not a skip.
+/// The picorv32 e2e gate (v0.12.9, DEF sha `505baea2f937702f`):
+/// `li.3`=19/`met1.2`=146 pinned ours-only residuals (see
+/// `PINNED_LEF_RESIDUALS`), `unrouted`=2016, `unguided`=67 io-pin-only
+/// nets. No byte-compare determinism test — the routed DEF is ≥1 MB
+/// and stays gitignored; `generate_drt_ours.sh picorv32 --verify`
+/// demonstrates the property script-side.
 #[test]
-#[ignore]
 fn test_e2e_ours_reference_picorv32() {
     ours_reference_gate("picorv32");
 }

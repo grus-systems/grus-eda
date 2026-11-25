@@ -917,6 +917,7 @@ ours_router = {
     "unrouted_kinds": None,
     "unrouted_blockers": None,
     "unrouted": None,
+    "unguided": None,
     "collisions": None,
     "area_patches": None,
     "area_residuals": None,
@@ -972,15 +973,46 @@ if ours_router["emit_log_present"]:
     ours_router["unrouted"] = re.findall(r"^\s+unrouted (\S+)$", elog, re.M)
     mk = re.search(
         r"^unrouted_kinds NoPath=(\d+) Unattachable=(\d+)$", elog, re.M)
-    ours_router["unrouted_kinds"] = (
-        {"NoPath": int(mk.group(1)), "Unattachable": int(mk.group(2))}
-        if mk else None)
+    if mk is None:
+        fail("emit log present but its unrouted_kinds line is missing "
+             "or malformed (emit/script version lock)")
+    ours_router["unrouted_kinds"] = {
+        "NoPath": int(mk.group(1)), "Unattachable": int(mk.group(2))}
     mb = re.search(r"^unrouted_blockers (.*)$", elog, re.M)
     ours_router["unrouted_blockers"] = (
         dict(
             (kv.split("=")[0], int(kv.split("=")[1]))
             for kv in mb.group(1).split())
         if mb else None)
+    # Nets absent from the guide never enter the emit census: a
+    # single-pin io net (conns exactly `( PIN <port> )`) has nothing to
+    # route, so emit writes a conns-only entry counted in neither
+    # `routed` nor `unrouted` (guided=6744 of picorv32's 6811 DEF nets).
+    # The golden names them — the join is
+    # `signal_nets_in_def - routed == unrouted + unguided`, each member
+    # verified io-pin-only and guide-absent, never assumed by
+    # subtraction.
+    guide_nets = set(
+        re.findall(r"^(\S+)\n\(", open(guide_abs).read(), re.M))
+    unrouted_set = set(ours_router["unrouted"])
+    unguided = []
+    for ent in nets_entries(open(def_abs).read()):
+        name = ent.split()[0]
+        if re.search(r"\+ (ROUTED|COVERED|FIXED)\b", ent):
+            continue
+        if name in unrouted_set:
+            continue
+        conns = [c.strip() for c in
+                 re.findall(r"\(([^()]*)\)", ent.split("+ USE")[0])]
+        if len(conns) != 1 or not conns[0].startswith("PIN "):
+            fail(f"DEF net {name}: unrouted yet neither in the emit "
+                 f"unrouted census nor single-pin-io conns {conns!r} — "
+                 "silent connectivity loss, not an unguided io net")
+        if name in guide_nets:
+            fail(f"DEF net {name}: present in the guide yet absent from "
+                 "both routed and unrouted — emit census gap")
+        unguided.append(name)
+    ours_router["unguided"] = sorted(unguided)
 
 # ---------- sanity control -------------------------------------------
 mutation = json.load(open(require(f"{run}/mutation.json")))
