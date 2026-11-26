@@ -4,6 +4,13 @@ on:
   push:
     branches: [dev, main]
     tags: ['v*']
+    # Docs-only branch pushes cost tens of minutes of the shared macOS
+    # runner queue for zero signal. Path filters are not evaluated for
+    # tag pushes, so release builds always run.
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'kurena/**'
   pull_request:
   workflow_dispatch:
 
@@ -17,8 +24,8 @@ concurrency:
 # bit-identical between the two machines, so the golden files
 # do not care which one produced the inputs. Docker comes
 # from Colima; the sky130A PDK is under ~/.ciel and Rust is
-# mise-installed. The trade-off is the shared queue with the
-# repositories that need macOS/ARM64. Generated inputs cross
+# mise-installed. Two runner instances on the same M4 split the queue: 'ci' takes
+# branch-push jobs, 'release' takes the macOS leg of tag builds. Generated inputs cross
 # between the jobs as a workflow artifact.
 
 jobs:
@@ -27,7 +34,7 @@ jobs:
     # self-hosted Mac mini must not run code from a fork's pull request. Pushes
     # and manual runs come from people with write access only.
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: [self-hosted, macOS, ARM64, ci]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -159,7 +166,7 @@ jobs:
   test:
     needs: generate
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: [self-hosted, macOS, ARM64, ci]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -199,7 +206,10 @@ jobs:
             target: aarch64-apple-darwin
           - runner: [self-hosted, Linux, X64]
             target: x86_64-unknown-linux-gnu
-    runs-on: ${{ matrix.runner }}
+    # macOS leg lane split: tag pushes (releases) must not queue behind
+    # dev-push CI on the shared M4 mini — they land on the dedicated
+    # 'release' runner instance; branch pushes use the 'ci' one.
+    runs-on: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && matrix.runner || fromJSON(github.ref_type == 'tag' && '["self-hosted","macOS","ARM64","release"]' || '["self-hosted","macOS","ARM64","ci"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

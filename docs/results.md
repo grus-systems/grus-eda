@@ -10148,3 +10148,240 @@ golden's `cli_lines` → `recount_unrouted.py gcd` exits 1
 -D warnings` clean; `cargo build --release -p grus-eda`; the gcd
 emit run above; the detached-HEAD digest arm; the doctored-golden
 recount arm.
+
+### 2026-11-26 — drt-converge-stats: per-iteration convergence record in the drt census (v0.12.11)
+
+Observability ticket — no routing-behavior change. `route_nets`
+now records one `IterStat{attempted, routed, prov_collisions}` per
+rip-up iteration into `RouteDb.iter_stats` (`attempted` = `bad`-set
+size at entry, `routed` = commits, `prov_collisions` = deduped
+provisional `Collision`s at iteration end; always 0 on the hard
+last iteration, where foreign hits block instead of reporting, and
+everywhere under `OccMode::Disabled`). The `== drt emit:` census
+prints them as `iter_progress=<attempted,…>` /
+`iter_prov=<prov_collisions,…>` lines after `guided=…`, and
+`route_digest` serializes the vector — the record is deterministic
+run output, so it belongs to the digest's own contract.
+
+**gcd census** (`cargo test --release -p grus-core --test drt
+test_maze_census -- --nocapture`, same `MazeConfig::default()`,
+run 2026-11-25):
+
+```
+gcd: guided=269 routed=188 pins_connected=513 projected=9 unrouted=81 collisions=0 iterations=8 ms=12933 digest=0xa6d8b74a740a7489
+gcd: iter_progress=269,94,87,81,81,81,81,81 iter_prov=25,6,0,0,0,0,0,0
+```
+
+Reading (the measurement this ticket exists for): the bad set
+falls 269→94→87→81 and is flat at 81 from iteration 4 on, with
+`iter_prov` already 0 from iteration 3 — gcd does not flatline on
+collision ping-pong; its 81-net residue is a stable dead-end set
+(met3-bridge ×2 + met2-connected pockets/OBS seals, per the
+existing census classification), so more iterations would not
+converge it. Digest moved `0xab23bcc1997e4484` →
+`0xa6d8b74a740a7489` — expected: a new serialized field, no
+pinned literal anywhere (verified: no test or golden carries a
+digest value).
+
+**gcd emit leg** (`target/release/grus-eda drt` on
+`gcd.placed.def` + `gcd.guide` → scratch `--out-def`,
+route_ms=12,853, run 2026-11-25), verbatim:
+
+```
+guided=269 routed=188 unrouted=81 projected=9 collisions=0 area_patches=1 area_residuals=0 iterations=8 route_ms=12853 hull_masked=227182 notch_fills=343 notch_residuals=0 hole_residuals=0
+iter_progress=269,94,87,81,81,81,81,81
+iter_prov=25,6,0,0,0,0,0,0
+```
+
+`iter_progress` entry count 8 == `iterations=8` (self-checking
+against the existing census field).
+
+**Fail-proof** (E0 rule 7): `test_route_digest_covers_iter_stats`
+flips one `prov_collisions` on a hand-built `RouteDb` and asserts
+the digest moves — proves `iter_stats` reaches the digest without
+routing. Additionally the loop's `iter_stats.push` was removed on
+a scratch edit: `test_maze_census` went red at
+`iter_stats len != iterations` (0 vs 8), restored. The census
+asserts the model invariants (`len == iterations`,
+`attempted[0] == guided`, `routed ≤ attempted`, last
+`prov_collisions == 0`,
+`last.attempted − last.routed == unrouted.len()`) and reports
+`attempted` non-increase only informationally
+(`iter_progress_monotonic=true` on this leg — empirical, not
+gated); `test_maze_determinism`'s `RouteDb` equality covers the
+field for free.
+
+**Consumers**: `check_drt_ours.sh` step-E keep-list gains
+`s.startswith("iter_progress=")` / `s.startswith("iter_prov=")` —
+generation-time snapshots only; committed goldens
+(`gcd`/`picorv32.drt.ours.reference.json`) unchanged, no
+`ours_router` schema change (the series is derivable from
+`cli_lines` on next regen). Absolute-path guard cannot fire
+(digits/commas/`=` only). `recount_unrouted.py gcd` exits 0
+(unknown prefixes ignored by construction).
+
+**picorv32 census** (`cargo test --release -p grus-core --test
+drt test_maze_census_picorv32 -- --ignored --nocapture`,
+7684 s ≈ 128 min, run 2026-11-26), verbatim:
+
+```
+picorv32: guided=6744 routed=4728 pins_connected=13112 projected=134 unrouted=2016 collisions=0 iterations=8 ms=7651141 digest=0xf7ce0bef5ae5b52f
+picorv32: iter_progress=6744,2557,2437,2382,2371,2342,2338,2326 iter_prov=2238,1710,1425,1307,1214,1187,1099,0
+```
+
+Reading: the opposite profile from gcd — the bad set was still
+falling at the cap (6744→2557→…→2326) with `iter_prov` at 1099
+entering the hard iteration, so the 2016-net unrouted residue
+sat inside live collision churn rather than a settled dead-end
+set. The tail was shallow (−29, −4, −12 `attempted` over the
+last three entries): extra soft iterations would keep
+re-queueing ~1100 provisional-collision parties, so convergence
+within a few more iterations is not evident. All `iter_stats`
+invariants asserted in `maze_census` held on this leg (`len ==
+iterations == 8`, `attempted[0] == 6744 == guided`,
+last `prov_collisions == 0`,
+`last.attempted − last.routed == unrouted.len()` — the hard
+iteration committed 310 of the 2326 queued); the leg reported
+`iter_progress_monotonic=true` — a future `false` is a datum,
+not a failure: a kept net named as a provisional-collision party
+re-queues into `bad[i+1]` from outside `bad[i]`.
+
+**What ran** (E0 rule 9): `cargo test --workspace` — 557 lib +
+18 drc + 26 drt (3 `#[ignore]`d picorv32 legs) + 2 irdrop +
+7 grus-eda, all green; `cargo clippy --workspace --all-targets --
+-D warnings` clean; `cargo build --release -p grus-eda`; the gcd
+census and emit runs above; the loop-push fail-proof;
+`recount_unrouted.py gcd`; the picorv32 census leg above
+(128 min release run, all invariants green). r3 verify
+(run 2026-11-26): `cargo test --workspace` — same counts, all
+green; `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `test_maze_census` release re-run printed
+`iter_progress_monotonic=true` with the unchanged
+`iter_progress` series and digest `0xa6d8b74a740a7489`.
+### 2026-11-26 — drt-pin-collision: foreign io-port `Pin` occupancy costs the wire side (v0.12.13)
+
+The `Pin(foreign)` verdict was **soft — never a block**: a wire
+inside an io-port's `w/2 + s` band paid the congestion price but
+committed the overlap silently, and nothing recorded it. The fix
+makes a wire×foreign-pin hit a *directed* provisional `Collision`
+(`a` = the committing wire net, `b` = the pin's owning net) that
+re-queues only `a` — the port cannot move, so re-queuing its net
+would churn the queue and escalate `hist[b]` unfairly — plus a
+hard block on the last iteration, and adds the post-hoc
+`pin_overlap_census` (`RouteDb.pin_collisions`, `Enabled` only)
+that names any survivor. `project_attach`/`try_pin_paint` stub
+candidates now scan live occupancy before committing access paint;
+blocked candidates join `tried_proj` (named exhaustion, no hang).
+Instance-pin metal stays the separate `ObsPin` class (hard block
+always — a foreign landing inside a hull is a Magic subcell
+overlap). `hit_verdict`'s doc no longer claims `Pin` "never
+hard-blocks"; `docs/e6-drt.md` §7's table, premark, rip-up, and
+CLI sections were rewritten in step (the same edit also retires
+the stale unconditional-host-cell-carve description — the code
+already clips OBS paint against the cell's own pin rects).
+
+**Fixture** (`test_maze_pin_collision`, `MAZE_PIN_TAIL`):
+io2's met1 port at x=2000 puts its mark interval [1900,2100] on
+u0/A's first attach arc so the hard-mode postmortem attributes
+`(met1, Pin)` (`blockers` element `(0,3)`; an x=2500 port would
+leave `blockers` empty — postmortem only attributes arcs between
+BFS-reachable nodes). Arm A (open guide): clean detour, every n1
+wire outside the [1690,690,2310,1310] inflated band,
+`pin_collisions` empty. Arm B (met1-row-only guide): soft
+iterations record `prov_collisions > 0`, the hard iteration
+blocks, n1 fails named `NoPath` with `(0,3)` in `blockers`,
+`pin_collisions` empty, n2 still routes — the named-failure arm
+bounds the loop instead of hanging.
+`test_route_digest_covers_pin_collisions` covers the new
+serialized field.
+
+**Red proof** (E0 rule 7, run before the verdict change): arm B
+committed the overlap — the census recorded `pin_collisions = 1`
+and n1 routed. The knock-on harm was also measured: n1's wire
+band sealed io2's port ring, so `unrouted[0]` was **n2** — the
+port's *own* net — `NoPath` on the hard iteration, a silent
+overlap corrupting an unrelated net's connectivity.
+
+**gcd emit leg** (`generate_drt_ours.sh gcd` rerun, run
+2026-11-26): routed DEF **byte-identical** to the committed
+artifact (`OURS-SHA 635f19a9…`), `self_drc findings_total=0`, no
+`pin_collision` lines in the census (clean → the conditional
+print keeps output byte-identical). Emit census identical to the
+committed baseline — `routed=188 unrouted=81 collisions=0
+iterations=8`, `iter_progress=269,94,87,81,81,81,81,81`,
+`iter_prov=25,6,0,0,0,0,0,0`. Digest moved `0xa6d8b74a740a7489` →
+`0x184fab6046e9c5d3` — expected: `route_digest` serializes the
+new `pin_collisions` field (empty on gcd, but `len=0` is part of
+the hash stream); no golden or test pins a digest literal.
+
+**What ran** (E0 rule 9): `cargo test --workspace` — 557 lib +
+18 drc + 28 drt (3 `#[ignore]`d picorv32 legs) + 2 irdrop +
+7 grus-eda, all green; `cargo clippy --workspace -- -D warnings`
+clean; the red-proof above (verdict reverted on a scratch edit:
+arm B red, `pin_collisions = 1`, n2 unrouted — restored); the
+gcd `generate_drt_ours.sh` rerun + byte-compare above. The
+picorv32 census leg was not rerun — its routed DEF stays
+gitignored and the verdict change only adds blocking where the
+old run silently committed; a divergence there would surface as
+`pin_collision` census lines on its next `#[ignore]`d run, which
+the conditional print makes visible by construction.
+### 2026-11-26 — drt-preemit-spacing: 50-rule subset over the in-memory emit shape set (v0.12.14)
+
+External review S1: `emit.rs` wrote routed DEF with no geometric
+check at the emit boundary — `--self-drc` is opt-in and post-emit.
+`emit::preemit_check` runs the identical toolchain — `drc::geom::assemble`
++ `drc::report::run_all`, no third geometry engine — on `design_db`
+between `apply_routes` (which commits `route_db` into `db.net_geoms`)
+and `write_routed_def`, wired as the opt-in `--preemit-check` flag.
+Detection precedes the write; findings print in the census's
+findings section through the same `print_subset_findings` helper
+`self_drc` now uses (identical rule names and finding lines —
+`self_drc` output stays byte-identical), followed by a `preemit_check
+scope:` line that names the report-only gap every run.
+
+**Clean gcd** (`test_preemit_gcd`, release): `findings_total=0` —
+mirrors the `--self-drc` bar — over nonzero coverage (all four
+checked families report `candidates > 0`), deterministic across a
+double run, `IoPort` shapes present in the assembled set. The
+load-bearing assert: `preemit_check(&db) == self_drc(write(db))`
+verbatim — rules, candidates, bounds and findings all equal, so the
+checked set *is* the emitted set (AGENTS §7.2, tested not prose).
+CLI sanity run (`drt ... --preemit-check --self-drc`, gcd, run
+2026-11-26): `preemit_check findings_total=0` then `self_drc
+findings_total=0`, DEF written, exit 0.
+
+**Violation fixture** (`test_preemit_foreign_pin`, release): a
+`SignalWire` of net `_000_` injected at a 1-DBU gap to the
+net-tagged `IoPort` rect `[45170,102390,45450,102670]` (met2,
+bound 140) produces `findings_total=3`; the named finding:
+
+    met2.2 [45170,102390,45450,102670] x [45451,102390,45591,102670] gap=(1,0) bound=140 nets=req_msg[0],_000_
+
+— the foreign port is a finding *endpoint* (rect in `bboxes`, port
+net in `nets`), not just present geometry. Sibling findings are the
+inject's own knock-ons (a second met2.2 pair, a met2.6 min-area on
+the injected rect), expected and named.
+
+**Red proof** (E0 rule 7, run 2026-11-26): gating `IoPort` out of
+`spacing.rs`'s `checkable` dropped the port finding — the test went
+red on the pin-rect/net membership assert (`findings_total=2`, only
+the wire×wire pair and the area finding remain). Restored
+byte-identical.
+
+**Named boundaries** (unchanged checker semantics — this ticket is a
+verification net for `drt-pin-collision`, not a new checker):
+`MacroPin`/`MacroObs` join connectivity islands but never generate
+findings — the in-hull adjacency class stays the documented
+under-report vs Magic (`docs/e7-drc.md` §12); distance-0 overlaps
+are `touching_ok`-exempt, so committed wire×pin *overlaps* remain
+`RouteDb.pin_collisions` territory; findings do not gate the write
+or the exit code — the findings→exit contract belongs to
+`drt-selfdrc-exit` (not landed) and the `preemit_check scope:` line
+says so in every run.
+
+**What ran** (E0 rule 9): `cargo test --workspace --profile verify`
+— 557 lib + 18 drc + 30 drt (3 `#[ignore]`d picorv32 legs) +
+2 irdrop + 7 grus-eda, all green; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; both new tests release-green;
+the red-proof above; the gcd CLI run above. picorv32 not run —
+`emit_leg` ≈ 135 min release; the gcd pair covers the mechanism.

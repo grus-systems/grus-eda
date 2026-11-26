@@ -3,6 +3,12 @@ name = "grus-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Physical-design engine core for the open sky130 PDK: LEF/DEF/SPEF/Liberty/SDC readers, analytical placement, static timing analysis, global/detailed routing, and a LEF-expressible DRC subset."
+readme = "README.md"
+keywords = ["eda", "asic", "physical-design", "sta", "lef"]
+categories = ["hardware-support", "parser-implementations"]
 
 [dependencies]
 anyhow = { workspace = true }

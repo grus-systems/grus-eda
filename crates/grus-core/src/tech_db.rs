@@ -165,7 +165,7 @@ pub struct CutLayer {
     #[serde(default)]
     pub spacing_dbu: i32,
     /// LEF `ENCLOSURE BELOW o1 o2` — overhang pair the routing layer
-    /// below the cut must provide. [0,0] = undeclared / zero.
+    /// below the cut must provide. `[0,0]` = undeclared / zero.
     #[serde(default)]
     pub enc_below_dbu: [i32; 2],
     /// LEF `ENCLOSURE ABOVE o1 o2` — same for the routing layer above.

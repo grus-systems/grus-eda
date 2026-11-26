@@ -3,7 +3,7 @@
 //! and report the census in the same field names TritonCTS emits into
 //! `<d>.cts.reference.json`.
 //!
-//! [`run_cts`] resolves clock roots from the parsed [`Sdc`] clock model
+//! [`run_cts`] resolves clock roots from the parsed [`crate::sta::sdc::Sdc`] clock model
 //! (no SDC re-parse), decomposes each root net's sinks by
 //! count-equalized median bisection into fanout groups of at most
 //! [`CtsConfig::max_loads`], and builds the tree bottom-up out of the

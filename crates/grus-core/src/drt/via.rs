@@ -72,7 +72,7 @@ pub struct ViaTable {
     /// LEF `via_defs` in file order, then `db.def_vias` in record
     /// order — the ranking's declaration-order tie-break.
     pub candidates: Vec<ViaCandidate>,
-    /// One per adjacent pair, `pairs[k]` = (routing_layers[k], [k+1]).
+    /// One per adjacent pair, `pairs[k]` = `(routing_layers[k], [k+1])`.
     pub pairs: Vec<ViaPair>,
     /// Adjacent pairs with zero candidates.
     pub gaps: Vec<ViaGap>,

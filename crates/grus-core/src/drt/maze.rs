@@ -191,6 +191,29 @@ pub struct ClosureResiduals {
     pub holes: Vec<HoleResidual>,
 }
 
+/// One iteration of the `route_nets` rip-up loop — the convergence
+/// record behind the census `iter_progress`/`iter_prov` lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IterStat {
+    /// Nets queued into the iteration — `bad.len()` at entry;
+    /// entry 0 is always `graphs.nets.len()` (every net attempts
+    /// once before any rip-up exists).
+    pub attempted: u32,
+    /// Nets that committed a route this iteration — counts
+    /// attempts, not distinct nets (a re-queued net that routes
+    /// again counts again). `attempted - routed` is the
+    /// iteration's failure count.
+    pub routed: u32,
+    /// Deduped provisional `Collision`s recorded by this
+    /// iteration's committed routes — the re-queue trigger: the
+    /// canonical net×net set plus the directed wire→pin set (whose
+    /// `a` side alone is re-queued). Always 0 on the hard (last)
+    /// iteration, where foreign hits block instead of reporting, and
+    /// on every iteration under `OccMode::Disabled`, where recording
+    /// is skipped.
+    pub prov_collisions: u32,
+}
+
 /// The router's complete deterministic output.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RouteDb {
@@ -201,8 +224,18 @@ pub struct RouteDb {
     pub unrouted: Vec<UnroutedNet>,
     /// Post-hoc census on the final committed routes.
     pub collisions: Vec<Collision>,
+    /// Committed routes' wire×foreign-pin overlaps (`Enabled` only) —
+    /// directed: `a` is the wire's net, `b` the pin's owning net (the
+    /// wire is the only movable party). Expected empty after the
+    /// `Pin` verdict change; an entry is a named residual, never
+    /// hidden.
+    pub pin_collisions: Vec<Collision>,
     /// Iterations actually run (≤ `max_iters`).
     pub iterations: u32,
+    /// Per-iteration convergence record — `iter_stats[i]` describes
+    /// iteration `i + 1` (1-based like `iterations`); `len() ==
+    /// iterations` and ≤ `max_iters` by loop construction.
+    pub iter_stats: Vec<IterStat>,
     /// Components the min-area patch brought to bound.
     pub area_patches: usize,
     /// Components it could not — named with layer/bbox/area/bound;
@@ -240,12 +273,13 @@ enum Occupant {
     /// true occupancy: cost in soft iterations, a hard block on the
     /// last.
     Net(u32), // NetId.0
-    /// A member pin's placed metal — free to its own net, a soft
-    /// penalty to foreign nets, never a hard block: a pin does not
-    /// move under rip-up, so charging it as congestion would churn
-    /// the queue forever without clearing the mark; a foreign wire
-    /// that lands on it is a pin-access finding for the emit/e2e
-    /// DRC, not a maze-time wall (`docs/e6-drt.md` §7).
+    /// An io-port's placed metal — free to its own net, a soft
+    /// penalty to foreign nets in soft iterations, a hard block on
+    /// the last. A pin does not move under rip-up, so the *wire* is
+    /// the movable party: a foreign hit is recorded as a directed
+    /// provisional `Collision` (wire net → pin net) that re-queues
+    /// the wire side only, and a survivor is named in
+    /// `RouteDb.pin_collisions` (`docs/e6-drt.md` §7).
     Pin(u32), // NetId.0
     /// An instance pin's placed metal — free to its own net, a hard
     /// block to every other net. Unlike a `Pin` mark (io-port rects,
@@ -561,18 +595,18 @@ impl Occupancy {
 
 /// Pre-marks every placed cell's macro `obs_rects` as `Obs` (the
 /// `drc::geom` source-4 convention: `{Placed, Fixed, Cover}` gate +
-/// `orient_rect` + translate, replicated for OBS only), every
-/// instance pin's shapes as `Pin(own_net)` — a pin's metal is free to
-/// its own net, soft-priced for foreign nets, and never a hard block
-/// (rip-up cannot move it; a landing wire is an emit-time DRC
-/// finding) — and every PDN `SPECIALNETS` wire rect and via stack
+/// `orient_rect` + translate, replicated for OBS only), every pin's
+/// shapes via `rasterize_pin_marks` — instance pins `ObsPin(own)`
+/// (own-free, foreign hard block), io-port rects `Pin(own)` (own
+/// free, foreign soft-priced and recorded, hard-blocked on the last
+/// iteration) — and every PDN `SPECIALNETS` wire rect and via stack
 /// metal as `Obs(u32::MAX)`. Pins without a net and PDN metal get
 /// `Obs(u32::MAX)` — immovable blockage with no exempting host:
 /// signal routes must hold the `w/2 + s` band off the power grid.
-/// io-port rects mark as `Pin(own_net)` like instance pins — a
-/// foreign wire inside a port's spacing band is a real emit-time
-/// finding (the gcd `met3.2` `req_msg`/`resp_msg` class), so the
-/// band is priced even though it never hard-blocks.
+/// io-port rects mark `Pin(own_net)` — a foreign wire inside a
+/// port's spacing band is a real emit-time finding (the gcd `met3.2`
+/// `req_msg`/`resp_msg` class), so the band is priced, recorded
+/// wire-side, and finally walled.
 fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut Occupancy) {
     // Cell → its instance pins' placed shapes per layer — OBS paint
     // clipped against them keeps a wall only where it is not pin.
@@ -628,6 +662,35 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
             }
         }
     }
+    rasterize_pin_marks(db, tech, tracks, occ);
+    // PDN stripes and via stacks: fixed metal every signal net must
+    // clear — the emit-time self-DRC measures spacing against these
+    // shapes, so the router has to price them.
+    for pdn in &db.pdn_nets {
+        for &(lid, r) in &pdn.wire_rects {
+            if (lid.0 as usize) < occ.lines_x.len() {
+                occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
+            }
+        }
+        for via in &pdn.vias {
+            for (dl, r) in expand_via(via, tech).expect("pdn via resolved at parse") {
+                if let DrcLayer::Routing(lid) = dl
+                    && (lid.0 as usize) < occ.lines_x.len()
+                {
+                    occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
+                }
+            }
+        }
+    }
+}
+
+/// Rasterizes every pin's placed shapes with the `premark_obs` mark
+/// rule — instance pins `ObsPin(net)`, io-port rects `Pin(net)`,
+/// net-less pins `Obs(u32::MAX)`; pins on non-`{Placed, Fixed,
+/// Cover}` hosts are skipped. Shared by the router's premark and
+/// `pin_overlap_census`'s rebuild so the census measures against
+/// exactly the marks the router saw.
+fn rasterize_pin_marks(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut Occupancy) {
     for p in 0..db.pin_names.len() {
         if let Some(c) = db.pin_cells[p]
             && !matches!(
@@ -650,25 +713,6 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
         for (lid, r) in pin_shapes(db, tech, pin) {
             if (lid.0 as usize) < occ.lines_x.len() {
                 occ.rasterize(tracks, lid.0, &r, who, None);
-            }
-        }
-    }
-    // PDN stripes and via stacks: fixed metal every signal net must
-    // clear — the emit-time self-DRC measures spacing against these
-    // shapes, so the router has to price them.
-    for pdn in &db.pdn_nets {
-        for &(lid, r) in &pdn.wire_rects {
-            if (lid.0 as usize) < occ.lines_x.len() {
-                occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
-            }
-        }
-        for via in &pdn.vias {
-            for (dl, r) in expand_via(via, tech).expect("pdn via resolved at parse") {
-                if let DrcLayer::Routing(lid) = dl
-                    && (lid.0 as usize) < occ.lines_x.len()
-                {
-                    occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
-                }
             }
         }
     }
@@ -701,13 +745,19 @@ fn covered_range(list: &[i32], lo: i32, hi: i32) -> (usize, usize) {
 /// Hull confinement: the stub a projected node implies — node → pin
 /// rect clamp — is committed metal, so a candidate whose stub would
 /// cross an uncovered hull is never admitted (the emit-side check in
-/// `route_one_net` is the matching guard).
+/// `route_one_net` is the matching guard). The stub is also scanned
+/// against `occ` — premarks only at topo time (`Net` marks cannot
+/// exist yet; the live-occupancy recheck is `try_pin_paint`'s) — so
+/// a candidate whose only stub crosses a foreign pin/OBS band is
+/// rejected here instead of being claimed and dropped at extraction.
 fn project_attach(
     g: &NetGraph,
     shapes: &[(LayerId, RectDbu)],
     tracks: &[LayerTracks],
+    occ: &Occupancy,
     mask: &HullMask,
     cover: &PinCover,
+    own: u32,
 ) -> Vec<u32> {
     let mut out = BTreeSet::new();
     for &(lid, r) in shapes {
@@ -731,17 +781,17 @@ fn project_attach(
                 continue;
             }
             let (x, y) = (lt.tracks_x[n.ix as usize], lt.tracks_y[n.iy as usize]);
-            if !mask.seg_allowed(
-                cover,
-                lid.0,
-                x,
-                y,
-                x.clamp(r.xl, r.xh),
-                y.clamp(r.yl, r.yh),
-            ) {
+            let (cx, cy) = (x.clamp(r.xl, r.xh), y.clamp(r.yl, r.yh));
+            if !mask.seg_allowed(cover, lid.0, x, y, cx, cy) {
                 continue;
             }
-            out.insert((lo + i) as u32);
+            let v = (lo + i) as u32;
+            let mut hits = Vec::new();
+            scan_stub(g, tracks, occ, cover, v, lid.0, cx, cy, &mut hits);
+            if hits.iter().any(|h| fill_blocked(h, own)) {
+                continue;
+            }
+            out.insert(v);
         }
     }
     out.into_iter().collect()
@@ -782,8 +832,11 @@ fn pref_axis(dir: LayerDir) -> Axis {
 /// up front, so what remains as `Obs` never needs carving.
 /// `Obs(u32::MAX)` (net-less pin metal, PDN) always blocks.
 ///
-/// `Pin` marks: own free, foreign soft-priced — never a hard block
-/// (rip-up cannot move a pin; a landing wire is an emit-time finding).
+/// `Pin` marks (io-port rects): own free, foreign soft-priced like
+/// `Net` — including the hard block on the last iteration. Rip-up
+/// cannot move a pin, so the record side is asymmetric instead:
+/// `edge_collisions` logs the hit as a *directed* provisional
+/// collision and `route_nets` re-queues only the wire net.
 /// `ObsPin` marks (instance-pin metal inside hulls): own free,
 /// foreign hard-blocked — a soft price there is a Magic
 /// subcell-overlap finding the maze cannot otherwise see.
@@ -812,11 +865,10 @@ fn hit_verdict(
     let mut blocked = false;
     for h in hits {
         let m = match h.iv.who {
-            Occupant::Net(m) => {
+            Occupant::Net(m) | Occupant::Pin(m) => {
                 blocked |= m != own;
                 m
             }
-            Occupant::Pin(m) => m,
             _ => continue,
         };
         if m != own && !foreign.contains(&m) {
@@ -971,9 +1023,14 @@ fn scan_stub(
     }
 }
 
-/// Records every foreign-net spacing hit of one committed edge as a
-/// provisional `Collision` (deduped on `(a, b, layer, line, lo, hi)`
-/// — `a < b` canonically).
+/// Records every foreign spacing hit of one committed edge as a
+/// provisional `Collision`. `Net` hits go to `out` deduped on
+/// `(a, b, layer, line, lo, hi)` — `a < b` canonically. `Pin` hits
+/// go to `out_pins` *directed* — `a` is always the committing (wire)
+/// net, `b` the pin's owning net: the wire is the only movable
+/// party, so `route_nets` re-queues `a` alone. `ObsPin` stays
+/// unrecorded (already a hard block — a hit means the edge was never
+/// committed, or a bug).
 #[allow(clippy::too_many_arguments)]
 fn edge_collisions(
     g: &NetGraph,
@@ -985,21 +1042,33 @@ fn edge_collisions(
     eidx: u32,
     own: NetId,
     out: &mut BTreeSet<Collision>,
+    out_pins: &mut BTreeSet<Collision>,
     hits: &mut Vec<Hit>,
 ) {
     let mut record = |layer: LayerId, hits: &[Hit]| {
         for h in hits {
-            if let Occupant::Net(m) = h.iv.who
-                && m != own.0
-            {
-                out.insert(Collision {
-                    a: NetId(own.0.min(m)),
-                    b: NetId(own.0.max(m)),
-                    layer,
-                    line: h.line,
-                    lo: h.lo,
-                    hi: h.hi,
-                });
+            match h.iv.who {
+                Occupant::Net(m) if m != own.0 => {
+                    out.insert(Collision {
+                        a: NetId(own.0.min(m)),
+                        b: NetId(own.0.max(m)),
+                        layer,
+                        line: h.line,
+                        lo: h.lo,
+                        hi: h.hi,
+                    });
+                }
+                Occupant::Pin(m) if m != own.0 => {
+                    out_pins.insert(Collision {
+                        a: own,
+                        b: NetId(m),
+                        layer,
+                        line: h.line,
+                        lo: h.lo,
+                        hi: h.hi,
+                    });
+                }
+                _ => {}
             }
         }
     };
@@ -1634,8 +1703,11 @@ fn other_end(g: &NetGraph, relax: &[RelaxedVia], eidx: u32, v: u32) -> u32 {
 /// One routed net's outcome.
 enum NetOutcome {
     /// Route, provisional collisions, and the closure pass's named
-    /// residuals (`self-spacing.md`, `residuals.md`).
-    Routed(NetRoute, Vec<Collision>, ClosureResiduals),
+    /// residuals (`self-spacing.md`, `residuals.md`). The first vec
+    /// is the canonical net×net set (`a < b`); the second the
+    /// directed wire→pin set (`a` = committing wire net, `b` = pin's
+    /// owning net — rip-up re-queues `a` only, the pin cannot move).
+    Routed(NetRoute, Vec<Collision>, Vec<Collision>, ClosureResiduals),
     Failed {
         unrouted: UnroutedNet,
         /// Pins that got no legal paint — the `Unattachable`
@@ -1711,7 +1783,7 @@ impl NetTopo {
                 continue;
             }
             let shapes = pin_shapes(db, tech, pin);
-            let nodes = project_attach(g, &shapes, tracks, mask, &cover);
+            let nodes = project_attach(g, &shapes, tracks, occ, mask, &cover, g.net.0);
             projected[pi] = !nodes.is_empty();
             attachable[pi] = !nodes.is_empty();
             attach.push(nodes);
@@ -2272,7 +2344,7 @@ fn route_one_net(
                                 hits.iter().find(|h| {
                                     hard && matches!(
                                         h.iv.who,
-                                        Occupant::Net(m) if m != g.net.0
+                                        Occupant::Net(m) | Occupant::Pin(m) if m != g.net.0
                                     )
                                 })
                             });
@@ -2537,12 +2609,15 @@ fn route_one_net(
         .collect();
 
     // Provisional collisions: the foreign hits the committed edges
-    // actually took (soft-mode bookkeeping for the rip-up set).
+    // actually took (soft-mode bookkeeping for the rip-up set) —
+    // canonical net×net plus directed wire→pin.
     let mut prov = BTreeSet::new();
+    let mut prov_pins = BTreeSet::new();
     let mut hits = Vec::new();
     for &eidx in &run.used_edges {
         edge_collisions(
-            g, tracks, vias, occ, &topo.relax, &topo.cover, eidx, g.net, &mut prov, &mut hits,
+            g, tracks, vias, occ, &topo.relax, &topo.cover, eidx, g.net, &mut prov,
+            &mut prov_pins, &mut hits,
         );
     }
 
@@ -2562,6 +2637,7 @@ fn route_one_net(
             fills,
         },
         prov.into_iter().collect(),
+        prov_pins.into_iter().collect(),
         residuals,
     )
 }
@@ -2641,8 +2717,9 @@ enum ClosureResult {
 /// Paints pin `pi`'s first legal attach element — the extraction-time
 /// version of `hit_verdict`'s `legal`: strict in-tree node → no paint
 /// → `Strict`; projected pin → first untried `(shape, node)` whose
-/// stub stays inside cover → `Proj`; else first untried access arc
-/// whose via + upper stub clears live occupancy → `Access`.
+/// stub stays inside cover and clears live occupancy → `Proj`; else
+/// first untried access arc whose via + upper stub clears live
+/// occupancy → `Access`.
 #[allow(clippy::too_many_arguments)]
 fn try_pin_paint(
     db: &DesignDb,
@@ -2687,7 +2764,17 @@ fn try_pin_paint(
                 // it must stay inside this net's own pin rect union —
                 // a stub through uncovered hull is the exact class the
                 // mask exists to kill, so the candidate is skipped
-                // rather than emitted.
+                // rather than emitted. Live occupancy gates it too —
+                // committed `Net` marks did not exist at topo time and
+                // emit never gets a soft pass; a blocked candidate lands
+                // in the tried-set so the pin advances or exhausts to
+                // `stub_blocked` (named), never a hang.
+                let mut hits = Vec::new();
+                scan_stub(g, tracks, occ, &topo.cover, v, lid.0, cx, cy, &mut hits);
+                if hits.iter().any(|h| fill_blocked(h, g.net.0)) {
+                    tried_proj.insert((si, v));
+                    continue;
+                }
                 if x == cx {
                     if y != cy {
                         if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
@@ -3727,6 +3814,7 @@ pub fn route_nets(
     let mut bad: Vec<usize> = (0..n).collect();
     let mut unrouted: Vec<UnroutedNet> = Vec::new();
     let mut iterations = 0u32;
+    let mut iter_stats: Vec<IterStat> = Vec::new();
 
     let cap = cfg.max_iters.max(1);
     let mut it = 0u32;
@@ -3734,20 +3822,25 @@ pub fn route_nets(
     while it < cap && !bad.is_empty() {
         it += 1;
         iterations = it;
+        let attempted = bad.len() as u32;
         let hard = it == cap;
         let ti = std::time::Instant::now();
         let mut prov: BTreeSet<Collision> = BTreeSet::new();
+        let mut prov_pins: BTreeSet<Collision> = BTreeSet::new();
         let mut failed: Vec<(usize, UnroutedNet)> = Vec::new();
+        let mut routed = 0u32;
         for (bi, &i) in bad.iter().enumerate() {
             let g = &graphs.nets[i];
             let tn = std::time::Instant::now();
             match route_one_net(
                 db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i], hard, cfg.occ,
             ) {
-                NetOutcome::Routed(route, hits, res) => {
+                NetOutcome::Routed(route, hits, pin_hits, res) => {
+                    routed += 1;
                     commit_route(&mut occ, tracks, vias, &route, &mut marks[i]);
                     if !hard && cfg.occ == OccMode::Enabled {
                         prov.extend(hits);
+                        prov_pins.extend(pin_hits);
                     }
                     res_of[i] = res;
                     routes[i] = Some(route);
@@ -3777,17 +3870,31 @@ pub fn route_nets(
                 }
             }
         }
+        iter_stats.push(IterStat {
+            attempted,
+            routed,
+            prov_collisions: (prov.len() + prov_pins.len()) as u32,
+        });
         if hard {
             unrouted = failed.into_iter().map(|(_, u)| u).collect();
             break;
         }
-        // bad = unrouted ∪ both parties of every provisional collision.
+        // bad = unrouted ∪ both parties of every net×net provisional
+        // collision ∪ the wire side only of every wire×pin one — a
+        // pin's net is never re-queued on its own port being hit: the
+        // port cannot move, so re-queuing it would only waste a route
+        // attempt and escalate `hist[b]` unfairly.
         let mut next: BTreeSet<usize> = failed.iter().map(|(i, _)| *i).collect();
         for c in &prov {
             if let Some(&i) = net_idx.get(&c.a.0) {
                 next.insert(i);
             }
             if let Some(&i) = net_idx.get(&c.b.0) {
+                next.insert(i);
+            }
+        }
+        for c in &prov_pins {
+            if let Some(&i) = net_idx.get(&c.a.0) {
                 next.insert(i);
             }
         }
@@ -3859,9 +3966,15 @@ pub fn route_nets(
         } else {
             Vec::new()
         },
+        pin_collisions: if cfg.occ == OccMode::Enabled {
+            pin_overlap_census(db, tech, tracks, vias, &nets)
+        } else {
+            Vec::new()
+        },
         nets,
         unrouted,
         iterations,
+        iter_stats,
         area_patches,
         area_residuals,
         notch_residuals: res_of
@@ -3921,6 +4034,70 @@ pub fn overlap_census(
                                 hi: a.hi.min(b.hi),
                             });
                         }
+                    }
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Committed-wire × foreign-pin overlaps — the named residual for
+/// the `Occupant::Pin`/`ObsPin` classes `overlap_census` cannot see
+/// (it rasterizes only `Net` marks). Rebuilds the router's pin marks
+/// (`rasterize_pin_marks` — io ports `Pin`, instance pins `ObsPin`)
+/// plus every route's `Net` marks into a fresh occupancy, then runs
+/// the same per-line `R + s` sweep. Reports are *directed*
+/// `Collision`s: `a` is the wire's net, `b` the pin's owning net —
+/// the wire is the only movable party, so the direction is the
+/// rip-up payload.
+pub fn pin_overlap_census(
+    db: &DesignDb,
+    tech: &TechDb,
+    tracks: &[LayerTracks],
+    vias: &ViaTable,
+    routes: &[NetRoute],
+) -> Vec<Collision> {
+    let mut occ = Occupancy::new(tech);
+    rasterize_pin_marks(db, tech, tracks, &mut occ);
+    for r in routes {
+        let mut sink = Vec::new();
+        commit_route(&mut occ, tracks, vias, r, &mut sink);
+    }
+    let mut out = BTreeSet::new();
+    for l in 0..occ.lines_x.len() {
+        let s = occ.spc[l];
+        for map in [&occ.lines_x[l], &occ.lines_y[l]] {
+            for (&t, line) in map {
+                let sorted = &line.ivs;
+                for i in 0..sorted.len() {
+                    for b in sorted.iter().skip(i + 1) {
+                        let a = &sorted[i];
+                        if b.lo >= a.hi + s {
+                            break;
+                        }
+                        let pgap = (a.perp_lo - b.perp_hi).max(b.perp_lo - a.perp_hi).max(0);
+                        if pgap >= s {
+                            continue;
+                        }
+                        let pair = match (a.who, b.who) {
+                            (Occupant::Net(w), Occupant::Pin(p) | Occupant::ObsPin(p))
+                            | (Occupant::Pin(p) | Occupant::ObsPin(p), Occupant::Net(w)) => {
+                                (w, p)
+                            }
+                            _ => continue,
+                        };
+                        if pair.0 == pair.1 {
+                            continue;
+                        }
+                        out.insert(Collision {
+                            a: NetId(pair.0),
+                            b: NetId(pair.1),
+                            layer: LayerId(l as u8),
+                            line: t,
+                            lo: a.lo.max(b.lo),
+                            hi: a.hi.min(b.hi),
+                        });
                     }
                 }
             }
@@ -3992,6 +4169,15 @@ pub fn route_digest(routed: &RouteDb) -> u64 {
         put(c.lo as u32);
         put(c.hi as u32);
     }
+    put(routed.pin_collisions.len() as u32);
+    for c in &routed.pin_collisions {
+        put(c.a.0);
+        put(c.b.0);
+        put(c.layer.0 as u32);
+        put(c.line as u32);
+        put(c.lo as u32);
+        put(c.hi as u32);
+    }
     put(routed.notch_residuals.len() as u32);
     for nr in &routed.notch_residuals {
         put(nr.net.0);
@@ -4024,6 +4210,12 @@ pub fn route_digest(routed: &RouteDb) -> u64 {
         put(p.0);
     }
     put(routed.iterations);
+    put(routed.iter_stats.len() as u32);
+    for s in &routed.iter_stats {
+        put(s.attempted);
+        put(s.routed);
+        put(s.prov_collisions);
+    }
     xxh3_64(&buf)
 }
 
@@ -4213,11 +4405,12 @@ mod tests {
         let tech = toy_tech();
         let mask = HullMask::new(&db, &tech);
         let cover = PinCover::new();
-        let got = project_attach(&g, &shapes, &tracks, &mask, &cover);
+        let occ = Occupancy::new(&tech);
+        let got = project_attach(&g, &shapes, &tracks, &occ, &mask, &cover, 0);
         assert_eq!(got, vec![3, 4], "nodes adjacent to the pin on covered lines");
         // No covered track at all → Unattachable (empty set).
         let shapes = vec![(LayerId(0), RectDbu::new(150, 3100, 250, 3400))];
-        assert!(project_attach(&g, &shapes, &tracks, &mask, &cover).is_empty());
+        assert!(project_attach(&g, &shapes, &tracks, &occ, &mask, &cover, 0).is_empty());
     }
 
     #[test]
@@ -4335,7 +4528,7 @@ mod tests {
         let outcome = route_one_net(
             &db, &tech, &tracks, &g, &topo, &vias, &occ, &mask, 0, false, cfg.occ,
         );
-        let NetOutcome::Routed(route, _, _) = outcome else {
+        let NetOutcome::Routed(route, _, _, _) = outcome else {
             panic!("square must route");
         };
         // Deterministic tie: node 1 reached before node 2, so the path

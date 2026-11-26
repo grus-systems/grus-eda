@@ -31,7 +31,7 @@ use grus_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
 use grus_core::drt::via::{ViaPair, ViaTable, via_table};
 use grus_core::interner::{LayerId, NetId, PinId, StringInterner};
 use grus_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
-use grus_core::tech_db::{LayerDir, TechDb};
+use grus_core::tech_db::{LayerDir, RectDbu, TechDb};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -1262,7 +1262,7 @@ fn test_via_edge_fixture() {
 // ---------------------------------------------------------------------------
 
 use grus_core::drt::maze::{
-    FailKind, MazeConfig, OccMode, overlap_census, route_digest, route_nets,
+    FailKind, IterStat, MazeConfig, OccMode, overlap_census, route_digest, route_nets,
 };
 use grus_core::drt::graph::RouteGraphs;
 
@@ -1404,6 +1404,25 @@ END NETS
 END DESIGN
 "#;
 
+/// The pin-collision fixture's tail: io2's met1 port rect sits
+/// mid-row between io1 and u0/A, so n1's direct y=1000 path crosses
+/// a foreign `Pin` mark band. io2 is placed at x=2000 — its mark
+/// interval [1900,2100] then sits on u0/A's very first attach arc
+/// (1000,1000)→(2000,1000), which is what lets the hard-mode
+/// postmortem attribute `(met1, Pin)` in the named failure (an
+/// x=2500 port leaves every attach-node arc free and `blockers`
+/// comes out empty).
+const MAZE_PIN_TAIL: &str = r#"PINS 2 ;
+- io1 + NET n1 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 4000 1000 ) N ;
+- io2 + NET n2 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 2000 1000 ) N ;
+END PINS
+NETS 2 ;
+- n1 ( PIN io1 ) ( u0 A ) + USE SIGNAL ;
+- n2 ( PIN io2 ) ( u1 B ) + USE SIGNAL ;
+END NETS
+END DESIGN
+"#;
+
 fn maze_tech() -> TechDb {
     let mut interner = StringInterner::new();
     let mut tech = TechDb::new();
@@ -1424,7 +1443,11 @@ fn maze_db(tech: &TechDb, with_blk: bool) -> DesignDb {
     } else {
         "COMPONENTS 3 ;\n- u0 CELL + PLACED ( 900 900 ) N ;\n- u1 CELLB + PLACED ( 3900 2900 ) N ;\n- u2 CELLC + PLACED ( 1400 1400 ) N ;\nEND COMPONENTS\n"
     };
-    let text = format!("{MAZE_DEF_HEAD}{comps}{MAZE_DEF_TAIL}");
+    maze_db_custom(tech, comps, MAZE_DEF_TAIL)
+}
+
+fn maze_db_custom(tech: &TechDb, comps: &str, tail: &str) -> DesignDb {
+    let text = format!("{MAZE_DEF_HEAD}{comps}{tail}");
     parse_def_bytes(text.as_bytes(), tech, None).expect("fixture DEF parses")
 }
 
@@ -1546,6 +1569,95 @@ fn test_maze_cases() {
     );
 }
 
+/// The foreign-pin collision contract (`docs/e6-drt.md` §7): a wire
+/// crossing a foreign io-port `Pin` mark band is soft-priced and
+/// *recorded* in soft iterations (rip-up re-queues the wire side
+/// only) and hard-blocked on the last iteration — never committed
+/// silently. io2's met1 port sits mid-row between io1 and u0/A.
+/// Arm A's open guide must detour; arm B's met1-row-only guide has
+/// no legal path and must fail named with `(met1, Pin)` blockers.
+/// Proven red on the unfixed verdict: arm B committed the overlap
+/// (`pin_collisions = 1`) and routed instead of failing.
+#[test]
+fn test_maze_pin_collision() {
+    let tech = maze_tech();
+    let cfg = MazeConfig::default();
+    let comps = "COMPONENTS 2 ;\n- u0 CELL + PLACED ( 900 900 ) N ;\n- u1 CELLB + PLACED ( 3900 2900 ) N ;\nEND COMPONENTS\n";
+    let db = maze_db_custom(&tech, comps, MAZE_PIN_TAIL);
+    let tracks = layer_tracks(&db, &tech);
+    let vias = via_table(&tech, &db).unwrap();
+    // io2's met1 port rect [1900,2100]×[900,1100] inflated by
+    // w/2 + s = 210 — the foreign band no committed n1 wire may enter.
+    let band = grus_core::tech_db::RectDbu::new(1690, 690, 2310, 1310);
+    let n2_guide = "n2\n(\n0 0 5000 5000 met1\n0 0 5000 5000 met2\n)\n";
+
+    // Arm A — open guide: the router must find a clean detour (an
+    // off-axis jog to y=0/2000 or a met2 leg), never the silent
+    // overlap.
+    let join = maze_guide(
+        &db,
+        &tech,
+        &format!("n1\n(\n0 0 5000 2000 met1\n0 0 5000 5000 met2\n)\n{n2_guide}"),
+    );
+    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+    assert_eq!(r.nets.len(), 2);
+    let n1 = r.nets.iter().find(|n| net_name(&db, n.net) == "n1").unwrap();
+    assert_eq!(n1.connected.len(), 2);
+    assert!(
+        r.pin_collisions.is_empty(),
+        "committed pin overlap must not survive: {:?}",
+        r.pin_collisions
+    );
+    for w in &n1.wires {
+        let hit = w.x1 < band.xh && w.x2 > band.xl && w.y1 < band.yh && w.y2 > band.yl;
+        assert!(!hit, "wire {w:?} enters the foreign port spacing band");
+    }
+
+    // Arm B — the only wave path crosses the port band: soft
+    // iterations commit and record the overlap (re-queuing n1); the
+    // hard iteration blocks it and the net must fail named — a
+    // `NoPath` unrouted entry attributing `(met1, Pin)`, never a
+    // silent overlap and never a hang (the cap bounds the loop).
+    let join = maze_guide(
+        &db,
+        &tech,
+        &format!("n1\n(\n0 800 5000 1200 met1\n)\n{n2_guide}"),
+    );
+    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert_eq!(r.unrouted.len(), 1, "{:?}", r.unrouted);
+    let u = &r.unrouted[0];
+    assert_eq!(net_name(&db, u.net), "n1");
+    assert!(
+        u.failed.iter().all(|&(_, k)| k == FailKind::NoPath),
+        "{:?}",
+        u.failed
+    );
+    assert!(
+        u.blockers.contains(&(0, 3)),
+        "expected (met1, Pin) blocker attribution, got {:?}",
+        u.blockers
+    );
+    assert!(
+        r.iter_stats[..r.iter_stats.len() - 1]
+            .iter()
+            .any(|s| s.prov_collisions > 0),
+        "the wire×pin record must fire before the hard iteration: {:?}",
+        r.iter_stats
+    );
+    assert!(
+        r.pin_collisions.is_empty(),
+        "the overlap must not survive to emit: {:?}",
+        r.pin_collisions
+    );
+    assert!(
+        r.nets.iter().any(|n| net_name(&db, n.net) == "n2"),
+        "n2 must still route"
+    );
+}
+
 /// True when the net's guide boxes form a single component under
 /// same-layer / adjacent-layer 2D-overlap (the planning probe's union
 /// connectivity). `max_layer` bounds the box set (LayerId(2) = met2).
@@ -1638,6 +1750,25 @@ fn maze_census(name: &str) {
             r.iterations,
             route_digest(&r),
         );
+        println!(
+            "{name}: iter_progress={} iter_prov={}",
+            r.iter_stats
+                .iter()
+                .map(|s| s.attempted.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            r.iter_stats
+                .iter()
+                .map(|s| s.prov_collisions.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        println!(
+            "{name}: iter_progress_monotonic={}",
+            r.iter_stats
+                .windows(2)
+                .all(|w| w[0].attempted >= w[1].attempted)
+        );
         for u in &r.unrouted {
             let kinds: Vec<String> = u
                 .failed
@@ -1663,6 +1794,41 @@ fn maze_census(name: &str) {
             r.nets.iter().all(|n| !n.wires.is_empty()),
             "{name}: routed net with no wires"
         );
+
+        // Convergence record (`IterStat` semantics, `docs/e6-drt.md`
+        // §7): one entry per iteration; entry 0 attempts every guided
+        // net; `bad[i+1] = failed ∪ both parties of every provisional
+        // collision`, and a collision's foreign party may be a kept
+        // net outside `bad[i]`, so `attempted` can rise — observed
+        // non-increasing on the recorded designs, reported above, not
+        // asserted. The last entry always has `prov_collisions == 0`
+        // (hard mode reports no provisionals; early convergence has
+        // none) and its failure count is the unrouted census.
+        assert_eq!(
+            r.iter_stats.len(),
+            r.iterations as usize,
+            "{name}: iter_stats len != iterations"
+        );
+        if !r.iter_stats.is_empty() {
+            assert_eq!(
+                r.iter_stats[0].attempted as usize,
+                join.nets.len(),
+                "{name}: iter_stats[0].attempted != guided"
+            );
+            let last = r.iter_stats.last().unwrap();
+            assert_eq!(
+                last.prov_collisions, 0,
+                "{name}: last-iteration prov_collisions != 0"
+            );
+            assert_eq!(
+                (last.attempted - last.routed) as usize,
+                r.unrouted.len(),
+                "{name}: last-iteration failures != unrouted"
+            );
+        }
+        for s in &r.iter_stats {
+            assert!(s.routed <= s.attempted, "{name}: routed > attempted");
+        }
 
         // Classify `NoPath` nets: `met3_bridge` has a disconnected
         // {li1,met1,met2} box union that only the met3+ boxes rejoin
@@ -1767,14 +1933,48 @@ fn maze_determinism(name: &str) {
     }
 }
 
+/// Digest coverage fail-proof (AGENTS §7.7): `iter_stats` is a
+/// deterministic output serialized into `route_digest` — flip one
+/// field and the digest must move, else the new record is invisible
+/// to the determinism gate.
+#[test]
+fn test_route_digest_covers_iter_stats() {
+    let a = RouteDb {
+        iter_stats: vec![IterStat {
+            attempted: 3,
+            routed: 3,
+            prov_collisions: 0,
+        }],
+        ..RouteDb::default()
+    };
+    let mut b = a.clone();
+    b.iter_stats[0].prov_collisions = 1;
+    assert_ne!(route_digest(&a), route_digest(&b));
+}
+
+#[test]
+fn test_route_digest_covers_pin_collisions() {
+    let a = RouteDb::default();
+    let mut b = a.clone();
+    b.pin_collisions.push(grus_core::drt::maze::Collision {
+        a: NetId(1),
+        b: NetId(2),
+        layer: LayerId(0),
+        line: 1000,
+        lo: 1900,
+        hi: 2100,
+    });
+    assert_ne!(route_digest(&a), route_digest(&b));
+}
 
 // ---------------------------------------------------------------------------
 // Routed DEF emission + self-DRC gate
 // ---------------------------------------------------------------------------
 
+use grus_core::drc::ShapeSrc;
 use grus_core::drc::geom::assemble;
 use grus_core::drc::report::{Family, SubsetReport, run_all};
-use grus_core::drt::emit::{EmitReport, apply_routes, write_routed_def};
+use grus_core::drt::emit::{EmitReport, apply_routes, preemit_check, write_routed_def};
 use grus_core::drt::maze::RouteDb;
 
 /// Route `name` and apply the result into `db.net_geoms` — the shared
@@ -2170,6 +2370,116 @@ fn test_emit_determinism() {
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out2).unwrap(),
         "two emit passes produced different bytes"
+    );
+}
+
+/// The pre-emit check on clean gcd: zero findings over nonzero
+/// coverage, deterministic, `IoPort` rects present in the assembled
+/// set — and the load-bearing equivalence: the in-memory report equals
+/// the write → re-parse → `run_all` report verbatim, which is what
+/// "the checked set is the emitted set" means (AGENTS §7.2 — tested,
+/// not asserted in prose).
+#[test]
+fn test_preemit_gcd() {
+    let (tech, db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let pre = preemit_check(&db, &tech).expect("preemit_check");
+    assert_eq!(
+        findings_total(&pre),
+        0,
+        "clean gcd carries pre-emit findings: {}",
+        pre.rules
+            .iter()
+            .filter(|o| !o.findings.is_empty())
+            .map(|o| format!("{}:{}", o.rule, o.findings.len()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for family in [
+        Family::Width,
+        Family::Spacing,
+        Family::Enclosure,
+        Family::Area,
+    ] {
+        let candidates: usize = pre
+            .rules
+            .iter()
+            .filter(|o| o.family == family)
+            .map(|o| o.candidates)
+            .sum();
+        assert!(candidates > 0, "gcd: {family:?} family checked nothing");
+    }
+    assert_eq!(pre, preemit_check(&db, &tech).expect("preemit_check 2"));
+
+    let io_ports = assemble(&db, &tech)
+        .expect("assemble")
+        .routing
+        .iter()
+        .flat_map(|ls| ls.rects.iter())
+        .filter(|s| s.src == ShapeSrc::IoPort)
+        .count();
+    assert!(io_ports > 0, "gcd emit carries no IoPort shapes");
+
+    let out = tmp_def("gcd-preemit");
+    write_routed_def(&db, &tech, &placed_def("gcd"), &out).expect("write");
+    let (_db2, drc_report) = self_drc(&out, &tech);
+    assert_eq!(
+        pre, drc_report,
+        "in-memory report diverges from the emit→parse report — a writer bug"
+    );
+}
+
+/// Fail-proof arm for the pre-emit check: a `SignalWire` injected at a
+/// 1-DBU gap to a foreign io-port rect must surface as a
+/// `Family::Spacing` finding that names the port's rect and net —
+/// `IoPort` is a checkable endpoint in the emitted set, not just
+/// present geometry.
+#[test]
+fn test_preemit_foreign_pin() {
+    let (tech, mut db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let d = assemble(&db, &tech).expect("assemble");
+    let (lid, pin_rect, port_net) = d
+        .routing
+        .iter()
+        .enumerate()
+        .flat_map(|(l, ls)| ls.rects.iter().map(move |s| (l, s)))
+        .find_map(|(l, s)| {
+            (s.src == ShapeSrc::IoPort && s.net.is_some())
+                .then(|| (LayerId(l as u8), s.rect, s.net.unwrap()))
+        })
+        .expect("gcd emit carries net-tagged io-port shapes");
+    let bound = tech.routing_layers[lid.0 as usize].min_spacing_dbu();
+    assert!(bound > 1, "io-port layer has no spacing bound to violate");
+    let b = (0..db.num_nets())
+        .find(|&n| db.net_names[n] != port_net)
+        .expect("a foreign net exists");
+    let w = RectDbu::new(
+        pin_rect.xh + 1,
+        pin_rect.yl,
+        pin_rect.xh + 1 + bound,
+        pin_rect.yh,
+    );
+    println!(
+        "injected: net {} wire {w:?} on layer {lid:?} at gap 1 < bound {bound} of port rect {pin_rect:?}",
+        net_name(&db, NetId(b as u32)),
+    );
+    db.net_geoms[b].wire_rects.push((lid, w));
+
+    let pre = preemit_check(&db, &tech).expect("preemit_check");
+    print_gate("gcd(preemit-injected)", &pre);
+    assert!(
+        findings_total(&pre) >= 1,
+        "io-port-adjacent inject produced no finding — the check is vacuous"
+    );
+    let port_name = db.strings.resolve(port_net).to_string();
+    let hit = pre
+        .rules
+        .iter()
+        .filter(|o| o.family == Family::Spacing)
+        .flat_map(|o| o.findings.iter())
+        .find(|f| f.bboxes.contains(&pin_rect) && f.nets.iter().any(|n| n == &port_name));
+    assert!(
+        hit.is_some(),
+        "no spacing finding names the io-port rect {pin_rect:?} and net {port_name}"
     );
 }
 
