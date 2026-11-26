@@ -88,7 +88,11 @@ return argmin → (best, h, v)
 - `cap` bounds both the reported span and the work: a `v` whose
   halo-bbox distance already exceeds `cap` can never produce a
   span ≤ `cap`, so it is skipped in O(1). Corridors only need
-  `cap = corridor_lines` — the probe never evaluates the full
+  `cap = corridor_lines`, floored at 1 — a span-1 adjacency merges
+  at emission with no corridor at all, so it stays a candidate even
+  under `corridor_lines = 0` (the retired BFS was uncapped and
+  merged it; the floor preserves that arm — landed as
+  `bound.max(1)`). The probe never evaluates the full
   `nx × ny` grid (the retired BFS's dominant cost was its
   `vec![u32::MAX; nx*ny]` allocation per escaped pin per layer,
   ~measurable at picorv32's 592 escapes).

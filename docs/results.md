@@ -10439,8 +10439,12 @@ escape pin inside an unrouted net (`req_msg[16]`'s port) is not the
 pin that failed.
 
 **Fixture** (`test_maze_guide_escape`, `ESC_LEF_WALL`/`ESC_DEF_TAIL`
-+ `WALL` macro hull): escape off → `Unattachable` + `region_escape`,
-graph bit-identical to pre-escape; default cfg → `CorridorBound`
++ `WALL` macro hull): escape off → `NoPath` + `region_escape`
+(corrected in place — a review-driven fix: the escape-off pin still
+lands an `access_vias` `b`-arc on its met2 transit-island node, so
+the wave seeds and dies on the island rather than reporting
+`Unattachable`), graph bit-identical to pre-escape; default cfg →
+`CorridorBound`
 refusals pin-token `corridor_bound(span=3)`; corridor open →
 `corridor_masked`/landed arms measured; corridor landing on `maze_db`
 → `halo(span=3)`, routed clean end-to-end.
@@ -10458,3 +10462,24 @@ picorv32 legs), `cargo clippy --workspace --all-targets --
 Version `0.12.14 → 0.13.0` — `build_route_graphs_ext`'s signature
 changed (`spare_above: u8` → `GraphOpts`), a breaking API change on
 0.x → minor.
+
+**Review revision** (same ticket): the contract fixes — escape-off
+fails `NoPath` (transit-island access landing), not `Unattachable`;
+`EscapeKind::NoAnchor` names the no-target case (was a `u32::MAX`
+span); `pairs_added` counts distinct inserted pairs (was
+double-counting the corridor layer's halo); `escape_span` is a
+bounded windowed enumeration (was an `nx×ny` BFS + allocation per
+escaped pin per layer — identical spans, bounded work).
+Arm F occupancy contrast: enabled `NoPath` / disabled routed
+measured on `ESC_DEF_TAIL_OCC` (the io4 met2 `Pin` band covers only
+escaped pairs — the block is attributable to escape metal by
+construction; the io4-drop break-it check is arm B itself — the
+identical wall fixture and `Enabled` run minus the band routes). Kind census re-print: gcd {halo: 7, halo_empty: 10},
+picorv32 {halo: 425, corridor_masked: 9, halo_empty: 158} —
+identical to the pre-revision counts (no refused records on either
+design, so no `corridor_bound → no_anchor` reclassification to
+name); graph census pins unchanged (`test_graph_census`,
+`test_via_edge_census`, `test_graph_determinism` green — the probe's
+endpoint tie-breaks did not shift paint on the measured designs);
+routed DEF sha unchanged (`test_e2e_ours_def_deterministic_gcd`
+byte-identical).

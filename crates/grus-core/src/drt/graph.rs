@@ -95,16 +95,21 @@ pub enum EscapeKind {
     /// is index-adjacent to a pre-existing pair, `corridor_span == 0`)
     /// or through a bounded L-corridor (`corridor_span` index steps).
     Halo,
-    /// The nearest in-region pair on every escape layer lay beyond
+    /// The nearest in-region pair on an escape layer lay beyond
     /// `EscapeCfg::corridor_lines` — the guide miss is outside the
     /// rescue window; no pairs were added (`corridor_span` is the
-    /// measured gap, `u32::MAX` when no layer had a target pair).
+    /// exact measured gap).
     CorridorBound,
     /// Every within-bound corridor died at the hull mask. The halo
     /// pairs themselves were legal and stay — the pin may still
     /// attach to them (an island) or through a route-time access
     /// arc.
     CorridorMasked,
+    /// No non-halo `region` pair exists on any layer the halo
+    /// covers — the corridor had nothing to aim at (the guide
+    /// covers only layers outside the pin's stack, or a fully empty
+    /// region).
+    NoAnchor,
     /// No legal track crossing inside the inflated pin bbox on any
     /// escape layer — nothing to anchor an escape to.
     HaloEmpty,
@@ -118,13 +123,14 @@ pub struct EscapeRecord {
     pub net: NetId,
     pub pin: PinId,
     pub kind: EscapeKind,
-    /// Halo + corridor pairs that entered `region` — 0 when the
-    /// escape was refused (`CorridorBound`, `HaloEmpty`).
+    /// Distinct halo + corridor pairs that entered `region` — 0 when
+    /// the escape was refused (`CorridorBound`, `NoAnchor`,
+    /// `HaloEmpty`).
     pub pairs_added: u32,
     /// Index steps of the landed corridor, or of the best
-    /// within-bound attempt (`CorridorMasked`) / the measured gap
-    /// (`CorridorBound`); 0 when the halo merged without a corridor
-    /// or the halo was empty.
+    /// within-bound attempt (`CorridorMasked`) / the exact measured
+    /// gap (`CorridorBound`); 0 when the halo merged without a
+    /// corridor, no anchor existed, or the halo was empty.
     pub corridor_span: u32,
 }
 
@@ -137,6 +143,7 @@ impl EscapeRecord {
             EscapeKind::Halo => format!("halo(span={})", self.corridor_span),
             EscapeKind::CorridorBound => format!("corridor_bound(span={})", self.corridor_span),
             EscapeKind::CorridorMasked => "corridor_masked".to_string(),
+            EscapeKind::NoAnchor => "no_anchor".to_string(),
             EscapeKind::HaloEmpty => "halo_empty".to_string(),
         }
     }
@@ -791,8 +798,9 @@ fn strict_hits(pairs: &[(u32, u32)], lt: &LayerTracks, rect: &RectDbu) -> Vec<u3
 /// layer's covered-pair set.
 type Idx = (u32, u32);
 
-/// Per-layer corridor candidate: BFS span from the layer's halo to
-/// its nearest non-halo `region` pair and the attaining endpoints.
+/// Per-layer corridor candidate: the index-span from the layer's
+/// halo to its nearest non-halo `region` pair (within the corridor
+/// bound) and the attaining endpoints.
 struct EscapeCand {
     layer: u8,
     span: u32,
@@ -809,46 +817,55 @@ struct Corridor {
 
 /// Min index-grid (Manhattan) distance from `halo` to a `region`
 /// pair outside `halo`, plus an attaining `(halo, region)` pair —
-/// multi-source BFS over the index grid, each cell visited once and
-/// the first target hit in BFS order winning ties. `None` when the
-/// layer has no non-halo region pair to anchor to.
-fn escape_span(
-    halo: &BTreeSet<Idx>,
-    region: &[Idx],
-    nx: usize,
-    ny: usize,
-) -> Option<(u32, Idx, Idx)> {
-    let seeds: Vec<Idx> = halo.iter().copied().collect();
-    // `origin[i]` = index of the seed whose BFS tree reached cell i.
-    let mut origin = vec![u32::MAX; nx * ny];
-    let mut queue: std::collections::VecDeque<((u32, u32), u32)> = std::collections::VecDeque::new();
-    for (i, &s) in seeds.iter().enumerate() {
-        origin[s.0 as usize * ny + s.1 as usize] = i as u32;
-        queue.push_back((s, 0));
+/// a bounded windowed enumeration, not a grid BFS: distance on an
+/// unobstructed 4-connected index grid is Manhattan distance, so
+/// each region pair is pruned in O(1) by its distance to the halo
+/// bbox and only near-window pairs pay the inner scan. `cap`
+/// bounds both the reported span and the work — a pair whose halo-
+/// bbox distance already exceeds `cap` can never attain a span
+/// `≤ cap`. Region pairs iterate in sorted order, halo pairs in
+/// `BTreeSet` order, strictly improving — the earliest `(v, h)`
+/// achieving each new minimum wins. `None` when no non-halo region
+/// pair lies within `cap`.
+fn escape_span(halo: &BTreeSet<Idx>, region: &[Idx], cap: u32) -> Option<(u32, Idx, Idx)> {
+    let (mut hx0, mut hy0, mut hx1, mut hy1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for &(x, y) in halo {
+        hx0 = hx0.min(x);
+        hy0 = hy0.min(y);
+        hx1 = hx1.max(x);
+        hy1 = hy1.max(y);
     }
-    while let Some((c, d)) = queue.pop_front() {
-        for n in [
-            (c.0 + 1, c.1),
-            (c.0, c.1 + 1),
-            (c.0.wrapping_sub(1), c.1),
-            (c.0, c.1.wrapping_sub(1)),
-        ] {
-            if n.0 as usize >= nx || n.1 as usize >= ny {
-                continue;
+    let mut best = cap.saturating_add(1);
+    let mut argmin = None;
+    for &v in region {
+        // Kept halo pairs are never in `region` for this pin, but a
+        // previous pin's escape may have merged a halo-overlapping
+        // pair — the guard keeps it from becoming a span-0 self-anchor.
+        if halo.contains(&v) {
+            continue;
+        }
+        let dx = if v.0 < hx0 {
+            hx0 - v.0
+        } else {
+            v.0.saturating_sub(hx1)
+        };
+        let dy = if v.1 < hy0 {
+            hy0 - v.1
+        } else {
+            v.1.saturating_sub(hy1)
+        };
+        if dx + dy >= best {
+            continue;
+        }
+        for &h in halo {
+            let m = v.0.abs_diff(h.0) + v.1.abs_diff(h.1);
+            if m < best {
+                best = m;
+                argmin = Some((h, v));
             }
-            let o = origin[c.0 as usize * ny + c.1 as usize];
-            let slot = &mut origin[n.0 as usize * ny + n.1 as usize];
-            if *slot != u32::MAX {
-                continue;
-            }
-            *slot = o;
-            if region.binary_search(&n).is_ok() && !halo.contains(&n) {
-                return Some((d + 1, seeds[*slot as usize], n));
-            }
-            queue.push_back((n, d + 1));
         }
     }
-    None
+    argmin.map(|(h, v)| (best, h, v))
 }
 
 /// The `transit_extend` L-shape: horizontal leg at `h.1` then
@@ -1012,16 +1029,18 @@ fn escape_extend(
             record(EscapeKind::HaloEmpty, 0, 0);
             continue;
         }
-        // Per-layer argmin (span, halo pair, region pair); a layer
-        // with no non-halo region pair offers no anchor.
+        // Per-layer argmin (span, halo pair, region pair), capped at
+        // the corridor bound — a layer whose nearest anchor lies
+        // beyond it, or that has no non-halo region pair, offers no
+        // candidate. The cap floors at 1: a span-1 adjacency merges
+        // at emission with no corridor at all, so it is a candidate
+        // even under a zero corridor bound.
         let mut cands: Vec<EscapeCand> = Vec::new();
         for (&l, hs) in &halo {
-            let (Some(pairs), Some(lt)) = (region.get(&l), tracks.get(l as usize)) else {
+            let Some(pairs) = region.get(&l) else {
                 continue;
             };
-            if let Some((span, h0, v0)) =
-                escape_span(hs, pairs, lt.tracks_x.len(), lt.tracks_y.len())
-            {
+            if let Some((span, h0, v0)) = escape_span(hs, pairs, bound.max(1)) {
                 cands.push(EscapeCand {
                     layer: l,
                     span,
@@ -1044,9 +1063,6 @@ fn escape_extend(
         cands.sort_by(|a, b| a.span.cmp(&b.span).then(b.layer.cmp(&a.layer)));
         let mut landed: Option<Corridor> = None;
         for c in &cands {
-            if c.span > bound {
-                break; // sorted: every later candidate also exceeds
-            }
             let lt = &tracks[c.layer as usize];
             let path = l_path(c.halo, c.region);
             if path.iter().all(|&(ix, iy)| {
@@ -1066,9 +1082,14 @@ fn escape_extend(
                 break;
             }
         }
-        let attempted = cands.iter().take_while(|c| c.span <= bound).count();
         match landed {
             Some(Corridor { layer: l, span, path }) => {
+                // `pairs_added` counts distinct pairs inserted into
+                // `region`: `path ∪ halo[l]` on the corridor layer
+                // plus each other layer's halo — never
+                // `halo_total + extra.len()` (the corridor layer's
+                // halo appears in both terms).
+                let landed_halo = halo.get(&l).map_or(0, BTreeSet::len);
                 let mut extra: BTreeSet<(u32, u32)> = path.into_iter().collect();
                 for (hl, hs) in halo {
                     if hl == l {
@@ -1080,11 +1101,11 @@ fn escape_extend(
                 merge_pairs(region.entry(l).or_default(), &extra);
                 record(
                     EscapeKind::Halo,
-                    (halo_total + extra.len()) as u32,
+                    (extra.len() + halo_total - landed_halo) as u32,
                     span,
                 );
             }
-            None if attempted > 0 => {
+            None if !cands.is_empty() => {
                 // Every within-bound corridor died at the mask; the
                 // legal halo stays — an island the pin still attaches
                 // to (and route-time access arcs may land on).
@@ -1094,10 +1115,25 @@ fn escape_extend(
                 record(EscapeKind::CorridorMasked, halo_total as u32, cands[0].span);
             }
             None => {
-                // Out of the rescue window — leave the graph as if the
-                // escape never ran for this pin.
-                let gap = cands.first().map(|c| c.span).unwrap_or(u32::MAX);
-                record(EscapeKind::CorridorBound, 0, gap);
+                // Refusal probe: the uncapped re-run per halo layer
+                // separates "nothing to aim at" (`NoAnchor`) from
+                // "target beyond the bound" (`CorridorBound` with the
+                // exact measured gap) — and leaves the graph as if
+                // the escape never ran for this pin either way.
+                let mut gap = u32::MAX;
+                for (&l, hs) in &halo {
+                    let Some(pairs) = region.get(&l) else {
+                        continue;
+                    };
+                    if let Some((span, _, _)) = escape_span(hs, pairs, u32::MAX) {
+                        gap = gap.min(span);
+                    }
+                }
+                if gap == u32::MAX {
+                    record(EscapeKind::NoAnchor, 0, 0);
+                } else {
+                    record(EscapeKind::CorridorBound, 0, gap);
+                }
             }
         }
     }

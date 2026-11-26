@@ -607,7 +607,7 @@ fn test_graph_census() {
 /// `region_escape` — the pre-halo escape set, recorded even when the
 /// pin-halo escape later re-attached the pin. `escapes` parallels
 /// `region_escape` exactly: refused escapes (`CorridorBound`,
-/// `HaloEmpty`) added no pairs and still hold an empty `pin_nodes`
+/// `NoAnchor`, `HaloEmpty`) added no pairs and still hold an empty `pin_nodes`
 /// list, while a pin with attached nodes must carry a `Halo` or
 /// `CorridorMasked` record. Escape names print per design; the gcd
 /// set is pinned.
@@ -652,7 +652,9 @@ fn test_pin_attachment() {
                         match rec.kind {
                             // Refused escapes added nothing — the pin
                             // stays unattached.
-                            EscapeKind::CorridorBound | EscapeKind::HaloEmpty => {
+                            EscapeKind::CorridorBound
+                            | EscapeKind::NoAnchor
+                            | EscapeKind::HaloEmpty => {
                                 assert!(
                                     ids.is_empty(),
                                     "{name}: refused escape {} has nodes",
@@ -900,13 +902,13 @@ fn test_region_escape_fixture() {
     assert_eq!(graphs.total_nodes, 0);
     assert_eq!(graphs.region_escape.len(), 2, "{:?}", graphs.region_escape);
     // With no region pairs to anchor to, every escape is refused as
-    // `CorridorBound` — nothing enters the graph.
+    // `NoAnchor` — nothing enters the graph.
     assert_eq!(graphs.escapes.len(), 2);
     assert!(
-        graphs
-            .escapes
-            .iter()
-            .all(|e| e.kind == EscapeKind::CorridorBound && e.pairs_added == 0),
+        graphs.escapes.iter().all(|e| e.kind == EscapeKind::NoAnchor
+            && e.pairs_added == 0
+            && e.corridor_span == 0
+            && e.token() == "no_anchor"),
         "{:?}",
         graphs.escapes
     );
@@ -1710,6 +1712,26 @@ END NETS
 END DESIGN
 "#;
 
+/// Arm F's occupancy band: io4's met2 port rect lands at absolute
+/// `x∈[1900,2100] × y∈[-2100,5100]`, rasterizing `Pin(n2)` on the
+/// met2 `x = 2000` line over every y-track — every met2 edge on the
+/// `ix = 2` escape column or crossing the band hits the mark, while
+/// `ix = 1`/`ix = 3` stay clear (edge-to-track ≥ 800 > w/2 + s ≈ 210).
+/// A foreign `Pin` is the one light-weight mark that contrasts:
+/// `hit_verdict` hard-blocks `Obs` and foreign `ObsPin` before the
+/// `OccMode::Disabled` check, so OBS rects and instance-pin marks
+/// block in both modes.
+const ESC_DEF_TAIL_OCC: &str = r#"PINS 2 ;
+- io1 + NET n1 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 4000 1000 ) N ;
+- io4 + NET n2 + DIRECTION INPUT + USE SIGNAL + LAYER met2 ( -100 -3600 ) ( 100 3600 ) + PLACED ( 2000 1500 ) N ;
+END PINS
+NETS 2 ;
+- n1 ( PIN io1 ) ( u0 A ) + USE SIGNAL ;
+- n2 ( PIN io4 ) + USE SIGNAL ;
+END NETS
+END DESIGN
+"#;
+
 /// The bounded pin-halo escape (`docs/e6-drt.md` §5): u0/A's met1
 /// rect sits at crossing (1000,1000) but the guide covers only the
 /// io side, and the `w0` wall walls off every met1 stub the
@@ -1719,7 +1741,10 @@ END DESIGN
 /// the mechanism did. Arms: off / merged halo / `CorridorBound`
 /// under a zero bound / `CorridorMasked` when the corridor dies at
 /// the wall. The corridor-landing arm runs on the open fixture,
-/// where a clean L-path records `halo(span=3)`.
+/// where a clean L-path records `halo(span=3)`. The last arm is the
+/// occupancy contrast: a foreign io-port `Pin` band covering only
+/// escaped pairs fails `Enabled` and routes `Disabled` — escaped
+/// metal is occupancy-checked like any other.
 #[test]
 fn test_maze_guide_escape() {
     let mut interner = StringInterner::new();
@@ -1889,8 +1914,72 @@ fn test_maze_guide_escape() {
     assert_eq!(rec.kind, EscapeKind::Halo, "{:?}", rec);
     assert_eq!(rec.corridor_span, 3, "{:?}", rec);
     assert_eq!(rec.token(), "halo(span=3)");
+    // The union-count pin: met1 halo {(1,1)} + corridor path
+    // {(2,1),(3,1)} = 3 distinct pairs; met2's halo {(1,1)} is
+    // already `region` (the transit island) and adds nothing — the
+    // retired `halo_total + extra.len()` arithmetic reported 4.
+    assert_eq!(rec.pairs_added, 3, "{:?}", rec);
     let r = route_nets(&db_open, &tech, &tracks_open, &graphs, &vias_open, &cfg);
     assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+
+    // Arm F — the occupancy contrast (`docs/e6-drt.md` §5): every
+    // met2 pair io4's `Pin` band can hit is an escaped pair
+    // (non-escape met2 `region` is exactly the (1,1) transit
+    // island; the guide covers no met2 at all), so the block is
+    // attributable to escape metal by construction, not by
+    // argument. `Enabled` fails `NoPath` — soft-priced crossings
+    // escalate until the hard iteration blocks them — while
+    // `Disabled` routes the identical graph. The `escapes` record
+    // is `Halo` either way: the graph build is occupancy-
+    // independent, the check is route-time.
+    let db_occ = maze_db_custom(&tech, comps, ESC_DEF_TAIL_OCC);
+    let tracks_occ = layer_tracks(&db_occ, &tech);
+    let vias_occ = via_table(&tech, &db_occ).unwrap();
+    let join_occ = maze_guide(&db_occ, &tech, "n1\n(\n3000 0 5000 2000 met1\n)\n");
+    let graphs_occ = grus_core::drt::graph::build_route_graphs_ext(
+        &db_occ,
+        &tech,
+        &tracks_occ,
+        &join_occ,
+        grus_core::drt::graph::GraphOpts {
+            spare_above: 0,
+            escape: Some(grus_core::drt::graph::EscapeCfg::DEFAULT),
+        },
+    );
+    assert_eq!(graphs_occ.escapes.len(), 1);
+    assert_eq!(
+        graphs_occ.escapes[0].kind,
+        EscapeKind::Halo,
+        "{:?}",
+        graphs_occ.escapes
+    );
+    let pin_occ = graphs_occ.nets[0]
+        .pin_nodes
+        .iter()
+        .find(|&&(p, _)| pin_label(&db_occ, p) == "u0/A")
+        .map(|&(p, _)| p)
+        .unwrap();
+    let r = route_nets(&db_occ, &tech, &tracks_occ, &graphs_occ, &vias_occ, &cfg);
+    assert_eq!(
+        failed(&r, pin_occ),
+        vec![FailKind::NoPath],
+        "{:?}",
+        r.unrouted
+    );
+    let r = route_nets(
+        &db_occ,
+        &tech,
+        &tracks_occ,
+        &graphs_occ,
+        &vias_occ,
+        &MazeConfig {
+            occ: OccMode::Disabled,
+            ..cfg
+        },
+    );
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+    assert_eq!(r.nets.len(), 1);
+    assert_eq!(r.nets[0].connected.len(), 2);
 }
 
 /// The foreign-pin collision contract (`docs/e6-drt.md` §7): a wire

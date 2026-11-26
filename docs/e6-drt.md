@@ -299,18 +299,28 @@ steps on each axis, each candidate kept only where
 `hull.point_allowed` passes and it is not already in `region`.
 When the halo already touches `region` (an index-adjacent pair
 induces an edge at emission) the pairs merge and the pin attaches —
-`EscapeKind::Halo` with span 0. Otherwise the argmin-span layer — an
-`escape_span` multi-source BFS to the nearest non-halo region pair,
+`EscapeKind::Halo` with span 0. Otherwise the argmin-span layer —
+`escape_span`, a bounded windowed enumeration of the layer's region
+pairs (distance on an unobstructed 4-connected index grid is
+Manhattan distance; each pair is pruned in O(1) by its distance to
+the halo bbox — `cap = corridor_lines` (floored at 1, since an
+adjacent pair needs no corridor) for candidates, uncapped on
+the refusal path so the recorded gap is exact — never a grid BFS),
 the unmasked surface winning ties — tries an L-corridor of
 ≤`EscapeCfg::corridor_lines` (=8, ≈1–2 GCell pitches) index steps
 back to it: every corridor pair must pass `point_allowed` or the next
 candidate layer is tried. Outcomes: `halo(span=N)` corridor landed;
 `corridor_masked` every within-bound corridor died at the mask (the
 legal halo stays, so the pin can still attach); `corridor_bound
-(span=N)` the nearest region pair exceeded the bound; `halo_empty`
-no candidate survived (sub-pitch rects, mask-sealed windows) — the
-refused kinds add nothing for that pin, so `pin_nodes` stays empty →
-`Unattachable`. The corridor bound is total Manhattan index steps,
+(span=N)` the nearest region pair exceeded the bound (N the measured
+gap); `no_anchor` no non-halo region pair on any escape layer — the
+corridor had no target; `halo_empty` no candidate survived
+(sub-pitch rects, mask-sealed windows). The refused kinds add no
+pairs; the pin's final `FailKind` follows the route-time attach
+ladder — `Unattachable` when every rung is empty, `NoPath` when a
+transit-island/projection/access landing survives (the fixture's
+escape-off arm is the latter). The corridor bound is total
+Manhattan index steps,
 both legs — a rescue window for "guide box stops just short", not an
 arbitrary rewrite. Records land in `RouteGraphs::escapes` (net, pin,
 kind, `pairs_added`, `corridor_span`) and the fail line carries
@@ -321,7 +331,11 @@ kind, `pairs_added`, `corridor_span`) and the fail line carries
 Router implication: the maze side needs no escape code — halo and
 corridor pairs enter `region` before emission, so strict attach,
 `project_attach`, `access_vias` and `relaxed_vias` all see them, and
-the §7 occupancy checks apply identically (no exemption path). The
+the §7 occupancy checks apply identically (no exemption path) —
+proven by the fixture's `OccMode` enabled-vs-disabled arm on a
+foreign `Pin` band that geometrically covers only escaped pairs
+(`Obs`/`ObsPin` cannot contrast — they hard-block before the
+`Disabled` check). The
 §7 projection fallback remains the attach path for class-(b) io
 ports whose inflated window still holds no complete crossing (gcd's
 10 `halo_empty` records), plus `spare_above = 1` region layers for
@@ -801,8 +815,11 @@ strict node at graph build — an ever-failed alternative census is
 with a `RouteGraphs::escapes` record — the §5 rescue attempt's
 outcome, one of `halo` (halo merged, span 0), `halo(span=N)`
 (L-corridor landed), `corridor_bound(span=N)` (nearest region pair
-beyond the bound — the refused rescue's measured distance),
+beyond the bound — the refused rescue's measured distance; N is the
+exact gap from the uncapped refusal probe, never a sentinel),
 `corridor_masked` (every within-bound corridor died at the mask),
+`no_anchor` (no non-halo region pair on any escape layer — the
+corridor had no target),
 `halo_empty` (no halo candidate survived). On gcd no escaped pin
 ends in `u.failed`, so the committed `cli_lines` show no token;
 `recount_unrouted.py` accepts 3–5 fields per fail line. The CLI
