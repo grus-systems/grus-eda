@@ -631,6 +631,29 @@ fn drc_finding_line(rule: &str, f: &grus_core::drc::report::Finding) -> String {
     }
 }
 
+/// The per-rule findings block both `drt` subset checks print through —
+/// identical rule names and finding lines for `preemit_check` and
+/// `self_drc`.
+fn print_subset_findings(tag: &str, subset: &grus_core::drc::report::SubsetReport) {
+    let findings_total: usize = subset.rules.iter().map(|o| o.findings.len()).sum();
+    println!("{tag} findings_total={findings_total}");
+    for o in &subset.rules {
+        if o.findings.is_empty() {
+            continue;
+        }
+        println!(
+            "  rule={} family={} layer={} findings={}",
+            o.rule,
+            drc_family_name(o.family),
+            o.layer.as_deref().unwrap_or("-"),
+            o.findings.len(),
+        );
+        for f in &o.findings {
+            println!("    {}", drc_finding_line(o.rule, f));
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 struct DrcArgs {
     #[arg(long, help = "Path to technology LEF (.tlef) file")]
@@ -689,6 +712,13 @@ struct DrtArgs {
         help = "Re-parse the emitted DEF, assemble, and run the 50-rule subset checker"
     )]
     self_drc: bool,
+
+    #[arg(
+        long,
+        help = "Assemble the post-`apply_routes` shape set and run the \
+                50-rule subset checker before the routed DEF is written"
+    )]
+    preemit_check: bool,
 
     #[arg(
         long,
@@ -2060,6 +2090,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let report = grus_core::drt::emit::apply_routes(
                 &mut design_db, tech_db, &graphs, &route_db, &vias,
             )?;
+            // Detection precedes the write: the check runs on the
+            // committed `net_geoms`, not the emitted text.
+            let preemit = args
+                .preemit_check
+                .then(|| grus_core::drt::emit::preemit_check(&design_db, tech_db))
+                .transpose()?;
             grus_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
 
             let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
@@ -2282,29 +2318,20 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
 
+            if let Some(subset) = &preemit {
+                print_subset_findings("preemit_check", subset);
+                println!(
+                    "preemit_check scope: report-only — 50-rule lef_expressible subset on the \
+                     in-memory emit shape set (same input --self-drc re-parses); findings do \
+                     not gate the write or the exit code until drt-selfdrc-exit lands"
+                );
+            }
             if args.self_drc {
                 let reparsed = grus_core::readers::parse_def(&args.out_def, tech_db, None)?;
                 let drc_design = grus_core::drc::geom::assemble(&reparsed, tech_db)?;
                 let subset =
                     grus_core::drc::report::run_all(&drc_design, tech_db, &reparsed.strings);
-                let findings_total: usize =
-                    subset.rules.iter().map(|o| o.findings.len()).sum();
-                println!("self_drc findings_total={findings_total}");
-                for o in &subset.rules {
-                    if o.findings.is_empty() {
-                        continue;
-                    }
-                    println!(
-                        "  rule={} family={} layer={} findings={}",
-                        o.rule,
-                        drc_family_name(o.family),
-                        o.layer.as_deref().unwrap_or("-"),
-                        o.findings.len(),
-                    );
-                    for f in &o.findings {
-                        println!("    {}", drc_finding_line(o.rule, f));
-                    }
-                }
+                print_subset_findings("self_drc", &subset);
                 println!(
                     "self_drc scope: 50-rule lef_expressible subset on our emitted DEF — \
                      the full Magic deck check on our DEF belongs to e6-drt-e2e"
@@ -2575,6 +2602,7 @@ mod tests {
             "--out-def",
             "o",
             "--self-drc",
+            "--preemit-check",
             "--occ",
             "disabled",
             "--reference",
@@ -2588,6 +2616,7 @@ mod tests {
         };
         assert_eq!(args.out_def, PathBuf::from("o"));
         assert!(args.self_drc);
+        assert!(args.preemit_check);
         assert!(matches!(args.occ, OccArg::Disabled));
         assert_eq!(args.reference, Some(PathBuf::from("r.json")));
         assert_eq!(args.max_iters, 3);

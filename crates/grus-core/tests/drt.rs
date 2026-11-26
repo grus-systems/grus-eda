@@ -31,7 +31,7 @@ use grus_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
 use grus_core::drt::via::{ViaPair, ViaTable, via_table};
 use grus_core::interner::{LayerId, NetId, PinId, StringInterner};
 use grus_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
-use grus_core::tech_db::{LayerDir, TechDb};
+use grus_core::tech_db::{LayerDir, RectDbu, TechDb};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -1971,9 +1971,10 @@ fn test_route_digest_covers_pin_collisions() {
 // Routed DEF emission + self-DRC gate
 // ---------------------------------------------------------------------------
 
+use grus_core::drc::ShapeSrc;
 use grus_core::drc::geom::assemble;
 use grus_core::drc::report::{Family, SubsetReport, run_all};
-use grus_core::drt::emit::{EmitReport, apply_routes, write_routed_def};
+use grus_core::drt::emit::{EmitReport, apply_routes, preemit_check, write_routed_def};
 use grus_core::drt::maze::RouteDb;
 
 /// Route `name` and apply the result into `db.net_geoms` — the shared
@@ -2369,6 +2370,116 @@ fn test_emit_determinism() {
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out2).unwrap(),
         "two emit passes produced different bytes"
+    );
+}
+
+/// The pre-emit check on clean gcd: zero findings over nonzero
+/// coverage, deterministic, `IoPort` rects present in the assembled
+/// set — and the load-bearing equivalence: the in-memory report equals
+/// the write → re-parse → `run_all` report verbatim, which is what
+/// "the checked set is the emitted set" means (AGENTS §7.2 — tested,
+/// not asserted in prose).
+#[test]
+fn test_preemit_gcd() {
+    let (tech, db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let pre = preemit_check(&db, &tech).expect("preemit_check");
+    assert_eq!(
+        findings_total(&pre),
+        0,
+        "clean gcd carries pre-emit findings: {}",
+        pre.rules
+            .iter()
+            .filter(|o| !o.findings.is_empty())
+            .map(|o| format!("{}:{}", o.rule, o.findings.len()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for family in [
+        Family::Width,
+        Family::Spacing,
+        Family::Enclosure,
+        Family::Area,
+    ] {
+        let candidates: usize = pre
+            .rules
+            .iter()
+            .filter(|o| o.family == family)
+            .map(|o| o.candidates)
+            .sum();
+        assert!(candidates > 0, "gcd: {family:?} family checked nothing");
+    }
+    assert_eq!(pre, preemit_check(&db, &tech).expect("preemit_check 2"));
+
+    let io_ports = assemble(&db, &tech)
+        .expect("assemble")
+        .routing
+        .iter()
+        .flat_map(|ls| ls.rects.iter())
+        .filter(|s| s.src == ShapeSrc::IoPort)
+        .count();
+    assert!(io_ports > 0, "gcd emit carries no IoPort shapes");
+
+    let out = tmp_def("gcd-preemit");
+    write_routed_def(&db, &tech, &placed_def("gcd"), &out).expect("write");
+    let (_db2, drc_report) = self_drc(&out, &tech);
+    assert_eq!(
+        pre, drc_report,
+        "in-memory report diverges from the emit→parse report — a writer bug"
+    );
+}
+
+/// Fail-proof arm for the pre-emit check: a `SignalWire` injected at a
+/// 1-DBU gap to a foreign io-port rect must surface as a
+/// `Family::Spacing` finding that names the port's rect and net —
+/// `IoPort` is a checkable endpoint in the emitted set, not just
+/// present geometry.
+#[test]
+fn test_preemit_foreign_pin() {
+    let (tech, mut db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let d = assemble(&db, &tech).expect("assemble");
+    let (lid, pin_rect, port_net) = d
+        .routing
+        .iter()
+        .enumerate()
+        .flat_map(|(l, ls)| ls.rects.iter().map(move |s| (l, s)))
+        .find_map(|(l, s)| {
+            (s.src == ShapeSrc::IoPort && s.net.is_some())
+                .then(|| (LayerId(l as u8), s.rect, s.net.unwrap()))
+        })
+        .expect("gcd emit carries net-tagged io-port shapes");
+    let bound = tech.routing_layers[lid.0 as usize].min_spacing_dbu();
+    assert!(bound > 1, "io-port layer has no spacing bound to violate");
+    let b = (0..db.num_nets())
+        .find(|&n| db.net_names[n] != port_net)
+        .expect("a foreign net exists");
+    let w = RectDbu::new(
+        pin_rect.xh + 1,
+        pin_rect.yl,
+        pin_rect.xh + 1 + bound,
+        pin_rect.yh,
+    );
+    println!(
+        "injected: net {} wire {w:?} on layer {lid:?} at gap 1 < bound {bound} of port rect {pin_rect:?}",
+        net_name(&db, NetId(b as u32)),
+    );
+    db.net_geoms[b].wire_rects.push((lid, w));
+
+    let pre = preemit_check(&db, &tech).expect("preemit_check");
+    print_gate("gcd(preemit-injected)", &pre);
+    assert!(
+        findings_total(&pre) >= 1,
+        "io-port-adjacent inject produced no finding — the check is vacuous"
+    );
+    let port_name = db.strings.resolve(port_net).to_string();
+    let hit = pre
+        .rules
+        .iter()
+        .filter(|o| o.family == Family::Spacing)
+        .flat_map(|o| o.findings.iter())
+        .find(|f| f.bboxes.contains(&pin_rect) && f.nets.iter().any(|n| n == &port_name));
+    assert!(
+        hit.is_some(),
+        "no spacing finding names the io-port rect {pin_rect:?} and net {port_name}"
     );
 }
 
