@@ -23,18 +23,25 @@ measurement says so.
 - **OpenSTA source is not read or copied.** OpenROAD is BSD-licensed and may be read;
   OpenSTA is GPL and is used only through its published papers and its output.
 
-## What fails today
+## What failed before the R-items (2026-11 snapshot — all four closed)
 
-Running grus-eda on the output of a real LibreLane run of a design with latches and clock
-gating shows four classes of difference from OpenSTA:
+This section is the dated record of why the R0-R10 work items exist. Running grus-eda on
+the output of a real LibreLane run of a design with latches and clock gating showed four
+classes of difference from OpenSTA, **all closed as of 2026-11-26** (resolutions in
+parentheses; the items below are the original wording):
 
 1. Setup slack is too optimistic and hold violations do not appear: the clock is ideal, but
    the real clock tree has cell-driven nets with large latency and skew. (Hold analysis
    itself exists and matches OpenSTA on ideal clocks; what is missing is the clock tree.)
+   → closed: propagated-clock STA (R2) and clock-tree synthesis (`v0.5.x`, E5).
 2. Many latch and clear/preset arcs are skipped. The skipped count is printed as a warning
    but does not say what fraction of the design is affected.
+   → closed: latch `D -> Q` with time borrowing is modeled; skip counts and shares print
+   per run (R0) with `--strict`/`--json`.
 3. The LibreLane SDC is rejected as written; it had to be rewritten by hand.
+   → closed: stock LibreLane `write_sdc` output parses unchanged (N2, R1).
 4. `set_timing_derate` is dropped, which shifts every path.
+   → closed: derate is applied per corner (N2).
 
 The items below close these gaps, in the order proposed at the end.
 
