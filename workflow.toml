@@ -5,7 +5,9 @@ reviewer = { driver = "devin", model = "swe-2" }       # driver for diff review
 max_verify_attempts = 3  # verify self-fix loop bound
 max_revises = 2          # reviewer revise loop bound
 max_implement_retries = 1  # implement executor-failure retry bound
-timeout_sec = 1800       # per subprocess invocation
+timeout_sec = 7200       # per subprocess invocation — the dev-profile
+                          # drt tests alone measured 2196 s on an M4
+                          # host; 1800 structurally cannot fit the suite
 # Generated picorv32 artifacts (gitignored) must be present in each
 # task worktree or the sta tests panic — seed copies them from the
 # main checkout at worktree creation.
@@ -28,7 +30,7 @@ kind = "host"
 # Verify commands run in declaration order inside the task worktree:
 [[verify]]
 name = "test-workspace"
-cmd = "cargo test --workspace"
+cmd = "cargo test --workspace --profile verify"
 
 [[verify]]
 name = "clippy"

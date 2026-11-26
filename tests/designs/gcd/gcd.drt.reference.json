@@ -1,0 +1,267 @@
+{
+  "design": "gcd",
+  "input_def": "gcd.placed.def",
+  "input_sdc": "gcd.sdc",
+  "image": "ghcr.io/librelane/librelane:3.0.16",
+  "generated_by": "tests/designs/generate_drt_ref.sh",
+  "prior_routed_def": {
+    "file": "gcd.routed.def",
+    "size_bytes": 224344,
+    "sha256_16": "d1571bd2eeddd947",
+    "baseline_def_identical": true
+  },
+  "prior_routed_def_present": true,
+  "variants": {
+    "baseline": {
+      "flow": "global_route+detailed_route",
+      "guide": {
+        "file": "runs/drt/gcd.baseline.guide",
+        "source": "emitted_by_global_route",
+        "size_bytes": 58761,
+        "sha256_16": "89aad22aebcc230e"
+      },
+      "signal_nets_in_def": 269,
+      "signal_nets_routed": 269,
+      "drc_violations": 0,
+      "drc_report": {
+        "file": "gcd.drc.baseline.rpt",
+        "committed": true,
+        "size_bytes": 0,
+        "sha256_16": "e3b0c44298fc1c14"
+      },
+      "antenna_check_command": "check_antennas -report_file",
+      "antenna_violations": 0,
+      "antenna_net_violations": 0,
+      "antenna_pin_violations": 0,
+      "antenna_report": {
+        "file": "gcd.antenna.baseline.rpt",
+        "committed": true,
+        "size_bytes": 0,
+        "sha256_16": "e3b0c44298fc1c14",
+        "nonblank_lines": 0
+      },
+      "antenna_log_lines": [
+        "[ERROR ANT-0008] No detailed or global routing found. Run global_route or detailed_route first.",
+        "[INFO ANT-0002] Found 0 net violations.",
+        "[INFO ANT-0001] Found 0 pin violations."
+      ],
+      "antenna_probe": {
+        "catch": 1,
+        "result": "ANT-0008",
+        "error_text": "No detailed or global routing found. Run global_route or detailed_route first."
+      },
+      "surface": {
+        "route": "draw_route_segments set_nets_to_route add_sroute_connect global_route detailed_route design_is_routed detailed_route_debug write_global_route_segments detailed_route_num_drvs detailed_route_run_worker global_route_debug detailed_route_set_default_via read_global_route_segments detailed_route_set_unidirectional_layer detailed_route_worker_debug rdl_route",
+        "antenna": "repair_antennas check_antennas",
+        "guide": "read_guides write_guides",
+        "wire_length": "report_wire_length"
+      },
+      "total_wirelength_um": 6154.505,
+      "wirelength_source": "routed_def_parse",
+      "def_dbu_per_micron": 1000,
+      "vias_per_cut_layer": {
+        "L1M1_PR_MR": 884,
+        "M1M2_PR": 881,
+        "M1M2_PR_MR": 2,
+        "M2M3_PR": 28,
+        "M3M4_PR": 2
+      },
+      "via_names_meaning": {
+        "L1M1_PR_MR": "mcon",
+        "M1M2_PR": "via",
+        "M1M2_PR_MR": "via",
+        "M2M3_PR": "via2",
+        "M3M4_PR": "via3"
+      },
+      "via_count_total": 1797,
+      "routed_def": {
+        "file": "gcd.drt.baseline.def",
+        "committed": false,
+        "size_bytes": 224344,
+        "sha256_16": "d1571bd2eeddd947"
+      },
+      "drt_summary_lines": [
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer mcon",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer mcon",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via2",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via2",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via3",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via3",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via4",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via4",
+        "[INFO DRT-0167] List of default vias:",
+        "[INFO DRT-0168] Init region query.",
+        "[INFO DRT-0033] FR_MASTERSLICE shape region query size = 0.",
+        "[INFO DRT-0033] licon shape region query size = 0.",
+        "[INFO DRT-0033] li1 shape region query size = 8469.",
+        "[INFO DRT-0033] mcon shape region query size = 0.",
+        "[INFO DRT-0033] met1 shape region query size = 1208.",
+        "[INFO DRT-0033] via shape region query size = 150.",
+        "[INFO DRT-0033] met2 shape region query size = 119.",
+        "[INFO DRT-0033] via2 shape region query size = 120.",
+        "[INFO DRT-0033] met3 shape region query size = 115.",
+        "[INFO DRT-0033] via3 shape region query size = 120.",
+        "[INFO DRT-0033] met4 shape region query size = 36.",
+        "[INFO DRT-0033] via4 shape region query size = 2.",
+        "[INFO DRT-0033] met5 shape region query size = 6.",
+        "[INFO DRT-0178] Init guide query.",
+        "[INFO DRT-0036] FR_MASTERSLICE guide region query size = 0.",
+        "[INFO DRT-0036] licon guide region query size = 0.",
+        "[INFO DRT-0036] li1 guide region query size = 695.",
+        "[INFO DRT-0036] mcon guide region query size = 0.",
+        "[INFO DRT-0036] met1 guide region query size = 588.",
+        "[INFO DRT-0036] via guide region query size = 0.",
+        "[INFO DRT-0036] met2 guide region query size = 308.",
+        "[INFO DRT-0036] via2 guide region query size = 0.",
+        "[INFO DRT-0036] met3 guide region query size = 29.",
+        "[INFO DRT-0036] via3 guide region query size = 0.",
+        "[INFO DRT-0036] met4 guide region query size = 1.",
+        "[INFO DRT-0036] via4 guide region query size = 0.",
+        "[INFO DRT-0036] met5 guide region query size = 0.",
+        "[INFO DRT-0179] Init gr pin query."
+      ],
+      "grt_log_lines": [],
+      "timing": {
+        "global_route_s": 0.069,
+        "detailed_route_s": 23.284,
+        "check_antennas_s": 0.302,
+        "total_route_s": 23.655
+      }
+    },
+    "delegated": {
+      "flow": "read_guides+detailed_route",
+      "guide": {
+        "file": "runs/guide-check/gcd.ours.guide",
+        "source": "grus-eda route --guide-out",
+        "size_bytes": 61953,
+        "sha256_16": "896356faee4aa648"
+      },
+      "signal_nets_in_def": 269,
+      "signal_nets_routed": 269,
+      "drc_violations": 0,
+      "drc_report": {
+        "file": "gcd.drc.delegated.rpt",
+        "committed": true,
+        "size_bytes": 0,
+        "sha256_16": "e3b0c44298fc1c14"
+      },
+      "antenna_check_command": "check_antennas -report_file",
+      "antenna_violations": 0,
+      "antenna_net_violations": 0,
+      "antenna_pin_violations": 0,
+      "antenna_report": {
+        "file": "gcd.antenna.delegated.rpt",
+        "committed": true,
+        "size_bytes": 0,
+        "sha256_16": "e3b0c44298fc1c14",
+        "nonblank_lines": 0
+      },
+      "antenna_log_lines": [
+        "[ERROR ANT-0008] No detailed or global routing found. Run global_route or detailed_route first.",
+        "[INFO ANT-0002] Found 0 net violations.",
+        "[INFO ANT-0001] Found 0 pin violations."
+      ],
+      "antenna_probe": {
+        "catch": 1,
+        "result": "ANT-0008",
+        "error_text": "No detailed or global routing found. Run global_route or detailed_route first."
+      },
+      "surface": {
+        "route": "draw_route_segments set_nets_to_route add_sroute_connect global_route detailed_route design_is_routed detailed_route_debug write_global_route_segments detailed_route_num_drvs detailed_route_run_worker global_route_debug detailed_route_set_default_via read_global_route_segments detailed_route_set_unidirectional_layer detailed_route_worker_debug rdl_route",
+        "antenna": "repair_antennas check_antennas",
+        "guide": "read_guides write_guides",
+        "wire_length": "report_wire_length"
+      },
+      "total_wirelength_um": 6046.305,
+      "wirelength_source": "routed_def_parse",
+      "def_dbu_per_micron": 1000,
+      "vias_per_cut_layer": {
+        "L1M1_PR_MR": 879,
+        "M1M2_PR": 899,
+        "M1M2_PR_MR": 2,
+        "M2M3_PR": 27
+      },
+      "via_names_meaning": {
+        "L1M1_PR_MR": "mcon",
+        "M1M2_PR": "via",
+        "M1M2_PR_MR": "via",
+        "M2M3_PR": "via2"
+      },
+      "via_count_total": 1807,
+      "routed_def": {
+        "file": "gcd.drt.delegated.def",
+        "committed": false,
+        "size_bytes": 223846,
+        "sha256_16": "2f0033107f22cb73"
+      },
+      "drt_summary_lines": [
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer mcon",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer mcon",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via2",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via2",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via3",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via3",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via4",
+        "[WARNING DRT-0349] LEF58_ENCLOSURE with no CUTCLASS is not supported. Skipping for layer via4",
+        "[INFO DRT-0167] List of default vias:",
+        "[INFO DRT-0168] Init region query.",
+        "[INFO DRT-0033] FR_MASTERSLICE shape region query size = 0.",
+        "[INFO DRT-0033] licon shape region query size = 0.",
+        "[INFO DRT-0033] li1 shape region query size = 8469.",
+        "[INFO DRT-0033] mcon shape region query size = 0.",
+        "[INFO DRT-0033] met1 shape region query size = 1208.",
+        "[INFO DRT-0033] via shape region query size = 150.",
+        "[INFO DRT-0033] met2 shape region query size = 119.",
+        "[INFO DRT-0033] via2 shape region query size = 120.",
+        "[INFO DRT-0033] met3 shape region query size = 115.",
+        "[INFO DRT-0033] via3 shape region query size = 120.",
+        "[INFO DRT-0033] met4 shape region query size = 36.",
+        "[INFO DRT-0033] via4 shape region query size = 2.",
+        "[INFO DRT-0033] met5 shape region query size = 6.",
+        "[INFO DRT-0178] Init guide query.",
+        "[INFO DRT-0036] FR_MASTERSLICE guide region query size = 0.",
+        "[INFO DRT-0036] licon guide region query size = 0.",
+        "[INFO DRT-0036] li1 guide region query size = 696.",
+        "[INFO DRT-0036] mcon guide region query size = 0.",
+        "[INFO DRT-0036] met1 guide region query size = 603.",
+        "[INFO DRT-0036] via guide region query size = 0.",
+        "[INFO DRT-0036] met2 guide region query size = 307.",
+        "[INFO DRT-0036] via2 guide region query size = 0.",
+        "[INFO DRT-0036] met3 guide region query size = 25.",
+        "[INFO DRT-0036] via3 guide region query size = 0.",
+        "[INFO DRT-0036] met4 guide region query size = 0.",
+        "[INFO DRT-0036] via4 guide region query size = 0.",
+        "[INFO DRT-0036] met5 guide region query size = 0.",
+        "[INFO DRT-0179] Init gr pin query."
+      ],
+      "grt_log_lines": [
+        "[WARNING GRT-0008] The read_guides command does not allow parasitics estimation from the guides file."
+      ],
+      "timing": {
+        "read_guides_s": 0.083,
+        "detailed_route_s": 29.505,
+        "check_antennas_s": 0.236,
+        "total_route_s": 29.824
+      }
+    }
+  },
+  "delta": {
+    "drc_violations": 0,
+    "antenna_violations": 0,
+    "total_wirelength_um": -108.2,
+    "total_wirelength_pct": -1.7581,
+    "via_count_total": 10,
+    "vias_per_cut_layer": {
+      "L1M1_PR_MR": -5,
+      "M1M2_PR": 18,
+      "M1M2_PR_MR": 0,
+      "M2M3_PR": -1,
+      "M3M4_PR": -2
+    },
+    "total_route_s": 6.169
+  }
+}

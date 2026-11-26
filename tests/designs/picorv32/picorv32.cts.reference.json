@@ -1,0 +1,36 @@
+{
+  "design": "picorv32",
+  "clock": "core_clk",
+  "cts_root_buf": "sky130_fd_sc_hd__clkbuf_16",
+  "cts_buf_list": [
+    "sky130_fd_sc_hd__clkbuf_8",
+    "sky130_fd_sc_hd__clkbuf_4",
+    "sky130_fd_sc_hd__clkbuf_2"
+  ],
+  "cts_wire_unit": 20000,
+  "inserted_instances": 253,
+  "tree_buffers": {
+    "sky130_fd_sc_hd__clkbuf_8": 68,
+    "sky130_fd_sc_hd__clkbuf_16": 129
+  },
+  "dummy_loads": {
+    "sky130_fd_sc_hd__bufinv_16": 4,
+    "sky130_fd_sc_hd__clkbuf_4": 19,
+    "sky130_fd_sc_hd__clkbuf_8": 15,
+    "sky130_fd_sc_hd__clkinv_2": 11,
+    "sky130_fd_sc_hd__clkinvlp_4": 6,
+    "sky130_fd_sc_hd__inv_6": 1
+  },
+  "clock_subnets": 197,
+  "sinks": 1597,
+  "tree_depth": 4,
+  "avg_sink_wirelength_um": 756.54,
+  "clock_net_wirelength_um": 12749.174,
+  "clock_net_wirelength_basis": "hpwl",
+  "skew_setup_ns": -0.034164505524969524,
+  "skew_hold_ns": -0.034164505524969524,
+  "latency_max_ns": 0.793474,
+  "latency_min_ns": 0.757265,
+  "def_components": 10458,
+  "def_signal_nets": 7008
+}

@@ -400,6 +400,7 @@ mod tests {
             offset_x_frac: false,
             offset_y_frac: false,
             layer: None,
+        rects: Vec::new(),
         });
 
         let mac = MacroDef {
@@ -410,6 +411,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 1,
             obs_rects: Vec::new(),
+            obs_rects_raw: Vec::new(),
             pin_obs_rects: Vec::new(),
         };
         tech_db.macros.push(mac);
@@ -442,6 +444,8 @@ mod tests {
             design_db.pin_dirs.push(PinDir::Input);
             design_db.pin_offset_x_dbu.push(200); // 0.2 um
             design_db.pin_offset_y_dbu.push(300); // 0.3 um
+            design_db.pin_io_layer.push(None);
+            design_db.pin_io_rects.push(Vec::new());
             design_db.pin_is_driver.push(i == 0);
         }
         design_db.cell_pin_offsets.push(3);

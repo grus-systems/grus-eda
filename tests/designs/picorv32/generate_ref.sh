@@ -2,9 +2,14 @@
 # Reproduction script for picorv32 reference artifacts in grus-eda.
 # Generates picorv32.synth.v, picorv32.synth.json, picorv32.floorplan.def, picorv32.placed.def,
 # picorv32.routed.spef (OpenROAD's placement estimate), picorv32.routed.def, picorv32.drc.rpt,
-# picorv32.rcx.spef (routed extraction), picorv32.orient.def, picorv32.orient.pins.txt,
-# picorv32.util65.def, picorv32.gcell_usage.txt, picorv32.reference.json and
-# picorv32.sta.reference.json using LibreLane, OpenROAD, and OpenSTA inside the
+# picorv32.rcx.spef (routed extraction), picorv32.guide (OpenROAD global_route -guide_file),
+# picorv32.guide.caps.txt (estimate_parasitics -global_routing on that guide; the
+# ~5 MB picorv32.guide.spef stays gitignored),
+# picorv32.orient.def, picorv32.orient.pins.txt,
+# picorv32.util65.def, picorv32.gcell_usage.txt, picorv32.reference.json,
+# picorv32.sta.reference.json, and picorv32.guide.sta.reference.json (step 9c:
+# OpenSTA endpoints on three guide-parasitics modes; gitignored) using
+# LibreLane, OpenROAD, and OpenSTA inside the
 # canonical container ghcr.io/librelane/librelane:3.0.16.
 
 set -euo pipefail
@@ -153,6 +158,42 @@ if [ -s "${SCRIPT_DIR}/picorv32.drc.rpt" ]; then
     exit 1
 fi
 echo "DRC violations: 0 (picorv32.drc.rpt is empty)"
+
+# 5c. Committed route-guide golden: global_route -guide_file on picorv32.placed.def with the
+#     same signal band and layer adjustments GCellGrid::build applies by default
+#     (met1 0.30, met2..met5 0.20). Step 5b's runs/canonical guide is untouched; this
+#     one is the comparison reference for our emitted guides.
+openroad -no_init -no_splash << 'EOF'
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/picorv32/picorv32.placed.def
+read_sdc /work/tests/designs/picorv32/picorv32.sdc
+set_routing_layers -signal met1-met5 -clock met3-met5
+set_global_routing_layer_adjustment met1 0.30
+set_global_routing_layer_adjustment met2-met5 0.20
+global_route -guide_file /work/tests/designs/picorv32/picorv32.guide -congestion_iterations 100
+exit
+EOF
+
+# 5d. Guide-parasitics golden: read_guides on the committed picorv32.guide, then
+#     estimate_parasitics -global_routing. The SPEF is regenerated here but
+#     gitignored (size); the caps table is the assertion input for the
+#     guide-parasitics tests.
+openroad -no_init -no_splash << 'EOF'
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/picorv32/picorv32.placed.def
+read_sdc /work/tests/designs/picorv32/picorv32.sdc
+set_wire_rc -layer met2
+read_guides /work/tests/designs/picorv32/picorv32.guide
+estimate_parasitics -global_routing -spef_file /work/tests/designs/picorv32/picorv32.guide.spef
+exit
+EOF
+
+python3 /work/tests/designs/guide_caps.py extract \
+    "${SCRIPT_DIR}/picorv32.guide.spef" "${SCRIPT_DIR}/picorv32.guide.caps.txt"
 
 # The Tcl below is fed to openroad on stdin, where the interactive shell treats `!` as
 # history expansion. Write negations as `== 0`, never `![...]`.
@@ -982,5 +1023,137 @@ puts "Appended routed_spef mode to picorv32.sta.reference.json"
 exit
 EOF
 openroad -no_init -no_splash "${RUN_DIR}/dump_sta_routed_ref.tcl"
+
+# 9c. Guide-parasitics STA golden (picorv32.guide.sta.reference.json): OpenSTA
+#     per-endpoint values on three guide-parasitics modes, one openroad process
+#     each so every read_spef/estimate_parasitics starts from a clean parasitics
+#     state (the 9b precedent):
+#       guide_spef          read_spef picorv32.guide.spef — OpenROAD's own guide
+#                           -> its -global_routing RC. The criterion-4 gate
+#                           reference.
+#       guide_ours_spef     read_spef picorv32.guide.ours.spef — our guide -> our
+#                           RC -> our write_spef; ours-vs-this is the pure
+#                           STA-engine residual, and read_spef accepting the
+#                           file is the write_spef interop check.
+#       guide_ours_readback read_guides runs/guide-check/picorv32.ours.guide +
+#                           estimate_parasitics -global_routing — our guide ->
+#                           OpenROAD's RC in memory; vs guide_spef it isolates
+#                           guide topology, vs guide_ours_spef it isolates the
+#                           RC model (incl. EST-0026 treatment).
+#     Consumes generate_guide_ours_spef.sh outputs — fails loudly without them.
+if [ ! -f "${SCRIPT_DIR}/picorv32.guide.spef" ]; then
+    echo "Error: missing ${SCRIPT_DIR}/picorv32.guide.spef (step 5d output)." >&2
+    exit 1
+fi
+for f in "${SCRIPT_DIR}/picorv32.guide.ours.spef" \
+         "${SCRIPT_DIR}/runs/guide-check/picorv32.ours.guide"; do
+    if [ ! -f "${f}" ]; then
+        echo "Error: missing ${f} — run tests/designs/generate_guide_ours_spef.sh picorv32 first." >&2
+        exit 1
+    fi
+done
+
+cat << 'EOF' > "${RUN_DIR}/dump_guide_sta_spef.tcl"
+source /work/tests/designs/picorv32/runs/canonical/collect_endpoints.tcl
+
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/picorv32/picorv32.placed.def
+read_sdc /work/tests/designs/picorv32/picorv32.sdc
+
+read_spef /work/tests/designs/picorv32/picorv32.guide.spef
+set gs_wns_max [format "%.6f" [sta::worst_slack -max]]
+set gs_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set gs_wns_min [format "%.6f" [sta::worst_slack -min]]
+set gs_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set gs_endpoints [collect_endpoints_json]
+
+set fp [open "/work/tests/designs/picorv32/picorv32.guide.sta.reference.json" "w"]
+puts $fp "{"
+puts $fp "  \"design\": \"picorv32\","
+puts $fp "  \"guide_spef\": {"
+puts $fp "    \"wns_max_ns\": $gs_wns_max,"
+puts $fp "    \"tns_max_ns\": $gs_tns_max,"
+puts $fp "    \"wns_min_ns\": $gs_wns_min,"
+puts $fp "    \"tns_min_ns\": $gs_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $gs_endpoints
+puts $fp "    \]"
+puts $fp "  },"
+close $fp
+puts "Wrote guide_spef block of picorv32.guide.sta.reference.json"
+exit
+EOF
+openroad -no_init -no_splash "${RUN_DIR}/dump_guide_sta_spef.tcl"
+
+cat << 'EOF' > "${RUN_DIR}/dump_guide_sta_ours_spef.tcl"
+source /work/tests/designs/picorv32/runs/canonical/collect_endpoints.tcl
+
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/picorv32/picorv32.placed.def
+read_sdc /work/tests/designs/picorv32/picorv32.sdc
+
+read_spef /work/tests/designs/picorv32/picorv32.guide.ours.spef
+set gos_wns_max [format "%.6f" [sta::worst_slack -max]]
+set gos_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set gos_wns_min [format "%.6f" [sta::worst_slack -min]]
+set gos_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set gos_endpoints [collect_endpoints_json]
+
+set fp [open "/work/tests/designs/picorv32/picorv32.guide.sta.reference.json" "a"]
+puts $fp "  \"guide_ours_spef\": {"
+puts $fp "    \"wns_max_ns\": $gos_wns_max,"
+puts $fp "    \"tns_max_ns\": $gos_tns_max,"
+puts $fp "    \"wns_min_ns\": $gos_wns_min,"
+puts $fp "    \"tns_min_ns\": $gos_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $gos_endpoints
+puts $fp "    \]"
+puts $fp "  },"
+close $fp
+puts "Appended guide_ours_spef block to picorv32.guide.sta.reference.json"
+exit
+EOF
+openroad -no_init -no_splash "${RUN_DIR}/dump_guide_sta_ours_spef.tcl"
+
+cat << 'EOF' > "${RUN_DIR}/dump_guide_sta_ours_readback.tcl"
+source /work/tests/designs/picorv32/runs/canonical/collect_endpoints.tcl
+
+read_liberty /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/techlef/sky130_fd_sc_hd__nom.tlef
+read_lef /pdk/sky130A/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef
+read_def /work/tests/designs/picorv32/picorv32.placed.def
+read_sdc /work/tests/designs/picorv32/picorv32.sdc
+
+set_wire_rc -layer met2
+read_guides /work/tests/designs/picorv32/runs/guide-check/picorv32.ours.guide
+estimate_parasitics -global_routing
+set gor_wns_max [format "%.6f" [sta::worst_slack -max]]
+set gor_tns_max [format "%.6f" [sta::total_negative_slack -max]]
+set gor_wns_min [format "%.6f" [sta::worst_slack -min]]
+set gor_tns_min [format "%.6f" [sta::total_negative_slack -min]]
+set gor_endpoints [collect_endpoints_json]
+
+set fp [open "/work/tests/designs/picorv32/picorv32.guide.sta.reference.json" "a"]
+puts $fp "  \"guide_ours_readback\": {"
+puts $fp "    \"wns_max_ns\": $gor_wns_max,"
+puts $fp "    \"tns_max_ns\": $gor_tns_max,"
+puts $fp "    \"wns_min_ns\": $gor_wns_min,"
+puts $fp "    \"tns_min_ns\": $gor_tns_min,"
+puts $fp "    \"endpoints\": \["
+puts $fp $gor_endpoints
+puts $fp "    \]"
+puts $fp "  }"
+puts $fp "}"
+close $fp
+puts "Appended guide_ours_readback block to picorv32.guide.sta.reference.json"
+exit
+EOF
+openroad -no_init -no_splash "${RUN_DIR}/dump_guide_sta_ours_readback.tcl" 2>&1 | tee "${SCRIPT_DIR}/runs/guide-check/guide_ours_readback.log"
+est0026_count=$(grep -c "EST-0026" "${SCRIPT_DIR}/runs/guide-check/guide_ours_readback.log" || true)
+echo "guide_ours_readback EST-0026 warnings: ${est0026_count}"
 
 echo "==> Successfully generated all picorv32 reference artifacts!"

@@ -115,10 +115,12 @@ Parse `.tlef` (technology LEF) followed by `.lef` (macro cell LEF) into `TechDb`
 3. **`LAYER <name>`**:
    - Only record layers with `TYPE ROUTING ;` in `routing_layers`.
    - `DIRECTION HORIZONTAL | VERTICAL ;`
-   - `PITCH <p_um> ;` (or `PITCH <px_um> <py_um> ;`), `WIDTH <w_um> ;`, `OFFSET <o_um> ;` $\rightarrow$ convert to `i32` DBU.
+   - `PITCH <p_um> ;` (or `PITCH <px_um> <py_um> ;`), `WIDTH <w_um> ;`, `OFFSET <o_um> ;` $\rightarrow$ convert to `i32` DBU. Both axes are retained (`pitch_{x,y}_dbu` / `offset_{x,y}_dbu`, y defaulting to x); `pitch_dbu`/`offset_dbu` are the preferred-direction pair. sky130 `li1` splits them (`PITCH 0.46 0.34` / `OFFSET 0.23 0.17`) — the `TRACKS` grids OpenROAD emits are axis-correct.
    - `RESISTANCE RPERSQ <f32> ;`
    - `CAPACITANCE CPERSQDIST <f32> ;` and `EDGECAPACITANCE <f32> ;`
-4. **`MACRO <name>`**:
+   - `TYPE CUT ;` layers are recorded in `cut_layers`, keyed on the routing layer parsed just before them (`CutLayer::above`); a bare `RESISTANCE <ohms> ;` on a CUT layer is the per-cut via resistance, folded into `via_res_ohm_above[above]` by `load_tech_db` (first CUT above a routing layer wins). `licon`, which precedes the first routing layer, is intentionally not recorded — it has no `above`.
+4. **`VIA <name>`**: the `LAYER <name> ;` groups classify each layer as routing (`layer_by_name`) or cut (`cut_layer_by_name`) — the via is stored as a `ViaDef { name, lower, upper, cut, cut_count }` where `lower`/`upper` are the min/max routing `LayerId`s and `cut_count` is the total `RECT` count across cut-layer groups. `RECT` coordinates are validated but not stored (DEF supplies via points; resistance lookup needs only the layer triple). A VIA with `< 2` routing layers or no cut layer is an error, as is a duplicate name. `VIARULE <name> GENERATE` blocks are skipped — the DEF `VIAS` section carries the generated via's layer triple itself.
+5. **`MACRO <name>`**:
    - `CLASS <class> ;`
    - `SIZE <w_um> BY <h_um> ;` $\rightarrow$ `width_dbu`, `height_dbu`.
    - For each `PIN <pin_name>`:
@@ -177,7 +179,7 @@ struct YosysFile {
 - Parse `DIEAREA ( xl yl ) ( xh yh ) ;`.
 - Parse `ROW <row_name> <site_name> <orig_x> <orig_y> <orient> DO <num_x> BY <num_y> STEP <step_x> <step_y> ;`.
 - Parse `TRACKS ( X | Y ) <start> DO <num> STEP <step> LAYER <layer_names...> ;`.
-- Parse `GCELLGRID ( X | Y ) <start> DO <num> STEP <step> ;` into `DesignDb::gcell_grids` if present.
+- Parse `GCELLGRID ( X | Y ) <start> DO <num> STEP <step> ;` into `DesignDb::gcell_grids` if present. `DO` is stored as `num_cells` — the gcell column/row count in OpenROAD's convention (`getGridX` returns one entry per column; strict DEF 5.8 would read it as boundary lines, but every in-tree DEF is OpenROAD's or ours).
 - Parse `COMPONENTS <n> ;`:
   - `- <inst_name> <macro_name> + ( PLACED | FIXED | UNPLACED ) ( <x> <y> ) <orient> ;`
   - Unescape DEF backslash sequences if present so instance names match Yosys JSON / Verilog.
@@ -185,8 +187,14 @@ struct YosysFile {
 - Parse `PINS <n> ;`:
   - `- <pin_name> + NET <net_name> + DIRECTION ( INPUT | OUTPUT | INOUT ) ... + PLACED ( <x> <y> ) <orient> ;`
   - Record primary I/O pin name in `pin_names`, direction in `pin_dirs`, coordinates in `pin_offset_x_dbu` / `pin_offset_y_dbu`, and push the `PinId` to `DesignDb::io_pins`.
+- Parse `VIAS <n> ;` records into a parse-local map:
+  - `- <name> + VIARULE <rule> + CUTSIZE ... + LAYERS <bot> <cut> <top> ... + ROWCOL <r> <c> ;` resolves to a `(lower, upper, cut)` stack with `cut_count = r * c` (`+ LAYERS` is authoritative; a `+ VIARULE` record missing `+ LAYERS` is an error).
+  - `- <name> + VIA <lef_via_name> ;` defers to the LEF `VIA` definition's layer triple when SPECIALNETS references it.
+  - `- <name> + RECT|POLYGON ... ;` inline vias have no resolvable stack; they are tolerated when defined but an error when a SPECIALNETS record names them.
 - Parse `SPECIALNETS <n> ;`:
-  - Skip power/ground nets (`VPWR`, `VGND`) from signal `NetId`s (matching OpenROAD `[$block getNets]`), **but** extract their routed wire rectangles (`+ ROUTED <layer> <width> + SHAPE ( FOLLOWPIN | STRIPE | ... ) ( x1 y1 ) ( x2 y2 )` and `RECT` entries) into `DesignDb::special_wire_rects` so E1 can deduct PDN routing blockages.
+  - Special nets stay out of signal `NetId`s (matching OpenROAD `[$block getNets]`). Each record becomes a `PdnNet` in `DesignDb::pdn_nets`: `( comp pin )` groups verbatim as `PdnConn` (`TopPin` / `AllInstances` / `Instance`), `+ USE` as `PdnUse`, two-point positive-width segments as half-width-expanded `wire_rects` (`ROUTED`/`NEW`/`FIXED`/`COVER`/`SHIELD`/`TRUNK` statements; `*` repeats the previous coordinate of the same axis), and zero-width records `NEW <layer> 0 ... ( x y ) <via_name>` as `PdnVia` stacks resolved through the `VIAS` map or a LEF `VIA` — never by name spelling. The via's record layer must be one of its endpoints.
+  - `DesignDb::special_wire_rects()` flattens every `PdnNet::wire_rects` for the gcell blockage scan (E1); `pdn::check_net` builds per-net connectivity for E8.
+  - `+ SUBNET` is unsupported (its wires do not land in the flat model); other net-level attributes (`SOURCE`, `PATTERN`, `ESTCAP`, ...) are skipped by name.
 - Parse `NETS <n> ;`:
   - `- <net_name> ( PIN <io_name> ) ( <inst_name> <pin_name> ) ... + USE ( SIGNAL | CLOCK ) ;`
 - **DEF Writer (`write_def`)**:

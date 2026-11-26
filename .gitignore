@@ -20,9 +20,23 @@ tests/designs/picorv32/picorv32.routed.spef
 tests/designs/picorv32/picorv32.sta.reference.json
 tests/designs/picorv32/picorv32.routed.def
 tests/designs/picorv32/picorv32.rcx.spef
+tests/designs/picorv32/picorv32.guide.spef
+tests/designs/picorv32/picorv32.guide.ours.spef
+tests/designs/picorv32/picorv32.guide.sta.reference.json
 tests/designs/picorv32/picorv32.drc.rpt
 tests/designs/picorv32/picorv32.orient.def
 tests/designs/picorv32/picorv32.util65.def
+tests/designs/picorv32/picorv32.cts.def
+tests/designs/picorv32/picorv32.cts.ours.def
+tests/designs/picorv32/picorv32.cts.ours.report.json
+
+# e6-drt-ref routed DEFs (regenerate via tests/designs/generate_drt_ref.sh)
+tests/designs/gcd/gcd.drt.*.def
+tests/designs/picorv32/picorv32.drt.*.def
+
+# e6-drt-e2e: gcd's ours routed DEF is committed (<1 MB) — asserted
+# byte-equal to a fresh emission; picorv32's stays ignored.
+!tests/designs/gcd/gcd.drt.ours.routed.def
 
 # aes generated artifacts over 1 MB (regenerate with tests/designs/aes/generate_ref.sh)
 tests/designs/aes/aes.synth.v

@@ -10,7 +10,7 @@ pub struct LibCellId(pub u16);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LibPinId(pub u16);
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LayerId(pub u8);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub struct CellId(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NetId(pub u32);
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PinId(pub u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,9 +266,19 @@ mod tests {
             pitch_dbu: 340,
             width_dbu: 140,
             offset_dbu: 170,
+            pitch_x_dbu: 340,
+            pitch_y_dbu: 340,
+            offset_x_dbu: 170,
+            offset_y_dbu: 170,
+            tracks_x: Vec::new(),
+            tracks_y: Vec::new(),
             res_per_sq: 0.125,
             cap_per_sq_um: 0.00003,
             edge_cap_per_um: 0.00004,
+            spacing_dbu: 0,
+            spacing_table: Vec::new(),
+            area_dbu2: 0,
+            min_enclosed_area_dbu2: 0,
         });
 
         let macro_name = interner.intern("sky130_fd_sc_hd__buf_1");
@@ -284,6 +294,7 @@ mod tests {
             offset_x_frac: false,
             offset_y_frac: false,
             layer: Some(LayerId(0)),
+        rects: Vec::new(),
         });
         tech.macro_pins.push(MacroPin {
             name: pin_x_name,
@@ -294,6 +305,7 @@ mod tests {
             offset_x_frac: false,
             offset_y_frac: false,
             layer: Some(LayerId(0)),
+        rects: Vec::new(),
         });
 
         tech.macros.push(MacroDef {
@@ -304,6 +316,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 2,
             obs_rects: vec![(LayerId(0), RectDbu::new(0, 0, 920, 2720))],
+            obs_rects_raw: vec![(LayerId(0), RectDbu::new(0, 0, 920, 2720))],
             pin_obs_rects: Vec::new(),
         });
 
@@ -354,6 +367,8 @@ mod tests {
         db.pin_nets.push(Some(NetId(0)));
         db.pin_offset_x_dbu.push(0);
         db.pin_offset_y_dbu.push(50_000);
+        db.pin_io_layer.push(None);
+        db.pin_io_rects.push(Vec::new());
         db.pin_is_driver.push(true); // primary input drives net 0
         db.io_pins.push(PinId(0));
 
@@ -365,6 +380,8 @@ mod tests {
         db.pin_nets.push(Some(NetId(1)));
         db.pin_offset_x_dbu.push(100_000);
         db.pin_offset_y_dbu.push(50_000);
+        db.pin_io_layer.push(None);
+        db.pin_io_rects.push(Vec::new());
         db.pin_is_driver.push(false); // primary output is sink of net 1
         db.io_pins.push(PinId(1));
 
@@ -377,6 +394,8 @@ mod tests {
         db.pin_nets.push(Some(NetId(0)));
         db.pin_offset_x_dbu.push(230);
         db.pin_offset_y_dbu.push(1360);
+        db.pin_io_layer.push(None);
+        db.pin_io_rects.push(Vec::new());
         db.pin_is_driver.push(false);
 
         db.pin_names.push(p1_name);
@@ -387,6 +406,8 @@ mod tests {
         db.pin_nets.push(Some(NetId(1)));
         db.pin_offset_x_dbu.push(400);
         db.pin_offset_y_dbu.push(1360);
+        db.pin_io_layer.push(None);
+        db.pin_io_rects.push(Vec::new());
         db.pin_is_driver.push(true); // instance output drives net 1
 
         // Cell 0 SoA

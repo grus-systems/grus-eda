@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/grus-core", "crates/grus-eda"]
 
 [workspace.package]
-version = "0.3.8"
+version = "0.12.10"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -13,8 +13,19 @@ bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 fast-float2 = "0.2.4"
 memmap2 = "0.9"
+nalgebra-sparse = "0.12"
 rayon = "1"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Verify-stage test profile: release-speed execution of the heavy
+# route re-execution tests with the dev-profile oracles (debug
+# assertions, overflow checks) kept on. Dev-profile `cargo test
+# --workspace` measures hours on the M4 runner; release measured
+# ~2 min of test time with the same 601-test green outcome.
+[profile.verify]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

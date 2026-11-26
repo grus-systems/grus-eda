@@ -424,9 +424,13 @@ Remaining:
   pitch; inputs go on the left edge, outputs on the right, names
   sorted naturally so buses read in order.
 - `readers/def.rs::write_def_full` serializes a whole DesignDb (no
-  template): header, DIEAREA, ROWs, COMPONENTS, PINS, NETS. TRACKS/
-  GCELLGRID/VIAS/SPECIALNETS are omitted — they constrain detailed
-  routing/power, which the database does not model. Names go through
+  template): header, DIEAREA, ROWs, TRACKS, GCELLGRID, COMPONENTS,
+  PINS, NETS. TRACKS re-emits `db.tracks` verbatim or derives the
+  per-axis grids OpenROAD writes (`drt::tracks::default_track_grids`);
+  GCELLGRID likewise (the congestion default grid, 15 met2
+  tracks/GCell). VIAS/SPECIALNETS remain omitted — DEF via defs
+  cannot be rebuilt faithfully and the PDN is outside this model.
+  Names go through
   `escape_def_name`, which escapes only the lexer delimiters and `\`
   itself; `[N]` bus-bit syntax stays literal so external readers see
   the same names OpenROAD-flow-scripts emits. The DEF lexer was
@@ -561,3 +565,366 @@ phases on `sta` and `power` (the shared DMP inner loop, now minus
 the `eval_2d` redundancy). Every optimization ticket lands only with
 a bit-identical-or-tolerance-named fast path and a `docs/results.md`
 number, per the usual discipline.
+
+## Candidate next stages (E4–E8, scoped 2026-11-22)
+
+The readers → placement → STA/power pipeline is complete; what is missing for
+a usable flow is routing, clock-tree, and sign-off-adjacent analyses. The
+full scoping — inputs/outputs, reusable modules by name, per-metric
+tolerances, probe evidence — is in
+`kurena/tasks/next-stage-scoping/design/`; probe outputs are logged in
+`docs/results.md` (2026-11-22 "next-stage-scoping"). Recommended order is
+**E4 → E5 → E8**, with E6/E7 behind a decision gate. Update 2026-11-23:
+the gate is lifted — E6/E7 are authorized; **E9** (reporting/usability
+surface, from the first large-design run's feedback
+`docs/history/run-2026-11-22-large-design.md`) joins as a small stage.
+
+### E4. Global routing → route guides + guide-based parasitics
+
+- In: `tlef` + `lef` + placed `def`. Out: OpenROAD-format guide file +
+  guide-based SPEF via the existing `--spef-out` path.
+- Reuses almost everything E1 built: `GCellGrid::build`, `decompose_net`
+  RSMT, `route_segments` committed paths (preserved in `RoutedDesign` since
+  `v0.3.9`), `NetRcTree`/`NetParasitics`, SPEF writer.
+- Done when (on `gcd.placed.def`, then `picorv32.placed.def`): per-net
+  guide-box overlap ≥ 0.70 vs `global_route -guide_file`; guide-box total
+  within 15%; our RC on OpenROAD's guides *and* our guides fed back via
+  `read_guides` agree with `estimate_parasitics -global_routing` SPEF within
+  `max(5%, 1 fF)` per net; end-to-end `sta` within `max(5 ps, 1%)`.
+- Progress 2026-11-22 (`v0.3.9`, ticket `e4-guides-emit`): guide emission
+  and the topology criteria are done — `grus-eda route --guide-out` writes
+  OpenROAD-format guides with weighted overlap `0.975` gcd / `0.960`
+  picorv32 and box deltas `+2.4%` / `-6.2%`; `read_guides` +
+  `estimate_parasitics -global_routing` accept our guide in the pinned
+  image.
+- Progress 2026-11-22 (`v0.3.10`, ticket `e4-guide-parasitics`): the guide
+  parasitics criterion is met — `sta --parasitics guide [--guide <file>]`
+  builds `NetRcTree`s reproducing `estimate_parasitics -global_routing`'s
+  per-net `*D_NET` totals: **269/269 gcd + 6744/6744 picorv32 nets** within
+  `max(5%, 1 fF)` (max rel diff 0.11%). The read-back direction (our
+  guides → OpenROAD `estimate_parasitics`) is recorded at 98.1%/98.4% —
+  its residual is guide coverage, not the RC model. The end-to-end `sta`
+  criterion remains open.
+- Progress 2026-11-22 (`v0.3.11`, ticket `e4-sta-e2e`): criterion 4
+  measured end to end — **not met** (gcd 0/53, picorv32 94/1,798 endpoints
+  inside bound). The decomposition names both causes: the
+  `SPEF_STUB_RES_KOHM` island-link lands OpenROAD-dead island RC on the
+  Elmore path (parasitics axis, +202 ps / +1,408 ps median) and guide
+  coverage is the topology axis (+65 ps / +523 ps); the STA engine stays
+  inside the recorded band. Remaining open item: guide-quality
+  improvements (met3–met5 band, stub coverage) and island-faithful
+  parasitics — not the e2e harness. See `docs/results.md` `e4-sta-e2e`.
+- Progress 2026-11-22 (`v0.3.12`, ticket `e4-guide-islands`): the named
+  dominant cause is fixed — dead components stay dead in `NetRcTree`
+  (island caps retained, `n n r` self-loops emitted, dead pins get zero
+  wire delay) and OpenSTA's lumped fallback is modelled (dead port →
+  lumped, ~1/3 dead-cap share → lumped, probed approximation). The
+  parasitics-axis median collapses +202/+1,408 ps → ~0; the e2e
+  residual is now the e4-1 topology axis (gcd `resp_val` +250.8 ps,
+  picorv32 `_108xx_` +627 ps). See `docs/results.md` `e4-guide-islands`.
+- Progress 2026-11-22 (`v0.3.13`, ticket `e4-topology`): emission-side
+  connectivity — bound pin cells emit contiguous rung stacks anchored on
+  the covering strip, unbound pin cells climb to access+1 (the conn+1
+  coverage OpenROAD gives port cells, probed on picorv32's io cells), and
+  every non-pin H∩V GCell emits a consecutive `met1`/`met2` bend pair.
+  Dead `*P` ports are **0** on both designs and all remaining dead
+  components are one-node stubs (multi-node islands eliminated; the
+  OpenROAD read-back keeps an 8/105-net residual). Criterion 4: gcd
+  topology max `210.6 < 250.8 ps` — the `resp_val` dead-port extreme is
+  gone. picorv32 is the named residual: fully-connected emission vs the
+  reference's dead detour islands on high-fanout nets (`_00012_`
+  fanout 273, +2.33 ns worst endpoint). See `docs/results.md`
+  `e4-topology`.
+- Probe note: guide parasitics halve the placement-estimate gap to routed
+  truth on gcd (median per-net C diff vs RCX: 27.6% vs 44.2%).
+- **Closed 2026-11-22**: criteria 1–3 pass; criterion 4 closed as named
+  residual — the remaining e2e error is route-path topology divergence vs
+  OpenROAD's GRT (gcd total max 232.75 ps; picorv32 named high-fanout
+  dead-detour class), not emission, parasitics (~0 median), or engine
+  (≤74 ps). The delegation path (our guides → `read_guides` →
+  `detailed_route`) is the recorded use case. See `docs/status.md` E4.
+- Sizing: ~6–8 tickets (M). Ticket sketch in `design/order.md`.
+
+### E5. Clock tree synthesis
+
+- In: placed `def` + `sdc` + `lib`/`lef`. Out: DEF with inserted clock
+  buffers + skew/insertion-delay report.
+- Reuses the Abacus legalizer, `write_def_full`, and the propagated-clock
+  STA mode (already matching OpenSTA) as the scoring path; the real new
+  infrastructure is `DesignDb` cell/net insertion — a mutation API every
+  future buffering/repair step needs.
+- Done when (on `gcd.placed.def`/`gcd.sdc` vs `clock_tree_synthesis` +
+  `repair_clock_nets`): skew within `max(25 ps, 25%)` (gcd reference ≈ 0 ps),
+  max insertion delay within 15% (reference ≈ 0.31 ns), propagated-clock STA
+  on the TritonCTS DEF vs ours within `max(5 ps, 1%)` per endpoint.
+- Progress: ticket 1 `e5-cts-ref` committed the TritonCTS goldens; ticket 2
+  `e5-insert-api` landed the `DesignDb` mutation API; ticket 3 `e5-cts-tree`
+  (`v0.5.0`) landed the depth-balanced constructor; ticket 4 `e5-cts-e2e`
+  (`v0.5.1`) scored our CTS DEFs against the committed goldens — criteria 2
+  (insertion) met on both designs, criterion 1 (skew) met on gcd, and the
+  named residual is **tree-shape** (our depth-balanced tree equalizes
+  buffer count, not per-pin RC): picorv32 skew +34.4 ps over bound (engine
+  residual on the same tree ≤0.41 ps), gcd hold-side endpoint fields ~9.5
+  ps early, picorv32 endpoints up to 94.4 ps with a secondary engine axis
+  on the `_1145x` reset-launched cluster; see `docs/e5-cts.md` and
+  `docs/results.md`. Remaining: dummy-load repair
+  (`repair_clock_nets`-class work) and, if the skew residual is to be
+  closed, a per-pin RC/latency balancing pass.
+- Sizing: ~6–8 tickets (M–L).
+
+### E8. IR drop (power-grid analysis)
+
+- In: `def` with `SPECIALNETS` PDN + per-instance power (N7). Out:
+  per-instance voltage map + worst drop.
+- Reference confirmed in the image (P-IRD): `analyze_power_grid -net VPWR` on
+  gcd reports worst IR drop 0.591 mV and emits a per-instance voltage CSV via
+  `-voltage_file`; `check_power_grid` verifies PDN connectivity.
+- Done when: worst drop within `max(5%, 5 mV)` and per-instance voltages
+  within `max(5%, 1 mV)` of the reference on `gcd.placed.def`; the
+  current-source convention (embedded estimate vs `set_pdnsim_inst_power`)
+  pinned by the golden ticket.
+- Progress 2026-11-23 (ticket `e8-irdrop-ref`): reference committed —
+  `tests/designs/generate_irdrop_ref.sh` runs `check_power_grid` +
+  `analyze_power_grid -voltage_file` on VPWR+VGND in the pinned image on
+  both designs and byte-reproduces its goldens on rerun. Embedded numbers
+  match the P-IRD scoping (gcd VPWR total 1.04 mW, supply 1.80 V, avg
+  drop 0.223 mV, worst 0.591 mV, 384 CSV rows; VGND worst bounce 0.559
+  mV; picorv32 VPWR worst 4.30 mV / VGND 3.61 mV, 10,205 rows). The
+  convention item resolved **embedded**: `set_pdnsim_inst_power` is
+  additive to the computed estimate — feeding OpenSTA's per-instance
+  power doubles the drop (gcd 0.591→1.18 mV) and the all-zero probe
+  leaves the solve byte-identical to embedded while reporting 0.00 W —
+  so the explicit feed cannot substitute an external estimator. See
+  `docs/results.md` 2026-11-23.
+- Progress 2026-11-23 (ticket `e8-pdn-parse`): per-net PDN model landed —
+  `DesignDb::pdn_nets` (`PdnNet`: conn groups verbatim, `+ USE`,
+  half-width-expanded `wire_rects`, `PdnVia` stacks). DEF `VIAS` records
+  resolve generated (`+ VIARULE`/`+ LAYERS`/`+ ROWCOL`), fixed (`+ VIA`), and
+  inline (`+ RECT`/`POLYGON`) forms; LEF `VIA` blocks give `ViaDef` layer
+  triples so DEF via names resolve without name heuristics, and `CutLayer` +
+  `via_res_ohm_above` carry the cut resistances (`via_res_ohm(cut, count)`).
+  `pdn::check_net` expands conns, attaches each `MacroPin` port rect to
+  same-layer wires, and unions rect components through via edges: on
+  `gcd.placed.def` VPWR/VGND each give 1 node, `attached_terminals` 384 =
+  embedded CSV rows, `unreachable_pins` empty — agreeing with
+  `check_power_grid` in `gcd.irdrop.reference.json`; picorv32 gives
+  10,205 = 10,205 rows on both rails. `special_wire_rects()` keeps the gcell
+  blockage view. See `docs/results.md` 2026-11-23.
+- Progress 2026-11-23 (ticket `e8-mesh-rc`): resistor network landed —
+  `pdn::mesh::PdnMesh` (junction-piece nodes, `RPERSQ × L/W` wire runs,
+  `via_res_ohm` stack links, sinks = the attach set, sources = the PIN's
+  io-rect nodes), `validate()` (finite+positive R, source-reachability
+  BFS) + `MeshCensus`. Both designs validate clean; census recorded in
+  `docs/results.md` (no PDNSim mesh golden exists — the e2e ticket gates
+  the solve).
+- Progress 2026-11-23 (ticket `e8-solve`, v0.7.3): sparse DC solve
+  landed — `pdn::solve` stamps the mesh into a conductance CSC, clamps
+  source nodes to each golden `supply_voltage_v` (exact, assigned not
+  factored), injects the N7 per-instance feed as `P/V` sink currents,
+  and solves with `nalgebra-sparse` `CscCholesky` (direct, SPD reduced
+  system). `grus-eda irdrop` emits PDNSim-shaped
+  `*.irdrop.voltage.ours.<net>.csv` — first five columns verbatim-equal
+  to the golden row set on all four nets — plus a summary JSON with
+  ‖GV−I‖∞ (≤ 1.7e-14 A abs / ≤ 2.3e-16 rel), worst/avg drop and bounce,
+  and deltas vs the golden scalars. Worst-drop deltas and the loose
+  per-pin bound sit inside tolerance on both designs; the strict
+  `max(5%, 1 mV)` per-pin claim was superseded by the e8-e2e gate below
+  (picorv32 VGND does not meet it). The residual gap is the
+  N7↔OpenSTA estimator feed (-72.5 % total on gcd, -43.5 % on
+  picorv32), quantified in `docs/results.md` 2026-11-23.
+- Progress 2026-11-23 (ticket `e8-e2e`): **done with named residual** —
+  `crates/grus-core/tests/irdrop.rs` gates our maps against the
+  `embedded` goldens on both designs and rails. gcd passes both
+  done-when bounds (per-pin max |dV| 5.4e-4 / 5.0e-4 V, worst-drop
+  deltas −4.1e-4 / −3.3e-4 V). picorv32 meets the `max(5%, 5 mV)`
+  worst-drop/bounce bound on both rails and the strict per-pin bound on
+  VPWR; **VGND keeps a named 3.2 mV floor** (146/10,205 rows over the
+  strict `max(5%, 1 mV)` rule, max 3.164 mV) decomposed by the
+  newly-committed `<d>.irdrop.inst_power.tcl` feed: on OpenSTA's
+  per-instance powers our mesh/solver lands inside the strict bound
+  everywhere (mesh axis max 0.13–0.69 mV), so the residual is the
+  **N7 power estimator**, not the engine. See `docs/results.md`.
+- Remaining: nothing structural — E8's engine is complete and its
+  mesh/solver axis verified; tighter drop agreement tracks the N7
+  estimator, not the solver.
+- Sizing: ~4–6 tickets (M).
+
+### E9. Reporting / usability surface
+
+- In: existing `sta` engine + JSON. Out: actionable reports — no new
+  timing semantics.
+- Source: `docs/history/run-2026-11-22-large-design.md` (first
+  large-design exercise, ~132k cells, multiple async domains).
+- Items in value order:
+  1. `sta --paths N` / `critical_paths` JSON — worst-N
+     startpoint→endpoint traces with cell/pin names and per-arc
+     delays (the blocker for acting on a deep-slack outlier).
+  2. Per-clock-domain WNS/TNS/violation summary.
+  3. Slack histogram over endpoints.
+  4. `--top` ergonomics — suffix match on the hierarchy separator /
+     single-top auto-accept instead of the exact `$paramod$…` name.
+  5. SDC examples doc — single clock, N async clocks +
+     `set_clock_groups`, FF clock-enable gating.
+- Sizing: ~3 small tickets (`ux-sta-paths`, `ux-sta-summary`,
+  `ux-top-sdc`).
+
+### E6/E7 — authorized 2026-11-23
+
+- **E6 detailed routing** is a TritonRoute-class build (LEF `VIA`/`SPACING`
+  and DEF `VIAS`/`NONDEFAULTRULES` parse, signal-net wire storage, DRC-aware
+  maze routing) — ~15+ tickets (XL), an order of magnitude beyond any prior
+  stage. The README's out-of-scope line needs updating when it lands. The
+  delegation path is measured, not hypothetical: P-GR showed `read_guides`
+  + `detailed_route` on a foreign guide file produces a clean routed DEF
+  (0 DRC) on gcd, so our guides already drive OpenROAD's own DRT — native
+  E6 is the replacement, not the enabler. Suggested first ticket:
+  reference generation (`detailed_route` on our guide + Magic/OpenROAD
+  DRC goldens on gcd), matching the per-stage pattern.
+- Progress 2026-11-23 (ticket `e6-drt-ref`): delegation reference
+  committed — `tests/designs/generate_drt_ref.sh <design>` runs the
+  baseline (`global_route` → `detailed_route`) and the delegated
+  variant (`read_guides <d>.ours.guide` → `detailed_route`) in the
+  pinned image and emits `<d>.drt.reference.json`. Both designs route
+  0-DRC on both variants; the baseline DEF is byte-identical to the
+  prior `<d>.routed.def` on gcd **and** picorv32. Delegated deltas:
+  gcd −1.76% wirelength / +10 vias / 0 antenna; picorv32 −2.11%
+  wirelength / +1,279 vias / antenna 38 → 30. JSON byte-reproduces on
+  rerun outside the `timing` block. See `docs/results.md` 2026-11-23.
+- Progress 2026-11-23 (`v0.12.1`, ticket `e6-drt-tracks`): the on-grid
+  substrate landed — LEF `TRACKS` parse into `RoutingLayer.tracks_{x,y}`,
+  `drt::tracks` merges the DEF `TRACKS` grids (sky130's techlef declares
+  none — grid is DEF-sourced) with named preferred-axis `TrackGap`s, and
+  `drt::access` enumerates candidate access points per signal-net member
+  pin — census green on both designs (off_track=0, no_shapes=0), fail-
+  proofs recorded. Next tickets: the maze/grid graph this substrate
+  feeds (this ticket is substrate-only — no routing, vias, TA, or
+  DRC-aware pruning).
+- Progress 2026-11-23 (`v0.12.2`, ticket `e6-drt-graph`): the
+  guide-bounded track graph — `drt::graph` joins the committed
+  `<d>.guide` blocks to nets (all 269/6,744 resolved; `missing_signal`
+  0; `absent_expected` gcd 0, picorv32 67 single-pin io nets), builds
+  each net's region as covered `(ix,iy)` track-index pairs (gcd
+  756,483 nodes / 1,453,444 edges; picorv32 28.4M / 54.6M;
+  `zero_coverage` 0), and attaches member pins — `region_escape` named
+  per design (gcd 17, picorv32 592; both are the guide/shape-holds-no-
+  crossing class, verified per-pin). Remaining: via/layer-transition
+  model (needs LEF `VIA` geometry), costs/legality, maze search.
+- Progress 2026-11-23 (`v0.12.3`, ticket `e6-drt-via`): the
+  layer-transition model — `drt::via`'s `ViaTable` (25 LEF `VIA` defs
+  + 4 resolvable DEF `VIAS` records now retained as `db.def_vias`;
+  {5,6,6,6,6} candidates/pair, named `ViaGap`/`UnmatchedVia`, policy
+  default = `nonpref_metal → area → file order`, matching the
+  reference majority on `via`/`via2`/`via3`; `mcon` diverges by name
+  only — `L1M1_PR`/`L1M1_PR_MR` are rect-identical) and `drt::graph`'s
+  `ViaEdge`s at same-`(x,y)` crossings covered on both layers (gcd
+  13,669 / picorv32 409,487, pinned rows, deterministic). Named gap:
+  met2–met3's grids are disjoint mod-20 domains — zero shared
+  crossings, needs an offset-snap rule before routing. Remaining:
+  io-port attachment fallback, costs/legality, maze search.
+- Progress 2026-11-23 (`v0.12.4`, ticket `e6-drt-maze`): the
+  sequential maze router — `drt::maze::route_nets` connects every
+  guided signal net inside its region graph: pathfinder-style tree
+  extension (multi-source BFS hop heuristic + `(g+hop, node)` PQ),
+  preferred-direction and via costs, foreign-occupancy hard-block,
+  per-net escalating rip-up (`MAX_ITERS = 8`), and relaxed via edges
+  that snap each node to the nearest upper preferred line — the rule
+  that answers the §6 met2–met3 zero-edge gap. Pin fallback: strict
+  `pin_nodes`, else projection onto the nearest preferred line
+  (gcd's 17 `region_escape` pins route through it). Post-hoc
+  `overlap_census` reports cross-net `R+s` collisions; named
+  `UnroutedNet`/`FailKind` report; deterministic `route_digest`.
+  Determinism/occupancy fail-proofs in `docs/results.md`; the
+  picorv32 census measured under `--ignored` (~135 min release) —
+  6,636/6,744 routed, 0 collisions, 108 `NoPath` nets classified
+  43 met3-bridge + 65 met2-connected, pinned in `docs/results.md`.
+  Remaining: routed-DEF emission, e2e vs the TritonRoute reference.
+- Progress 2026-11-24 (`v0.12.5`, ticket `e6-drt-emit`): routed DEF
+  emission + self-DRC gate — `drt::emit` maps `RouteDb` into
+  `db.net_geoms` (square-cap `seg ± w/2` model, `ViaTable`-default
+  vias, conns-only unrouted records) and `write_routed_def` splices a
+  canonical zero-width `NETS` section into the placed template —
+  write → parse → write byte-stable. `grus-eda drt` replaces the
+  delegation path (placed DEF + guide → routed DEF; `--reference`
+  census deltas, `--self-drc`). Emit-driven maze fixes: PDN metal as
+  `Obs(u32::MAX)`, io-port rects as `Pin(own_net)`, projected-pin
+  access stubs. Verdict: `run_all`'s 50-rule subset on our own
+  re-parsed DEF reports **0 findings on gcd** (picorv32 leg detached
+  under `--ignored`); census deltas vs `delegated`/`baseline`
+  recorded as informational. Remaining: `e6-drt-e2e` (full Magic
+  deck on our DEF in the container).
+- Progress 2026-11-24 (`v0.12.6`, ticket `e6-drt-emit` r2):
+  post-route min-area patch — the picorv32 gate's 42 `*.6`
+  findings' fix. `patch_net_min_area` rebuilds each `AREA`-bound
+  layer's metal through the checker's `union::components` +
+  `is_drawn` model and extends sub-bound components along in-plane
+  `g.edges` spans, occupancy-strict and guide-region-bound;
+  unfixable components land in `RouteDb.area_residuals`
+  (`AreaResidual`), the decline arm paired 1:1 with `*.6` findings.
+  No-op on gcd (digest `0x48593d441074229b` stands); picorv32
+  emit-gate re-run detached under `--ignored`.
+- Progress 2026-11-24 (`v0.12.7`, ticket `e6-drt-e2e`): the full
+  Magic `drc(full)` deck on our routed DEF —
+  `tests/designs/check_drt_ours.sh gcd` scores the committed
+  `gcd.drt.ours.routed.def` in the pinned image and commits
+  `gcd.drt.ours.reference.json`: **`lef_expressible` = 0 on all 50
+  rules** (~3025 → 847 → 514 → 317 → 0; the 32-fragment `met1.2`
+  residual was one X3 mechanism — `try_fill` carved li1-strict cover
+  blockers on `hull_host_open` met1, truncating fills inside
+  member-pin hulls — closed alongside the `_099_`
+  `notch_residual`), `magic_only` all inherited, `unclassified`
+  empty, antenna 0, sanity mutation live. Emit `routed=188
+  unrouted=81` (named via the golden join), wirelength −33.7% vs
+  baseline on the routed nets; picorv32 leg deferred — no golden,
+  the `#[ignore]`d gate test carries the joins. Numbers:
+  `docs/results.md`.
+- **E7 DRC** has two entry shapes — paired with E6 (0 violations on gcd
+  under Magic `drc style drc(full)`, which P-DRC confirmed reads foreign
+  routed DEFs in this image), or independently as a LEF-rule subset
+  checker on the committed `gcd.routed.def`/`picorv32.routed.def`
+  matching Magic's per-rule `drc listall why` counts exactly (~4 tickets
+  as a subset checker). The subset-checker shape does not depend on E6
+  and can run first.
+- **`e7-drc-ref` landed 2026-11-23** (reference-only): committed
+  `tests/designs/generate_drc_ref.sh` + `<d>.drc.reference.json` on
+  gcd/picorv32 — Magic 8.3.623 `drc(full)` counts, `check_antennas`,
+  the DRT report, a `met2.2` sanity control, and the 278-statement deck
+  taxonomy (`docs/e7-drc.md`). Two corrections vs the P-DRC scoping
+  probe: the clean deck is **not** zero (305 merged nwell violations
+  inside the cell masters on gcd — the probe counted before
+  `drc catchup`), and `drc listall why` bbox fragments ≠ `drc count
+  total` merged regions.
+- **`e7-drc-geom` landed 2026-11-23** (`v0.9.0`): the LEF+DEF geometry
+  substrate + first rule family — `NETS` routed-geometry retention
+  (square-cap wires, `( x y 0 )` points, `NONDEFAULTRULES` width
+  overrides), `drc::geom` per-layer shape assembly (signal/special
+  wires, via cut+metal, placed macro pin/obs, io ports), and
+  `drc::width` covering the 13 `lef_expressible` width rules — **0
+  violations on both routed DEFs** joined to the Magic goldens by
+  rule-name template; `NEW met1 100` mutation flags exactly `met1.1`;
+  `<`→`<=` fail-proof recorded in `docs/results.md`.
+- **`e7-drc-spacing` landed 2026-11-23** (`v0.10.0`): the spacing
+  family — LEF `SPACING`/`SPACINGTABLE` retention, `ShapeRect.group`
+  via-instance ids, union-find connectivity islands (same-net touching
+  merges; via cuts chain layers through the instance's metals), and
+  `drc::spacing` covering all 20 `lef_expressible` spacing rules
+  (same-layer min on li/mcon/via*/met1–5 + the met1–4 wide-metal
+  pairs) — **0 violations on both routed DEFs**; the committed met2
+  probe mutation flags exactly `met2.2`; merge-disable fail-proof
+  recorded. Pair enumeration uses `LayerShapes::for_each_pair_within`
+  (xl-sweep) after per-rect probes proved O(n²) on rail-poisoned
+  `max_xh` prefixes.
+- **`e7-drc-enc-area` landed 2026-11-23** (`v0.11.0`): the subset
+  checker completes the `lef_expressible` set — LEF
+  `ENCLOSURE {BELOW|ABOVE}` / `AREA` / `MINENCLOSEDAREA` retention,
+  `drc::enclosure` (9 cut-overlap rules, symmetric min/max pair
+  reading over the same-net metal union), `drc::union` +
+  `drc::area` (6 min-area + 2 min-hole-area rules over net-agnostic
+  merged polygons, OBS void discard) — **0 violations on both routed
+  DEFs across all 50 unique rule ids**. Mutations: shrunk `via2_3`
+  enclosure + moved covering stripe → exactly 5 `via.5a`; a `RECT`
+  met1 stub → exactly `met1.6`. Three fail-proofs recorded.
+- **`e7-drc-e2e` landed 2026-11-23** (`v0.12.0`): `grus-eda drc` CLI,
+  `drc::report` unified subset report, full-set gate vs
+  `magic_per_rule` (50/50 rules, `ours == magic` at 0 on both
+  designs), honest claim-boundary output on every run; E7 stage gate
+  passed — the `magic_only` deck remainder stays out of scope.

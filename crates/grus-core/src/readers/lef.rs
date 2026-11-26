@@ -1,5 +1,8 @@
 use crate::interner::{LayerId, MacroId, PinDir, StringInterner};
-use crate::tech_db::{LayerDir, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer, TechDb};
+use crate::tech_db::{
+    CutLayer, LayerDir, LefTrackRecord, MacroClass, MacroDef, MacroPin, RectDbu, RoutingLayer,
+    TechDb, ViaDef, ViaLayerRect, ViaRectLayer,
+};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -253,8 +256,11 @@ pub fn parse_lef_bytes(
         } else if word.eq_ignore_ascii_case("PROPERTYDEFINITIONS") {
             skip_block(&mut lexer, "PROPERTYDEFINITIONS")?;
             count_skip(&mut report, word);
-        } else if word.eq_ignore_ascii_case("VIA")
-            || word.eq_ignore_ascii_case("VIARULE")
+        } else if word.eq_ignore_ascii_case("VIA") {
+            parse_via(&mut lexer, tech_db, interner)?;
+        } else if word.eq_ignore_ascii_case("TRACKS") {
+            parse_tracks(&mut lexer, tech_db)?;
+        } else if word.eq_ignore_ascii_case("VIARULE")
             || word.eq_ignore_ascii_case("NONDEFAULTRULE")
         {
             count_skip(&mut report, word);
@@ -274,7 +280,141 @@ pub fn parse_lef_bytes(
         }
     }
 
+    expand_tracks(tech_db, interner)?;
     Ok(report)
+}
+
+/// `TRACKS {X|Y} start DO n STEP s [LAYER l]+ ;` — raw µm values into
+/// `TechDb::lef_track_records`; expansion to DBU happens in
+/// `expand_tracks` once the whole file is read (the record may precede
+/// `UNITS` and the `LAYER` it names). A record without `LAYER` applies
+/// to every routing layer.
+fn parse_tracks(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
+    let axis = required_word(lexer, "TRACKS axis")?;
+    let is_x = if axis.eq_ignore_ascii_case("X") {
+        true
+    } else if axis.eq_ignore_ascii_case("Y") {
+        false
+    } else {
+        bail!(
+            "LEF line {}: TRACKS axis must be X or Y, found `{axis}`",
+            lexer.line()
+        );
+    };
+    let start_um = required_f32(lexer, "TRACKS start")?;
+    let do_kw = required_word(lexer, "TRACKS")?;
+    if !do_kw.eq_ignore_ascii_case("DO") {
+        bail!(
+            "LEF line {}: TRACKS expects `DO <n> STEP <s>`, found `{do_kw}`",
+            lexer.line()
+        );
+    }
+    let count = required_i32(lexer, "TRACKS count")?;
+    if count < 0 {
+        bail!(
+            "LEF line {}: TRACKS count {count} is negative",
+            lexer.line()
+        );
+    }
+    let step_kw = required_word(lexer, "TRACKS")?;
+    if !step_kw.eq_ignore_ascii_case("STEP") {
+        bail!(
+            "LEF line {}: TRACKS expects `STEP <s>`, found `{step_kw}`",
+            lexer.line()
+        );
+    }
+    let step_um = required_f32(lexer, "TRACKS step")?;
+
+    let mut layers = Vec::new();
+    match lexer.next_token() {
+        Some(Token::Semi) => {}
+        Some(Token::Word(w)) if w.eq_ignore_ascii_case("LAYER") => {
+            // One or more layer names up to `;` (the plural form the DEF
+            // reader also accepts). MASK/SAMEMASK or any other keyword is
+            // malformed here, not skipped.
+            loop {
+                match lexer.next_token() {
+                    Some(Token::Semi) => break,
+                    Some(Token::Word(w)) => layers.push(w.to_string()),
+                    other => bail!(
+                        "LEF line {}: TRACKS LAYER expects layer names terminated by `;`, found {other:?}",
+                        lexer.line()
+                    ),
+                }
+            }
+            if layers.is_empty() {
+                bail!(
+                    "LEF line {}: TRACKS LAYER requires at least one layer name",
+                    lexer.line()
+                );
+            }
+        }
+        other => bail!(
+            "LEF line {}: TRACKS expects `;` or `LAYER <name>... ;`, found {other:?}",
+            lexer.line()
+        ),
+    }
+
+    tech_db.lef_track_records.push(LefTrackRecord {
+        is_x,
+        start_um,
+        count: count as u32,
+        step_um,
+        layers: (!layers.is_empty()).then_some(layers),
+        line: lexer.line(),
+    });
+    Ok(())
+}
+
+/// Expands the buffered `TRACKS` records into `RoutingLayer::tracks_{x,y}`:
+/// `start`/`step` round to DBU first (the `pitch_dbu`/`offset_dbu`
+/// convention), then `coord[k] = x0 + k·s`. An unknown layer name is an
+/// error — deliberately stricter than the DEF reader, which drops unknown
+/// `TRACKS` layers silently.
+fn expand_tracks(tech_db: &mut TechDb, interner: &StringInterner) -> Result<()> {
+    if tech_db.lef_track_records.is_empty() {
+        return Ok(());
+    }
+    let dbu = tech_db.dbu_per_micron as f32;
+    let routing_count = tech_db.routing_layers.len();
+    for rec in std::mem::take(&mut tech_db.lef_track_records) {
+        let x0 = (rec.start_um * dbu).round() as i32;
+        let s = (rec.step_um * dbu).round() as i32;
+        let targets: Vec<LayerId> = match &rec.layers {
+            None => (0..routing_count as u8).map(LayerId).collect(),
+            Some(names) => {
+                let mut ids = Vec::with_capacity(names.len());
+                for name in names {
+                    let lid = interner
+                        .get(name)
+                        .and_then(|sym| tech_db.layer_by_name.get(&sym).copied());
+                    match lid {
+                        Some(lid) => ids.push(lid),
+                        None => bail!(
+                            "LEF line {}: TRACKS references layer `{name}`, which is not a routing layer",
+                            rec.line
+                        ),
+                    }
+                }
+                ids
+            }
+        };
+        for lid in targets {
+            let list = if rec.is_x {
+                &mut tech_db.routing_layers[lid.0 as usize].tracks_x
+            } else {
+                &mut tech_db.routing_layers[lid.0 as usize].tracks_y
+            };
+            list.extend((0..rec.count as i32).map(|k| x0 + k * s));
+        }
+    }
+    for layer in &mut tech_db.routing_layers {
+        layer.tracks_x.sort_unstable();
+        layer.tracks_x.dedup();
+        layer.tracks_y.sort_unstable();
+        layer.tracks_y.dedup();
+    }
+    Ok(())
 }
 
 fn parse_units(lexer: &mut LefLexer, tech_db: &mut TechDb) -> Result<()> {
@@ -347,6 +487,7 @@ fn parse_layer(
 ) -> Result<()> {
     let layer_name = required_word(lexer, "LAYER name")?.to_string();
     let mut is_routing = false;
+    let mut is_cut = false;
     let mut dir = LayerDir::Horizontal;
     let mut pitch_x_um = None;
     let mut pitch_y_um = None;
@@ -354,8 +495,15 @@ fn parse_layer(
     let mut offset_y_um = None;
     let mut width_um = None;
     let mut res_per_sq = 0.0f32;
+    let mut cut_res_ohm = None;
     let mut cap_per_sq_um = 0.0f32;
     let mut edge_cap_per_um = 0.0f32;
+    let mut spacing_um = None;
+    let mut spacing_table_um: Vec<(f32, f32)> = Vec::new();
+    let mut area_um2 = None;
+    let mut min_enclosed_area_um2 = None;
+    let mut enc_below_um: Option<[f32; 2]> = None;
+    let mut enc_above_um: Option<[f32; 2]> = None;
     let mut closed = false;
 
     while let Some(tok) = lexer.next_token() {
@@ -365,10 +513,12 @@ fn parse_layer(
                 closed = true;
                 break;
             } else if w.eq_ignore_ascii_case("TYPE") {
-                if let Some(t) = lexer.next_word()
-                    && t.eq_ignore_ascii_case("ROUTING")
-                {
-                    is_routing = true;
+                if let Some(t) = lexer.next_word() {
+                    if t.eq_ignore_ascii_case("ROUTING") {
+                        is_routing = true;
+                    } else if t.eq_ignore_ascii_case("CUT") {
+                        is_cut = true;
+                    }
                 }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("DIRECTION") {
@@ -404,10 +554,14 @@ fn parse_layer(
                 width_um = Some(required_f32(lexer, "LAYER WIDTH")?);
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("RESISTANCE") {
-                if let Some(r_kw) = lexer.next_word()
-                    && r_kw.eq_ignore_ascii_case("RPERSQ")
-                {
-                    res_per_sq = required_f32(lexer, "LAYER RESISTANCE RPERSQ")?;
+                if let Some(r_kw) = lexer.next_word() {
+                    if r_kw.eq_ignore_ascii_case("RPERSQ") {
+                        res_per_sq = required_f32(lexer, "LAYER RESISTANCE RPERSQ")?;
+                    } else if let Ok(r) = r_kw.parse::<f32>() {
+                        // A bare `RESISTANCE <ohms> ;` is the per-cut value on
+                        // CUT layers — the via resistance guide parasitics read.
+                        cut_res_ohm = Some(r);
+                    }
                 }
                 lexer.skip_to_semi();
             } else if w.eq_ignore_ascii_case("CAPACITANCE") {
@@ -420,6 +574,75 @@ fn parse_layer(
             } else if w.eq_ignore_ascii_case("EDGECAPACITANCE") {
                 edge_cap_per_um = required_f32(lexer, "LAYER EDGECAPACITANCE")?;
                 lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("SPACINGTABLE") {
+                // `SPACINGTABLE PARALLELRUNLENGTH <f>... WIDTH <w> <s> ... ;`
+                // — keep the `WIDTH w s` rows; the run-length dimension is
+                // not modeled (selecting by width can only over-require).
+                while let Some(t) = lexer.next_token() {
+                    match t {
+                        Token::Semi => break,
+                        Token::Word(kw) if kw.eq_ignore_ascii_case("WIDTH") => {
+                            let row = lexer
+                                .next_word()
+                                .and_then(|w| w.parse::<f32>().ok())
+                                .zip(lexer.next_word().and_then(|s| s.parse::<f32>().ok()));
+                            if let Some(row) = row {
+                                spacing_table_um.push(row);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if w.eq_ignore_ascii_case("SPACING") {
+                // Plain `SPACING <v> ;` is the only form sky130 `LAYER`
+                // blocks carry; `RANGE`/`BY`/`SAMENET` forms (seen inside
+                // VIARULE blocks, which never reach this loop) are skipped
+                // like any unmodeled statement rather than misread.
+                let plain = match lexer.peek_token() {
+                    Some(Token::Word(v)) => v.parse::<f32>().ok(),
+                    _ => None,
+                };
+                if let Some(v) = plain {
+                    let _ = lexer.next_token();
+                    if let Some(Token::Semi) = lexer.peek_token() {
+                        let _ = lexer.next_token();
+                        spacing_um = Some(v);
+                    } else {
+                        lexer.skip_to_semi();
+                    }
+                } else {
+                    lexer.skip_to_semi();
+                }
+            } else if w.eq_ignore_ascii_case("AREA") {
+                // Routing `AREA <f> ;` — minimum merged-polygon area.
+                // ANTENNA* keywords are longer words, no collision.
+                area_um2 = Some(required_f32(lexer, "LAYER AREA")?);
+                lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("MINENCLOSEDAREA") {
+                min_enclosed_area_um2 =
+                    Some(required_f32(lexer, "LAYER MINENCLOSEDAREA")?);
+                lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("ENCLOSURE") {
+                // Cut-layer `ENCLOSURE {BELOW|ABOVE} o1 o2 ;` — the
+                // overhang pair the metal on that side must provide.
+                // VIARULE's `ENCLOSURE x y` form never reaches this loop
+                // (VIARULE blocks skip at top level); a non-side keyword
+                // is unmodeled and skipped like any other statement.
+                match lexer.next_word() {
+                    Some(side) if side.eq_ignore_ascii_case("BELOW") => {
+                        let o1 = required_f32(lexer, "LAYER ENCLOSURE BELOW")?;
+                        let o2 = required_f32(lexer, "LAYER ENCLOSURE BELOW")?;
+                        enc_below_um = Some([o1, o2]);
+                        lexer.skip_to_semi();
+                    }
+                    Some(side) if side.eq_ignore_ascii_case("ABOVE") => {
+                        let o1 = required_f32(lexer, "LAYER ENCLOSURE ABOVE")?;
+                        let o2 = required_f32(lexer, "LAYER ENCLOSURE ABOVE")?;
+                        enc_above_um = Some([o1, o2]);
+                        lexer.skip_to_semi();
+                    }
+                    _ => lexer.skip_to_semi(),
+                }
             } else {
                 lexer.skip_to_semi();
             }
@@ -429,24 +652,49 @@ fn parse_layer(
         bail!("LEF: LAYER {layer_name} is not terminated by END {layer_name} (truncated file?)");
     }
 
+    if is_cut && !tech_db.routing_layers.is_empty() {
+        // The cut layer sits above the routing layer parsed just before it;
+        // `load_tech_db` resolves the resistance into `via_res_ohm_above`.
+        // A cut layer before the first routing layer (`licon`) has no `above`
+        // and is not recorded.
+        let below = LayerId(tech_db.routing_layers.len() as u8 - 1);
+        let cut_sym = interner.intern(&layer_name);
+        let cut_idx = tech_db.cut_layers.len() as u32;
+        let dbu = tech_db.dbu_per_micron as f32;
+        tech_db.cut_layers.push(CutLayer {
+            name: cut_sym,
+            above: below,
+            width_dbu: width_um.map(|w| (w * dbu).round() as i32).unwrap_or(0),
+            spacing_dbu: spacing_um.map(|s| (s * dbu).round() as i32).unwrap_or(0),
+            enc_below_dbu: enc_below_um
+                .map(|[a, b]| [(a * dbu).round() as i32, (b * dbu).round() as i32])
+                .unwrap_or([0, 0]),
+            enc_above_dbu: enc_above_um
+                .map(|[a, b]| [(a * dbu).round() as i32, (b * dbu).round() as i32])
+                .unwrap_or([0, 0]),
+        });
+        tech_db.cut_layer_by_name.insert(cut_sym, cut_idx);
+        if let Some(res) = cut_res_ohm {
+            tech_db.cut_res_above.push((below.0, res));
+        }
+    }
+
     if is_routing {
         let dbu = tech_db.dbu_per_micron as f32;
         let width_um =
             width_um.with_context(|| format!("LEF: routing layer {layer_name} has no WIDTH"))?;
-        let pitch_um = match dir {
-            LayerDir::Vertical => pitch_x_um.or(pitch_y_um),
-            LayerDir::Horizontal => pitch_y_um.or(pitch_x_um),
-        }
-        .with_context(|| format!("LEF: routing layer {layer_name} has no PITCH"))?;
-        // OFFSET is optional; an absent OFFSET is the LEF default of 0.
-        let offset_um = match dir {
-            LayerDir::Vertical => offset_x_um.or(offset_y_um),
-            LayerDir::Horizontal => offset_y_um.or(offset_x_um),
-        }
-        .unwrap_or(0.0);
-
-        let pitch_dbu = (pitch_um * dbu).round() as i32;
-        let offset_dbu = (offset_um * dbu).round() as i32;
+        let pitch_x = pitch_x_um
+            .with_context(|| format!("LEF: routing layer {layer_name} has no PITCH"))?;
+        // A single `PITCH`/`OFFSET` value applies to both axes; an
+        // absent `OFFSET` is the LEF default of 0.
+        let pitch_x_dbu = (pitch_x * dbu).round() as i32;
+        let pitch_y_dbu = (pitch_y_um.unwrap_or(pitch_x) * dbu).round() as i32;
+        let offset_x_dbu = (offset_x_um.unwrap_or(0.0) * dbu).round() as i32;
+        let offset_y_dbu = (offset_y_um.or(offset_x_um).unwrap_or(0.0) * dbu).round() as i32;
+        let (pitch_dbu, offset_dbu) = match dir {
+            LayerDir::Vertical => (pitch_x_dbu, offset_x_dbu),
+            LayerDir::Horizontal => (pitch_y_dbu, offset_y_dbu),
+        };
         let width_dbu = (width_um * dbu).round() as i32;
 
         let layer_sym = interner.intern(&layer_name);
@@ -459,12 +707,153 @@ fn parse_layer(
             pitch_dbu,
             width_dbu,
             offset_dbu,
+            pitch_x_dbu,
+            pitch_y_dbu,
+            offset_x_dbu,
+            offset_y_dbu,
+            tracks_x: Vec::new(),
+            tracks_y: Vec::new(),
             res_per_sq,
             cap_per_sq_um,
             edge_cap_per_um,
+            spacing_dbu: spacing_um.map(|s| (s * dbu).round() as i32).unwrap_or(0),
+            spacing_table: spacing_table_um
+                .iter()
+                .map(|&(w, s)| crate::tech_db::SpacingTableRow {
+                    width_dbu: (w * dbu).round() as i32,
+                    spacing_dbu: (s * dbu).round() as i32,
+                })
+                .collect(),
+            area_dbu2: area_um2
+                .map(|a| (a * dbu * dbu).round() as i64)
+                .unwrap_or(0),
+            min_enclosed_area_dbu2: min_enclosed_area_um2
+                .map(|a| (a * dbu * dbu).round() as i64)
+                .unwrap_or(0),
         });
     }
 
+    Ok(())
+}
+
+/// A `VIA` block: `LAYER`/`RECT` groups plus attributes the model does not
+/// keep. Every `RECT` is retained in group order — the PDN model reads the
+/// cut count and layer stack; the DRC shape model places all of them.
+fn parse_via(
+    lexer: &mut LefLexer,
+    tech_db: &mut TechDb,
+    interner: &mut StringInterner,
+) -> Result<()> {
+    let via_name = required_word(lexer, "VIA name")?.to_string();
+    // (name sym, routing layer, cut-layer index, rects) per LAYER group.
+    struct ViaGroup {
+        name: crate::interner::SymbolId,
+        routing: Option<LayerId>,
+        cut: Option<u32>,
+        rects: Vec<RectDbu>,
+    }
+    let mut groups: Vec<ViaGroup> = Vec::new();
+    let dbu = tech_db.dbu_per_micron as f32;
+    let mut closed = false;
+
+    while let Some(tok) = lexer.next_token() {
+        if let Token::Word(w) = tok {
+            if w.eq_ignore_ascii_case("END") {
+                end_block(lexer, "VIA", Some(&via_name))?;
+                closed = true;
+                break;
+            } else if w.eq_ignore_ascii_case("LAYER") {
+                let lname = required_word(lexer, "VIA LAYER")?.to_string();
+                let lsym = interner.intern(&lname);
+                let routing = tech_db.layer_by_name.get(&lsym).copied();
+                let cut = tech_db.cut_layer_by_name.get(&lsym).copied();
+                if routing.is_none() && cut.is_none() {
+                    bail!(
+                        "LEF line {}: VIA {via_name} LAYER {lname} is neither a routing nor a cut layer",
+                        lexer.line()
+                    );
+                }
+                groups.push(ViaGroup {
+                    name: lsym,
+                    routing,
+                    cut,
+                    rects: Vec::new(),
+                });
+                lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("RECT") {
+                let Some(group) = groups.last_mut() else {
+                    bail!(
+                        "LEF line {}: VIA {via_name} RECT before any LAYER",
+                        lexer.line()
+                    );
+                };
+                let x1 = required_f32(lexer, "VIA RECT x1")?;
+                let y1 = required_f32(lexer, "VIA RECT y1")?;
+                let x2 = required_f32(lexer, "VIA RECT x2")?;
+                let y2 = required_f32(lexer, "VIA RECT y2")?;
+                let x1_dbu = (x1 * dbu).round() as i32;
+                let y1_dbu = (y1 * dbu).round() as i32;
+                let x2_dbu = (x2 * dbu).round() as i32;
+                let y2_dbu = (y2 * dbu).round() as i32;
+                group.rects.push(RectDbu::new(
+                    x1_dbu.min(x2_dbu),
+                    y1_dbu.min(y2_dbu),
+                    x1_dbu.max(x2_dbu),
+                    y1_dbu.max(y2_dbu),
+                ));
+                lexer.skip_to_semi();
+            } else if w.eq_ignore_ascii_case("DEFAULT") || w.eq_ignore_ascii_case("TOPOFSTACKONLY")
+            {
+                // Bare markers with no `;`-terminated statement.
+            } else {
+                // FOREIGN, PATTERN, RESISTANCE, PROPERTY, MASK, …: `;`-terminated
+                // attributes the model does not read.
+                lexer.skip_to_semi();
+            }
+        }
+    }
+    if !closed {
+        bail!("LEF: VIA {via_name} is not terminated by END {via_name} (truncated file?)");
+    }
+
+    if groups.is_empty() {
+        // An empty `VIA name END name` block records nothing.
+        return Ok(());
+    }
+    let routing: Vec<LayerId> = groups.iter().filter_map(|g| g.routing).collect();
+    let cuts: Vec<usize> = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.cut.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    if routing.len() < 2 || cuts.is_empty() {
+        bail!("LEF: VIA {via_name} needs at least two routing layers and one cut layer");
+    }
+
+    let via_sym = interner.intern(&via_name);
+    if tech_db.via_by_name.contains_key(&via_sym) {
+        bail!("LEF: VIA {via_name} is defined more than once");
+    }
+    let rects: Vec<ViaLayerRect> = groups
+        .iter()
+        .flat_map(|g| {
+            let layer = g
+                .routing
+                .map_or_else(|| ViaRectLayer::Cut(g.cut.unwrap()), ViaRectLayer::Routing);
+            g.rects.iter().map(move |&rect| ViaLayerRect { layer, rect })
+        })
+        .collect();
+    let idx = tech_db.via_defs.len() as u32;
+    tech_db.via_defs.push(ViaDef {
+        name: via_sym,
+        lower: *routing.iter().min_by_key(|l| l.0).unwrap(),
+        upper: *routing.iter().max_by_key(|l| l.0).unwrap(),
+        cut: groups[cuts[0]].name,
+        cut_count: cuts.iter().map(|&i| groups[i].rects.len() as u32).sum(),
+        rects,
+    });
+    tech_db.via_by_name.insert(via_sym, idx);
     Ok(())
 }
 
@@ -529,6 +918,7 @@ fn parse_macro(
         bail!("LEF: MACRO {macro_name} has no SIZE");
     };
 
+    let obs_rects_raw = obs_rects.clone();
     merge_connected_obs(&mut obs_rects);
 
     let pin_count = (tech_db.macro_pins.len() as u32 - pin_offset) as u16;
@@ -543,6 +933,7 @@ fn parse_macro(
         pin_offset,
         pin_count,
         obs_rects,
+        obs_rects_raw,
         pin_obs_rects,
     });
 
@@ -718,6 +1109,7 @@ fn parse_pin(
         bail!("LEF: PIN {pin_name} is not terminated by END {pin_name} (truncated file?)");
     }
 
+    let pin_rects = local_pin_rects.clone();
     if !local_pin_rects.is_empty() {
         merge_connected_obs(&mut local_pin_rects);
         pin_obs_rects.extend(local_pin_rects);
@@ -735,6 +1127,7 @@ fn parse_pin(
         offset_x_frac,
         offset_y_frac,
         layer: pin_layer,
+        rects: pin_rects,
     });
 
     Ok(())
@@ -822,6 +1215,15 @@ pub fn load_tech_db(
     let mut tech_db = TechDb::new();
     let mut report = parse_lef(tlef_path, &mut tech_db, interner)?;
     report.merge(&parse_lef(lef_path, &mut tech_db, interner)?);
+    // The first cut layer above a routing layer is the via between it and
+    // the next routing layer; later cuts between the same pair stack higher.
+    tech_db.via_res_ohm_above = vec![0.0; tech_db.routing_layers.len()];
+    for (below, res) in std::mem::take(&mut tech_db.cut_res_above) {
+        let slot = &mut tech_db.via_res_ohm_above[below as usize];
+        if *slot == 0.0 {
+            *slot = res;
+        }
+    }
     tech_db.strings = interner.clone();
     tech_db.rebuild_maps();
     Ok((tech_db, report))
@@ -1276,13 +1678,14 @@ END
         assert_eq!(db.macros.len(), 1);
         assert_eq!(report.skipped["FOO"], 1);
         assert_eq!(report.skipped["VERSION"], 1);
-        // Lowercase `via` still counts under the uppercased keyword.
-        assert_eq!(report.skipped["VIA"], 2);
+        // `VIA` blocks are parsed now — both the empty uppercase record and
+        // the lowercase one record nothing but count as consumed, not skipped.
+        assert!(!report.skipped.contains_key("VIA"));
         assert_eq!(report.skipped["VIARULE"], 1);
         assert_eq!(report.skipped["NONDEFAULTRULE"], 1);
         assert_eq!(report.skipped["PROPERTYDEFINITIONS"], 1);
         assert_eq!(report.skipped["SPACING"], 1);
-        assert_eq!(report.total(), 8);
+        assert_eq!(report.total(), 6);
     }
 
     const KNOWN_LEF: &str = r#"
@@ -1317,5 +1720,498 @@ END
 
         assert!(report.skipped.is_empty());
         assert_eq!(report.total(), 0);
+    }
+
+    /// `SPACING`/`SPACINGTABLE` inside `LAYER` blocks: plain scalar on a
+    /// CUT layer, PRL/WIDTH table on a ROUTING layer, a non-plain form
+    /// skipped like any unmodeled statement, and a layer with neither.
+    const SPACING_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+LAYER li1
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.17 ;
+END li1
+LAYER mcon
+  TYPE CUT ;
+  WIDTH 0.17 ;
+  SPACING 0.19 ;
+END mcon
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+  SPACING 0.3 RANGE 3 100 ;
+END met1
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+  SPACINGTABLE
+     PARALLELRUNLENGTH 0
+     WIDTH 0 0.14
+     WIDTH 3 0.28 ;
+END met2
+END LIBRARY
+"#;
+
+    #[test]
+    fn test_layer_spacing_scalar_and_table() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(SPACING_LEF.as_bytes(), &mut db, &mut interner).unwrap();
+
+        let mcon = &db.cut_layers[0];
+        assert_eq!(mcon.spacing_dbu, 190);
+
+        // `SPACING 0.3 RANGE 3 100` is not the plain scalar form — the
+        // statement is consumed but records nothing.
+        let met1 = &db.routing_layers[1];
+        assert_eq!(met1.spacing_dbu, 0);
+        assert!(met1.spacing_table.is_empty());
+        assert_eq!(met1.min_spacing_dbu(), 0);
+        assert_eq!(met1.wide_spacing(), None);
+
+        let met2 = &db.routing_layers[2];
+        assert_eq!(met2.spacing_dbu, 0);
+        assert_eq!(
+            met2.spacing_table,
+            vec![
+                crate::tech_db::SpacingTableRow {
+                    width_dbu: 0,
+                    spacing_dbu: 140,
+                },
+                crate::tech_db::SpacingTableRow {
+                    width_dbu: 3000,
+                    spacing_dbu: 280,
+                },
+            ]
+        );
+        assert_eq!(met2.min_spacing_dbu(), 140);
+        assert_eq!(met2.wide_spacing(), Some((3000, 280)));
+
+        // li1 carries neither statement — both helpers report no data.
+        let li1 = &db.routing_layers[0];
+        assert_eq!(li1.min_spacing_dbu(), 0);
+        assert_eq!(li1.wide_spacing(), None);
+    }
+
+    /// A `VIA` whose name spells nothing about layers — resolution must come
+    /// from its `LAYER` groups, not the name.
+    const VIA_TLEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+
+LAYER via12
+  TYPE CUT ;
+  RESISTANCE 15.0 ;
+END via12
+
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+END met2
+
+VIA xyzzy DEFAULT
+  LAYER via12 ;
+    RECT -0.075 -0.075 0.075 0.075 ;
+    RECT -0.075 -0.075 0.075 0.075 ;
+  LAYER met1 ;
+    RECT -0.16 -0.13 0.16 0.13 ;
+  LAYER met2 ;
+    RECT -0.13 -0.16 0.13 0.16 ;
+END xyzzy
+"#;
+
+    fn parse_via_tlef() -> (StringInterner, TechDb) {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(VIA_TLEF.as_bytes(), &mut db, &mut interner).unwrap();
+        db.strings = interner.clone();
+        // `load_tech_db` folds `cut_res_above` into `via_res_ohm_above`;
+        // `parse_lef_bytes` alone does not.
+        db.via_res_ohm_above = vec![0.0; db.routing_layers.len()];
+        for (below, res) in std::mem::take(&mut db.cut_res_above) {
+            db.via_res_ohm_above[below as usize] = res;
+        }
+        db.rebuild_maps();
+        (interner, db)
+    }
+
+    #[test]
+    fn test_via_renamed_still_resolves_by_layer_triple() {
+        let (interner, db) = parse_via_tlef();
+        let layer = |name: &str| db.layer_by_name[&interner.get(name).unwrap()];
+
+        assert_eq!(db.via_defs.len(), 1);
+        let vd = &db.via_defs[0];
+        assert_eq!(interner.resolve(vd.name), "xyzzy");
+        assert_eq!(vd.lower, layer("met1"));
+        assert_eq!(vd.upper, layer("met2"));
+        assert_eq!(interner.resolve(vd.cut), "via12");
+        assert_eq!(vd.cut_count, 2);
+
+        // The cut layer sits above met1; two parallel cuts halve the 15 Ω.
+        assert_eq!(db.via_res_ohm(vd.cut, 2), Some(7.5));
+        assert_eq!(db.via_res_ohm(vd.cut, 1), Some(15.0));
+        // A name unknown to the CUT-layer map has no resistance.
+        assert_eq!(db.via_res_ohm(interner.get("met1").unwrap(), 1), None);
+    }
+
+    #[test]
+    fn test_via_without_a_cut_layer_is_an_error() {
+        let text = edit_fixture(
+            VIA_TLEF,
+            "  LAYER via12 ;\n    RECT -0.075 -0.075 0.075 0.075 ;\n    RECT -0.075 -0.075 0.075 0.075 ;\n",
+            "",
+        );
+        let msg = lef_error(&text);
+        assert!(msg.contains("xyzzy") && msg.contains("cut layer"), "{msg}");
+    }
+
+    #[test]
+    fn test_via_on_an_unknown_layer_is_an_error() {
+        // The indented `LAYER <name> ;` inside the VIA block is the group
+        // header; `LAYER via12` alone would hit the layer's own definition.
+        let text = edit_fixture(VIA_TLEF, "  LAYER via12 ;", "  LAYER via99 ;");
+        let msg = lef_error(&text);
+        assert!(msg.contains("via99") && msg.contains("neither a routing nor a cut"), "{msg}");
+    }
+
+    #[test]
+    fn test_unterminated_via_is_an_error() {
+        let text = edit_fixture(VIA_TLEF, "END xyzzy", "");
+        let msg = lef_error(&text);
+        assert!(msg.contains("VIA xyzzy") && msg.contains("not terminated"), "{msg}");
+    }
+
+    #[test]
+    fn test_duplicate_via_name_is_an_error() {
+        // A second full definition of `xyzzy` after the first.
+        let dup = VIA_TLEF.replace(
+            "END xyzzy",
+            "END xyzzy\nVIA xyzzy\n  LAYER via12 ;\n    RECT -0.075 -0.075 0.075 0.075 ;\n  LAYER met1 ;\n    RECT -0.16 -0.13 0.16 0.13 ;\n  LAYER met2 ;\n    RECT -0.13 -0.16 0.13 0.16 ;\nEND xyzzy",
+        );
+        let msg = lef_error(&dup);
+        assert!(msg.contains("xyzzy") && msg.contains("more than once"), "{msg}");
+    }
+
+    #[test]
+    fn test_sky130_tlef_via_defs() {
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        if !tlef_path.is_file() || !lef_path.is_file() {
+            panic!("PDK LEF files missing under {:?}", sky130_hd());
+        }
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load sky130 TechDb")
+            .0;
+
+        let layer = |name: &str| {
+            tech_db.layer_by_name[&tech_db.strings.get(name).expect(name)]
+        };
+        let via = |name: &str| {
+            let sym = tech_db.strings.get(name).expect(name);
+            &tech_db.via_defs[tech_db.via_by_name[&sym] as usize]
+        };
+
+        // `licon` precedes the first routing layer and is not a PDN cut;
+        // `mcon`..`via4` are.
+        assert!(tech_db
+            .strings
+            .get("licon")
+            .is_none_or(|s| !tech_db.cut_layer_by_name.contains_key(&s)));
+        for name in ["mcon", "via", "via2", "via3", "via4"] {
+            let s = tech_db.strings.get(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(tech_db.cut_layer_by_name.contains_key(&s), "{name}");
+        }
+
+        // The DEF via names in the test designs resolve through these
+        // fixed-via definitions.
+        let vd = via("L1M1_PR");
+        assert_eq!(vd.lower, layer("li1"));
+        assert_eq!(vd.upper, layer("met1"));
+        assert_eq!(tech_db.strings.resolve(vd.cut), "mcon");
+        // nom corner: mcon RESISTANCE 9.30, one cut RECT.
+        assert_eq!(vd.cut_count, 1);
+        assert_eq!(tech_db.via_res_ohm(vd.cut, vd.cut_count), Some(9.30));
+
+        let vd = via("M1M2_PR");
+        assert_eq!(vd.lower, layer("met1"));
+        assert_eq!(vd.upper, layer("met2"));
+        assert_eq!(tech_db.strings.resolve(vd.cut), "via");
+        assert_eq!(vd.cut_count, 1);
+        // nom corner: via RESISTANCE 4.50 over 5 parallel cuts (ROWCOL 1 5).
+        assert_eq!(tech_db.via_res_ohm(vd.cut, 5), Some(0.90));
+
+        let vd = via("M4M5_PR");
+        assert_eq!(vd.lower, layer("met4"));
+        assert_eq!(vd.upper, layer("met5"));
+        assert_eq!(tech_db.strings.resolve(vd.cut), "via4");
+    }
+
+    /// `VIA` rects are retained in group order with the right
+    /// `ViaRectLayer` discriminants; a multi-`RECT` cut group keeps every
+    /// parallel cut.
+    #[test]
+    fn test_via_rects_retained_in_group_order() {
+        let (interner, db) = parse_via_tlef();
+        let vd = &db.via_defs[0];
+        let met1 = db.layer_by_name[&interner.get("met1").unwrap()];
+        let met2 = db.layer_by_name[&interner.get("met2").unwrap()];
+        let cut = db.cut_layer_by_name[&interner.get("via12").unwrap()];
+
+        assert_eq!(vd.cut_count, 2);
+        assert_eq!(
+            vd.rects,
+            vec![
+                ViaLayerRect {
+                    layer: ViaRectLayer::Cut(cut),
+                    rect: RectDbu::new(-75, -75, 75, 75),
+                },
+                ViaLayerRect {
+                    layer: ViaRectLayer::Cut(cut),
+                    rect: RectDbu::new(-75, -75, 75, 75),
+                },
+                ViaLayerRect {
+                    layer: ViaRectLayer::Routing(met1),
+                    rect: RectDbu::new(-160, -130, 160, 130),
+                },
+                ViaLayerRect {
+                    layer: ViaRectLayer::Routing(met2),
+                    rect: RectDbu::new(-130, -160, 130, 160),
+                },
+            ]
+        );
+    }
+
+    /// A CUT layer's `WIDTH` is recorded in DBU; an omitted `WIDTH` is 0.
+    #[test]
+    fn test_cut_layer_width_recorded() {
+        let (_, db) = parse_via_tlef();
+        assert_eq!(db.cut_layers.len(), 1);
+        assert_eq!(db.cut_layers[0].width_dbu, 0);
+
+        let with_width = VIA_TLEF.replace(
+            "  RESISTANCE 15.0 ;",
+            "  RESISTANCE 15.0 ;\n  WIDTH 0.15 ;",
+        );
+        assert!(with_width.contains("WIDTH 0.15"));
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(with_width.as_bytes(), &mut db, &mut interner).unwrap();
+        assert_eq!(db.cut_layers[0].width_dbu, 150);
+    }
+
+    /// `AREA`/`MINENCLOSEDAREA` on routing layers and
+    /// `ENCLOSURE {BELOW|ABOVE}` on cut layers — the bounds the
+    /// enclosure/area/hole DRC families read. `mcon` must follow a
+    /// routing layer to be recorded as a cut layer.
+    const ENC_AREA_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+LAYER li1
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.17 ;
+  AREA 0.0561 ;
+END li1
+LAYER mcon
+  TYPE CUT ;
+  WIDTH 0.17 ;
+  ENCLOSURE BELOW 0 0 ;
+  ENCLOSURE ABOVE 0.03 0.06 ;
+END mcon
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+  AREA 0.083 ;
+  MINENCLOSEDAREA 0.14 ;
+END met1
+LAYER via
+  TYPE CUT ;
+  WIDTH 0.15 ;
+  ENCLOSURE 0.055 0.085 ;
+  ENCLOSURE BELOW 0.055 0.085 ;
+END via
+END LIBRARY
+"#;
+
+    #[test]
+    fn test_layer_area_enclosure_retained() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(ENC_AREA_LEF.as_bytes(), &mut db, &mut interner).unwrap();
+
+        // Cut layers: mcon keeps both enclosure pairs; via's bare
+        // `ENCLOSURE 0.055 0.085` (no BELOW/ABOVE) is skipped while the
+        // BELOW pair records — matching the documented grammar.
+        let mcon = &db.cut_layers[0];
+        assert_eq!(mcon.enc_below_dbu, [0, 0]);
+        assert_eq!(mcon.enc_above_dbu, [30, 60]);
+        let via = &db.cut_layers[1];
+        assert_eq!(via.enc_below_dbu, [55, 85]);
+        assert_eq!(via.enc_above_dbu, [0, 0]);
+
+        // Routing: met1 carries both area bounds (µm² → DBU²); li1 has
+        // AREA but no MINENCLOSEDAREA.
+        let met1 = &db.routing_layers[1];
+        assert_eq!(met1.area_dbu2, 83000);
+        assert_eq!(met1.min_enclosed_area_dbu2, 140000);
+        let li1 = &db.routing_layers[0];
+        assert_eq!(li1.area_dbu2, 56100);
+        assert_eq!(li1.min_enclosed_area_dbu2, 0);
+    }
+
+    /// A cut layer with no `ENCLOSURE` and a routing layer with no
+    /// `AREA`/`MINENCLOSEDAREA` record zeros — the downstream rules
+    /// treat 0 as "undeclared, skip".
+    #[test]
+    fn test_layer_area_enclosure_defaults_zero() {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(VIA_TLEF.as_bytes(), &mut db, &mut interner).unwrap();
+        let cut = &db.cut_layers[0];
+        assert_eq!(cut.enc_below_dbu, [0, 0]);
+        assert_eq!(cut.enc_above_dbu, [0, 0]);
+        assert!(db
+            .routing_layers
+            .iter()
+            .all(|l| l.area_dbu2 == 0 && l.min_enclosed_area_dbu2 == 0));
+    }
+
+    /// Two routing layers so the bare/`LAYER a b` forms are observable.
+    const TRACKS_LEF: &str = r#"
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+SITE unithd
+  CLASS CORE ;
+  SIZE 0.46 BY 2.72 ;
+END unithd
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+LAYER met2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.46 ;
+  WIDTH 0.14 ;
+END met2
+"#;
+
+    fn tracks_db(lef: &str) -> TechDb {
+        let mut interner = StringInterner::new();
+        let mut db = TechDb::new();
+        parse_lef_bytes(lef.as_bytes(), &mut db, &mut interner).expect("TRACKS LEF must parse");
+        db
+    }
+
+    #[test]
+    fn test_tracks_xy_expand() {
+        let lef = format!(
+            "{TRACKS_LEF}TRACKS X 0.17 DO 3 STEP 0.34 LAYER met1 ;\n\
+             TRACKS Y 0.23 DO 2 STEP 0.46 LAYER met1 ;\n\
+             END LIBRARY\n"
+        );
+        let db = tracks_db(&lef);
+        assert_eq!(db.routing_layers[0].tracks_x, vec![170, 510, 850]);
+        assert_eq!(db.routing_layers[0].tracks_y, vec![230, 690]);
+        assert!(db.routing_layers[1].tracks_x.is_empty());
+    }
+
+    /// `LAYER a b` (plural) hits both named layers; a record with no
+    /// `LAYER` at all lands on every routing layer.
+    #[test]
+    fn test_tracks_multi_layer_and_bare() {
+        let lef = format!(
+            "{TRACKS_LEF}TRACKS X 0.1 DO 2 STEP 0.2 LAYER met1 met2 ;\n\
+             TRACKS Y 0.05 DO 1 STEP 0.5 ;\n\
+             END LIBRARY\n"
+        );
+        let db = tracks_db(&lef);
+        for layer in &db.routing_layers {
+            assert_eq!(layer.tracks_x, vec![100, 300]);
+            assert_eq!(layer.tracks_y, vec![50]);
+        }
+    }
+
+    /// Overlapping records merge into one sorted, deduplicated list.
+    #[test]
+    fn test_tracks_dedup_and_sort() {
+        let lef = format!(
+            "{TRACKS_LEF}TRACKS X 0.5 DO 2 STEP 0.2 LAYER met1 ;\n\
+             TRACKS X 0.1 DO 3 STEP 0.2 LAYER met1 ;\n\
+             END LIBRARY\n"
+        );
+        let db = tracks_db(&lef);
+        assert_eq!(db.routing_layers[0].tracks_x, vec![100, 300, 500, 700]);
+    }
+
+    /// A `TRACKS` record ahead of `UNITS` still expands at the declared
+    /// scale — expansion is deferred to end of file.
+    #[test]
+    fn test_tracks_before_units() {
+        let lef = r#"
+TRACKS X 0.1 DO 1 STEP 0.1 ;
+UNITS
+  DATABASE MICRONS 2000 ;
+END UNITS
+LAYER met1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.34 ;
+  WIDTH 0.14 ;
+END met1
+END LIBRARY
+"#;
+        let db = tracks_db(lef);
+        assert_eq!(db.routing_layers[0].tracks_x, vec![200]);
+    }
+
+    #[test]
+    fn test_tracks_unknown_layer_errors() {
+        let lef = format!("{TRACKS_LEF}TRACKS X 0.1 DO 1 STEP 0.1 LAYER foo ;\n");
+        let msg = lef_error(&lef);
+        assert!(msg.contains("TRACKS") && msg.contains("foo"), "{msg}");
+    }
+
+    #[test]
+    fn test_tracks_malformed_errors() {
+        for needle in [
+            "TRACKS X 0.1 DO 1 LAYER met1 ;",          // missing STEP
+            "TRACKS X 0.1 1 STEP 0.1 LAYER met1 ;",    // missing DO
+            "TRACKS X abc DO 1 STEP 0.1 LAYER met1 ;", // non-numeric start
+            "TRACKS X 0.1 DO 1 STEP 0.1 MASK 3 LAYER met1 ;", // MASK token
+            "TRACKS X 0.1 DO 1 STEP 0.1 LAYER ;",       // empty LAYER list
+            "TRACKS Q 0.1 DO 1 STEP 0.1 LAYER met1 ;", // bad axis
+        ] {
+            let lef = format!("{TRACKS_LEF}{needle}\nEND LIBRARY\n");
+            let msg = lef_error(&lef);
+            assert!(msg.contains("TRACKS"), "`{needle}` → {msg}");
+        }
     }
 }

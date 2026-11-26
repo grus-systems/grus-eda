@@ -1,4 +1,4 @@
-use crate::design_db::{DesignDb, Orient, PlacementStatus};
+use crate::design_db::{DesignDb, PlacementStatus};
 use crate::interner::LayerId;
 use crate::tech_db::{LayerDir, TechDb};
 
@@ -118,8 +118,10 @@ impl GCellGrid {
                     let oy = y_grid.start_dbu;
                     let gw = x_grid.step_dbu;
                     let gh = y_grid.step_dbu;
-                    let num_x = (x_grid.num_boundaries - 1).max(1) as usize;
-                    let num_y = (y_grid.num_boundaries - 1).max(1) as usize;
+                    // `DO` is the column/row count in OpenROAD's
+                    // convention (`getGridX` has one entry per column).
+                    let num_x = x_grid.num_cells.max(1) as usize;
+                    let num_y = y_grid.num_cells.max(1) as usize;
                     (ox, oy, gw, gh, num_x, num_y)
                 } else {
                     Self::compute_default_grid(design_db, tech_db, gcell_tracks_override)
@@ -199,27 +201,14 @@ impl GCellGrid {
 
                     for &(obs_layer, r) in mac.obs_rects.iter().chain(mac.pin_obs_rects.iter()) {
                         if obs_layer == layer_id {
-                            let (xl, yl, xh, yh) = match orient {
-                                Orient::N => (cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh),
-                                Orient::S => {
-                                    (cx + w - r.xh, cy + h - r.yh, cx + w - r.xl, cy + h - r.yl)
-                                }
-                                Orient::W => (cx + h - r.yh, cy + r.xl, cx + h - r.yl, cy + r.xh),
-                                Orient::E => (cx + r.yl, cy + w - r.xh, cx + r.yh, cy + w - r.xl),
-                                Orient::FN => (cx + w - r.xh, cy + r.yl, cx + w - r.xl, cy + r.yh),
-                                Orient::FS => (cx + r.xl, cy + h - r.yh, cx + r.xh, cy + h - r.yl),
-                                Orient::FW => (cx + r.yl, cy + r.xl, cx + r.yh, cy + r.xh),
-                                Orient::FE => {
-                                    (cx + h - r.yh, cy + w - r.xh, cx + h - r.yl, cy + w - r.xl)
-                                }
-                            };
-                            obstacles.push((xl, yl, xh, yh));
+                            let r = DesignDb::orient_rect(r, w, h, orient);
+                            obstacles.push((cx + r.xl, cy + r.yl, cx + r.xh, cy + r.yh));
                         }
                     }
                 }
             }
 
-            for &(wire_layer, r) in &design_db.special_wire_rects {
+            for (wire_layer, r) in design_db.special_wire_rects() {
                 if wire_layer == layer_id {
                     obstacles.push((r.xl, r.yl, r.xh, r.yh));
                 }
@@ -430,7 +419,11 @@ impl GCellGrid {
         grid
     }
 
-    fn compute_default_grid(
+    /// The grid used when the DEF is silent (or an axis is missing):
+    /// die lower-left origin, `step = gcell_tracks_override.unwrap_or(15)
+    /// × routing_layers[2].pitch_dbu`, `n = max(1, floor(span/step))`.
+    /// `write_def_full` emits these numbers as the default `GCELLGRID`.
+    pub fn compute_default_grid(
         design_db: &DesignDb,
         tech_db: &TechDb,
         gcell_tracks_override: Option<i32>,
@@ -456,6 +449,7 @@ mod tests {
     use super::*;
     use crate::interner::StringInterner;
     use crate::readers::def::parse_def;
+    use crate::RectDbu;
     use crate::readers::lef::load_tech_db;
     use crate::test_support::{design_dir, sky130_hd};
 
@@ -482,6 +476,37 @@ mod tests {
                 y: (grid.ny - 1) as u16
             }
         );
+    }
+
+    /// The `special_wire_rects` compatibility view must yield exactly the
+    /// union of `pdn_nets` wire rects (same multiset — count and contents).
+    #[test]
+    fn test_special_wire_rects_view() {
+        let tlef_path = sky130_hd().join("techlef/sky130_fd_sc_hd__nom.tlef");
+        let lef_path = sky130_hd().join("lef/sky130_fd_sc_hd.lef");
+        let def_path = design_dir("gcd").join("gcd.placed.def");
+        for p in [&tlef_path, &lef_path, &def_path] {
+            if !p.is_file() {
+                panic!("required file missing at {p:?}");
+            }
+        }
+        let mut interner = StringInterner::new();
+        let tech_db = load_tech_db(&tlef_path, &lef_path, &mut interner)
+            .expect("Failed to load TechDb")
+            .0;
+        let db = parse_def(&def_path, &tech_db, None).expect("Failed to parse placed DEF");
+
+        let mut view: Vec<_> = db.special_wire_rects().collect();
+        let mut union: Vec<_> = db
+            .pdn_nets
+            .iter()
+            .flat_map(|n| n.wire_rects.iter().copied())
+            .collect();
+        let key = |&(l, r): &(LayerId, RectDbu)| (l.0, r.xl, r.yl, r.xh, r.yh);
+        view.sort_by_key(key);
+        union.sort_by_key(key);
+        assert_eq!(view, union);
+        assert!(!view.is_empty(), "gcd SPECIALNETS produced no wire rects");
     }
 
     #[test]

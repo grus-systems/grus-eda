@@ -674,6 +674,7 @@ mod tests {
             offset_x_frac: false,
             offset_y_frac: false,
             layer: None,
+        rects: Vec::new(),
         });
         tech_db.macros.push(MacroDef {
             name: m_name,
@@ -683,6 +684,7 @@ mod tests {
             pin_offset: 0,
             pin_count: 1,
             obs_rects: Vec::new(),
+            obs_rects_raw: Vec::new(),
             pin_obs_rects: Vec::new(),
         });
         tech_db.macro_by_name.insert(m_name, MacroId(0));
@@ -712,6 +714,8 @@ mod tests {
             design_db.pin_dirs.push(PinDir::Input);
             design_db.pin_offset_x_dbu.push(2000);
             design_db.pin_offset_y_dbu.push(1000);
+            design_db.pin_io_layer.push(None);
+            design_db.pin_io_rects.push(Vec::new());
             design_db.pin_is_driver.push(i % 4 == 0);
         }
         design_db.cell_pin_offsets.push(num_cells as u32);
