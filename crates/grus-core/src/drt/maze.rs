@@ -214,6 +214,27 @@ pub struct IterStat {
     pub prov_collisions: u32,
 }
 
+/// One attempted net's completion snapshot — the router's only
+/// live-progress channel, emitted once per `bad`-loop attempt to
+/// the `route_nets_with_progress` sink. `elapsed` is observational
+/// and never feeds a routing decision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RouteProgress {
+    /// 1-based rip-up iteration (the `IterStat` index).
+    pub iteration: u32,
+    /// Attempts finished so far this iteration, `1..=queued`, in
+    /// `bad` order — routed or failed alike.
+    pub done: u32,
+    /// Nets queued into this iteration (`IterStat.attempted`).
+    pub queued: u32,
+    /// Failed attempts so far this iteration — the "unrouted so
+    /// far" count. Resets each iteration: re-queued failures count
+    /// again in the iteration where they re-fail.
+    pub unrouted: u32,
+    /// Wall time since `route_nets` entry.
+    pub elapsed: std::time::Duration,
+}
+
 /// The router's complete deterministic output.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RouteDb {
@@ -3770,7 +3791,8 @@ fn patch_net_min_area(
 /// (`pairs[k].default`) and supplies footprints; a `ViaGap` pair's
 /// edges are forbidden. Soft iterations price foreign hits
 /// (`OCC_PENALTY + hist·HIST_STEP` per net); the last iteration is
-/// hard — foreign hits block. `Obs` always blocks.
+/// hard — foreign hits block. `Obs` always blocks. Use
+/// `route_nets_with_progress` to observe per-net progress.
 pub fn route_nets(
     db: &DesignDb,
     tech: &TechDb,
@@ -3778,6 +3800,22 @@ pub fn route_nets(
     graphs: &RouteGraphs,
     vias: &ViaTable,
     cfg: &MazeConfig,
+) -> RouteDb {
+    route_nets_with_progress(db, tech, tracks, graphs, vias, cfg, None)
+}
+
+/// `route_nets` plus an opt-in progress sink: `progress`, when
+/// `Some`, receives a `RouteProgress` copy after every attempted
+/// net of every rip-up iteration. The sink holds no router-state
+/// references — it cannot perturb the route.
+pub fn route_nets_with_progress(
+    db: &DesignDb,
+    tech: &TechDb,
+    tracks: &[LayerTracks],
+    graphs: &RouteGraphs,
+    vias: &ViaTable,
+    cfg: &MazeConfig,
+    mut progress: Option<&mut dyn FnMut(RouteProgress)>,
 ) -> RouteDb {
     let timing = std::env::var_os("GRUS_DRT_TIMING").is_some();
     let t0 = std::time::Instant::now();
@@ -3855,6 +3893,15 @@ pub fn route_nets(
                     res_of[i] = ClosureResiduals::default();
                     failed.push((i, unrouted));
                 }
+            }
+            if let Some(sink) = progress.as_deref_mut() {
+                sink(RouteProgress {
+                    iteration: it,
+                    done: bi as u32 + 1,
+                    queued: attempted,
+                    unrouted: failed.len() as u32,
+                    elapsed: t0.elapsed(),
+                });
             }
             if timing {
                 let el = tn.elapsed();
