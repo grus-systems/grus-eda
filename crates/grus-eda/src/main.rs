@@ -2081,6 +2081,27 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 route_db.notch_residuals.len(),
                 route_db.hole_residuals.len(),
             );
+            // Per-iteration convergence series: bad-set size entering
+            // each iteration, and the provisional collision count at
+            // its end (`docs/e6-drt.md` §7–§8).
+            println!(
+                "iter_progress={}",
+                route_db
+                    .iter_stats
+                    .iter()
+                    .map(|s| s.attempted.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            println!(
+                "iter_prov={}",
+                route_db
+                    .iter_stats
+                    .iter()
+                    .map(|s| s.prov_collisions.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             let (mut nopath, mut unatt) = (0usize, 0usize);
             for u in &route_db.unrouted {
                 for &(_, k) in &u.failed {

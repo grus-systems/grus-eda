@@ -932,6 +932,8 @@ if ours_router["emit_log_present"]:
     for ln in elog.splitlines():
         s = ln.rstrip()
         if (s.startswith("== drt emit") or s.startswith("guided=")
+                or s.startswith("iter_progress=")
+                or s.startswith("iter_prov=")
                 or s.lstrip().startswith("unrouted ")
                 or s.lstrip().startswith("unrouted_kinds ")
                 or s.lstrip().startswith("unrouted_blockers ")
