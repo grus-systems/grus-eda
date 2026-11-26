@@ -1,120 +1,137 @@
-# drt-converge-stats — Steps (r2, continuation)
+# drt-converge-stats — Steps (r3, memo corrections)
 
-Observability ticket; no routing-behavior change. HEAD is wip
-checkpoint ca053ac — the r1 driver timed out *after* committing
-the full code surface, so this plan is evidence + verify only.
-**Do not re-implement anything in §1** — it is a read-only
-reconciliation of the memo's "remaining" list against the tree.
+HEAD is 08141b1 — the full feature surface is landed and green.
+This round is three small corrections per the review memo. No
+routing-behavior change, no CLI output change, no digest change.
 
-## 1. Reconcile the memo's remaining list (read-only, no edits)
+## 1. `tests/drt.rs` — weaken the monotonicity assert
 
-Confirm each item matches its design spec — all landed at ca053ac:
+Three hunks inside `maze_census`:
 
-- [ ] `IterStat` + `RouteDb.iter_stats` + loop collection +
-      ctor — `maze.rs:194-231, 3755, 3763, 3768, 3776, 3809-3813,
-      3899`; re-export `drt.rs:21` (`model.md`)
-- [ ] Emit census lines `iter_progress=`/`iter_prov=` after
-      `guided=…` — `main.rs:2084-2104` (`output.md`)
-- [ ] Digest serialization appended after
-      `put(routed.iterations)` — `maze.rs:4061-4067` (`digest.md`;
-      memo ruling: keep it, touch no existing input)
-- [ ] Census-pinning asserts + digest fail-proof —
-      `tests/drt.rs:1641-1653, 1680-1716, 1821-1838`
-- [ ] keep-list arms — `check_drt_ours.sh:935-936`
-- [ ] `docs/e6-drt.md` §7/:562-569 + §8/:709-713,
-      `docs/status.md`, `Cargo.toml` 0.12.11
-- [ ] `docs/results.md` dated entry — gcd census + emit-leg
-      verbatim + digest move + fail-proof + consumers all
-      recorded; only the picorv32 arm is pending (§2)
+a. **Informational print** — after the
+   `{name}: iter_progress=… iter_prov=…` println (:1641-1653),
+   add:
 
-If any item has drifted from the spec, fix the spec deviation —
-do not redesign.
+   ```rust
+   println!(
+       "{name}: iter_progress_monotonic={}",
+       r.iter_stats
+           .windows(2)
+           .all(|w| w[0].attempted >= w[1].attempted)
+   );
+   ```
 
-## 2. picorv32 census leg (the only open evidence)
+   Empty/single-entry `iter_stats` → `all()` on an empty
+   iterator → `true`; acceptable (vacuous), no special-casing.
 
-The acceptance's "gcd/picorv32 iteration profile" needs the
-picorv32 `iter_progress`/`iter_prov` series in `docs/results.md`.
-~135 min release — over the 7200 s per-invocation bound, so run
-detached and poll across commands:
+b. **Remove** the `for w in r.iter_stats.windows(2)` assert
+   block (:1708-1713) — `w[0].attempted >= w[1].attempted` is
+   not a structural invariant (`model.md`).
 
-```
-# 1. build once so the cargo lock window stays short
-cargo test --release -p grus-core --test drt --no-run
-# 2. detached run, output to a log outside the repo
-nohup cargo test --release -p grus-core --test drt \
-    test_maze_census_picorv32 -- --ignored --nocapture \
-    > /tmp/drt-pico-census.log 2>&1 &
-# 3. poll `tail /tmp/drt-pico-census.log` between other steps for
-#    `picorv32: iter_progress=… iter_prov=…`
-```
+c. **Fix the comment** (:1680-1685) — drop "`attempted` is
+   non-increasing (the re-queue is a subset)". Replace with the
+   mechanism-accurate note: `bad[i+1] = failed ∪ both parties of
+   every provisional collision`, and a collision's foreign party
+   may be a kept net outside `bad[i]`, so `attempted` can rise —
+   observed non-increasing, reported not asserted.
 
-Launch this **first** so it overlaps §3's verify. Inputs are in
-place (`tests/designs/picorv32/` seeded by `worktree_seed`;
-`load_routed_inputs("picorv32")` reads them). The test also runs
-the landed `iter_stats` invariant asserts — a red leg is a real
-failure, not a doc gap.
+   `maze.rs` needs no edit: its comments were audited — the
+   `// bad = unrouted ∪ both parties of every provisional
+   collision.` note (:3818) states the construction verbatim and
+   never claims `bad[i+1] ⊆ bad[i]`; the `IterStat` doc comments
+   (:194-212) make no monotonicity claim either.
 
-When the series lands, edit the results.md entry's pending
-paragraph ("picorv32 leg … running detached"): splice the
-verbatim `picorv32: iter_progress=… iter_prov=…` line plus a
-one-sentence reading (prior record: `unrouted=2016` at the cap —
-the series says whether that tail was still falling or flat).
-Extend "What ran" with the leg command.
+## 2. `docs/results.md` — dated-entry corrections
 
-## 3. Workspace verify (per `workflow.toml`, memo's closing item)
+In the `drt-converge-stats` entry (:10152-10249):
+
+- Header `### 2026-11-25` → `### 2026-11-26` — the picorv32
+  splice (the entry's completion) ran 2026-11-26 and already
+  says so inline.
+- Annotate the gcd legs inline "run 2026-11-25" (census +
+  emit-leg paragraphs) — once the header carries the splice
+  day, the gcd legs' own date would otherwise be lost (E0
+  lesson 9: say what you ran, dated). The picorv32 paragraph's
+  inline `run 2026-11-26` stays as the model.
+- Fail-proof paragraph (:10204-10208): drop "`attempted`
+  non-increasing," from the asserted-invariant list; append that
+  monotonicity is reported informationally
+  (`iter_progress_monotonic=true` on the gcd leg) — empirical,
+  not gated.
+- Picorv32 paragraph (:10237-10241): same — "non-increasing"
+  leaves the asserted list; the leg reported
+  `iter_progress_monotonic=true`. Add the one-line reason a
+  future leg could print `false` (kept-net collision parties
+  re-queue from outside `bad[i]`).
+- "What ran" (:10243+): extend with this round's verify run.
+
+Keep the verbatim census blocks and both digest numbers
+byte-identical — they are run records.
+
+## 3. `docs/e6-drt.md` — semantics clause + punctuation
+
+- §7 (:560-562): after "`bad` = unrouted nets ∪ both parties of
+  every provisional collision", add one clause — a collision's
+  foreign party may be a kept net (committed in an earlier
+  iteration, marks still in `occ`), so `bad[i+1]` need not ⊆
+  `bad[i]` and `iter_progress` is not guaranteed non-increasing.
+- §8 (:709-713): fix the `—,` join — rewrite "…from
+  `RouteDb.iter_stats` — the last `iter_prov` entry is always 0,
+  the hard iteration reporting no provisionals —, one `unrouted
+  <name>` line…" e.g. by switching the aside to parentheses:
+  "…series from `RouteDb.iter_stats` (the last `iter_prov`
+  entry is always 0 — the hard iteration reports no
+  provisionals), one `unrouted <name>` line…".
+
+## 4. Verify
 
 ```
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Dev-profile drt tests measured ~2196 s on an M4 host — fits the
-7200 s bound. Run even though results.md records green from r1:
-the memo asks for a fresh full verify on the final tree. If green,
-the results.md "What ran" claim stands as written.
+Then `cargo test --release -p grus-core --test drt
+test_maze_census -- --nocapture` and confirm the gcd census
+prints `iter_progress_monotonic=true` (the informational line is
+the only new output; the iter_progress series must still be
+`269,94,87,81,81,81,81,81`). No picorv32 re-run needed — the
+recorded series stands; the assert removal only loosens the leg.
 
-## 4. Commit
+## 5. Commit
 
-- If the picorv32 leg landed: one docs commit —
-  `docs: Record picorv32 iter_progress series for
-  drt-converge-stats` (English, agent trailer). No version bump:
-  the feature bump 0.12.10 → 0.12.11 is already in ca053ac and a
-  docs-only delta needs none.
-- If the leg is still running when §3 finishes: leave the
-  results.md pending paragraph as written, note in the card that
-  the picorv32 acceptance box stays open (same convention as the
-  deferred picorv32 emit legs). No commit — the tree already
-  matches ca053ac.
+One commit covering §1–§3 (test + docs correction is one logical
+fix):
+
+```
+fix: Report iter_progress monotonicity instead of asserting it
+
+- maze_census: drop the windows(2) non-increasing assert —
+  bad[i+1] can gain kept nets re-queued as provisional-collision
+  parties, so attempted non-increase is empirical, not
+  structural; add an informational iter_progress_monotonic=
+  print and fix the stale subset comment
+- docs/e6-drt.md: name the kept-net re-queue case in §7; fix the
+  §8 em-dash join
+- docs/results.md: header date to the picorv32 splice day;
+  invariant lists mark monotonicity observed-only
+
+<agent trailer>
+```
+
+No `Cargo.toml` bump — a test/doc correction with no shipped
+behavior change (the 0.12.11 feature bump is already landed).
 
 ## Contingencies
 
-- **Leg fails or panics** — treat as a real defect: the failing
-  assert's message names which invariant broke; fix only that,
-  re-verify, re-run the leg.
-- **Leg cannot complete in-session** — the pending paragraph is
-  the documented fallback; flag the open acceptance box in the
-  card rather than faking a profile.
-- **Cargo lock contention** between the release leg and the dev
-  workspace test — cargo waits on the lock; the `--no-run`
-  pre-build keeps the window short. If it still stalls, run §3
-  first and launch the leg after.
-- **`iter_stats` empty on an input** — only `guided=0`; the
-  unconditional lines print bare keys. Acceptable; note if it
-  ever fires.
+- **`iter_progress_monotonic=false` on a future leg** — not a
+  failure by design; record it in `docs/results.md` as the first
+  observed kept-net re-queue if it ever appears.
+- **Any of the remaining `iter_stats` asserts goes red** — real
+  defect, treat as such; do not weaken further without naming
+  the mechanism.
 
 ## Files
 
-- `docs/results.md` (picorv32 series splice — the only expected
-  edit this round)
-
-Landed surface (no further edits expected, listed for the diff
-boundary):
-
-- `crates/grus-core/src/drt/maze.rs`
-- `crates/grus-core/src/drt.rs`
-- `crates/grus-eda/src/main.rs`
 - `crates/grus-core/tests/drt.rs`
-- `tests/designs/check_drt_ours.sh`
+- `docs/results.md`
 - `docs/e6-drt.md`
-- `docs/status.md`
-- `Cargo.toml`

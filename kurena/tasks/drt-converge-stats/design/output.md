@@ -1,12 +1,9 @@
-# drt-converge-stats — Output format & consumers (r2)
+# drt-converge-stats — Output format & consumers (r3)
 
-**Status: landed at ca053ac.** Line numbers are HEAD.
+## CLI census lines — unchanged (`main.rs:2084-2104`)
 
-## Line grammar — `main.rs:2084-2104`
-
-Two lines inside the `== drt emit:` block, printed at column 0
-immediately after the `guided=…` summary line (`main.rs:2069-2083`),
-before the `unrouted_kinds` computation:
+Two lines inside the `== drt emit:` block, at column 0 after the
+`guided=…` summary line:
 
 ```
 guided=269 routed=188 unrouted=81 … iterations=8 route_ms=… …
@@ -14,85 +11,63 @@ iter_progress=269,94,87,81,81,81,81,81
 iter_prov=25,6,0,0,0,0,0,0
 ```
 
-- `iter_progress=` — `s.attempted` per entry: the bad-set size
-  entering each iteration (spec's `iter_progress=6700,410,…`
-  example). Entry count == `iterations` on the summary line —
-  self-checking against the existing field (verified on the gcd
-  emit leg: 8 entries == `iterations=8`).
-- `iter_prov=` — `s.prov_collisions` per entry: the provisional
-  collision count at each iteration's end. This is the spec's
-  "(or still collides provisionally)" half of the motivation —
-  `iter_progress` alone cannot distinguish persistent *failures*
-  from persistent *collision ping-pong* (flat `attempted` +
-  nonzero `prov` vs flat `attempted` + zero `prov`).
-- Comma-separated `u32`s, no spaces, no brackets. Empty
-  `iter_stats` (no guided nets) prints a bare `iter_progress=` /
-  `iter_prov=` — unconditional lines keep the block shape stable
-  for parsers.
-- `route_ms` stays non-deterministic wall clock; both new lines
-  are fully deterministic functions of the route.
+- `iter_progress=` — `s.attempted` per entry (bad-set size
+  entering each iteration). Entry count == `iterations`.
+- `iter_prov=` — `s.prov_collisions` per entry (provisional
+  collisions at iteration end; distinguishes persistent failures
+  from collision ping-pong on a flat `attempted` tail).
+- Comma-separated `u32`s, no spaces; empty `iter_stats` prints a
+  bare key. Both lines deterministic; `route_ms` stays wall
+  clock.
 
-Reading: `attempted` tail still falling → convergence was
-progressing when capped; flat tail → stuck. `iter_prov` tail
-nonzero → collisions, not dead ends, dominated the endgame. The
-gcd record: `269,94,87,81,81,81,81,81` + prov 0 from iteration 3
-— a stable dead-end residue, not a convergence shortfall
-(`docs/results.md` 2026-11-25 entry).
+**r3: no CLI output change.** The informational monotonicity
+print the memo asks for is test-side only — no new tokens on the
+emit surface, keep-list arms unchanged, goldens unaffected.
 
-**Pin discipline:** no stdout-literal pin for the new lines —
-consistent with every other census line (`guided=`, `unrouted `,
-…), none of which has a string-match gate. Coverage is
-invariant-level (`maze_census` asserts the series, prints the
-line in the same spellings) + digest-level
-(`test_route_digest_covers_iter_stats`). This is the memo's "test
-pinning the census lines" item as designed.
+## Test-side print — `maze_census` (new this round)
 
-## Consumer 1: `check_drt_ours.sh` step-E keep-list — landed :935-936
+After the existing `{name}: iter_progress=… iter_prov=…` println
+(`tests/drt.rs:1641-1653`), one informational line:
 
-The `cli_lines` whitelist is prefix-based; the two arms sit beside
-`s.startswith("guided=")`:
-
-```python
-or s.startswith("iter_progress=") or s.startswith("iter_prov=")
+```
+{name}: iter_progress_monotonic={true|false}
 ```
 
-Consequences (same shape as `drt-unrouted-census`'s `fail` arm):
+computed as `r.iter_stats.windows(2).all(|w| w[0].attempted >=
+w[1].attempted)`. This is the memo's "downgrade to an
+informational print comparing the counts": the property is
+empirical (`model.md`), so it is reported for the record — a
+`false` someday is a datum about the design input, not a test
+failure. The `iter_progress` series itself is already printed,
+so the location of any increase is visible without extra
+fields. Boolean (not a literal `true` pin) keeps it honest on
+every input `maze_census` runs.
 
-- Committed goldens (`gcd`/`picorv32.drt.ours.reference.json`)
-  unchanged — generation-time snapshots; the next regeneration
-  simply carries the lines.
-- No `ours_router` schema change — an `iter_progress` array is
-  derivable from `cli_lines`; the JSON surface stays stable.
-- Absolute-path guard `(?<![A-Za-z_.])/` cannot fire: digits,
-  commas, `=` only.
-- The `guided=` regex (`mg`, ~957-961) is unaffected — the new
-  lines are separate, and `mg` does not anchor end-of-line.
+## Consumers — unchanged
 
-## Consumer 2: `recount_unrouted.py`
+- `check_drt_ours.sh` step-E keep-list (:935-936): prefix arms
+  `iter_progress=`/`iter_prov=` — the new print does not reach
+  `cli_lines` (it is a test-side `maze_census` line, not CLI
+  output; even if it ever were, an unknown prefix is dropped by
+  the whitelist).
+- `recount_unrouted.py`: ignores unknown prefixes by
+  construction.
+- `tests/drt.rs` golden gates: no assert string-matches these
+  lines; coverage stays invariant-level + digest-level.
+- `docs/e6-drt.md` §8 (:709-713): enumerates the two CLI lines —
+  gains only the punctuation fix (`steps.md` §3).
 
-No change. Its `cli_lines` walk matches `unrouted `/`fail
-`/`stub_outside_cover `/`unrouted_kinds`/`unrouted_blockers`
-prefixes; unknown prefixes are ignored by construction. Verified
-in the r1 run: `recount_unrouted.py gcd` exits 0 (recorded in
-`docs/results.md`).
+## Reading (unchanged)
 
-## Consumer 3: `tests/drt.rs` gates
-
-No golden-dependent assert touches these lines (`cli_lines`
-joins are all prefix-scoped to other prefixes —
-`tests/drt.rs:2497-2559` walks `notch_residual `/`hole_residual
-`/`unrouted `/`stub_outside_cover `). The in-run asserts live in
-`maze_census` (`model.md`).
-
-## Consumer 4: `docs/e6-drt.md` — landed
-
-- §7 (Order and rip-up, :562-569): the per-iteration
-  `attempted`/`routed`/`prov_collisions` recording sentence.
-- §8 (CLI census, :709-713): the `iter_progress`/`iter_prov`
-  enumeration + the hard-iteration `prov=0` note.
+`attempted` tail still falling → convergence was progressing
+when capped; flat tail → stuck. `iter_prov` tail nonzero →
+collision churn, not dead ends. A rising `attempted` step → a
+kept net was re-queued as a collision party (`model.md`).
 
 ## Files
 
-- `crates/grus-eda/src/main.rs`
-- `tests/designs/check_drt_ours.sh`
-- `docs/e6-drt.md`
+- `crates/grus-core/tests/drt.rs` (test-side print only)
+- `docs/e6-drt.md` (§8 punctuation)
+
+Reference-only (no edits): `crates/grus-eda/src/main.rs`,
+`tests/designs/check_drt_ours.sh`.

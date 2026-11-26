@@ -1,103 +1,85 @@
-# drt-converge-stats — Overview (r2)
+# drt-converge-stats — Overview (r3)
 
 E6 observability ticket. `route_nets` runs a capped rip-up loop
-(`MAX_ITERS = 8`, last iteration hard — `maze.rs` ~3760-3847). When
-the cap bites, `iterations=8 unrouted=N` alone cannot tell a run
-that was still converging (bad-set shrinking to the end) from one
-that flatlined at iteration 2 — the external review's "8 iters
-wasn't enough" guess. This ticket records the per-iteration counts
-the loop already computes, prints them as compact convergence
-lines in the `== drt emit:` census, and folds them into
-`route_digest` so they are deterministic, checked output.
+(`MAX_ITERS = 8`, last iteration hard — `maze.rs` ~3760-3847).
+`RouteDb.iter_stats` records one `IterStat{attempted, routed,
+prov_collisions}` per iteration, the `== drt emit:` census prints
+them as `iter_progress=`/`iter_prov=` lines, and `route_digest`
+serializes the vector. All of it landed at 08141b1 with
+gcd/picorv32 evidence in `docs/results.md`.
 
-## Revision r2 — review-memo reconciliation
+## Revision r3 — review-memo reconciliation
 
-The r1 driver timed out at a clean compile point; the memo says
-"no design change needed — continue per design 7a82de1". This r2
-keeps the design identical and re-baselines it onto what the wip
-checkpoint ca053ac actually committed. The memo's "remaining"
-list is already landed — verified line-by-line in the tree:
+The memo rejects one claim in the semantics, not the feature:
 
-| Memo "remaining" item | Status at HEAD (ca053ac) |
-|---|---|
-| stats struct plumbed through `RouteDb` | `IterStat` `maze.rs:194-212`; `RouteDb.iter_stats` :227-231; loop collection :3755/:3763/:3768/:3776/:3809-3813; ctor literal :3899; `drt.rs:21` re-export |
-| per-iteration counts in the emit census | `main.rs:2084-2104` — `iter_progress=` / `iter_prov=` after `guided=…`, before `unrouted_kinds` |
-| `docs/results.md` dated entry w/ gcd numbers | landed — `iter_progress=269,94,87,81,81,81,81,81`, `iter_prov=25,6,0,0,0,0,0,0`, gcd emit-leg verbatim lines, digest `0xab23bcc1997e4484 → 0xa6d8b74a740a7489` |
-| test pinning the census lines | `maze_census` invariant asserts `tests/drt.rs:1680-1716` + printed series :1641-1653; `test_route_digest_covers_iter_stats` :1821-1838 |
+**`attempted` non-increase is empirical, not structural.** After
+each soft iteration `bad[i+1] = failed[i] ∪ parties(prov[i])`
+(`maze.rs:3819-3828`). `parties(prov[i])` resolves through
+`net_idx` to *any* guided net — a provisional `Collision`'s
+foreign party can be a *kept* net whose `Net(id)` marks still sit
+in `occ` from an earlier iteration and which is not a member of
+`bad[i]`. A re-queued kept net lands in `bad[i+1]` from outside
+`bad[i]`, so `bad[i+1] ⊆ bad[i]` is false as a semantic fact and
+`attempted` may rise. It did not rise on either recorded design
+(gcd `269,94,87,81,…`; picorv32 `6744,2557,…,2326`) — that makes
+it an empirical observation to report, not an invariant to assert
+(E0 lessons 4–5, 8: docs and gates must match code semantics).
 
-Plus, landed but not enumerated in the memo: `route_digest`
-serialization (`maze.rs:4061-4067`), `check_drt_ours.sh` keep-list
-(:935-936), `docs/e6-drt.md` §7/:566 + §8/:710-713,
-`docs/status.md`, `Cargo.toml` 0.12.10 → 0.12.11.
+### Delta this round (corrections only, no behavior change)
 
-**Digest ruling (memo):** "stats are a print/recording path, keep
-route_db digest inputs unchanged unless the design says
-otherwise." This design *does* say otherwise (`digest.md`):
-`iter_stats` is a deterministic run output and is serialized —
-appended end-of-stream after `put(routed.iterations)`, so every
-pre-existing digest input's byte position is unchanged. Keep the
-landed serialization; do not strip it, and do not touch any
-existing digest input.
+1. `tests/drt.rs` `maze_census` — remove the
+   `w[0].attempted >= w[1].attempted` `windows(2)` assert
+   (:1708-1713); downgrade to an informational print comparing
+   the counts (`iter_progress_monotonic=`); fix the stale comment
+   (:1680-1685) claiming "the re-queue is a subset". All other
+   `iter_stats` asserts stay — they are structural (`model.md`).
+   `maze.rs` comments were audited: the `// bad = unrouted ∪
+   both parties…` note (:3818) states the construction and never
+   claims ⊆ — no source edit.
+2. `docs/results.md` — entry header `2026-11-25` → `2026-11-26`
+   (the picorv32 splice ran 2026-11-26); annotate the gcd legs
+   inline as run 2026-11-25 so the header change loses no
+   provenance; the two sentences that list asserted invariants
+   (:10204-10208, :10237-10241) drop "non-increasing" from the
+   asserted set and restate it as observed-only.
+3. `docs/e6-drt.md` — §8 (:709-713) fix the `—,` em-dash+comma
+   join; §7 (:560-562) gains one clause naming that a collision
+   party may be a kept net, so `bad[i+1]` need not ⊆ `bad[i]`.
 
-## Genuinely open at HEAD
+### Unchanged (verified at HEAD 08141b1 — do not touch)
 
-1. **picorv32 iteration profile** — the
-   `test_maze_census_picorv32 --ignored` leg (~135 min release,
-   over the 7200 s per-invocation bound → detached) was in flight
-   when the driver timed out; no process survives. Its
-   `iter_progress`/`iter_prov` series still goes into the
-   results.md entry, which currently marks it pending
-   (`steps.md` §2). The acceptance's picorv32 box stays open
-   until the series is recorded.
-2. **Workspace verify** — `cargo test --workspace` + clippy
-   `-D warnings` per `workflow.toml`. results.md records green
-   from the r1 run; the memo asks for a fresh full verify.
-
-## State the design is written against
-
-- `e6-drt-e2e` (and the picorv32 leg) landed — the spec's "queue
-  after `e6-drt-e2e`" note is satisfied.
-- `RouteDb.iterations` stays — it is the census/digest scalar;
-  `iter_stats` is the series behind it, not a replacement.
-- `GRUS_DRT_TIMING` stderr already prints `iter {it} bad=…
-  failed=… prov=…` — opt-in timing evidence, not a census
-  record. This ticket is the *committed* equivalent: same
-  numbers, in `RouteDb` and stdout.
+- `IterStat` fields, `RouteDb.iter_stats`, all collection sites —
+  `maze.rs:194-231, 3755, 3763, 3768, 3776, 3809-3813, 3899`;
+  re-export `drt.rs:21`.
+- CLI census lines `iter_progress=`/`iter_prov=` —
+  `main.rs:2084-2104`. Byte-identical; no new tokens. The
+  informational monotonicity print is test-side only
+  (`output.md`).
+- `route_digest` serialization — `maze.rs:4061-4067` (end-of-stream
+  append after `put(routed.iterations)`).
+- `check_drt_ours.sh` step-E keep-list — :935-936.
+- `test_route_digest_covers_iter_stats` fail-proof —
+  `tests/drt.rs:1821-1838`.
+- `docs/status.md`, `Cargo.toml` 0.12.11.
 
 ## Boundary vs `drt-progress`
 
 `drt-progress` (spec only, unlanded) adds a *periodic stderr*
-progress line and promises "stdout census block byte-identical"
-— that promise is about its own diff. This ticket deliberately
-extends the stdout census; the two are complementary channels
-(periodic vs final) and must not be merged per the spec. Whichever
-lands second rebases over the other's output surface — no
-mechanism overlap (`drt-progress` adds a hook/callback;
-`iter_stats` is loop-internal accounting).
+progress line. This ticket's lines are the final census record in
+stdout — complementary channels, do not merge per the spec.
 
 ## Non-goals
 
 - No routing-behavior change: `bad` computation, rip-up, history
-  escalation, hard mode — all untouched (verified in the ca053ac
-  diff: collection is additive, no reordering).
-- No new output channel, no JSON schema change in
-  `ours_router`, no golden regeneration (the series is derivable
-  from `cli_lines` on next regen).
-- No per-net iteration attribution (which nets were in each
-  `bad` set) — counts only, per spec.
-- No stdout-literal pin for the new lines: consistent with every
-  other census line, coverage is invariant-level (`maze_census`
-  asserts) + digest-level (`route_digest` fail-proof), not a
-  string match on emit output.
+  escalation, hard mode — all untouched. Removing the assert does
+  not change what the loop computes; it stops gating on a
+  property the mechanism does not guarantee.
+- No new output channel, no CLI output change, no golden
+  regeneration, no `ours_router` schema change.
+- No per-net iteration attribution — counts only, per spec.
 
 ## Files
 
-- `crates/grus-core/src/drt/maze.rs`
-- `crates/grus-core/src/drt.rs`
-- `crates/grus-eda/src/main.rs`
 - `crates/grus-core/tests/drt.rs`
-- `tests/designs/check_drt_ours.sh`
-- `docs/e6-drt.md`
 - `docs/results.md`
-- `docs/status.md`
-- `Cargo.toml`
+- `docs/e6-drt.md`
