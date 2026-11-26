@@ -118,7 +118,12 @@ Named finding kinds, all gate-blocking on the test designs:
 - `region_escape` — a member pin of a guided net whose candidate
   shapes contain no in-region node on any layer. The partition gate:
   every member pin attaches or is named, printed per design. Measured:
-  gcd 17, picorv32 592 — see §5.
+  gcd 17, picorv32 592 — see §5. The flag is computed on the
+  *pre-escape* region: `escape_extend` may re-attach the pin by adding
+  bounded pairs outside the guide (§5), and each attempt lands in
+  `RouteGraphs::escapes` with its `EscapeKind` — the flag keeps
+  meaning "pin metal outside the guide region" while `escapes`
+  records the rescue outcome.
 
 `off_track`/`no_shapes`/`TrackGap` are empty on gcd/picorv32; any
 entry is a named finding with its pin (`cell/pin` for instance pins,
@@ -145,8 +150,11 @@ The route graph is *not*:
 - **Costs or direction legality** — both axes are offered on every
   layer (`RouteEdge.axis` records which); preferred-direction legality
   and cost assignment are the maze router's concern.
-- **DRC/OBS-pruned** — the region is purely guide-defined; no node is
-  dropped for spacing or blockage overlap. Via edges are likewise
+- **DRC/OBS-pruned** — the region is guide-defined plus the bounded
+  pin-halo escape (§5): ≤`halo_lines` index steps around a
+  strict-escape pin's shape bbox and ≤`corridor_lines` steps of
+  L-corridor back to the region. No node is dropped for spacing or
+  blockage overlap. Via edges are likewise
   geometric only (§6): a shared crossing plus guide coverage, not a
   DRC-clean transition.
 - **A reproduction of TritonRoute's `FlexGridGraph`** — this is a
@@ -279,15 +287,61 @@ y-track (gcd's 14 `req_msg`/`resp_msg` ports, picorv32's 237 io
 escapes) — no complete crossing exists inside the pin shape. The
 pinned gcd set is asserted by name in `tests/drt.rs`.
 
-Router implication (updated by §7 — this paragraph's prediction is
-now historical): class-(b) escapes are *unattachable* under the pure
-track-crossing model — the io port square holds no node at all, so
-the maze search cannot reach them. The shipped answer is the §7
-projection fallback (in-region nodes in the rect's track
-neighborhood, one line of margin), plus `spare_above = 1` region
-layers for OBS-sealed pockets: guide boxes bound the search in XY,
-but the guide's layer choice does not bind which layer detailed
-routing taps on. The remaining recorded gap is the met2–met3
+**Escape mechanism** (`escape_extend`, `GraphOpts::escape` — on by
+default; runs between `transit_extend` and node emission): for each
+member pin with no strict in-region node — the same covered-range
+test the attach loop applies, factored as `strict_hits` — a **halo**
+is built on layers `pin_lo..=max(pin_hi, first_unmasked)` (an li1 pin
+gets {li1, met1, met2}, the whole via-descent stack to the
+corridor-friendly surface): the covered pairs of the pin's shape bbox
+with the covered index range inflated `EscapeCfg::halo_lines` (=2)
+steps on each axis, each candidate kept only where
+`hull.point_allowed` passes and it is not already in `region`.
+When the halo already touches `region` (an index-adjacent pair
+induces an edge at emission) the pairs merge and the pin attaches —
+`EscapeKind::Halo` with span 0. Otherwise the argmin-span layer —
+`escape_span`, a bounded windowed enumeration of the layer's region
+pairs (distance on an unobstructed 4-connected index grid is
+Manhattan distance; each pair is pruned in O(1) by its distance to
+the halo bbox — `cap = corridor_lines` (floored at 1, since an
+adjacent pair needs no corridor) for candidates, uncapped on
+the refusal path so the recorded gap is exact — never a grid BFS),
+the unmasked surface winning ties — tries an L-corridor of
+≤`EscapeCfg::corridor_lines` (=8, ≈1–2 GCell pitches) index steps
+back to it: every corridor pair must pass `point_allowed` or the next
+candidate layer is tried. Outcomes: `halo(span=N)` corridor landed;
+`corridor_masked` every within-bound corridor died at the mask (the
+legal halo stays, so the pin can still attach); `corridor_bound
+(span=N)` the nearest region pair exceeded the bound (N the measured
+gap); `no_anchor` no non-halo region pair on any escape layer — the
+corridor had no target; `halo_empty` no candidate survived
+(sub-pitch rects, mask-sealed windows). The refused kinds add no
+pairs; the pin's final `FailKind` follows the route-time attach
+ladder — `Unattachable` when every rung is empty, `NoPath` when a
+transit-island/projection/access landing survives (the fixture's
+escape-off arm is the latter). The corridor bound is total
+Manhattan index steps,
+both legs — a rescue window for "guide box stops just short", not an
+arbitrary rewrite. Records land in `RouteGraphs::escapes` (net, pin,
+kind, `pairs_added`, `corridor_span`) and the fail line carries
+`escape=<token>` for escaped pins (§8). Measured: gcd
+{halo: 7, halo_empty: 10}, picorv32
+{halo: 425, corridor_masked: 9, halo_empty: 158}.
+
+Router implication: the maze side needs no escape code — halo and
+corridor pairs enter `region` before emission, so strict attach,
+`project_attach`, `access_vias` and `relaxed_vias` all see them, and
+the §7 occupancy checks apply identically (no exemption path) —
+proven by the fixture's `OccMode` enabled-vs-disabled arm on a
+foreign `Pin` band that geometrically covers only escaped pairs
+(`Obs`/`ObsPin` cannot contrast — they hard-block before the
+`Disabled` check). The
+§7 projection fallback remains the attach path for class-(b) io
+ports whose inflated window still holds no complete crossing (gcd's
+10 `halo_empty` records), plus `spare_above = 1` region layers for
+OBS-sealed pockets: guide boxes bound the search in XY, but the
+guide's layer choice does not bind which layer detailed routing taps
+on. The remaining recorded gap is the met2–met3
 transition itself (§6's disjoint-grids gap) — relaxed edges bridge
 strict-crossing sparsity *within* a pair whose upper preferred lines
 exist, and met2–met3 has no transition path at all.
@@ -362,12 +416,12 @@ in `RouteGraphs::via_edges_per_pair`.
 
 | pair | gcd | picorv32 |
 |---|---|---|
-| li1–met1 | 13,292 | 395,479 |
-| met1–met2 | 375 | 13,961 |
+| li1–met1 | 6,636 | 180,427 |
+| met1–met2 | 322 | 11,148 |
 | met2–met3 | 0 | 0 |
 | met3–met4 | 2 | 47 |
 | met4–met5 | 0 | 0 |
-| **total** | **13,669** | **409,487** |
+| **total** | **6,960** | **191,622** |
 
 Two named zeros. **met2–met3 is an edge-domain tech gap**: met2's
 DEF grids are `230 + 460k` (≡10 mod 20) on both axes while met3's are
@@ -396,8 +450,11 @@ pins), a named unrouted report, the post-hoc collision census, and
 the iteration count.
 
 **Region input**: the tests build graphs with
-`build_route_graphs_ext(.., spare_above = 1)` — every guide box's XY
-is also covered on `top_guided + 1`. Guide boxes bound the search in
+`build_route_graphs_ext(.., GraphOpts{spare_above: 1, escape:
+Some(EscapeCfg::DEFAULT)})` — every guide box's XY
+is also covered on `top_guided + 1`, and strict-escape pins get the
+§5 bounded halo/corridor pairs merged into `region` before emission.
+Guide boxes bound the search in
 XY, but their layer choice does not bind detailed routing: OBS-sealed
 pin pockets are reached one layer above the global route's pick
 (OpenROAD's gcd `_038_` escapes its li1+met1 guide on met2 inside the
@@ -418,7 +475,7 @@ shape — `route_one_net` paints the single-axis **access stub**
 closing the gap at extraction (the node's x or y lies inside the
 rect's covered range by `project_attach` construction, so the stub
 is always axis-aligned and reaches the pin metal); `NetRoute::
-projected` names every pin connected this way (gcd: 17). The implied
+projected` names every pin connected this way (gcd: 8). The implied
 stub is committed metal, so admission is occupancy-checked twice:
 `project_attach` scans it against the premark-only occupancy at topo
 time (`Net` marks cannot exist yet), and `try_pin_paint` re-scans
@@ -749,11 +806,24 @@ iv=[lo,hi]` line per `RouteDb.pin_collisions` survivor), the
 informational `wirelength_um` + `via.<cut>`
 deltas vs `variants.delegated`/`baseline`, and — under `--self-drc`
 — the re-parse→assemble→`run_all` verdict. Under each `unrouted`
-line one `    fail <inst>/<pin> <FailKind>[ region_escape]` line
+line one `    fail <inst>/<pin> <FailKind>[ region_escape]
+[ escape=<token>]` line
 names every member pin's *final* classification (`u.failed`; the
 `region_escape` suffix marks a pin whose shapes held no in-region
 strict node at graph build — an ever-failed alternative census is
-`stub_outside_cover`). The CLI reports and
+`stub_outside_cover`). `escape=<token>` appears on exactly the pins
+with a `RouteGraphs::escapes` record — the §5 rescue attempt's
+outcome, one of `halo` (halo merged, span 0), `halo(span=N)`
+(L-corridor landed), `corridor_bound(span=N)` (nearest region pair
+beyond the bound — the refused rescue's measured distance; N is the
+exact gap from the uncapped refusal probe, never a sentinel),
+`corridor_masked` (every within-bound corridor died at the mask),
+`no_anchor` (no non-halo region pair on any escape layer — the
+corridor had no target),
+`halo_empty` (no halo candidate survived). On gcd no escaped pin
+ends in `u.failed`, so the committed `cli_lines` show no token;
+`recount_unrouted.py` accepts 3–5 fields per fail line. The CLI
+reports and
 never exits nonzero on findings; the gate is `tests/drt.rs`.
 
 ## 9. End-to-end Magic gate (`e6-drt-e2e`)
@@ -780,7 +850,7 @@ uncovered-cover carve ran on `hull_host_open` met1; skipping it on
 host-open layers closed all 7 sites and the `_099_` notch residual).
 `magic_only` rows are the inherited cell-master nwell paint
 (6/120/300, identical on every input); `unclassified_fired` empty;
-antenna 0. `unrouted=81` — the golden's `ours_router.unrouted` is
+antenna 0. `unrouted=80` — the golden's `ours_router.unrouted` is
 the pinned list; `notch_fills=343`, all residual vectors empty.
 Mechanisms: `kurena/tasks/e6-drt-e2e/design/`.
 

@@ -21,17 +21,18 @@
 //!
 //! Tests fail loudly on missing inputs — no silent skips.
 
-use grus_core::congestion::guide::{GuideBox, guide_net_name, parse_guides};
-use grus_core::design_db::DesignDb;
-use grus_core::drt::access::{AccessReport, access_points};
-use grus_core::drt::graph::{
-    GuideJoin, HullMask, build_route_graphs, cell_hull_rect, join_guides, pin_rects,
+use grus_eda_core::congestion::guide::{GuideBox, guide_net_name, parse_guides};
+use grus_eda_core::design_db::DesignDb;
+use grus_eda_core::drt::access::{AccessReport, access_points, pin_shapes};
+use grus_eda_core::drt::graph::{
+    EscapeKind, GuideJoin, HullMask, build_route_graphs, cell_hull_rect, join_guides,
+    pin_rects,
 };
-use grus_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
-use grus_core::drt::via::{ViaPair, ViaTable, via_table};
-use grus_core::interner::{LayerId, NetId, PinId, StringInterner};
-use grus_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
-use grus_core::tech_db::{LayerDir, RectDbu, TechDb};
+use grus_eda_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
+use grus_eda_core::drt::via::{ViaPair, ViaTable, via_table};
+use grus_eda_core::interner::{LayerId, NetId, PinId, StringInterner};
+use grus_eda_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
+use grus_eda_core::tech_db::{LayerDir, RectDbu, TechDb};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -199,7 +200,7 @@ fn test_access_census() {
 
         println!("== {name} access census ==");
         let member_pins: usize = (0..db.num_nets())
-            .map(|n| db.net_pins(grus_core::interner::NetId(n as u32)).len())
+            .map(|n| db.net_pins(grus_eda_core::interner::NetId(n as u32)).len())
             .sum();
         println!(
             "{name}: member_pins={member_pins} points={} off_track={} no_shapes={}",
@@ -220,7 +221,7 @@ fn test_access_census() {
             covered.insert(ap.pin);
         }
         for n in 0..db.num_nets() {
-            for &p in db.net_pins(grus_core::interner::NetId(n as u32)) {
+            for &p in db.net_pins(grus_eda_core::interner::NetId(n as u32)) {
                 assert!(
                     covered.contains(&p),
                     "{name}: member pin {} has no access point",
@@ -482,7 +483,7 @@ fn test_graph_census() {
         let transit_l = (0..tech.routing_layers.len())
             .find(|&l| !hull.masked(l as u8))
             .map(|l| l as u8);
-        let grid = |r: &grus_core::tech_db::RectDbu, lt: &LayerTracks| -> usize {
+        let grid = |r: &grus_eda_core::tech_db::RectDbu, lt: &LayerTracks| -> usize {
             let nx = lt.tracks_x.partition_point(|&t| t <= r.xh)
                 - lt.tracks_x.partition_point(|&t| t < r.xl);
             let ny = lt.tracks_y.partition_point(|&t| t <= r.yh)
@@ -490,8 +491,8 @@ fn test_graph_census() {
             nx * ny
         };
         let union =
-            |a: grus_core::tech_db::RectDbu, b: grus_core::tech_db::RectDbu| {
-                grus_core::tech_db::RectDbu::new(
+            |a: grus_eda_core::tech_db::RectDbu, b: grus_eda_core::tech_db::RectDbu| {
+                grus_eda_core::tech_db::RectDbu::new(
                     a.xl.min(b.xl),
                     a.yl.min(b.yl),
                     a.xh.max(b.xh),
@@ -520,7 +521,7 @@ fn test_graph_census() {
             if let Some(l) = transit_l
                 && !cover.is_empty()
             {
-                let mut span: Option<grus_core::tech_db::RectDbu> = None;
+                let mut span: Option<grus_eda_core::tech_db::RectDbu> = None;
                 for b in boxes.iter().filter(|b| b.layer.0 == l) {
                     span = Some(match span {
                         None => b.rect,
@@ -533,6 +534,45 @@ fn test_graph_census() {
                     // (`base.is_empty()` skips only the corridor).
                     let ext = span.map_or(h, |s| union(h, s));
                     *bounds.entry(l).or_default() += grid(&ext, &tracks[l as usize]);
+                }
+            }
+            // Escape pairs: the halo ⊆ the pin shape-bbox's covered
+            // range inflated `halo_lines` index steps per axis, and a
+            // corridor stays within `corridor_lines` steps of the halo
+            // (its far end is a pre-existing pair already bounded
+            // above) — so halo+corridor ⊆ the range inflated by both.
+            let esc = grus_eda_core::drt::graph::EscapeCfg::DEFAULT;
+            let h = (esc.halo_lines + esc.corridor_lines).max(0) as usize;
+            for rec in &graphs.escapes {
+                if rec.net != *net || rec.pairs_added == 0 {
+                    continue;
+                }
+                let shapes = pin_shapes(&db, &tech, rec.pin);
+                let Some(bbox) = shapes.iter().map(|s| s.1).reduce(union) else {
+                    continue;
+                };
+                let lo = shapes.iter().map(|s| s.0.0).min().unwrap_or(0);
+                let hi = shapes
+                    .iter()
+                    .map(|s| s.0.0)
+                    .max()
+                    .unwrap_or(0)
+                    .max(transit_l.unwrap_or(0));
+                for l in lo.min(hi)..=hi {
+                    let lt = &tracks[l as usize];
+                    let xa = lt
+                        .tracks_x
+                        .partition_point(|&t| t < bbox.xl)
+                        .saturating_sub(h);
+                    let xb = (lt.tracks_x.partition_point(|&t| t <= bbox.xh) + h)
+                        .min(lt.tracks_x.len());
+                    let ya = lt
+                        .tracks_y
+                        .partition_point(|&t| t < bbox.yl)
+                        .saturating_sub(h);
+                    let yb = (lt.tracks_y.partition_point(|&t| t <= bbox.yh) + h)
+                        .min(lt.tracks_y.len());
+                    *bounds.entry(l).or_default() += (xb - xa) * (yb - ya);
                 }
             }
             let mut per_layer: BTreeMap<u8, usize> = BTreeMap::new();
@@ -564,8 +604,13 @@ fn test_graph_census() {
 
 /// The attachment partition, checked per element (§7.5): every member
 /// pin of every guided net has ≥1 attached node or appears in
-/// `region_escape` — and every escape appears in `pin_nodes` with an
-/// empty list. Escape names print per design; the gcd set is pinned.
+/// `region_escape` — the pre-halo escape set, recorded even when the
+/// pin-halo escape later re-attached the pin. `escapes` parallels
+/// `region_escape` exactly: refused escapes (`CorridorBound`,
+/// `NoAnchor`, `HaloEmpty`) added no pairs and still hold an empty `pin_nodes`
+/// list, while a pin with attached nodes must carry a `Halo` or
+/// `CorridorMasked` record. Escape names print per design; the gcd
+/// set is pinned.
 #[test]
 fn test_pin_attachment() {
     for name in ["gcd", "picorv32"] {
@@ -574,6 +619,21 @@ fn test_pin_attachment() {
         let graphs = build_route_graphs(&db, &tech, &tracks, &join);
         let escapes: std::collections::BTreeSet<PinId> =
             graphs.region_escape.iter().map(|e| e.pin).collect();
+        let records: std::collections::BTreeMap<PinId, &grus_eda_core::drt::graph::EscapeRecord> =
+            graphs.escapes.iter().map(|e| (e.pin, e)).collect();
+        assert_eq!(
+            records.len(),
+            escapes.len(),
+            "{name}: escapes does not parallel region_escape"
+        );
+        let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+        for e in &graphs.escapes {
+            let tok = e.token();
+            *kinds
+                .entry(tok.split('(').next().unwrap().to_string())
+                .or_default() += 1;
+        }
+        println!("{name}: escape kinds {kinds:?}");
 
         let mut members_total = 0usize;
         for g in &graphs.nets {
@@ -587,15 +647,50 @@ fn test_pin_attachment() {
             for (i, &(pin, ref ids)) in g.pin_nodes.iter().enumerate() {
                 assert_eq!(pin, members[i], "{name}: pin order");
                 assert!(ids.windows(2).all(|w| w[0] < w[1]));
-                if escapes.contains(&pin) {
-                    assert!(ids.is_empty(), "{name}: escape pin has nodes");
-                } else {
-                    assert!(
-                        !ids.is_empty(),
-                        "{name}: pin {} of net {} attached nothing and is not named",
-                        pin_label(&db, pin),
-                        net_name(&db, g.net)
-                    );
+                match (escapes.contains(&pin), records.get(&pin)) {
+                    (true, Some(rec)) => {
+                        match rec.kind {
+                            // Refused escapes added nothing — the pin
+                            // stays unattached.
+                            EscapeKind::CorridorBound
+                            | EscapeKind::NoAnchor
+                            | EscapeKind::HaloEmpty => {
+                                assert!(
+                                    ids.is_empty(),
+                                    "{name}: refused escape {} has nodes",
+                                    pin_label(&db, pin)
+                                );
+                            }
+                            // A landed halo/corridor puts its pairs in
+                            // region; attach is non-structural (a pin
+                            // rect covering no track crossing on its
+                            // own layers stays empty).
+                            EscapeKind::Halo | EscapeKind::CorridorMasked => {}
+                        }
+                        if !ids.is_empty() {
+                            assert!(
+                                matches!(
+                                    rec.kind,
+                                    EscapeKind::Halo | EscapeKind::CorridorMasked
+                                ),
+                                "{name}: re-attached escape {} records {:?}",
+                                pin_label(&db, pin),
+                                rec.kind
+                            );
+                        }
+                    }
+                    (false, None) => {
+                        assert!(
+                            !ids.is_empty(),
+                            "{name}: pin {} of net {} attached nothing and is not named",
+                            pin_label(&db, pin),
+                            net_name(&db, g.net)
+                        );
+                    }
+                    _ => panic!(
+                        "{name}: pin {} region_escape/escapes mismatch",
+                        pin_label(&db, pin)
+                    ),
                 }
             }
         }
@@ -675,6 +770,7 @@ fn test_graph_determinism() {
         assert_eq!(g1.nets, g2.nets, "{name}: nondeterministic graphs");
         assert_eq!(g1.zero_coverage, g2.zero_coverage);
         assert_eq!(g1.region_escape, g2.region_escape);
+        assert_eq!(g1.escapes, g2.escapes);
         assert_eq!(g1.total_nodes, g2.total_nodes);
         assert_eq!(g1.total_edges, g2.total_edges);
         assert_eq!(g1.total_via_edges, g2.total_via_edges);
@@ -790,6 +886,13 @@ fn test_region_escape_fixture() {
     let e = &graphs.region_escape[0];
     assert_eq!(pin_label(&db, e.pin), "u0/A");
     assert_eq!(net_name(&db, e.net), "n1");
+    // The halo reaches index-adjacent pairs of the io box's region —
+    // a span-1 merge, no corridor.
+    assert_eq!(graphs.escapes.len(), 1);
+    let rec = graphs.escapes[0];
+    assert_eq!(rec.kind, EscapeKind::Halo);
+    assert_eq!(rec.corridor_span, 0);
+    assert_eq!(rec.token(), "halo");
 
     // Fail-proof: both boxes under the grid — every member pin escapes
     // and (n1, met1) is a named zero-coverage pair, then restoring the
@@ -798,6 +901,17 @@ fn test_region_escape_fixture() {
     let graphs = build_route_graphs(&db, &tech, &tracks, &guide(empty));
     assert_eq!(graphs.total_nodes, 0);
     assert_eq!(graphs.region_escape.len(), 2, "{:?}", graphs.region_escape);
+    // With no region pairs to anchor to, every escape is refused as
+    // `NoAnchor` — nothing enters the graph.
+    assert_eq!(graphs.escapes.len(), 2);
+    assert!(
+        graphs.escapes.iter().all(|e| e.kind == EscapeKind::NoAnchor
+            && e.pairs_added == 0
+            && e.corridor_span == 0
+            && e.token() == "no_anchor"),
+        "{:?}",
+        graphs.escapes
+    );
     assert_eq!(graphs.zero_coverage.len(), 1);
     let z = &graphs.zero_coverage[0];
     assert_eq!(net_name(&db, z.net), "n1");
@@ -1007,7 +1121,7 @@ fn test_via_edge_census() {
         let expected: Vec<usize> = if name == "gcd" {
             vec![6_636, 322, 0, 2, 0]
         } else {
-            vec![180_346, 11_128, 0, 47, 0]
+            vec![180_427, 11_148, 0, 47, 0]
         };
         assert_eq!(
             graphs.via_edges_per_pair, expected,
@@ -1191,7 +1305,7 @@ fn test_via_edge_fixture() {
         let parsed = parse_guides(text, &tech).expect("fixture guide parses");
         join_guides(&db, &tech, &parsed).expect("fixture join")
     };
-    let node_xy = |g: &grus_core::drt::graph::NetGraph, id: u32| {
+    let node_xy = |g: &grus_eda_core::drt::graph::NetGraph, id: u32| {
         let n = g.nodes[id as usize];
         let lt = &tracks[n.layer.0 as usize];
         (lt.tracks_x[n.ix as usize], lt.tracks_y[n.iy as usize])
@@ -1249,7 +1363,7 @@ fn test_via_edge_fixture() {
     let table = via_table(&tech_novia, &db_bare).unwrap();
     assert_eq!(
         table.gaps,
-        vec![grus_core::drt::via::ViaGap {
+        vec![grus_eda_core::drt::via::ViaGap {
             lower: LayerId(0),
             upper: LayerId(1)
         }]
@@ -1261,10 +1375,10 @@ fn test_via_edge_fixture() {
 // Maze router
 // ---------------------------------------------------------------------------
 
-use grus_core::drt::maze::{
+use grus_eda_core::drt::maze::{
     FailKind, IterStat, MazeConfig, OccMode, overlap_census, route_digest, route_nets,
 };
-use grus_core::drt::graph::RouteGraphs;
+use grus_eda_core::drt::graph::RouteGraphs;
 
 /// `load` + `load_guide` + `build_route_graphs` + `via_table` — the
 /// full router input bundle for one placed design.
@@ -1282,8 +1396,18 @@ fn load_routed_inputs(
     let (_, join) = load_guide(&db, &tech, name);
     // The maze gets one spare layer above each net's topmost guided
     // layer — OBS-sealed pin pockets need it (OpenROAD's routed DEF
-    // escapes on the next layer inside the same guide XY).
-    let graphs = grus_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, 1);
+    // escapes on the next layer inside the same guide XY) — plus the
+    // bounded pin-halo escape.
+    let graphs = grus_eda_core::drt::graph::build_route_graphs_ext(
+        &db,
+        &tech,
+        &tracks,
+        &join,
+        grus_eda_core::drt::graph::GraphOpts {
+            spare_above: 1,
+            escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+        },
+    );
     let vias = via_table(&tech, &db).expect("via_table");
     (tech, db, tracks, join, graphs, vias)
 }
@@ -1478,7 +1602,7 @@ fn test_maze_cases() {
     let n1 = &r.nets[0];
     assert_eq!(
         n1.wires,
-        vec![grus_core::drt::maze::WireSeg {
+        vec![grus_eda_core::drt::maze::WireSeg {
             layer: LayerId(0),
             x1: 1000,
             y1: 1000,
@@ -1505,7 +1629,7 @@ fn test_maze_cases() {
     assert_eq!(n2.connected.len(), 2);
     assert_eq!(
         n2.vias,
-        vec![grus_core::drt::maze::ViaPlace {
+        vec![grus_eda_core::drt::maze::ViaPlace {
             lower: LayerId(0),
             x: 4000,
             y: 3000
@@ -1532,7 +1656,7 @@ fn test_maze_cases() {
     );
     // The emitted intervals — not trust — prove the detour: no met1
     // wire may enter the OBS rect inflated by w/2 + s = 210.
-    let inflated = grus_core::tech_db::RectDbu::new(1500 - 210, 900 - 210, 2500 + 210, 1100 + 210);
+    let inflated = grus_eda_core::tech_db::RectDbu::new(1500 - 210, 900 - 210, 2500 + 210, 1100 + 210);
     for w in &n1.wires {
         let hit = w.x1 < inflated.xh && w.x2 > inflated.xl && w.y1 < inflated.yh && w.y2 > inflated.yl;
         assert!(!hit, "wire {w:?} enters the OBS spacing band");
@@ -1551,7 +1675,7 @@ fn test_maze_cases() {
     let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
     assert!(r.nets.is_empty(), "{:?}", r.nets);
     assert_eq!(r.unrouted.len(), 2, "{:?}", r.unrouted);
-    let labels = |u: &grus_core::drt::maze::UnroutedNet| -> Vec<(String, FailKind)> {
+    let labels = |u: &grus_eda_core::drt::maze::UnroutedNet| -> Vec<(String, FailKind)> {
         u.failed
             .iter()
             .map(|&(p, k)| (pin_label(&db, p), k))
@@ -1567,6 +1691,295 @@ fn test_maze_cases() {
         labels(&r.unrouted[1]),
         vec![("u2/C".to_string(), FailKind::Unattachable)]
     );
+}
+
+/// `MAZE_LEF` plus a foreign-hull wall: `w0`'s `SIZE 1.1×5.0` hull
+/// sits at x∈[1400,2500] across the whole grid height, so every
+/// met1 segment from the guide region to u0's neighborhood crosses
+/// a foreign hull and dies at `seg_allowed` (the `relaxed_vias`
+/// confinement check) — u0's met2 transit island stays unreachable
+/// and the pin is `NoPath` before the escape. met2 is unmasked, so
+/// the escape halo bridges the wall there and the merged graph
+/// routes.
+const ESC_LEF_WALL: &str = "MACRO WALL\n  CLASS CORE ;\n  SIZE 1.1 BY 5.0 ;\nEND WALL\n";
+
+const ESC_DEF_TAIL: &str = r#"PINS 1 ;
+- io1 + NET n1 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 4000 1000 ) N ;
+END PINS
+NETS 1 ;
+- n1 ( PIN io1 ) ( u0 A ) + USE SIGNAL ;
+END NETS
+END DESIGN
+"#;
+
+/// Arm F's occupancy band: io4's met2 port rect lands at absolute
+/// `x∈[1900,2100] × y∈[-2100,5100]`, rasterizing `Pin(n2)` on the
+/// met2 `x = 2000` line over every y-track — every met2 edge on the
+/// `ix = 2` escape column or crossing the band hits the mark, while
+/// `ix = 1`/`ix = 3` stay clear (edge-to-track ≥ 800 > w/2 + s ≈ 210).
+/// A foreign `Pin` is the one light-weight mark that contrasts:
+/// `hit_verdict` hard-blocks `Obs` and foreign `ObsPin` before the
+/// `OccMode::Disabled` check, so OBS rects and instance-pin marks
+/// block in both modes.
+const ESC_DEF_TAIL_OCC: &str = r#"PINS 2 ;
+- io1 + NET n1 + DIRECTION INPUT + USE SIGNAL + LAYER met1 ( -100 -100 ) ( 100 100 ) + PLACED ( 4000 1000 ) N ;
+- io4 + NET n2 + DIRECTION INPUT + USE SIGNAL + LAYER met2 ( -100 -3600 ) ( 100 3600 ) + PLACED ( 2000 1500 ) N ;
+END PINS
+NETS 2 ;
+- n1 ( PIN io1 ) ( u0 A ) + USE SIGNAL ;
+- n2 ( PIN io4 ) + USE SIGNAL ;
+END NETS
+END DESIGN
+"#;
+
+/// The bounded pin-halo escape (`docs/e6-drt.md` §5): u0/A's met1
+/// rect sits at crossing (1000,1000) but the guide covers only the
+/// io side, and the `w0` wall walls off every met1 stub the
+/// route-time fallbacks could project — `NoPath` before the escape,
+/// routed once the halo merges. `region_escape` names u0/A either
+/// way (the flag is the pre-halo statement); `escapes` records what
+/// the mechanism did. Arms: off / merged halo / `CorridorBound`
+/// under a zero bound / `CorridorMasked` when the corridor dies at
+/// the wall. The corridor-landing arm runs on the open fixture,
+/// where a clean L-path records `halo(span=3)`. The last arm is the
+/// occupancy contrast: a foreign io-port `Pin` band covering only
+/// escaped pairs fails `Enabled` and routes `Disabled` — escaped
+/// metal is occupancy-checked like any other.
+#[test]
+fn test_maze_guide_escape() {
+    let mut interner = StringInterner::new();
+    let mut tech = TechDb::new();
+    let lef = MAZE_LEF.replace("END LIBRARY", &format!("{ESC_LEF_WALL}END LIBRARY"));
+    parse_lef_bytes(lef.as_bytes(), &mut tech, &mut interner).expect("fixture LEF parses");
+    tech.strings = interner.clone();
+    tech.rebuild_maps();
+    let cfg = MazeConfig::default();
+    let comps = "COMPONENTS 2 ;\n- u0 CELL + PLACED ( 900 900 ) N ;\n- w0 WALL + PLACED ( 1400 0 ) N ;\nEND COMPONENTS\n";
+    let db = maze_db_custom(&tech, comps, ESC_DEF_TAIL);
+    let tracks = layer_tracks(&db, &tech);
+    let vias = via_table(&tech, &db).unwrap();
+    let build = |join: &GuideJoin, escape| {
+        grus_eda_core::drt::graph::build_route_graphs_ext(
+            &db,
+            &tech,
+            &tracks,
+            join,
+            grus_eda_core::drt::graph::GraphOpts {
+                spare_above: 0,
+                escape,
+            },
+        )
+    };
+    let u0a = |graphs: &RouteGraphs| -> PinId {
+        graphs.nets[0]
+            .pin_nodes
+            .iter()
+            .find(|&&(p, _)| pin_label(&db, p) == "u0/A")
+            .map(|&(p, _)| p)
+            .unwrap()
+    };
+    let pin_ids = |graphs: &RouteGraphs, pin: PinId| -> usize {
+        graphs.nets[0]
+            .pin_nodes
+            .iter()
+            .find(|&&(p, _)| p == pin)
+            .map(|(_, ids)| ids.len())
+            .unwrap()
+    };
+    let failed = |r: &grus_eda_core::drt::maze::RouteDb, pin: PinId| -> Vec<FailKind> {
+        r.unrouted
+            .iter()
+            .flat_map(|u| u.failed.iter())
+            .filter(|&&(p, _)| p == pin)
+            .map(|&(_, k)| k)
+            .collect()
+    };
+
+    // Arm A — mechanism off: bit-identical to the pre-escape build.
+    // The strict-escape pin holds no nodes; the wall kills every
+    // fallback stub, so the net fails `NoPath` (the pin still
+    // attaches to its met2 transit island).
+    let join = maze_guide(&db, &tech, "n1\n(\n3000 0 5000 2000 met1\n)\n");
+    let graphs = build(&join, None);
+    let pin = u0a(&graphs);
+    assert!(graphs.escapes.is_empty());
+    assert_eq!(graphs.region_escape.len(), 1);
+    assert_eq!(graphs.region_escape[0].pin, pin);
+    assert_eq!(pin_ids(&graphs, pin), 0, "escape pin must hold no nodes");
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert_eq!(
+        failed(&r, pin),
+        vec![FailKind::NoPath],
+        "{:?}",
+        r.unrouted
+    );
+
+    // Arm B — mechanism on: the halo merges (met1 pairs adjacent to
+    // the guide region, met2 pairs adjacent to the transit island),
+    // u0/A attaches at its own crossing, and the met2 halo bridges
+    // the wall — the net routes. `region_escape` still names u0/A.
+    let graphs = build(&join, Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT));
+    assert_eq!(graphs.region_escape.len(), 1, "{:?}", graphs.region_escape);
+    assert_eq!(graphs.escapes.len(), 1);
+    let rec = graphs.escapes[0];
+    assert_eq!(rec.pin, pin);
+    assert_eq!(rec.kind, EscapeKind::Halo, "{:?}", rec);
+    assert_eq!(rec.corridor_span, 0, "{:?}", rec);
+    assert_eq!(rec.token(), "halo");
+    assert!(rec.pairs_added > 0);
+    assert!(pin_ids(&graphs, pin) > 0, "halo pairs inside the pin rect");
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+    assert_eq!(r.nets.len(), 1);
+    assert_eq!(r.nets[0].connected.len(), 2);
+
+    // Arm C — refusal is honest: under a zero corridor bound the
+    // same escape set records `CorridorBound`, no pairs are added,
+    // and the pin stays unreachable.
+    let join = maze_guide(&db, &tech, "n1\n(\n4000 0 5000 2000 met1\n)\n");
+    let graphs = build(
+        &join,
+        Some(grus_eda_core::drt::graph::EscapeCfg {
+            halo_lines: 0,
+            corridor_lines: 0,
+        }),
+    );
+    assert_eq!(graphs.escapes.len(), 1);
+    let rec = graphs.escapes[0];
+    assert_eq!(rec.kind, EscapeKind::CorridorBound, "{:?}", rec);
+    assert_eq!(rec.pairs_added, 0);
+    assert_eq!(rec.corridor_span, 3);
+    assert_eq!(rec.token(), "corridor_bound(span=3)");
+    assert_eq!(pin_ids(&graphs, pin), 0);
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert_eq!(
+        failed(&r, pin),
+        vec![FailKind::NoPath],
+        "{:?}",
+        r.unrouted
+    );
+
+    // Arm D — the corridor dies at the mask: halo_lines=0 puts the
+    // pin's own crossing in the halo, the bound admits the 3-step
+    // corridor, but the L-path crosses the wall — `CorridorMasked`
+    // keeps the legal halo pair (u0/A attaches to it) while the
+    // net still fails `NoPath`.
+    let graphs = build(
+        &join,
+        Some(grus_eda_core::drt::graph::EscapeCfg {
+            halo_lines: 0,
+            corridor_lines: 8,
+        }),
+    );
+    assert_eq!(graphs.escapes.len(), 1);
+    let rec = graphs.escapes[0];
+    assert_eq!(rec.kind, EscapeKind::CorridorMasked, "{:?}", rec);
+    assert_eq!(rec.corridor_span, 3, "{:?}", rec);
+    assert_eq!(rec.token(), "corridor_masked");
+    assert_eq!(rec.pairs_added, 1, "{:?}", rec);
+    assert!(pin_ids(&graphs, pin) > 0);
+    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert_eq!(
+        failed(&r, pin),
+        vec![FailKind::NoPath],
+        "{:?}",
+        r.unrouted
+    );
+
+    // Corridor landing, open fixture: no wall, halo_lines=0 —
+    // met1's halo is just the pin crossing, the guide starts three
+    // index steps away, and the L-corridor lands on every pair. The
+    // record names `halo(span=3)`; here the route-time fallbacks
+    // would have rescued the pin anyway (no wall), so the arm pins
+    // corridor geometry and the token, not necessity.
+    let db_open = maze_db(&tech, false);
+    let tracks_open = layer_tracks(&db_open, &tech);
+    let vias_open = via_table(&tech, &db_open).unwrap();
+    let join = maze_guide(&db_open, &tech, "n1\n(\n4000 0 5000 2000 met1\n)\n");
+    let graphs = grus_eda_core::drt::graph::build_route_graphs_ext(
+        &db_open,
+        &tech,
+        &tracks_open,
+        &join,
+        grus_eda_core::drt::graph::GraphOpts {
+            spare_above: 0,
+            escape: Some(grus_eda_core::drt::graph::EscapeCfg {
+                halo_lines: 0,
+                corridor_lines: 8,
+            }),
+        },
+    );
+    assert_eq!(graphs.escapes.len(), 1);
+    let rec = graphs.escapes[0];
+    assert_eq!(rec.kind, EscapeKind::Halo, "{:?}", rec);
+    assert_eq!(rec.corridor_span, 3, "{:?}", rec);
+    assert_eq!(rec.token(), "halo(span=3)");
+    // The union-count pin: met1 halo {(1,1)} + corridor path
+    // {(2,1),(3,1)} = 3 distinct pairs; met2's halo {(1,1)} is
+    // already `region` (the transit island) and adds nothing — the
+    // retired `halo_total + extra.len()` arithmetic reported 4.
+    assert_eq!(rec.pairs_added, 3, "{:?}", rec);
+    let r = route_nets(&db_open, &tech, &tracks_open, &graphs, &vias_open, &cfg);
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+
+    // Arm F — the occupancy contrast (`docs/e6-drt.md` §5): every
+    // met2 pair io4's `Pin` band can hit is an escaped pair
+    // (non-escape met2 `region` is exactly the (1,1) transit
+    // island; the guide covers no met2 at all), so the block is
+    // attributable to escape metal by construction, not by
+    // argument. `Enabled` fails `NoPath` — soft-priced crossings
+    // escalate until the hard iteration blocks them — while
+    // `Disabled` routes the identical graph. The `escapes` record
+    // is `Halo` either way: the graph build is occupancy-
+    // independent, the check is route-time.
+    let db_occ = maze_db_custom(&tech, comps, ESC_DEF_TAIL_OCC);
+    let tracks_occ = layer_tracks(&db_occ, &tech);
+    let vias_occ = via_table(&tech, &db_occ).unwrap();
+    let join_occ = maze_guide(&db_occ, &tech, "n1\n(\n3000 0 5000 2000 met1\n)\n");
+    let graphs_occ = grus_eda_core::drt::graph::build_route_graphs_ext(
+        &db_occ,
+        &tech,
+        &tracks_occ,
+        &join_occ,
+        grus_eda_core::drt::graph::GraphOpts {
+            spare_above: 0,
+            escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+        },
+    );
+    assert_eq!(graphs_occ.escapes.len(), 1);
+    assert_eq!(
+        graphs_occ.escapes[0].kind,
+        EscapeKind::Halo,
+        "{:?}",
+        graphs_occ.escapes
+    );
+    let pin_occ = graphs_occ.nets[0]
+        .pin_nodes
+        .iter()
+        .find(|&&(p, _)| pin_label(&db_occ, p) == "u0/A")
+        .map(|&(p, _)| p)
+        .unwrap();
+    let r = route_nets(&db_occ, &tech, &tracks_occ, &graphs_occ, &vias_occ, &cfg);
+    assert_eq!(
+        failed(&r, pin_occ),
+        vec![FailKind::NoPath],
+        "{:?}",
+        r.unrouted
+    );
+    let r = route_nets(
+        &db_occ,
+        &tech,
+        &tracks_occ,
+        &graphs_occ,
+        &vias_occ,
+        &MazeConfig {
+            occ: OccMode::Disabled,
+            ..cfg
+        },
+    );
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+    assert_eq!(r.nets.len(), 1);
+    assert_eq!(r.nets[0].connected.len(), 2);
 }
 
 /// The foreign-pin collision contract (`docs/e6-drt.md` §7): a wire
@@ -1588,7 +2001,7 @@ fn test_maze_pin_collision() {
     let vias = via_table(&tech, &db).unwrap();
     // io2's met1 port rect [1900,2100]×[900,1100] inflated by
     // w/2 + s = 210 — the foreign band no committed n1 wire may enter.
-    let band = grus_core::tech_db::RectDbu::new(1690, 690, 2310, 1310);
+    let band = grus_eda_core::tech_db::RectDbu::new(1690, 690, 2310, 1310);
     let n2_guide = "n2\n(\n0 0 5000 5000 met1\n0 0 5000 5000 met2\n)\n";
 
     // Arm A — open guide: the router must find a clean detour (an
@@ -1730,6 +2143,7 @@ fn test_maze_census() {
 fn test_maze_census_picorv32() {
     maze_census("picorv32");
 }
+
 
 fn maze_census(name: &str) {
     {
@@ -1956,7 +2370,7 @@ fn test_route_digest_covers_iter_stats() {
 fn test_route_digest_covers_pin_collisions() {
     let a = RouteDb::default();
     let mut b = a.clone();
-    b.pin_collisions.push(grus_core::drt::maze::Collision {
+    b.pin_collisions.push(grus_eda_core::drt::maze::Collision {
         a: NetId(1),
         b: NetId(2),
         layer: LayerId(0),
@@ -1971,11 +2385,11 @@ fn test_route_digest_covers_pin_collisions() {
 // Routed DEF emission + self-DRC gate
 // ---------------------------------------------------------------------------
 
-use grus_core::drc::ShapeSrc;
-use grus_core::drc::geom::assemble;
-use grus_core::drc::report::{Family, SubsetReport, run_all};
-use grus_core::drt::emit::{EmitReport, apply_routes, preemit_check, write_routed_def};
-use grus_core::drt::maze::RouteDb;
+use grus_eda_core::drc::ShapeSrc;
+use grus_eda_core::drc::geom::assemble;
+use grus_eda_core::drc::report::{Family, SubsetReport, run_all};
+use grus_eda_core::drt::emit::{EmitReport, apply_routes, preemit_check, write_routed_def};
+use grus_eda_core::drt::maze::RouteDb;
 
 /// Route `name` and apply the result into `db.net_geoms` — the shared
 /// emit leg (gcd routes in seconds; picorv32 legs live under
@@ -2913,3 +3327,4 @@ fn test_emit_via_default_consistency() {
     }
     assert!(placed > 0, "no vias emitted — vacuous");
 }
+

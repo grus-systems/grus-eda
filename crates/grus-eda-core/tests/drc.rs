@@ -15,18 +15,18 @@
 //!
 //! Tests fail loudly on missing inputs — no silent skips.
 
-use grus_core::drc::geom::assemble;
-use grus_core::drc::report::{
+use grus_eda_core::drc::geom::assemble;
+use grus_eda_core::drc::report::{
     DECK_STATEMENTS, DECK_UNIQUE_NAMES, IMPLEMENTED_RULES, IMPLEMENTED_STATEMENTS,
     MAGIC_ONLY_STATEMENTS, magic_deltas, run_all,
 };
-use grus_core::drc::spacing::{SPACING_RULES, check_spacing, check_spacing_report};
-use grus_core::drc::width::{Violation, WIDTH_RULES, check_width};
-use grus_core::drc::{DrcDesign, DrcLayer, ShapeSrc};
-use grus_core::design_db::DesignDb;
-use grus_core::interner::StringInterner;
-use grus_core::readers::{load_tech_db, parse_def, parse_def_bytes};
-use grus_core::tech_db::TechDb;
+use grus_eda_core::drc::spacing::{SPACING_RULES, check_spacing, check_spacing_report};
+use grus_eda_core::drc::width::{Violation, WIDTH_RULES, check_width};
+use grus_eda_core::drc::{DrcDesign, DrcLayer, ShapeSrc};
+use grus_eda_core::design_db::DesignDb;
+use grus_eda_core::interner::StringInterner;
+use grus_eda_core::readers::{load_tech_db, parse_def, parse_def_bytes};
+use grus_eda_core::tech_db::TechDb;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -433,7 +433,7 @@ fn test_spacing_mutation_met2_probe() {
         .map(|v| v.as_i64().unwrap() as i32)
         .collect();
     let half = m["layer_width_dbu"].as_i64().unwrap() as i32 / 2;
-    let probe_rect = grus_core::tech_db::RectDbu::new(
+    let probe_rect = grus_eda_core::tech_db::RectDbu::new(
         seg[0].min(seg[2]) - half,
         seg[1].min(seg[3]) - half,
         seg[0].max(seg[2]) + half,
@@ -526,8 +526,8 @@ fn test_spacing_mutation_met2_probe() {
 // Enclosure gate vs Magic golden
 // ---------------------------------------------------------------------------
 
-use grus_core::drc::area::{AREA_RULES, HOLE_RULES, check_area_report, check_hole_report};
-use grus_core::drc::enclosure::{
+use grus_eda_core::drc::area::{AREA_RULES, HOLE_RULES, check_area_report, check_hole_report};
+use grus_eda_core::drc::enclosure::{
     ENCLOSURE_RULES, EncMode, check_enclosure, check_enclosure_report,
 };
 
@@ -871,7 +871,7 @@ fn test_area_mutation_met1_island() {
 
     let db = parse_def_bytes(mutated.as_bytes(), &tech, None).unwrap();
     let drc = assemble(&db, &tech).unwrap();
-    let all = grus_core::drc::area::check_area(&drc, &tech);
+    let all = grus_eda_core::drc::area::check_area(&drc, &tech);
     for v in &all {
         println!("{v:?}");
     }
@@ -889,7 +889,7 @@ fn test_area_mutation_met1_island() {
     // Control: the unmutated DEF is clean.
     let db = parse_def_bytes(text.as_bytes(), &tech, None).unwrap();
     let drc = assemble(&db, &tech).unwrap();
-    assert!(grus_core::drc::area::check_area(&drc, &tech).is_empty());
+    assert!(grus_eda_core::drc::area::check_area(&drc, &tech).is_empty());
 }
 
 // ---------------------------------------------------------------------------

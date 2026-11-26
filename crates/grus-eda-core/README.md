@@ -1,4 +1,4 @@
-# grus-core
+# grus-eda-core
 
 Physical-design engine core for the open SkyWater sky130 PDK (`sky130_fd_sc_hd`).
 

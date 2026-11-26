@@ -68,7 +68,7 @@ grus-eda/
 │   ├── grus-eda/                 # CLI binary crate
 │   │   ├── Cargo.toml
 │   │   └── src/main.rs
-│   └── grus-core/                # Core library crate
+│   └── grus-eda-core/                # Core library crate
 │       ├── Cargo.toml
 │       └── src/
 │           ├── lib.rs
@@ -122,7 +122,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 ---
 
-## 4. Core Data Structures (`grus-core`)
+## 4. Core Data Structures (`grus-eda-core`)
 
 ### 4.1 Typed Indices & String Interner (`interner.rs`)
 

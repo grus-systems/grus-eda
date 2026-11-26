@@ -27,7 +27,7 @@ run can feed all of them.
 
 ## Files
 
-- `crates/grus-core/tests/drt.rs`
+- `crates/grus-eda-core/tests/drt.rs`
 - `docs/results.md` dated entry
 
 ## Verify

@@ -18,18 +18,18 @@
 //! Both tests fail loudly on missing inputs — there are no silent skips.
 
 use anyhow::{Context, Result, bail, ensure};
-use grus_core::activity::ActivityOverrides;
-use grus_core::design_db::{DesignDb, PdnNet, PdnUse};
-use grus_core::interner::StringInterner;
-use grus_core::lib_db::LibDb;
-use grus_core::pdn::{
+use grus_eda_core::activity::ActivityOverrides;
+use grus_eda_core::design_db::{DesignDb, PdnNet, PdnUse};
+use grus_eda_core::interner::StringInterner;
+use grus_eda_core::lib_db::LibDb;
+use grus_eda_core::pdn::{
     PdnMesh, PdnSolve, SolveOptions, VoltageRow, build_mesh, solve_pdn_net, voltage_rows,
     write_voltage_csv,
 };
-use grus_core::power::estimate_power;
-use grus_core::readers::{VcdActivity, load_liberty, load_tech_db, parse_def};
-use grus_core::sta::{load_sdc, sta_pin_slews};
-use grus_core::tech_db::TechDb;
+use grus_eda_core::power::estimate_power;
+use grus_eda_core::readers::{VcdActivity, load_liberty, load_tech_db, parse_def};
+use grus_eda_core::sta::{load_sdc, sta_pin_slews};
+use grus_eda_core::tech_db::TechDb;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 

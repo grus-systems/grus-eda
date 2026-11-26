@@ -24,8 +24,8 @@ turns the hot query into O(cells-touched) array reads.
 
 ## Files
 
-- `crates/grus-core/src/drt/maze.rs` (Occupancy internals — keep
+- `crates/grus-eda-core/src/drt/maze.rs` (Occupancy internals — keep
   the public surface)
-- `crates/grus-core/tests/drt.rs` (differential/regression pin)
+- `crates/grus-eda-core/tests/drt.rs` (differential/regression pin)
 - `docs/results.md` dated entry (measured scan share before/after,
   route_ms on gcd)
