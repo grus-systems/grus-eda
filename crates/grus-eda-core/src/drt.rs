@@ -19,5 +19,5 @@ pub mod via;
 
 pub use maze::{
     AreaResidual, Collision, FailKind, IterStat, MazeConfig, NetRoute, OccMode, RouteDb,
-    UnroutedNet, ViaPlace, WireSeg,
+    RouteProgress, UnroutedNet, ViaPlace, WireSeg,
 };

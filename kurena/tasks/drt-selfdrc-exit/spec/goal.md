@@ -31,8 +31,8 @@ the emit is clean; today it can still carry real violations.
 ## Files
 
 - `crates/grus-eda/src/main.rs` (exit code + census line order)
-- `crates/grus-eda-core/src/drt/` (only if the honest-enum direction
+- `crates/grus-core/src/drt/` (only if the honest-enum direction
   lands)
-- `crates/grus-eda-core/tests/drt.rs` (exit-code test)
+- `crates/grus-core/tests/drt.rs` (exit-code test)
 - `docs/results.md` dated entry + `docs/e6-drt.md` contract note
   (what `routed` does and does not claim)

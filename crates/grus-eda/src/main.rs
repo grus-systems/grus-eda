@@ -684,6 +684,12 @@ enum OccArg {
     Disabled,
 }
 
+/// `drt` stderr progress cadence — every N completed nets or T
+/// seconds since the last line, whichever fires first; the last
+/// net of each iteration always prints.
+const DRT_PROGRESS_NETS: u32 = 500;
+const DRT_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Args, Debug)]
 struct DrtArgs {
     #[arg(long, help = "Path to technology LEF (.tlef) file")]
@@ -2083,7 +2089,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 OccArg::Disabled => grus_eda_core::drt::OccMode::Disabled,
             };
             let t_route = std::time::Instant::now();
-            let route_db = grus_eda_core::drt::maze::route_nets(
+            let mut last = std::time::Instant::now();
+            let mut sink = move |p: grus_eda_core::drt::RouteProgress| {
+                if p.done.is_multiple_of(DRT_PROGRESS_NETS)
+                    || p.done == p.queued
+                    || last.elapsed() >= DRT_PROGRESS_INTERVAL
+                {
+                    eprintln!(
+                        "drt: iter {} nets {}/{} unrouted={} elapsed={}s",
+                        p.iteration,
+                        p.done,
+                        p.queued,
+                        p.unrouted,
+                        p.elapsed.as_secs(),
+                    );
+                    last = std::time::Instant::now();
+                }
+            };
+            let route_db = grus_eda_core::drt::maze::route_nets_with_progress(
                 &design_db,
                 tech_db,
                 &tracks,
@@ -2093,6 +2116,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     occ,
                     max_iters: args.max_iters,
                 },
+                Some(&mut sink),
             );
             let elapsed_route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
 
