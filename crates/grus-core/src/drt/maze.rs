@@ -191,6 +191,27 @@ pub struct ClosureResiduals {
     pub holes: Vec<HoleResidual>,
 }
 
+/// One iteration of the `route_nets` rip-up loop — the convergence
+/// record behind the census `iter_progress`/`iter_prov` lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IterStat {
+    /// Nets queued into the iteration — `bad.len()` at entry;
+    /// entry 0 is always `graphs.nets.len()` (every net attempts
+    /// once before any rip-up exists).
+    pub attempted: u32,
+    /// Nets that committed a route this iteration — counts
+    /// attempts, not distinct nets (a re-queued net that routes
+    /// again counts again). `attempted - routed` is the
+    /// iteration's failure count.
+    pub routed: u32,
+    /// Deduped provisional `Collision`s recorded by this
+    /// iteration's committed routes — the re-queue trigger. Always
+    /// 0 on the hard (last) iteration, where foreign hits block
+    /// instead of reporting, and on every iteration under
+    /// `OccMode::Disabled`, where recording is skipped.
+    pub prov_collisions: u32,
+}
+
 /// The router's complete deterministic output.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RouteDb {
@@ -203,6 +224,10 @@ pub struct RouteDb {
     pub collisions: Vec<Collision>,
     /// Iterations actually run (≤ `max_iters`).
     pub iterations: u32,
+    /// Per-iteration convergence record — `iter_stats[i]` describes
+    /// iteration `i + 1` (1-based like `iterations`); `len() ==
+    /// iterations` and ≤ `max_iters` by loop construction.
+    pub iter_stats: Vec<IterStat>,
     /// Components the min-area patch brought to bound.
     pub area_patches: usize,
     /// Components it could not — named with layer/bbox/area/bound;
@@ -3727,6 +3752,7 @@ pub fn route_nets(
     let mut bad: Vec<usize> = (0..n).collect();
     let mut unrouted: Vec<UnroutedNet> = Vec::new();
     let mut iterations = 0u32;
+    let mut iter_stats: Vec<IterStat> = Vec::new();
 
     let cap = cfg.max_iters.max(1);
     let mut it = 0u32;
@@ -3734,10 +3760,12 @@ pub fn route_nets(
     while it < cap && !bad.is_empty() {
         it += 1;
         iterations = it;
+        let attempted = bad.len() as u32;
         let hard = it == cap;
         let ti = std::time::Instant::now();
         let mut prov: BTreeSet<Collision> = BTreeSet::new();
         let mut failed: Vec<(usize, UnroutedNet)> = Vec::new();
+        let mut routed = 0u32;
         for (bi, &i) in bad.iter().enumerate() {
             let g = &graphs.nets[i];
             let tn = std::time::Instant::now();
@@ -3745,6 +3773,7 @@ pub fn route_nets(
                 db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i], hard, cfg.occ,
             ) {
                 NetOutcome::Routed(route, hits, res) => {
+                    routed += 1;
                     commit_route(&mut occ, tracks, vias, &route, &mut marks[i]);
                     if !hard && cfg.occ == OccMode::Enabled {
                         prov.extend(hits);
@@ -3777,6 +3806,11 @@ pub fn route_nets(
                 }
             }
         }
+        iter_stats.push(IterStat {
+            attempted,
+            routed,
+            prov_collisions: prov.len() as u32,
+        });
         if hard {
             unrouted = failed.into_iter().map(|(_, u)| u).collect();
             break;
@@ -3862,6 +3896,7 @@ pub fn route_nets(
         nets,
         unrouted,
         iterations,
+        iter_stats,
         area_patches,
         area_residuals,
         notch_residuals: res_of
@@ -4024,6 +4059,12 @@ pub fn route_digest(routed: &RouteDb) -> u64 {
         put(p.0);
     }
     put(routed.iterations);
+    put(routed.iter_stats.len() as u32);
+    for s in &routed.iter_stats {
+        put(s.attempted);
+        put(s.routed);
+        put(s.prov_collisions);
+    }
     xxh3_64(&buf)
 }
 

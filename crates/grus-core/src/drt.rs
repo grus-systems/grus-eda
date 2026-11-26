@@ -18,6 +18,6 @@ pub mod tracks;
 pub mod via;
 
 pub use maze::{
-    AreaResidual, Collision, FailKind, MazeConfig, NetRoute, OccMode, RouteDb, UnroutedNet,
-    ViaPlace, WireSeg,
+    AreaResidual, Collision, FailKind, IterStat, MazeConfig, NetRoute, OccMode, RouteDb,
+    UnroutedNet, ViaPlace, WireSeg,
 };

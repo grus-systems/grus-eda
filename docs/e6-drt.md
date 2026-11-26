@@ -557,11 +557,19 @@ them).
 iterations the foreign hits a committed edge actually took are
 recorded as provisional `Collision`s deduped on `(a, b, layer, line,
 lo, hi)` with `a < b`. After each round: `bad` = unrouted nets ∪ both
-parties of every provisional collision; each bad net's marks are
+parties of every provisional collision — and a collision's foreign
+party may be a kept net (committed in an earlier iteration, its marks
+still in `occ`), so `bad[i+1]` need not ⊆ `bad[i]` and `iter_progress`
+is not guaranteed non-increasing; each bad net's marks are
 ripped up and its `hist` escalates — per-net escalation breaks the
 two-net ping-pong cycle. Kept nets stay committed and price later
 re-routes. Cap `MAX_ITERS = 8`; the last iteration runs hard mode and
-its failures become the unrouted report. `OccMode::Disabled` (the
+its failures become the unrouted report. Each iteration's
+`bad`-set size, committed-route count, and deduped provisional
+`Collision` count are recorded in `RouteDb.iter_stats` (one
+`IterStat` per iteration; the hard iteration always records
+`prov_collisions = 0` since foreign hits block instead of
+reporting). `OccMode::Disabled` (the
 fail-proof knob) skips foreign-`Net`/`Pin` checks and collision
 recording entirely; `Obs` still blocks — a fixed blockage is not
 "occupancy". After the cap, `overlap_census` rebuilds every route's
@@ -701,7 +709,11 @@ grus-eda drt --tlef <t> --lef <l> --def <placed.def> \
 ```
 
 prints the emit census (`guided/routed/unrouted/projected/
-collisions/area_patches/area_residuals/iterations/route_ms`, one
+collisions/area_patches/area_residuals/iterations/route_ms`, the
+`iter_progress=<attempted,…>` / `iter_prov=<prov_collisions,…>`
+comma-joined per-iteration series from `RouteDb.iter_stats` (the
+last `iter_prov` entry is always 0 — the hard iteration reports
+no provisionals), one
 `unrouted <name>` line per unrouted net and one `area_residual
 <net> <layer> area=… bound=… region=…` line per unfixable §7
 component), the informational `wirelength_um` + `via.<cut>`
