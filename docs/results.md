@@ -10149,7 +10149,7 @@ golden's `cli_lines` → `recount_unrouted.py gcd` exits 1
 emit run above; the detached-HEAD digest arm; the doctored-golden
 recount arm.
 
-### 2026-11-25 — drt-converge-stats: per-iteration convergence record in the drt census (v0.12.11)
+### 2026-11-26 — drt-converge-stats: per-iteration convergence record in the drt census (v0.12.11)
 
 Observability ticket — no routing-behavior change. `route_nets`
 now records one `IterStat{attempted, routed, prov_collisions}` per
@@ -10164,7 +10164,8 @@ prints them as `iter_progress=<attempted,…>` /
 run output, so it belongs to the digest's own contract.
 
 **gcd census** (`cargo test --release -p grus-core --test drt
-test_maze_census -- --nocapture`, same `MazeConfig::default()`):
+test_maze_census -- --nocapture`, same `MazeConfig::default()`,
+run 2026-11-25):
 
 ```
 gcd: guided=269 routed=188 pins_connected=513 projected=9 unrouted=81 collisions=0 iterations=8 ms=12933 digest=0xa6d8b74a740a7489
@@ -10184,7 +10185,7 @@ digest value).
 
 **gcd emit leg** (`target/release/grus-eda drt` on
 `gcd.placed.def` + `gcd.guide` → scratch `--out-def`,
-route_ms=12,853), verbatim:
+route_ms=12,853, run 2026-11-25), verbatim:
 
 ```
 guided=269 routed=188 unrouted=81 projected=9 collisions=0 area_patches=1 area_residuals=0 iterations=8 route_ms=12853 hull_masked=227182 notch_fills=343 notch_residuals=0 hole_residuals=0
@@ -10202,11 +10203,13 @@ routing. Additionally the loop's `iter_stats.push` was removed on
 a scratch edit: `test_maze_census` went red at
 `iter_stats len != iterations` (0 vs 8), restored. The census
 asserts the model invariants (`len == iterations`,
-`attempted[0] == guided`, `attempted` non-increasing,
-`routed ≤ attempted`, last `prov_collisions == 0`,
-`last.attempted − last.routed == unrouted.len()`), and
-`test_maze_determinism`'s `RouteDb` equality covers the field for
-free.
+`attempted[0] == guided`, `routed ≤ attempted`, last
+`prov_collisions == 0`,
+`last.attempted − last.routed == unrouted.len()`) and reports
+`attempted` non-increase only informationally
+(`iter_progress_monotonic=true` on this leg — empirical, not
+gated); `test_maze_determinism`'s `RouteDb` equality covers the
+field for free.
 
 **Consumers**: `check_drt_ours.sh` step-E keep-list gains
 `s.startswith("iter_progress=")` / `s.startswith("iter_prov=")` —
@@ -10236,9 +10239,12 @@ re-queueing ~1100 provisional-collision parties, so convergence
 within a few more iterations is not evident. All `iter_stats`
 invariants asserted in `maze_census` held on this leg (`len ==
 iterations == 8`, `attempted[0] == 6744 == guided`,
-non-increasing, last `prov_collisions == 0`,
+last `prov_collisions == 0`,
 `last.attempted − last.routed == unrouted.len()` — the hard
-iteration committed 310 of the 2326 queued).
+iteration committed 310 of the 2326 queued); the leg reported
+`iter_progress_monotonic=true` — a future `false` is a datum,
+not a failure: a kept net named as a provisional-collision party
+re-queues into `bad[i+1]` from outside `bad[i]`.
 
 **What ran** (E0 rule 9): `cargo test --workspace` — 557 lib +
 18 drc + 26 drt (3 `#[ignore]`d picorv32 legs) + 2 irdrop +
@@ -10246,4 +10252,9 @@ iteration committed 310 of the 2326 queued).
 -D warnings` clean; `cargo build --release -p grus-eda`; the gcd
 census and emit runs above; the loop-push fail-proof;
 `recount_unrouted.py gcd`; the picorv32 census leg above
-(128 min release run, all invariants green).
+(128 min release run, all invariants green). r3 verify
+(run 2026-11-26): `cargo test --workspace` — same counts, all
+green; `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `test_maze_census` release re-run printed
+`iter_progress_monotonic=true` with the unchanged
+`iter_progress` series and digest `0xa6d8b74a740a7489`.

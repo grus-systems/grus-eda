@@ -1651,6 +1651,12 @@ fn maze_census(name: &str) {
                 .collect::<Vec<_>>()
                 .join(","),
         );
+        println!(
+            "{name}: iter_progress_monotonic={}",
+            r.iter_stats
+                .windows(2)
+                .all(|w| w[0].attempted >= w[1].attempted)
+        );
         for u in &r.unrouted {
             let kinds: Vec<String> = u
                 .failed
@@ -1679,8 +1685,11 @@ fn maze_census(name: &str) {
 
         // Convergence record (`IterStat` semantics, `docs/e6-drt.md`
         // §7): one entry per iteration; entry 0 attempts every guided
-        // net; `attempted` is non-increasing (the re-queue is a
-        // subset); the last entry always has `prov_collisions == 0`
+        // net; `bad[i+1] = failed ∪ both parties of every provisional
+        // collision`, and a collision's foreign party may be a kept
+        // net outside `bad[i]`, so `attempted` can rise — observed
+        // non-increasing on the recorded designs, reported above, not
+        // asserted. The last entry always has `prov_collisions == 0`
         // (hard mode reports no provisionals; early convergence has
         // none) and its failure count is the unrouted census.
         assert_eq!(
@@ -1703,12 +1712,6 @@ fn maze_census(name: &str) {
                 (last.attempted - last.routed) as usize,
                 r.unrouted.len(),
                 "{name}: last-iteration failures != unrouted"
-            );
-        }
-        for w in r.iter_stats.windows(2) {
-            assert!(
-                w[0].attempted >= w[1].attempted,
-                "{name}: attempted increased across iterations"
             );
         }
         for s in &r.iter_stats {
