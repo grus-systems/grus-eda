@@ -24,5 +24,5 @@ measured; picorv32 already peaks in the hundreds of MB.
 
 ## Files
 
-- `crates/grus-core/src/drt/` (as scoped by the measurement)
+- `crates/grus-eda-core/src/drt/` (as scoped by the measurement)
 - `docs/results.md` dated entry (RSS before/after, split table)

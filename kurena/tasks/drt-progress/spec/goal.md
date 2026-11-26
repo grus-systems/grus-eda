@@ -23,7 +23,7 @@ is cheap and answers "is it stuck?" without attaching a debugger.
 
 ## Files
 
-- `crates/grus-core/src/drt/maze.rs` (progress hook — minimal
+- `crates/grus-eda-core/src/drt/maze.rs` (progress hook — minimal
   surface change; no shared-state change for the hook itself)
 - `crates/grus-eda/src/main.rs` (wire the hook to stderr in `drt`)
 - `docs/results.md` dated entry (sample output on gcd/picorv32)

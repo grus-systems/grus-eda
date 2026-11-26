@@ -38,9 +38,9 @@ parallel-search-then-serial-commit or snapshot-occupancy schemes.
 
 ## Files
 
-- `crates/grus-core/src/drt/graph.rs`, `drt/maze.rs`,
+- `crates/grus-eda-core/src/drt/graph.rs`, `drt/maze.rs`,
   `drt/emit.rs` (as scoped)
-- `crates/grus-core/Cargo.toml` (rayon)
-- `crates/grus-core/tests/drt.rs` (determinism pin incl. forced
+- `crates/grus-eda-core/Cargo.toml` (rayon)
+- `crates/grus-eda-core/tests/drt.rs` (determinism pin incl. forced
   single-thread)
 - `docs/results.md` dated entry (phase timings before/after)

@@ -68,7 +68,7 @@ grus-eda/
 │   ├── grus-eda/                 # CLI binary crate
 │   │   ├── Cargo.toml
 │   │   └── src/main.rs
-│   └── grus-core/                # Core library crate
+│   └── grus-eda-core/                # Core library crate
 │       ├── Cargo.toml
 │       └── src/
 │           ├── lib.rs
