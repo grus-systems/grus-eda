@@ -30,7 +30,7 @@ kind = "host"
 # Verify commands run in declaration order inside the task worktree:
 [[verify]]
 name = "test-workspace"
-cmd = "cargo test --workspace"
+cmd = "cargo test --workspace --profile verify"
 
 [[verify]]
 name = "clippy"
