@@ -10217,16 +10217,33 @@ generation-time snapshots only; committed goldens
 (digits/commas/`=` only). `recount_unrouted.py gcd` exits 0
 (unknown prefixes ignored by construction).
 
-**picorv32 leg** (`test_maze_census_picorv32 --ignored`,
-~135 min release): running detached; the `iter_progress`/
-`iter_prov` series goes into this entry when it lands. The
-acceptance's picorv32 iteration-profile box stays open until
-then. Prior record (v0.12.9 emit census): `guided=6744
-routed=4728 unrouted=2016`, `iterations=8`.
+**picorv32 census** (`cargo test --release -p grus-core --test
+drt test_maze_census_picorv32 -- --ignored --nocapture`,
+7684 s ≈ 128 min, run 2026-11-26), verbatim:
+
+```
+picorv32: guided=6744 routed=4728 pins_connected=13112 projected=134 unrouted=2016 collisions=0 iterations=8 ms=7651141 digest=0xf7ce0bef5ae5b52f
+picorv32: iter_progress=6744,2557,2437,2382,2371,2342,2338,2326 iter_prov=2238,1710,1425,1307,1214,1187,1099,0
+```
+
+Reading: the opposite profile from gcd — the bad set was still
+falling at the cap (6744→2557→…→2326) with `iter_prov` at 1099
+entering the hard iteration, so the 2016-net unrouted residue
+sat inside live collision churn rather than a settled dead-end
+set. The tail was shallow (−29, −4, −12 `attempted` over the
+last three entries): extra soft iterations would keep
+re-queueing ~1100 provisional-collision parties, so convergence
+within a few more iterations is not evident. All `iter_stats`
+invariants asserted in `maze_census` held on this leg (`len ==
+iterations == 8`, `attempted[0] == 6744 == guided`,
+non-increasing, last `prov_collisions == 0`,
+`last.attempted − last.routed == unrouted.len()` — the hard
+iteration committed 310 of the 2326 queued).
 
 **What ran** (E0 rule 9): `cargo test --workspace` — 557 lib +
 18 drc + 26 drt (3 `#[ignore]`d picorv32 legs) + 2 irdrop +
 7 grus-eda, all green; `cargo clippy --workspace --all-targets --
 -D warnings` clean; `cargo build --release -p grus-eda`; the gcd
 census and emit runs above; the loop-push fail-proof;
-`recount_unrouted.py gcd`.
+`recount_unrouted.py gcd`; the picorv32 census leg above
+(128 min release run, all invariants green).
