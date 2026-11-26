@@ -10,9 +10,13 @@
 #
 # No --occ/--max-iters flags — the CLI defaults (OccMode::Enabled,
 # MAX_ITERS = 8) are the contract the test legs use
-# (MazeConfig::default()). --self-drc prints the re-parse -> run_all
-# verdict into the log, which check_drt_ours.sh step E lifts verbatim
-# into <design>.drt.ours.reference.json's `ours_router` block.
+# (MazeConfig::default()). Self-DRC is default-on (re-parse ->
+# assemble -> run_all on the emitted DEF) and gates the exit code
+# above --self-drc-tolerance; the verdict line and findings flow into
+# the log, which check_drt_ours.sh step E lifts verbatim into
+# <design>.drt.ours.reference.json's `ours_router` block. picorv32
+# carries a pinned emit-visible residual (3 of the 21 met1.2 sites —
+# docs/e6-drt.md §9), so its budget is 3; every other design is 0.
 #
 # gcd's routed DEF is committed (< 1 MB) and asserted byte-equal to a
 # fresh emission by test_e2e_ours_def_deterministic_gcd; picorv32's is
@@ -74,13 +78,22 @@ GRUS="${REPO_ROOT}/target/release/grus-eda"
 
 OUT_DEF="${D}/${DESIGN}.drt.ours.routed.def"
 
+# Per-design self-DRC findings budget: picorv32's pinned emit-visible
+# met1.2 residual (3 of 21 sites — docs/e6-drt.md §9) would otherwise
+# abort the emit under pipefail; the strict per-rule gate stays with
+# PINNED_LEF_RESIDUALS in tests/drt.rs.
+case "${DESIGN}" in
+    picorv32) SELF_DRC_TOL=3 ;;
+    *) SELF_DRC_TOL=0 ;;
+esac
+
 "${GRUS}" drt \
     --tlef "${PDK_TLEF}" --lef "${PDK_LEF}" \
     --def "${D}/${DESIGN}.placed.def" \
     --guide "${D}/${DESIGN}.guide" \
     --out-def "${OUT_DEF}" \
     --reference "${D}/${DESIGN}.drt.reference.json" \
-    --self-drc | tee "${RUN_DIR}/${DESIGN}.drt.ours.log"
+    --self-drc-tolerance "${SELF_DRC_TOL}" | tee "${RUN_DIR}/${DESIGN}.drt.ours.log"
 
 SHA="$(shasum -a 256 "${OUT_DEF}" | cut -d' ' -f1)"
 echo "OURS-SHA ${SHA}"
@@ -93,7 +106,7 @@ if [ "${VERIFY}" = "1" ]; then
         --guide "${D}/${DESIGN}.guide" \
         --out-def "${RERUN_DEF}" \
         --reference "${D}/${DESIGN}.drt.reference.json" \
-        --self-drc | tee "${RUN_DIR}/${DESIGN}.drt.ours.rerun.log"
+        --self-drc-tolerance "${SELF_DRC_TOL}" | tee "${RUN_DIR}/${DESIGN}.drt.ours.rerun.log"
     if cmp -s "${OUT_DEF}" "${RERUN_DEF}"; then
         echo "OURS-DETERMINISTIC ${SHA}"
     else

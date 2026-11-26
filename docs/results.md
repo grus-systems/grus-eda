@@ -10497,3 +10497,66 @@ byte-identical).
 - **Library-quiet**: the engine gains zero `eprintln!` — the only maze.rs stderr writes remain behind `GRUS_DRT_TIMING` (pre-existing). `route_nets` delegates with `None`; the sink lives in `main.rs` only.
 - **Hook test**: `test_route_nets_progress_hook` on the `maze_db` fixture (n1/n2 route, n3 `Unattachable` — 8 iterations) asserts one event per attempt, per-iteration `done = 1..=queued`, last-event `unrouted == attempted - routed` joining `IterStat`, and hooked `RouteDb` == unhooked `RouteDb`. Fail-proof run: `unrouted: 999` in the emit hunk turns the test red; restored.
 - **Checks run**: `cargo test --workspace --profile verify` (all green; 3 `#[ignore]`d picorv32 legs), `cargo clippy --workspace --all-targets -- -D warnings` clean.
+### 2026-11-27 — drt-selfdrc-exit: emitted-DEF self-DRC gates the `drt` exit code (v0.14.0)
+
+External review S2-1: `routed=N` + exit 0 could be read as "the emit
+is clean" while self-DRC was opt-in (`--self-drc`) and its findings
+never reached the exit code. Self-DRC is now **default-on**: the
+`Drt` arm re-parses `args.out_def`, assembles, and `run_all`s the
+50-rule `lef_expressible` subset right after `write_routed_def`;
+`--self-drc`/`--no-self-drc` form a clap `overrides_with` pair (last
+flag wins — `generate_drt_ours.sh`'s `--self-drc` spelling stays
+valid), and `--self-drc-tolerance N` (default 0, `conflicts_with
+--no-self-drc`) is the named-residual budget. The arm exits 1 via
+`anyhow::bail!` when `findings_total > tolerance` — after the DEF is
+written and `wrote routed DEF to …` prints, so the artifact is
+preserved and only the verdict fails. Census ordering: a new
+`self_drc_verdict <CLEAN | VIOLATIONS findings=N tolerance=T |
+TOLERATED findings=N tolerance=T | SKIPPED (--no-self-drc; routed=
+counts connectivity, not DRC)>` line prints directly beneath
+`guided=`, followed by the `self_drc` findings block and the
+`preemit_check` block (both moved ahead of `iter_progress=`); the
+`guided=` line itself is byte-identical (`check_drt_ours.sh`'s
+anchored regex unaffected). The `preemit_check scope:` line's "until
+drt-selfdrc-exit lands" clause is rewritten — report-only stays its
+contract. `unrouted>0` still exits 0 (named census, not a violation
+gate — D6). `RouteOutcome::RoutedWithFindings` was rejected: the
+findings are a property of the emitted text composed at the CLI
+layer, not engine state (D5).
+
+- **Our Command**: `cargo test --profile verify -p grus-eda --bin
+  grus-eda cli_drt` — `cli_drt_parses` (extended: the
+  overrides-with pair both directions, `--self-drc-tolerance 3`
+  parses, `--no-self-drc --self-drc-tolerance 3` is a clap error)
+  and the new `cli_drt_selfdrc_gates_exit`, four `run(Cli)` arms on
+  real sky130 PDK + committed gcd inputs, 34.65 s total:
+  - clean arm (defaults, occ enabled) → `Ok` — `self_drc_verdict
+    CLEAN`, `findings_total=0`, and `unrouted=80` does not trip the
+    gate;
+  - injected arm `--occ disabled` → `Err("self_drc findings_total=86
+    exceeds --self-drc-tolerance 0 — …")` — the parsed count 86 is
+    asserted > 0 so a silently-zero checker fails the test too; the
+    `--out-def` artifact exists after the failure (emit preserved);
+  - tolerated arm `--occ disabled --self-drc-tolerance 1000000` →
+    `Ok` (`self_drc_verdict TOLERATED findings=86 tolerance=1000000`);
+  - skipped arm `--occ disabled --no-self-drc` → `Ok`
+    (`self_drc_verdict SKIPPED`).
+- **Prove-it-red** (AGENTS §7.7): with the `bail!` disabled, the
+  injected arm went red — `run` returned `Ok` where `Err` was
+  asserted ("self-DRC findings must fail the run"); restored and
+  re-verified green.
+- **Script**: `generate_drt_ours.sh` gains a per-design
+  `--self-drc-tolerance` (picorv32=3 — the pinned emit-visible
+  `met1.2` residual, `docs/e6-drt.md` §9; else 0) on both the emit
+  and `--verify` invocations; without it picorv32 generation aborts
+  under `pipefail`. `check_drt_ours.sh` needs no edit — its step-E
+  keep-list prefix `self_drc` already catches `self_drc_verdict`.
+- **Known follow-up**: the committed `*.drt.ours.reference.json`
+  `ours_router.cli_lines` go stale in order and content (new
+  `self_drc_verdict` line + relocated `self_drc`/`preemit_check`
+  blocks) until the next `check_drt_ours.sh` container regeneration;
+  the census *numbers* (`routed`, `unrouted_count`, …) are parsed by
+  anchored regexes and unchanged.
+- **Checks run** (E0 rule 9): `cargo test --workspace --profile
+  verify` (all green; 3 `#[ignore]`d picorv32 legs), `cargo clippy
+  --workspace --all-targets -- -D warnings` clean.
