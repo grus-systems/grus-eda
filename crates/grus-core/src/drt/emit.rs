@@ -12,6 +12,8 @@
 
 use crate::congestion::guide::guide_net_name;
 use crate::design_db::{DesignDb, NetGeom, PdnVia};
+use crate::drc::geom::assemble;
+use crate::drc::report::{SubsetReport, run_all};
 use crate::drt::graph::RouteGraphs;
 use crate::drt::maze::{RouteDb, ViaPlace, WireSeg};
 use crate::drt::via::ViaTable;
@@ -191,6 +193,21 @@ fn place_via(
         x_dbu: vp.x,
         y_dbu: vp.y,
     })
+}
+
+/// The 50-rule `lef_expressible` subset over the in-memory emit shape
+/// set — the same `assemble` input `--self-drc` builds from the
+/// re-parsed DEF, run here after `apply_routes` has filled
+/// `db.net_geoms` and before `write_routed_def`, so a violation in the
+/// committed geometry is detected before it reaches a file.
+///
+/// Same claim boundary as every subset run (`docs/e7-drc.md` §12):
+/// `IoPort` rects — the foreign-pin class the maze occupancy
+/// soft-prices — are checkable endpoints; `MacroPin`/`MacroObs` join
+/// connectivity islands but never generate findings.
+pub fn preemit_check(db: &DesignDb, tech: &TechDb) -> Result<SubsetReport> {
+    let design = assemble(db, tech)?;
+    Ok(run_all(&design, tech, &db.strings))
 }
 
 /// Byte offset where `section` (`"NETS "`, `"END NETS"`) starts at a

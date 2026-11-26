@@ -10325,3 +10325,63 @@ gitignored and the verdict change only adds blocking where the
 old run silently committed; a divergence there would surface as
 `pin_collision` census lines on its next `#[ignore]`d run, which
 the conditional print makes visible by construction.
+### 2026-11-26 — drt-preemit-spacing: 50-rule subset over the in-memory emit shape set (v0.12.14)
+
+External review S1: `emit.rs` wrote routed DEF with no geometric
+check at the emit boundary — `--self-drc` is opt-in and post-emit.
+`emit::preemit_check` runs the identical toolchain — `drc::geom::assemble`
++ `drc::report::run_all`, no third geometry engine — on `design_db`
+between `apply_routes` (which commits `route_db` into `db.net_geoms`)
+and `write_routed_def`, wired as the opt-in `--preemit-check` flag.
+Detection precedes the write; findings print in the census's
+findings section through the same `print_subset_findings` helper
+`self_drc` now uses (identical rule names and finding lines —
+`self_drc` output stays byte-identical), followed by a `preemit_check
+scope:` line that names the report-only gap every run.
+
+**Clean gcd** (`test_preemit_gcd`, release): `findings_total=0` —
+mirrors the `--self-drc` bar — over nonzero coverage (all four
+checked families report `candidates > 0`), deterministic across a
+double run, `IoPort` shapes present in the assembled set. The
+load-bearing assert: `preemit_check(&db) == self_drc(write(db))`
+verbatim — rules, candidates, bounds and findings all equal, so the
+checked set *is* the emitted set (AGENTS §7.2, tested not prose).
+CLI sanity run (`drt ... --preemit-check --self-drc`, gcd, run
+2026-11-26): `preemit_check findings_total=0` then `self_drc
+findings_total=0`, DEF written, exit 0.
+
+**Violation fixture** (`test_preemit_foreign_pin`, release): a
+`SignalWire` of net `_000_` injected at a 1-DBU gap to the
+net-tagged `IoPort` rect `[45170,102390,45450,102670]` (met2,
+bound 140) produces `findings_total=3`; the named finding:
+
+    met2.2 [45170,102390,45450,102670] x [45451,102390,45591,102670] gap=(1,0) bound=140 nets=req_msg[0],_000_
+
+— the foreign port is a finding *endpoint* (rect in `bboxes`, port
+net in `nets`), not just present geometry. Sibling findings are the
+inject's own knock-ons (a second met2.2 pair, a met2.6 min-area on
+the injected rect), expected and named.
+
+**Red proof** (E0 rule 7, run 2026-11-26): gating `IoPort` out of
+`spacing.rs`'s `checkable` dropped the port finding — the test went
+red on the pin-rect/net membership assert (`findings_total=2`, only
+the wire×wire pair and the area finding remain). Restored
+byte-identical.
+
+**Named boundaries** (unchanged checker semantics — this ticket is a
+verification net for `drt-pin-collision`, not a new checker):
+`MacroPin`/`MacroObs` join connectivity islands but never generate
+findings — the in-hull adjacency class stays the documented
+under-report vs Magic (`docs/e7-drc.md` §12); distance-0 overlaps
+are `touching_ok`-exempt, so committed wire×pin *overlaps* remain
+`RouteDb.pin_collisions` territory; findings do not gate the write
+or the exit code — the findings→exit contract belongs to
+`drt-selfdrc-exit` (not landed) and the `preemit_check scope:` line
+says so in every run.
+
+**What ran** (E0 rule 9): `cargo test --workspace --profile verify`
+— 557 lib + 18 drc + 30 drt (3 `#[ignore]`d picorv32 legs) +
+2 irdrop + 7 grus-eda, all green; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; both new tests release-green;
+the red-proof above; the gcd CLI run above. picorv32 not run —
+`emit_leg` ≈ 135 min release; the gcd pair covers the mechanism.
