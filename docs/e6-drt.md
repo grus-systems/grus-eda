@@ -712,6 +712,11 @@ cache's byte-identical arcs. Two full runs produce identical
 **Instrumentation**: `GRUS_DRT_TIMING` (any value) makes `route_nets`
 print premark/topo/per-iteration/per-slow-net timings to stderr —
 opt-in, zero cost unset; it feeds `docs/results.md` runtime evidence.
+Separately, `route_nets_with_progress` emits a `RouteProgress`
+snapshot per attempted net to an opt-in sink; `grus-eda drt` wires
+that sink to stderr and prints `drt: iter N nets k/q unrouted=u
+elapsed=Ts` every 500 nets or 60 s, plus each iteration's last net —
+the supported always-on channel (stdout's census block is untouched).
 
 ## 8. Routed DEF emission
 

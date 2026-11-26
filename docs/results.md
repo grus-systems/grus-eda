@@ -10483,3 +10483,17 @@ name); graph census pins unchanged (`test_graph_census`,
 endpoint tie-breaks did not shift paint on the measured designs);
 routed DEF sha unchanged (`test_e2e_ours_def_deterministic_gcd`
 byte-identical).
+
+### 2026-11-26 — drt-progress: `route_nets` progress hook + `drt` stderr cadence (v0.13.1)
+
+- **Our Command**: `target/release/grus-eda drt --tlef <sky130A nom.tlef> --lef <sky130_fd_sc_hd.lef> --def tests/designs/gcd/gcd.placed.def --guide tests/designs/gcd/gcd.guide --out-def tests/designs/gcd/gcd.drt.ours.routed.def --reference tests/designs/gcd/gcd.drt.reference.json --self-drc` — the `generate_drt_ours.sh gcd` invocation, with `2> tests/designs/gcd/runs/drt-ours/gcd.progress.log | tee tests/designs/gcd/runs/drt-ours/gcd.drt.ours.log` (release build, gcd leg only; picorv32 stays deferred with the ~135 min sequential route).
+- **stderr**: 9 lines — the pre-existing `lef: skipped 35 statements …` reader line plus 8 progress lines, one per rip-up iteration (each iteration under 500 nets / 60 s fires only the iteration-end condition). Sample (observational — `elapsed` is wall time, never a golden):
+
+  ```
+  drt: iter 1 nets 269/269 unrouted=80 elapsed=5s
+  ```
+
+- **stdout contract**: `gcd.drt.ours.routed.def` sha256 `27f7665922c6df0212788f27b73f562d078e5bebdd47446eb1f933a469122aee`, byte-identical to the committed emission (routing untouched by construction — the sink receives a `Copy` `RouteProgress`). The tee'd emit log re-filtered through `check_drt_ours.sh`'s `cli_lines` grammar reproduces all 328 golden `cli_lines` byte-identically except `route_ms` (runtime field, varies every run — pre-existing provenance, not census content). `check_drt_ours.sh` step E not re-run: it requires the LibreLane container and re-derives Magic numbers the routed-DEF-identical sha already pins.
+- **Library-quiet**: the engine gains zero `eprintln!` — the only maze.rs stderr writes remain behind `GRUS_DRT_TIMING` (pre-existing). `route_nets` delegates with `None`; the sink lives in `main.rs` only.
+- **Hook test**: `test_route_nets_progress_hook` on the `maze_db` fixture (n1/n2 route, n3 `Unattachable` — 8 iterations) asserts one event per attempt, per-iteration `done = 1..=queued`, last-event `unrouted == attempted - routed` joining `IterStat`, and hooked `RouteDb` == unhooked `RouteDb`. Fail-proof run: `unrouted: 999` in the emit hunk turns the test red; restored.
+- **Checks run**: `cargo test --workspace --profile verify` (all green; 3 `#[ignore]`d picorv32 legs), `cargo clippy --workspace --all-targets -- -D warnings` clean.

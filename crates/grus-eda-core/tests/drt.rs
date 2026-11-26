@@ -1376,7 +1376,8 @@ fn test_via_edge_fixture() {
 // ---------------------------------------------------------------------------
 
 use grus_eda_core::drt::maze::{
-    FailKind, IterStat, MazeConfig, OccMode, overlap_census, route_digest, route_nets,
+    FailKind, IterStat, MazeConfig, OccMode, RouteProgress, overlap_census, route_digest,
+    route_nets, route_nets_with_progress,
 };
 use grus_eda_core::drt::graph::RouteGraphs;
 
@@ -1691,6 +1692,68 @@ fn test_maze_cases() {
         labels(&r.unrouted[1]),
         vec![("u2/C".to_string(), FailKind::Unattachable)]
     );
+}
+
+/// The progress hook sees one `RouteProgress` per attempted net in
+/// `bad` order, `done` walks `1..=queued` per iteration, and an
+/// iteration's last event carries the `IterStat` failure count.
+/// Hooked and unhooked runs return identical `RouteDb`s — the sink
+/// cannot perturb routing (it holds a `Copy` snapshot, no state
+/// references).
+#[test]
+fn test_route_nets_progress_hook() {
+    let tech = maze_tech();
+    let cfg = MazeConfig::default();
+    let db = maze_db(&tech, false);
+    let tracks = layer_tracks(&db, &tech);
+    // n1 routes straight, n2 routes through a via, n3's u2/C pin is
+    // `Unattachable` — iteration 1 attempts 3 nets, iterations 2..
+    // retry n3 alone until the hard cap.
+    let join = maze_guide(
+        &db,
+        &tech,
+        "n1\n(\n0 0 5000 2000 met1\n)\n\
+         n2\n(\n0 0 5000 5000 met1\n0 0 5000 5000 met2\n)\n\
+         n3\n(\n0 0 5000 5000 met1\n)\n",
+    );
+    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
+    let vias = via_table(&tech, &db).unwrap();
+
+    let mut events = Vec::new();
+    let hooked = route_nets_with_progress(
+        &db,
+        &tech,
+        &tracks,
+        &graphs,
+        &vias,
+        &cfg,
+        Some(&mut |p: RouteProgress| events.push(p)),
+    );
+
+    // One event per attempt, across all iterations.
+    let total: u32 = hooked.iter_stats.iter().map(|s| s.attempted).sum();
+    assert_eq!(events.len() as u32, total);
+    assert!(
+        hooked.iterations > 1,
+        "fixture must exercise rip-up iterations"
+    );
+
+    let mut cursor = 0usize;
+    for (it, stat) in hooked.iter_stats.iter().enumerate() {
+        let group = &events[cursor..cursor + stat.attempted as usize];
+        for (k, ev) in group.iter().enumerate() {
+            assert_eq!(ev.iteration, it as u32 + 1);
+            assert_eq!(ev.done, k as u32 + 1);
+            assert_eq!(ev.queued, stat.attempted);
+        }
+        let last = group.last().unwrap();
+        assert_eq!(last.done, last.queued);
+        assert_eq!(last.unrouted, stat.attempted - stat.routed);
+        cursor += stat.attempted as usize;
+    }
+
+    let plain = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    assert_eq!(hooked, plain);
 }
 
 /// `MAZE_LEF` plus a foreign-hull wall: `w0`'s `SIZE 1.1×5.0` hull
