@@ -21,17 +21,17 @@
 //!
 //! Tests fail loudly on missing inputs — no silent skips.
 
-use grus_core::congestion::guide::{GuideBox, guide_net_name, parse_guides};
-use grus_core::design_db::DesignDb;
-use grus_core::drt::access::{AccessReport, access_points};
-use grus_core::drt::graph::{
+use grus_eda_core::congestion::guide::{GuideBox, guide_net_name, parse_guides};
+use grus_eda_core::design_db::DesignDb;
+use grus_eda_core::drt::access::{AccessReport, access_points};
+use grus_eda_core::drt::graph::{
     GuideJoin, HullMask, build_route_graphs, cell_hull_rect, join_guides, pin_rects,
 };
-use grus_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
-use grus_core::drt::via::{ViaPair, ViaTable, via_table};
-use grus_core::interner::{LayerId, NetId, PinId, StringInterner};
-use grus_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
-use grus_core::tech_db::{LayerDir, RectDbu, TechDb};
+use grus_eda_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
+use grus_eda_core::drt::via::{ViaPair, ViaTable, via_table};
+use grus_eda_core::interner::{LayerId, NetId, PinId, StringInterner};
+use grus_eda_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef_bytes};
+use grus_eda_core::tech_db::{LayerDir, RectDbu, TechDb};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -199,7 +199,7 @@ fn test_access_census() {
 
         println!("== {name} access census ==");
         let member_pins: usize = (0..db.num_nets())
-            .map(|n| db.net_pins(grus_core::interner::NetId(n as u32)).len())
+            .map(|n| db.net_pins(grus_eda_core::interner::NetId(n as u32)).len())
             .sum();
         println!(
             "{name}: member_pins={member_pins} points={} off_track={} no_shapes={}",
@@ -220,7 +220,7 @@ fn test_access_census() {
             covered.insert(ap.pin);
         }
         for n in 0..db.num_nets() {
-            for &p in db.net_pins(grus_core::interner::NetId(n as u32)) {
+            for &p in db.net_pins(grus_eda_core::interner::NetId(n as u32)) {
                 assert!(
                     covered.contains(&p),
                     "{name}: member pin {} has no access point",
@@ -482,7 +482,7 @@ fn test_graph_census() {
         let transit_l = (0..tech.routing_layers.len())
             .find(|&l| !hull.masked(l as u8))
             .map(|l| l as u8);
-        let grid = |r: &grus_core::tech_db::RectDbu, lt: &LayerTracks| -> usize {
+        let grid = |r: &grus_eda_core::tech_db::RectDbu, lt: &LayerTracks| -> usize {
             let nx = lt.tracks_x.partition_point(|&t| t <= r.xh)
                 - lt.tracks_x.partition_point(|&t| t < r.xl);
             let ny = lt.tracks_y.partition_point(|&t| t <= r.yh)
@@ -490,8 +490,8 @@ fn test_graph_census() {
             nx * ny
         };
         let union =
-            |a: grus_core::tech_db::RectDbu, b: grus_core::tech_db::RectDbu| {
-                grus_core::tech_db::RectDbu::new(
+            |a: grus_eda_core::tech_db::RectDbu, b: grus_eda_core::tech_db::RectDbu| {
+                grus_eda_core::tech_db::RectDbu::new(
                     a.xl.min(b.xl),
                     a.yl.min(b.yl),
                     a.xh.max(b.xh),
@@ -520,7 +520,7 @@ fn test_graph_census() {
             if let Some(l) = transit_l
                 && !cover.is_empty()
             {
-                let mut span: Option<grus_core::tech_db::RectDbu> = None;
+                let mut span: Option<grus_eda_core::tech_db::RectDbu> = None;
                 for b in boxes.iter().filter(|b| b.layer.0 == l) {
                     span = Some(match span {
                         None => b.rect,
@@ -1191,7 +1191,7 @@ fn test_via_edge_fixture() {
         let parsed = parse_guides(text, &tech).expect("fixture guide parses");
         join_guides(&db, &tech, &parsed).expect("fixture join")
     };
-    let node_xy = |g: &grus_core::drt::graph::NetGraph, id: u32| {
+    let node_xy = |g: &grus_eda_core::drt::graph::NetGraph, id: u32| {
         let n = g.nodes[id as usize];
         let lt = &tracks[n.layer.0 as usize];
         (lt.tracks_x[n.ix as usize], lt.tracks_y[n.iy as usize])
@@ -1249,7 +1249,7 @@ fn test_via_edge_fixture() {
     let table = via_table(&tech_novia, &db_bare).unwrap();
     assert_eq!(
         table.gaps,
-        vec![grus_core::drt::via::ViaGap {
+        vec![grus_eda_core::drt::via::ViaGap {
             lower: LayerId(0),
             upper: LayerId(1)
         }]
@@ -1261,10 +1261,10 @@ fn test_via_edge_fixture() {
 // Maze router
 // ---------------------------------------------------------------------------
 
-use grus_core::drt::maze::{
+use grus_eda_core::drt::maze::{
     FailKind, IterStat, MazeConfig, OccMode, overlap_census, route_digest, route_nets,
 };
-use grus_core::drt::graph::RouteGraphs;
+use grus_eda_core::drt::graph::RouteGraphs;
 
 /// `load` + `load_guide` + `build_route_graphs` + `via_table` — the
 /// full router input bundle for one placed design.
@@ -1283,7 +1283,7 @@ fn load_routed_inputs(
     // The maze gets one spare layer above each net's topmost guided
     // layer — OBS-sealed pin pockets need it (OpenROAD's routed DEF
     // escapes on the next layer inside the same guide XY).
-    let graphs = grus_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, 1);
+    let graphs = grus_eda_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, 1);
     let vias = via_table(&tech, &db).expect("via_table");
     (tech, db, tracks, join, graphs, vias)
 }
@@ -1478,7 +1478,7 @@ fn test_maze_cases() {
     let n1 = &r.nets[0];
     assert_eq!(
         n1.wires,
-        vec![grus_core::drt::maze::WireSeg {
+        vec![grus_eda_core::drt::maze::WireSeg {
             layer: LayerId(0),
             x1: 1000,
             y1: 1000,
@@ -1505,7 +1505,7 @@ fn test_maze_cases() {
     assert_eq!(n2.connected.len(), 2);
     assert_eq!(
         n2.vias,
-        vec![grus_core::drt::maze::ViaPlace {
+        vec![grus_eda_core::drt::maze::ViaPlace {
             lower: LayerId(0),
             x: 4000,
             y: 3000
@@ -1532,7 +1532,7 @@ fn test_maze_cases() {
     );
     // The emitted intervals — not trust — prove the detour: no met1
     // wire may enter the OBS rect inflated by w/2 + s = 210.
-    let inflated = grus_core::tech_db::RectDbu::new(1500 - 210, 900 - 210, 2500 + 210, 1100 + 210);
+    let inflated = grus_eda_core::tech_db::RectDbu::new(1500 - 210, 900 - 210, 2500 + 210, 1100 + 210);
     for w in &n1.wires {
         let hit = w.x1 < inflated.xh && w.x2 > inflated.xl && w.y1 < inflated.yh && w.y2 > inflated.yl;
         assert!(!hit, "wire {w:?} enters the OBS spacing band");
@@ -1551,7 +1551,7 @@ fn test_maze_cases() {
     let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
     assert!(r.nets.is_empty(), "{:?}", r.nets);
     assert_eq!(r.unrouted.len(), 2, "{:?}", r.unrouted);
-    let labels = |u: &grus_core::drt::maze::UnroutedNet| -> Vec<(String, FailKind)> {
+    let labels = |u: &grus_eda_core::drt::maze::UnroutedNet| -> Vec<(String, FailKind)> {
         u.failed
             .iter()
             .map(|&(p, k)| (pin_label(&db, p), k))
@@ -1588,7 +1588,7 @@ fn test_maze_pin_collision() {
     let vias = via_table(&tech, &db).unwrap();
     // io2's met1 port rect [1900,2100]×[900,1100] inflated by
     // w/2 + s = 210 — the foreign band no committed n1 wire may enter.
-    let band = grus_core::tech_db::RectDbu::new(1690, 690, 2310, 1310);
+    let band = grus_eda_core::tech_db::RectDbu::new(1690, 690, 2310, 1310);
     let n2_guide = "n2\n(\n0 0 5000 5000 met1\n0 0 5000 5000 met2\n)\n";
 
     // Arm A — open guide: the router must find a clean detour (an
@@ -1956,7 +1956,7 @@ fn test_route_digest_covers_iter_stats() {
 fn test_route_digest_covers_pin_collisions() {
     let a = RouteDb::default();
     let mut b = a.clone();
-    b.pin_collisions.push(grus_core::drt::maze::Collision {
+    b.pin_collisions.push(grus_eda_core::drt::maze::Collision {
         a: NetId(1),
         b: NetId(2),
         layer: LayerId(0),
@@ -1971,11 +1971,11 @@ fn test_route_digest_covers_pin_collisions() {
 // Routed DEF emission + self-DRC gate
 // ---------------------------------------------------------------------------
 
-use grus_core::drc::ShapeSrc;
-use grus_core::drc::geom::assemble;
-use grus_core::drc::report::{Family, SubsetReport, run_all};
-use grus_core::drt::emit::{EmitReport, apply_routes, preemit_check, write_routed_def};
-use grus_core::drt::maze::RouteDb;
+use grus_eda_core::drc::ShapeSrc;
+use grus_eda_core::drc::geom::assemble;
+use grus_eda_core::drc::report::{Family, SubsetReport, run_all};
+use grus_eda_core::drt::emit::{EmitReport, apply_routes, preemit_check, write_routed_def};
+use grus_eda_core::drt::maze::RouteDb;
 
 /// Route `name` and apply the result into `db.net_geoms` — the shared
 /// emit leg (gcd routes in seconds; picorv32 legs live under

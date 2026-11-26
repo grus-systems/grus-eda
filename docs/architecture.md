@@ -122,7 +122,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 ---
 
-## 4. Core Data Structures (`grus-core`)
+## 4. Core Data Structures (`grus-eda-core`)
 
 ### 4.1 Typed Indices & String Interner (`interner.rs`)
 

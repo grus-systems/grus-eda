@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 fn load_lef_tech_db(
     tlef: &Path,
     lef: &Path,
-    interner: &mut grus_core::interner::StringInterner,
-) -> anyhow::Result<grus_core::tech_db::TechDb> {
-    let (tech_db, report) = grus_core::readers::load_tech_db(tlef, lef, interner)?;
+    interner: &mut grus_eda_core::interner::StringInterner,
+) -> anyhow::Result<grus_eda_core::tech_db::TechDb> {
+    let (tech_db, report) = grus_eda_core::readers::load_tech_db(tlef, lef, interner)?;
     print_lef_skip_summary(&report);
     Ok(tech_db)
 }
 
-fn print_lef_skip_summary(report: &grus_core::readers::LefSkipReport) {
+fn print_lef_skip_summary(report: &grus_eda_core::readers::LefSkipReport) {
     if report.skipped.is_empty() {
         return;
     }
@@ -501,11 +501,11 @@ struct DrcClaim {
 impl DrcClaim {
     fn pinned() -> Self {
         Self {
-            implemented_rules: grus_core::drc::report::IMPLEMENTED_RULES,
-            implemented_statements: grus_core::drc::report::IMPLEMENTED_STATEMENTS,
-            deck_statements: grus_core::drc::report::DECK_STATEMENTS,
-            deck_unique_names: grus_core::drc::report::DECK_UNIQUE_NAMES,
-            magic_only_statements: grus_core::drc::report::MAGIC_ONLY_STATEMENTS,
+            implemented_rules: grus_eda_core::drc::report::IMPLEMENTED_RULES,
+            implemented_statements: grus_eda_core::drc::report::IMPLEMENTED_STATEMENTS,
+            deck_statements: grus_eda_core::drc::report::DECK_STATEMENTS,
+            deck_unique_names: grus_eda_core::drc::report::DECK_UNIQUE_NAMES,
+            magic_only_statements: grus_eda_core::drc::report::MAGIC_ONLY_STATEMENTS,
         }
     }
 }
@@ -553,7 +553,7 @@ struct DrcJsonReport<'a> {
     input_def: String,
     claim_boundary: String,
     claim: DrcClaim,
-    rules: &'a [grus_core::drc::report::RuleOutcome],
+    rules: &'a [grus_eda_core::drc::report::RuleOutcome],
     reference: Option<DrcJsonReference>,
     runtime_ms: DrcRuntime,
 }
@@ -562,7 +562,7 @@ struct DrcJsonReport<'a> {
 struct DrcJsonReference {
     path: String,
     magic_total: u64,
-    deltas: Vec<grus_core::drc::report::RuleDelta>,
+    deltas: Vec<grus_eda_core::drc::report::RuleDelta>,
     unclaimed: Vec<DrcUnclaimed>,
 }
 
@@ -579,22 +579,22 @@ struct DrcRuntime {
     check: f64,
 }
 
-fn drc_family_name(f: grus_core::drc::report::Family) -> &'static str {
+fn drc_family_name(f: grus_eda_core::drc::report::Family) -> &'static str {
     match f {
-        grus_core::drc::report::Family::Width => "width",
-        grus_core::drc::report::Family::Spacing => "spacing",
-        grus_core::drc::report::Family::Enclosure => "enclosure",
-        grus_core::drc::report::Family::Area => "area",
-        grus_core::drc::report::Family::Hole => "hole",
+        grus_eda_core::drc::report::Family::Width => "width",
+        grus_eda_core::drc::report::Family::Spacing => "spacing",
+        grus_eda_core::drc::report::Family::Enclosure => "enclosure",
+        grus_eda_core::drc::report::Family::Area => "area",
+        grus_eda_core::drc::report::Family::Hole => "hole",
     }
 }
 
 /// One finding line: the offending `[xl,yl,xh,yh]` DBU bboxes plus the
 /// measured quantity — the per-shape list a later `drc listall`
 /// comparison consumes.
-fn drc_finding_line(rule: &str, f: &grus_core::drc::report::Finding) -> String {
-    use grus_core::drc::report::Measured;
-    let rect = |r: &grus_core::tech_db::RectDbu| {
+fn drc_finding_line(rule: &str, f: &grus_eda_core::drc::report::Finding) -> String {
+    use grus_eda_core::drc::report::Measured;
+    let rect = |r: &grus_eda_core::tech_db::RectDbu| {
         format!("[{},{},{},{}]", r.xl, r.yl, r.xh, r.yh)
     };
     let nets = if f.nets.is_empty() {
@@ -634,7 +634,7 @@ fn drc_finding_line(rule: &str, f: &grus_core::drc::report::Finding) -> String {
 /// The per-rule findings block both `drt` subset checks print through —
 /// identical rule names and finding lines for `preemit_check` and
 /// `self_drc`.
-fn print_subset_findings(tag: &str, subset: &grus_core::drc::report::SubsetReport) {
+fn print_subset_findings(tag: &str, subset: &grus_eda_core::drc::report::SubsetReport) {
     let findings_total: usize = subset.rules.iter().map(|o| o.findings.len()).sum();
     println!("{tag} findings_total={findings_total}");
     for o in &subset.rules {
@@ -735,8 +735,8 @@ struct DrtArgs {
 /// Shared load path of the `congestion` and `route` arms: tech + placed DEF
 /// plus the `--layer-adjust`/`--gcell-tracks` mapping.
 struct CongestionInputs {
-    tech_db: grus_core::tech_db::TechDb,
-    design_db: grus_core::design_db::DesignDb,
+    tech_db: grus_eda_core::tech_db::TechDb,
+    design_db: grus_eda_core::design_db::DesignDb,
     layer_adjustments: Option<Vec<f32>>,
     gcell_tracks_override: Option<i32>,
     elapsed_load_ms: f64,
@@ -750,12 +750,12 @@ fn load_congestion_inputs(
     gcell_tracks: Option<u32>,
 ) -> anyhow::Result<CongestionInputs> {
     println!("Loading technology from {:?} and {:?}", tlef, lef);
-    let mut interner = grus_core::interner::StringInterner::new();
+    let mut interner = grus_eda_core::interner::StringInterner::new();
     let t_load = std::time::Instant::now();
     let (tech_db, design_db) = {
-        let _p = grus_core::timing::phase("cong.load");
+        let _p = grus_eda_core::timing::phase("cong.load");
         let tech_db = load_lef_tech_db(tlef, lef, &mut interner)?;
-        let design_db = grus_core::readers::parse_def(def, &tech_db, None)?;
+        let design_db = grus_eda_core::readers::parse_def(def, &tech_db, None)?;
         (tech_db, design_db)
     };
     let elapsed_load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
@@ -777,8 +777,8 @@ fn load_congestion_inputs(
 
 fn print_congestion_summary(
     loaded: &CongestionInputs,
-    grid: &grus_core::congestion::GCellGrid,
-    report: &grus_core::congestion::CongestionReport,
+    grid: &grus_eda_core::congestion::GCellGrid,
+    report: &grus_eda_core::congestion::CongestionReport,
     elapsed_route_ms: f64,
 ) {
     let total_cap: f32 = grid.h_cap.iter().sum::<f32>() + grid.v_cap.iter().sum::<f32>();
@@ -806,7 +806,7 @@ fn print_congestion_summary(
 
 /// `cell/pin` for instance pins, the bare port name for io pins —
 /// the label the emit census prints (`fail`, `stub_outside_cover`).
-fn pin_label(db: &grus_core::design_db::DesignDb, pin: grus_core::interner::PinId) -> String {
+fn pin_label(db: &grus_eda_core::design_db::DesignDb, pin: grus_eda_core::interner::PinId) -> String {
     let i = pin.0 as usize;
     let pname = db.strings.resolve(db.pin_names[i]);
     match db.pin_cells[i] {
@@ -841,7 +841,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::CheckE0(args) => {
             println!("Loading Liberty from {:?}", args.lib);
             let t0 = std::time::Instant::now();
-            let lib_db = grus_core::readers::load_liberty(&args.lib)?;
+            let lib_db = grus_eda_core::readers::load_liberty(&args.lib)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let ff_count = lib_db.cells.iter().filter(|c| c.is_sequential).count();
             let latch_count = lib_db.cells.iter().filter(|c| c.is_latch).count();
@@ -866,7 +866,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if let (Some(tlef_path), Some(lef_path)) = (&args.tlef, &args.lef) {
                 println!("Loading LEF from {:?} and {:?}", tlef_path, lef_path);
                 let t_lef = std::time::Instant::now();
-                let mut interner = grus_core::interner::StringInterner::new();
+                let mut interner = grus_eda_core::interner::StringInterner::new();
                 let tech_db = load_lef_tech_db(tlef_path, lef_path, &mut interner)?;
                 let elapsed_lef_ms = t_lef.elapsed().as_secs_f64() * 1000.0;
                 println!(
@@ -885,7 +885,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     println!("Loading Yosys JSON netlist from {:?}", json_path);
                     let t_json = std::time::Instant::now();
                     let db_json =
-                        grus_core::readers::parse_yosys_json(json_path, &tech_db, Some(&lib_db))?;
+                        grus_eda_core::readers::parse_yosys_json(json_path, &tech_db, Some(&lib_db))?;
                     check_top_name(args.top.as_deref(), "Yosys JSON", &db_json.design_name)?;
                     let elapsed_json_ms = t_json.elapsed().as_secs_f64() * 1000.0;
                     println!(
@@ -901,7 +901,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 if let Some(v_path) = &args.verilog {
                     println!("Loading Verilog netlist from {:?}", v_path);
                     let t_v = std::time::Instant::now();
-                    let db_v = grus_core::readers::parse_verilog(v_path, &tech_db, Some(&lib_db))?;
+                    let db_v = grus_eda_core::readers::parse_verilog(v_path, &tech_db, Some(&lib_db))?;
                     check_top_name(args.top.as_deref(), "Verilog", &db_v.design_name)?;
                     let elapsed_v_ms = t_v.elapsed().as_secs_f64() * 1000.0;
                     println!(
@@ -917,7 +917,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 if let Some(def_path) = &args.def {
                     println!("Loading DEF from {:?}", def_path);
                     let t_def = std::time::Instant::now();
-                    let db_def = grus_core::readers::parse_def(def_path, &tech_db, Some(&lib_db))?;
+                    let db_def = grus_eda_core::readers::parse_def(def_path, &tech_db, Some(&lib_db))?;
                     check_top_name(args.top.as_deref(), "DEF", &db_def.design_name)?;
                     let hpwl_dbu = db_def.compute_hpwl_dbu(&tech_db);
                     let elapsed_def_ms = t_def.elapsed().as_secs_f64() * 1000.0;
@@ -945,7 +945,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 args.gcell_tracks,
             )?;
             let t_route = std::time::Instant::now();
-            let (grid, report) = grus_core::congestion::estimate_congestion(
+            let (grid, report) = grus_eda_core::congestion::estimate_congestion(
                 &loaded.design_db,
                 &loaded.tech_db,
                 loaded.layer_adjustments.as_deref(),
@@ -958,8 +958,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if args.heatmap {
                 print_heatmap(grid.nx, grid.ny, &report.gcell_usage_ratio);
             }
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
         Commands::Route(args) => {
@@ -971,20 +971,20 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 args.gcell_tracks,
             )?;
             let t_route = std::time::Instant::now();
-            let routed = grus_core::congestion::route_design(
+            let routed = grus_eda_core::congestion::route_design(
                 &loaded.design_db,
                 &loaded.tech_db,
                 loaded.layer_adjustments.as_deref(),
                 loaded.gcell_tracks_override,
             );
-            let guides = grus_core::congestion::build_guides(
+            let guides = grus_eda_core::congestion::build_guides(
                 &loaded.design_db,
                 &loaded.tech_db,
                 &routed,
             );
             let box_count: usize = guides.iter().map(|g| g.boxes.len()).sum();
             let mut out = std::io::BufWriter::new(std::fs::File::create(&args.guide_out)?);
-            grus_core::congestion::write_guides(
+            grus_eda_core::congestion::write_guides(
                 &mut out,
                 &loaded.design_db,
                 &loaded.tech_db,
@@ -1001,24 +1001,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 box_count,
                 args.guide_out
             );
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
         Commands::Floorplan(args) => {
             if args.json.is_some() == args.verilog.is_some() {
                 anyhow::bail!("floorplan needs exactly one of --json or --verilog");
             }
-            let mut interner = grus_core::interner::StringInterner::new();
+            let mut interner = grus_eda_core::interner::StringInterner::new();
             let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
             let lib_db = match &args.lib {
-                Some(path) => Some(grus_core::readers::load_liberty(path)?),
+                Some(path) => Some(grus_eda_core::readers::load_liberty(path)?),
                 None => None,
             };
             let mut db = if let Some(json_path) = &args.json {
-                grus_core::readers::parse_yosys_json(json_path, &tech_db, lib_db.as_ref())?
+                grus_eda_core::readers::parse_yosys_json(json_path, &tech_db, lib_db.as_ref())?
             } else {
-                grus_core::readers::parse_verilog(
+                grus_eda_core::readers::parse_verilog(
                     args.verilog.as_ref().unwrap(),
                     &tech_db,
                     lib_db.as_ref(),
@@ -1048,11 +1048,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             .map_err(|e| anyhow::anyhow!("--die-area: bad number {p:?}: {e}"))?;
                         v[i] = to_dbu(um, "--die-area")?;
                     }
-                    Some(grus_core::tech_db::RectDbu::new(v[0], v[1], v[2], v[3]))
+                    Some(grus_eda_core::tech_db::RectDbu::new(v[0], v[1], v[2], v[3]))
                 }
                 None => None,
             };
-            let spec = grus_core::floorplan::FloorplanSpec {
+            let spec = grus_eda_core::floorplan::FloorplanSpec {
                 die_area,
                 utilization: args.utilization.unwrap_or(0.60),
                 margin_dbu: to_dbu(args.margin_um, "--margin")?,
@@ -1061,8 +1061,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     .clone()
                     .unwrap_or_else(|| tech_db.site_name.clone()),
             };
-            grus_core::floorplan::generate_floorplan(&mut db, &tech_db, &spec)?;
-            grus_core::readers::write_def_full(&db, &tech_db, &args.out)?;
+            grus_eda_core::floorplan::generate_floorplan(&mut db, &tech_db, &spec)?;
+            grus_eda_core::readers::write_def_full(&db, &tech_db, &args.out)?;
             println!(
                 "Floorplan: design={}, cells={}, nets={}, io_pins={}, die={}x{} dbu, rows={}, site={}, wrote {:?}",
                 db.design_name,
@@ -1078,10 +1078,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Place(args) => {
             println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
-            let mut interner = grus_core::interner::StringInterner::new();
+            let mut interner = grus_eda_core::interner::StringInterner::new();
             let t_load = std::time::Instant::now();
             let tech_db = load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?;
-            let mut design_db = grus_core::readers::parse_def(&args.def, &tech_db, None)?;
+            let mut design_db = grus_eda_core::readers::parse_def(&args.def, &tech_db, None)?;
             let elapsed_load = t_load.elapsed().as_secs_f64() * 1000.0;
             let movable_count = design_db
                 .cell_status
@@ -1090,12 +1090,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .filter(|&(&status, &macro_id)| {
                     matches!(
                         status,
-                        grus_core::design_db::PlacementStatus::Unplaced
-                            | grus_core::design_db::PlacementStatus::Placed
+                        grus_eda_core::design_db::PlacementStatus::Unplaced
+                            | grus_eda_core::design_db::PlacementStatus::Placed
                     ) && matches!(
                         tech_db.macros[macro_id.0 as usize].class,
-                        grus_core::tech_db::MacroClass::Core
-                            | grus_core::tech_db::MacroClass::CoreTie
+                        grus_eda_core::tech_db::MacroClass::Core
+                            | grus_eda_core::tech_db::MacroClass::CoreTie
                     )
                 })
                 .count();
@@ -1114,13 +1114,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 "Running global placement (target density: {:.2})...",
                 args.target_density
             );
-            let config = grus_core::placement::NesterovConfig {
+            let config = grus_eda_core::placement::NesterovConfig {
                 target_density: args.target_density,
                 ..Default::default()
             };
             let t_gp = std::time::Instant::now();
             let gp_res =
-                grus_core::placement::run_nesterov_placement(&design_db, &tech_db, &config);
+                grus_eda_core::placement::run_nesterov_placement(&design_db, &tech_db, &config);
             let elapsed_gp = t_gp.elapsed().as_secs_f64() * 1000.0;
             if gp_res.converged {
                 println!(
@@ -1149,7 +1149,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // Detailed Placement (Abacus Legalization + Local Refinement)
             println!("Running legalization and detailed placement refinement...");
             let t_leg = std::time::Instant::now();
-            let leg_res = grus_core::placement::legalize_placement(
+            let leg_res = grus_eda_core::placement::legalize_placement(
                 &mut design_db,
                 &tech_db,
                 &gp_res.cell_x_um,
@@ -1171,8 +1171,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             println!("Writing placed DEF to {:?}", args.out_def);
             let t_write = std::time::Instant::now();
             {
-                let _p = grus_core::timing::phase("place.write");
-                grus_core::readers::write_def(&design_db, &tech_db, &args.def, &args.out_def)?;
+                let _p = grus_eda_core::timing::phase("place.write");
+                grus_eda_core::readers::write_def(&design_db, &tech_db, &args.def, &args.out_def)?;
             }
             let elapsed_write = t_write.elapsed().as_secs_f64() * 1000.0;
             println!(
@@ -1180,8 +1180,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 elapsed_write,
                 elapsed_gp + elapsed_leg
             );
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
         Commands::Sta(args) => {
@@ -1198,29 +1198,29 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 ),
             };
             let lib_db = {
-                let _p = grus_core::timing::phase("sta.load.liberty");
-                grus_core::readers::load_liberty(&args.lib)?
+                let _p = grus_eda_core::timing::phase("sta.load.liberty");
+                grus_eda_core::readers::load_liberty(&args.lib)?
             };
             let lib_hold_db = match &args.lib_hold {
                 Some(path) => {
-                    let _p = grus_core::timing::phase("sta.load.liberty");
-                    Some(grus_core::readers::load_liberty(path)?)
+                    let _p = grus_eda_core::timing::phase("sta.load.liberty");
+                    Some(grus_eda_core::readers::load_liberty(path)?)
                 }
                 None => None,
             };
-            let mut interner = grus_core::interner::StringInterner::new();
+            let mut interner = grus_eda_core::interner::StringInterner::new();
             let tech_db = {
-                let _p = grus_core::timing::phase("sta.load.lef");
+                let _p = grus_eda_core::timing::phase("sta.load.lef");
                 load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
             };
             let design = {
-                let _p = grus_core::timing::phase("sta.load.def");
-                grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
+                let _p = grus_eda_core::timing::phase("sta.load.def");
+                grus_eda_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
             };
             let design_hold = match &lib_hold_db {
                 Some(lib) => {
-                    let _p = grus_core::timing::phase("sta.load.def");
-                    Some(grus_core::readers::parse_def(
+                    let _p = grus_eda_core::timing::phase("sta.load.def");
+                    Some(grus_eda_core::readers::parse_def(
                         &args.def,
                         &tech_db,
                         Some(lib),
@@ -1229,47 +1229,47 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None => None,
             };
             let sdc = {
-                let _p = grus_core::timing::phase("sta.load.sdc");
-                grus_core::sta::load_sdc(&args.sdc)?
+                let _p = grus_eda_core::timing::phase("sta.load.sdc");
+                grus_eda_core::sta::load_sdc(&args.sdc)?
             };
             let t0 = std::time::Instant::now();
-            let compute_parasitics = |d: &grus_core::design_db::DesignDb| -> anyhow::Result<Option<grus_core::sta::NetParasitics>> {
+            let compute_parasitics = |d: &grus_eda_core::design_db::DesignDb| -> anyhow::Result<Option<grus_eda_core::sta::NetParasitics>> {
                 match (mode, &args.spef) {
                     ("placement RC", _) => {
-                        let _p = grus_core::timing::phase("sta.parasitics");
-                        let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
-                        Ok(Some(grus_core::sta::estimate_placement_parasitics(d, &tech_db, rc)))
+                        let _p = grus_eda_core::timing::phase("sta.parasitics");
+                        let rc = grus_eda_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                        Ok(Some(grus_eda_core::sta::estimate_placement_parasitics(d, &tech_db, rc)))
                     }
                     ("guide RC", _) => {
-                        let _p = grus_core::timing::phase("sta.parasitics");
+                        let _p = grus_eda_core::timing::phase("sta.parasitics");
                         match &args.guide {
                             Some(guide_path) => {
-                                let grid = grus_core::congestion::GCellGrid::build(
+                                let grid = grus_eda_core::congestion::GCellGrid::build(
                                     d, &tech_db, None, None,
                                 );
-                                let parsed = grus_core::congestion::parse_guides(
+                                let parsed = grus_eda_core::congestion::parse_guides(
                                     &std::fs::read_to_string(guide_path)?,
                                     &tech_db,
                                 )?;
                                 let net_boxes =
-                                    grus_core::congestion::resolve_guide_nets(d, &parsed)?;
-                                Ok(Some(grus_core::sta::estimate_guide_parasitics(
+                                    grus_eda_core::congestion::resolve_guide_nets(d, &parsed)?;
+                                Ok(Some(grus_eda_core::sta::estimate_guide_parasitics(
                                     d, &tech_db, &grid, &net_boxes,
                                 )))
                             }
                             None => {
                                 // Our guide -> our RC: route internally and feed
                                 // build_guides' boxes through the same builder.
-                                let routed = grus_core::congestion::route_design(
+                                let routed = grus_eda_core::congestion::route_design(
                                     d, &tech_db, None, None,
                                 );
                                 let guides =
-                                    grus_core::congestion::build_guides(d, &tech_db, &routed);
+                                    grus_eda_core::congestion::build_guides(d, &tech_db, &routed);
                                 let net_boxes: Vec<_> = guides
                                     .iter()
                                     .map(|g| (g.net, g.boxes.clone()))
                                     .collect();
-                                Ok(Some(grus_core::sta::estimate_guide_parasitics(
+                                Ok(Some(grus_eda_core::sta::estimate_guide_parasitics(
                                     d, &tech_db, &routed.grid, &net_boxes,
                                 )))
                             }
@@ -1277,11 +1277,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     }
                     (_, Some(spef_path)) => {
                         let spef = {
-                            let _p = grus_core::timing::phase("sta.spef.read");
-                            grus_core::readers::load_spef(spef_path)?
+                            let _p = grus_eda_core::timing::phase("sta.spef.read");
+                            grus_eda_core::readers::load_spef(spef_path)?
                         };
-                        let _p = grus_core::timing::phase("sta.parasitics");
-                        Ok(Some(grus_core::sta::spef_parasitics(d, &spef)?))
+                        let _p = grus_eda_core::timing::phase("sta.parasitics");
+                        Ok(Some(grus_eda_core::sta::spef_parasitics(d, &spef)?))
                     }
                     _ => Ok(None),
                 }
@@ -1305,30 +1305,30 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         "--spef-out needs parasitics: pass --parasitics placement or --spef"
                     );
                 };
-                let _p = grus_core::timing::phase("sta.spef.write");
-                let spef_text = grus_core::sta::write_spef(&design, &lib_db, p)?;
+                let _p = grus_eda_core::timing::phase("sta.spef.write");
+                let spef_text = grus_eda_core::sta::write_spef(&design, &lib_db, p)?;
                 std::fs::write(path, spef_text)?;
                 println!("Wrote SPEF to {:?}", path);
             }
             let report = match (&lib_hold_db, &design_hold, &parasitics_hold) {
                 (Some(hold_lib), Some(hold_design), Some(hold_parasitics)) => {
-                    let setup = grus_core::sta::run_sta_with_paths(
+                    let setup = grus_eda_core::sta::run_sta_with_paths(
                         &design,
                         &lib_db,
                         &sdc,
                         parasitics.as_ref(),
                         args.paths,
                     )?;
-                    let hold = grus_core::sta::run_sta_quiet_with_paths(
+                    let hold = grus_eda_core::sta::run_sta_quiet_with_paths(
                         hold_design,
                         hold_lib,
                         &sdc,
                         Some(hold_parasitics),
                         args.paths,
                     )?;
-                    grus_core::sta::merge_corner_reports(setup, hold)?
+                    grus_eda_core::sta::merge_corner_reports(setup, hold)?
                 }
-                _ => grus_core::sta::run_sta_with_paths(
+                _ => grus_eda_core::sta::run_sta_with_paths(
                     &design,
                     &lib_db,
                     &sdc,
@@ -1382,12 +1382,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             if !report.slack_histogram.is_empty() {
-                let label = |b: grus_core::sta::SlackBucketKind| match b {
-                    grus_core::sta::SlackBucketKind::Negative => "<0",
-                    grus_core::sta::SlackBucketKind::P0To20 => "0-20%",
-                    grus_core::sta::SlackBucketKind::P20To50 => "20-50%",
-                    grus_core::sta::SlackBucketKind::Over50 => ">50%",
-                    grus_core::sta::SlackBucketKind::NoPeriod => "no_period",
+                let label = |b: grus_eda_core::sta::SlackBucketKind| match b {
+                    grus_eda_core::sta::SlackBucketKind::Negative => "<0",
+                    grus_eda_core::sta::SlackBucketKind::P0To20 => "0-20%",
+                    grus_eda_core::sta::SlackBucketKind::P20To50 => "20-50%",
+                    grus_eda_core::sta::SlackBucketKind::Over50 => ">50%",
+                    grus_eda_core::sta::SlackBucketKind::NoPeriod => "no_period",
                 };
                 let parts: Vec<String> = report
                     .slack_histogram
@@ -1404,8 +1404,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("paths (worst {} per corner):", args.paths);
                 for (i, p) in report.critical_paths.iter().enumerate() {
                     let corner = match p.corner {
-                        grus_core::sta::PathCorner::Max => "max",
-                        grus_core::sta::PathCorner::Min => "min",
+                        grus_eda_core::sta::PathCorner::Max => "max",
+                        grus_eda_core::sta::PathCorner::Min => "min",
                     };
                     let launch = p.startpoint_clock.as_deref().unwrap_or("-");
                     let capture = p.capture_clock.as_deref().unwrap_or("-");
@@ -1418,16 +1418,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     );
                     for s in &p.stages {
                         let edge = match s.edge {
-                            grus_core::sta::PathEdge::Clock => "clock",
-                            grus_core::sta::PathEdge::LatchOpen => "latch_open",
-                            grus_core::sta::PathEdge::Port => "port",
-                            grus_core::sta::PathEdge::Pin => "pin",
-                            grus_core::sta::PathEdge::CellArc => "cell_arc",
-                            grus_core::sta::PathEdge::Net => "net",
+                            grus_eda_core::sta::PathEdge::Clock => "clock",
+                            grus_eda_core::sta::PathEdge::LatchOpen => "latch_open",
+                            grus_eda_core::sta::PathEdge::Port => "port",
+                            grus_eda_core::sta::PathEdge::Pin => "pin",
+                            grus_eda_core::sta::PathEdge::CellArc => "cell_arc",
+                            grus_eda_core::sta::PathEdge::Net => "net",
                         };
                         let t = match s.transition {
-                            grus_core::sta::PathTransition::Rise => "^",
-                            grus_core::sta::PathTransition::Fall => "v",
+                            grus_eda_core::sta::PathTransition::Rise => "^",
+                            grus_eda_core::sta::PathTransition::Fall => "v",
                         };
                         println!(
                             "           {:.6} {:+.6} {:<9} {} {}",
@@ -1440,7 +1440,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             if let Some(path) = &args.json {
-                let _p = grus_core::timing::phase("sta.report.json");
+                let _p = grus_eda_core::timing::phase("sta.report.json");
                 let json = serde_json::to_string_pretty(&report)?;
                 std::fs::write(path, json)?;
                 println!("Wrote STA report JSON to {:?}", path);
@@ -1448,8 +1448,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if args.strict && !report.skipped.is_clean() {
                 anyhow::bail!("strict: the run skipped inputs; see the summary above");
             }
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
         Commands::Power(args) => {
@@ -1464,68 +1464,68 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 ),
             };
             let lib_db = {
-                let _p = grus_core::timing::phase("power.load.liberty");
-                grus_core::readers::load_liberty(&args.lib)?
+                let _p = grus_eda_core::timing::phase("power.load.liberty");
+                grus_eda_core::readers::load_liberty(&args.lib)?
             };
-            let mut interner = grus_core::interner::StringInterner::new();
+            let mut interner = grus_eda_core::interner::StringInterner::new();
             let tech_db = {
-                let _p = grus_core::timing::phase("power.load.lef");
+                let _p = grus_eda_core::timing::phase("power.load.lef");
                 load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
             };
             let design = {
-                let _p = grus_core::timing::phase("power.load.def");
-                grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
+                let _p = grus_eda_core::timing::phase("power.load.def");
+                grus_eda_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
             };
             let sdc = {
-                let _p = grus_core::timing::phase("power.load.sdc");
-                grus_core::sta::load_sdc(&args.sdc)?
+                let _p = grus_eda_core::timing::phase("power.load.sdc");
+                grus_eda_core::sta::load_sdc(&args.sdc)?
             };
             let parasitics = match (mode, &args.spef) {
                 ("placement RC", _) => {
-                    let _p = grus_core::timing::phase("power.parasitics");
-                    let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
-                    Some(grus_core::sta::estimate_placement_parasitics(
+                    let _p = grus_eda_core::timing::phase("power.parasitics");
+                    let rc = grus_eda_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                    Some(grus_eda_core::sta::estimate_placement_parasitics(
                         &design, &tech_db, rc,
                     ))
                 }
                 (_, Some(spef_path)) => {
                     let spef = {
-                        let _p = grus_core::timing::phase("power.spef.read");
-                        grus_core::readers::load_spef(spef_path)?
+                        let _p = grus_eda_core::timing::phase("power.spef.read");
+                        grus_eda_core::readers::load_spef(spef_path)?
                     };
-                    let _p = grus_core::timing::phase("power.parasitics");
-                    Some(grus_core::sta::spef_parasitics(&design, &spef)?)
+                    let _p = grus_eda_core::timing::phase("power.parasitics");
+                    Some(grus_eda_core::sta::spef_parasitics(&design, &spef)?)
                 }
                 _ => None,
             };
             let t0 = std::time::Instant::now();
             let pin_slews = {
-                let _p = grus_core::timing::phase("power.slews");
-                grus_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?
+                let _p = grus_eda_core::timing::phase("power.slews");
+                grus_eda_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?
             };
             let annotated = args.vcd.is_some() || args.saif.is_some();
             let (activity, saif_diag) = match (&args.vcd, &args.saif) {
                 (Some(vcd_path), _) => {
-                    let _p = grus_core::timing::phase("power.activity.load");
-                    (grus_core::readers::load_vcd(vcd_path)?, None)
+                    let _p = grus_eda_core::timing::phase("power.activity.load");
+                    (grus_eda_core::readers::load_vcd(vcd_path)?, None)
                 }
                 (None, Some(saif_path)) => {
-                    let _p = grus_core::timing::phase("power.activity.load");
-                    let saif = grus_core::readers::load_saif(saif_path)?;
+                    let _p = grus_eda_core::timing::phase("power.activity.load");
+                    let saif = grus_eda_core::readers::load_saif(saif_path)?;
                     let (activity, diag) =
                         saif.resolve(&design, args.saif_scope.as_deref())?;
                     (activity, Some(diag))
                 }
-                (None, None) => (grus_core::readers::VcdActivity::default(), None),
+                (None, None) => (grus_eda_core::readers::VcdActivity::default(), None),
             };
-            let mut report = grus_core::power::estimate_power(
+            let mut report = grus_eda_core::power::estimate_power(
                 &design,
                 &lib_db,
                 &sdc,
                 parasitics.as_ref(),
                 &activity,
                 &pin_slews,
-                &grus_core::activity::ActivityOverrides::default(),
+                &grus_eda_core::activity::ActivityOverrides::default(),
             );
             if let Some(d) = saif_diag {
                 report.diagnostics.saif_unmatched_scopes = d.unmatched_scopes;
@@ -1615,8 +1615,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 std::fs::write(path, json)?;
                 println!("Wrote power report JSON to {:?}", path);
             }
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
         Commands::Irdrop(args) => {
@@ -1631,66 +1631,66 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 ),
             };
             let lib_db = {
-                let _p = grus_core::timing::phase("irdrop.load.liberty");
-                grus_core::readers::load_liberty(&args.lib)?
+                let _p = grus_eda_core::timing::phase("irdrop.load.liberty");
+                grus_eda_core::readers::load_liberty(&args.lib)?
             };
-            let mut interner = grus_core::interner::StringInterner::new();
+            let mut interner = grus_eda_core::interner::StringInterner::new();
             let tech_db = {
-                let _p = grus_core::timing::phase("irdrop.load.lef");
+                let _p = grus_eda_core::timing::phase("irdrop.load.lef");
                 load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
             };
             let design = {
-                let _p = grus_core::timing::phase("irdrop.load.def");
-                grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
+                let _p = grus_eda_core::timing::phase("irdrop.load.def");
+                grus_eda_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
             };
             let sdc = {
-                let _p = grus_core::timing::phase("irdrop.load.sdc");
-                grus_core::sta::load_sdc(&args.sdc)?
+                let _p = grus_eda_core::timing::phase("irdrop.load.sdc");
+                grus_eda_core::sta::load_sdc(&args.sdc)?
             };
             let parasitics = match (mode, &args.spef) {
                 ("placement RC", _) => {
-                    let _p = grus_core::timing::phase("irdrop.parasitics");
-                    let rc = grus_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
-                    Some(grus_core::sta::estimate_placement_parasitics(
+                    let _p = grus_eda_core::timing::phase("irdrop.parasitics");
+                    let rc = grus_eda_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                    Some(grus_eda_core::sta::estimate_placement_parasitics(
                         &design, &tech_db, rc,
                     ))
                 }
                 (_, Some(spef_path)) => {
                     let spef = {
-                        let _p = grus_core::timing::phase("irdrop.spef.read");
-                        grus_core::readers::load_spef(spef_path)?
+                        let _p = grus_eda_core::timing::phase("irdrop.spef.read");
+                        grus_eda_core::readers::load_spef(spef_path)?
                     };
-                    let _p = grus_core::timing::phase("irdrop.parasitics");
-                    Some(grus_core::sta::spef_parasitics(&design, &spef)?)
+                    let _p = grus_eda_core::timing::phase("irdrop.parasitics");
+                    Some(grus_eda_core::sta::spef_parasitics(&design, &spef)?)
                 }
                 _ => None,
             };
             let pin_slews = {
-                let _p = grus_core::timing::phase("irdrop.slews");
-                grus_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?
+                let _p = grus_eda_core::timing::phase("irdrop.slews");
+                grus_eda_core::sta::sta_pin_slews(&design, &lib_db, &sdc, parasitics.as_ref())?
             };
             let (activity, saif_diag) = match (&args.vcd, &args.saif) {
                 (Some(vcd_path), _) => {
-                    let _p = grus_core::timing::phase("irdrop.activity.load");
-                    (grus_core::readers::load_vcd(vcd_path)?, None)
+                    let _p = grus_eda_core::timing::phase("irdrop.activity.load");
+                    (grus_eda_core::readers::load_vcd(vcd_path)?, None)
                 }
                 (None, Some(saif_path)) => {
-                    let _p = grus_core::timing::phase("irdrop.activity.load");
-                    let saif = grus_core::readers::load_saif(saif_path)?;
+                    let _p = grus_eda_core::timing::phase("irdrop.activity.load");
+                    let saif = grus_eda_core::readers::load_saif(saif_path)?;
                     let (activity, diag) =
                         saif.resolve(&design, args.saif_scope.as_deref())?;
                     (activity, Some(diag))
                 }
-                (None, None) => (grus_core::readers::VcdActivity::default(), None),
+                (None, None) => (grus_eda_core::readers::VcdActivity::default(), None),
             };
-            let mut report = grus_core::power::estimate_power(
+            let mut report = grus_eda_core::power::estimate_power(
                 &design,
                 &lib_db,
                 &sdc,
                 parasitics.as_ref(),
                 &activity,
                 &pin_slews,
-                &grus_core::activity::ActivityOverrides::default(),
+                &grus_eda_core::activity::ActivityOverrides::default(),
             );
             if let Some(d) = saif_diag {
                 report.diagnostics.saif_unmatched_scopes = d.unmatched_scopes;
@@ -1716,14 +1716,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .map_err(|e| anyhow::anyhow!("parse {:?}: {e}", args.reference))?;
 
-            let targets: Vec<&grus_core::design_db::PdnNet> = design
+            let targets: Vec<&grus_eda_core::design_db::PdnNet> = design
                 .pdn_nets
                 .iter()
                 .filter(|n| {
                     matches!(
                         n.use_kind,
-                        Some(grus_core::design_db::PdnUse::Power)
-                            | Some(grus_core::design_db::PdnUse::Ground)
+                        Some(grus_eda_core::design_db::PdnUse::Power)
+                            | Some(grus_eda_core::design_db::PdnUse::Ground)
                     )
                 })
                 .collect();
@@ -1748,8 +1748,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let name = design.strings.resolve(net.name).to_string();
                 let supply = field(embedded(&name)?, &name, "supply_voltage_v")?;
                 match net.use_kind {
-                    Some(grus_core::design_db::PdnUse::Power) => vpwr_supply = Some(supply),
-                    Some(grus_core::design_db::PdnUse::Ground) => vgnd_supply = Some(supply),
+                    Some(grus_eda_core::design_db::PdnUse::Power) => vpwr_supply = Some(supply),
+                    Some(grus_eda_core::design_db::PdnUse::Ground) => vgnd_supply = Some(supply),
                     _ => {}
                 }
             }
@@ -1769,19 +1769,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let name = design.strings.resolve(net.name).to_string();
                 let block = embedded(&name)?;
                 let supply = field(block, &name, "supply_voltage_v")?;
-                let mesh = grus_core::pdn::build_mesh(&design, &tech_db, net)?;
+                let mesh = grus_eda_core::pdn::build_mesh(&design, &tech_db, net)?;
                 let t_solve = std::time::Instant::now();
-                let solve = grus_core::pdn::solve_pdn_net(
+                let solve = grus_eda_core::pdn::solve_pdn_net(
                     &design,
                     net,
                     &mesh,
-                    &grus_core::pdn::SolveOptions {
+                    &grus_eda_core::pdn::SolveOptions {
                         source_voltage_v: supply,
                         current_scale_v,
                     },
                     &cell_power_w,
                 )?;
-                let rows = grus_core::pdn::voltage_rows(&design, &tech_db, &mesh, &solve)?;
+                let rows = grus_eda_core::pdn::voltage_rows(&design, &tech_db, &mesh, &solve)?;
                 let csv_name = format!(
                     "{}.irdrop.voltage.ours.{}.csv",
                     design.design_name,
@@ -1791,11 +1791,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 {
                     let mut out = std::io::BufWriter::new(std::fs::File::create(&csv_path)
                         .map_err(|e| anyhow::anyhow!("create {:?}: {e}", csv_path))?);
-                    grus_core::pdn::write_voltage_csv(&rows, &mut out)?;
+                    grus_eda_core::pdn::write_voltage_csv(&rows, &mut out)?;
                 }
                 let elapsed_ms = t_solve.elapsed().as_secs_f64() * 1000.0;
 
-                let reference = grus_core::pdn::IrDropReference {
+                let reference = grus_eda_core::pdn::IrDropReference {
                     total_power_w: field(block, &name, "total_power_w")?,
                     supply_voltage_v: supply,
                     average_voltage_v: field(block, &name, "average_voltage_v")?,
@@ -1809,7 +1809,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         as u32,
                 };
                 let s = &solve.summary;
-                let deltas = grus_core::pdn::IrDropDeltas {
+                let deltas = grus_eda_core::pdn::IrDropDeltas {
                     total_power_w: s.injected_power_w - reference.total_power_w,
                     total_current_a: s.total_current_a - reference.total_current_a,
                     average_voltage_v: s.average_voltage_v - reference.average_voltage_v,
@@ -1837,7 +1837,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     s.max_source_error_v,
                     elapsed_ms,
                 );
-                net_reports.push(grus_core::pdn::IrDropNetReport {
+                net_reports.push(grus_eda_core::pdn::IrDropNetReport {
                     csv_file: csv_name,
                     csv_rows: rows.len() as u32,
                     elapsed_ms,
@@ -1846,7 +1846,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     deltas: Some(deltas),
                 });
             }
-            let summary = grus_core::pdn::IrDropReport {
+            let summary = grus_eda_core::pdn::IrDropReport {
                 design: design.design_name.clone(),
                 current_scale_v,
                 estimator_total_power_w: report.total_w,
@@ -1857,43 +1857,43 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .join(format!("{}.irdrop.summary.ours.json", design.design_name));
             std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
             println!("Wrote IR-drop summary JSON to {:?}", summary_path);
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
         Commands::Cts(args) => {
-            let mut interner = grus_core::interner::StringInterner::new();
+            let mut interner = grus_eda_core::interner::StringInterner::new();
             let tech_db = {
-                let _p = grus_core::timing::phase("cts.load.lef");
+                let _p = grus_eda_core::timing::phase("cts.load.lef");
                 load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
             };
             let lib_db = {
-                let _p = grus_core::timing::phase("cts.load.liberty");
-                grus_core::readers::load_liberty(&args.lib)?
+                let _p = grus_eda_core::timing::phase("cts.load.liberty");
+                grus_eda_core::readers::load_liberty(&args.lib)?
             };
             let mut design = {
-                let _p = grus_core::timing::phase("cts.load.def");
-                grus_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
+                let _p = grus_eda_core::timing::phase("cts.load.def");
+                grus_eda_core::readers::parse_def(&args.def, &tech_db, Some(&lib_db))?
             };
             let sdc = {
-                let _p = grus_core::timing::phase("cts.load.sdc");
-                grus_core::sta::load_sdc(&args.sdc)?
+                let _p = grus_eda_core::timing::phase("cts.load.sdc");
+                grus_eda_core::sta::load_sdc(&args.sdc)?
             };
             let t0 = std::time::Instant::now();
             let report = {
-                let _p = grus_core::timing::phase("cts.tree");
-                grus_core::cts::run_cts(
+                let _p = grus_eda_core::timing::phase("cts.tree");
+                grus_eda_core::cts::run_cts(
                     &mut design,
                     &tech_db,
                     &lib_db,
                     &sdc,
-                    &grus_core::cts::CtsConfig::default(),
+                    &grus_eda_core::cts::CtsConfig::default(),
                 )?
             };
             let elapsed_cts = t0.elapsed().as_secs_f64() * 1000.0;
             {
-                let _p = grus_core::timing::phase("cts.write.def");
-                grus_core::readers::write_def_full(&design, &tech_db, &args.def_out)?;
+                let _p = grus_eda_core::timing::phase("cts.write.def");
+                grus_eda_core::readers::write_def_full(&design, &tech_db, &args.def_out)?;
             }
             println!(
                 "CTS: design={}, clock={}, buffers={}, depth={}, sinks={}, clock-net HPWL={:.3} um, wrote {:?} ({:.2} ms)",
@@ -1911,34 +1911,34 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 std::fs::write(path, json)?;
                 println!("Wrote CTS report JSON to {:?}", path);
             }
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
         Commands::Drc(args) => {
             println!("Loading technology from {:?} and {:?}", args.tlef, args.lef);
-            let mut interner = grus_core::interner::StringInterner::new();
+            let mut interner = grus_eda_core::interner::StringInterner::new();
             let t_load = std::time::Instant::now();
             let tech_db = {
-                let _p = grus_core::timing::phase("drc.load.lef");
+                let _p = grus_eda_core::timing::phase("drc.load.lef");
                 load_lef_tech_db(&args.tlef, &args.lef, &mut interner)?
             };
             println!("Loading DEF from {:?}", args.def);
             let design_db = {
-                let _p = grus_core::timing::phase("drc.load.def");
-                grus_core::readers::parse_def(&args.def, &tech_db, None)?
+                let _p = grus_eda_core::timing::phase("drc.load.def");
+                grus_eda_core::readers::parse_def(&args.def, &tech_db, None)?
             };
             let elapsed_load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
             let t_asm = std::time::Instant::now();
             let drc_design = {
-                let _p = grus_core::timing::phase("drc.assemble");
-                grus_core::drc::geom::assemble(&design_db, &tech_db)?
+                let _p = grus_eda_core::timing::phase("drc.assemble");
+                grus_eda_core::drc::geom::assemble(&design_db, &tech_db)?
             };
             let elapsed_assemble_ms = t_asm.elapsed().as_secs_f64() * 1000.0;
             let t_check = std::time::Instant::now();
             let report = {
-                let _p = grus_core::timing::phase("drc.check");
-                grus_core::drc::report::run_all(&drc_design, &tech_db, &design_db.strings)
+                let _p = grus_eda_core::timing::phase("drc.check");
+                grus_eda_core::drc::report::run_all(&drc_design, &tech_db, &design_db.strings)
             };
             let elapsed_check_ms = t_check.elapsed().as_secs_f64() * 1000.0;
 
@@ -1954,13 +1954,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .transpose()?;
             let delta = golden
                 .as_ref()
-                .map(|g| grus_core::drc::report::magic_deltas(&report, g))
+                .map(|g| grus_eda_core::drc::report::magic_deltas(&report, g))
                 .transpose()?;
             let claim = match &golden {
                 Some(g) => drc_claim_from_golden(g)?,
                 None => DrcClaim::pinned(),
             };
-            let boundary = grus_core::drc::report::claim_boundary_from(
+            let boundary = grus_eda_core::drc::report::claim_boundary_from(
                 claim.deck_statements,
                 claim.implemented_statements,
                 claim.implemented_rules,
@@ -2048,8 +2048,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 "Runtime: load={:.2}ms assemble={:.2}ms check={:.2}ms",
                 elapsed_load_ms, elapsed_assemble_ms, elapsed_check_ms
             );
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
         Commands::Drt(args) => {
@@ -2059,44 +2059,44 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
             let guide_text = std::fs::read_to_string(&args.guide)
                 .map_err(|e| anyhow::anyhow!("read {:?}: {e}", args.guide))?;
-            let parsed = grus_core::congestion::guide::parse_guides(&guide_text, tech_db)?;
-            let join = grus_core::drt::graph::join_guides(&design_db, tech_db, &parsed)?;
-            let tracks = grus_core::drt::tracks::layer_tracks(&design_db, tech_db);
+            let parsed = grus_eda_core::congestion::guide::parse_guides(&guide_text, tech_db)?;
+            let join = grus_eda_core::drt::graph::join_guides(&design_db, tech_db, &parsed)?;
+            let tracks = grus_eda_core::drt::tracks::layer_tracks(&design_db, tech_db);
             // One spare layer above each net's topmost guided layer —
             // the OBS-sealed pin-pocket escape (`docs/e6-drt.md` §7).
-            let graphs = grus_core::drt::graph::build_route_graphs_ext(
+            let graphs = grus_eda_core::drt::graph::build_route_graphs_ext(
                 &design_db, tech_db, &tracks, &join, 1,
             );
-            let vias = grus_core::drt::via::via_table(tech_db, &design_db)?;
+            let vias = grus_eda_core::drt::via::via_table(tech_db, &design_db)?;
 
             let occ = match args.occ {
-                OccArg::Enabled => grus_core::drt::OccMode::Enabled,
-                OccArg::Disabled => grus_core::drt::OccMode::Disabled,
+                OccArg::Enabled => grus_eda_core::drt::OccMode::Enabled,
+                OccArg::Disabled => grus_eda_core::drt::OccMode::Disabled,
             };
             let t_route = std::time::Instant::now();
-            let route_db = grus_core::drt::maze::route_nets(
+            let route_db = grus_eda_core::drt::maze::route_nets(
                 &design_db,
                 tech_db,
                 &tracks,
                 &graphs,
                 &vias,
-                &grus_core::drt::MazeConfig {
+                &grus_eda_core::drt::MazeConfig {
                     occ,
                     max_iters: args.max_iters,
                 },
             );
             let elapsed_route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
 
-            let report = grus_core::drt::emit::apply_routes(
+            let report = grus_eda_core::drt::emit::apply_routes(
                 &mut design_db, tech_db, &graphs, &route_db, &vias,
             )?;
             // Detection precedes the write: the check runs on the
             // committed `net_geoms`, not the emitted text.
             let preemit = args
                 .preemit_check
-                .then(|| grus_core::drt::emit::preemit_check(&design_db, tech_db))
+                .then(|| grus_eda_core::drt::emit::preemit_check(&design_db, tech_db))
                 .transpose()?;
-            grus_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
+            grus_eda_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
 
             let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
             let notch_fills: usize = route_db.nets.iter().map(|n| n.fills.len()).sum();
@@ -2144,8 +2144,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             for c in &route_db.pin_collisions {
                 println!(
                     "pin_collision {} {} {} line={} iv=[{},{}]",
-                    grus_core::congestion::guide::guide_net_name(&design_db, c.a),
-                    grus_core::congestion::guide::guide_net_name(&design_db, c.b),
+                    grus_eda_core::congestion::guide::guide_net_name(&design_db, c.a),
+                    grus_eda_core::congestion::guide::guide_net_name(&design_db, c.b),
                     tech_db
                         .strings
                         .resolve(tech_db.routing_layers[c.layer.0 as usize].name),
@@ -2158,8 +2158,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             for u in &route_db.unrouted {
                 for &(_, k) in &u.failed {
                     match k {
-                        grus_core::drt::maze::FailKind::NoPath => nopath += 1,
-                        grus_core::drt::maze::FailKind::Unattachable => unatt += 1,
+                        grus_eda_core::drt::maze::FailKind::NoPath => nopath += 1,
+                        grus_eda_core::drt::maze::FailKind::Unattachable => unatt += 1,
                     }
                 }
             }
@@ -2193,7 +2193,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             for u in &route_db.unrouted {
                 println!(
                     "  unrouted {}",
-                    grus_core::congestion::guide::guide_net_name(&design_db, u.net)
+                    grus_eda_core::congestion::guide::guide_net_name(&design_db, u.net)
                 );
                 for &(p, k) in &u.failed {
                     let esc = if escapes.contains(&(u.net.0, p.0)) {
@@ -2207,14 +2207,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             for &(net, pin) in &route_db.stub_outside_cover {
                 println!(
                     "  stub_outside_cover {} {}",
-                    grus_core::congestion::guide::guide_net_name(&design_db, net),
+                    grus_eda_core::congestion::guide::guide_net_name(&design_db, net),
                     pin_label(&design_db, pin),
                 );
             }
             for r in &route_db.area_residuals {
                 println!(
                     "  area_residual {} {} area={} bound={} region={:?}",
-                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    grus_eda_core::congestion::guide::guide_net_name(&design_db, r.net),
                     tech_db
                         .strings
                         .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
@@ -2226,7 +2226,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             for r in &route_db.notch_residuals {
                 println!(
                     "  notch_residual {} {} a={:?} b={:?}",
-                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    grus_eda_core::congestion::guide::guide_net_name(&design_db, r.net),
                     tech_db
                         .strings
                         .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
@@ -2237,7 +2237,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             for r in &route_db.hole_residuals {
                 println!(
                     "  hole_residual {} {} area={} bound={} region={:?}",
-                    grus_core::congestion::guide::guide_net_name(&design_db, r.net),
+                    grus_eda_core::congestion::guide::guide_net_name(&design_db, r.net),
                     tech_db
                         .strings
                         .resolve(tech_db.routing_layers[r.layer.0 as usize].name),
@@ -2327,10 +2327,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
             if args.self_drc {
-                let reparsed = grus_core::readers::parse_def(&args.out_def, tech_db, None)?;
-                let drc_design = grus_core::drc::geom::assemble(&reparsed, tech_db)?;
+                let reparsed = grus_eda_core::readers::parse_def(&args.out_def, tech_db, None)?;
+                let drc_design = grus_eda_core::drc::geom::assemble(&reparsed, tech_db)?;
                 let subset =
-                    grus_core::drc::report::run_all(&drc_design, tech_db, &reparsed.strings);
+                    grus_eda_core::drc::report::run_all(&drc_design, tech_db, &reparsed.strings);
                 print_subset_findings("self_drc", &subset);
                 println!(
                     "self_drc scope: 50-rule lef_expressible subset on our emitted DEF — \
@@ -2338,8 +2338,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
             println!("wrote routed DEF to {:?}", args.out_def);
-            if grus_core::timing::enabled() {
-                grus_core::timing::print_report();
+            if grus_eda_core::timing::enabled() {
+                grus_eda_core::timing::print_report();
             }
         }
     }
@@ -2348,7 +2348,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
 /// Per-kind counts of everything the STA run left out, as a share of the design's arcs and
 /// endpoints plus the ignored SDC options. Printed at the end of every `sta` run.
-fn print_skip_summary(report: &grus_core::sta::StaReport) {
+fn print_skip_summary(report: &grus_eda_core::sta::StaReport) {
     let s = &report.skipped;
     if s.is_clean() {
         // `is_clean` exempts deferred check arcs and SDC design rules; they still
@@ -2652,7 +2652,7 @@ mod tests {
             .collect();
         assert_eq!(blocks.len(), 3);
         for block in blocks {
-            grus_core::sta::parse_sdc(block).expect("documented SDC example must parse");
+            grus_eda_core::sta::parse_sdc(block).expect("documented SDC example must parse");
         }
     }
 
@@ -2938,12 +2938,12 @@ mod tests {
         .expect("cts must succeed");
 
         // The emitted DEF re-parses and passes legality.
-        let mut interner = grus_core::interner::StringInterner::new();
+        let mut interner = grus_eda_core::interner::StringInterner::new();
         let (tech_db, _) =
-            grus_core::readers::load_tech_db(&tlef, &lef, &mut interner).expect("tech DB reload");
+            grus_eda_core::readers::load_tech_db(&tlef, &lef, &mut interner).expect("tech DB reload");
         let db2 =
-            grus_core::readers::parse_def(&out_def, &tech_db, None).expect("re-parse CTS DEF");
-        grus_core::placement::verify_legality(&db2, &tech_db).expect("CTS DEF passes legality");
+            grus_eda_core::readers::parse_def(&out_def, &tech_db, None).expect("re-parse CTS DEF");
+        grus_eda_core::placement::verify_legality(&db2, &tech_db).expect("CTS DEF passes legality");
 
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&report_path).expect("report JSON"))

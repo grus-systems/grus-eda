@@ -207,8 +207,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37bfe73dc8ec21f54d181e5a60554327ec3f1c600c455a75ccbfc65d2106a6c4"
 
 [[package]]
-name = "grus-core"
-version = "0.12.14"
+name = "grus-eda"
+version = "0.12.15"
+dependencies = [
+ "anyhow",
+ "clap",
+ "grus-eda-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "grus-eda-core"
+version = "0.12.15"
 dependencies = [
  "anyhow",
  "bincode",
@@ -220,17 +231,6 @@ dependencies = [
  "serde",
  "serde_json",
  "xxhash-rust",
-]
-
-[[package]]
-name = "grus-eda"
-version = "0.12.14"
-dependencies = [
- "anyhow",
- "clap",
- "grus-core",
- "serde",
- "serde_json",
 ]
 
 [[package]]

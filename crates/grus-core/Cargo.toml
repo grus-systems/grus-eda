@@ -1,5 +1,5 @@
 [package]
-name = "grus-core"
+name = "grus-eda-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

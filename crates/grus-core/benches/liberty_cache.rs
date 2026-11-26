@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use grus_core::readers::liberty::{load_liberty, parse_liberty_bytes};
+use grus_eda_core::readers::liberty::{load_liberty, parse_liberty_bytes};
 
 // Deliberately small copy of the lookup. The canonical logic is `test_support`
 // (`#[cfg(test)]` in the crate); no public API is added for one benchmark.
