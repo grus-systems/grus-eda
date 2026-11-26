@@ -41,7 +41,7 @@ cmd = "cargo clippy --workspace --all-targets -- -D warnings"
 # `runner = "eda"` restricts `push --remote` to hosts advertising it.
 [[verify]]
 name = "sta-regression"
-cmd = "cargo test --release -p grus-core sta"
+cmd = "cargo test --release -p grus-eda-core sta"
 runner = "eda"
 
 # Custom agent-CLI drivers:
