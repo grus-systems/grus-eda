@@ -715,9 +715,28 @@ struct DrtArgs {
 
     #[arg(
         long,
-        help = "Re-parse the emitted DEF, assemble, and run the 50-rule subset checker"
+        overrides_with = "no_self_drc",
+        help = "(default) Re-parse the emitted DEF, assemble, and run the \
+                50-rule lef_expressible subset checker"
     )]
     self_drc: bool,
+
+    #[arg(
+        long,
+        overrides_with = "self_drc",
+        help = "Skip the emitted-DEF subset check — the census prints \
+                `self_drc_verdict SKIPPED` and the exit code stays 0"
+    )]
+    no_self_drc: bool,
+
+    #[arg(
+        long,
+        default_value_t = 0,
+        conflicts_with = "no_self_drc",
+        help = "Findings budget for the named residual class — exit stays \
+                0 while findings_total <= N"
+    )]
+    self_drc_tolerance: usize,
 
     #[arg(
         long,
@@ -2130,6 +2149,25 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .then(|| grus_eda_core::drt::emit::preemit_check(&design_db, tech_db))
                 .transpose()?;
             grus_eda_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
+            // The verdict is a property of the emitted text: the subset
+            // checker scores a re-parse of what was just written, and its
+            // findings_total gates the exit code at the end of the arm.
+            let self_drc: Option<grus_eda_core::drc::report::SubsetReport> =
+                if args.no_self_drc {
+                    None
+                } else {
+                    let reparsed =
+                        grus_eda_core::readers::parse_def(&args.out_def, tech_db, None)?;
+                    let drc_design = grus_eda_core::drc::geom::assemble(&reparsed, tech_db)?;
+                    Some(grus_eda_core::drc::report::run_all(
+                        &drc_design,
+                        tech_db,
+                        &reparsed.strings,
+                    ))
+                };
+            let self_drc_findings: Option<usize> = self_drc
+                .as_ref()
+                .map(|s| s.rules.iter().map(|o| o.findings.len()).sum());
 
             let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
             let notch_fills: usize = route_db.nets.iter().map(|n| n.fills.len()).sum();
@@ -2150,6 +2188,40 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 route_db.notch_residuals.len(),
                 route_db.hole_residuals.len(),
             );
+            // The DRC verdict prints adjacent to `routed=` — a
+            // connectivity count — so a census can never read as clean
+            // while the emitted text carries findings (`docs/e6-drt.md`
+            // §8).
+            match self_drc_findings {
+                None => println!(
+                    "self_drc_verdict SKIPPED (--no-self-drc; routed= counts connectivity, not DRC)"
+                ),
+                Some(0) => println!("self_drc_verdict CLEAN"),
+                Some(n) => println!(
+                    "self_drc_verdict {} findings={n} tolerance={}",
+                    if n > args.self_drc_tolerance {
+                        "VIOLATIONS"
+                    } else {
+                        "TOLERATED"
+                    },
+                    args.self_drc_tolerance,
+                ),
+            }
+            if let Some(subset) = &self_drc {
+                print_subset_findings("self_drc", subset);
+                println!(
+                    "self_drc scope: 50-rule lef_expressible subset on our emitted DEF — \
+                     the full Magic deck check on our DEF belongs to e6-drt-e2e"
+                );
+            }
+            if let Some(subset) = &preemit {
+                print_subset_findings("preemit_check", subset);
+                println!(
+                    "preemit_check scope: report-only — 50-rule lef_expressible subset on the \
+                     in-memory emit shape set (same input --self-drc re-parses); the exit \
+                     gate is self_drc on the emitted text"
+                );
+            }
             // Per-iteration convergence series: bad-set size entering
             // each iteration, and the provisional collision count at
             // its end (`docs/e6-drt.md` §7–§8).
@@ -2363,28 +2435,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
 
-            if let Some(subset) = &preemit {
-                print_subset_findings("preemit_check", subset);
-                println!(
-                    "preemit_check scope: report-only — 50-rule lef_expressible subset on the \
-                     in-memory emit shape set (same input --self-drc re-parses); findings do \
-                     not gate the write or the exit code until drt-selfdrc-exit lands"
-                );
-            }
-            if args.self_drc {
-                let reparsed = grus_eda_core::readers::parse_def(&args.out_def, tech_db, None)?;
-                let drc_design = grus_eda_core::drc::geom::assemble(&reparsed, tech_db)?;
-                let subset =
-                    grus_eda_core::drc::report::run_all(&drc_design, tech_db, &reparsed.strings);
-                print_subset_findings("self_drc", &subset);
-                println!(
-                    "self_drc scope: 50-rule lef_expressible subset on our emitted DEF — \
-                     the full Magic deck check on our DEF belongs to e6-drt-e2e"
-                );
-            }
             println!("wrote routed DEF to {:?}", args.out_def);
             if grus_eda_core::timing::enabled() {
                 grus_eda_core::timing::print_report();
+            }
+            // Fail loud after the artifact is written: a `routed=N`
+            // census is connectivity-only, so findings on the emitted
+            // text beyond the budget are a nonzero exit, not a report.
+            if let Some(n) = self_drc_findings
+                && n > args.self_drc_tolerance
+            {
+                anyhow::bail!(
+                    "self_drc findings_total={n} exceeds --self-drc-tolerance {} — \
+                     emitted DEF is not DRC-clean (routed= counts connectivity only; \
+                     see docs/e6-drt.md §8)",
+                    args.self_drc_tolerance
+                );
             }
         }
     }
@@ -2661,6 +2727,8 @@ mod tests {
         };
         assert_eq!(args.out_def, PathBuf::from("o"));
         assert!(args.self_drc);
+        assert!(!args.no_self_drc);
+        assert_eq!(args.self_drc_tolerance, 0);
         assert!(args.preemit_check);
         assert!(matches!(args.occ, OccArg::Disabled));
         assert_eq!(args.reference, Some(PathBuf::from("r.json")));
@@ -2671,6 +2739,138 @@ mod tests {
                 .is_err(),
             "drt without --guide/--out-def must fail"
         );
+
+        // The self-DRC flag pair: last one wins; a budget on a skipped
+        // check is a parse error, not a silent no-op.
+        let base = [
+            "grus-eda", "drt", "--tlef", "a", "--lef", "b", "--def", "c", "--guide", "g",
+            "--out-def", "o",
+        ];
+        let cli = Cli::try_parse_from(
+            base.iter()
+                .chain(["--no-self-drc", "--self-drc"].iter())
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .expect("drt argv parses");
+        let Commands::Drt(args) = cli.command else {
+            panic!("expected Commands::Drt");
+        };
+        assert!(args.self_drc && !args.no_self_drc);
+        let cli = Cli::try_parse_from(
+            base.iter()
+                .chain(["--self-drc", "--no-self-drc"].iter())
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .expect("drt argv parses");
+        let Commands::Drt(args) = cli.command else {
+            panic!("expected Commands::Drt");
+        };
+        assert!(!args.self_drc && args.no_self_drc);
+
+        let cli = Cli::try_parse_from(
+            base.iter()
+                .chain(["--self-drc-tolerance", "3"].iter())
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .expect("drt argv parses");
+        let Commands::Drt(args) = cli.command else {
+            panic!("expected Commands::Drt");
+        };
+        assert_eq!(args.self_drc_tolerance, 3);
+
+        assert!(
+            Cli::try_parse_from(
+                base.iter()
+                    .chain(["--no-self-drc", "--self-drc-tolerance", "3"].iter())
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )
+            .is_err(),
+            "--self-drc-tolerance on a skipped check must fail at parse"
+        );
+    }
+
+    /// The emitted-DEF subset check is default-on and its findings
+    /// gate the exit code. `--occ disabled` is the injected violation —
+    /// real wires committed at real sub-bound gaps by the real router,
+    /// scored on the real emitted text (`test_emit_fail_proof` Arm B),
+    /// not a mocked report.
+    #[test]
+    fn cli_drt_selfdrc_gates_exit() {
+        let hd = sky130_hd();
+        let tlef = require(hd.join("techlef/sky130_fd_sc_hd__nom.tlef"));
+        let lef = require(hd.join("lef/sky130_fd_sc_hd.lef"));
+        let gcd = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/designs/gcd");
+        let placed = gcd.join("gcd.placed.def");
+        let guide = gcd.join("gcd.guide");
+
+        let drt_argv = |out: &Path, extra: &[&str]| {
+            let mut argv = vec![
+                "grus-eda",
+                "drt",
+                "--tlef",
+                tlef.to_str().unwrap(),
+                "--lef",
+                lef.to_str().unwrap(),
+                "--def",
+                placed.to_str().unwrap(),
+                "--guide",
+                guide.to_str().unwrap(),
+                "--out-def",
+                out.to_str().unwrap(),
+            ];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv).unwrap()
+        };
+
+        // Clean arm: gcd's pinned self-DRC is findings_total=0 — and
+        // the unrouted=80 connectivity census must not trip the gate.
+        let clean_def = std::env::temp_dir().join("grus_cli_test_drt_clean.def");
+        run(drt_argv(&clean_def, &[])).expect("clean emit must exit 0");
+
+        // Injected arm: occupancy off commits wires across sub-bound
+        // gaps; the checker must see them on the emitted text and the
+        // run must fail while the DEF artifact stays written.
+        let viol_def = std::env::temp_dir().join("grus_cli_test_drt_viol.def");
+        let err = run(drt_argv(&viol_def, &["--occ", "disabled"]))
+            .expect_err("self-DRC findings must fail the run");
+        let msg = err.to_string();
+        let findings: usize = msg
+            .strip_prefix("self_drc findings_total=")
+            .unwrap_or_else(|| panic!("error must name findings_total, got: {msg}"))
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("findings_total parses");
+        assert!(
+            findings > 0,
+            "injected violation must report findings, got: {msg}"
+        );
+        assert!(
+            viol_def.exists(),
+            "the routed DEF is still written on a failing verdict"
+        );
+
+        // Tolerated arm: a budget absorbs the same findings.
+        let tol_def = std::env::temp_dir().join("grus_cli_test_drt_tol.def");
+        run(drt_argv(
+            &tol_def,
+            &["--occ", "disabled", "--self-drc-tolerance", "1000000"],
+        ))
+        .expect("findings within --self-drc-tolerance must exit 0");
+
+        // Skipped arm: the opt-out keeps exit 0.
+        let skip_def = std::env::temp_dir().join("grus_cli_test_drt_skip.def");
+        run(drt_argv(&skip_def, &["--occ", "disabled", "--no-self-drc"]))
+            .expect("--no-self-drc must exit 0");
+
+        for p in [&clean_def, &viol_def, &tol_def, &skip_def] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]
