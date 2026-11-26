@@ -33,7 +33,7 @@ fn print_lef_skip_summary(report: &grus_core::readers::LefSkipReport) {
     name = "grus-eda",
     author = "Grus Systems",
     version,
-    about = "Fast preflight EDA estimation toolkit for sky130hd"
+    about = "Physical-design research toolkit for sky130hd"
 )]
 struct Cli {
     #[command(subcommand)]

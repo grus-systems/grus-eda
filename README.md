@@ -114,7 +114,7 @@ With [mise](https://mise.jdx.dev):
 
 ```toml
 [tools."github:grus-systems/grus-eda"]
-version = "v0.12.10"
+version = "v0.12.11"
 
 [tools."github:grus-systems/grus-eda".platforms]
 macos-arm64 = { asset_pattern = "grus-eda-aarch64-apple-darwin.tar.gz" }
