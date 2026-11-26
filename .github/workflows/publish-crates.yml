@@ -1,0 +1,47 @@
+# Publishes both crates to crates.io on release tags via trusted publishing
+# (OIDC). No long-lived token is stored anywhere: rust-lang/crates-io-auth-action
+# exchanges the workflow's GitHub OIDC identity for a 30-minute registry token.
+# Requires the per-crate trusted publisher configuration on crates.io
+# (repo grus-systems/grus-eda, workflow publish-crates.yml, environment release),
+# which can only be created after the first manual publish of each crate.
+
+name: publish-crates
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish-core:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+      - run: cargo publish -p grus-eda-core
+
+  publish-cli:
+    needs: publish-core
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The sparse index lags the upload by a minute or two; poll it directly
+      # rather than failing the dependent publish on a stale resolution.
+      - name: Wait for grus-eda-core in the sparse index
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          for i in $(seq 1 60); do
+            curl -sf "https://index.crates.io/gr/us/grus-eda-core" | grep -q "\"vers\":\"$version\"" && exit 0
+            sleep 10
+          done
+          echo "grus-eda-core $version never appeared in the sparse index" >&2
+          exit 1
+      - uses: rust-lang/crates-io-auth-action@v1
+      - run: cargo publish -p grus-eda
