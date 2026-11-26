@@ -194,7 +194,9 @@ The routed result (§7) is *not*:
   rule family with a post-pass: §7's occupancy-strict patch lifts
   sub-bound components along in-plane edges and names what it cannot
   fix in `RouteDb.area_residuals` — residuals the emit gate surfaces
-  as `*.6` findings, not a claim of min-area cleanliness.
+  as `*.6` findings, not a claim of min-area cleanliness; the emitted
+  DEF carries the CLI verdict (`self_drc_verdict`, §8), not only a
+  findings print.
 - **A TritonRoute reproduction** — the search is a pathfinder-style
   tree extension over our own region graph with relaxed (non-strict-
   crossing) via transitions, not a port of `FlexGridGraph`/`drWorker`;
@@ -793,8 +795,8 @@ full Magic deck check on our routed DEF is `e6-drt-e2e`.
 ```
 grus-eda drt --tlef <t> --lef <l> --def <placed.def> \
     --guide <d>.guide --out-def <routed.def> \
-    [--reference <d>.drt.reference.json] [--self-drc] \
-    [--occ enabled|disabled] [--max-iters N]
+    [--reference <d>.drt.reference.json] [--self-drc | --no-self-drc] \
+    [--self-drc-tolerance N] [--occ enabled|disabled] [--max-iters N]
 ```
 
 prints the emit census (`guided/routed/unrouted/projected/
@@ -809,8 +811,14 @@ component, and — only when non-empty, so a clean census stays
 byte-identical — one `pin_collision <a> <b> <layer> line=…
 iv=[lo,hi]` line per `RouteDb.pin_collisions` survivor), the
 informational `wirelength_um` + `via.<cut>`
-deltas vs `variants.delegated`/`baseline`, and — under `--self-drc`
-— the re-parse→assemble→`run_all` verdict. Under each `unrouted`
+deltas vs `variants.delegated`/`baseline`, and — self-DRC is
+default-on, `--no-self-drc` the explicit opt-out — the
+re-parse→assemble→`run_all` verdict on the emitted DEF, announced by
+a `self_drc_verdict <CLEAN | VIOLATIONS findings=N tolerance=T |
+TOLERATED findings=N tolerance=T | SKIPPED (--no-self-drc; routed=
+counts connectivity, not DRC)>` line printed directly beneath
+`guided=` and followed by the `self_drc` findings block before the
+unrouted listing. Under each `unrouted`
 line one `    fail <inst>/<pin> <FailKind>[ region_escape]
 [ escape=<token>]` line
 names every member pin's *final* classification (`u.failed`; the
@@ -827,9 +835,19 @@ exact gap from the uncapped refusal probe, never a sentinel),
 corridor had no target),
 `halo_empty` (no halo candidate survived). On gcd no escaped pin
 ends in `u.failed`, so the committed `cli_lines` show no token;
-`recount_unrouted.py` accepts 3–5 fields per fail line. The CLI
-reports and
-never exits nonzero on findings; the gate is `tests/drt.rs`.
+`recount_unrouted.py` accepts 3–5 fields per fail line. `routed=` is
+a connectivity count — all member pins joined — never a DRC claim;
+the DRC verdict of the same run is the `self_drc_verdict` line
+printed directly beneath it. The CLI exits 1 when the emitted DEF's
+self-DRC `findings_total` exceeds `--self-drc-tolerance` (default
+0); the routed DEF is still written and `wrote routed DEF to …`
+still prints — only the verdict fails. `CLEAN`, `TOLERATED`, and
+`SKIPPED` exit 0; `unrouted>0` does not gate (a named census class,
+not a violation gate). `--no-self-drc` skips the check deliberately
+and its `SKIPPED` verdict marks the census so `routed=` cannot be
+misread as clean; `--self-drc-tolerance` exists for the named
+picorv32 residual, pinned per design in `generate_drt_ours.sh`. The
+stricter per-rule gate remains `tests/drt.rs`.
 
 ## 9. End-to-end Magic gate (`e6-drt-e2e`)
 
@@ -865,7 +883,9 @@ our li1 stub vs LEF-declared OBS li1 masked inside host hulls, the
 masked-layer class) and `met1.2` ours=146 (21 sites — same-net
 disjoint met1 edges < 0.14 µm inside pin-access clusters, all X3;
 the emit-time self-DRC sees 3 of them, the other 18 are
-intra-island concavities the island spacing subset cannot see).
+intra-island concavities the island spacing subset cannot see —
+generation now runs with `--self-drc-tolerance 3` pinned in
+`generate_drt_ours.sh`, the subset-visible residual budget).
 Both pinned in `PINNED_LEF_RESIDUALS`. `magic_only` all inherited,
 `unclassified_fired` empty, antenna 106 net / 152 pin. Census:
 `routed=4728 unrouted=2016 unguided=67` (`irq[*]`/`pcpi_*`
