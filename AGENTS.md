@@ -65,6 +65,7 @@ Instructions for AI coding agents working in this repository.
 - Watch the run with `kurena wait <slug> --stall-after 900`: it prints stage transitions and exits 0 on a pending card or final outcome, 2 on stall (recover with `kurena resume <slug>`). `kurena status --json` / `kurena show <slug>` give machine-readable state.
 - `workflow.toml` configures the drivers (devin ACP) and verify commands (`cargo test --workspace`, clippy `-D warnings`). Do not hand-edit `.kurena/`; spec and design docs under `kurena/tasks/` are pipeline artifacts and stay committed.
 - Cards are human-gated: present `kurena show <slug>` output and let the user run `approve` / `reject <memo>` / `edit` / `abort`. Never run these yourself.
+- Releases (dev→main + tag): the user has standing permission to cut a release at coherent milestones without asking each time. `main` is a protected branch — direct pushes are rejected, so release through a PR (`gh pr create --base main --head dev`, merge via `gh api .../pulls/N/merge` with a custom `commit_title`/`commit_message`), then tag the merge commit and push the tag. The first release (v0.12.10, PR #5) is the template: release notes plus any required `feat:` bodies go in the merge message.
 
 ## 7. Lessons from the E0 Review (2026-11-09)
 
