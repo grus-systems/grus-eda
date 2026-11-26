@@ -12,18 +12,19 @@ as done only when its numbers agree with that tool's or its residual is named.
 > **Research prototype — read the skip summary.** `sta` covers a subset of
 > SDC (stock LibreLane `write_sdc` output parses unchanged) and models clocks
 > both ideally and via `set_propagated_clock`, including latch `D -> Q` and
-> time borrowing for `sky130_fd_sc_hd` shapes. Recognised check arcs the
-> endpoint model does not evaluate (`non_seq_*`, `preserve`,
-> async `Clear`/`Preset`, and `min_pulse_width` arcs whose pin is off the
-> clock network — clock-pin `min_pulse_width` arcs and `three_state_*`
-> enable/disable arcs are evaluated) are counted
-> and shown
-> but exempt from `--strict`: they add checks outside the reported set rather
-> than altering an arrival. Cells driven far outside their Liberty timing
-> tables can diverge from OpenSTA. Every run prints what it left out as
-> counts and shares of the design's arcs and endpoints; `--strict` exits
-> non-zero when a skip can change a reported number, and `--json <path>`
-> writes the same summary machine-readably.
+> time borrowing for `sky130_fd_sc_hd` shapes.
+>
+> - Recognised check arcs the endpoint model does not evaluate — `non_seq_*`,
+>   `preserve`, async `Clear`/`Preset`, and `min_pulse_width` arcs whose pin is
+>   off the clock network — are counted and shown but exempt from `--strict`:
+>   they add checks outside the reported set rather than altering an arrival.
+>   (Clock-pin `min_pulse_width` arcs and `three_state_*` enable/disable arcs
+>   *are* evaluated.)
+> - Cells driven far outside their Liberty timing tables can diverge from
+>   OpenSTA.
+> - Every run prints what it left out as counts and shares of the design's arcs
+>   and endpoints; `--strict` exits non-zero when a skip can change a reported
+>   number, and `--json <path>` writes the same summary machine-readably.
 
 ## Why
 
@@ -70,8 +71,7 @@ boundaries.
 6. **Agreement before speed**: a stage gets faster only after it agrees with the
    reference tool, and the fast version must give the same answer as the simple one.
 
-Not goals: sign-off, GDS output, LVS, replacing the full Magic DRC deck, or
-beating OpenROAD on result quality.
+Not goals: sign-off or replacing the reference tools — see the scope note under Stages.
 
 ## Stages
 
@@ -97,33 +97,27 @@ The `floorplan` command is a utility that generates a starting DEF from a public
 netlist; it is not a reference-checked stage by itself. Readers for SDC, SPEF,
 VCD/SAIF, and route guides are verified as part of the stage that consumes them.
 
-Still out of scope: sign-off, GDS output, LVS, full Magic-deck DRC replacement,
-and production-quality detailed routing. The DRC command covers the
+Out of scope: sign-off, GDS output, LVS, full Magic-deck DRC replacement, and
+production-quality detailed routing — OpenROAD, OpenSTA, Magic, KLayout, and
+PDNSim remain the reference and sign-off tools. The DRC command covers the
 LEF-expressible subset; the detailed router is a research implementation whose
-unrouted and residual cases are reported rather than hidden. OpenROAD, OpenSTA,
-Magic, KLayout, and PDNSim remain the reference and sign-off tools.
+unrouted and residual cases are reported rather than hidden.
 
 A GPU path (Metal) may come after a stage's CPU version agrees with the reference
 tool. The GPU result must then equal the CPU result.
 
 ## Install
 
-Tagged releases (`v*`) ship `grus-eda` binaries for `aarch64-apple-darwin`
-and `x86_64-unknown-linux-gnu` as `grus-eda-<target>.tar.gz` assets (plus `.sha256`).
-With [mise](https://mise.jdx.dev):
-
-```toml
-[tools."github:grus-systems/grus-eda"]
-version = "v0.12.11"
-
-[tools."github:grus-systems/grus-eda".platforms]
-macos-arm64 = { asset_pattern = "grus-eda-aarch64-apple-darwin.tar.gz" }
-linux-x64 = { asset_pattern = "grus-eda-x86_64-unknown-linux-gnu.tar.gz" }
+```
+cargo install grus-eda
+mise use -g github:grus-systems/grus-eda
 ```
 
-The archive holds the `grus-eda` executable at its root, which mise puts on
-`PATH`. Assets can also be fetched directly from the
-[releases page](https://github.com/grus-systems/grus-eda/releases).
+Either one suffices: the first builds from source with a Rust toolchain, the
+second fetches a prebuilt binary (`aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu`) with [mise](https://mise.jdx.dev). Archives and
+checksums are also on the
+[releases page](https://github.com/grus-systems/grus-eda/releases) directly.
 
 ## Documentation
 
@@ -142,6 +136,7 @@ Start at [`docs/README.md`](docs/README.md) for the reading order.
 - [`docs/e7-drc.md`](docs/e7-drc.md) — E7: LEF-expressible DRC subset and Magic taxonomy
 - [`docs/e9-reporting.md`](docs/e9-reporting.md) — E9: Critical-path reporting, clock-domain summaries, slack histograms, and CLI ergonomics
 - [`docs/results.md`](docs/results.md) — Verification log against OpenROAD, OpenSTA, Magic, and PDNSim
+- [`docs/benchmarks.md`](docs/benchmarks.md) — Runtime measurements by stage, extracted from the verification log
 - [`docs/history/`](docs/history/README.md) — Per-step design documents, implementation tickets, and the 2026-11-11 project review (records, not current guidance)
 
 E8 IR drop and N7 power estimation do not yet have consolidated stage documents;
