@@ -10258,3 +10258,70 @@ green; `cargo clippy --workspace --all-targets -- -D warnings`
 clean; `test_maze_census` release re-run printed
 `iter_progress_monotonic=true` with the unchanged
 `iter_progress` series and digest `0xa6d8b74a740a7489`.
+### 2026-11-26 — drt-pin-collision: foreign io-port `Pin` occupancy costs the wire side (v0.12.13)
+
+The `Pin(foreign)` verdict was **soft — never a block**: a wire
+inside an io-port's `w/2 + s` band paid the congestion price but
+committed the overlap silently, and nothing recorded it. The fix
+makes a wire×foreign-pin hit a *directed* provisional `Collision`
+(`a` = the committing wire net, `b` = the pin's owning net) that
+re-queues only `a` — the port cannot move, so re-queuing its net
+would churn the queue and escalate `hist[b]` unfairly — plus a
+hard block on the last iteration, and adds the post-hoc
+`pin_overlap_census` (`RouteDb.pin_collisions`, `Enabled` only)
+that names any survivor. `project_attach`/`try_pin_paint` stub
+candidates now scan live occupancy before committing access paint;
+blocked candidates join `tried_proj` (named exhaustion, no hang).
+Instance-pin metal stays the separate `ObsPin` class (hard block
+always — a foreign landing inside a hull is a Magic subcell
+overlap). `hit_verdict`'s doc no longer claims `Pin` "never
+hard-blocks"; `docs/e6-drt.md` §7's table, premark, rip-up, and
+CLI sections were rewritten in step (the same edit also retires
+the stale unconditional-host-cell-carve description — the code
+already clips OBS paint against the cell's own pin rects).
+
+**Fixture** (`test_maze_pin_collision`, `MAZE_PIN_TAIL`):
+io2's met1 port at x=2000 puts its mark interval [1900,2100] on
+u0/A's first attach arc so the hard-mode postmortem attributes
+`(met1, Pin)` (`blockers` element `(0,3)`; an x=2500 port would
+leave `blockers` empty — postmortem only attributes arcs between
+BFS-reachable nodes). Arm A (open guide): clean detour, every n1
+wire outside the [1690,690,2310,1310] inflated band,
+`pin_collisions` empty. Arm B (met1-row-only guide): soft
+iterations record `prov_collisions > 0`, the hard iteration
+blocks, n1 fails named `NoPath` with `(0,3)` in `blockers`,
+`pin_collisions` empty, n2 still routes — the named-failure arm
+bounds the loop instead of hanging.
+`test_route_digest_covers_pin_collisions` covers the new
+serialized field.
+
+**Red proof** (E0 rule 7, run before the verdict change): arm B
+committed the overlap — the census recorded `pin_collisions = 1`
+and n1 routed. The knock-on harm was also measured: n1's wire
+band sealed io2's port ring, so `unrouted[0]` was **n2** — the
+port's *own* net — `NoPath` on the hard iteration, a silent
+overlap corrupting an unrelated net's connectivity.
+
+**gcd emit leg** (`generate_drt_ours.sh gcd` rerun, run
+2026-11-26): routed DEF **byte-identical** to the committed
+artifact (`OURS-SHA 635f19a9…`), `self_drc findings_total=0`, no
+`pin_collision` lines in the census (clean → the conditional
+print keeps output byte-identical). Emit census identical to the
+committed baseline — `routed=188 unrouted=81 collisions=0
+iterations=8`, `iter_progress=269,94,87,81,81,81,81,81`,
+`iter_prov=25,6,0,0,0,0,0,0`. Digest moved `0xa6d8b74a740a7489` →
+`0x184fab6046e9c5d3` — expected: `route_digest` serializes the
+new `pin_collisions` field (empty on gcd, but `len=0` is part of
+the hash stream); no golden or test pins a digest literal.
+
+**What ran** (E0 rule 9): `cargo test --workspace` — 557 lib +
+18 drc + 28 drt (3 `#[ignore]`d picorv32 legs) + 2 irdrop +
+7 grus-eda, all green; `cargo clippy --workspace -- -D warnings`
+clean; the red-proof above (verdict reverted on a scratch edit:
+arm B red, `pin_collisions = 1`, n2 unrouted — restored); the
+gcd `generate_drt_ours.sh` rerun + byte-compare above. The
+picorv32 census leg was not rerun — its routed DEF stays
+gitignored and the verdict change only adds blocking where the
+old run silently committed; a divergence there would surface as
+`pin_collision` census lines on its next `#[ignore]`d run, which
+the conditional print makes visible by construction.
