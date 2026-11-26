@@ -10385,3 +10385,101 @@ says so in every run.
 --all-targets -- -D warnings` clean; both new tests release-green;
 the red-proof above; the gcd CLI run above. picorv32 not run —
 `emit_leg` ≈ 135 min release; the gcd pair covers the mechanism.
+
+### 2026-11-26 — drt-guide-escape: bounded pin-halo escape in the route graph
+
+`drt::graph::escape_extend` lands: a pin with no strict in-region
+node (the `region_escape` class — gcd 17, picorv32 592, unchanged
+pre-escape semantics) gets a halo of covered pairs on layers
+`pin_lo..=max(pin_hi, first_unmasked)` — the pin-shape bbox's
+covered index range inflated `halo_lines=2` steps per axis,
+`point_allowed`-filtered — merged into `region` pre-emission, plus
+an L-corridor of ≤`corridor_lines=8` index steps when the halo
+doesn't already touch region. `GraphOpts{spare_above, escape}` now
+parameterizes `build_route_graphs_ext`; `RouteGraphs::escapes`
+records each attempt (`EscapeKind`, `pairs_added`,
+`corridor_span`), and fail lines carry `escape=<token>`.
+
+**Graph census** (escape off → on, measured via `build_route_graphs_ext`
+off arm — the bit-identical check in `test_maze_guide_escape` keeps
+the off arm honest):
+
+| design | nodes | edges | via_edges per pair |
+|---|---|---|---|
+| gcd | 555,914 → 555,974 | 1,021,110 → 1,021,199 | `[6636, 322, 0, 2, 0]` (unchanged) |
+| picorv32 | 20,523,742 → 20,540,037 | 37,999,144 → 38,027,026 | `[180346, 11128, 0, 47, 0]` → `[180427, 11148, 0, 47, 0]` |
+
+**Escape records** (`test_pin_attachment` census): gcd
+{halo: 7, halo_empty: 10} — the 3 instance escapes (`_301_/B1`,
+`_307_/B1`, `_313_/X`) plus 4 io ports re-attach purely on halo
+pairs; the other 10 io ports' inflated ±2-line window yields no
+surviving candidate (their attach path stays the §7 projection).
+picorv32 {halo: 425, corridor_masked: 9, halo_empty: 158} — 434 of
+592 escapes re-attach.
+
+**gcd emit delta** (release, `generate_drt_ours.sh gcd --verify` +
+`check_drt_ours.sh gcd` regenerating both goldens):
+`routed=189 unrouted=80` (was 188/81), `projected=8` (was 9),
+`area_patches=0` (was 1), `unrouted_kinds` Unattachable 52→51
+(NoPath 46 unchanged), `route_ms=12647`. Unrouted delta by name:
+`_134_` (`_301_/B1`) and `_138_` (`_307_/B1`) rescued — the two
+li1 pins whose only covered pair sat outside the guide region;
+`req_msg[16]` newly unrouted (`_300_/A2 Unattachable`) — halo nodes
+shifted the maze's ordering, a swap not a regression in kind.
+Route digest `0x184fab6046e9c5d3` → `0x8a4768ab15bd4bd5`; routed DEF
+regenerated, double-emit sha256
+`27f7665922c6df0212788f27b73f562d078e5bebdd47446eb1f933a469122aee`.
+`stub_outside_cover` lines 142 → 143; Magic `drc(full)` on the new
+DEF: `lef_expressible` 0 on all 50 rules, `magic_only` the same 3
+inherited nwell rows (6/120/300), `unclassified` empty,
+`count_total=305` — the escape wires introduce no new findings. No
+fail line carries `region_escape` or `escape=` on gcd anymore — the
+two prior `region_escape` fail lines are gone (rescued), and the one
+escape pin inside an unrouted net (`req_msg[16]`'s port) is not the
+pin that failed.
+
+**Fixture** (`test_maze_guide_escape`, `ESC_LEF_WALL`/`ESC_DEF_TAIL`
++ `WALL` macro hull): escape off → `NoPath` + `region_escape`
+(corrected in place — a review-driven fix: the escape-off pin still
+lands an `access_vias` `b`-arc on its met2 transit-island node, so
+the wave seeds and dies on the island rather than reporting
+`Unattachable`), graph bit-identical to pre-escape; default cfg →
+`CorridorBound`
+refusals pin-token `corridor_bound(span=3)`; corridor open →
+`corridor_masked`/landed arms measured; corridor landing on `maze_db`
+→ `halo(span=3)`, routed clean end-to-end.
+
+**picorv32 emit leg**: deferred — the ~135 min sequential route
+(`test_maze_census_picorv32 --ignored`) and its golden regeneration
+stay out of this ticket; the graph-side census and via-edge re-pin
+above are the picorv32 evidence.
+
+**Checks run**: `cargo test --workspace` (all green; 3 `#[ignore]`d
+picorv32 legs), `cargo clippy --workspace --all-targets --
+-D warnings` clean, `recount_unrouted.py gcd` exits 0
+(`unrouted=80`, `fail_lines=97`, `stub∩unrouted=76`,
+`unrouted∖stub=4` — the class split unchanged in kind).
+Version `0.12.14 → 0.13.0` — `build_route_graphs_ext`'s signature
+changed (`spare_above: u8` → `GraphOpts`), a breaking API change on
+0.x → minor.
+
+**Review revision** (same ticket): the contract fixes — escape-off
+fails `NoPath` (transit-island access landing), not `Unattachable`;
+`EscapeKind::NoAnchor` names the no-target case (was a `u32::MAX`
+span); `pairs_added` counts distinct inserted pairs (was
+double-counting the corridor layer's halo); `escape_span` is a
+bounded windowed enumeration (was an `nx×ny` BFS + allocation per
+escaped pin per layer — identical spans, bounded work).
+Arm F occupancy contrast: enabled `NoPath` / disabled routed
+measured on `ESC_DEF_TAIL_OCC` (the io4 met2 `Pin` band covers only
+escaped pairs — the block is attributable to escape metal by
+construction; the io4-drop break-it check is arm B itself — the
+identical wall fixture and `Enabled` run minus the band routes). Kind census re-print: gcd {halo: 7, halo_empty: 10},
+picorv32 {halo: 425, corridor_masked: 9, halo_empty: 158} —
+identical to the pre-revision counts (no refused records on either
+design, so no `corridor_bound → no_anchor` reclassification to
+name); graph census pins unchanged (`test_graph_census`,
+`test_via_edge_census`, `test_graph_determinism` green — the probe's
+endpoint tie-breaks did not shift paint on the measured designs);
+routed DEF sha unchanged (`test_e2e_ours_def_deterministic_gcd`
+byte-identical).

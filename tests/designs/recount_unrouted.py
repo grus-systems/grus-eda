@@ -189,10 +189,12 @@ def main():
             fail_lines += 1
             if fail_net not in u:
                 fail(f"cli `fail` line {line!r} outside a known unrouted net")
-            if len(parts) not in (3, 4) or parts[2] not in ("NoPath", "Unattachable"):
+            if len(parts) not in (3, 4, 5) or parts[2] not in ("NoPath", "Unattachable"):
                 fail(f"malformed cli `fail` line {line!r}")
-            if len(parts) == 4 and parts[3] != "region_escape":
+            if len(parts) >= 4 and parts[3] != "region_escape":
                 fail(f"cli `fail` line {line!r} 4th token is not `region_escape`")
+            if len(parts) == 5 and not parts[4].startswith("escape="):
+                fail(f"cli `fail` line {line!r} 5th token is not `escape=`")
         elif parts[0] == "stub_outside_cover":
             stub_lines += 1
             stub_nets.add(parts[1])
