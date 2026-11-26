@@ -2102,6 +2102,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
                     .join(",")
             );
+            // Wire×foreign-pin survivors — the named residual. Printed
+            // per entry only when non-empty so a clean census stays
+            // byte-identical.
+            for c in &route_db.pin_collisions {
+                println!(
+                    "pin_collision {} {} {} line={} iv=[{},{}]",
+                    grus_core::congestion::guide::guide_net_name(&design_db, c.a),
+                    grus_core::congestion::guide::guide_net_name(&design_db, c.b),
+                    tech_db
+                        .strings
+                        .resolve(tech_db.routing_layers[c.layer.0 as usize].name),
+                    c.line,
+                    c.lo,
+                    c.hi,
+                );
+            }
             let (mut nopath, mut unatt) = (0usize, 0usize);
             for u in &route_db.unrouted {
                 for &(_, k) in &u.failed {

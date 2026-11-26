@@ -178,10 +178,11 @@ The via model (§6) is *not*:
 The routed result (§7) is *not*:
 
 - **DRC-clean** — the occupancy model is spacing-lite: `w/2 + s`
-  bands on track lines, no enclosure/cut rules, unmerged
-  OBS marks with an unconditional host-cell carve, and `Pin` marks
-  that never hard-block. A foreign wire landing on pin metal is an
-  emit/e2e finding, not a search-time error. Min-area is the one
+  bands on track lines, no enclosure/cut rules, and unmerged
+  OBS marks clipped against their own pin rects. A foreign wire
+  that survives onto io-port pin metal is named in
+  `RouteDb.pin_collisions` — a residual census, still not a
+  search-time error class of its own. Min-area is the one
   rule family with a post-pass: §7's occupancy-strict patch lifts
   sub-bound components along in-plane edges and names what it cannot
   fix in `RouteDb.area_residuals` — residuals the emit gate surfaces
@@ -417,7 +418,14 @@ shape — `route_one_net` paints the single-axis **access stub**
 closing the gap at extraction (the node's x or y lies inside the
 rect's covered range by `project_attach` construction, so the stub
 is always axis-aligned and reaches the pin metal); `NetRoute::
-projected` names every pin connected this way (gcd: 17). A pin with
+projected` names every pin connected this way (gcd: 17). The implied
+stub is committed metal, so admission is occupancy-checked twice:
+`project_attach` scans it against the premark-only occupancy at topo
+time (`Net` marks cannot exist yet), and `try_pin_paint` re-scans
+against live occupancy before painting — the strict `fill_blocked`
+verdict (`Obs` always, foreign `ObsPin`/`Net`/`Pin`) refusing any
+candidate whose only stub must cross a foreign band; refused
+candidates exhaust named, never hang. A pin with
 empty strict *and* projection sets is `Unattachable`.
 
 **Edge classes** — one unified `u32` index space per net:
@@ -456,9 +464,10 @@ equal-`VIA_COST` tie breaks toward the strict arc (CSR order), with
 extraction deduping the placement on `(lower, x, y)`.
 
 **Search** (pathfinder-style tree extension): `NetTopo` is built
-once per net — attach sets, `host_cells`, relaxed vias, and the CSR
-adjacency over the unified index space — and reused across rip-up
-iterations (byte-identical arc order). The tree seeds at the driver
+once per net — attach sets, the `PinCover` hull mask, pin-anchored
+access arcs, relaxed vias, and the CSR adjacency over the unified
+index space — and reused across rip-up iterations (byte-identical
+arc order). The tree seeds at the driver
 pin's attach set (`net_driver`, else the first attachable member in
 `net_pins` order). Each extension round: a unit-weight BFS over all
 arc classes from every unconnected attachable pin's attach set fills
@@ -506,43 +515,56 @@ footprints. Candidate `scan_wire` hits are intervals overlapping
 perpendicular `< s` is guaranteed by the band. A collision sliver
 containing no track line on either axis is the recorded miss class.
 Cut-layer occupancy stays unmodeled (spacing-lite); io-port rects
-now mark `Pin(own_net)` (pre-mark below) — the unmarked class
-produced real emit-time `met3.2` findings the first gate run
-surfaced.
+mark `Pin(own_net)` (pre-mark below) — the unmarked class produced
+real emit-time `met3.2` findings the first gate run surfaced.
 
-Three occupant classes in `hit_verdict`:
+Four occupant classes in `hit_verdict`:
 
 | mark | soft iteration | last iteration (hard) |
 |---|---|---|
-| `Obs(cell)`, `cell ∈ host_cells` | invisible | invisible |
-| `Obs(cell)`, `cell ∉ host_cells` | hard block | hard block |
-| `Obs(u32::MAX)` (net-less pin metal) | hard block | hard block |
+| `Obs(cell)` (OBS clipped against the cell's pin rects), `Obs(u32::MAX)` (net-less pin metal, PDN) | hard block | hard block |
+| `ObsPin(own)` (instance-pin metal) | free | free |
+| `ObsPin(foreign)` | hard block | hard block |
 | `Net(own)` | free | free |
 | `Net(foreign)` | `+(OCC_PENALTY + hist·HIST_STEP)` per distinct foreign net | hard block |
 | `Pin(own)` | free | free |
-| `Pin(foreign)` | same penalty, pooled into the distinct set | **soft — never a block** |
+| `Pin(foreign)` | same penalty, pooled into the distinct set — and recorded (below) | hard block |
 
-The **host-cell carve** is unconditional: `host_cells` is the sorted,
-deduped set of cells hosting the net's member pins, and an
-`Obs(cell)` hit is invisible whenever `cell ∈ host_cells` — the
-rasterized "access shapes ignore own-instance OBS" rule (the earlier
-pin-halo carve left approach edges blocked before the halo was
-reached — measured root cause of 47/48 gcd `NoPath`s). Recorded
-looseness: the net may cross its host cell's OBS anywhere, not just
-near the pin — connectivity-level acceptable; the emit/e2e DRC owns
-the real check. `Pin` never hard-blocks because rip-up cannot move a
-pin — charging it as congestion churns the queue without clearing
-the mark; a foreign wire landing on pin metal is an emit-time
-finding. Macro OBS marks use the **unmerged** `obs_rects_raw` set —
-the `merge_connected_obs` bbox fills the decap/edge gaps pins need.
+The **pin-rect exemption** replaces the old whole-cell carve:
+`premark_obs` clips every cell's OBS paint against the cell's own
+pin rects — the pin-area part becomes an `ObsPin(pin_net)` mark
+(own-free, foreign hard block; instance-pin metal sits inside a hull
+where Magic reports a foreign landing as a subcell overlap, so
+soft-pricing cannot apply), and the residual slabs wall *every* net,
+the host's included — real access keeps full `w/2 + s` clearance to
+non-pin OBS like the delegated routes do.
+
+`Pin` marks (io-port rects, outside every hull) are the asymmetric
+case: rip-up cannot move a port, so the *wire* is the movable party.
+A foreign `Pin` hit is soft-priced like `Net` in soft iterations but
+recorded as a **directed** provisional `Collision` (`a` = the
+committing wire net, `b` = the pin's owning net) that re-queues `a`
+alone — re-queuing the pin's net would churn the queue without
+clearing the mark, and `hist[b]` would escalate unfairly. On the
+last iteration a foreign `Pin` hit is a hard block like `Net`; a
+wire×pin overlap that nevertheless survives is named in
+`RouteDb.pin_collisions` (the `pin_overlap_census`, expected empty —
+an entry is a residual, never hidden). Instance-pin `ObsPin` hits
+stay unrecorded: already a hard block, so a recorded hit would mean
+the edge was never committed, or a bug. Macro OBS marks use the
+**unmerged** `obs_rects_raw` set — the `merge_connected_obs` bbox
+fills the decap/edge gaps pins need.
 
 **Pre-mark** (`premark_obs`, once at `route_nets` start): every
-`{Placed, Fixed, Cover}` cell's `obs_rects_raw` on routing layers →
-`Obs(cell)` (the `drc::geom` source-4 convention — `orient_rect` +
-translate); every member pin's shapes → `Pin(own_net)` — instance
-pins and io-port rects alike, a priced band that never hard-blocks
-(or `Obs(u32::MAX)` when the pin has no net); and every PDN
-`SPECIALNETS` wire rect and via-stack routing-layer rect
+`{Placed, Fixed, Cover}` cell's `obs_rects_raw` +
+`pin_obs_rects` on routing layers, clipped against the cell's own
+pin rects → `Obs(cell)` (the `drc::geom` source-4 convention —
+`orient_rect` + translate); every member pin's shapes →
+`ObsPin(own_net)` for instance pins, `Pin(own_net)` for io-port
+rects, `Obs(u32::MAX)` when the pin has no net (the shared
+`rasterize_pin_marks` rule — `pin_overlap_census` rebuilds exactly
+these marks so the census measures what the router saw); and every
+PDN `SPECIALNETS` wire rect and via-stack routing-layer rect
 (`expand_via`-expanded) → `Obs(u32::MAX)` — signal routes must hold
 the `w/2 + s` band off the power grid, the shapes the emit-time
 self-DRC measures spacing against.
@@ -556,26 +578,32 @@ them).
 **Order and rip-up**: nets route in `join.nets` order. In soft
 iterations the foreign hits a committed edge actually took are
 recorded as provisional `Collision`s deduped on `(a, b, layer, line,
-lo, hi)` with `a < b`. After each round: `bad` = unrouted nets ∪ both
-parties of every provisional collision — and a collision's foreign
-party may be a kept net (committed in an earlier iteration, its marks
-still in `occ`), so `bad[i+1]` need not ⊆ `bad[i]` and `iter_progress`
-is not guaranteed non-increasing; each bad net's marks are
-ripped up and its `hist` escalates — per-net escalation breaks the
-two-net ping-pong cycle. Kept nets stay committed and price later
-re-routes. Cap `MAX_ITERS = 8`; the last iteration runs hard mode and
-its failures become the unrouted report. Each iteration's
-`bad`-set size, committed-route count, and deduped provisional
-`Collision` count are recorded in `RouteDb.iter_stats` (one
-`IterStat` per iteration; the hard iteration always records
-`prov_collisions = 0` since foreign hits block instead of
-reporting). `OccMode::Disabled` (the
+lo, hi)` — foreign-`Net` hits canonically (`a < b`), foreign-`Pin`
+hits *directed* (`a` = wire net, `b` = pin net). After each round:
+`bad` = unrouted nets ∪ both parties of every net×net provisional ∪
+the `a` side only of every wire→pin provisional — and a collision's
+foreign party may be a kept net (committed in an earlier iteration,
+its marks still in `occ`), so `bad[i+1]` need not ⊆ `bad[i]` and
+`iter_progress` is not guaranteed non-increasing; each bad net's
+marks are ripped up and its `hist` escalates — per-net escalation
+breaks the two-net ping-pong cycle. Kept nets stay committed and
+price later re-routes. Cap `MAX_ITERS = 8`; the last iteration runs
+hard mode and its failures become the unrouted report. Each
+iteration's `bad`-set size, committed-route count, and deduped
+provisional `Collision` count (net×net + wire→pin) are recorded in
+`RouteDb.iter_stats` (one `IterStat` per iteration; the hard
+iteration always records `prov_collisions = 0` since foreign hits
+block instead of reporting). `OccMode::Disabled` (the
 fail-proof knob) skips foreign-`Net`/`Pin` checks and collision
-recording entirely; `Obs` still blocks — a fixed blockage is not
-"occupancy". After the cap, `overlap_census` rebuilds every route's
-wire rects and via footprints into a fresh occupancy (no OBS) and
-reports each cross-net pair whose `R + s`-intersect rule violates —
-the exact `RouteDb.collisions` list (`Enabled` only).
+recording entirely; `Obs` and foreign `ObsPin` still block — fixed
+blockage, not "occupancy". After the cap, two post-hoc censuses run
+(`Enabled` only): `overlap_census` rebuilds every route's wire rects
+and via footprints into a fresh occupancy (no OBS) and reports each
+cross-net pair whose `R + s`-intersect rule violates — the exact
+`RouteDb.collisions` list; `pin_overlap_census` rebuilds the route
+`Net` marks plus the `rasterize_pin_marks` premarks and reports each
+wire×`Pin`/`ObsPin` pair the same rule violates — the directed
+`RouteDb.pin_collisions` list.
 
 **Min-area patch** (`patch_net_min_area`, once per committed net
 after the iteration loop — occupancy then holds the final foreign
@@ -594,19 +622,18 @@ checker's `is_drawn` gate). A sub-bound component tries
 `−pref` along adjacent covered nodes on its line — every step is one
 in-plane `g.edges` span, so patch metal stays inside the guide
 region and on-track by construction. A step commits only when
-`scan_wire` reports own-net `Net`/`Pin` hits exclusively —
-**occupancy-strict**: any `Obs` hit (the host-cell carve is not
-inherited; patch metal is optional, not access) or foreign hit stops
-that direction, and the strictness holds even under
-`OccMode::Disabled`. On reaching `union_area ≥ bound` the
-accumulated span commits as one `WireSeg` marked `Net(own)`; the
-layer re-derives because one patch can merge two sub-bound
-components into a cleared union. A component no walk lifts lands in
-`RouteDb.area_residuals` — `AreaResidual{net, layer, region,
-area_dbu2, bound_dbu2}` — the named decline arm: every residual
-maps to a `*.6` self-DRC finding if the gate fires, and a `*.6`
-finding with no matching residual is a model divergence (a bug, not
-a tolerance). Recorded step-domain gap: the walk follows in-plane
+`scan_wire` reports own-net `Net`/`Pin`/`ObsPin` hits exclusively —
+**occupancy-strict**: any `Obs` hit or foreign `Net`/`Pin`/`ObsPin`
+hit stops that direction (patch metal is optional, not access), and
+the strictness holds even under `OccMode::Disabled`. On reaching
+`union_area ≥ bound` the accumulated span commits as one `WireSeg`
+marked `Net(own)`; the layer re-derives because one patch can merge
+two sub-bound components into a cleared union. A component no walk
+lifts lands in `RouteDb.area_residuals` — `AreaResidual{net, layer,
+region, area_dbu2, bound_dbu2}` — the named decline arm: every
+residual maps to a `*.6` self-DRC finding if the gate fires, and a
+`*.6` finding with no matching residual is a model divergence (a bug,
+not a tolerance). Recorded step-domain gap: the walk follows in-plane
 edges only — a component needing off-axis metal or a detour through
 an index gap is residual-bound even when legal metal could reach.
 
@@ -714,9 +741,12 @@ collisions/area_patches/area_residuals/iterations/route_ms`, the
 comma-joined per-iteration series from `RouteDb.iter_stats` (the
 last `iter_prov` entry is always 0 — the hard iteration reports
 no provisionals), one
-`unrouted <name>` line per unrouted net and one `area_residual
+`unrouted <name>` line per unrouted net, one `area_residual
 <net> <layer> area=… bound=… region=…` line per unfixable §7
-component), the informational `wirelength_um` + `via.<cut>`
+component, and — only when non-empty, so a clean census stays
+byte-identical — one `pin_collision <a> <b> <layer> line=…
+iv=[lo,hi]` line per `RouteDb.pin_collisions` survivor), the
+informational `wirelength_um` + `via.<cut>`
 deltas vs `variants.delegated`/`baseline`, and — under `--self-drc`
 — the re-parse→assemble→`run_all` verdict. Under each `unrouted`
 line one `    fail <inst>/<pin> <FailKind>[ region_escape]` line

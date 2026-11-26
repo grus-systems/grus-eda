@@ -937,6 +937,7 @@ if ours_router["emit_log_present"]:
                 or s.lstrip().startswith("unrouted ")
                 or s.lstrip().startswith("unrouted_kinds ")
                 or s.lstrip().startswith("unrouted_blockers ")
+                or s.startswith("pin_collision ")
                 or s.lstrip().startswith("fail ")
                 or s.lstrip().startswith("area_residual ")
                 or s.lstrip().startswith("notch_residual ")
