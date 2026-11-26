@@ -75,23 +75,8 @@ Not goals: sign-off or replacing the reference tools — see the scope note unde
 
 ## Stages
 
-The exact current tolerances and named residuals are in
-[`docs/status.md`](docs/status.md); this table is the map of the implemented
-surface.
-
-| stage | what | checked against | done when |
-|---|---|---|---|
-| E0 | core readers for Liberty (NLDM tables), LEF, DEF, Yosys JSON (preferred) and gate-level Verilog; shared writers for DEF, SPEF, and route guides | OpenROAD and OpenSTA reports on the same files | cell, net, pin and row counts match on every test design |
-| E1 | global-routing congestion estimate (usage ratio per GCell edge, from placed DEF) | OpenROAD `global_route` GCell usage map | per-edge usage-ratio map vs OpenROAD: Spearman ρ ≥ 0.60 and ≥ negative-control null + 0.15, hot-set (ratio ≥ 0.9) overlap ≥ 0.45; the gcd rank-order test stays as a smoke test |
-| E2 | global placement (wirelength plus a density penalty) and Abacus legalization with local refinement | OpenROAD `global_placement` | OpenROAD's legalizer accepts the result; HPWL within 5% |
-| E3 | static timing: arrival, slew, setup and hold — zero-wire, placement-based RC estimation, guide parasitics, and SPEF | OpenSTA | worst slack and every endpoint's arrival within 1% or 5 ps, with documented per-design floors |
-| N7 | power estimation from VCD/SAIF switching activity | OpenROAD/OpenSTA `report_power` | microbenchmark and gcd group totals match within documented tolerances; unsupported annotation/`when` cases are counted |
-| E4 | global routing to OpenROAD-format route guides, plus guide parasitics | OpenROAD `global_route` and `estimate_parasitics -global_routing` | guide overlap and per-net capacitance meet the documented bounds; end-to-end STA residuals are named |
-| E5 | clock-tree synthesis | TritonCTS plus OpenSTA propagated-clock STA | insertion delay, skew, endpoint timing, and buffer census meet the documented bounds or have named residuals |
-| E6 | guide-bounded detailed routing and routed DEF emission | Magic `drc(full)`, OpenROAD detailed routing, and antenna reports | routed DEF re-parses and is deterministic; unrouted pins and violation residuals are named; gcd has zero LEF-expressible violations |
-| E7 | LEF-expressible DRC subset checker | Magic `drc` rule taxonomy and mutation fixtures | zero violations on clean public routed DEFs across the implemented rules; mutations flag exactly the expected rules |
-| E8 | IR drop on extracted PDN meshes | PDNSim `analyze_power_grid` and OpenSTA per-instance power feeds | worst drop/bounce and per-instance voltages meet the documented bounds or named floors |
-| E9 | reporting and usability: critical paths, clock-domain summaries, slack histograms, `--top` ergonomics | OpenSTA `report_checks` and endpoint goldens | path sequences, timing fields, partitions, and histograms match the documented goldens |
+The implemented surface, per-stage done criteria, tolerances actually used, and
+named residuals are consolidated in one place: [`docs/status.md`](docs/status.md).
 
 The `floorplan` command is a utility that generates a starting DEF from a public
 netlist; it is not a reference-checked stage by itself. Readers for SDC, SPEF,
@@ -121,27 +106,10 @@ checksums are also on the
 
 ## Documentation
 
-Start at [`docs/README.md`](docs/README.md) for the reading order.
-
-- [`docs/status.md`](docs/status.md) — Current status per stage: designs covered, tolerances actually used, known gaps
-- [`docs/roadmap.md`](docs/roadmap.md) — Remaining correctness and performance work, including named residuals
-- [`docs/architecture.md`](docs/architecture.md) — Data-oriented design (SoA/CSR), decoupled pipeline, numeric model, and Apple Silicon strategy
-- [`docs/e0-readers.md`](docs/e0-readers.md) — E0: File formats, Yosys JSON vs. Verilog, and Liberty binary caching
-- [`docs/e1-congestion.md`](docs/e1-congestion.md) — E1: GCell grid, RSMT (Steiner tree) decomposition, and pattern/probabilistic routing
-- [`docs/e2-placement.md`](docs/e2-placement.md) — E2: ePlace electrostatic placement, 2D DCT/FFT, and Abacus legalization
-- [`docs/e3-sta.md`](docs/e3-sta.md) — E3: STA in Kahn topological order, NLDM extrapolation, placement-based RC, SPEF, DMP driver model
-- [`docs/e4-guides.md`](docs/e4-guides.md) — E4: Global routing, route-guide emission, and guide parasitics
-- [`docs/e5-cts.md`](docs/e5-cts.md) — E5: Clock-tree synthesis and propagated-clock verification
-- [`docs/e6-drt.md`](docs/e6-drt.md) — E6: Detailed-routing substrate, maze routing, routed DEF emission, and the Magic end-to-end gate
-- [`docs/e7-drc.md`](docs/e7-drc.md) — E7: LEF-expressible DRC subset and Magic taxonomy
-- [`docs/e9-reporting.md`](docs/e9-reporting.md) — E9: Critical-path reporting, clock-domain summaries, slack histograms, and CLI ergonomics
-- [`docs/results.md`](docs/results.md) — Verification log against OpenROAD, OpenSTA, Magic, and PDNSim
-- [`docs/benchmarks.md`](docs/benchmarks.md) — Runtime measurements by stage, extracted from the verification log
-- [`docs/history/`](docs/history/README.md) — Per-step design documents, implementation tickets, and the 2026-11-11 project review (records, not current guidance)
-
-E8 IR drop and N7 power estimation do not yet have consolidated stage documents;
-their current evidence and residuals are in `docs/status.md`, `docs/results.md`,
-and `docs/roadmap.md`.
+[`docs/README.md`](docs/README.md) gives the reading order. The entry points:
+[`docs/status.md`](docs/status.md) for current status per stage,
+[`docs/benchmarks.md`](docs/benchmarks.md) for runtime measurements,
+[`docs/results.md`](docs/results.md) for the full verification log.
 
 ## Dependencies
 
