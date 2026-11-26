@@ -1,66 +1,66 @@
-# Docs edits — `docs/e6-drt.md` + `docs/results.md`
+# Docs edits — `docs/e6-drt.md` + `docs/results.md` + `docs/status.md`
+
+The implementation commit already wrote the §5 mechanism paragraph,
+the §8 `fail`-line format, and the `results.md`/`status.md` entries.
+The revision corrects three claims and adds one token.
 
 ## `docs/e6-drt.md`
 
-1. **§5 escape-classes paragraph (~L269–293)** — after the
-   "Router implication" paragraph, add the mechanism paragraph:
-   `escape_extend` stage (between `transit_extend` and node
-   emission), the contiguous `pin_layer..=first_unmasked` halo rule,
-   the bounded L-corridor + `EscapeCfg` constants with their
-   rationale, and the pre-halo `region_escape` semantics. Update the
-   closing sentence — "the remaining recorded gap" now includes the
-   bounded-escape mechanism and its named refusal records.
-2. **§7 attach ladder** — one paragraph after the `access_vias`/
-   projection description noting that halo pairs enter `region`
-   pre-emission, so strict/proj/access/`relaxed_vias` all see escape
-   nodes with no maze-side code, and occupancy checks apply
-   identically (no exemption path exists).
-3. **§8 census format (~L752)** — extend the `fail` line doc:
-   `    fail <inst>/<pin> <FailKind>[ region_escape][ escape=<token>]`
-   with the five token shapes (`reporting.md` §1), and one sentence
-   on `RouteGraphs.escapes` as the graph-side census.
-4. **§4 claim boundary** — if the routed-vs-clean claim text still
-   describes escapes as unrescueable, amend to "bounded halo rescue
-   or named refusal".
+1. **§5 outcome sentence** — the paragraph ends "…the refused kinds
+   add nothing for that pin, so `pin_nodes` stays empty →
+   `Unattachable`." Wrong as a rule: empty `pin_nodes` yields
+   `Unattachable` **only when every route-time attach rung is also
+   empty** — a pin whose `transit_extend` island (planted for every
+   member-pin host, escape switch or not) still lands an
+   `access_vias` `b`-arc attaches and fails `NoPath` instead.
+   Rewrite the tail as: refused kinds add no pairs; the pin's final
+   `FailKind` follows the route-time attach ladder —
+   `Unattachable` when every rung is empty, `NoPath` when a
+   transit-island/projection/access landing survives (the fixture's
+   escape-off arm is the latter).
+2. **§5 outcome list** — add `no_anchor` (no non-halo region pair
+   on any escape layer — the corridor had no target; replaces the
+   `u32::MAX`-span `CorridorBound` case). Note the span probe is a
+   bounded windowed enumeration (`cap = corridor_lines` for
+   candidates, uncapped on the refusal path for the exact recorded
+   gap), not a grid BFS.
+3. **§5 occupancy sentence** — extend "(no exemption path)" with:
+   proven by the fixture's `OccMode` enabled-vs-disabled arm on a
+   foreign `Pin` band that geometrically covers only escaped pairs
+   (`Obs`/`ObsPin` cannot contrast — they hard-block before the
+   `Disabled` check).
+4. **§8 `fail`-line token list** — add `escape=no_anchor`; keep
+   `corridor_bound(span=N)` and state N is the measured gap
+   (uncapped refusal probe, never a sentinel).
 
-## `docs/results.md` — dated entry template
+## `docs/results.md` — amend the 2026-11-26 entry
+
+1. **Fixture line, corrected in place.** The committed entry says
+   "escape off → `Unattachable` + `region_escape`" — the test
+   asserts `NoPath` and the router semantics agree (fixture.md §
+   "Why escape-off is NoPath"). Replace with `NoPath` +
+   `region_escape` and one clause naming the transit-island
+   `access_vias` landing; mark it as a review-driven correction.
+2. **Append the revision paragraph:**
 
 ```
-## 2026-XX-XX — drt-guide-escape (bounded pin halo)
-
-Re-baseline (post-e6-drt-e2e, worktree HEAD): gcd unrouted=81
-(NoPath=46 Unattachable=52), 17 graph-build escapes pinned by name,
-2 final `fail ... region_escape` lines (_134_/_301_/B1,
-_138_/_307_/B1). Per-pin gap probe: <step-0 finding — which layer
-lacked nodes>.
-
-Mechanism: `escape_extend` graph-build pass — halo
-(pin_bbox ⊕ ESCAPE_HALO=2 idx steps on pin_layer..=first_unmasked,
-point_allowed-filtered) + bounded L-corridor (ESCAPE_CORRIDOR=8 idx
-steps). EscapeCfg switch; region_escape keeps pre-halo semantics.
-
-Post-run (gcd, release):
-- escapes records: Halo=<n> CorridorBound=<n> CorridorMasked=<n>
-  HaloEmpty=<n>; pairs added=<n>; corridor spans max=<n>
-- unrouted=<n> (delta vs 81: <names of recovered/new-failed nets>)
-- projected=<n> (delta vs baseline), stub_outside_cover=<n> (delta
-  vs 142)
-- digest 0x<old> → 0x<new>; routed DEF sha <old> → <new> (regenerated
-  host-side via generate_drt_ours.sh)
-- graph census re-pins: nodes <a>→<b>, edges <a>→<b>, via_edges
-  <a>→<b>
-- fixture: red (escape off → Unattachable+region_escape) → green;
-  arm C enabled/disabled occupancy contrast <result>
-- self-DRC on gcd emit: findings_total=<n> (<named residual if >0>)
-- picorv32: graph-level escape census <counts>; emit leg deferred
-  <decision>
-- runtime: <route wall delta if measurable>
-- known staleness: gcd.drt.ours.reference.json cli_lines predate the
-  `escape=` suffix — internal-join gate stays green; regeneration
-  is a container leg, deferred/approved <state>.
+**Review revision** (same ticket): the contract fixes — escape-off
+fails `NoPath` (transit-island access landing), not `Unattachable`;
+`EscapeKind::NoAnchor` names the no-target case (was a `u32::MAX`
+span); `pairs_added` counts distinct inserted pairs (was
+double-counting the corridor layer's halo); `escape_span` is a
+bounded windowed enumeration (was an `nx×ny` BFS + allocation per
+escaped pin per layer — identical spans, bounded work).
+Arm F occupancy contrast: <enabled NoPath / disabled routed
+measured>; kind census re-print: gcd <…>, picorv32 <…> (deltas vs
+{halo:7, halo_empty:10} / {halo:425, corridor_masked:9,
+halo_empty:158} named by pin); graph census pins <moved/unchanged>;
+routed DEF sha <unchanged | old→new>.
 ```
 
 ## `docs/status.md`
 
-Only the E6 row, and only if `unrouted`/routed or a named residual
-number actually moved.
+In the v0.13.0 blurb (unreleased, edit in place): the token list
+becomes `halo`/`corridor_bound`/`corridor_masked`/`no_anchor`/
+`halo_empty`; no other named number moves unless the re-measure says
+so.

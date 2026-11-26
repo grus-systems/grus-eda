@@ -4,10 +4,10 @@
 
 A pin whose metal lies outside its guide region has no legal attach
 point: graph build records `RegionEscape`, the attach ladder finds
-nothing, and the pin fails `Unattachable` — or its in-region attach
-nodes are sealed by OBS and it fails the same way. The guide is
-advisory; a pin a few track lines outside its box is recoverable
-geometry, not a hard error.
+nothing, and the pin fails `Unattachable`/`NoPath` — or its
+in-region attach nodes are sealed by OBS and it fails the same way.
+The guide is advisory; a pin a few track lines outside its box is
+recoverable geometry, not a hard error.
 
 ## Re-baseline verdict (post-`e6-drt-e2e` dev, measured at this
 worktree's HEAD `72dcc9c`)
@@ -63,9 +63,9 @@ Remaining class decomposition:
 
 ## Mechanism decision
 
-**Bounded halo + bounded corridor at graph build** — a new
-`escape_extend` pass inside `build_route_graphs_ext`, between
-`transit_extend` and node emission (`mechanism.md`):
+**Bounded halo + bounded corridor at graph build** — `escape_extend`
+inside `build_route_graphs_ext`, between `transit_extend` and node
+emission (`mechanism.md`):
 
 - For each member pin with no strict attach on the post-transit
   region (exactly today's `region_escape` set — pre-halo semantics
@@ -81,15 +81,16 @@ Remaining class decomposition:
   pattern with a bound); refused corridors are recorded, not retried.
 - Every strict-escape pin gets an `EscapeRecord`
   `{net, pin, kind, pairs_added, corridor_span}` on
-  `RouteGraphs.escapes`; `EscapeKind` = `Halo | CorridorBound |
-  CorridorMasked | HaloEmpty`.
+  `RouteGraphs.escapes`; `EscapeKind` =
+  `Halo | CorridorBound | CorridorMasked | NoAnchor | HaloEmpty`.
 
 Occupancy is **unchanged**: halo/corridor pairs are ordinary
 `region` entries — nodes, edges, via edges, `edge_cost`, extraction,
 `commit_route` rasterization and the collision censuses all apply
 identically. "Escaped geometry is occupancy-checked like normal
-metal" holds structurally, not by audit (`fixture.md` arm C proves
-it red/green).
+metal" holds structurally — and is now proven by the fixture's
+`OccMode` enabled-vs-disabled arm (`fixture.md` arm F), not only by
+audit.
 
 Rejected alternatives:
 
@@ -106,7 +107,59 @@ Rejected alternatives:
 - **Unbounded corridor** (`transit_extend`-style): a corridor is a
   silent guide rewrite — an arbitrarily long escape path turns a
   real guide miss into unbounded paint. The bound keeps the failure
-  named: `corridor_bound(span)` instead of painted-through.
+  named: `corridor_bound(span=N)` instead of painted-through.
+
+## Review revision (2026-11-26)
+
+The first design pass diverged from the landed implementation in
+four places; the contract is corrected here (same class as the
+converge-stats revision — the design document is the contract):
+
+1. **Escape-off `FailKind`: `NoPath`, not `Unattachable`.** The old
+   fixture.md predicted `Unattachable`; the correct outcome is
+   `NoPath`. With escape off, the strict-escape pin holds no strict
+   node — but `transit_extend` plants the host-hull interior pairs
+   on the first unmasked layer *for every member-pin host
+   regardless of the escape switch*, and the route-time
+   `access_vias` rung lands `b` on that transit-island node inside
+   the pin's own hull → `attachable` holds → the wave dies on the
+   one-node island → `NoPath`. `Unattachable` is only the outcome
+   when *every* attach rung is empty (e.g. an io-port pin with no
+   host hull, hence no transit island, and no projection/access
+   landing). fixture.md, `docs/e6-drt.md`, and the `results.md`
+   fixture line are amended to say so (`docs.md`).
+2. **Occupancy arm restored (fixture arm F).** The old arm C —
+   the `OccMode` enabled-vs-disabled contrast proving escaped metal
+   is occupancy-checked — was dropped in implementation and the drop
+   undocumented. It is feasible and specced in `fixture.md`: the
+   band must be a foreign **`Pin`** or **`Net`** mark, because
+   `hit_verdict` (`maze.rs` ~L850) returns `None` for `Obs` and
+   foreign `ObsPin` *before* the `Disabled` check — those classes
+   hard-block in both modes and give no contrast. A foreign io-port
+   `Pin` rect on met2 covering exactly the escaped-pair column gives
+   enabled `NoPath` vs disabled routed.
+3. **`pairs_added` counts the union.** On the corridor-landed arm,
+   `halo_total + extra.len()` double-counts the corridor layer's
+   halo pairs (`extra = path ∪ halo[layer]`). The record's contract:
+   `pairs_added` = the number of *distinct* pairs inserted into
+   `region`; the fixture's landing arm pins the exact count (`== 3`
+   for the fixture geometry; the old arithmetic reported 4).
+4. **`escape_span` is a bounded enumeration, not a grid BFS.**
+   Distance on an unobstructed 4-connected index grid *is*
+   Manhattan distance — the multi-source BFS over `nx × ny` (with a
+   `vec![u32::MAX; nx*ny]` allocation per escaped pin per layer)
+   computed nothing more. The probe enumerates `region` pairs once,
+   pruning each `v` in O(1) by its distance to the halo bbox, and
+   takes a `cap`: corridor candidates probe with `cap = bound`
+   (work bounded by `corridor_lines`, the early exit); the refusal
+   path re-probes uncapped so `CorridorBound` records the *exact*
+   measured gap (`mechanism.md` §4).
+5. **`EscapeKind::NoAnchor` for the no-target case.** "No non-halo
+   region pair on any escape layer" was folded into `CorridorBound`
+   with `corridor_span = u32::MAX`, which rendered
+   `corridor_bound(span=4294967295)` on fail lines. The explicit
+   kind records `corridor_span = 0` and renders `escape=no_anchor`
+   (`mechanism.md` §5, `reporting.md`).
 
 ## Honesty contract
 
@@ -117,27 +170,32 @@ Rejected alternatives:
   `escape=<kind>` on its `fail` line (`reporting.md`).
 - Successful escapes are ordinary routed metal — no emit-side
   special-casing, no census exemption.
-- The fixture proves red (escape off ⇒ `Unattachable` +
-  `region_escape`) before the mechanism lands, and proves occupancy
-  applies to escaped metal (arm C, enabled-vs-disabled contrast).
+- The fixture proves red (escape off ⇒ `NoPath` + `region_escape`)
+  before the mechanism lands, and proves occupancy applies to
+  escaped metal (arm F, enabled-vs-disabled contrast on a band that
+  geometrically can only intersect escaped pairs).
 - The OBS-walled class stays a named residual — measured in the
   census delta, not silently folded into this mechanism's claims.
 
 ## Files
 
-- `crates/grus-core/src/drt/graph.rs` — `EscapeKind`/`EscapeRecord`,
-  `RouteGraphs.escapes`, `escape_extend`, `GraphOpts`/`EscapeCfg`,
-  region_escape push condition.
-- `crates/grus-core/src/drt/maze.rs` — nothing in the wave; only if
-  the fixture needs a seam (expected: none).
-- `crates/grus-eda/src/main.rs` — `fail`-line `escape=` suffix join.
-- `crates/grus-core/tests/drt.rs` — `test_maze_guide_escape` fixture,
-  `test_pin_attachment` escape-arm update, graph census re-pins.
-- `tests/designs/recount_unrouted.py` — `fail`-line parser for the
-  new suffix.
-- `tests/designs/gcd/gcd.drt.ours.routed.def` — regenerate if routes
-  move (`steps.md` §6; host leg, `generate_drt_ours.sh gcd`).
-- `docs/e6-drt.md` — attach-ladder stage + census paragraph.
-- `docs/results.md` — dated entry.
-- `docs/status.md` — only if a named number moves.
-- `Cargo.toml` — `workspace.package` patch bump.
+- `crates/grus-core/src/drt/graph.rs` — `EscapeKind::NoAnchor` +
+  `token()` arm, `escape_span` bounded-enumeration rewrite,
+  `pairs_added` union count, refusal-path uncapped probe.
+- `crates/grus-core/tests/drt.rs` — `test_maze_guide_escape` arm F
+  (`ESC_DEF_TAIL_OCC` + the io4/n2 met2 `Pin` band; enabled-vs-
+  disabled contrast), landing-arm `pairs_added == 3`,
+  `test_region_escape_fixture` empty-guide arm → `NoAnchor`,
+  `test_pin_attachment` refused-kinds match arm.
+- `docs/e6-drt.md` — §5 outcome list (`no_anchor` + the
+  `Unattachable`/`NoPath` correction), §8 `fail`-line token list.
+- `docs/results.md` — amend the 2026-11-26 fixture line
+  (`Unattachable` → `NoPath`, with the transit-island reason) and
+  append the revision paragraph (`docs.md`).
+- `docs/status.md` — the v0.13.0 blurb's token list (`no_anchor`).
+
+No `maze.rs`, `main.rs`, or `recount_unrouted.py` changes: arm F is
+test-side (`MazeConfig.occ`), `token()` lives next to `EscapeKind`,
+and the parser already accepts any `escape=` suffix. No version
+bump: the workspace is at the unreleased `0.13.0` on this branch —
+the added enum variant rides the same breaking bump.
