@@ -6,6 +6,8 @@ members = ["crates/grus-core", "crates/grus-eda"]
 version = "0.12.14"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/grus-systems/grus-eda"
+homepage = "https://eda.grus.systems"
 
 [workspace.dependencies]
 anyhow = "1"
