@@ -2185,6 +2185,12 @@ fn guide_union_connected(boxes: &[GuideBox], max_layer: u8) -> bool {
         == 1
 }
 
+/// Recorded gcd route digest (`docs/results.md` `drt-occupancy-ds`
+/// entry): a `route_digest` drift means the routed geometry, the
+/// connectivity record, or the iteration stats changed — the pin for
+/// any router/occupancy data-structure rewrite.
+const GCD_ROUTE_DIGEST: u64 = 0x8a4768ab15bd4bd5;
+
 /// The connectivity census: every guided signal net either routes all
 /// member pins or lands in the unrouted report with every failed pin
 /// named (`FailKind`). Prints the counts `docs/results.md` records —
@@ -2253,6 +2259,16 @@ fn maze_census(name: &str) {
                 .map(|&(p, k)| format!("{}:{k:?}", pin_label(&db, p)))
                 .collect();
             println!("  unrouted {} pins={kinds:?}", net_name(&db, u.net));
+        }
+
+        // Occupancy data-structure pin: the route output must be
+        // byte-identical across the `BTreeMap` → `Vec<Line>` swap.
+        if name == "gcd" {
+            assert_eq!(
+                route_digest(&r),
+                GCD_ROUTE_DIGEST,
+                "gcd route digest drifted"
+            );
         }
 
         // Total accounting — no silent drops.

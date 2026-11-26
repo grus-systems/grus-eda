@@ -10560,3 +10560,75 @@ layer, not engine state (D5).
 - **Checks run** (E0 rule 9): `cargo test --workspace --profile
   verify` (all green; 3 `#[ignore]`d picorv32 legs), `cargo clippy
   --workspace --all-targets -- -D warnings` clean.
+
+### 2026-11-27 — drt-occupancy-ds: dense track-indexed `Vec<Line>` occupancy (v0.14.2)
+
+The external profiling review put the maze router's occupancy scans at
+~70% of gcd route time and named the per-layer `BTreeMap<i32, Line>`
+keying as the suspect. `Occupancy.lines_x`/`lines_y` are now
+`Vec<Line>` indexed by track position — rasterization only ever
+touches track lines, so the key domain is dense — with the sorted
+coordinate lists `coords_x`/`coords_y` held alongside for `Hit.line`
+reconstruction and the `scan_rect`/`rasterize` window
+`partition_point`s. `scan_wire`/`scan_stub`/`edge_collisions` pass a
+track index instead of a coordinate; `rasterize` and `commit_route`
+no longer take `tracks` (`Occupancy::new` owns the lists). `Mark`
+carries `line_idx: u32` instead of `line: i32`. The `Line` contents
+(`lo`-sorted `ivs`, `SKIP_CHUNK` skip index) are unchanged.
+
+- **Query-shape census** (`GRUS_DRT_TIMING`, new `ScanStats` counters,
+  emission-gated only): gcd emits `occ-scan totals wire=91222700
+  rect=74133685 rect_lines=390472123 ivs=3092862215 hits=98384624
+  marks+=100528 marks-=11596` — 165 M scans, 5.3 lines per `scan_rect`,
+  ~18.7 intervals per scan. The small per-line windows are why the
+  tree-node walk dominated: it is eliminated, not amortized.
+- **Identity proof**: gcd route digest **byte-identical**
+  `0x8a4768ab15bd4bd5` before and after (new `GCD_ROUTE_DIGEST` pin in
+  `test_maze_census`); emitted DEF sha256
+  `27f7665922c6df0212788f27b73f562d078e5bebdd47446eb1f933a469122aee`
+  identical to golden `tests/designs/gcd/gcd.drt.ours.routed.def` on
+  all 5 after-runs; census `guided=269 routed=189 unrouted=80
+  collisions=0 iterations=8` unchanged.
+- **Runtime** (`route_ms` from the `guided=` census field, 5 reps
+  each, same release binary flags
+  `--tlef … --lef … --def gcd.placed.def --guide gcd.guide
+  --reference … --no-self-drc`):
+  | | rep1 | rep2 | rep3 | rep4 | rep5 | median |
+  |---|---|---|---|---|---|---|
+  | before (`BTreeMap`) | 12628 | 12634 | 12656 | 12670 | 12691 | **12656** |
+  | after (`Vec<Line>`) | 11960 | 11939 | 11963 | 11945 | 12001 | **11960** |
+  Median −696 ms = **−5.5%** — a real but modest win, not the ~70%
+  the review's share attribution suggested: the eliminated work is
+  the per-query `BTreeMap::get`/`range` descent, and the `ivs` chunk
+  scan it guarded is unchanged and still dominant.
+- **`sample` attribution** (8 s, ~1 ms cadence, release binary): the
+  scan class (`scan_rect` + `scan_wire` + BTreeMap range internals)
+  went 4364/6081 = **71.8%** before → (`scan_rect` + `scan_wire`,
+  BTreeMap frames gone entirely) 4152/6015 = **69.0%** after —
+  `find_leaf_edges_spanning_range` (1367 samples before) no longer
+  appears; its cost moved into `scan_rect`'s now-cheaper slice walk.
+- **`test_occupancy_differential`** (new): the pre-swap BTreeMap
+  implementation kept verbatim as `RefOccupancy` — a seeded
+  (xorshift64*, 2 seeds × 5000 ops) stream of
+  rasterize/unmark/scan_wire/scan_rect on 4 layers with
+  uniform/irregular/empty-axis track lists must produce identical
+  `Hit` sequences order-included; deliberate arms cover no-line
+  bands, unmark-all-reinsert, duplicate `iv` inserts, and
+  re-unmarking dead marks.
+- **Prove-it-red** (AGENTS §7.7): `scan_rect` y-window `ay..by` →
+  `(ay+1)..by` went red on the differential test; dropping the
+  `iv.perp_hi > re.yl` conjunct went red; `GCD_ROUTE_DIGEST` +1 made
+  `test_maze_census` fail as asserted — all three restored and
+  re-verified green.
+- **Counter delta note**: `rect_lines_visited` rose 390.5 M → 417.1 M
+  — `BTreeMap::range` visited only lines that held marks while the
+  slice walk visits every track index in the window (empty slots
+  cost one bounds check each). `ivs` visited is unchanged
+  (3092862215 both sides) — the interval-level work is identical.
+- **Checks run** (E0 rule 9): `cargo test --workspace --profile
+  verify` all green — 558 lib (incl. `test_occupancy_differential`)
+  + 32 drt (incl. the `GCD_ROUTE_DIGEST` pin in `test_maze_census`)
+  + 18 drc + 8 cli + 2 irdrop, 5 `#[ignore]`d; `cargo clippy
+  --workspace --all-targets -- -D warnings` clean. picorv32 legs stay
+  `#[ignore]`d (~135 min, not re-measured — digest/DEF pins carry
+  the identity proof on gcd).
