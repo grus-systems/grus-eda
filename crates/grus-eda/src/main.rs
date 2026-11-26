@@ -2063,9 +2063,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let join = grus_core::drt::graph::join_guides(&design_db, tech_db, &parsed)?;
             let tracks = grus_core::drt::tracks::layer_tracks(&design_db, tech_db);
             // One spare layer above each net's topmost guided layer —
-            // the OBS-sealed pin-pocket escape (`docs/e6-drt.md` §7).
+            // the OBS-sealed pin-pocket escape (`docs/e6-drt.md` §7) —
+            // plus the bounded pin-halo escape for pins whose metal
+            // lies outside the guide region (`docs/e6-drt.md` §5).
             let graphs = grus_core::drt::graph::build_route_graphs_ext(
-                &design_db, tech_db, &tracks, &join, 1,
+                &design_db,
+                tech_db,
+                &tracks,
+                &join,
+                grus_core::drt::graph::GraphOpts {
+                    spare_above: 1,
+                    escape: Some(grus_core::drt::graph::EscapeCfg::DEFAULT),
+                },
             );
             let vias = grus_core::drt::via::via_table(tech_db, &design_db)?;
 
@@ -2190,6 +2199,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .iter()
                 .map(|e| (e.net.0, e.pin.0))
                 .collect();
+            // What the pin-halo escape did per strict-escape pin —
+            // joined onto the `fail` line as `escape=<token>`.
+            let esc_records: std::collections::BTreeMap<(u32, u32), &grus_core::drt::graph::EscapeRecord> =
+                graphs
+                    .escapes
+                    .iter()
+                    .map(|e| ((e.net.0, e.pin.0), e))
+                    .collect();
             for u in &route_db.unrouted {
                 println!(
                     "  unrouted {}",
@@ -2201,7 +2218,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     } else {
                         ""
                     };
-                    println!("    fail {} {k:?}{esc}", pin_label(&design_db, p));
+                    let tok = match esc_records.get(&(u.net.0, p.0)) {
+                        Some(r) => format!(" escape={}", r.token()),
+                        None => String::new(),
+                    };
+                    println!("    fail {} {k:?}{esc}{tok}", pin_label(&design_db, p));
                 }
             }
             for &(net, pin) in &route_db.stub_outside_cover {
