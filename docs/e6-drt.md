@@ -719,13 +719,17 @@ cache's byte-identical arcs. Two full runs produce identical
 
 **Instrumentation**: `GRUS_DRT_TIMING` (any value) makes `route_nets`
 print premark/topo/per-iteration/per-slow-net timings to stderr —
-opt-in, zero cost unset; it feeds `docs/results.md` runtime evidence.
-The same flag also appends the `ScanStats` query census per
-iteration and an `occ-scan totals` line at route end (`wire`/`rect`
-call counts, lines and intervals visited, hits pushed, marks
-inserted/removed) — counting is unconditional `Cell` bumps (below
-timer noise), only the emission is gated; the totals record the
-query shape behind the `Vec<Line>` pick in `docs/results.md`.
+opt-in emission, zero printing cost unset; it feeds
+`docs/results.md` runtime evidence. The same flag also appends the
+`ScanStats` query census per iteration and an `occ-scan totals`
+line at route end (`wire`/`rect` call counts, lines and intervals
+visited, hits pushed, marks inserted/removed). The counting itself
+is unconditional `Cell` bumps inside every scan — not zero-cost
+(billions of per-interval increments on gcd) but a handful of
+single-thread adds per query, measured below timer noise against
+the BTreeMap work being replaced; only the emission is gated. The
+totals record the query shape behind the `Vec<Line>` pick in
+`docs/results.md`.
 Separately, `route_nets_with_progress` emits a `RouteProgress`
 snapshot per attempted net to an opt-in sink; `grus-eda drt` wires
 that sink to stderr and prints `drt: iter N nets k/q unrouted=u
