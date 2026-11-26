@@ -1,113 +1,114 @@
-# drt-converge-stats — Steps
+# drt-converge-stats — Steps (r2, continuation)
 
-Observability ticket; no routing-behavior change. `e6-drt-e2e` has
-landed (v0.12.7/v0.12.9) — the `maze.rs` line numbers below are
-the current state. Keep the diff to the listed touches.
+Observability ticket; no routing-behavior change. HEAD is wip
+checkpoint ca053ac — the r1 driver timed out *after* committing
+the full code surface, so this plan is evidence + verify only.
+**Do not re-implement anything in §1** — it is a read-only
+reconciliation of the memo's "remaining" list against the tree.
 
-## 1. `maze.rs` — model + collection + digest
+## 1. Reconcile the memo's remaining list (read-only, no edits)
 
-- Add `IterStat` above `RouteDb` (~194) and `iter_stats:
-  Vec<IterStat>` on `RouteDb` after `iterations` (~205) —
-  `model.md` for comments/semantics.
-- In `route_nets` (~3727-3814): declare `let mut iter_stats =
-  Vec::new();` beside `unrouted`; per loop body — `let attempted
-  = bad.len() as u32;` after `iterations = it;`, `let mut routed
-  = 0u32;` beside `prov`/`failed`, `routed += 1;` in the
-  `Routed` arm, and `iter_stats.push(IterStat { attempted,
-  routed, prov_collisions: prov.len() as u32 });` **after** the
-  per-net `for` closes and **before** `if hard { … break; }`.
-- Store `iter_stats` in the `RouteDb` literal (~3856).
-- `route_digest` (~4026): append the len + per-entry triples
-  after `put(routed.iterations)` (`digest.md`).
+Confirm each item matches its design spec — all landed at ca053ac:
 
-## 2. `drt.rs` — re-export
+- [ ] `IterStat` + `RouteDb.iter_stats` + loop collection +
+      ctor — `maze.rs:194-231, 3755, 3763, 3768, 3776, 3809-3813,
+      3899`; re-export `drt.rs:21` (`model.md`)
+- [ ] Emit census lines `iter_progress=`/`iter_prov=` after
+      `guided=…` — `main.rs:2084-2104` (`output.md`)
+- [ ] Digest serialization appended after
+      `put(routed.iterations)` — `maze.rs:4061-4067` (`digest.md`;
+      memo ruling: keep it, touch no existing input)
+- [ ] Census-pinning asserts + digest fail-proof —
+      `tests/drt.rs:1641-1653, 1680-1716, 1821-1838`
+- [ ] keep-list arms — `check_drt_ours.sh:935-936`
+- [ ] `docs/e6-drt.md` §7/:562-569 + §8/:709-713,
+      `docs/status.md`, `Cargo.toml` 0.12.11
+- [ ] `docs/results.md` dated entry — gcd census + emit-leg
+      verbatim + digest move + fail-proof + consumers all
+      recorded; only the picorv32 arm is pending (§2)
 
-Add `IterStat` to the `pub use maze::{…}` list (~20-23).
+If any item has drifted from the spec, fix the spec deviation —
+do not redesign.
 
-## 3. `main.rs` — census lines
+## 2. picorv32 census leg (the only open evidence)
 
-After the `guided=…` `println!` (~2083), before the
-`unrouted_kinds` computation: two `println!`s emitting
-`iter_progress=<attempted,…>` and `iter_prov=<prov_collisions,…>`
-— `route_db.iter_stats` comma-joined (`output.md` grammar).
-Match the block's fully-qualified style.
+The acceptance's "gcd/picorv32 iteration profile" needs the
+picorv32 `iter_progress`/`iter_prov` series in `docs/results.md`.
+~135 min release — over the 7200 s per-invocation bound, so run
+detached and poll across commands:
 
-## 4. `tests/drt.rs`
+```
+# 1. build once so the cargo lock window stays short
+cargo test --release -p grus-core --test drt --no-run
+# 2. detached run, output to a log outside the repo
+nohup cargo test --release -p grus-core --test drt \
+    test_maze_census_picorv32 -- --ignored --nocapture \
+    > /tmp/drt-pico-census.log 2>&1 &
+# 3. poll `tail /tmp/drt-pico-census.log` between other steps for
+#    `picorv32: iter_progress=… iter_prov=…`
+```
 
-- `maze_census`: print `{name}: iter_progress=… iter_prov=…`
-  after the census line; assert the `model.md` invariants.
-- New `test_route_digest_covers_iter_stats` (`digest.md`).
-- Extend the `maze::{…}` import with `IterStat`.
+Launch this **first** so it overlaps §3's verify. Inputs are in
+place (`tests/designs/picorv32/` seeded by `worktree_seed`;
+`load_routed_inputs("picorv32")` reads them). The test also runs
+the landed `iter_stats` invariant asserts — a red leg is a real
+failure, not a doc gap.
 
-## 5. `check_drt_ours.sh` — keep-list
+When the series lands, edit the results.md entry's pending
+paragraph ("picorv32 leg … running detached"): splice the
+verbatim `picorv32: iter_progress=… iter_prov=…` line plus a
+one-sentence reading (prior record: `unrouted=2016` at the cap —
+the series says whether that tail was still falling or flat).
+Extend "What ran" with the leg command.
 
-Add `or s.startswith("iter_progress=") or
-s.startswith("iter_prov=")` to the step-E `cli_lines` keep-list
-(~934). No regex, schema, or golden change (`output.md` §1).
-
-## 6. Verify
+## 3. Workspace verify (per `workflow.toml`, memo's closing item)
 
 ```
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build --release -p grus-eda
 ```
 
-## 7. Evidence legs (each recorded in `docs/results.md`)
+Dev-profile drt tests measured ~2196 s on an M4 host — fits the
+7200 s bound. Run even though results.md records green from r1:
+the memo asks for a fresh full verify on the final tree. If green,
+the results.md "What ran" claim stands as written.
 
-- **gcd census** — `cargo test --release -p grus-core --test drt
-  test_maze_census -- --nocapture`: record `iter_progress` /
-  `iter_prov` series and the new `digest=` value (the digest
-  changes by construction — `digest.md`; record it, do not pin
-  it anywhere).
-- **gcd emit run** — release `grus-eda drt` on
-  `gcd.placed.def` + `gcd.guide` into a scratch `--out-def`
-  (~15 s route): capture the two new census lines verbatim into
-  the results entry; confirm `iter_progress` entry count ==
-  `iterations=`.
-- **Fail-proof** (E0 rule 7) — the
-  `test_route_digest_covers_iter_stats` gate is itself the proof
-  the stats reach the digest; additionally break the loop push
-  on a scratch edit and confirm `maze_census`'s
-  `len() == iterations` assert goes red, then restore.
-- **picorv32 profile** — `cargo test --release -p grus-core
-  --test drt test_maze_census_picorv32 -- --ignored --nocapture`
-  — the ~2 h ignored leg; run detached, record its
-  `iter_progress`/`iter_prov` series in the results entry. This
-  is the acceptance-required "picorv32 iteration profile" and
-  the run that actually exercises a non-trivial tail (2,016
-  unrouted at the cap on the last record).
-- **Consumers** — `recount_unrouted.py gcd` still exits 0;
-  eyeball that a `cli_lines` regen would carry the lines (no
-  regen this ticket).
+## 4. Commit
 
-## 8. Docs + version + commit
-
-- `docs/e6-drt.md` §7/§8 sentences (`output.md` §4).
-- `docs/results.md`: dated entry — the two series for
-  gcd/picorv32, new gcd digest, keep-list note, what ran.
-- `docs/status.md`: one-line update.
-- `Cargo.toml`: `[workspace.package] version` `0.12.10 →
-  0.12.11` (feature → patch on 0.x), same commit.
-- Commit: `feat: Per-iteration convergence stats in drt census`
-  (Conventional, English, agent trailer).
+- If the picorv32 leg landed: one docs commit —
+  `docs: Record picorv32 iter_progress series for
+  drt-converge-stats` (English, agent trailer). No version bump:
+  the feature bump 0.12.10 → 0.12.11 is already in ca053ac and a
+  docs-only delta needs none.
+- If the leg is still running when §3 finishes: leave the
+  results.md pending paragraph as written, note in the card that
+  the picorv32 acceptance box stays open (same convention as the
+  deferred picorv32 emit legs). No commit — the tree already
+  matches ca053ac.
 
 ## Contingencies
 
-- **picorv32 leg impractical in-session** — run it detached
-  before commit if feasible; otherwise land the code with the
-  gcd profile recorded and the picorv32 arm named as pending in
-  `results.md` (same convention as the deferred picorv32 emit
-  legs), and flag that the acceptance box stays open until the
-  series is recorded.
+- **Leg fails or panics** — treat as a real defect: the failing
+  assert's message names which invariant broke; fix only that,
+  re-verify, re-run the leg.
+- **Leg cannot complete in-session** — the pending paragraph is
+  the documented fallback; flag the open acceptance box in the
+  card rather than faking a profile.
+- **Cargo lock contention** between the release leg and the dev
+  workspace test — cargo waits on the lock; the `--no-run`
+  pre-build keeps the window short. If it still stalls, run §3
+  first and launch the leg after.
 - **`iter_stats` empty on an input** — only `guided=0`; the
   unconditional lines print bare keys. Acceptable; note if it
   ever fires.
-- **Digest drift vs `docs/results.md` history** — historical
-  digests are dated records, not expectations; the entry states
-  the cause (new serialized field) explicitly.
 
 ## Files
+
+- `docs/results.md` (picorv32 series splice — the only expected
+  edit this round)
+
+Landed surface (no further edits expected, listed for the diff
+boundary):
 
 - `crates/grus-core/src/drt/maze.rs`
 - `crates/grus-core/src/drt.rs`
@@ -115,6 +116,5 @@ cargo build --release -p grus-eda
 - `crates/grus-core/tests/drt.rs`
 - `tests/designs/check_drt_ours.sh`
 - `docs/e6-drt.md`
-- `docs/results.md`
 - `docs/status.md`
 - `Cargo.toml`
