@@ -15,7 +15,7 @@ Instructions for AI coding agents working in this repository.
 
 ## 2. Verification Discipline (Most Important Rule)
 
-- Every stage (`E0` through `E3` in `README.md`) has a **reference tool**. **Passing your own unit tests does not mean a stage is done.** A stage is done only when run on the exact same inputs as the reference tool and its numbers meet the "done when" criteria in `README.md`.
+- Every stage in `README.md` has a **reference tool**. **Passing your own unit tests does not mean a stage is done.** A stage is done only when run on the exact same inputs as the reference tool and its numbers meet the "done when" criteria in `README.md` and `docs/status.md`, or when the residual is explicitly named there.
 - **Never hand-write or round reference numbers**: Golden reference files (`*.reference.json`) must be emitted directly by Tcl/scripts running inside OpenROAD or OpenSTA, and integration tests must deserialize and assert against those files directly.
 - **No silent test skips**: Integration tests that require PDK or design files must fail loudly if the files are missing (do not `eprintln!("Skipping...")` and `return` green).
 - **Honest runtime measurement**: When reporting cold parse vs. warm cache runtimes in `docs/results.md`, explicitly remove the cache file before timing the cold path.
@@ -31,8 +31,8 @@ Instructions for AI coding agents working in this repository.
 
 ## 3. Picking Up Work
 
-- Status, tolerances and open tasks for E3 are in `docs/e3-sta.md` Sections 4-6 (open tasks `E3.4`-`E3.6`, each with
-  why, reference, approach and done criterion). `docs/results.md` is the log of every comparison, including failures.
+- Cross-stage status, tolerances and known gaps are in `docs/status.md`; stage-specific detail is in the `docs/e*-*.md`
+  documents. `docs/results.md` is the log of every comparison, including failures.
 - Before running tests that use `picorv32`, generate its inputs (`docs/e3-sta.md` Section 6).
 - Licensing: OpenROAD is BSD 3-Clause; since the user's decision of 2026-11-15 its source may be read (the
   pinned revision is the reference), but its code must not be copied into this repository — implementations

@@ -2,7 +2,7 @@
 
 This document breaks E3 into implementation steps `E3.1`–`E3.3` (done) and the Section 5 tasks `E3.4` (closed 2026-11-15), `E3.5` (closed 2026-11-16) and `E3.6` (done), with the data structures, NLDM extrapolation code, and RC and driver-model equations an implementing agent needs. Section 4 is the current status; Section 6 says how to generate the test inputs.
 
-> `docs/status.md` is the cross-stage status source (E0–E3). Section 4 below keeps the per-test E3 breakdown.
+> `docs/status.md` is the cross-stage status source. Section 4 below keeps the per-test E3 breakdown.
 
 ---
 
