@@ -48,10 +48,10 @@ pub enum Measured {
 /// One finding, normalized across families.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Finding {
-    /// Offending geometry in DBU: width → [rect]; spacing → [a, b]
+    /// Offending geometry in DBU: width → `[rect]`; spacing → `[a, b]`
     /// (`a` is the earlier-`xl` member, ties by rects index — the
     /// sweep order, not a full lexicographic sort); enclosure →
-    /// [cut]; area/hole → [region]. This is the list a later
+    /// `[cut]`; area/hole → `[region]`. This is the list a later
     /// `drc listall` comparison consumes (Magic emits µm; divide by
     /// dbu_per_micron).
     pub bboxes: Vec<RectDbu>,

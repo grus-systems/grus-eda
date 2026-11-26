@@ -183,7 +183,7 @@ fn map_rows_1d(
 }
 
 /// 1D unnormalized Forward DCT-II:
-/// out[u] = sum_{n=0}^{M-1} x[n] * cos(pi * u * (2n + 1) / (2M))
+/// `out[u] = sum_{n=0}^{M-1} x[n] * cos(pi * u * (2n + 1) / (2M))`
 pub fn dct1d(x: &[f32], out: &mut [f32], fft_fwd: &dyn Fft<f32>, buf: &mut [Complex<f32>]) {
     let m = x.len();
     assert!(m.is_power_of_two(), "M must be a power of two");
@@ -207,7 +207,7 @@ pub fn dct1d(x: &[f32], out: &mut [f32], fft_fwd: &dyn Fft<f32>, buf: &mut [Comp
 }
 
 /// 1D Inverse DCT (DCT-III satisfying idct1d(dct1d(x)) == x):
-/// out[n] = (1/M) * c[0] + (2/M) * sum_{u=1}^{M-1} c[u] * cos(pi * u * (2n + 1) / (2M))
+/// `out[n] = (1/M) * c[0] + (2/M) * sum_{u=1}^{M-1} c[u] * cos(pi * u * (2n + 1) / (2M))`
 pub fn idct1d(c: &[f32], out: &mut [f32], fft_inv: &dyn Fft<f32>, buf: &mut [Complex<f32>]) {
     let m = c.len();
     assert!(m.is_power_of_two(), "M must be a power of two");
@@ -236,7 +236,7 @@ pub fn idct1d(c: &[f32], out: &mut [f32], fft_inv: &dyn Fft<f32>, buf: &mut [Com
 }
 
 /// 1D Inverse Shifted Sine Transform:
-/// out[n] = sum_{u=1}^{M-1} s[u] * sin(pi * u * (2n + 1) / (2M))
+/// `out[n] = sum_{u=1}^{M-1} s[u] * sin(pi * u * (2n + 1) / (2M))`
 pub fn idxst1d(s: &[f32], out: &mut [f32], fft_inv: &dyn Fft<f32>, buf: &mut [Complex<f32>]) {
     let m = s.len();
     assert!(m.is_power_of_two(), "M must be a power of two");

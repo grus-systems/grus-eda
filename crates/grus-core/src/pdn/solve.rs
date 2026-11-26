@@ -75,7 +75,7 @@ pub struct SolveSummary {
     pub residual_inf: f64,
     /// residual_inf / (||A||∞||x||∞ + ||b||∞).
     pub residual_rel_inf: f64,
-    /// max |node_voltage[source] - source_voltage_v|, expected 0.
+    /// max `|node_voltage[source] - source_voltage_v|`, expected 0.
     pub max_source_error_v: f64,
 }
 

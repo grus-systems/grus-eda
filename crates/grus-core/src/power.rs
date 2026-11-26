@@ -22,7 +22,7 @@
 //! other net takes its class default, combinational cell outputs derive
 //! the M1 local-marginal fill, and a sequential output copies its data
 //! pin's net. Slews come from
-//! [`sta_pin_slews`]. Edges involving x/z count
+//! [`crate::sta::sta_pin_slews`]. Edges involving x/z count
 //! half a transition each, and per-direction lookups consume half the effective
 //! count — both measured OpenSTA behaviors (docs/results.md N7). `when` forms
 //! outside the literal-conjunction grammar, naming no sibling pin, or whose
