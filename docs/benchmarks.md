@@ -116,9 +116,10 @@ Check is the dominant phase; spacing pair scans dominate.
 
 ## Detailed routing (E6; release)
 
-Sequential maze router, 8 iterations per run. Wall-clock for the routing loop
-(`route_ms` or the suite table), single-threaded — parallelization is a queued
-ticket (`drt-rayon`).
+Maze router, 8 iterations per run; since v0.14.3 the soft iterations search in
+parallel on a per-call rayon pool (snapshot-search / ordered-commit, hard
+iteration serial). Wall-clock for the routing loop is the `route_ms` census
+field.
 
 First full router results (v0.12.4, 2026-11-23 — one coherent measurement
 series across both designs):
@@ -134,9 +135,22 @@ collisions=0`. The `--verify` second route emitted a byte-identical DEF
 (determinism check). The unrouted residue is dominated by pins with no legal
 access out of their halo (`stub_outside_cover` on 1,988 distinct nets) — the
 failure class the post-gate ticket series (`drt-pin-collision`,
-`drt-preemit-spacing`, `drt-guide-escape`, and the queued `drt-occupancy-ds`)
+`drt-preemit-spacing`, `drt-guide-escape`, `drt-occupancy-ds` — all merged since)
 is actively driving down, so per-version census numbers move fast; the dated
 rows are in `docs/results.md`.
+
+Parallel-era measurements (2026-11-27, all on the M4 Mac mini machine context
+of their entries; `route_ms` median-of-5 on gcd unless noted):
+
+| version | change | gcd `route_ms` | picorv32 |
+|---|---|---|---|
+| v0.14.2 | dense track-indexed occupancy vectors | 12,656 → 11,960 ms (−5.5%) | — |
+| v0.14.3 | rayon snapshot-search / ordered-commit | 11,953 → **3,490 ms** at 8 threads (−70.8%); threads=1 7,122 | — |
+| v0.15.1 | streamed per-attempt graph rebuild (memory) | peak RSS 153.1 → 95.2 MB; `route_ms` median 3,823 ms | peak RSS 2.37 GB → **958 MB** (−59.6%); `route_ms` 7,229,267 → 4,130,770 ms (−42.9%) |
+
+The v0.15.1 `route_ms` rows compare different machine states across the
+ticket's measurement series — the entry's own reconciliation applies; treat
+the time delta as secondary to the RSS delta the ticket measured for.
 
 Comparability warning: rows across versions are **not** like-for-like. Router
 features added after v0.12.4 (pin-collision occupancy costing, hull masking,
@@ -147,6 +161,6 @@ scale markers, not a regression series.
 
 ## Source
 
-`docs/results.md` — 176 dated entries as of 2026-11-26. Discrepancies or
+`docs/results.md` — entries current through 2026-11-27. Discrepancies or
 updated numbers should be fixed there first; this document is a digest, not
 a record of its own.
