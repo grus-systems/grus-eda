@@ -14,7 +14,6 @@ use crate::congestion::guide::guide_net_name;
 use crate::design_db::{DesignDb, NetGeom, PdnVia};
 use crate::drc::geom::assemble;
 use crate::drc::report::{SubsetReport, run_all};
-use crate::drt::graph::RouteGraphs;
 use crate::drt::maze::{RouteDb, ViaPlace, WireSeg};
 use crate::drt::pool::drt_pool;
 use crate::drt::via::ViaTable;
@@ -26,6 +25,17 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
+
+/// Heap census of `db.net_geoms` — the `drt: mem post_emit` row
+/// (`drt/mem.rs` capacity walk).
+pub fn net_geoms_bytes(db: &DesignDb) -> usize {
+    use crate::drt::mem::vec_bytes;
+    vec_bytes(&db.net_geoms)
+        + db.net_geoms
+            .iter()
+            .map(|g| vec_bytes(&g.wire_rects) + vec_bytes(&g.vias))
+            .sum::<usize>()
+}
 
 /// What `apply_routes` did — printed by the CLI and asserted in tests.
 #[derive(Clone, Debug, Default)]
@@ -83,7 +93,7 @@ fn seg_rect(w: &WireSeg, tech: &TechDb) -> RectDbu {
 pub fn apply_routes(
     db: &mut DesignDb,
     tech: &TechDb,
-    graphs: &RouteGraphs,
+    guided: &[NetId],
     route_db: &RouteDb,
     via_table: &ViaTable,
 ) -> Result<EmitReport> {
@@ -166,11 +176,11 @@ pub fn apply_routes(
         report.unrouted.push(guide_net_name(db, u.net));
     }
 
-    for g in &graphs.nets {
-        if !routed.contains(&g.net.0) && !unrouted_set.contains(&g.net.0) {
+    for &net in guided {
+        if !routed.contains(&net.0) && !unrouted_set.contains(&net.0) {
             bail!(
                 "guided net {} is absent from both route_db.nets and route_db.unrouted — graphs/route_db disagree",
-                guide_net_name(db, g.net)
+                guide_net_name(db, net)
             );
         }
     }
@@ -198,10 +208,7 @@ fn place_via(
         )
     })?;
     let Some(di) = pair.default else {
-        let lname = |l: LayerId| {
-            tech.strings
-                .resolve(tech.routing_layers[l.0 as usize].name)
-        };
+        let lname = |l: LayerId| tech.strings.resolve(tech.routing_layers[l.0 as usize].name);
         bail!(
             "net {} via at ({}, {}) on pair {}–{}, which has no default candidate — a ViaGap reached emit",
             guide_net_name(db, net),
@@ -303,61 +310,64 @@ fn nets_section(db: &DesignDb, tech: &TechDb) -> Result<String> {
         (0..db.num_nets())
             .into_par_iter()
             .map(|n| {
-        let net = NetId(n as u32);
-        let net_name = guide_net_name(db, net);
-        let mut rec = format!("    - {net_name}");
-        for &pin in db.net_pins(net) {
-            let p = pin.0 as usize;
-            match db.pin_cells[p] {
-                Some(cell) => rec.push_str(&format!(
-                    " ( {} {} )",
-                    escape_def_name(db.strings.resolve(db.cell_names[cell.0 as usize])),
-                    escape_def_name(db.strings.resolve(db.pin_names[p])),
-                )),
-                None => rec.push_str(&format!(
-                    " ( PIN {} )",
-                    escape_def_name(db.strings.resolve(db.pin_names[p])),
-                )),
-            }
-        }
-        let mut stmts: Vec<String> = Vec::new();
-        if let Some(geom) = db.net_geom(net) {
-            for &(lid, ref rect) in &geom.wire_rects {
-                match centerline(lid, rect, tech) {
-                    Some((x1, y1, x2, y2)) => {
-                        stmts.push(format!("{} ( {x1} {y1} ) ( {x2} {y2} )", layer_name(lid)));
+                let net = NetId(n as u32);
+                let net_name = guide_net_name(db, net);
+                let mut rec = format!("    - {net_name}");
+                for &pin in db.net_pins(net) {
+                    let p = pin.0 as usize;
+                    match db.pin_cells[p] {
+                        Some(cell) => rec.push_str(&format!(
+                            " ( {} {} )",
+                            escape_def_name(db.strings.resolve(db.cell_names[cell.0 as usize])),
+                            escape_def_name(db.strings.resolve(db.pin_names[p])),
+                        )),
+                        None => rec.push_str(&format!(
+                            " ( PIN {} )",
+                            escape_def_name(db.strings.resolve(db.pin_names[p])),
+                        )),
                     }
-                    // Not square-cap-expressible → a `RECT` record:
-                    // deltas from the point, which `parse_net_wire`
-                    // reads back as the identical `wire_rect` —
-                    // self-spacing fills and foreign `RECT` stubs from
-                    // a routed template both round-trip byte-stable.
-                    None => stmts.push(format!(
-                        "{} ( {} {} ) RECT ( 0 0 {} {} )",
-                        layer_name(lid),
-                        rect.xl,
-                        rect.yl,
-                        rect.xh - rect.xl,
-                        rect.yh - rect.yl,
-                    )),
                 }
-            }
-            for via in &geom.vias {
-                stmts.push(format!(
-                    "{} ( {} {} ) {}",
-                    layer_name(via.lower),
-                    via.x_dbu,
-                    via.y_dbu,
-                    escape_def_name(db.strings.resolve(via.name)),
-                ));
-            }
-        }
-        for (i, stmt) in stmts.iter().enumerate() {
-            let kw = if i == 0 { "+ ROUTED" } else { "NEW" };
-            rec.push_str(&format!("\n    {kw} {stmt}"));
-        }
-        rec.push_str("\n    + USE SIGNAL ;\n");
-        rec
+                let mut stmts: Vec<String> = Vec::new();
+                if let Some(geom) = db.net_geom(net) {
+                    for &(lid, ref rect) in &geom.wire_rects {
+                        match centerline(lid, rect, tech) {
+                            Some((x1, y1, x2, y2)) => {
+                                stmts.push(format!(
+                                    "{} ( {x1} {y1} ) ( {x2} {y2} )",
+                                    layer_name(lid)
+                                ));
+                            }
+                            // Not square-cap-expressible → a `RECT` record:
+                            // deltas from the point, which `parse_net_wire`
+                            // reads back as the identical `wire_rect` —
+                            // self-spacing fills and foreign `RECT` stubs from
+                            // a routed template both round-trip byte-stable.
+                            None => stmts.push(format!(
+                                "{} ( {} {} ) RECT ( 0 0 {} {} )",
+                                layer_name(lid),
+                                rect.xl,
+                                rect.yl,
+                                rect.xh - rect.xl,
+                                rect.yh - rect.yl,
+                            )),
+                        }
+                    }
+                    for via in &geom.vias {
+                        stmts.push(format!(
+                            "{} ( {} {} ) {}",
+                            layer_name(via.lower),
+                            via.x_dbu,
+                            via.y_dbu,
+                            escape_def_name(db.strings.resolve(via.name)),
+                        ));
+                    }
+                }
+                for (i, stmt) in stmts.iter().enumerate() {
+                    let kw = if i == 0 { "+ ROUTED" } else { "NEW" };
+                    rec.push_str(&format!("\n    {kw} {stmt}"));
+                }
+                rec.push_str("\n    + USE SIGNAL ;\n");
+                rec
             })
             .collect()
     });

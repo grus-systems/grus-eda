@@ -25,7 +25,7 @@ use grus_eda_core::congestion::guide::{GuideBox, guide_net_name, parse_guides};
 use grus_eda_core::design_db::DesignDb;
 use grus_eda_core::drt::access::{AccessReport, access_points, pin_shapes};
 use grus_eda_core::drt::graph::{
-    EscapeKind, GuideJoin, HullMask, build_route_graphs, cell_hull_rect, join_guides,
+    EscapeKind, GraphOpts, GuideJoin, HullMask, build_route_graphs, cell_hull_rect, join_guides,
     pin_rects,
 };
 use grus_eda_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
@@ -35,6 +35,20 @@ use grus_eda_core::readers::{load_tech_db, parse_def, parse_def_bytes, parse_lef
 use grus_eda_core::tech_db::{LayerDir, RectDbu, TechDb};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// `build_route_graphs`'s options (`spare_above: 0`, pin-halo escape
+/// on) — `route_nets` rebuilds per-net graphs internally, so callers
+/// spell out the same `GraphOpts` the graph build used.
+const GRAPHS_OPTS: GraphOpts = GraphOpts {
+    spare_above: 0,
+    escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+};
+/// `load_routed_inputs`'s options (`spare_above: 1` — the OBS-sealed
+/// pin-pocket escape).
+const LOADED_OPTS: GraphOpts = GraphOpts {
+    spare_above: 1,
+    escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+};
 
 // ---------------------------------------------------------------------------
 // Inputs (same convention as tests/drc.rs)
@@ -1001,7 +1015,13 @@ fn test_via_candidate_table() {
         let gaps: Vec<String> = table
             .gaps
             .iter()
-            .map(|g| format!("({},{})", routing_name(&tech, g.lower), routing_name(&tech, g.upper)))
+            .map(|g| {
+                format!(
+                    "({},{})",
+                    routing_name(&tech, g.lower),
+                    routing_name(&tech, g.upper)
+                )
+            })
             .collect();
         assert!(table.gaps.is_empty(), "{name}: via gaps {gaps:?}");
         let unmatched: Vec<String> = table
@@ -1595,9 +1615,8 @@ fn test_maze_cases() {
     let db = maze_db(&tech, false);
     let tracks = layer_tracks(&db, &tech);
     let join = maze_guide(&db, &tech, "n1\n(\n0 0 5000 2000 met1\n)\n");
-    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
     let vias = via_table(&tech, &db).unwrap();
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
     assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
     assert_eq!(r.nets.len(), 1);
     let n1 = &r.nets[0];
@@ -1623,8 +1642,7 @@ fn test_maze_cases() {
         &tech,
         "n2\n(\n0 0 5000 5000 met1\n0 0 5000 5000 met2\n)\n",
     );
-    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
     assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
     let n2 = &r.nets[0];
     assert_eq!(n2.connected.len(), 2);
@@ -1644,9 +1662,16 @@ fn test_maze_cases() {
     let db_blk = maze_db(&tech, true);
     let tracks_blk = layer_tracks(&db_blk, &tech);
     let join = maze_guide(&db_blk, &tech, "n1\n(\n0 0 5000 2000 met1\n)\n");
-    let graphs = build_route_graphs(&db_blk, &tech, &tracks_blk, &join);
     let vias_blk = via_table(&tech, &db_blk).unwrap();
-    let r = route_nets(&db_blk, &tech, &tracks_blk, &graphs, &vias_blk, &cfg);
+    let r = route_nets(
+        &db_blk,
+        &tech,
+        &tracks_blk,
+        &join,
+        GRAPHS_OPTS,
+        &vias_blk,
+        &cfg,
+    );
     assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
     let n1 = &r.nets[0];
     assert_eq!(n1.connected.len(), 2);
@@ -1672,8 +1697,7 @@ fn test_maze_cases() {
         &tech,
         "n1\n(\n0 0 2000 2000 met1\n3500 500 4500 1500 met1\n)\nn3\n(\n0 0 5000 5000 met1\n)\n",
     );
-    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
     assert!(r.nets.is_empty(), "{:?}", r.nets);
     assert_eq!(r.unrouted.len(), 2, "{:?}", r.unrouted);
     let labels = |u: &grus_eda_core::drt::maze::UnroutedNet| -> Vec<(String, FailKind)> {
@@ -1716,15 +1740,15 @@ fn test_route_nets_progress_hook() {
          n2\n(\n0 0 5000 5000 met1\n0 0 5000 5000 met2\n)\n\
          n3\n(\n0 0 5000 5000 met1\n)\n",
     );
-    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
     let vias = via_table(&tech, &db).unwrap();
 
     let mut events = Vec::new();
-    let hooked = route_nets_with_progress(
+    let (_census, hooked) = route_nets_with_progress(
         &db,
         &tech,
         &tracks,
-        &graphs,
+        &join,
+        GRAPHS_OPTS,
         &vias,
         &cfg,
         Some(&mut |p: RouteProgress| events.push(p)),
@@ -1752,7 +1776,7 @@ fn test_route_nets_progress_hook() {
         cursor += stat.attempted as usize;
     }
 
-    let plain = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    let plain = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
     assert_eq!(hooked, plain);
 }
 
@@ -1869,13 +1893,19 @@ fn test_maze_guide_escape() {
     assert_eq!(graphs.region_escape.len(), 1);
     assert_eq!(graphs.region_escape[0].pin, pin);
     assert_eq!(pin_ids(&graphs, pin), 0, "escape pin must hold no nodes");
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
-    assert_eq!(
-        failed(&r, pin),
-        vec![FailKind::NoPath],
-        "{:?}",
-        r.unrouted
+    let r = route_nets(
+        &db,
+        &tech,
+        &tracks,
+        &join,
+        GraphOpts {
+            spare_above: 0,
+            escape: None,
+        },
+        &vias,
+        &cfg,
     );
+    assert_eq!(failed(&r, pin), vec![FailKind::NoPath], "{:?}", r.unrouted);
 
     // Arm B — mechanism on: the halo merges (met1 pairs adjacent to
     // the guide region, met2 pairs adjacent to the transit island),
@@ -1891,7 +1921,7 @@ fn test_maze_guide_escape() {
     assert_eq!(rec.token(), "halo");
     assert!(rec.pairs_added > 0);
     assert!(pin_ids(&graphs, pin) > 0, "halo pairs inside the pin rect");
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
     assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
     assert_eq!(r.nets.len(), 1);
     assert_eq!(r.nets[0].connected.len(), 2);
@@ -1914,13 +1944,22 @@ fn test_maze_guide_escape() {
     assert_eq!(rec.corridor_span, 3);
     assert_eq!(rec.token(), "corridor_bound(span=3)");
     assert_eq!(pin_ids(&graphs, pin), 0);
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
-    assert_eq!(
-        failed(&r, pin),
-        vec![FailKind::NoPath],
-        "{:?}",
-        r.unrouted
+    let r = route_nets(
+        &db,
+        &tech,
+        &tracks,
+        &join,
+        GraphOpts {
+            spare_above: 0,
+            escape: Some(grus_eda_core::drt::graph::EscapeCfg {
+                halo_lines: 0,
+                corridor_lines: 0,
+            }),
+        },
+        &vias,
+        &cfg,
     );
+    assert_eq!(failed(&r, pin), vec![FailKind::NoPath], "{:?}", r.unrouted);
 
     // Arm D — the corridor dies at the mask: halo_lines=0 puts the
     // pin's own crossing in the halo, the bound admits the 3-step
@@ -1941,13 +1980,22 @@ fn test_maze_guide_escape() {
     assert_eq!(rec.token(), "corridor_masked");
     assert_eq!(rec.pairs_added, 1, "{:?}", rec);
     assert!(pin_ids(&graphs, pin) > 0);
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
-    assert_eq!(
-        failed(&r, pin),
-        vec![FailKind::NoPath],
-        "{:?}",
-        r.unrouted
+    let r = route_nets(
+        &db,
+        &tech,
+        &tracks,
+        &join,
+        GraphOpts {
+            spare_above: 0,
+            escape: Some(grus_eda_core::drt::graph::EscapeCfg {
+                halo_lines: 0,
+                corridor_lines: 8,
+            }),
+        },
+        &vias,
+        &cfg,
     );
+    assert_eq!(failed(&r, pin), vec![FailKind::NoPath], "{:?}", r.unrouted);
 
     // Corridor landing, open fixture: no wall, halo_lines=0 —
     // met1's halo is just the pin crossing, the guide starts three
@@ -1982,7 +2030,21 @@ fn test_maze_guide_escape() {
     // already `region` (the transit island) and adds nothing — the
     // retired `halo_total + extra.len()` arithmetic reported 4.
     assert_eq!(rec.pairs_added, 3, "{:?}", rec);
-    let r = route_nets(&db_open, &tech, &tracks_open, &graphs, &vias_open, &cfg);
+    let r = route_nets(
+        &db_open,
+        &tech,
+        &tracks_open,
+        &join,
+        GraphOpts {
+            spare_above: 0,
+            escape: Some(grus_eda_core::drt::graph::EscapeCfg {
+                halo_lines: 0,
+                corridor_lines: 8,
+            }),
+        },
+        &vias_open,
+        &cfg,
+    );
     assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
 
     // Arm F — the occupancy contrast (`docs/e6-drt.md` §5): every
@@ -2022,7 +2084,15 @@ fn test_maze_guide_escape() {
         .find(|&&(p, _)| pin_label(&db_occ, p) == "u0/A")
         .map(|&(p, _)| p)
         .unwrap();
-    let r = route_nets(&db_occ, &tech, &tracks_occ, &graphs_occ, &vias_occ, &cfg);
+    let r = route_nets(
+        &db_occ,
+        &tech,
+        &tracks_occ,
+        &join_occ,
+        GRAPHS_OPTS,
+        &vias_occ,
+        &cfg,
+    );
     assert_eq!(
         failed(&r, pin_occ),
         vec![FailKind::NoPath],
@@ -2033,7 +2103,8 @@ fn test_maze_guide_escape() {
         &db_occ,
         &tech,
         &tracks_occ,
-        &graphs_occ,
+        &join_occ,
+        GRAPHS_OPTS,
         &vias_occ,
         &MazeConfig {
             occ: OccMode::Disabled,
@@ -2075,11 +2146,14 @@ fn test_maze_pin_collision() {
         &tech,
         &format!("n1\n(\n0 0 5000 2000 met1\n0 0 5000 5000 met2\n)\n{n2_guide}"),
     );
-    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
     assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
     assert_eq!(r.nets.len(), 2);
-    let n1 = r.nets.iter().find(|n| net_name(&db, n.net) == "n1").unwrap();
+    let n1 = r
+        .nets
+        .iter()
+        .find(|n| net_name(&db, n.net) == "n1")
+        .unwrap();
     assert_eq!(n1.connected.len(), 2);
     assert!(
         r.pin_collisions.is_empty(),
@@ -2101,8 +2175,7 @@ fn test_maze_pin_collision() {
         &tech,
         &format!("n1\n(\n0 800 5000 1200 met1\n)\n{n2_guide}"),
     );
-    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
-    let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
     assert_eq!(r.unrouted.len(), 1, "{:?}", r.unrouted);
     let u = &r.unrouted[0];
     assert_eq!(net_name(&db, u.net), "n1");
@@ -2218,12 +2291,19 @@ fn test_maze_census_picorv32() {
     maze_census("picorv32");
 }
 
-
 fn maze_census(name: &str) {
     {
-        let (tech, db, tracks, join, graphs, vias) = load_routed_inputs(name);
+        let (tech, db, tracks, join, _, vias) = load_routed_inputs(name);
         let t0 = std::time::Instant::now();
-        let r = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+        let r = route_nets(
+            &db,
+            &tech,
+            &tracks,
+            &join,
+            LOADED_OPTS,
+            &vias,
+            &MazeConfig::default(),
+        );
         let ms = t0.elapsed().as_millis();
 
         let pins_connected: usize = r.nets.iter().map(|n| n.connected.len()).sum();
@@ -2376,13 +2456,22 @@ fn maze_census(name: &str) {
 /// nothing and the gate must go red.
 #[test]
 fn test_maze_occupancy() {
-    let (tech, db, tracks, _, graphs, vias) = load_routed_inputs("gcd");
-    let on = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+    let (tech, db, tracks, join, _, vias) = load_routed_inputs("gcd");
+    let on = route_nets(
+        &db,
+        &tech,
+        &tracks,
+        &join,
+        LOADED_OPTS,
+        &vias,
+        &MazeConfig::default(),
+    );
     let off = route_nets(
         &db,
         &tech,
         &tracks,
-        &graphs,
+        &join,
+        LOADED_OPTS,
         &vias,
         &MazeConfig {
             occ: OccMode::Disabled,
@@ -2420,11 +2509,14 @@ fn test_maze_determinism_picorv32() {
 
 fn maze_determinism(name: &str) {
     {
-        let (tech, db, tracks, _, graphs, vias) = load_routed_inputs(name);
+        let (tech, db, tracks, join, _, vias) = load_routed_inputs(name);
         let cfg = MazeConfig::default();
-        let r1 = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
-        let r2 = route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg);
-        assert!(!r1.nets.is_empty(), "{name}: empty route set proves nothing");
+        let r1 = route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, &cfg);
+        let r2 = route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, &cfg);
+        assert!(
+            !r1.nets.is_empty(),
+            "{name}: empty route set proves nothing"
+        );
         assert_ne!(route_digest(&r1), 0, "{name}: zero digest");
         assert_eq!(r1, r2, "{name}: nondeterministic routes");
         assert_eq!(route_digest(&r1), route_digest(&r2));
@@ -2463,6 +2555,37 @@ fn test_route_digest_covers_pin_collisions() {
         hi: 2100,
     });
     assert_ne!(route_digest(&a), route_digest(&b));
+}
+
+/// `GRUS_DRT_MEM` census fail-proof (`drt-scale-memory` commit 1):
+/// the capacity walk must read nonzero, internally consistent bytes
+/// on the structures it reports — a census returning 0 makes the
+/// whole measurement worthless. Asserts the floor (`Σ len × size_of`,
+/// capacity ≥ len), never a literal: sizes legitimately move with
+/// later changes.
+#[test]
+fn test_mem_census_sanity() {
+    let (tech, db, tracks, _join, graphs, vias) = load_routed_inputs("gcd");
+    let graphs_b = grus_eda_core::drt::graph::route_graphs_bytes(&graphs);
+    let topos_b =
+        grus_eda_core::drt::maze::topos_footprint_bytes(&db, &tech, &tracks, &graphs, &vias);
+    println!("gcd mem census: route_graphs={graphs_b} topos={topos_b}");
+    let min_graphs: usize = graphs
+        .nets
+        .iter()
+        .map(|g| {
+            use grus_eda_core::drt::graph::{RouteEdge, RouteNode, ViaEdge};
+            g.nodes.len() * std::mem::size_of::<RouteNode>()
+                + g.edges.len() * std::mem::size_of::<RouteEdge>()
+                + g.via_edges.len() * std::mem::size_of::<ViaEdge>()
+        })
+        .sum();
+    assert!(graphs_b > 0, "route_graphs_bytes read zero");
+    assert!(
+        graphs_b >= min_graphs,
+        "route_graphs_bytes {graphs_b} under the len floor {min_graphs}"
+    );
+    assert!(topos_b > 0, "topos_footprint_bytes read zero");
 }
 
 // ---------------------------------------------------------------------------
@@ -2508,20 +2631,71 @@ fn test_rayon_graphs_serial_identity() {
     let serial = with_rayon_threads(1, || {
         format!(
             "{:?}",
-            grus_eda_core::drt::graph::build_route_graphs_ext(
-                &db, &tech, &tracks, &join, opts
-            )
+            grus_eda_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, opts)
         )
     });
     let par8 = with_rayon_threads(8, || {
         format!(
             "{:?}",
-            grus_eda_core::drt::graph::build_route_graphs_ext(
-                &db, &tech, &tracks, &join, opts
-            )
+            grus_eda_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, opts)
         )
     });
     assert_eq!(serial, par8, "graph build diverged under 8 threads");
+}
+
+/// The streamed attach pass's contract (`docs/e6-drt.md` §7
+/// "Resident footprint"): `build_net_graph` per net is a pure
+/// function of the shared inputs — occupancy never enters the build —
+/// so the per-attempt rebuild is bit-identical to the bulk
+/// `build_route_graphs_ext` output. Asserts `PartialEq` per net plus
+/// the streamed `RouteGraphs` census (every field but `nets`, which
+/// stays empty by construction), under both pool sizes the rebuild
+/// can run inside.
+#[test]
+fn test_net_graph_rebuild_identity() {
+    let (tech, db, tracks, _) = load("gcd");
+    let (_, join) = load_guide(&db, &tech, "gcd");
+    let vias = via_table(&tech, &db).unwrap();
+    let opts = grus_eda_core::drt::graph::GraphOpts {
+        spare_above: 1,
+        escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+    };
+    let bulk = grus_eda_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, opts);
+    assert_eq!(bulk.nets.len(), join.nets.len());
+    let hull = HullMask::new(&db, &tech);
+    for (i, &(net, ref boxes)) in join.nets.iter().enumerate() {
+        let mut scratch = Vec::new();
+        let nb = grus_eda_core::drt::graph::build_net_graph(
+            &db, &tech, &tracks, &hull, net, boxes, opts, &mut scratch,
+        );
+        assert_eq!(nb.graph, bulk.nets[i], "rebuilt graph diverged at index {i}");
+    }
+    let mut streamed = Vec::new();
+    for threads in [1, 8] {
+        streamed.push(with_rayon_threads(threads, || {
+            let (census, _route_db) = route_nets_with_progress(
+                &db,
+                &tech,
+                &tracks,
+                &join,
+                opts,
+                &vias,
+                &MazeConfig::default(),
+                None,
+            );
+            format!("{census:?}")
+        }));
+    }
+    assert_eq!(
+        streamed[0], streamed[1],
+        "streamed census diverged under 8 threads"
+    );
+    let bulk_census = format!("{:?}", {
+        let mut b = bulk.clone();
+        b.nets.clear();
+        b
+    });
+    assert_eq!(streamed[0], bulk_census, "streamed census != bulk census");
 }
 
 /// The route loop's named invariant: snapshot-search / ordered-commit
@@ -2533,11 +2707,11 @@ fn test_rayon_graphs_serial_identity() {
 /// census.
 #[test]
 fn test_rayon_route_determinism() {
-    let (tech, db, tracks, _join, graphs, vias) = load_routed_inputs("gcd");
+    let (tech, db, tracks, join, _, vias) = load_routed_inputs("gcd");
     let cfg = MazeConfig::default();
     let route = |threads: usize| {
         with_rayon_threads(threads, || {
-            route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg)
+            route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, &cfg)
         })
     };
     let r1 = route(1);
@@ -2588,14 +2762,11 @@ use grus_eda_core::drt::maze::RouteDb;
 /// Route `name` and apply the result into `db.net_geoms` — the shared
 /// emit leg (gcd routes in seconds; picorv32 legs live under
 /// `#[ignore]`).
-fn emit_leg(
-    name: &str,
-    cfg: &MazeConfig,
-) -> (TechDb, DesignDb, RouteDb, ViaTable, EmitReport) {
-    let (tech, mut db, tracks, _join, graphs, vias) = load_routed_inputs(name);
-    let route_db = route_nets(&db, &tech, &tracks, &graphs, &vias, cfg);
-    let report =
-        apply_routes(&mut db, &tech, &graphs, &route_db, &vias).expect("apply_routes");
+fn emit_leg(name: &str, cfg: &MazeConfig) -> (TechDb, DesignDb, RouteDb, ViaTable, EmitReport) {
+    let (tech, mut db, tracks, join, _, vias) = load_routed_inputs(name);
+    let route_db = route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, cfg);
+    let guided: Vec<NetId> = join.nets.iter().map(|&(n, _)| n).collect();
+    let report = apply_routes(&mut db, &tech, &guided, &route_db, &vias).expect("apply_routes");
     (tech, db, route_db, vias, report)
 }
 
@@ -2814,11 +2985,13 @@ fn test_emit_roundtrip_gcd() {
     assert_eq!(report.routed, route_db.nets.len());
     // The unrouted set is pinned by the e2e golden — a drift names the
     // differing nets in the failure rather than re-baselining a count.
-    let golden_unrouted: BTreeSet<String> =
-        j_arr(&load_ours_ref("gcd")["ours_router"]["unrouted"], "ours_router.unrouted")
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
+    let golden_unrouted: BTreeSet<String> = j_arr(
+        &load_ours_ref("gcd")["ours_router"]["unrouted"],
+        "ours_router.unrouted",
+    )
+    .iter()
+    .filter_map(|v| v.as_str().map(str::to_string))
+    .collect();
     assert_eq!(
         BTreeSet::from_iter(report.unrouted.iter().cloned()),
         golden_unrouted,
@@ -2988,21 +3161,33 @@ fn test_emit_determinism() {
 /// pool on the same `RouteDb`.
 #[test]
 fn test_rayon_emit_serial_identity() {
-    let (tech, mut db1, tracks, _join, graphs, vias) = load_routed_inputs("gcd");
+    let (tech, mut db1, tracks, join, _, vias) = load_routed_inputs("gcd");
     let mut db2 = db1.clone();
-    let route_db = route_nets(&db1, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+    let route_db = route_nets(
+        &db1,
+        &tech,
+        &tracks,
+        &join,
+        LOADED_OPTS,
+        &vias,
+        &MazeConfig::default(),
+    );
     assert!(!route_db.nets.is_empty());
+    let guided: Vec<NetId> = join.nets.iter().map(|&(n, _)| n).collect();
 
     let rep1 = with_rayon_threads(1, || {
-        apply_routes(&mut db1, &tech, &graphs, &route_db, &vias).expect("apply_routes serial")
+        apply_routes(&mut db1, &tech, &guided, &route_db, &vias).expect("apply_routes serial")
     });
     let rep8 = with_rayon_threads(8, || {
-        apply_routes(&mut db2, &tech, &graphs, &route_db, &vias).expect("apply_routes par8")
+        apply_routes(&mut db2, &tech, &guided, &route_db, &vias).expect("apply_routes par8")
     });
     assert_eq!(rep1.wire_length_dbu, rep8.wire_length_dbu);
     assert_eq!(rep1.vias_per_cut, rep8.vias_per_cut);
     assert_eq!(rep1.unrouted, rep8.unrouted);
-    assert_eq!(db1.net_geoms, db2.net_geoms, "net_geoms diverged under 8 threads");
+    assert_eq!(
+        db1.net_geoms, db2.net_geoms,
+        "net_geoms diverged under 8 threads"
+    );
 
     let placed = placed_def("gcd");
     let out1 = tmp_def("gcd-rayon-e1");
@@ -3146,11 +3331,19 @@ fn test_emit_unrouted_fixture() {
         &tech,
         "n1\n(\n0 0 5000 2000 met1\n)\nn3\n(\n0 0 5000 5000 met1\n)\n",
     );
-    let graphs = build_route_graphs(&db, &tech, &tracks, &join);
     let vias = via_table(&tech, &db).unwrap();
-    let route_db = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+    let route_db = route_nets(
+        &db,
+        &tech,
+        &tracks,
+        &join,
+        GRAPHS_OPTS,
+        &vias,
+        &MazeConfig::default(),
+    );
     assert_eq!(route_db.unrouted.len(), 1, "{:?}", route_db.unrouted);
-    let report = apply_routes(&mut db, &tech, &graphs, &route_db, &vias).expect("apply");
+    let guided: Vec<NetId> = join.nets.iter().map(|&(n, _)| n).collect();
+    let report = apply_routes(&mut db, &tech, &guided, &route_db, &vias).expect("apply");
     assert_eq!(report.unrouted, vec!["n3".to_string()]);
 
     // The fixture's own text is the splice template.
@@ -3190,10 +3383,8 @@ fn test_emit_unrouted_fixture() {
 /// li1 inside host hulls — the masked-layer class (4 sites); `met1.2`
 /// = same-net disjoint met1 edges of one net's pin-access cluster
 /// < 0.14um (21 sites, all X3 — no cell-internal metal1 at any site).
-const PINNED_LEF_RESIDUALS: &[(&str, &str, i64)] = &[
-    ("picorv32", "li.3", 19),
-    ("picorv32", "met1.2", 146),
-];
+const PINNED_LEF_RESIDUALS: &[(&str, &str, i64)] =
+    &[("picorv32", "li.3", 19), ("picorv32", "met1.2", 146)];
 
 /// Magic's two built-in hierarchy-boundary messages — no tech-file
 /// rule id, so the deck's `classification` never covers them. Mirrors
@@ -3245,7 +3436,10 @@ fn j_u64(v: &serde_json::Value, ctx: &str) -> u64 {
         .unwrap_or_else(|| panic!("{ctx}: expected unsigned integer, got {v}"))
 }
 
-fn j_obj<'a>(v: &'a serde_json::Value, ctx: &str) -> &'a serde_json::Map<String, serde_json::Value> {
+fn j_obj<'a>(
+    v: &'a serde_json::Value,
+    ctx: &str,
+) -> &'a serde_json::Map<String, serde_json::Value> {
     v.as_object()
         .unwrap_or_else(|| panic!("{ctx}: expected object, got {v}"))
 }
@@ -3277,9 +3471,8 @@ fn ours_reference_gate(name: &str) {
         if class.as_str() != Some("lef_expressible") {
             continue;
         }
-        let rid = magic_rule_id(tmpl).unwrap_or_else(|| {
-            panic!("{name}: lef_expressible template has no rule id: {tmpl}")
-        });
+        let rid = magic_rule_id(tmpl)
+            .unwrap_or_else(|| panic!("{name}: lef_expressible template has no rule id: {tmpl}"));
         assert!(
             expected.insert(rid),
             "{name}: duplicate lef_expressible rule id in {tmpl}"

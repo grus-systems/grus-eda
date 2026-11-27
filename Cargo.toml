@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/grus-eda-core", "crates/grus-eda"]
 
 [workspace.package]
-version = "0.14.3"
+version = "0.15.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/grus-systems/grus-eda"
@@ -14,6 +14,7 @@ anyhow = "1"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 fast-float2 = "0.2.4"
+libc = "0.2"
 memmap2 = "0.9"
 nalgebra-sparse = "0.12"
 rayon = "1"
