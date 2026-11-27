@@ -560,11 +560,17 @@ The preferred axis follows §1's direction-to-axis flip: a
 **Occupancy** (`Occupancy`): committed geometry — macro OBS, pin
 shapes, committed wires/stubs, via footprints — rasterized onto
 track lines so an edge's conflict check is a per-line interval
-query. Per layer, `lines_y`/`lines_x` map a line coordinate to a
-`Line`: `lo`-sorted `ivs` plus a `max_hi` skip index per
-`SKIP_CHUNK = 16` chunk (rebuilt eagerly from the dirty chunk; a
-scan skips `max_hi ≤ qlo` chunks and stops at `lo ≥ qhi` — identical
-hit *set*, both consumers order-insensitive). A rect `r` marks
+query. Per layer, `lines_y`/`lines_x` are `Vec<Line>` indexed by
+track position — the mark domain is exactly the track index set
+(rasterization only ever touches track lines), so a slot index
+replaces the old `BTreeMap<i32, Line>` keyed lookup — with the
+sorted coordinate lists `coords_y`/`coords_x` held alongside for
+`Hit.line` reconstruction and the `scan_rect`/`rasterize` window
+`partition_point`s. A `Line` is `lo`-sorted `ivs` plus a `max_hi`
+skip index per `SKIP_CHUNK = 16` chunk (rebuilt eagerly from the
+dirty chunk; a scan skips `max_hi ≤ qlo` chunks and stops at
+`lo ≥ qhi` — identical hit *set*, both consumers order-insensitive).
+A rect `r` marks
 `[r.yl, r.yh]` on every vertical line inside the strict
 `w/2 + s` band (`w/2 = width_dbu/2`, `s = min_spacing_dbu()`) and
 `[r.xl, r.xh]` likewise on horizontal lines; `perp_*` stores the
@@ -713,7 +719,17 @@ cache's byte-identical arcs. Two full runs produce identical
 
 **Instrumentation**: `GRUS_DRT_TIMING` (any value) makes `route_nets`
 print premark/topo/per-iteration/per-slow-net timings to stderr —
-opt-in, zero cost unset; it feeds `docs/results.md` runtime evidence.
+opt-in emission, zero printing cost unset; it feeds
+`docs/results.md` runtime evidence. The same flag also appends the
+`ScanStats` query census per iteration and an `occ-scan totals`
+line at route end (`wire`/`rect` call counts, lines and intervals
+visited, hits pushed, marks inserted/removed). The counting itself
+is unconditional `Cell` bumps inside every scan — not zero-cost
+(billions of per-interval increments on gcd) but a handful of
+single-thread adds per query, measured below timer noise against
+the BTreeMap work being replaced; only the emission is gated. The
+totals record the query shape behind the `Vec<Line>` pick in
+`docs/results.md`.
 Separately, `route_nets_with_progress` emits a `RouteProgress`
 snapshot per attempted net to an opt-in sink; `grus-eda drt` wires
 that sink to stderr and prints `drt: iter N nets k/q unrouted=u

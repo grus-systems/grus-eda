@@ -10560,3 +10560,133 @@ layer, not engine state (D5).
 - **Checks run** (E0 rule 9): `cargo test --workspace --profile
   verify` (all green; 3 `#[ignore]`d picorv32 legs), `cargo clippy
   --workspace --all-targets -- -D warnings` clean.
+
+### 2026-11-27 — drt-occupancy-ds: dense track-indexed `Vec<Line>` occupancy (v0.14.2)
+
+The external profiling review put the maze router's occupancy scans at
+~70% of gcd route time and named the per-layer `BTreeMap<i32, Line>`
+keying as the suspect. `Occupancy.lines_x`/`lines_y` are now
+`Vec<Line>` indexed by track position — rasterization only ever
+touches track lines, so the key domain is dense — with the sorted
+coordinate lists `coords_x`/`coords_y` held alongside for `Hit.line`
+reconstruction and the `scan_rect`/`rasterize` window
+`partition_point`s. `scan_wire`/`scan_stub`/`edge_collisions` pass a
+track index instead of a coordinate; `rasterize` keeps its rect
+signature minus `tracks` (`Occupancy::new` owns the lists);
+`commit_route` drops `tracks` the same way. `Mark` carries
+`line_idx: u32` instead of `line: i32`. The `Line` contents
+(`lo`-sorted `ivs`, `SKIP_CHUNK` skip index) are unchanged.
+
+**Machine context**: Mac mini `Q0tzlynoMac-mini`, Apple M4 (4P+6E),
+16 GB; `sw_vers` macOS 27.2.1 (26B131); `rustc --version` →
+`rustc 1.100.0 (0ef1bc386 2026-11-09)`; `cargo build --release`,
+binary `target/release/grus-eda` in the ticket worktree
+`.kurena/wt/drt-occupancy-ds`. Rep policy: 5 reps per side, the
+`route_ms=` field of the `guided=` census line (route phase only —
+`--no-self-drc` excludes the post-emit check); median is the table
+figure.
+
+**Exact commands** (run in the task worktree, identical both sides
+— the before rows were measured on the instrumented `BTreeMap`
+build at runtime, before the swap edits landed):
+
+```sh
+cargo build --release -p grus-eda
+GRUS=target/release/grus-eda
+LIB=$HOME/.ciel/sky130A/libs.ref/sky130_fd_sc_hd
+TLEF=$LIB/techlef/sky130_fd_sc_hd__nom.tlef
+LEF=$LIB/lef/sky130_fd_sc_hd.lef
+D=tests/designs/gcd
+for i in 1 2 3 4 5; do
+  $GRUS drt --tlef $TLEF --lef $LEF --def $D/gcd.placed.def \
+    --guide $D/gcd.guide --out-def /tmp/gcd.occ.$i.def \
+    --reference $D/gcd.drt.reference.json --no-self-drc \
+    | grep 'guided='
+done
+shasum -a 256 /tmp/gcd.occ.*.def          # DEF sha per rep
+GRUS_DRT_TIMING=1 $GRUS drt …             # ScanStats census (stderr)
+$GRUS drt … & PID=$!; sample $PID 8 -file /tmp/gcd.occ.txt   # attribution
+cargo test --release -p grus-eda-core --test drt \
+  test_maze_census -- --nocapture         # digest + collisions
+```
+
+- **Query-shape census** (`GRUS_DRT_TIMING`, new `ScanStats`
+  counters — counting unconditional `Cell` bumps, emission
+  env-gated). Emitted `occ-scan totals` lines, labelled by build:
+  | counter | before (`BTreeMap`) | after (`Vec<Line>`) |
+  |---|---|---|
+  | wire_calls | 91222700 | 91222700 |
+  | rect_calls | 74133685 | 74133685 |
+  | rect_lines_visited | 390472123 | 417128457 |
+  | ivs_visited | 3092862215 | 3092862215 |
+  | hits_pushed | 98384624 | 98384624 |
+  | marks_inserted / removed | 100528 / 11596 | 100528 / 11596 |
+  Call counts, `ivs`, `hits`, and marks are **identical** — the
+  query stream is a router-output invariant. `rect_lines_visited`
+  legitimately differs (+26.6 M): `BTreeMap::range` visited only
+  lines holding marks, while the slice walk visits every track
+  index in the window (empty slots cost a bounds check and a
+  zero-trip chunk loop). `lines/rect_call` 5.3 → 5.6. 165 M scans
+  at ~18.7 ivs each: the small per-line windows are why the
+  tree-node descent dominated — it is eliminated, not amortized.
+- **Identity proof**: gcd route digest **byte-identical**
+  `0x8a4768ab15bd4bd5` before and after (new `GCD_ROUTE_DIGEST` pin
+  in `test_maze_census`); `collisions=0` both sides; emitted DEF
+  sha256
+  `27f7665922c6df0212788f27b73f562d078e5bebdd47446eb1f933a469122aee`
+  identical to golden `tests/designs/gcd/gcd.drt.ours.routed.def`
+  on all 5 after-reps; census `guided=269 routed=189 unrouted=80
+  collisions=0 iterations=8` unchanged.
+- **Runtime** (`route_ms` from the `guided=` census field; flags as
+  in the command list above):
+  | | rep1 | rep2 | rep3 | rep4 | rep5 | median |
+  |---|---|---|---|---|---|---|
+  | before (`BTreeMap`) | 12628 | 12634 | 12656 | 12670 | 12691 | **12656** |
+  | after (`Vec<Line>`) | 11960 | 11939 | 11963 | 11945 | 12001 | **11960** |
+  Median −696 ms = **−5.5%** — a real but modest win, not the ~70%
+  the review's share attribution suggested: the eliminated work is
+  the per-query `BTreeMap::get`/`range` descent, and the `ivs`
+  chunk scan it guarded is unchanged and still dominant.
+- **`sample` attribution** (8 s, ~1 ms cadence, release binary; the
+  `scan_*` frames resolve under their own symbols — no inlining
+  into `edge_cost` to fold): the scan class (`scan_rect` +
+  `scan_wire` + BTreeMap range internals) went 4364/6081 =
+  **71.8%** before → (`scan_rect` + `scan_wire`, BTreeMap frames
+  gone entirely) 4152/6015 = **69.0%** after —
+  `find_leaf_edges_spanning_range` (1367 samples before) no longer
+  appears; its cost moved into `scan_rect`'s now-cheaper slice
+  walk.
+- **`test_occupancy_differential`** (new): the pre-swap `BTreeMap`
+  implementation kept verbatim as `RefOccupancy` — a seeded
+  (xorshift64*, 2 seeds × 5000 ops = 10000 ops) stream of
+  rasterize/unmark/scan_wire/scan_rect on 4 layers with
+  uniform/irregular/empty-axis track lists must produce identical
+  `Hit` sequences order-included; deliberate arms cover no-line
+  bands, unmark-all-reinsert, duplicate `iv` inserts, and
+  re-unmarking dead marks.
+- **Prove-it-red** (AGENTS §7.7) — all three arms restored and
+  re-verified green; transcript tails:
+  - `scan_rect` y-window `ay..by` → `(ay+1)..by` →
+    `test_occupancy_differential` red at op 24:
+    `seed 0x9e3779b97f4a7c15 op 24 rect: hit sequence differs
+    ([] vs [(1000, 0, false, 157, 157, -383, 5462, 977, 1021,
+    (1, 44))])` — the shifted window missed the line the oracle
+    hit.
+  - `scan_rect` filter `iv.perp_hi > re.yl` conjunct dropped →
+    red at op 204: `… op 204 rect: hit sequence differs
+    ([(2990, 1, false, 1048, 1058, 1048, 5310, 2593, 2795,
+    (1, 21))] vs [])` — a spurious hit where the perpendicular
+    extent does not overlap.
+  - `GCD_ROUTE_DIGEST` `…4bd5` → `…4bd6` inside
+    `test_maze_census` → `assertion left == right failed: gcd
+    route digest drifted — left: 9964047784593935317 right:
+    9964047784593935318` (the left value confirms the computed
+    digest is still `0x8a4768ab15bd4bd5`).
+- **picorv32 arm**: **not measured — deferred** (recorded ~135 min
+  full route; no counter-carrying run was scheduled). The gcd
+  digest + DEF pins carry the identity proof.
+- **Checks run** (E0 rule 9): `cargo test --workspace --profile
+  verify` all green — 558 lib (incl. `test_occupancy_differential`)
+  + 32 drt (incl. the `GCD_ROUTE_DIGEST` pin in `test_maze_census`)
+  + 18 drc + 8 cli + 2 irdrop, 5 `#[ignore]`d; `cargo clippy
+  --workspace --all-targets -- -D warnings` clean.

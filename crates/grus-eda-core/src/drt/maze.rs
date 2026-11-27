@@ -17,6 +17,7 @@ use crate::drt::tracks::{Axis, LayerTracks};
 use crate::drt::via::ViaTable;
 use crate::interner::{LayerId, NetId, PinId};
 use crate::tech_db::{LayerDir, RectDbu, TechDb};
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use xxhash_rust::xxh3::xxh3_64;
@@ -325,12 +326,13 @@ struct Interval {
 }
 
 /// One rasterized insertion — the rip-up log. `x_axis` selects
-/// `lines_x` (vertical lines) vs `lines_y` (horizontal).
+/// `lines_x` (vertical lines) vs `lines_y` (horizontal); `line_idx`
+/// indexes that layer's coordinate list (`coords_x`/`coords_y`).
 #[derive(Clone, Copy, Debug)]
 struct Mark {
     x_axis: bool,
     layer: u8,
-    line: i32,
+    line_idx: u32,
     iv: Interval,
 }
 
@@ -352,16 +354,53 @@ struct Line {
 
 /// Per-layer committed geometry rasterized onto track lines so an
 /// edge's conflict check is a single-line interval query. `lines_x[l]`
-/// keys vertical lines (x-coords) → y-intervals; `lines_y[l]` keys
-/// horizontal lines → x-intervals.
+/// holds y-intervals on vertical lines indexed by track position into
+/// `coords_x[l]`; `lines_y[l]` likewise on horizontal lines. Marks
+/// only ever live on track lines (`rasterize` windows are
+/// `partition_point`s over `tracks`), so the key domain is dense —
+/// a direct slot index replaces a keyed lookup, and `coords_*` resolve
+/// a slot back to its line coordinate for `Hit.line` and the
+/// `scan_rect`/`rasterize` windows.
 struct Occupancy {
-    lines_x: Vec<BTreeMap<i32, Line>>,
-    lines_y: Vec<BTreeMap<i32, Line>>,
+    lines_x: Vec<Vec<Line>>,
+    lines_y: Vec<Vec<Line>>,
+    /// Sorted line coordinates per axis — the `LayerTracks` lists,
+    /// owned so windows and `Hit.line` resolution need no `tracks`
+    /// parameter.
+    coords_x: Vec<Vec<i32>>,
+    coords_y: Vec<Vec<i32>>,
     /// `width_dbu / 2` per routing layer (integer division — sky130
     /// widths are even).
     halfw: Vec<i32>,
     /// `min_spacing_dbu()` per routing layer.
     spc: Vec<i32>,
+    /// Query census (`GRUS_DRT_TIMING` emission in
+    /// `route_nets_with_progress`) — `Cell` so `&self` scans count.
+    stats: ScanStats,
+}
+
+/// Scan/mark counters — the query-shape record behind the occupancy
+/// structure pick (`docs/results.md` occupancy-ds entry). Counting is
+/// unconditional (a handful of single-thread adds per query, below
+/// timer noise against the BTreeMap work being measured); only the
+/// emission is `GRUS_DRT_TIMING`-gated.
+#[derive(Default)]
+struct ScanStats {
+    wire_calls: Cell<u64>,
+    rect_calls: Cell<u64>,
+    /// Lines iterated across both axes inside `scan_rect`.
+    rect_lines_visited: Cell<u64>,
+    /// `ivs` elements inspected across all scans (pre-predicate).
+    ivs_visited: Cell<u64>,
+    hits_pushed: Cell<u64>,
+    marks_inserted: Cell<u64>,
+    marks_removed: Cell<u64>,
+}
+
+impl ScanStats {
+    fn bump(c: &Cell<u64>) {
+        c.set(c.get() + 1);
+    }
 }
 
 /// One interval hit by a candidate edge: the rasterized mark (`iv`),
@@ -392,11 +431,18 @@ fn hit_bbox(h: &Hit) -> RectDbu {
 }
 
 impl Occupancy {
-    fn new(tech: &TechDb) -> Self {
-        let n = tech.routing_layers.len();
+    fn new(tech: &TechDb, tracks: &[LayerTracks]) -> Self {
         Self {
-            lines_x: vec![BTreeMap::new(); n],
-            lines_y: vec![BTreeMap::new(); n],
+            lines_x: tracks
+                .iter()
+                .map(|t| vec![Line::default(); t.tracks_x.len()])
+                .collect(),
+            lines_y: tracks
+                .iter()
+                .map(|t| vec![Line::default(); t.tracks_y.len()])
+                .collect(),
+            coords_x: tracks.iter().map(|t| t.tracks_x.clone()).collect(),
+            coords_y: tracks.iter().map(|t| t.tracks_y.clone()).collect(),
             halfw: tech
                 .routing_layers
                 .iter()
@@ -407,6 +453,7 @@ impl Occupancy {
                 .iter()
                 .map(|l| l.min_spacing_dbu())
                 .collect(),
+            stats: ScanStats::default(),
         }
     }
 
@@ -419,7 +466,6 @@ impl Occupancy {
     /// candidates only exist on lines.
     fn rasterize(
         &mut self,
-        tracks: &[LayerTracks],
         layer: u8,
         r: &RectDbu,
         who: Occupant,
@@ -427,10 +473,9 @@ impl Occupancy {
     ) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
-        let tx = &tracks[l].tracks_x;
-        let a = tx.partition_point(|&t| t <= r.xl - w2 - s);
-        let b = tx.partition_point(|&t| t < r.xh + w2 + s);
-        for &t in &tx[a..b] {
+        let a = self.coords_x[l].partition_point(|&t| t <= r.xl - w2 - s);
+        let b = self.coords_x[l].partition_point(|&t| t < r.xh + w2 + s);
+        for i in a..b {
             let iv = Interval {
                 lo: r.yl,
                 hi: r.yh,
@@ -438,20 +483,20 @@ impl Occupancy {
                 perp_hi: r.xh,
                 who,
             };
-            Self::insert(self.lines_x[l].entry(t).or_default(), iv);
+            Self::insert(&mut self.lines_x[l][i], iv);
+            ScanStats::bump(&self.stats.marks_inserted);
             if let Some(m) = log.as_deref_mut() {
                 m.push(Mark {
                     x_axis: true,
                     layer,
-                    line: t,
+                    line_idx: i as u32,
                     iv,
                 });
             }
         }
-        let ty = &tracks[l].tracks_y;
-        let a = ty.partition_point(|&t| t <= r.yl - w2 - s);
-        let b = ty.partition_point(|&t| t < r.yh + w2 + s);
-        for &t in &ty[a..b] {
+        let a = self.coords_y[l].partition_point(|&t| t <= r.yl - w2 - s);
+        let b = self.coords_y[l].partition_point(|&t| t < r.yh + w2 + s);
+        for i in a..b {
             let iv = Interval {
                 lo: r.xl,
                 hi: r.xh,
@@ -459,12 +504,13 @@ impl Occupancy {
                 perp_hi: r.yh,
                 who,
             };
-            Self::insert(self.lines_y[l].entry(t).or_default(), iv);
+            Self::insert(&mut self.lines_y[l][i], iv);
+            ScanStats::bump(&self.stats.marks_inserted);
             if let Some(m) = log.as_deref_mut() {
                 m.push(Mark {
                     x_axis: false,
                     layer,
-                    line: t,
+                    line_idx: i as u32,
                     iv,
                 });
             }
@@ -492,46 +538,47 @@ impl Occupancy {
         );
     }
 
-    /// Frees one recorded insertion (rip-up).
+    /// Frees one recorded insertion (rip-up). A logged mark always
+    /// points at a live slot — indices never move.
     fn unmark(&mut self, m: &Mark) {
-        let map = if m.x_axis {
+        let lines = if m.x_axis {
             &mut self.lines_x[m.layer as usize]
         } else {
             &mut self.lines_y[m.layer as usize]
         };
-        if let Some(line) = map.get_mut(&m.line)
-            && let Some(pos) = line.ivs.iter().position(|iv| *iv == m.iv)
-        {
+        let line = &mut lines[m.line_idx as usize];
+        if let Some(pos) = line.ivs.iter().position(|iv| *iv == m.iv) {
             line.ivs.remove(pos);
             Self::rebuild_from(line, pos / SKIP_CHUNK);
+            ScanStats::bump(&self.stats.marks_removed);
         }
     }
 
-    /// Wire-candidate check on line `t` of layer `l`: the candidate
-    /// shape spans track coords `[c, d]`, so its extent is
+    /// Wire-candidate check on track index `ti` of layer `l`: the
+    /// candidate shape spans track coords `[c, d]`, so its extent is
     /// `[c − w/2, d + w/2]` and hits are the line's intervals
     /// overlapping `[c − w/2 − s, d + w/2 + s]` — shape edge-distance
     /// `< s` along the line; the perpendicular `< s` is already
-    /// guaranteed because the committed shape rasterized `t` only
-    /// inside its `w/2 + s` band.
+    /// guaranteed because the committed shape rasterized the line
+    /// only inside its `w/2 + s` band.
     fn scan_wire(
         &self,
         axis: Axis,
         layer: u8,
-        t: i32,
+        ti: u32,
         c: i32,
         d: i32,
         out: &mut Vec<Hit>,
     ) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
-        let map = match axis {
-            Axis::X => &self.lines_y[l],
-            Axis::Y => &self.lines_x[l],
+        ScanStats::bump(&self.stats.wire_calls);
+        let (lines, coords) = match axis {
+            Axis::X => (&self.lines_y[l], &self.coords_y[l]),
+            Axis::Y => (&self.lines_x[l], &self.coords_x[l]),
         };
-        let Some(line) = map.get(&t) else {
-            return;
-        };
+        let line = &lines[ti as usize];
+        let t = coords[ti as usize];
         let (qlo, qhi) = (c - w2 - s, d + w2 + s);
         let (slo, shi) = (c - w2, d + w2);
         for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
@@ -539,10 +586,12 @@ impl Occupancy {
                 continue;
             }
             for iv in chunk {
+                ScanStats::bump(&self.stats.ivs_visited);
                 if iv.lo >= qhi {
                     return; // `lo`-sorted: no later interval can overlap
                 }
                 if iv.hi > qlo {
+                    ScanStats::bump(&self.stats.hits_pushed);
                     out.push(Hit {
                         iv: *iv,
                         line: t,
@@ -566,17 +615,25 @@ impl Occupancy {
     fn scan_rect(&self, layer: u8, r: &RectDbu, out: &mut Vec<Hit>) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
+        ScanStats::bump(&self.stats.rect_calls);
         let re = RectDbu::new(r.xl - s, r.yl - s, r.xh + s, r.yh + s);
-        for (&t, line) in self.lines_y[l].range(re.yl - w2 - s..=re.yh + w2 + s) {
+        let ay = self.coords_y[l].partition_point(|&t| t < re.yl - w2 - s);
+        let by = self.coords_y[l].partition_point(|&t| t <= re.yh + w2 + s);
+        for ti in ay..by {
+            ScanStats::bump(&self.stats.rect_lines_visited);
+            let t = self.coords_y[l][ti];
+            let line = &self.lines_y[l][ti];
             for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
                 if line.max_hi[ci] <= re.xl {
                     continue;
                 }
                 for iv in chunk {
+                    ScanStats::bump(&self.stats.ivs_visited);
                     if iv.lo >= re.xh {
                         break;
                     }
                     if iv.hi > re.xl && iv.perp_lo < re.yh && iv.perp_hi > re.yl {
+                        ScanStats::bump(&self.stats.hits_pushed);
                         out.push(Hit {
                             iv: *iv,
                             line: t,
@@ -589,16 +646,23 @@ impl Occupancy {
                 }
             }
         }
-        for (&t, line) in self.lines_x[l].range(re.xl - w2 - s..=re.xh + w2 + s) {
+        let ax = self.coords_x[l].partition_point(|&t| t < re.xl - w2 - s);
+        let bx = self.coords_x[l].partition_point(|&t| t <= re.xh + w2 + s);
+        for ti in ax..bx {
+            ScanStats::bump(&self.stats.rect_lines_visited);
+            let t = self.coords_x[l][ti];
+            let line = &self.lines_x[l][ti];
             for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
                 if line.max_hi[ci] <= re.yl {
                     continue;
                 }
                 for iv in chunk {
+                    ScanStats::bump(&self.stats.ivs_visited);
                     if iv.lo >= re.yh {
                         break;
                     }
                     if iv.hi > re.yl && iv.perp_lo < re.xh && iv.perp_hi > re.xl {
+                        ScanStats::bump(&self.stats.hits_pushed);
                         out.push(Hit {
                             iv: *iv,
                             line: t,
@@ -628,7 +692,7 @@ impl Occupancy {
 /// port's spacing band is a real emit-time finding (the gcd `met3.2`
 /// `req_msg`/`resp_msg` class), so the band is priced, recorded
 /// wire-side, and finally walled.
-fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut Occupancy) {
+fn premark_obs(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy) {
     // Cell → its instance pins' placed shapes per layer — OBS paint
     // clipped against them keeps a wall only where it is not pin.
     let mut cell_pins: BTreeMap<u32, Vec<(u8, RectDbu)>> = BTreeMap::new();
@@ -679,18 +743,18 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
                 })
                 .unwrap_or_default();
             for slab in rect_minus(vec![pr], &subs) {
-                occ.rasterize(tracks, lid.0, &slab, Occupant::Obs(c as u32), None);
+                occ.rasterize(lid.0, &slab, Occupant::Obs(c as u32), None);
             }
         }
     }
-    rasterize_pin_marks(db, tech, tracks, occ);
+    rasterize_pin_marks(db, tech, occ);
     // PDN stripes and via stacks: fixed metal every signal net must
     // clear — the emit-time self-DRC measures spacing against these
     // shapes, so the router has to price them.
     for pdn in &db.pdn_nets {
         for &(lid, r) in &pdn.wire_rects {
             if (lid.0 as usize) < occ.lines_x.len() {
-                occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
+                occ.rasterize(lid.0, &r, Occupant::Obs(u32::MAX), None);
             }
         }
         for via in &pdn.vias {
@@ -698,7 +762,7 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
                 if let DrcLayer::Routing(lid) = dl
                     && (lid.0 as usize) < occ.lines_x.len()
                 {
-                    occ.rasterize(tracks, lid.0, &r, Occupant::Obs(u32::MAX), None);
+                    occ.rasterize(lid.0, &r, Occupant::Obs(u32::MAX), None);
                 }
             }
         }
@@ -711,7 +775,7 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut O
 /// Cover}` hosts are skipped. Shared by the router's premark and
 /// `pin_overlap_census`'s rebuild so the census measures against
 /// exactly the marks the router saw.
-fn rasterize_pin_marks(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ: &mut Occupancy) {
+fn rasterize_pin_marks(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy) {
     for p in 0..db.pin_names.len() {
         if let Some(c) = db.pin_cells[p]
             && !matches!(
@@ -733,7 +797,7 @@ fn rasterize_pin_marks(db: &DesignDb, tech: &TechDb, tracks: &[LayerTracks], occ
         };
         for (lid, r) in pin_shapes(db, tech, pin) {
             if (lid.0 as usize) < occ.lines_x.len() {
-                occ.rasterize(tracks, lid.0, &r, who, None);
+                occ.rasterize(lid.0, &r, who, None);
             }
         }
     }
@@ -929,13 +993,15 @@ fn edge_cost(
         let (na, nb) = (&g.nodes[e.a as usize], &g.nodes[e.b as usize]);
         let l = na.layer.0;
         let lt = &tracks[l as usize];
-        let (line, c, d) = match e.axis {
+        let (ti, line, c, d) = match e.axis {
             Axis::X => (
+                na.iy,
                 lt.tracks_y[na.iy as usize],
                 lt.tracks_x[na.ix as usize].min(lt.tracks_x[nb.ix as usize]),
                 lt.tracks_x[na.ix as usize].max(lt.tracks_x[nb.ix as usize]),
             ),
             Axis::Y => (
+                na.ix,
                 lt.tracks_x[na.ix as usize],
                 lt.tracks_y[na.iy as usize].min(lt.tracks_y[nb.iy as usize]),
                 lt.tracks_y[na.iy as usize].max(lt.tracks_y[nb.iy as usize]),
@@ -947,7 +1013,7 @@ fn edge_cost(
             OFF_AXIS_COST
         };
         let from = hits.len();
-        occ.scan_wire(e.axis, l, line, c, d, hits);
+        occ.scan_wire(e.axis, l, ti, c, d, hits);
         let w2 = occ.halfw[l as usize];
         let paint = match e.axis {
             Axis::X => RectDbu::new(c, line - w2, d, line + w2),
@@ -1028,17 +1094,18 @@ fn scan_stub(
     out: &mut Vec<Hit>,
 ) {
     let (nx, ny) = node_xy(g, tracks, n);
+    let node = &g.nodes[n as usize];
     let w2 = occ.halfw[l as usize];
     if nx == x {
         if ny != y {
             let from = out.len();
-            occ.scan_wire(Axis::Y, l, nx, ny.min(y), ny.max(y), out);
+            occ.scan_wire(Axis::Y, l, node.ix, ny.min(y), ny.max(y), out);
             let paint = RectDbu::new(nx - w2, ny.min(y), nx + w2, ny.max(y));
             exempt_obs(cover, &paint, out, from);
         }
     } else if ny == y {
         let from = out.len();
-        occ.scan_wire(Axis::X, l, ny, nx.min(x), nx.max(x), out);
+        occ.scan_wire(Axis::X, l, node.iy, nx.min(x), nx.max(x), out);
         let paint = RectDbu::new(nx.min(x), ny - w2, nx.max(x), ny + w2);
         exempt_obs(cover, &paint, out, from);
     }
@@ -1101,19 +1168,19 @@ fn edge_collisions(
         let (na, nb) = (&g.nodes[e.a as usize], &g.nodes[e.b as usize]);
         let l = na.layer.0;
         let lt = &tracks[l as usize];
-        let (line, c, d) = match e.axis {
+        let (ti, c, d) = match e.axis {
             Axis::X => (
-                lt.tracks_y[na.iy as usize],
+                na.iy,
                 lt.tracks_x[na.ix as usize].min(lt.tracks_x[nb.ix as usize]),
                 lt.tracks_x[na.ix as usize].max(lt.tracks_x[nb.ix as usize]),
             ),
             Axis::Y => (
-                lt.tracks_x[na.ix as usize],
+                na.ix,
                 lt.tracks_y[na.iy as usize].min(lt.tracks_y[nb.iy as usize]),
                 lt.tracks_y[na.iy as usize].max(lt.tracks_y[nb.iy as usize]),
             ),
         };
-        occ.scan_wire(e.axis, l, line, c, d, hits);
+        occ.scan_wire(e.axis, l, ti, c, d, hits);
         record(LayerId(l), hits);
     } else {
         let (k, x, y) = if eidx < v_plane {
@@ -3383,7 +3450,6 @@ fn try_fill(
 /// footprints) as `Net(net)` marks, logging each insertion for rip-up.
 fn commit_route(
     occ: &mut Occupancy,
-    tracks: &[LayerTracks],
     vias: &ViaTable,
     route: &NetRoute,
     marks: &mut Vec<Mark>,
@@ -3391,7 +3457,7 @@ fn commit_route(
     for w in &route.wires {
         let hw = occ.halfw[w.layer.0 as usize];
         let r = RectDbu::new(w.x1 - hw, w.y1 - hw, w.x2 + hw, w.y2 + hw);
-        occ.rasterize(tracks, w.layer.0, &r, Occupant::Net(route.net.0), Some(marks));
+        occ.rasterize(w.layer.0, &r, Occupant::Net(route.net.0), Some(marks));
     }
     for v in &route.vias {
         let pair = &vias.pairs[v.lower.0 as usize];
@@ -3407,11 +3473,11 @@ fn commit_route(
                 continue;
             }
             let shift = RectDbu::new(v.x + r.xl, v.y + r.yl, v.x + r.xh, v.y + r.yh);
-            occ.rasterize(tracks, lid.0, &shift, Occupant::Net(route.net.0), Some(marks));
+            occ.rasterize(lid.0, &shift, Occupant::Net(route.net.0), Some(marks));
         }
     }
     for (lid, r) in &route.fills {
-        occ.rasterize(tracks, lid.0, r, Occupant::Net(route.net.0), Some(marks));
+        occ.rasterize(lid.0, r, Occupant::Net(route.net.0), Some(marks));
     }
 }
 
@@ -3611,7 +3677,7 @@ fn patch_component(
                     (coord(prev), coord(lo), prev)
                 };
                 hits.clear();
-                occ.scan_wire(pref, l, line_at(line), c, d, &mut hits);
+                occ.scan_wire(pref, l, line, c, d, &mut hits);
                 if !hits
                     .iter()
                     .all(|h| {
@@ -3667,7 +3733,7 @@ fn patch_component(
         };
         route.wires.push(seg);
         let r = span_rect(pref, w2, line_at(line), coord(lo), coord(hi));
-        occ.rasterize(tracks, l, &r, Occupant::Net(own), None);
+        occ.rasterize(l, &r, Occupant::Net(own), None);
         return true;
     }
     false
@@ -3821,8 +3887,8 @@ pub fn route_nets_with_progress(
     let t0 = std::time::Instant::now();
     let n = graphs.nets.len();
     let hull = HullMask::new(db, tech);
-    let mut occ = Occupancy::new(tech);
-    premark_obs(db, tech, tracks, &mut occ);
+    let mut occ = Occupancy::new(tech, tracks);
+    premark_obs(db, tech, &mut occ);
     if timing {
         eprintln!("drt: premark_obs {:?}", t0.elapsed());
     }
@@ -3875,7 +3941,7 @@ pub fn route_nets_with_progress(
             ) {
                 NetOutcome::Routed(route, hits, pin_hits, res) => {
                     routed += 1;
-                    commit_route(&mut occ, tracks, vias, &route, &mut marks[i]);
+                    commit_route(&mut occ, vias, &route, &mut marks[i]);
                     if !hard && cfg.occ == OccMode::Enabled {
                         prov.extend(hits);
                         prov_pins.extend(pin_hits);
@@ -3957,12 +4023,21 @@ pub fn route_nets_with_progress(
             hist[i] = hist[i].saturating_add(1);
         }
         if timing {
+            let st = &occ.stats;
             eprintln!(
-                "drt: iter {it} bad={} failed={} prov={} {:?}",
+                "drt: iter {it} bad={} failed={} prov={} {:?} \
+                 occ wire={} rect={} rect_lines={} ivs={} hits={} marks+={} marks-={}",
                 bad.len(),
                 failed.len(),
                 prov.len(),
-                ti.elapsed()
+                ti.elapsed(),
+                st.wire_calls.get(),
+                st.rect_calls.get(),
+                st.rect_lines_visited.get(),
+                st.ivs_visited.get(),
+                st.hits_pushed.get(),
+                st.marks_inserted.get(),
+                st.marks_removed.get(),
             );
         }
     }
@@ -3998,6 +4073,23 @@ pub fn route_nets_with_progress(
             "drt: min-area patch patches={area_patches} residuals={} {:?}",
             area_residuals.len(),
             tp.elapsed()
+        );
+        let st = &occ.stats;
+        let (wc, rc) = (st.wire_calls.get(), st.rect_calls.get());
+        let (rl, ivs, hits) = (
+            st.rect_lines_visited.get(),
+            st.ivs_visited.get(),
+            st.hits_pushed.get(),
+        );
+        eprintln!(
+            "drt: occ-scan totals wire={wc} rect={rc} rect_lines={rl} ivs={ivs} \
+             hits={hits} marks+={} marks-={} | ivs/wire_call={:.1} \
+             lines/rect_call={:.1} hits/scan={:.2}",
+            st.marks_inserted.get(),
+            st.marks_removed.get(),
+            ivs as f64 / wc.max(1) as f64,
+            rl as f64 / rc.max(1) as f64,
+            hits as f64 / (wc + rc).max(1) as f64,
         );
     }
 
@@ -4048,16 +4140,19 @@ pub fn overlap_census(
     tracks: &[LayerTracks],
     vias: &ViaTable,
 ) -> Vec<Collision> {
-    let mut occ = Occupancy::new(tech);
+    let mut occ = Occupancy::new(tech, tracks);
     for r in routes {
         let mut sink = Vec::new();
-        commit_route(&mut occ, tracks, vias, r, &mut sink);
+        commit_route(&mut occ, vias, r, &mut sink);
     }
     let mut out = BTreeSet::new();
     for l in 0..occ.lines_x.len() {
         let s = occ.spc[l];
-        for map in [&occ.lines_x[l], &occ.lines_y[l]] {
-            for (&t, line) in map {
+        for (coords, lines) in [
+            (&occ.coords_x[l], &occ.lines_x[l]),
+            (&occ.coords_y[l], &occ.lines_y[l]),
+        ] {
+            for (&t, line) in coords.iter().zip(lines) {
                 let sorted = &line.ivs;
                 for i in 0..sorted.len() {
                     for b in sorted.iter().skip(i + 1) {
@@ -4105,17 +4200,20 @@ pub fn pin_overlap_census(
     vias: &ViaTable,
     routes: &[NetRoute],
 ) -> Vec<Collision> {
-    let mut occ = Occupancy::new(tech);
-    rasterize_pin_marks(db, tech, tracks, &mut occ);
+    let mut occ = Occupancy::new(tech, tracks);
+    rasterize_pin_marks(db, tech, &mut occ);
     for r in routes {
         let mut sink = Vec::new();
-        commit_route(&mut occ, tracks, vias, r, &mut sink);
+        commit_route(&mut occ, vias, r, &mut sink);
     }
     let mut out = BTreeSet::new();
     for l in 0..occ.lines_x.len() {
         let s = occ.spc[l];
-        for map in [&occ.lines_x[l], &occ.lines_y[l]] {
-            for (&t, line) in map {
+        for (coords, lines) in [
+            (&occ.coords_x[l], &occ.lines_x[l]),
+            (&occ.coords_y[l], &occ.lines_y[l]),
+        ] {
+            for (&t, line) in coords.iter().zip(lines) {
                 let sorted = &line.ivs;
                 for i in 0..sorted.len() {
                     for b in sorted.iter().skip(i + 1) {
@@ -4349,49 +4447,47 @@ mod tests {
     }
 
     fn toy_occ(tech: &TechDb) -> Occupancy {
-        Occupancy::new(tech)
+        Occupancy::new(tech, &toy_tracks())
     }
 
-    fn commit_wire(occ: &mut Occupancy, tracks: &[LayerTracks], lo: i32, hi: i32, t: i32) {
+    fn commit_wire(occ: &mut Occupancy, lo: i32, hi: i32, t: i32) {
         // Horizontal wire of net 7 on line t, span [lo,hi] — shape
         // [lo-70, t-70, hi+70, t+70] with w=140.
         let r = RectDbu::new(lo - 70, t - 70, hi + 70, t + 70);
-        occ.rasterize(tracks, 0, &r, Occupant::Net(7), None);
+        occ.rasterize(0, &r, Occupant::Net(7), None);
     }
 
     #[test]
     fn test_band_math() {
         let tech = toy_tech();
-        let tracks = toy_tracks();
         let mut occ = toy_occ(&tech);
-        commit_wire(&mut occ, &tracks, 1000, 2000, 1000);
+        commit_wire(&mut occ, 1000, 2000, 1000);
         // Committed shape [930,2070] on y=1000. w2=70, s=140.
         let mut hits = Vec::new();
         // Near: candidate span [2210,3000] → shape lo 2140, gap 70 < s → hit.
-        occ.scan_wire(Axis::X, 0, 1000, 2210, 3000, &mut hits);
+        occ.scan_wire(Axis::X, 0, 1, 2210, 3000, &mut hits);
         assert!(!hits.is_empty(), "edge distance 70 < s must conflict");
         // Abut-at-s: span [2280,3000] → shape lo 2210, gap == s → legal.
         hits.clear();
-        occ.scan_wire(Axis::X, 0, 1000, 2280, 3000, &mut hits);
+        occ.scan_wire(Axis::X, 0, 1, 2280, 3000, &mut hits);
         assert!(hits.is_empty(), "edge distance == s is legal (strict <)");
         // Far: different line entirely.
         hits.clear();
-        occ.scan_wire(Axis::X, 0, 2000, 1000, 2000, &mut hits);
+        occ.scan_wire(Axis::X, 0, 2, 1000, 2000, &mut hits);
         assert!(hits.is_empty());
     }
 
     #[test]
     fn test_perpendicular_crossing() {
         let tech = toy_tech();
-        let tracks = toy_tracks();
         let mut occ = toy_occ(&tech);
-        commit_wire(&mut occ, &tracks, 1000, 2000, 1000);
+        commit_wire(&mut occ, 1000, 2000, 1000);
         // The committed wire's shape [930,930,2070,1070] marks vertical
         // lines x ∈ (720, 3280) → x = 1000, 2000, 3000 with y-interval
         // [930,1070].
         let mut hits = Vec::new();
         // Vertical candidate through the footprint: x=2000, y [0,1500].
-        occ.scan_wire(Axis::Y, 0, 2000, 0, 1500, &mut hits);
+        occ.scan_wire(Axis::Y, 0, 2, 0, 1500, &mut hits);
         assert_eq!(hits.len(), 1, "crossing the footprint must hit");
         // Beside it: x=0 holds no mark.
         hits.clear();
@@ -4399,11 +4495,11 @@ mod tests {
         assert!(hits.is_empty());
         // Boundary: y span [1210,2000] → shape lo 1140, gap to 1070 = 70 → hit.
         hits.clear();
-        occ.scan_wire(Axis::Y, 0, 2000, 1210, 2000, &mut hits);
+        occ.scan_wire(Axis::Y, 0, 2, 1210, 2000, &mut hits);
         assert_eq!(hits.len(), 1);
         // Span [1280,2000] → shape lo 1210, gap 140 == s → free.
         hits.clear();
-        occ.scan_wire(Axis::Y, 0, 2000, 1280, 2000, &mut hits);
+        occ.scan_wire(Axis::Y, 0, 2, 1280, 2000, &mut hits);
         assert!(hits.is_empty());
     }
 
@@ -4452,7 +4548,7 @@ mod tests {
         let tech = toy_tech();
         let mask = HullMask::new(&db, &tech);
         let cover = PinCover::new();
-        let occ = Occupancy::new(&tech);
+        let occ = Occupancy::new(&tech, &tracks);
         let got = project_attach(&g, &shapes, &tracks, &occ, &mask, &cover, 0);
         assert_eq!(got, vec![3, 4], "nodes adjacent to the pin on covered lines");
         // No covered track at all → Unattachable (empty set).
@@ -4568,7 +4664,7 @@ mod tests {
         db.net_pin_offsets = vec![0, 2];
         db.net_pin_ids = vec![PinId(0), PinId(1)];
 
-        let occ = Occupancy::new(&tech);
+        let occ = Occupancy::new(&tech, &tracks);
         let cfg = MazeConfig::default();
         let mask = HullMask::new(&db, &tech);
         let topo = NetTopo::new(&db, &tech, &tracks, &g, &vias, &occ, &mask);
@@ -4681,7 +4777,6 @@ mod tests {
         assert_eq!(component_area(&db, &tech, &g, &vias, &route), 159_600);
         let mut occ = toy_occ(&tech);
         occ.rasterize(
-            &tracks,
             0,
             &RectDbu::new(-70, -70, 1070, 70),
             Occupant::Net(0),
@@ -4760,7 +4855,6 @@ mod tests {
             let tech = toy_tech_area(area_dbu2);
             let mut occ = toy_occ(&tech);
             occ.rasterize(
-                &tracks,
                 0,
                 &RectDbu::new(-70, -70, 1070, 70),
                 Occupant::Net(0),
@@ -4814,7 +4908,6 @@ mod tests {
         assert_eq!(component_area(&db, &tech, &g, &vias, &route), 159_600);
         let mut occ = toy_occ(&tech);
         occ.rasterize(
-            &tracks,
             0,
             &RectDbu::new(930, -70, 2070, 70),
             Occupant::Net(0),
@@ -4823,14 +4916,12 @@ mod tests {
         // Foreign metal inside the [2000,3000] step's band; an Obs
         // mark inside every −x step's band.
         occ.rasterize(
-            &tracks,
             0,
             &RectDbu::new(2280, -70, 3000, 70),
             Occupant::Net(42),
             None,
         );
         occ.rasterize(
-            &tracks,
             0,
             &RectDbu::new(-500, -70, -100, 70),
             Occupant::Obs(u32::MAX),
@@ -5035,7 +5126,6 @@ mod tests {
         // Foreign committed metal walls the [500,600]×[930,1070] gap —
         // every `try_fill` slab loses it to `fill_blocked`.
         occ.rasterize(
-            &toy_tracks(),
             0,
             &RectDbu::new(500, 930, 600, 1070),
             Occupant::Net(9),
@@ -5089,7 +5179,6 @@ mod tests {
         };
         let mut occ = toy_occ(&tech);
         occ.rasterize(
-            &toy_tracks(),
             0,
             &RectDbu::new(500, 930, 600, 1070),
             Occupant::Net(9),
@@ -5148,7 +5237,6 @@ mod tests {
         route.fills = vec![(LayerId(0), RectDbu::new(2130, -70, 2470, 70))];
         let mut occ = toy_occ(&tech);
         occ.rasterize(
-            &tracks,
             0,
             &RectDbu::new(-70, -70, 1070, 70),
             Occupant::Net(0),
@@ -5197,7 +5285,6 @@ mod tests {
         ];
         let mut occ = toy_occ(&tech);
         occ.rasterize(
-            &tracks,
             0,
             &RectDbu::new(-70, -70, 1070, 70),
             Occupant::Net(0),
@@ -5363,5 +5450,503 @@ mod tests {
                 bound_dbu2: 600_000,
             }]
         );
+    }
+
+    // --- Occupancy differential oracle ---------------------------------
+    //
+    // `RefOccupancy` is the pre-swap per-layer `BTreeMap<i32, Line>`
+    // occupancy, verbatim from before the dense track-indexed rewrite
+    // (sharing `Line`, `Interval`, `Occupant`, `Hit`, `SKIP_CHUNK`,
+    // `insert`, `rebuild_from`). The seeded op stream below must
+    // produce identical `Hit` sequences — order included — on both
+    // structures; `RefMark` keeps the old coordinate payload while
+    // `Mark` keeps the slot index, with `coords_*`/`tracks` resolving
+    // between them.
+
+    #[derive(Clone, Copy, Debug)]
+    struct RefMark {
+        x_axis: bool,
+        layer: u8,
+        line: i32,
+        iv: Interval,
+    }
+
+    struct RefOccupancy {
+        lines_x: Vec<BTreeMap<i32, Line>>,
+        lines_y: Vec<BTreeMap<i32, Line>>,
+        halfw: Vec<i32>,
+        spc: Vec<i32>,
+    }
+
+    impl RefOccupancy {
+        fn new(tech: &TechDb) -> Self {
+            let n = tech.routing_layers.len();
+            Self {
+                lines_x: vec![BTreeMap::new(); n],
+                lines_y: vec![BTreeMap::new(); n],
+                halfw: tech
+                    .routing_layers
+                    .iter()
+                    .map(|l| l.width_dbu / 2)
+                    .collect(),
+                spc: tech
+                    .routing_layers
+                    .iter()
+                    .map(|l| l.min_spacing_dbu())
+                    .collect(),
+            }
+        }
+
+        fn rasterize(
+            &mut self,
+            tracks: &[LayerTracks],
+            layer: u8,
+            r: &RectDbu,
+            who: Occupant,
+            mut log: Option<&mut Vec<RefMark>>,
+        ) {
+            let l = layer as usize;
+            let (w2, s) = (self.halfw[l], self.spc[l]);
+            let tx = &tracks[l].tracks_x;
+            let a = tx.partition_point(|&t| t <= r.xl - w2 - s);
+            let b = tx.partition_point(|&t| t < r.xh + w2 + s);
+            for &t in &tx[a..b] {
+                let iv = Interval {
+                    lo: r.yl,
+                    hi: r.yh,
+                    perp_lo: r.xl,
+                    perp_hi: r.xh,
+                    who,
+                };
+                Occupancy::insert(self.lines_x[l].entry(t).or_default(), iv);
+                if let Some(m) = log.as_deref_mut() {
+                    m.push(RefMark {
+                        x_axis: true,
+                        layer,
+                        line: t,
+                        iv,
+                    });
+                }
+            }
+            let ty = &tracks[l].tracks_y;
+            let a = ty.partition_point(|&t| t <= r.yl - w2 - s);
+            let b = ty.partition_point(|&t| t < r.yh + w2 + s);
+            for &t in &ty[a..b] {
+                let iv = Interval {
+                    lo: r.xl,
+                    hi: r.xh,
+                    perp_lo: r.yl,
+                    perp_hi: r.yh,
+                    who,
+                };
+                Occupancy::insert(self.lines_y[l].entry(t).or_default(), iv);
+                if let Some(m) = log.as_deref_mut() {
+                    m.push(RefMark {
+                        x_axis: false,
+                        layer,
+                        line: t,
+                        iv,
+                    });
+                }
+            }
+        }
+
+        fn unmark(&mut self, m: &RefMark) {
+            let map = if m.x_axis {
+                &mut self.lines_x[m.layer as usize]
+            } else {
+                &mut self.lines_y[m.layer as usize]
+            };
+            if let Some(line) = map.get_mut(&m.line)
+                && let Some(pos) = line.ivs.iter().position(|iv| *iv == m.iv)
+            {
+                line.ivs.remove(pos);
+                Occupancy::rebuild_from(line, pos / SKIP_CHUNK);
+            }
+        }
+
+        fn scan_wire(
+            &self,
+            axis: Axis,
+            layer: u8,
+            t: i32,
+            c: i32,
+            d: i32,
+            out: &mut Vec<Hit>,
+        ) {
+            let l = layer as usize;
+            let (w2, s) = (self.halfw[l], self.spc[l]);
+            let map = match axis {
+                Axis::X => &self.lines_y[l],
+                Axis::Y => &self.lines_x[l],
+            };
+            let Some(line) = map.get(&t) else {
+                return;
+            };
+            let (qlo, qhi) = (c - w2 - s, d + w2 + s);
+            let (slo, shi) = (c - w2, d + w2);
+            for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
+                if line.max_hi[ci] <= qlo {
+                    continue;
+                }
+                for iv in chunk {
+                    if iv.lo >= qhi {
+                        return;
+                    }
+                    if iv.hi > qlo {
+                        out.push(Hit {
+                            iv: *iv,
+                            line: t,
+                            layer,
+                            x_axis: matches!(axis, Axis::Y),
+                            lo: iv.lo.max(slo),
+                            hi: iv.hi.min(shi),
+                        });
+                    }
+                }
+            }
+        }
+
+        fn scan_rect(&self, layer: u8, r: &RectDbu, out: &mut Vec<Hit>) {
+            let l = layer as usize;
+            let (w2, s) = (self.halfw[l], self.spc[l]);
+            let re = RectDbu::new(r.xl - s, r.yl - s, r.xh + s, r.yh + s);
+            for (&t, line) in self.lines_y[l].range(re.yl - w2 - s..=re.yh + w2 + s) {
+                for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
+                    if line.max_hi[ci] <= re.xl {
+                        continue;
+                    }
+                    for iv in chunk {
+                        if iv.lo >= re.xh {
+                            break;
+                        }
+                        if iv.hi > re.xl && iv.perp_lo < re.yh && iv.perp_hi > re.yl {
+                            out.push(Hit {
+                                iv: *iv,
+                                line: t,
+                                layer,
+                                x_axis: false,
+                                lo: iv.lo.max(r.xl),
+                                hi: iv.hi.min(r.xh),
+                            });
+                        }
+                    }
+                }
+            }
+            for (&t, line) in self.lines_x[l].range(re.xl - w2 - s..=re.xh + w2 + s) {
+                for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
+                    if line.max_hi[ci] <= re.yl {
+                        continue;
+                    }
+                    for iv in chunk {
+                        if iv.lo >= re.yh {
+                            break;
+                        }
+                        if iv.hi > re.yl && iv.perp_lo < re.xh && iv.perp_hi > re.xl {
+                            out.push(Hit {
+                                iv: *iv,
+                                line: t,
+                                layer,
+                                x_axis: true,
+                                lo: iv.lo.max(r.yl),
+                                hi: iv.hi.min(r.yh),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// xorshift64* — deterministic op stream for the differential
+    /// test (no external RNG dependency).
+    struct Xor64(u64);
+
+    impl Xor64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn span(&mut self) -> i32 {
+            // Rect/query coordinate: covers every track list's extent
+            // plus off-edge space so empty-band windows occur.
+            -1500 + self.below(7500) as i32
+        }
+    }
+
+    /// Four routing layers with distinct width/spacing pairs so the
+    /// band arithmetic differs per layer.
+    fn diff_tech() -> TechDb {
+        let mut tech = TechDb::new();
+        for (i, (w, s)) in [(140, 140), (160, 160), (170, 130), (150, 150)]
+            .into_iter()
+            .enumerate()
+        {
+            let name = tech.strings.intern(&format!("l{i}"));
+            tech.routing_layers.push(RoutingLayer {
+                name,
+                dir: LayerDir::Horizontal,
+                pitch_dbu: 340,
+                width_dbu: w,
+                offset_dbu: 0,
+                pitch_x_dbu: 340,
+                pitch_y_dbu: 340,
+                offset_x_dbu: 0,
+                offset_y_dbu: 0,
+                tracks_x: vec![],
+                tracks_y: vec![],
+                res_per_sq: 0.0,
+                cap_per_sq_um: 0.0,
+                edge_cap_per_um: 0.0,
+                spacing_dbu: s,
+                spacing_table: vec![],
+                area_dbu2: 0,
+                min_enclosed_area_dbu2: 0,
+            });
+        }
+        tech
+    }
+
+    /// Mixed track lists: uniform, irregular-spaced, and one layer
+    /// with an empty axis each way — the no-line-window arm.
+    fn diff_tracks() -> Vec<LayerTracks> {
+        vec![
+            LayerTracks {
+                tracks_x: vec![0, 1000, 2000, 3000],
+                tracks_y: vec![0, 1000, 2000, 3000],
+            },
+            LayerTracks {
+                tracks_x: vec![-320, 150, 930, 2155, 3900, 5150],
+                tracks_y: vec![10, 480, 2990],
+            },
+            LayerTracks {
+                tracks_x: vec![],
+                tracks_y: vec![0, 170, 340, 510],
+            },
+            LayerTracks {
+                tracks_x: vec![100, 300, 500],
+                tracks_y: vec![],
+            },
+        ]
+    }
+
+    fn rand_rect(rng: &mut Xor64) -> RectDbu {
+        // Shape classes: degenerate (xl==xh), long-thin both ways,
+        // and large — small rects still band-mark lines while off-
+        // edge and empty-window rects exercise the zero-line arms.
+        let (xl, yl) = (rng.span(), rng.span());
+        let (w, h) = match rng.below(4) {
+            0 => (0, rng.below(3000) as i32),
+            1 => (rng.below(300) as i32, 3000 + rng.below(4000) as i32),
+            2 => (3000 + rng.below(4000) as i32, rng.below(300) as i32),
+            _ => (rng.below(2000) as i32, rng.below(2000) as i32),
+        };
+        RectDbu::new(xl, yl, xl + w, yl + h)
+    }
+
+    fn rand_who(rng: &mut Xor64) -> Occupant {
+        let n = rng.below(64) as u32;
+        match rng.below(4) {
+            0 => Occupant::Obs(if rng.below(16) == 0 { u32::MAX } else { n }),
+            1 => Occupant::Net(n),
+            2 => Occupant::Pin(n),
+            _ => Occupant::ObsPin(n),
+        }
+    }
+
+    fn who_key(w: Occupant) -> (u8, u32) {
+        match w {
+            Occupant::Obs(n) => (0, n),
+            Occupant::Net(n) => (1, n),
+            Occupant::Pin(n) => (2, n),
+            Occupant::ObsPin(n) => (3, n),
+        }
+    }
+
+    /// Every `Hit` field as a sortable key.
+    type HitKey = (i32, u8, bool, i32, i32, i32, i32, i32, i32, (u8, u32));
+
+    /// Ordering the emitted `Vec`s must be identical — a sorted
+    /// multiset check would hide a permutation the raw comparison
+    /// catches.
+    fn hit_key(h: &Hit) -> HitKey {
+        (
+            h.line,
+            h.layer,
+            h.x_axis,
+            h.lo,
+            h.hi,
+            h.iv.lo,
+            h.iv.hi,
+            h.iv.perp_lo,
+            h.iv.perp_hi,
+            who_key(h.iv.who),
+        )
+    }
+
+    fn assert_hits_eq(new: &[Hit], oracle: &[Hit], ctx: &str) {
+        let a: Vec<_> = new.iter().map(hit_key).collect();
+        let b: Vec<_> = oracle.iter().map(hit_key).collect();
+        assert_eq!(a, b, "{ctx}: hit sequence differs ({a:?} vs {b:?})");
+    }
+
+    /// Differential test: the dense `Occupancy` must reproduce the
+    /// BTreeMap oracle's `Hit` sequences exactly — window endpoints,
+    /// mark/unmark churn, duplicate intervals, empty axes, and
+    /// off-grid rects included.
+    #[test]
+    fn test_occupancy_differential() {
+        let tech = diff_tech();
+        let tracks = diff_tracks();
+        for &seed in &[0x9E37_79B9_7F4A_7C15u64, 0xDEAD_BEEF_CAFE_F00D] {
+            let mut rng = Xor64(seed);
+            let mut occ = Occupancy::new(&tech, &tracks);
+            let mut oracle = RefOccupancy::new(&tech);
+            // Parallel rip-up logs: `marks[i]` and `marks_ref[i]` name
+            // the same insertion (slot index vs coordinate).
+            let mut marks: Vec<Mark> = Vec::new();
+            let mut marks_ref: Vec<RefMark> = Vec::new();
+            let mut dead: Vec<(Mark, RefMark)> = Vec::new();
+            let (mut ha, mut hb) = (Vec::new(), Vec::new());
+
+            for op in 0..5000u64 {
+                let ctx = format!("seed {seed:#x} op {op}");
+                match rng.below(20) {
+                    // ~40%: rasterize a random rect; ~1 in 8 repeats
+                    // the insert so equal `iv`s stack up on a line.
+                    0..=7 => {
+                        let layer = rng.below(4) as u8;
+                        let (r, who) = (rand_rect(&mut rng), rand_who(&mut rng));
+                        let reps = 1 + (rng.below(8) == 0) as usize;
+                        for _ in 0..reps {
+                            occ.rasterize(layer, &r, who, Some(&mut marks));
+                            oracle.rasterize(&tracks, layer, &r, who, Some(&mut marks_ref));
+                        }
+                    }
+                    // ~15%: rip up a random live mark; a fifth of the
+                    // time re-unmark a dead one (no-op unless a
+                    // duplicate `iv` is still live — exercised by the
+                    // duplicate-insert arm above).
+                    8..=10 => {
+                        if !dead.is_empty() && (marks.is_empty() || rng.below(5) == 0) {
+                            let i = rng.below(dead.len() as u64) as usize;
+                            occ.unmark(&dead[i].0);
+                            oracle.unmark(&dead[i].1);
+                        } else if !marks.is_empty() {
+                            let i = rng.below(marks.len() as u64) as usize;
+                            occ.unmark(&marks[i]);
+                            oracle.unmark(&marks_ref[i]);
+                            dead.push((marks[i], marks_ref[i]));
+                            marks.swap_remove(i);
+                            marks_ref.swap_remove(i);
+                        }
+                    }
+                    // ~20%: `scan_wire` on a random live track index —
+                    // the oracle gets the resolved coordinate.
+                    11..=14 => {
+                        let layer = rng.below(4) as u8;
+                        let axis = [Axis::X, Axis::Y][rng.below(2) as usize];
+                        let coords = match axis {
+                            Axis::X => &tracks[layer as usize].tracks_y,
+                            Axis::Y => &tracks[layer as usize].tracks_x,
+                        };
+                        // An empty axis can never host a wire
+                        // candidate — out of contract, so re-roll as
+                        // a rect query on that layer instead.
+                        if coords.is_empty() {
+                            let r = rand_rect(&mut rng);
+                            ha.clear();
+                            hb.clear();
+                            occ.scan_rect(layer, &r, &mut ha);
+                            oracle.scan_rect(layer, &r, &mut hb);
+                            assert_hits_eq(&ha, &hb, &format!("{ctx} rect (empty-axis fallback)"));
+                            continue;
+                        }
+                        let ti = rng.below(coords.len() as u64) as usize;
+                        let c = rng.span();
+                        let d = c + rng.below(4000) as i32;
+                        ha.clear();
+                        hb.clear();
+                        occ.scan_wire(axis, layer, ti as u32, c, d, &mut ha);
+                        oracle.scan_wire(axis, layer, coords[ti], c, d, &mut hb);
+                        assert_hits_eq(&ha, &hb, &format!("{ctx} wire"));
+                    }
+                    // ~25%: `scan_rect` on a random rect.
+                    _ => {
+                        let layer = rng.below(4) as u8;
+                        let r = rand_rect(&mut rng);
+                        ha.clear();
+                        hb.clear();
+                        occ.scan_rect(layer, &r, &mut ha);
+                        oracle.scan_rect(layer, &r, &mut hb);
+                        assert_hits_eq(&ha, &hb, &format!("{ctx} rect"));
+                    }
+                }
+                assert_eq!(marks.len(), marks_ref.len(), "{ctx}: mark logs diverged");
+            }
+
+            // Deliberate arms the stream may under-hit.
+            // A rect whose bands cover no track line marks nothing.
+            let before = marks.len();
+            occ.rasterize(
+                0,
+                &RectDbu::new(-60_000, -60_000, -59_000, -59_000),
+                Occupant::Obs(0),
+                Some(&mut marks),
+            );
+            oracle.rasterize(
+                &tracks,
+                0,
+                &RectDbu::new(-60_000, -60_000, -59_000, -59_000),
+                Occupant::Obs(0),
+                Some(&mut marks_ref),
+            );
+            assert_eq!(marks.len(), before, "no-line rect must mark nothing");
+            assert_eq!(marks_ref.len(), before, "oracle: no-line rect");
+            // Unmark-all then reinsert — empty lines must carry no
+            // tombstones and reinserted intervals behave identically.
+            while let Some(m) = marks.pop() {
+                let mr = marks_ref.pop().unwrap();
+                occ.unmark(&m);
+                oracle.unmark(&mr);
+            }
+            let dup = RectDbu::new(-500, -500, 500, 500);
+            for _ in 0..2 {
+                occ.rasterize(0, &dup, Occupant::Net(5), Some(&mut marks));
+                oracle.rasterize(&tracks, 0, &dup, Occupant::Net(5), Some(&mut marks_ref));
+            }
+            // Full sweep: every track index on both axes, plus a
+            // whole-space rect per layer.
+            for layer in 0..tech.routing_layers.len() as u8 {
+                let lt = &tracks[layer as usize];
+                for (i, &t) in lt.tracks_y.iter().enumerate() {
+                    ha.clear();
+                    hb.clear();
+                    occ.scan_wire(Axis::X, layer, i as u32, -10_000, 10_000, &mut ha);
+                    oracle.scan_wire(Axis::X, layer, t, -10_000, 10_000, &mut hb);
+                    assert_hits_eq(&ha, &hb, &format!("seed {seed:#x} sweep wire-x l{layer} i{i}"));
+                }
+                for (i, &t) in lt.tracks_x.iter().enumerate() {
+                    ha.clear();
+                    hb.clear();
+                    occ.scan_wire(Axis::Y, layer, i as u32, -10_000, 10_000, &mut ha);
+                    oracle.scan_wire(Axis::Y, layer, t, -10_000, 10_000, &mut hb);
+                    assert_hits_eq(&ha, &hb, &format!("seed {seed:#x} sweep wire-y l{layer} i{i}"));
+                }
+                let all = RectDbu::new(-10_000, -10_000, 10_000, 10_000);
+                ha.clear();
+                hb.clear();
+                occ.scan_rect(layer, &all, &mut ha);
+                oracle.scan_rect(layer, &all, &mut hb);
+                assert_hits_eq(&ha, &hb, &format!("seed {seed:#x} sweep rect l{layer}"));
+            }
+        }
     }
 }
