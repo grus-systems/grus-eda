@@ -1396,7 +1396,7 @@ fn test_via_edge_fixture() {
 // ---------------------------------------------------------------------------
 
 use grus_eda_core::drt::maze::{
-    FailKind, IterStat, MazeConfig, OccMode, RouteProgress, overlap_census, route_digest,
+    FailKind, IterStat, MazeConfig, OccMode, RouteDb, RouteProgress, overlap_census, route_digest,
     route_nets, route_nets_with_progress,
 };
 use grus_eda_core::drt::graph::RouteGraphs;
@@ -1431,6 +1431,102 @@ fn load_routed_inputs(
     );
     let vias = via_table(&tech, &db).expect("via_table");
     (tech, db, tracks, join, graphs, vias)
+}
+
+/// One `(fixture, config)` pair's shared route: the immutable input
+/// bundle plus its `RouteDb`, resolved once per test process. Tests
+/// that only read the route borrow `&'static RoutedLeg`; tests that
+/// mutate emit geometry clone `leg.db` (the `&'static` borrow can
+/// never yield `&mut`). `route_ms` is measured inside the
+/// initializer — it is the single real execution's time, whatever
+/// `Instant` would read in the resolving thread.
+struct RoutedLeg {
+    name: &'static str,
+    tech: TechDb,
+    db: DesignDb,
+    tracks: Vec<LayerTracks>,
+    join: GuideJoin,
+    vias: ViaTable,
+    cfg: MazeConfig,
+    route: RouteDb,
+    route_ms: u128,
+}
+
+static GCD_LEG: std::sync::OnceLock<RoutedLeg> = std::sync::OnceLock::new();
+static GCD_OCC_OFF_LEG: std::sync::OnceLock<RoutedLeg> = std::sync::OnceLock::new();
+static PICORV32_LEG: std::sync::OnceLock<RoutedLeg> = std::sync::OnceLock::new();
+
+/// Resolves `cell` once per process. The init deliberately skips
+/// `build_route_graphs_ext`: `route_nets` rebuilds per-net graphs
+/// internally (the `opts` argument only documents the build options)
+/// and no shared consumer needs the `RouteGraphs` — the two that do
+/// (`test_mem_census_sanity`, `test_net_graph_rebuild_identity`)
+/// keep `load_routed_inputs` / explicit builds.
+fn shared_leg(
+    name: &'static str,
+    occ: OccMode,
+    cell: &'static std::sync::OnceLock<RoutedLeg>,
+) -> &'static RoutedLeg {
+    cell.get_or_init(|| {
+        let (tech, db, tracks, _) = load(name);
+        let (_, join) = load_guide(&db, &tech, name);
+        let vias = via_table(&tech, &db).expect("via_table");
+        let cfg = MazeConfig {
+            occ,
+            ..MazeConfig::default()
+        };
+        let t0 = std::time::Instant::now();
+        let route = route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, &cfg);
+        RoutedLeg {
+            name,
+            tech,
+            db,
+            tracks,
+            join,
+            vias,
+            cfg,
+            route,
+            route_ms: t0.elapsed().as_millis(),
+        }
+    })
+}
+
+/// The shared legs are read across test threads — a `Cell`/`RefCell`
+/// regression inside any field fails here naming the type.
+const _: fn() = || {
+    fn need<T: Sync + Send>() {}
+    need::<RoutedLeg>();
+};
+
+fn gcd_leg() -> &'static RoutedLeg {
+    shared_leg("gcd", OccMode::Enabled, &GCD_LEG)
+}
+
+fn gcd_occ_off_leg() -> &'static RoutedLeg {
+    shared_leg("gcd", OccMode::Disabled, &GCD_OCC_OFF_LEG)
+}
+
+fn leg_for(name: &str) -> &'static RoutedLeg {
+    match name {
+        "gcd" => gcd_leg(),
+        "picorv32" => shared_leg("picorv32", OccMode::Enabled, &PICORV32_LEG),
+        _ => panic!("no shared leg for {name}"),
+    }
+}
+
+/// One fresh `route_nets` execution on a shared leg's inputs — the
+/// independent second run every determinism check compares against
+/// (`leg.route` vs `leg.route` proves nothing).
+fn route_fresh(leg: &'static RoutedLeg) -> RouteDb {
+    route_nets(
+        &leg.db,
+        &leg.tech,
+        &leg.tracks,
+        &leg.join,
+        LOADED_OPTS,
+        &leg.vias,
+        &leg.cfg,
+    )
 }
 
 /// The maze fixture: met1 `HORIZONTAL` + met2 `VERTICAL` on one 6×6
@@ -2283,7 +2379,7 @@ fn test_maze_census() {
 /// single-threaded router — a release run measures ~135 min wall
 /// (recorded in docs/results.md), well over the test-suite budget. The
 /// census runs identically under `--ignored`; the measured counts are
-/// pinned there. Run: `cargo test --release -p grus-core --test drt
+/// pinned there. Run: `cargo test --release -p grus-eda-core --test drt
 /// test_maze_census_picorv32 -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -2293,18 +2389,8 @@ fn test_maze_census_picorv32() {
 
 fn maze_census(name: &str) {
     {
-        let (tech, db, tracks, join, _, vias) = load_routed_inputs(name);
-        let t0 = std::time::Instant::now();
-        let r = route_nets(
-            &db,
-            &tech,
-            &tracks,
-            &join,
-            LOADED_OPTS,
-            &vias,
-            &MazeConfig::default(),
-        );
-        let ms = t0.elapsed().as_millis();
+        let leg = leg_for(name);
+        let (db, join, r, ms) = (&leg.db, &leg.join, &leg.route, leg.route_ms);
 
         let pins_connected: usize = r.nets.iter().map(|n| n.connected.len()).sum();
         let projected: usize = r.nets.iter().map(|n| n.projected.len()).sum();
@@ -2316,7 +2402,7 @@ fn maze_census(name: &str) {
             r.unrouted.len(),
             r.collisions.len(),
             r.iterations,
-            route_digest(&r),
+            route_digest(r),
         );
         println!(
             "{name}: iter_progress={} iter_prov={}",
@@ -2341,16 +2427,16 @@ fn maze_census(name: &str) {
             let kinds: Vec<String> = u
                 .failed
                 .iter()
-                .map(|&(p, k)| format!("{}:{k:?}", pin_label(&db, p)))
+                .map(|&(p, k)| format!("{}:{k:?}", pin_label(db, p)))
                 .collect();
-            println!("  unrouted {} pins={kinds:?}", net_name(&db, u.net));
+            println!("  unrouted {} pins={kinds:?}", net_name(db, u.net));
         }
 
         // Occupancy data-structure pin: the route output must be
         // byte-identical across the `BTreeMap` → `Vec<Line>` swap.
-        if name == "gcd" {
+        if leg.name == "gcd" {
             assert_eq!(
-                route_digest(&r),
+                route_digest(r),
                 GCD_ROUTE_DIGEST,
                 "gcd route digest drifted"
             );
@@ -2433,10 +2519,10 @@ fn maze_census(name: &str) {
             n_bridge += bridged as usize;
             for (_, k) in &u.failed {
                 if *k == FailKind::NoPath && !bridged && !pocket {
-                    unclassified.push(net_name(&db, u.net));
+                    unclassified.push(net_name(db, u.net));
                 }
             }
-            println!("  {} met3_bridge={bridged} met2_connected={pocket}", net_name(&db, u.net));
+            println!("  {} met3_bridge={bridged} met2_connected={pocket}", net_name(db, u.net));
         }
         if !r.unrouted.is_empty() {
             println!(
@@ -2456,37 +2542,17 @@ fn maze_census(name: &str) {
 /// nothing and the gate must go red.
 #[test]
 fn test_maze_occupancy() {
-    let (tech, db, tracks, join, _, vias) = load_routed_inputs("gcd");
-    let on = route_nets(
-        &db,
-        &tech,
-        &tracks,
-        &join,
-        LOADED_OPTS,
-        &vias,
-        &MazeConfig::default(),
-    );
-    let off = route_nets(
-        &db,
-        &tech,
-        &tracks,
-        &join,
-        LOADED_OPTS,
-        &vias,
-        &MazeConfig {
-            occ: OccMode::Disabled,
-            ..MazeConfig::default()
-        },
-    );
-    let on_census = overlap_census(&on.nets, &tech, &tracks, &vias).len();
-    let off_census = overlap_census(&off.nets, &tech, &tracks, &vias).len();
+    let on = gcd_leg();
+    let off = gcd_occ_off_leg();
+    let on_census = overlap_census(&on.route.nets, &on.tech, &on.tracks, &on.vias).len();
+    let off_census = overlap_census(&off.route.nets, &off.tech, &off.tracks, &off.vias).len();
     println!(
         "occupancy fail-proof: enabled digest={:#x} census={on_census} | disabled digest={:#x} census={off_census}",
-        route_digest(&on),
-        route_digest(&off),
+        route_digest(&on.route),
+        route_digest(&off.route),
     );
     assert!(
-        route_digest(&on) != route_digest(&off) || on_census != off_census,
+        route_digest(&on.route) != route_digest(&off.route) || on_census != off_census,
         "disabling occupancy changed nothing — occupancy constrains no route"
     );
 }
@@ -2509,17 +2575,16 @@ fn test_maze_determinism_picorv32() {
 
 fn maze_determinism(name: &str) {
     {
-        let (tech, db, tracks, join, _, vias) = load_routed_inputs(name);
-        let cfg = MazeConfig::default();
-        let r1 = route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, &cfg);
-        let r2 = route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, &cfg);
+        let leg = leg_for(name);
+        let r1 = &leg.route;
+        let r2 = route_fresh(leg);
         assert!(
             !r1.nets.is_empty(),
             "{name}: empty route set proves nothing"
         );
-        assert_ne!(route_digest(&r1), 0, "{name}: zero digest");
-        assert_eq!(r1, r2, "{name}: nondeterministic routes");
-        assert_eq!(route_digest(&r1), route_digest(&r2));
+        assert_ne!(route_digest(r1), 0, "{name}: zero digest");
+        assert_eq!(r1, &r2, "{name}: nondeterministic routes");
+        assert_eq!(route_digest(r1), route_digest(&r2));
     }
 }
 
@@ -2707,11 +2772,22 @@ fn test_net_graph_rebuild_identity() {
 /// census.
 #[test]
 fn test_rayon_route_determinism() {
-    let (tech, db, tracks, join, _, vias) = load_routed_inputs("gcd");
-    let cfg = MazeConfig::default();
+    // The leg resolves before any forced-thread arm — a `*_leg()`
+    // call inside a `with_rayon_threads` closure would pin the
+    // shared route's thread count to test-order luck. The forced
+    // runs stay fresh: their thread count is the input under test.
+    let leg = gcd_leg();
     let route = |threads: usize| {
         with_rayon_threads(threads, || {
-            route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, &cfg)
+            route_nets(
+                &leg.db,
+                &leg.tech,
+                &leg.tracks,
+                &leg.join,
+                LOADED_OPTS,
+                &leg.vias,
+                &leg.cfg,
+            )
         })
     };
     let r1 = route(1);
@@ -2757,17 +2833,16 @@ use grus_eda_core::drc::ShapeSrc;
 use grus_eda_core::drc::geom::assemble;
 use grus_eda_core::drc::report::{Family, SubsetReport, run_all};
 use grus_eda_core::drt::emit::{EmitReport, apply_routes, preemit_check, write_routed_def};
-use grus_eda_core::drt::maze::RouteDb;
 
-/// Route `name` and apply the result into `db.net_geoms` — the shared
-/// emit leg (gcd routes in seconds; picorv32 legs live under
-/// `#[ignore]`).
-fn emit_leg(name: &str, cfg: &MazeConfig) -> (TechDb, DesignDb, RouteDb, ViaTable, EmitReport) {
-    let (tech, mut db, tracks, join, _, vias) = load_routed_inputs(name);
-    let route_db = route_nets(&db, &tech, &tracks, &join, LOADED_OPTS, &vias, cfg);
-    let guided: Vec<NetId> = join.nets.iter().map(|&(n, _)| n).collect();
-    let report = apply_routes(&mut db, &tech, &guided, &route_db, &vias).expect("apply_routes");
-    (tech, db, route_db, vias, report)
+/// Clone `leg.db`, apply the shared `leg.route` into it — the emit
+/// half of the gate. Route re-execution is never part of emit; the
+/// clone keeps `apply_routes`' `net_geoms` writes off shared state.
+fn emit_leg(leg: &'static RoutedLeg) -> (DesignDb, EmitReport) {
+    let mut db = leg.db.clone();
+    let guided: Vec<NetId> = leg.join.nets.iter().map(|&(n, _)| n).collect();
+    let report =
+        apply_routes(&mut db, &leg.tech, &guided, &leg.route, &leg.vias).expect("apply_routes");
+    (db, report)
 }
 
 fn tmp_def(tag: &str) -> PathBuf {
@@ -2895,11 +2970,14 @@ fn print_emit_census(name: &str, tech: &TechDb, db: &DesignDb, report: &EmitRepo
     );
 }
 
-/// Route → emit → write → re-parse → `run_all` on `name` — the shared
-/// body of the gcd/picorv32 gate tests. Returns the `RouteDb` so a
-/// caller can assert on the min-area patch census.
-fn emit_gate(name: &str) -> RouteDb {
-    let (tech, db, route_db, _vias, report) = emit_leg(name, &MazeConfig::default());
+/// Emit → write → re-parse → `run_all` on the shared leg — the
+/// shared body of the gcd/picorv32 gate tests. Returns the leg's
+/// `RouteDb` so a caller can assert on the min-area patch census.
+fn emit_gate(leg: &'static RoutedLeg) -> &'static RouteDb {
+    let name = leg.name;
+    let tech = &leg.tech;
+    let (db, report) = emit_leg(leg);
+    let route_db = &leg.route;
     let (rects, vias) = geom_totals(&db);
     println!(
         "{name}: routed={} unrouted={} wire_rects={rects} vias={vias} wirelength_dbu={} area_patches={} area_residuals={}",
@@ -2924,11 +3002,11 @@ fn emit_gate(name: &str) -> RouteDb {
         );
     }
     assert!(rects > 0 && vias > 0, "{name}: empty emission — vacuous gate");
-    print_emit_census(name, &tech, &db, &report);
+    print_emit_census(name, tech, &db, &report);
 
     let out = tmp_def(&format!("{name}-gate"));
-    write_routed_def(&db, &tech, &placed_def(name), &out).expect("write routed DEF");
-    let (db2, drc_report) = self_drc(&out, &tech);
+    write_routed_def(&db, tech, &placed_def(name), &out).expect("write routed DEF");
+    let (db2, drc_report) = self_drc(&out, tech);
     print_gate(name, &drc_report);
 
     // Non-vacuity: every checked family actually saw candidates — a
@@ -2949,14 +3027,14 @@ fn emit_gate(name: &str) -> RouteDb {
     }
     // Determinism: a second `run_all` over the same assembled design
     // repeats the report verbatim.
-    let drc2 = assemble(&db2, &tech).expect("assemble");
-    assert_eq!(drc_report, run_all(&drc2, &tech, &db2.strings));
+    let drc2 = assemble(&db2, tech).expect("assemble");
+    assert_eq!(drc_report, run_all(&drc2, tech, &db2.strings));
 
     // Byte stability on the design under test itself: the re-parsed
     // geometry re-emits to the same bytes (`out` is its own template,
     // so this exercises the NETS-splice fixed point).
     let out2 = tmp_def(&format!("{name}-gate2"));
-    write_routed_def(&db2, &tech, &out, &out2).expect("re-emit");
+    write_routed_def(&db2, tech, &out, &out2).expect("re-emit");
     assert_eq!(
         std::fs::read(&out).unwrap(),
         std::fs::read(&out2).unwrap(),
@@ -2981,8 +3059,10 @@ fn emit_gate(name: &str) -> RouteDb {
 /// fixed point rather than only the placed template.
 #[test]
 fn test_emit_roundtrip_gcd() {
-    let (tech, db, route_db, _vias, report) = emit_leg("gcd", &MazeConfig::default());
-    assert_eq!(report.routed, route_db.nets.len());
+    let leg = gcd_leg();
+    let tech = &leg.tech;
+    let (db, report) = emit_leg(leg);
+    assert_eq!(report.routed, leg.route.nets.len());
     // The unrouted set is pinned by the e2e golden — a drift names the
     // differing nets in the failure rather than re-baselining a count.
     let golden_unrouted: BTreeSet<String> = j_arr(
@@ -3003,13 +3083,13 @@ fn test_emit_roundtrip_gcd() {
 
     let out1 = tmp_def("gcd-rt1");
     let out2 = tmp_def("gcd-rt2");
-    write_routed_def(&db, &tech, &placed_def("gcd"), &out1).expect("write out1");
-    let db2 = parse_def(&out1, &tech, None).expect("re-parse out1");
+    write_routed_def(&db, tech, &placed_def("gcd"), &out1).expect("write out1");
+    let db2 = parse_def(&out1, tech, None).expect("re-parse out1");
     assert_eq!(
         db2.net_geoms, db.net_geoms,
         "re-parsed net_geoms differ from applied geometry"
     );
-    write_routed_def(&db2, &tech, &out1, &out2).expect("write out2");
+    write_routed_def(&db2, tech, &out1, &out2).expect("write out2");
     assert_eq!(
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out2).unwrap(),
@@ -3023,7 +3103,7 @@ fn test_emit_roundtrip_gcd() {
 /// on our DEF; the full Magic deck check belongs to `e6-drt-e2e`.
 #[test]
 fn test_emit_selfdrc_gcd() {
-    let route_db = emit_gate("gcd");
+    let route_db = emit_gate(gcd_leg());
     // gcd's gate was 0 before the patch — a residual appearing here
     // is a patch regression to investigate, not a count to re-pin.
     assert!(
@@ -3045,7 +3125,7 @@ fn test_emit_selfdrc_gcd() {
 #[test]
 #[ignore]
 fn test_emit_selfdrc_picorv32() {
-    emit_gate("picorv32");
+    emit_gate(leg_for("picorv32"));
 }
 
 /// The fail-proof (AGENTS §7.7): the gate must go red on deliberately
@@ -3063,7 +3143,9 @@ fn test_emit_fail_proof() {
     // short is connectivity-check territory, not this subset's. The
     // injected defect is therefore a positive sub-bound gap, the
     // class the spacing rules measure.
-    let (tech, mut db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let leg = gcd_leg();
+    let tech = &leg.tech;
+    let (mut db, _rep) = emit_leg(leg);
     let met1 = tech.layer_by_name[&tech.strings.get("met1").unwrap()];
     let bound = tech.routing_layers[met1.0 as usize].min_spacing_dbu();
     let mut hit = None;
@@ -3095,8 +3177,8 @@ fn test_emit_fail_proof() {
     );
     db.net_geoms[ai].wire_rects[aj].1.xh = foreign_xl - 1;
     let out = tmp_def("gcd-fp-injected");
-    write_routed_def(&db, &tech, &placed_def("gcd"), &out).expect("write");
-    let (_db2, drc_report) = self_drc(&out, &tech);
+    write_routed_def(&db, tech, &placed_def("gcd"), &out).expect("write");
+    let (_db2, drc_report) = self_drc(&out, tech);
     print_gate("gcd(injected)", &drc_report);
     let spacing_hits: Vec<&str> = drc_report
         .rules
@@ -3110,17 +3192,13 @@ fn test_emit_fail_proof() {
     );
 
     // Arm B — occupancy disabled.
-    let (tech, db, route_db, _vias, _rep) = emit_leg(
-        "gcd",
-        &MazeConfig {
-            occ: OccMode::Disabled,
-            ..MazeConfig::default()
-        },
-    );
-    assert!(!route_db.nets.is_empty());
+    let off_leg = gcd_occ_off_leg();
+    let tech = &off_leg.tech;
+    let (db, _rep) = emit_leg(off_leg);
+    assert!(!off_leg.route.nets.is_empty());
     let out = tmp_def("gcd-fp-occ");
-    write_routed_def(&db, &tech, &placed_def("gcd"), &out).expect("write");
-    let (_db2, drc_report) = self_drc(&out, &tech);
+    write_routed_def(&db, tech, &placed_def("gcd"), &out).expect("write");
+    let (_db2, drc_report) = self_drc(&out, tech);
     print_gate("gcd(occ=disabled)", &drc_report);
     assert!(
         findings_total(&drc_report) >= 1,
@@ -3133,11 +3211,17 @@ fn test_emit_fail_proof() {
 /// identical emitted bytes.
 #[test]
 fn test_emit_determinism() {
-    let cfg = MazeConfig::default();
-    let (tech, db1, r1, _v1, rep1) = emit_leg("gcd", &cfg);
-    let (_t, db2, r2, _v2, rep2) = emit_leg("gcd", &cfg);
-    assert!(!r1.nets.is_empty());
-    assert_eq!(r1, r2, "nondeterministic routes");
+    let leg = gcd_leg();
+    let tech = &leg.tech;
+    let (db1, rep1) = emit_leg(leg);
+    // Pass 2 routes fresh on the shared inputs — comparing
+    // `leg.route` to itself would be reflexive.
+    let r2 = route_fresh(leg);
+    let mut db2 = leg.db.clone();
+    let guided: Vec<NetId> = leg.join.nets.iter().map(|&(n, _)| n).collect();
+    let rep2 = apply_routes(&mut db2, tech, &guided, &r2, &leg.vias).expect("apply_routes");
+    assert!(!leg.route.nets.is_empty());
+    assert_eq!(leg.route, r2, "nondeterministic routes");
     assert_eq!(rep1.wire_length_dbu, rep2.wire_length_dbu);
     assert_eq!(rep1.vias_per_cut, rep2.vias_per_cut);
     assert_eq!(db1.net_geoms, db2.net_geoms);
@@ -3145,8 +3229,8 @@ fn test_emit_determinism() {
     let out1 = tmp_def("gcd-det1");
     let out2 = tmp_def("gcd-det2");
     let placed = placed_def("gcd");
-    write_routed_def(&db1, &tech, &placed, &out1).expect("write 1");
-    write_routed_def(&db2, &tech, &placed, &out2).expect("write 2");
+    write_routed_def(&db1, tech, &placed, &out1).expect("write 1");
+    write_routed_def(&db2, tech, &placed, &out2).expect("write 2");
     assert_eq!(
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out2).unwrap(),
@@ -3161,25 +3245,22 @@ fn test_emit_determinism() {
 /// pool on the same `RouteDb`.
 #[test]
 fn test_rayon_emit_serial_identity() {
-    let (tech, mut db1, tracks, join, _, vias) = load_routed_inputs("gcd");
-    let mut db2 = db1.clone();
-    let route_db = route_nets(
-        &db1,
-        &tech,
-        &tracks,
-        &join,
-        LOADED_OPTS,
-        &vias,
-        &MazeConfig::default(),
-    );
-    assert!(!route_db.nets.is_empty());
-    let guided: Vec<NetId> = join.nets.iter().map(|&(n, _)| n).collect();
+    // The leg resolves before any forced-thread arm (see
+    // `test_rayon_route_determinism`): what runs under
+    // `RAYON_NUM_THREADS` here is `apply_routes`/`write_routed_def`
+    // — the shared `leg.route` feeds both apply arms.
+    let leg = gcd_leg();
+    let tech = &leg.tech;
+    let mut db1 = leg.db.clone();
+    let mut db2 = leg.db.clone();
+    assert!(!leg.route.nets.is_empty());
+    let guided: Vec<NetId> = leg.join.nets.iter().map(|&(n, _)| n).collect();
 
     let rep1 = with_rayon_threads(1, || {
-        apply_routes(&mut db1, &tech, &guided, &route_db, &vias).expect("apply_routes serial")
+        apply_routes(&mut db1, tech, &guided, &leg.route, &leg.vias).expect("apply_routes serial")
     });
     let rep8 = with_rayon_threads(8, || {
-        apply_routes(&mut db2, &tech, &guided, &route_db, &vias).expect("apply_routes par8")
+        apply_routes(&mut db2, tech, &guided, &leg.route, &leg.vias).expect("apply_routes par8")
     });
     assert_eq!(rep1.wire_length_dbu, rep8.wire_length_dbu);
     assert_eq!(rep1.vias_per_cut, rep8.vias_per_cut);
@@ -3193,10 +3274,10 @@ fn test_rayon_emit_serial_identity() {
     let out1 = tmp_def("gcd-rayon-e1");
     let out8 = tmp_def("gcd-rayon-e8");
     with_rayon_threads(1, || {
-        write_routed_def(&db1, &tech, &placed, &out1).expect("write serial")
+        write_routed_def(&db1, tech, &placed, &out1).expect("write serial")
     });
     with_rayon_threads(8, || {
-        write_routed_def(&db2, &tech, &placed, &out8).expect("write par8")
+        write_routed_def(&db2, tech, &placed, &out8).expect("write par8")
     });
     assert_eq!(
         std::fs::read(&out1).unwrap(),
@@ -3213,8 +3294,10 @@ fn test_rayon_emit_serial_identity() {
 /// not asserted in prose).
 #[test]
 fn test_preemit_gcd() {
-    let (tech, db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
-    let pre = preemit_check(&db, &tech).expect("preemit_check");
+    let leg = gcd_leg();
+    let tech = &leg.tech;
+    let (db, _rep) = emit_leg(leg);
+    let pre = preemit_check(&db, tech).expect("preemit_check");
     assert_eq!(
         findings_total(&pre),
         0,
@@ -3240,9 +3323,9 @@ fn test_preemit_gcd() {
             .sum();
         assert!(candidates > 0, "gcd: {family:?} family checked nothing");
     }
-    assert_eq!(pre, preemit_check(&db, &tech).expect("preemit_check 2"));
+    assert_eq!(pre, preemit_check(&db, tech).expect("preemit_check 2"));
 
-    let io_ports = assemble(&db, &tech)
+    let io_ports = assemble(&db, tech)
         .expect("assemble")
         .routing
         .iter()
@@ -3252,8 +3335,8 @@ fn test_preemit_gcd() {
     assert!(io_ports > 0, "gcd emit carries no IoPort shapes");
 
     let out = tmp_def("gcd-preemit");
-    write_routed_def(&db, &tech, &placed_def("gcd"), &out).expect("write");
-    let (_db2, drc_report) = self_drc(&out, &tech);
+    write_routed_def(&db, tech, &placed_def("gcd"), &out).expect("write");
+    let (_db2, drc_report) = self_drc(&out, tech);
     assert_eq!(
         pre, drc_report,
         "in-memory report diverges from the emit→parse report — a writer bug"
@@ -3267,8 +3350,10 @@ fn test_preemit_gcd() {
 /// present geometry.
 #[test]
 fn test_preemit_foreign_pin() {
-    let (tech, mut db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
-    let d = assemble(&db, &tech).expect("assemble");
+    let leg = gcd_leg();
+    let tech = &leg.tech;
+    let (mut db, _rep) = emit_leg(leg);
+    let d = assemble(&db, tech).expect("assemble");
     let (lid, pin_rect, port_net) = d
         .routing
         .iter()
@@ -3296,7 +3381,7 @@ fn test_preemit_foreign_pin() {
     );
     db.net_geoms[b].wire_rects.push((lid, w));
 
-    let pre = preemit_check(&db, &tech).expect("preemit_check");
+    let pre = preemit_check(&db, tech).expect("preemit_check");
     print_gate("gcd(preemit-injected)", &pre);
     assert!(
         findings_total(&pre) >= 1,
@@ -3707,9 +3792,10 @@ fn test_e2e_ours_reference_gcd() {
 /// demonstrates the same property script-side.
 #[test]
 fn test_e2e_ours_def_deterministic_gcd() {
-    let (tech, db, _route_db, _vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let leg = gcd_leg();
+    let (db, _rep) = emit_leg(leg);
     let out = tmp_def("gcd-ours-det");
-    write_routed_def(&db, &tech, &placed_def("gcd"), &out).expect("write routed DEF");
+    write_routed_def(&db, &leg.tech, &placed_def("gcd"), &out).expect("write routed DEF");
     let committed = require(design_dir("gcd").join("gcd.drt.ours.routed.def"));
     assert_eq!(
         std::fs::read(&committed).unwrap(),
@@ -3735,7 +3821,9 @@ fn test_e2e_ours_reference_picorv32() {
 /// router priced).
 #[test]
 fn test_emit_via_default_consistency() {
-    let (_tech, db, _route_db, vias, _rep) = emit_leg("gcd", &MazeConfig::default());
+    let leg = gcd_leg();
+    let (db, _rep) = emit_leg(leg);
+    let vias = &leg.vias;
     let mut placed = 0usize;
     for geom in &db.net_geoms {
         for via in &geom.vias {
