@@ -8,10 +8,10 @@
 
 use std::mem::size_of;
 
-/// `BTreeMap` exposes no capacity API, so `members`/`cover` rows
-/// report `len × BTREE_NODE_EST` beside their exact inner-vec bytes —
-/// labeled `~` in the emitted line and never folded into the exact
-/// totals.
+/// `BTreeMap` exposes no capacity API, so `NetTopo.cover`'s per-entry
+/// node overhead reports as `entries × BTREE_NODE_EST` beside the
+/// exact inner-vec bytes — labeled `~` in the emitted line and never
+/// folded into the exact totals.
 pub(crate) const BTREE_NODE_EST: usize = 80;
 
 /// Whether the census is live — read once per checkpoint site, so an

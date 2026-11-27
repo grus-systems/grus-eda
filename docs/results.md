@@ -10857,20 +10857,63 @@ Two-step ticket (`kurena/tasks/drt-scale-memory`): a `GRUS_DRT_MEM`
 structural census first, then the measured dominant reduction with
 the routed DEF held byte-identical.
 
+**Machine context**: Mac mini `Q0tzlynoMac-mini`, Apple M4 (4P+6E),
+16 GB; `sw_vers` macOS 27.2.1 (26B131); `rustc 1.100.0 (0ef1bc386
+2026-11-09)`; `cargo build --release`, binary `target/release/grus-eda`
+in the ticket worktree `.kurena/wt/drt-scale-memory`. Rep policy:
+gcd ≥3 reps per binary via `/usr/bin/time -l`, the median is the
+tabled figure; picorv32 one detached rep per binary — each leg is a
+multi-hour route, the named cost reason.
+
 **Census** (`GRUS_DRT_MEM=1`, capacity walks over the live
 structures — `drt/mem.rs`; `post_premark`/`post_graphs`/
 `post_topos`/per-`iter`/`post_route`/`post_emit` rows on stderr,
-gated so the ungated path prints nothing):
+gated so the ungated path prints nothing). Three builds are named:
+`base` = HEAD baseline (uninstrumented), `inst` = the commit-1
+instrumented baseline (HEAD's structures plus the census code),
+`new` = this change. "Before" census rows come from `inst`; the
+"before" peak RSS comes from `base` (reconciled below the table).
+All figures are bytes; `~` marks the `BTreeMap` node estimate
+(`entries × BTREE_NODE_EST=80`, never folded into the exact totals);
+`→ attempt_hi` means the row moved into the per-attempt transient
+budget and no longer has a resident-set figure of its own:
 
-| structure | gcd | picorv32 |
+| structure | gcd `inst` → `new` | picorv32 `inst` → `new` |
 |---|---|---|
-| `route_graphs` (`RouteGraphs.nets` + pin_nodes) | 28.4 MB | 1.21 GB |
-| `NetTopo` total | **91.0 MB** | **3.13 GB** |
-| — `relax` (relaxed via edges) | 44.4 MB | 1.48 GB |
-| — CSR adjacency (`adj_start`/`adj_to`/`adj_eidx`) | 46.2 MB | 1.64 GB |
-| — `attach`/`access`/`cover` (kept) | 0.26 MB | 8.0 MB |
-| `Occupancy` (post-premark → steady) | 2.6 → 3.7 MB | 82.8 → 137 MB |
-| peak RSS (`/usr/bin/time -l`) | 152.8 MB | 2,372,993,024 B (2.37 GB) |
+| `route_graphs` (`post_graphs graphs=`) | 28,424,084 → 28,370,836¹ | 1,207,429,648 → 1,206,577,680¹ |
+| `NetTopo` total (`post_topos topos=`) | **91,025,382 → 262,418** | **3,127,280,120 → 7,990,400** |
+| — `attach` | 64,266 → 64,266 | 1,997,776 → 1,997,776 |
+| — `access` | 133,320 → 133,320 | 3,959,600 → 3,959,600 |
+| — `cover` inner + `~est` | 64,832 + ~70,160 (877) → same | 2,033,024 + ~2,119,360 (26,492) → same |
+| — `members` inner + `~est` | 112,656 + ~563,280 (7,041) → `attempt_hi` | 3,641,760 + ~18,208,800 (227,610) → `attempt_hi` |
+| — `relax` | 44,441,600 → `attempt_hi` | 1,478,266,880 → `attempt_hi` |
+| — `csr` adjacency | 46,208,708 → `attempt_hi` | 1,637,381,080 → `attempt_hi` |
+| `occupancy` (post-premark → steady) | 2,648,284 → 3,727,740 | 82,783,876 → 137,235,332 |
+| `marks` (iter-1 hi → `post_route`) | 1,580,344 → 810,808 | 69,483,840 → 24,774,464 |
+| `routes` + `residuals` (`post_route`) | 126,264 + 12,912 | 3,937,544 + 323,712 |
+| `outcomes` hi-water (iter-1)² | 261,980 → 733,484 | 8,067,768 → 24,261,976 |
+| `attempt_hi` (worst `(graph, adj)` pair) | — → 6,519,748³ | — → 217,516,920³ |
+| `rest` (`post_topos`: rss − Σmeasured, saturating) | 21,508,010 → 17,667,602⁴ | 0 → 189,818,108⁵ |
+| peak RSS (`/usr/bin/time -l`) | 152,829,952 (`inst`) | 3,138,633,728 (`inst`) |
+
+¹ `new` `graphs=` is the summed capacity of the *streamed* builds —
+transient, ≤threads graphs resident at once, nothing held. The tiny
+before/after delta is `Vec` over-allocation noise.
+² The after-`outcomes` carries resolved `EdgeProbe`s in place of
+`used_edges` — a deliberately larger outcome (the commit scan no
+longer references the graph), named here so the row is not misread
+as regression.
+³ `inst` predates the `attempt_hi` key entirely; `new`'s value is
+the global max pair over the full net set (iter-1 attempts every
+guided net). The serial hard arm's value is covered under
+"Serial-arm `attempt_hi`" below.
+⁴ Fresh gated re-run of the v0.15.1 binary reads `rest=17,913,362`
+— `rest` is rss-derived and moves with the allocator; every exact
+row is identical between the two gated runs.
+⁵ The `inst` picorv32 `rest=0` is the saturating subtraction
+bottoming out: at `post_topos` the measured rows (topos 3.13 GB
+alone) already exceeded that checkpoint's `rss=1.20 GB` — the
+remainder is recorded as 0, not interpolated.
 
 The dominant row is the `relax`+`csr` half of `NetTopo`, and
 `route_graphs` is the second row — the pick generalizes `options.md`
@@ -10909,33 +10952,75 @@ under the same legality argument as `NetGraph` itself.
   the guided-set membership check never needed graph payloads.
 - Patch loop rebuilds the patched net's graph serially inside the
   post-loop pass (bounded: one at a time).
-- Breaking API change → minor bump 0.14.4 → 0.15.0.
+- Breaking API change → minor bump **0.14.3 → 0.15.0**.
+- Patch **0.15.0 → 0.15.1** (this revision's conformance repairs):
+  the serial hard arm now contributes to `attempt_hi` (previously
+  the key read 0 on `iter=8` — an unmeasured row, not a real zero);
+  `mem.rs`'s `BTREE_NODE_EST` docstring names `cover` alone
+  (`members` was flattened into `NetAdj`'s CSR in the change above);
+  `libc` moved to `[workspace.dependencies]` (same resolved version,
+  lock diff is the version bump only).
 
-**Memory after** (`GRUS_DRT_MEM=1`, new row `attempt_hi` = largest
-per-attempt `(graph, adj)` pair — the transient bound is
-`threads × attempt_hi`, not `nets × …`):
+**Peak RSS before → after** (`/usr/bin/time -l`; `before` is the
+`base`/`new` headline pair — see the reconciliation note):
 
-| design | `topos` before → after | peak RSS before → after |
+| design | peak RSS before → after | `route_ms` before → after |
 |---|---|---|
-| gcd | 91.0 MB → **0.26 MB** | 153.1 MB → **82.6 MB** (−46 %) |
-| picorv32 | 3.13 GB → **8.0 MB** | 2,372,993,024 → **958,464,000 B** (−59.6 %) |
+| gcd | 153,092,096 → **95,240,192 B** (−37.8 %) | 5705 → 3823 ms (−33.0 %) |
+| picorv32 | 2,372,993,024 → **958,464,000 B** (−59.6 %) | 7,229,267 → 4,130,770 ms (−42.9 %) |
 
-picorv32 legs (three detached runs, same inputs): the HEAD baseline
-(no census) peaked at `maximum resident set size` 2,372,993,024 B
-(real 7279.8 s); the commit-1 instrumented binary peaked at
+Baseline reconciliation — the two "before" figures are two different
+builds: **153,092,096 B** is the `base` HEAD-baseline median over 3
+reps (153,092,096 / 154,255,360 / 152,551,424 — rep 1 is the median)
+and is the canonical headline figure; **152,829,952 B** in the
+census table is the `inst` instrumented build's `time -l` peak, a
+single rep — the census code itself allocates, so the ~0.3 MB (0.2 %)
+build difference is inside the rep spread, and the two are named by
+build rather than conflated.
+
+gcd `new` reps: the retained census leg read 82,575,360 B and the
+fresh v0.15.1 legs read 99,057,664 / 95,584,256 / 94,027,776 /
+94,896,128 ungated and 97,943,552 gated — six-rep median
+**95,240,192 B**; the retained 82.6 MB leg sits at the bottom of the
+rep spread and the tabled after-figure moved accordingly. `route_ms`
+fresh reps 3782 / 3813 / 3823 / 3842 / 3859 → median **3823 ms**
+(the retained leg's log captured stderr only). The `route_ms`
+reduction mirrors picorv32's — the rebuild cost is more than repaid
+by the removed allocator churn, so the memory win did not trade
+runtime on either design.
+
+picorv32 legs (three detached runs, same inputs — numbers extracted
+from the retained logs): the `base` HEAD baseline peaked at
+`maximum resident set size` 2,372,993,024 B (real 7279.8 s,
+`route_ms=7229267`); the `inst` instrumented binary peaked at
 3,138,633,728 B (steady `rss=3.14 GB` across iters 4–8, graphs+topos
 4.3 GB census dominating residency — the instrumented build's higher
-peak is allocator-level, both DEFs byte-identical); the rebuilt
-binary peaked at **958,464,000 B** (`post_topos rss=280.6 MB` with
+peak is allocator-level, both DEFs byte-identical); the `new` binary
+peaked at **958,464,000 B** (`post_topos rss=280.6 MB` with
 `topos=8.0 MB`, `occ=82.8 MB`; iter-1 `rss=586.2 MB`,
 `attempt_hi=217.5 MB`; steady `rss=958.5 MB` through iter 8; real
-4148.4 s — the rebuild cost is more than repaid by the removed
-allocator churn, −43 % wall). All three routed DEFs sha256 to
+4148.4 s, `route_ms=4130770` — −43 % wall). All three routed DEFs
+sha256 to
 `db8fb82f699bc69c5942b8d85c1818b30d9e1f2ab398df4dfd3fe6cd40625bb9`
 — byte-identical. All legs report `self_drc_verdict VIOLATIONS
 findings_total=6` > tolerance 3 — the pre-existing picorv32
 self-DRC residual, unchanged by this work (the DEF is still
 emitted and compared).
+
+**Serial-arm `attempt_hi`** (v0.15.1 census repair): the `iter` row
+now measures the serial hard iteration too — a fresh gated gcd run
+reports `iter=8 attempt_hi=6,519,748` (equal to the iter-1 global
+max, expected: iter-1 already attempts every guided net), and the
+emitted DEF still sha256s to the golden. `outcomes=0` on the hard
+iteration holds by construction — the serial arm commits inline and
+has no outcomes buffer. picorv32 was **not** re-run (the change is
+a `mem_on`-gated read-only size walk; the leg is ~70 min): the hard
+iteration holds exactly one `(graph, adj)` pair at a time, and
+iter-1 attempts every guided net, so the recorded
+`attempt_hi=217,516,920` — the global max pair over the full net
+set — already bounds any serial-arm pair. The retained leg's
+`iter=8 attempt_hi=0` predates the serial-arm census key; that gap
+is named, not hidden.
 
 **Honest bound** (acceptance item 4): pre-change, peak ≈ base +
 Σ_nets (graph + topo) — picorv32's census put that at ~640 KB/net
@@ -10957,9 +11042,10 @@ net's rebuild is unbounded), not the net census.
   untouched.
 - Emitted DEF sha256 `1422d02765f6aba99e25f1792436607c788ca31397c0bf843340bd65fb2f9482`
   byte-identical to the committed golden
-  `tests/designs/gcd/gcd.drt.ours.routed.def` (`self_drc_verdict
-  CLEAN`, `guided=269 routed=189 unrouted=80 iterations=8`
-  unchanged).
+  `tests/designs/gcd/gcd.drt.ours.routed.def` on every leg —
+  `base`/`inst`/`new` gcd DEFs and all six v0.15.1 rep DEFs
+  (`self_drc_verdict CLEAN`, `guided=269 routed=189 unrouted=80
+  iterations=8` unchanged).
 - `test_net_graph_rebuild_identity` (new): per-net
   `build_net_graph` ≡ `bulk.nets[i]` under `PartialEq`, plus the
   streamed `RouteGraphs` census ≡ the bulk census with `nets`
@@ -10967,12 +11053,20 @@ net's rebuild is unbounded), not the net census.
 - `test_rayon_route_determinism`/`test_rayon_graphs_serial_identity`/
   `test_maze_determinism`/`test_route_nets_progress_hook` all green —
   determinism contract intact.
+- Fresh gated re-run (v0.15.1): every exact census row
+  (`graphs`/`topos`/`attach`/`access`/`cover`/`occ`/`marks`/
+  `outcomes`/`attempt_hi`/`routes`/`residuals`/`net_geoms`) is
+  identical to the retained leg; only the allocator-dependent
+  `rss`/`rest` figures moved.
 
 **Prove-it-red** (AGENTS §7.7, run 2026-11-27): `hull_cells_at`'s
 `out.clear()` deleted → the worker-local `hull_scratch` leaks stale
 cell ids into later nets' masks — `test_net_graph_rebuild_identity`
 red (`rebuilt graph diverged at index 1`), `test_maze_census` red
 (digest `0x9e199fb33db70a06` ≠ pin). Restored, re-verified green.
+Not re-run for v0.15.1: the addition is a `max()` over a capacity
+walk under the existing `mem_on` gate — no logic a red-proof could
+discriminate.
 
 **Exact commands** (task worktree `.kurena/wt/drt-scale-memory`):
 
@@ -10983,10 +11077,11 @@ TLEF=$LIB/techlef/sky130_fd_sc_hd__nom.tlef
 LEF=$LIB/lef/sky130_fd_sc_hd.lef
 GRUS_DRT_MEM=1 /usr/bin/time -l target/release/grus-eda drt \
   --tlef $TLEF --lef $LEF --def tests/designs/gcd/gcd.placed.def \
-  --guide tests/designs/gcd/gcd.guide --out-def /tmp/gcd.mem.new.def \
+  --guide tests/designs/gcd/gcd.guide --out-def /tmp/gcd.mem.new2.def \
   --reference tests/designs/gcd/gcd.drt.reference.json \
   --self-drc-tolerance 3
-shasum -a 256 /tmp/gcd.mem.new.def \
+# ungated reps: same command minus GRUS_DRT_MEM, /tmp/gcd.mem.new.N.{def,log}
+shasum -a 256 /tmp/gcd.mem.new*.def \
   tests/designs/gcd/gcd.drt.ours.routed.def
 # picorv32 legs detached (HEAD baseline / commit-1 instrumented /
 # this change): same command, --def tests/designs/picorv32/…
@@ -10995,8 +11090,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 - **Checks run** (E0 rule 9): `cargo test --workspace --profile
-  verify` all green — 559 lib + drt suite incl.
+  verify` all green — 559 lib + 37 drt (incl.
   `test_net_graph_rebuild_identity`, the three `test_rayon_*` pins,
   `test_maze_census` (digest), `test_e2e_ours_def_deterministic_gcd`
-  (golden DEF); `cargo clippy --workspace --all-targets --
-  -D warnings` clean.
+  (golden DEF)) + 18 drc + 8 cli + 2 irdrop, `#[ignore]`d legs
+  unchanged; `cargo clippy --workspace --all-targets --
+  -D warnings` clean. Re-run on v0.15.1 after the census repairs —
+  same green outcome; fresh gcd legs: one `GRUS_DRT_MEM=1` census
+  run (serial-arm `attempt_hi` + golden DEF sha) plus four ungated
+  `/usr/bin/time -l` reps, all DEFs byte-identical. picorv32
+  numbers are extracted from the three retained run logs — no
+  fresh leg; the gcd after-reps and the serial-arm census are
+  fresh runs on this binary.

@@ -4462,7 +4462,8 @@ fn route_prepared(
         let mut routed = 0u32;
         let mut search_el = std::time::Duration::ZERO;
         // `drt: mem` "outcomes" row — the transient all-nets buffer
-        // exists only in the snapshot arm; the hard arm commits inline.
+        // exists only in the snapshot arm; the hard arm commits inline
+        // (outcomes stays 0). `attempt_hi` is measured in both arms.
         let mut outcomes_b = 0usize;
         // `drt: mem` per-attempt hi-water — the biggest rebuilt
         // (NetGraph, NetAdj) pair this iteration; the transient bound
@@ -4481,6 +4482,9 @@ fn route_prepared(
                 let mut scratch = Vec::new();
                 let g = mk_graph(i, &mut scratch);
                 let adj = NetAdj::new(&g, &topos[i], tech, tracks, vias, hull);
+                if mem_on {
+                    attempt_hi = attempt_hi.max(net_graph_bytes(&g) + net_adj_bytes(&adj));
+                }
                 match route_one_net(
                     db, tech, tracks, &g, &topos[i], &adj, vias, &occ, hull, hist[i], true, cfg.occ,
                 ) {

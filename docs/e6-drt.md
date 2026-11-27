@@ -798,11 +798,12 @@ footprints), and `probe_collisions` replays them against live `occ`
 at commit in the same order `edge_collisions` scanned — identical
 collision sets. `GRUS_DRT_MEM` prints the structural split:
 `post_graphs`/`post_topos` capacity walks, per-iteration
-`attempt_hi` (the transient rebuild hi-water — the bound is
-`threads × attempt_hi`, not `nets × (graph+topo)`), and
+`attempt_hi` (the transient rebuild hi-water — measured on the
+snapshot arm and, since v0.15.1, on the serial hard arm too; the
+bound is `threads × attempt_hi`, not `nets × (graph+topo)`), and
 `post_route`/`post_emit`. Measured (`docs/results.md`,
 drt-scale-memory): gcd `topos` 91.0 MB → 0.26 MB, peak RSS
-153.1 → 82.6 MB; picorv32 `topos` census 3.13 GB → 8.0 MB, peak RSS
+153.1 → 95.2 MB; picorv32 `topos` census 3.13 GB → 8.0 MB, peak RSS
 2.37 GB → 958 MB — the bound is now `threads ×` the worst guide
 union's `(graph, adj)` pair (`attempt_hi` 217.5 MB on picorv32), not
 linear in net count. Routed DEF stays byte-identical;
