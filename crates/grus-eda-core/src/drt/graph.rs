@@ -11,9 +11,11 @@ use crate::congestion::guide::{GuideBox, resolve_guide_nets};
 use crate::design_db::{DesignDb, PlacementStatus};
 use crate::drc::union::rect_covered;
 use crate::drt::access::pin_shapes;
+use crate::drt::pool::drt_pool;
 use crate::drt::tracks::{Axis, LayerTracks};
 use crate::interner::{LayerId, NetId, PinId};
 use crate::tech_db::{RectDbu, TechDb};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One graph node: a track-index crossing inside a net's guide
@@ -1253,8 +1255,37 @@ pub fn build_route_graphs_ext(
         ..Default::default()
     };
     let hull = HullMask::new(db, tech);
-    let mut hull_scratch = Vec::new();
-    for (net, boxes) in &join.nets {
+    // Per-net build partials — the shared accumulators become
+    // per-net vecs folded serially in `join.nets` order below, and
+    // the hull scratch becomes per-worker state via `map_init`.
+    // Byte-identity to the serial loop is by construction: the
+    // fold replays the same appends in the same order.
+    struct NetBuild {
+        graph: NetGraph,
+        zero_coverage: Vec<ZeroCoverage>,
+        region_escape: Vec<RegionEscape>,
+        escapes: Vec<EscapeRecord>,
+        via_edges_per_pair: Vec<usize>,
+        hull_masked: Vec<usize>,
+    }
+    let builds: Vec<NetBuild> = drt_pool().install(|| {
+        join.nets
+            .par_iter()
+            .map_init(Vec::new, |hull_scratch, (net, boxes)| {
+    let mut nb = NetBuild {
+        graph: NetGraph {
+            net: *net,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            via_edges: Vec::new(),
+            pin_nodes: Vec::new(),
+        },
+        zero_coverage: Vec::new(),
+        region_escape: Vec::new(),
+        escapes: Vec::new(),
+        via_edges_per_pair: vec![0; tech.routing_layers.len().saturating_sub(1)],
+        hull_masked: vec![0; tech.routing_layers.len()],
+    };
         let (mut region, box_layers) = net_region(boxes, tracks, opts.spare_above);
         // Instance-hull mask: on masked layers a node inside a cell
         // bbox survives only inside the net's own pin rects on that
@@ -1272,17 +1303,17 @@ pub fn build_route_graphs_ext(
             pairs.retain(|&(ix, iy)| {
                 hull.point_allowed(
                     &cover,
-                    &mut hull_scratch,
+                    hull_scratch,
                     l,
                     lt.tracks_x[ix as usize],
                     lt.tracks_y[iy as usize],
                 )
             });
-            out.hull_masked[l as usize] += before - pairs.len();
+            nb.hull_masked[l as usize] += before - pairs.len();
         }
         for &l in &box_layers {
             if region.get(&l).is_none_or(|v| v.is_empty()) {
-                out.zero_coverage.push(ZeroCoverage {
+                nb.zero_coverage.push(ZeroCoverage {
                     net: *net,
                     layer: LayerId(l),
                 });
@@ -1326,11 +1357,11 @@ pub fn build_route_graphs_ext(
             &mut region,
             &cover,
             &hull,
-            &mut hull_scratch,
+            hull_scratch,
             first_unmasked,
             *net,
             opts.escape,
-            &mut out.escapes,
+            &mut nb.escapes,
         );
 
         let mut nodes = Vec::new();
@@ -1388,7 +1419,7 @@ pub fn build_route_graphs_ext(
                 pairs_hi,
                 lt_hi,
             );
-            if let Some(slot) = out.via_edges_per_pair.get_mut(l as usize) {
+            if let Some(slot) = nb.via_edges_per_pair.get_mut(l as usize) {
                 *slot += pair_edges.len();
             }
             via_edges.extend(pair_edges);
@@ -1413,21 +1444,43 @@ pub fn build_route_graphs_ext(
             // when the halo later re-attached the pin, so the flag
             // keeps meaning "pin metal outside the guide region".
             if escaped.contains(&pin) {
-                out.region_escape.push(RegionEscape { pin, net: *net });
+                nb.region_escape.push(RegionEscape { pin, net: *net });
             }
             pin_nodes.push((pin, attached.into_iter().collect()));
         }
 
-        out.total_nodes += nodes.len();
-        out.total_edges += edges.len();
-        out.total_via_edges += via_edges.len();
-        out.nets.push(NetGraph {
+        nb.graph = NetGraph {
             net: *net,
             nodes,
             edges,
             via_edges,
             pin_nodes,
-        });
+        };
+        nb
+            })
+            .collect()
+    });
+    // Serial fold in `join.nets` order — same append order as the
+    // serial loop produced, so the emitted vecs and totals are
+    // byte-identical under any thread count.
+    for nb in builds {
+        out.zero_coverage.extend(nb.zero_coverage);
+        out.region_escape.extend(nb.region_escape);
+        out.escapes.extend(nb.escapes);
+        for (d, s) in out
+            .via_edges_per_pair
+            .iter_mut()
+            .zip(&nb.via_edges_per_pair)
+        {
+            *d += s;
+        }
+        for (d, s) in out.hull_masked.iter_mut().zip(&nb.hull_masked) {
+            *d += s;
+        }
+        out.total_nodes += nb.graph.nodes.len();
+        out.total_edges += nb.graph.edges.len();
+        out.total_via_edges += nb.graph.via_edges.len();
+        out.nets.push(nb.graph);
     }
     out
 }
@@ -1438,6 +1491,14 @@ mod tests {
     use crate::design_db::PlacementStatus;
     use crate::interner::{CellId, MacroId, MacroPinId, PinDir};
     use crate::tech_db::{LayerDir, MacroDef, MacroPin, RectDbu, RoutingLayer};
+
+    /// The parallel graph build shares `&HullMask` across workers —
+    /// a `Cell`/`RefCell` regression fails here at compile time
+    /// naming the type.
+    const _: fn() = || {
+        fn need<T: Sync + Send>() {}
+        need::<HullMask>();
+    };
 
     fn lt() -> LayerTracks {
         LayerTracks {

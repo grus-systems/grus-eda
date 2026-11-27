@@ -13,13 +13,15 @@ use crate::drc::union::{rect_covered, rect_minus};
 use crate::drc::{DrcLayer, LayerShapes, ShapeRect, ShapeSrc};
 use crate::drt::access::pin_shapes;
 use crate::drt::graph::{cell_hull_rect, pin_rects, HullMask, NetGraph, PinCover, RouteGraphs};
+use crate::drt::pool::drt_pool;
 use crate::drt::tracks::{Axis, LayerTracks};
 use crate::drt::via::ViaTable;
 use crate::interner::{LayerId, NetId, PinId};
 use crate::tech_db::{LayerDir, RectDbu, TechDb};
-use std::cell::Cell;
+use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
 // Recorded cost constants (docs/e6-drt.md §7).
@@ -375,31 +377,63 @@ struct Occupancy {
     /// `min_spacing_dbu()` per routing layer.
     spc: Vec<i32>,
     /// Query census (`GRUS_DRT_TIMING` emission in
-    /// `route_nets_with_progress`) — `Cell` so `&self` scans count.
+    /// `route_nets_with_progress`) — slotted atomics so `&self`
+    /// scans count from the parallel search workers without
+    /// contending on a shared word; totals stay exact because the
+    /// query stream is a pure function of the occupancy state.
     stats: ScanStats,
+}
+
+/// Census slots — one per worker ticket, cache-line padded so
+/// counter updates from parallel searches never share a word
+/// (a shared `AtomicU64` here serialized the inner scan loops to
+/// ~7× slower than serial).
+const STAT_SLOTS: usize = 64;
+static STAT_TICKET: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// This thread's census slot — one atomic ticket on first use,
+    /// then a TLS read per scan call. Slot reuse after `STAT_SLOTS`
+    /// workers is safe (atomics), just mildly contended.
+    static STAT_SLOT: usize = STAT_TICKET.fetch_add(1, Ordering::Relaxed);
+}
+
+#[repr(align(64))]
+#[derive(Default)]
+struct ScanStatsSlot {
+    wire_calls: AtomicU64,
+    rect_calls: AtomicU64,
+    /// Lines iterated across both axes inside `scan_rect`.
+    rect_lines_visited: AtomicU64,
+    /// `ivs` elements inspected across all scans (pre-predicate).
+    ivs_visited: AtomicU64,
+    hits_pushed: AtomicU64,
+    marks_inserted: AtomicU64,
+    marks_removed: AtomicU64,
 }
 
 /// Scan/mark counters — the query-shape record behind the occupancy
 /// structure pick (`docs/results.md` occupancy-ds entry). Counting is
-/// unconditional (a handful of single-thread adds per query, below
-/// timer noise against the BTreeMap work being measured); only the
-/// emission is `GRUS_DRT_TIMING`-gated.
-#[derive(Default)]
+/// unconditional (a handful of slot-local adds per query, below timer
+/// noise against the interval work being measured); only the emission
+/// is `GRUS_DRT_TIMING`-gated.
 struct ScanStats {
-    wire_calls: Cell<u64>,
-    rect_calls: Cell<u64>,
-    /// Lines iterated across both axes inside `scan_rect`.
-    rect_lines_visited: Cell<u64>,
-    /// `ivs` elements inspected across all scans (pre-predicate).
-    ivs_visited: Cell<u64>,
-    hits_pushed: Cell<u64>,
-    marks_inserted: Cell<u64>,
-    marks_removed: Cell<u64>,
+    slots: [ScanStatsSlot; STAT_SLOTS],
+}
+
+impl Default for ScanStats {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| ScanStatsSlot::default()),
+        }
+    }
 }
 
 impl ScanStats {
-    fn bump(c: &Cell<u64>) {
-        c.set(c.get() + 1);
+    fn slot(&self) -> &ScanStatsSlot {
+        STAT_SLOT.with(|&s| &self.slots[s % STAT_SLOTS])
+    }
+    fn get(&self, f: impl Fn(&ScanStatsSlot) -> &AtomicU64) -> u64 {
+        self.slots.iter().map(|s| f(s).load(Ordering::Relaxed)).sum()
     }
 }
 
@@ -484,7 +518,7 @@ impl Occupancy {
                 who,
             };
             Self::insert(&mut self.lines_x[l][i], iv);
-            ScanStats::bump(&self.stats.marks_inserted);
+            self.stats.slot().marks_inserted.fetch_add(1, Ordering::Relaxed);
             if let Some(m) = log.as_deref_mut() {
                 m.push(Mark {
                     x_axis: true,
@@ -505,7 +539,7 @@ impl Occupancy {
                 who,
             };
             Self::insert(&mut self.lines_y[l][i], iv);
-            ScanStats::bump(&self.stats.marks_inserted);
+            self.stats.slot().marks_inserted.fetch_add(1, Ordering::Relaxed);
             if let Some(m) = log.as_deref_mut() {
                 m.push(Mark {
                     x_axis: false,
@@ -550,7 +584,7 @@ impl Occupancy {
         if let Some(pos) = line.ivs.iter().position(|iv| *iv == m.iv) {
             line.ivs.remove(pos);
             Self::rebuild_from(line, pos / SKIP_CHUNK);
-            ScanStats::bump(&self.stats.marks_removed);
+            self.stats.slot().marks_removed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -572,7 +606,12 @@ impl Occupancy {
     ) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
-        ScanStats::bump(&self.stats.wire_calls);
+        // Census is bulk-added once per call — a per-element store
+        // into the worker's slot costs more than the predicate it
+        // measures under parallel search.
+        let st = self.stats.slot();
+        st.wire_calls.fetch_add(1, Ordering::Relaxed);
+        let (mut ivs_seen, mut hits_pushed) = (0u64, 0u64);
         let (lines, coords) = match axis {
             Axis::X => (&self.lines_y[l], &self.coords_y[l]),
             Axis::Y => (&self.lines_x[l], &self.coords_x[l]),
@@ -581,17 +620,17 @@ impl Occupancy {
         let t = coords[ti as usize];
         let (qlo, qhi) = (c - w2 - s, d + w2 + s);
         let (slo, shi) = (c - w2, d + w2);
-        for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
+        'scan: for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
             if line.max_hi[ci] <= qlo {
                 continue;
             }
             for iv in chunk {
-                ScanStats::bump(&self.stats.ivs_visited);
+                ivs_seen += 1;
                 if iv.lo >= qhi {
-                    return; // `lo`-sorted: no later interval can overlap
+                    break 'scan; // `lo`-sorted: no later interval can overlap
                 }
                 if iv.hi > qlo {
-                    ScanStats::bump(&self.stats.hits_pushed);
+                    hits_pushed += 1;
                     out.push(Hit {
                         iv: *iv,
                         line: t,
@@ -603,6 +642,8 @@ impl Occupancy {
                 }
             }
         }
+        st.ivs_visited.fetch_add(ivs_seen, Ordering::Relaxed);
+        st.hits_pushed.fetch_add(hits_pushed, Ordering::Relaxed);
     }
 
     /// Rect-candidate check (via footprints): hits iff the shape
@@ -615,12 +656,14 @@ impl Occupancy {
     fn scan_rect(&self, layer: u8, r: &RectDbu, out: &mut Vec<Hit>) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
-        ScanStats::bump(&self.stats.rect_calls);
+        let st = self.stats.slot();
+        st.rect_calls.fetch_add(1, Ordering::Relaxed);
+        let (mut lines_seen, mut ivs_seen, mut hits_pushed) = (0u64, 0u64, 0u64);
         let re = RectDbu::new(r.xl - s, r.yl - s, r.xh + s, r.yh + s);
         let ay = self.coords_y[l].partition_point(|&t| t < re.yl - w2 - s);
         let by = self.coords_y[l].partition_point(|&t| t <= re.yh + w2 + s);
         for ti in ay..by {
-            ScanStats::bump(&self.stats.rect_lines_visited);
+            lines_seen += 1;
             let t = self.coords_y[l][ti];
             let line = &self.lines_y[l][ti];
             for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
@@ -628,12 +671,12 @@ impl Occupancy {
                     continue;
                 }
                 for iv in chunk {
-                    ScanStats::bump(&self.stats.ivs_visited);
+                    ivs_seen += 1;
                     if iv.lo >= re.xh {
                         break;
                     }
                     if iv.hi > re.xl && iv.perp_lo < re.yh && iv.perp_hi > re.yl {
-                        ScanStats::bump(&self.stats.hits_pushed);
+                        hits_pushed += 1;
                         out.push(Hit {
                             iv: *iv,
                             line: t,
@@ -649,7 +692,7 @@ impl Occupancy {
         let ax = self.coords_x[l].partition_point(|&t| t < re.xl - w2 - s);
         let bx = self.coords_x[l].partition_point(|&t| t <= re.xh + w2 + s);
         for ti in ax..bx {
-            ScanStats::bump(&self.stats.rect_lines_visited);
+            lines_seen += 1;
             let t = self.coords_x[l][ti];
             let line = &self.lines_x[l][ti];
             for (ci, chunk) in line.ivs.chunks(SKIP_CHUNK).enumerate() {
@@ -657,12 +700,12 @@ impl Occupancy {
                     continue;
                 }
                 for iv in chunk {
-                    ScanStats::bump(&self.stats.ivs_visited);
+                    ivs_seen += 1;
                     if iv.lo >= re.yh {
                         break;
                     }
                     if iv.hi > re.yl && iv.perp_lo < re.xh && iv.perp_hi > re.xl {
-                        ScanStats::bump(&self.stats.hits_pushed);
+                        hits_pushed += 1;
                         out.push(Hit {
                             iv: *iv,
                             line: t,
@@ -675,6 +718,10 @@ impl Occupancy {
                 }
             }
         }
+        st.rect_lines_visited
+            .fetch_add(lines_seen, Ordering::Relaxed);
+        st.ivs_visited.fetch_add(ivs_seen, Ordering::Relaxed);
+        st.hits_pushed.fetch_add(hits_pushed, Ordering::Relaxed);
     }
 }
 
@@ -1790,12 +1837,14 @@ fn other_end(g: &NetGraph, relax: &[RelaxedVia], eidx: u32, v: u32) -> u32 {
 
 /// One routed net's outcome.
 enum NetOutcome {
-    /// Route, provisional collisions, and the closure pass's named
-    /// residuals (`self-spacing.md`, `residuals.md`). The first vec
-    /// is the canonical net×net set (`a < b`); the second the
-    /// directed wire→pin set (`a` = committing wire net, `b` = pin's
-    /// owning net — rip-up re-queues `a` only, the pin cannot move).
-    Routed(NetRoute, Vec<Collision>, Vec<Collision>, ClosureResiduals),
+    /// Route, the committed unified-edge ids, and the closure pass's
+    /// named residuals (`self-spacing.md`, `residuals.md`). The
+    /// provisional-collision scan runs at commit time against live
+    /// occupancy (`route_nets_with_progress`), not at extraction —
+    /// under parallel search the extraction-time occupancy is the
+    /// iteration-start snapshot, which cannot see same-iteration
+    /// stale conflicts.
+    Routed(NetRoute, Vec<u32>, ClosureResiduals),
     Failed {
         unrouted: UnroutedNet,
         /// Pins that got no legal paint — the `Unattachable`
@@ -2696,19 +2745,11 @@ fn route_one_net(
         })
         .collect();
 
-    // Provisional collisions: the foreign hits the committed edges
-    // actually took (soft-mode bookkeeping for the rip-up set) —
-    // canonical net×net plus directed wire→pin.
-    let mut prov = BTreeSet::new();
-    let mut prov_pins = BTreeSet::new();
-    let mut hits = Vec::new();
-    for &eidx in &run.used_edges {
-        edge_collisions(
-            g, tracks, vias, occ, &topo.relax, &topo.cover, eidx, g.net, &mut prov,
-            &mut prov_pins, &mut hits,
-        );
-    }
-
+    // Provisional collisions are recorded at commit time
+    // (`route_nets_with_progress`), not here: under snapshot search
+    // the scan must see live occupancy — prior-iteration marks plus
+    // every earlier same-iteration commit — so the used edge list is
+    // carried out and scanned just before `commit_route` rasterizes.
     NetOutcome::Routed(
         NetRoute {
             net: g.net,
@@ -2724,8 +2765,7 @@ fn route_one_net(
                 .collect(),
             fills,
         },
-        prov.into_iter().collect(),
-        prov_pins.into_iter().collect(),
+        run.used_edges,
         residuals,
     )
 }
@@ -3895,14 +3935,21 @@ pub fn route_nets_with_progress(
     // Per-net topology (attach sets, relaxed vias, CSR) is built once —
     // occupancy/history/hard-mode vary per iteration, the graph does
     // not. Arc order is fixed → determinism untouched.
+    // All drt parallel sections run inside a per-call pool so
+    // `RAYON_NUM_THREADS` is honored at call time — the global pool
+    // pins the env var on first use, untestable in-process.
+    let pool = drt_pool();
+    let nthreads = pool.current_num_threads();
     let t1 = std::time::Instant::now();
-    let topos: Vec<NetTopo> = graphs
-        .nets
-        .iter()
-        .map(|g| NetTopo::new(db, tech, tracks, g, vias, &occ, &hull))
-        .collect();
+    let topos: Vec<NetTopo> = pool.install(|| {
+        graphs
+            .nets
+            .par_iter()
+            .map(|g| NetTopo::new(db, tech, tracks, g, vias, &occ, &hull))
+            .collect()
+    });
     if timing {
-        eprintln!("drt: topos {:?}", t1.elapsed());
+        eprintln!("drt: topos {:?} threads={nthreads}", t1.elapsed());
     }
     let net_idx: BTreeMap<u32, usize> = graphs
         .nets
@@ -3933,56 +3980,154 @@ pub fn route_nets_with_progress(
         let mut prov_pins: BTreeSet<Collision> = BTreeSet::new();
         let mut failed: Vec<(usize, UnroutedNet)> = Vec::new();
         let mut routed = 0u32;
-        for (bi, &i) in bad.iter().enumerate() {
-            let g = &graphs.nets[i];
-            let tn = std::time::Instant::now();
-            match route_one_net(
-                db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i], hard, cfg.occ,
-            ) {
-                NetOutcome::Routed(route, hits, pin_hits, res) => {
-                    routed += 1;
-                    commit_route(&mut occ, vias, &route, &mut marks[i]);
-                    if !hard && cfg.occ == OccMode::Enabled {
-                        prov.extend(hits);
-                        prov_pins.extend(pin_hits);
+        let mut search_el = std::time::Duration::ZERO;
+        let commit_el = if hard {
+            // The hard iteration keeps the serial interleave: foreign
+            // hits are blocks *during* search, which requires live
+            // occupancy — this iteration does not snapshot, and its
+            // provisional scan would have no legal disposition.
+            for (bi, &i) in bad.iter().enumerate() {
+                let g = &graphs.nets[i];
+                let tn = std::time::Instant::now();
+                match route_one_net(
+                    db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i], true, cfg.occ,
+                ) {
+                    NetOutcome::Routed(route, _used_edges, res) => {
+                        routed += 1;
+                        commit_route(&mut occ, vias, &route, &mut marks[i]);
+                        res_of[i] = res;
+                        routes[i] = Some(route);
                     }
-                    res_of[i] = res;
-                    routes[i] = Some(route);
-                }
-                NetOutcome::Failed {
-                    unrouted,
-                    stub_blocked,
-                } => {
-                    for &p in &stub_blocked {
-                        stub_outside_cover.push((g.net, p));
+                    NetOutcome::Failed {
+                        unrouted,
+                        stub_blocked,
+                    } => {
+                        for &p in &stub_blocked {
+                            stub_outside_cover.push((g.net, p));
+                        }
+                        res_of[i] = ClosureResiduals::default();
+                        failed.push((i, unrouted));
                     }
-                    res_of[i] = ClosureResiduals::default();
-                    failed.push((i, unrouted));
+                }
+                if let Some(sink) = progress.as_deref_mut() {
+                    sink(RouteProgress {
+                        iteration: it,
+                        done: bi as u32 + 1,
+                        queued: attempted,
+                        unrouted: failed.len() as u32,
+                        elapsed: t0.elapsed(),
+                    });
+                }
+                if timing {
+                    let el = tn.elapsed();
+                    if el.as_millis() > 500 || bi % 500 == 0 {
+                        eprintln!(
+                            "drt:   net[{bi}/{}] nodes={} edges={} pins={} {:?}",
+                            bad.len(),
+                            g.nodes.len(),
+                            g.edges.len(),
+                            g.pin_nodes.len(),
+                            el
+                        );
+                    }
                 }
             }
-            if let Some(sink) = progress.as_deref_mut() {
-                sink(RouteProgress {
-                    iteration: it,
-                    done: bi as u32 + 1,
-                    queued: attempted,
-                    unrouted: failed.len() as u32,
-                    elapsed: t0.elapsed(),
-                });
-            }
-            if timing {
-                let el = tn.elapsed();
-                if timing && (el.as_millis() > 500 || bi % 500 == 0) {
-                    eprintln!(
-                        "drt:   net[{bi}/{}] nodes={} edges={} pins={} {:?}",
-                        bad.len(),
-                        g.nodes.len(),
-                        g.edges.len(),
-                        g.pin_nodes.len(),
-                        el
-                    );
+            ti.elapsed()
+        } else {
+            // Snapshot-search / ordered-commit: every net in `bad`
+            // searches against the iteration-start occupancy (shared
+            // as `&Occupancy` — the borrow checker forbids writers),
+            // then outcomes commit one at a time in `bad` order.
+            // `collect` on an indexed parallel iterator preserves
+            // `bad` order, so the committed stream is a pure function
+            // of the inputs for any thread count.
+            let outcomes: Vec<NetOutcome> = pool.install(|| {
+                bad.par_iter()
+                    .map(|&i| {
+                        let g = &graphs.nets[i];
+                        let tn = std::time::Instant::now();
+                        let out = route_one_net(
+                            db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i],
+                            false, cfg.occ,
+                        );
+                        if timing {
+                            let el = tn.elapsed();
+                            if el.as_millis() > 500 || i % 500 == 0 {
+                                eprintln!(
+                                    "drt:   net[{i}/{}] nodes={} edges={} pins={} {:?} (interleaved)",
+                                    bad.len(),
+                                    g.nodes.len(),
+                                    g.edges.len(),
+                                    g.pin_nodes.len(),
+                                    el
+                                );
+                            }
+                        }
+                        out
+                    })
+                    .collect()
+            });
+            search_el = ti.elapsed();
+            let tc = std::time::Instant::now();
+            let mut hits = Vec::new();
+            for (bi, (outcome, &i)) in outcomes.into_iter().zip(&bad).enumerate() {
+                let g = &graphs.nets[i];
+                match outcome {
+                    NetOutcome::Routed(route, used_edges, res) => {
+                        routed += 1;
+                        // Stale-collision detection: parallel searches
+                        // may claim the same resource — scan the
+                        // committed edges against live `occ` (prior
+                        // marks plus earlier same-iteration commits)
+                        // before rasterizing, recording canonical
+                        // net×net plus directed wire→pin.
+                        if cfg.occ == OccMode::Enabled {
+                            for &eidx in &used_edges {
+                                edge_collisions(
+                                    g,
+                                    tracks,
+                                    vias,
+                                    &occ,
+                                    &topos[i].relax,
+                                    &topos[i].cover,
+                                    eidx,
+                                    g.net,
+                                    &mut prov,
+                                    &mut prov_pins,
+                                    &mut hits,
+                                );
+                            }
+                        }
+                        commit_route(&mut occ, vias, &route, &mut marks[i]);
+                        res_of[i] = res;
+                        routes[i] = Some(route);
+                    }
+                    NetOutcome::Failed {
+                        unrouted,
+                        stub_blocked,
+                    } => {
+                        for &p in &stub_blocked {
+                            stub_outside_cover.push((g.net, p));
+                        }
+                        res_of[i] = ClosureResiduals::default();
+                        failed.push((i, unrouted));
+                    }
+                }
+                // The per-attempt progress point is the commit — the
+                // only moment an attempt's disposition exists in
+                // `bad` order under parallel search.
+                if let Some(sink) = progress.as_deref_mut() {
+                    sink(RouteProgress {
+                        iteration: it,
+                        done: bi as u32 + 1,
+                        queued: attempted,
+                        unrouted: failed.len() as u32,
+                        elapsed: t0.elapsed(),
+                    });
                 }
             }
-        }
+            tc.elapsed()
+        };
         iter_stats.push(IterStat {
             attempted,
             routed,
@@ -4025,19 +4170,21 @@ pub fn route_nets_with_progress(
         if timing {
             let st = &occ.stats;
             eprintln!(
-                "drt: iter {it} bad={} failed={} prov={} {:?} \
+                "drt: iter {it} bad={} failed={} prov={} search={:?} commit={:?} threads={} \
                  occ wire={} rect={} rect_lines={} ivs={} hits={} marks+={} marks-={}",
                 bad.len(),
                 failed.len(),
                 prov.len(),
-                ti.elapsed(),
-                st.wire_calls.get(),
-                st.rect_calls.get(),
-                st.rect_lines_visited.get(),
-                st.ivs_visited.get(),
-                st.hits_pushed.get(),
-                st.marks_inserted.get(),
-                st.marks_removed.get(),
+                search_el,
+                commit_el,
+                nthreads,
+                st.get(|s| &s.wire_calls),
+                st.get(|s| &s.rect_calls),
+                st.get(|s| &s.rect_lines_visited),
+                st.get(|s| &s.ivs_visited),
+                st.get(|s| &s.hits_pushed),
+                st.get(|s| &s.marks_inserted),
+                st.get(|s| &s.marks_removed),
             );
         }
     }
@@ -4075,18 +4222,18 @@ pub fn route_nets_with_progress(
             tp.elapsed()
         );
         let st = &occ.stats;
-        let (wc, rc) = (st.wire_calls.get(), st.rect_calls.get());
+        let (wc, rc) = (st.get(|s| &s.wire_calls), st.get(|s| &s.rect_calls));
         let (rl, ivs, hits) = (
-            st.rect_lines_visited.get(),
-            st.ivs_visited.get(),
-            st.hits_pushed.get(),
+            st.get(|s| &s.rect_lines_visited),
+            st.get(|s| &s.ivs_visited),
+            st.get(|s| &s.hits_pushed),
         );
         eprintln!(
             "drt: occ-scan totals wire={wc} rect={rc} rect_lines={rl} ivs={ivs} \
              hits={hits} marks+={} marks-={} | ivs/wire_call={:.1} \
              lines/rect_call={:.1} hits/scan={:.2}",
-            st.marks_inserted.get(),
-            st.marks_removed.get(),
+            st.get(|s| &s.marks_inserted),
+            st.get(|s| &s.marks_removed),
             ivs as f64 / wc.max(1) as f64,
             rl as f64 / rc.max(1) as f64,
             hits as f64 / (wc + rc).max(1) as f64,
@@ -4376,6 +4523,22 @@ mod tests {
     use crate::drt::via::{ViaCandidate, ViaPair, ViaTable};
     use crate::interner::SymbolId;
     use crate::tech_db::RoutingLayer;
+
+    /// Parallel search shares `&Occupancy`, `&NetTopo`, `&ViaTable`,
+    /// `&HullMask`, and `&NetGraph` across workers and returns
+    /// `NetOutcome`s — the `Sync`/`Send` bounds are the scheme's
+    /// stated foundation; a regression to non-atomic interior
+    /// mutability fails here at compile time.
+    #[test]
+    fn drt_search_inputs_are_sync_send() {
+        fn assert_sync_send<T: Sync + Send>() {}
+        assert_sync_send::<Occupancy>();
+        assert_sync_send::<NetTopo>();
+        assert_sync_send::<ViaTable>();
+        assert_sync_send::<HullMask>();
+        assert_sync_send::<NetGraph>();
+        assert_sync_send::<NetOutcome>();
+    }
 
     fn toy_tech_area(area_dbu2: i64) -> TechDb {
         let mut tech = TechDb::new();
@@ -4671,7 +4834,7 @@ mod tests {
         let outcome = route_one_net(
             &db, &tech, &tracks, &g, &topo, &vias, &occ, &mask, 0, false, cfg.occ,
         );
-        let NetOutcome::Routed(route, _, _, _) = outcome else {
+        let NetOutcome::Routed(route, _, _) = outcome else {
             panic!("square must route");
         };
         // Deterministic tie: node 1 reached before node 2, so the path

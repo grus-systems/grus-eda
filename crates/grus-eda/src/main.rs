@@ -2078,6 +2078,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Drt(args) => {
+            let timing = std::env::var_os("GRUS_DRT_TIMING").is_some();
+            let t_total = std::time::Instant::now();
             let loaded = load_congestion_inputs(&args.tlef, &args.lef, &args.def, None, None)?;
             let mut design_db = loaded.design_db;
             let tech_db = &loaded.tech_db;
@@ -2091,6 +2093,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // the OBS-sealed pin-pocket escape (`docs/e6-drt.md` §7) —
             // plus the bounded pin-halo escape for pins whose metal
             // lies outside the guide region (`docs/e6-drt.md` §5).
+            let t_graphs = std::time::Instant::now();
             let graphs = grus_eda_core::drt::graph::build_route_graphs_ext(
                 &design_db,
                 tech_db,
@@ -2101,6 +2104,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
                 },
             );
+            if timing {
+                eprintln!("drt: build_graphs {:?}", t_graphs.elapsed());
+            }
             let vias = grus_eda_core::drt::via::via_table(tech_db, &design_db)?;
 
             let occ = match args.occ {
@@ -2139,6 +2145,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             );
             let elapsed_route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
 
+            let t_emit = std::time::Instant::now();
             let report = grus_eda_core::drt::emit::apply_routes(
                 &mut design_db, tech_db, &graphs, &route_db, &vias,
             )?;
@@ -2148,6 +2155,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .preemit_check
                 .then(|| grus_eda_core::drt::emit::preemit_check(&design_db, tech_db))
                 .transpose()?;
+            if timing {
+                eprintln!("drt: emit_apply {:?}", t_emit.elapsed());
+            }
+            let t_write = std::time::Instant::now();
             grus_eda_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
             // The verdict is a property of the emitted text: the subset
             // checker scores a re-parse of what was just written, and its
@@ -2168,6 +2179,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let self_drc_findings: Option<usize> = self_drc
                 .as_ref()
                 .map(|s| s.rules.iter().map(|o| o.findings.len()).sum());
+            if timing {
+                eprintln!("drt: emit_write {:?}", t_write.elapsed());
+            }
 
             let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
             let notch_fills: usize = route_db.nets.iter().map(|n| n.fills.len()).sum();
@@ -2451,6 +2465,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                      see docs/e6-drt.md §8)",
                     args.self_drc_tolerance
                 );
+            }
+            if timing {
+                eprintln!("drt: total {:?}", t_total.elapsed());
             }
         }
     }
