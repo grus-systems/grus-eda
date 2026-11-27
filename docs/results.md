@@ -11102,3 +11102,74 @@ cargo clippy --workspace --all-targets -- -D warnings
   numbers are extracted from the three retained run logs — no
   fresh leg; the gcd after-reps and the serial-arm census are
   fresh runs on this binary.
+
+### 2026-11-27 — drt-test-consolidation: shared `route_nets` legs across drt test assertions (v0.15.2)
+
+`tests/drt.rs` executed 21 `route_nets` gcd runs per suite — one per
+assertion group — on identical inputs. `OnceLock`-shared
+`(fixture, config)` legs (`RoutedLeg`: gcd default, gcd
+`OccMode::Disabled`, picorv32 default) now feed every read-only
+consumer; mutating emit tests go through `emit_leg`'s `leg.db`
+clone. The executions kept fresh are the ones under test:
+determinism second runs (`maze_determinism`,
+`test_emit_determinism`), the three forced `RAYON_NUM_THREADS`
+route arms, and the two streamed-rebuild arms — 7 gcd routes that
+are each the mechanism being asserted, not inputs to it. Shared
+legs are resolved at test top level only, never inside
+`with_rayon_threads`. Assertion count `rg -c 'assert'`
+before/after: **301 → 301** (macro count 292 → 292); digest pin
+`GCD_ROUTE_DIGEST = 0xef2b3ff70271a2e9`, census joins, golden
+compares unchanged — the shared run's digest printed
+`0xef2b3ff70271a2e9` on its resolving thread.
+
+**Machine context**: Mac mini `Q0tzlynoMac-mini`, Apple M4 (4P+6E),
+16 GB; `sw_vers` macOS 27.2.1 (26B131); `rustc 1.100.0 (0ef1bc386
+2026-11-09)`; dev profile (`cargo test -p grus-eda-core --test drt`,
+no `--profile` flag) in the ticket worktree
+`.kurena/wt/drt-test-consolidation`. Rep policy: **single warm rep
+per side**, two runs each — one `GRUS_DRT_TIMING=1 --nocapture`
+instrumented run (route-execution count) and one clean timed run.
+Caveat: host load average reached ~46 during the baseline runs and
+stayed elevated afterwards (a concurrent CI/VM job shared the
+machine) — treat the wall numbers as ±10 % noise.
+
+| metric | before | after |
+|---|---|---|
+| `route_nets` executions (`premark_obs` count, whole suite) | 37 | **25** |
+| gcd full routes (static call-site census) | 21 | **9** |
+| picorv32 routes (`--ignored`, static census) | 4 | 2 |
+| clean-run wall `real` | 29m1.6s | 30m53.4s |
+| clean-run wall `user` | 149m45.2s | **126m41.7s** |
+| instrumented-run wall `real` | 29m58.3s | 25m52.3s |
+| instrumented-run wall `user` | 148m43.2s | 117m3.4s |
+| per-test time sum (clean run) | 1741.47s | 1853.20s |
+| assert count in `tests/drt.rs` (`rg -c 'assert'`) | 301 | 301 |
+| suite result | 37 passed / 3 ignored | 37 passed / 3 ignored |
+
+Wall is roughly flat — expected: parallel test execution bounds
+wall by the longest serial tail (`test_net_graph_rebuild_identity`
++ `test_rayon_route_determinism` + `test_via_edge_census` +
+`test_pin_attachment`, none of which share the leg), and
+`OnceLock::get_or_init` blocking makes up to ten emit consumers
+wait on the one resolving thread instead of routing in parallel.
+The per-test sum rose for the same reason — the get_or_init wait
+is counted inside each blocked consumer's own duration. The real
+saving shows in `user`: **~23 minutes of CPU eliminated per suite
+run** (−15 %), matching 12 dropped gcd routes at ~90–120 s dev-
+profile each, and in the execution count 37 → 25.
+
+**Prove-it-red** (AGENTS §7.7): `GCD_ROUTE_DIGEST`
+`0xef2b3ff70271a2e9` → `…e8` → `cargo test -p grus-eda-core
+--test drt --profile verify test_maze_census` FAILED at
+`crates/grus-eda-core/tests/drt.rs:2438`: `assertion
+\`left == right\` failed: gcd route digest drifted` (left
+17233938729193808617, right 17233938729193808616); restored →
+`test_maze_census ... ok` in 4.62s.
+
+**Checks run** (E0 rule 9): `cargo test -p grus-eda-core --test drt
+--profile verify` 37 passed / 0 failed (114.67s) before
+measurements; on the final tree `cargo test --workspace
+--profile verify` all green — 559 lib + 37 drt + 18 drc + 8 cli +
+2 irdrop, 0 failed — and `cargo clippy --workspace --all-targets
+-- -D warnings` clean. Both baseline and after measurement pairs
+used the exact commands tabled above.
