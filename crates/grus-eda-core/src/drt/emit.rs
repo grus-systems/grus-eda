@@ -90,12 +90,16 @@ fn seg_rect(w: &WireSeg, tech: &TechDb) -> RectDbu {
 /// `default == None` (a via-table gap reached emit — the router
 /// skips gap transitions, so this is a bug), or `vp.lower !=
 /// cand.lower` (table consistency).
+///
+/// `threads` sizes the per-net build's rayon pool; `0` keeps rayon's
+/// default parallelism.
 pub fn apply_routes(
     db: &mut DesignDb,
     tech: &TechDb,
     guided: &[NetId],
     route_db: &RouteDb,
     via_table: &ViaTable,
+    threads: usize,
 ) -> Result<EmitReport> {
     if db.net_geoms.len() < db.num_nets() {
         db.net_geoms.resize_with(db.num_nets(), NetGeom::default);
@@ -117,7 +121,7 @@ pub fn apply_routes(
         cut_names: Vec<String>,
     }
     let db_ref: &DesignDb = db;
-    let built: Vec<Result<NetEmit>> = drt_pool().install(|| {
+    let built: Vec<Result<NetEmit>> = drt_pool(threads).install(|| {
         route_db
             .nets
             .par_iter()
@@ -296,7 +300,7 @@ fn centerline(lid: LayerId, r: &RectDbu, tech: &TechDb) -> Option<(i32, i32, i32
 /// geometry — exactly one `+ ROUTED` on the first statement, `NEW`
 /// on the rest — and `+ USE SIGNAL ;`. Errors name the offending
 /// net, matching the writer's no-silent-distortion contract.
-fn nets_section(db: &DesignDb, tech: &TechDb) -> Result<String> {
+fn nets_section(db: &DesignDb, tech: &TechDb, threads: usize) -> Result<String> {
     let layer_name = |l: LayerId| {
         db.strings
             .resolve(tech.routing_layers[l.0 as usize].name)
@@ -306,7 +310,7 @@ fn nets_section(db: &DesignDb, tech: &TechDb) -> Result<String> {
     out.push_str(&format!("NETS {} ;\n", db.num_nets()));
     // One record per net in db order — the strings are pure per-net
     // reads, so they build in parallel and concat in order.
-    let recs: Vec<String> = drt_pool().install(|| {
+    let recs: Vec<String> = drt_pool(threads).install(|| {
         (0..db.num_nets())
             .into_par_iter()
             .map(|n| {
@@ -382,12 +386,14 @@ fn nets_section(db: &DesignDb, tech: &TechDb) -> Result<String> {
 /// every byte outside `NETS n ;` … `END NETS` verbatim — the same
 /// mechanism `write_def` uses for `COMPONENTS`. Errors when the
 /// template has no `NETS` section or a `wire_rect` is not
-/// square-cap-expressible.
+/// square-cap-expressible. `threads` sizes the record-build pool;
+/// `0` keeps rayon's default parallelism.
 pub fn write_routed_def(
     db: &DesignDb,
     tech: &TechDb,
     template_def: &Path,
     out_def: &Path,
+    threads: usize,
 ) -> Result<()> {
     let template = std::fs::read_to_string(template_def)
         .with_context(|| format!("Failed to open template DEF at {template_def:?}"))?;
@@ -403,7 +409,7 @@ pub fn write_routed_def(
 
     let mut out = String::with_capacity(template.len() + (1 << 20));
     out.push_str(&template[..nets_start]);
-    out.push_str(&nets_section(db, tech)?);
+    out.push_str(&nets_section(db, tech, threads)?);
     out.push_str(&template[after_end..]);
 
     let mut file = std::fs::File::create(out_def)

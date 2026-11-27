@@ -1428,6 +1428,7 @@ fn load_routed_inputs(
             spare_above: 1,
             escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
         },
+        0,
     );
     let vias = via_table(&tech, &db).expect("via_table");
     (tech, db, tracks, join, graphs, vias)
@@ -1951,6 +1952,7 @@ fn test_maze_guide_escape() {
                 spare_above: 0,
                 escape,
             },
+            0,
         )
     };
     let u0a = |graphs: &RouteGraphs| -> PinId {
@@ -2115,6 +2117,7 @@ fn test_maze_guide_escape() {
                 corridor_lines: 8,
             }),
         },
+        0,
     );
     assert_eq!(graphs.escapes.len(), 1);
     let rec = graphs.escapes[0];
@@ -2166,6 +2169,7 @@ fn test_maze_guide_escape() {
             spare_above: 0,
             escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
         },
+        0,
     );
     assert_eq!(graphs_occ.escapes.len(), 1);
     assert_eq!(
@@ -2656,30 +2660,17 @@ fn test_mem_census_sanity() {
 // ---------------------------------------------------------------------------
 // Rayon determinism (drt-rayon)
 //
-// The drt phases run inside a per-call thread pool that reads
-// `RAYON_NUM_THREADS` at call time (`drt::pool`). Build and emit are
-// pinned byte-identical across thread counts; the route loop's
-// contract is determinism under a *fixed* thread count plus a
-// collision-free end state — serial identity across counts is a
-// named non-goal (same-iteration searches run against the
-// iteration-start snapshot, so the committed stream is a function
-// of pool size).
+// The drt parallel sections run inside a per-call thread pool whose
+// size is an explicit `threads` input (`drt::pool`): the route legs
+// read `MazeConfig::threads`, and `build_route_graphs_ext` /
+// `apply_routes` / `write_routed_def` take a `threads` parameter —
+// `0` is rayon's default. Build and emit are pinned byte-identical
+// across thread counts; the route loop's contract is determinism
+// under a *fixed* thread count plus a collision-free end state —
+// serial identity across counts is a named non-goal (same-iteration
+// searches run against the iteration-start snapshot, so the
+// committed stream is a function of pool size).
 // ---------------------------------------------------------------------------
-
-/// Serializes the forced-thread-count arms: `RAYON_NUM_THREADS` is
-/// process-global, so without this lock a neighbouring test could
-/// inherit the forced value mid-run. `set_var`/`remove_var` are
-/// `unsafe` under edition 2024 — the lock is the safety argument;
-/// the var is always restored before the guard drops.
-static THREAD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn with_rayon_threads<T>(n: usize, f: impl FnOnce() -> T) -> T {
-    let _guard = THREAD_ENV_LOCK.lock().unwrap();
-    unsafe { std::env::set_var("RAYON_NUM_THREADS", n.to_string()) };
-    let out = f();
-    unsafe { std::env::remove_var("RAYON_NUM_THREADS") };
-    out
-}
 
 /// Graph build folds per-net partials in `join.nets` order — the
 /// emitted `RouteGraphs` must be byte-identical between a
@@ -2689,23 +2680,23 @@ fn with_rayon_threads<T>(n: usize, f: impl FnOnce() -> T) -> T {
 fn test_rayon_graphs_serial_identity() {
     let (tech, db, tracks, _) = load("gcd");
     let (_, join) = load_guide(&db, &tech, "gcd");
-    let opts = grus_eda_core::drt::graph::GraphOpts {
-        spare_above: 1,
-        escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+    let graphs = |threads: usize| {
+        format!(
+            "{:?}",
+            grus_eda_core::drt::graph::build_route_graphs_ext(
+                &db,
+                &tech,
+                &tracks,
+                &join,
+                grus_eda_core::drt::graph::GraphOpts {
+                    spare_above: 1,
+                    escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+                },
+                threads,
+            )
+        )
     };
-    let serial = with_rayon_threads(1, || {
-        format!(
-            "{:?}",
-            grus_eda_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, opts)
-        )
-    });
-    let par8 = with_rayon_threads(8, || {
-        format!(
-            "{:?}",
-            grus_eda_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, opts)
-        )
-    });
-    assert_eq!(serial, par8, "graph build diverged under 8 threads");
+    assert_eq!(graphs(1), graphs(8), "graph build diverged under 8 threads");
 }
 
 /// The streamed attach pass's contract (`docs/e6-drt.md` §7
@@ -2725,7 +2716,8 @@ fn test_net_graph_rebuild_identity() {
         spare_above: 1,
         escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
     };
-    let bulk = grus_eda_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, opts);
+    let bulk =
+        grus_eda_core::drt::graph::build_route_graphs_ext(&db, &tech, &tracks, &join, opts, 0);
     assert_eq!(bulk.nets.len(), join.nets.len());
     let hull = HullMask::new(&db, &tech);
     for (i, &(net, ref boxes)) in join.nets.iter().enumerate() {
@@ -2737,19 +2729,20 @@ fn test_net_graph_rebuild_identity() {
     }
     let mut streamed = Vec::new();
     for threads in [1, 8] {
-        streamed.push(with_rayon_threads(threads, || {
-            let (census, _route_db) = route_nets_with_progress(
-                &db,
-                &tech,
-                &tracks,
-                &join,
-                opts,
-                &vias,
-                &MazeConfig::default(),
-                None,
-            );
-            format!("{census:?}")
-        }));
+        let (census, _route_db) = route_nets_with_progress(
+            &db,
+            &tech,
+            &tracks,
+            &join,
+            opts,
+            &vias,
+            &MazeConfig {
+                threads,
+                ..MazeConfig::default()
+            },
+            None,
+        );
+        streamed.push(format!("{census:?}"));
     }
     assert_eq!(
         streamed[0], streamed[1],
@@ -2772,23 +2765,20 @@ fn test_net_graph_rebuild_identity() {
 /// census.
 #[test]
 fn test_rayon_route_determinism() {
-    // The leg resolves before any forced-thread arm — a `*_leg()`
-    // call inside a `with_rayon_threads` closure would pin the
-    // shared route's thread count to test-order luck. The forced
-    // runs stay fresh: their thread count is the input under test.
     let leg = gcd_leg();
     let route = |threads: usize| {
-        with_rayon_threads(threads, || {
-            route_nets(
-                &leg.db,
-                &leg.tech,
-                &leg.tracks,
-                &leg.join,
-                LOADED_OPTS,
-                &leg.vias,
-                &leg.cfg,
-            )
-        })
+        route_nets(
+            &leg.db,
+            &leg.tech,
+            &leg.tracks,
+            &leg.join,
+            LOADED_OPTS,
+            &leg.vias,
+            &MazeConfig {
+                threads,
+                ..leg.cfg
+            },
+        )
     };
     let r1 = route(1);
     let r2 = route(8);
@@ -2841,7 +2831,7 @@ fn emit_leg(leg: &'static RoutedLeg) -> (DesignDb, EmitReport) {
     let mut db = leg.db.clone();
     let guided: Vec<NetId> = leg.join.nets.iter().map(|&(n, _)| n).collect();
     let report =
-        apply_routes(&mut db, &leg.tech, &guided, &leg.route, &leg.vias).expect("apply_routes");
+        apply_routes(&mut db, &leg.tech, &guided, &leg.route, &leg.vias, 0).expect("apply_routes");
     (db, report)
 }
 
@@ -3005,7 +2995,7 @@ fn emit_gate(leg: &'static RoutedLeg) -> &'static RouteDb {
     print_emit_census(name, tech, &db, &report);
 
     let out = tmp_def(&format!("{name}-gate"));
-    write_routed_def(&db, tech, &placed_def(name), &out).expect("write routed DEF");
+    write_routed_def(&db, tech, &placed_def(name), &out, 0).expect("write routed DEF");
     let (db2, drc_report) = self_drc(&out, tech);
     print_gate(name, &drc_report);
 
@@ -3034,7 +3024,7 @@ fn emit_gate(leg: &'static RoutedLeg) -> &'static RouteDb {
     // geometry re-emits to the same bytes (`out` is its own template,
     // so this exercises the NETS-splice fixed point).
     let out2 = tmp_def(&format!("{name}-gate2"));
-    write_routed_def(&db2, tech, &out, &out2).expect("re-emit");
+    write_routed_def(&db2, tech, &out, &out2, 0).expect("re-emit");
     assert_eq!(
         std::fs::read(&out).unwrap(),
         std::fs::read(&out2).unwrap(),
@@ -3083,13 +3073,13 @@ fn test_emit_roundtrip_gcd() {
 
     let out1 = tmp_def("gcd-rt1");
     let out2 = tmp_def("gcd-rt2");
-    write_routed_def(&db, tech, &placed_def("gcd"), &out1).expect("write out1");
+    write_routed_def(&db, tech, &placed_def("gcd"), &out1, 0).expect("write out1");
     let db2 = parse_def(&out1, tech, None).expect("re-parse out1");
     assert_eq!(
         db2.net_geoms, db.net_geoms,
         "re-parsed net_geoms differ from applied geometry"
     );
-    write_routed_def(&db2, tech, &out1, &out2).expect("write out2");
+    write_routed_def(&db2, tech, &out1, &out2, 0).expect("write out2");
     assert_eq!(
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out2).unwrap(),
@@ -3177,7 +3167,7 @@ fn test_emit_fail_proof() {
     );
     db.net_geoms[ai].wire_rects[aj].1.xh = foreign_xl - 1;
     let out = tmp_def("gcd-fp-injected");
-    write_routed_def(&db, tech, &placed_def("gcd"), &out).expect("write");
+    write_routed_def(&db, tech, &placed_def("gcd"), &out, 0).expect("write");
     let (_db2, drc_report) = self_drc(&out, tech);
     print_gate("gcd(injected)", &drc_report);
     let spacing_hits: Vec<&str> = drc_report
@@ -3197,7 +3187,7 @@ fn test_emit_fail_proof() {
     let (db, _rep) = emit_leg(off_leg);
     assert!(!off_leg.route.nets.is_empty());
     let out = tmp_def("gcd-fp-occ");
-    write_routed_def(&db, tech, &placed_def("gcd"), &out).expect("write");
+    write_routed_def(&db, tech, &placed_def("gcd"), &out, 0).expect("write");
     let (_db2, drc_report) = self_drc(&out, tech);
     print_gate("gcd(occ=disabled)", &drc_report);
     assert!(
@@ -3219,7 +3209,7 @@ fn test_emit_determinism() {
     let r2 = route_fresh(leg);
     let mut db2 = leg.db.clone();
     let guided: Vec<NetId> = leg.join.nets.iter().map(|&(n, _)| n).collect();
-    let rep2 = apply_routes(&mut db2, tech, &guided, &r2, &leg.vias).expect("apply_routes");
+    let rep2 = apply_routes(&mut db2, tech, &guided, &r2, &leg.vias, 0).expect("apply_routes");
     assert!(!leg.route.nets.is_empty());
     assert_eq!(leg.route, r2, "nondeterministic routes");
     assert_eq!(rep1.wire_length_dbu, rep2.wire_length_dbu);
@@ -3229,8 +3219,8 @@ fn test_emit_determinism() {
     let out1 = tmp_def("gcd-det1");
     let out2 = tmp_def("gcd-det2");
     let placed = placed_def("gcd");
-    write_routed_def(&db1, tech, &placed, &out1).expect("write 1");
-    write_routed_def(&db2, tech, &placed, &out2).expect("write 2");
+    write_routed_def(&db1, tech, &placed, &out1, 0).expect("write 1");
+    write_routed_def(&db2, tech, &placed, &out2, 0).expect("write 2");
     assert_eq!(
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out2).unwrap(),
@@ -3245,10 +3235,8 @@ fn test_emit_determinism() {
 /// pool on the same `RouteDb`.
 #[test]
 fn test_rayon_emit_serial_identity() {
-    // The leg resolves before any forced-thread arm (see
-    // `test_rayon_route_determinism`): what runs under
-    // `RAYON_NUM_THREADS` here is `apply_routes`/`write_routed_def`
-    // — the shared `leg.route` feeds both apply arms.
+    // The leg resolves before any forced-thread arm; the shared
+    // `leg.route` feeds both apply arms.
     let leg = gcd_leg();
     let tech = &leg.tech;
     let mut db1 = leg.db.clone();
@@ -3256,12 +3244,10 @@ fn test_rayon_emit_serial_identity() {
     assert!(!leg.route.nets.is_empty());
     let guided: Vec<NetId> = leg.join.nets.iter().map(|&(n, _)| n).collect();
 
-    let rep1 = with_rayon_threads(1, || {
-        apply_routes(&mut db1, tech, &guided, &leg.route, &leg.vias).expect("apply_routes serial")
-    });
-    let rep8 = with_rayon_threads(8, || {
-        apply_routes(&mut db2, tech, &guided, &leg.route, &leg.vias).expect("apply_routes par8")
-    });
+    let rep1 =
+        apply_routes(&mut db1, tech, &guided, &leg.route, &leg.vias, 1).expect("apply_routes serial");
+    let rep8 =
+        apply_routes(&mut db2, tech, &guided, &leg.route, &leg.vias, 8).expect("apply_routes par8");
     assert_eq!(rep1.wire_length_dbu, rep8.wire_length_dbu);
     assert_eq!(rep1.vias_per_cut, rep8.vias_per_cut);
     assert_eq!(rep1.unrouted, rep8.unrouted);
@@ -3273,12 +3259,8 @@ fn test_rayon_emit_serial_identity() {
     let placed = placed_def("gcd");
     let out1 = tmp_def("gcd-rayon-e1");
     let out8 = tmp_def("gcd-rayon-e8");
-    with_rayon_threads(1, || {
-        write_routed_def(&db1, tech, &placed, &out1).expect("write serial")
-    });
-    with_rayon_threads(8, || {
-        write_routed_def(&db2, tech, &placed, &out8).expect("write par8")
-    });
+    write_routed_def(&db1, tech, &placed, &out1, 1).expect("write serial");
+    write_routed_def(&db2, tech, &placed, &out8, 8).expect("write par8");
     assert_eq!(
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out8).unwrap(),
@@ -3335,7 +3317,7 @@ fn test_preemit_gcd() {
     assert!(io_ports > 0, "gcd emit carries no IoPort shapes");
 
     let out = tmp_def("gcd-preemit");
-    write_routed_def(&db, tech, &placed_def("gcd"), &out).expect("write");
+    write_routed_def(&db, tech, &placed_def("gcd"), &out, 0).expect("write");
     let (_db2, drc_report) = self_drc(&out, tech);
     assert_eq!(
         pre, drc_report,
@@ -3428,14 +3410,14 @@ fn test_emit_unrouted_fixture() {
     );
     assert_eq!(route_db.unrouted.len(), 1, "{:?}", route_db.unrouted);
     let guided: Vec<NetId> = join.nets.iter().map(|&(n, _)| n).collect();
-    let report = apply_routes(&mut db, &tech, &guided, &route_db, &vias).expect("apply");
+    let report = apply_routes(&mut db, &tech, &guided, &route_db, &vias, 0).expect("apply");
     assert_eq!(report.unrouted, vec!["n3".to_string()]);
 
     // The fixture's own text is the splice template.
     let template = tmp_def("fixture-template");
     std::fs::write(&template, &def_text).unwrap();
     let out = tmp_def("fixture-unrouted");
-    write_routed_def(&db, &tech, &template, &out).expect("write");
+    write_routed_def(&db, &tech, &template, &out, 0).expect("write");
     let text = std::fs::read_to_string(&out).unwrap();
 
     let n3_start = text.find(" - n3 ").expect("n3 record missing");
@@ -3795,7 +3777,7 @@ fn test_e2e_ours_def_deterministic_gcd() {
     let leg = gcd_leg();
     let (db, _rep) = emit_leg(leg);
     let out = tmp_def("gcd-ours-det");
-    write_routed_def(&db, &leg.tech, &placed_def("gcd"), &out).expect("write routed DEF");
+    write_routed_def(&db, &leg.tech, &placed_def("gcd"), &out, 0).expect("write routed DEF");
     let committed = require(design_dir("gcd").join("gcd.drt.ours.routed.def"));
     assert_eq!(
         std::fs::read(&committed).unwrap(),

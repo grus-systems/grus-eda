@@ -13,6 +13,6 @@ categories = ["command-line-utilities", "hardware-support"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-grus-eda-core = { version = "0.15", path = "../grus-eda-core" }
+grus-eda-core = { version = "0.16", path = "../grus-eda-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
