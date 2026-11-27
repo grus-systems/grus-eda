@@ -521,11 +521,8 @@ fn drc_claim_from_golden(golden: &serde_json::Value) -> anyhow::Result<DrcClaim>
     let cls = checked["classification"].as_object().ok_or_else(|| {
         anyhow::anyhow!("reference magic_rules_checked.classification missing or not an object")
     })?;
-    let class_of = |n: &serde_json::Value| {
-        n.as_str()
-            .and_then(|s| cls.get(s))
-            .and_then(|v| v.as_str())
-    };
+    let class_of =
+        |n: &serde_json::Value| n.as_str().and_then(|s| cls.get(s)).and_then(|v| v.as_str());
     let (mut le_stmts, mut magic_only) = (0, 0);
     for n in names {
         match class_of(n) {
@@ -594,9 +591,8 @@ fn drc_family_name(f: grus_eda_core::drc::report::Family) -> &'static str {
 /// comparison consumes.
 fn drc_finding_line(rule: &str, f: &grus_eda_core::drc::report::Finding) -> String {
     use grus_eda_core::drc::report::Measured;
-    let rect = |r: &grus_eda_core::tech_db::RectDbu| {
-        format!("[{},{},{},{}]", r.xl, r.yl, r.xh, r.yh)
-    };
+    let rect =
+        |r: &grus_eda_core::tech_db::RectDbu| format!("[{},{},{},{}]", r.xl, r.yl, r.xh, r.yh);
     let nets = if f.nets.is_empty() {
         "-".to_string()
     } else {
@@ -831,7 +827,10 @@ fn print_congestion_summary(
 
 /// `cell/pin` for instance pins, the bare port name for io pins —
 /// the label the emit census prints (`fail`, `stub_outside_cover`).
-fn pin_label(db: &grus_eda_core::design_db::DesignDb, pin: grus_eda_core::interner::PinId) -> String {
+fn pin_label(
+    db: &grus_eda_core::design_db::DesignDb,
+    pin: grus_eda_core::interner::PinId,
+) -> String {
     let i = pin.0 as usize;
     let pname = db.strings.resolve(db.pin_names[i]);
     match db.pin_cells[i] {
@@ -909,8 +908,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 if let Some(json_path) = &args.json {
                     println!("Loading Yosys JSON netlist from {:?}", json_path);
                     let t_json = std::time::Instant::now();
-                    let db_json =
-                        grus_eda_core::readers::parse_yosys_json(json_path, &tech_db, Some(&lib_db))?;
+                    let db_json = grus_eda_core::readers::parse_yosys_json(
+                        json_path,
+                        &tech_db,
+                        Some(&lib_db),
+                    )?;
                     check_top_name(args.top.as_deref(), "Yosys JSON", &db_json.design_name)?;
                     let elapsed_json_ms = t_json.elapsed().as_secs_f64() * 1000.0;
                     println!(
@@ -1258,12 +1260,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 grus_eda_core::sta::load_sdc(&args.sdc)?
             };
             let t0 = std::time::Instant::now();
-            let compute_parasitics = |d: &grus_eda_core::design_db::DesignDb| -> anyhow::Result<Option<grus_eda_core::sta::NetParasitics>> {
+            let compute_parasitics = |d: &grus_eda_core::design_db::DesignDb| -> anyhow::Result<
+                Option<grus_eda_core::sta::NetParasitics>,
+            > {
                 match (mode, &args.spef) {
                     ("placement RC", _) => {
                         let _p = grus_eda_core::timing::phase("sta.parasitics");
-                        let rc = grus_eda_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
-                        Ok(Some(grus_eda_core::sta::estimate_placement_parasitics(d, &tech_db, rc)))
+                        let rc =
+                            grus_eda_core::sta::WireRc::from_layer(&tech_db, &args.wire_layer)?;
+                        Ok(Some(grus_eda_core::sta::estimate_placement_parasitics(
+                            d, &tech_db, rc,
+                        )))
                     }
                     ("guide RC", _) => {
                         let _p = grus_eda_core::timing::phase("sta.parasitics");
@@ -1763,9 +1770,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 Ok(block)
             };
             let field = |block: &serde_json::Value, net: &str, f: &str| -> anyhow::Result<f64> {
-                block[f]
-                    .as_f64()
-                    .ok_or_else(|| anyhow::anyhow!("reference nets.{net}.conventions.embedded.{f} missing or non-numeric"))
+                block[f].as_f64().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "reference nets.{net}.conventions.embedded.{f} missing or non-numeric"
+                    )
+                })
             };
             let mut vpwr_supply = None;
             let mut vgnd_supply = None;
@@ -1814,8 +1823,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
                 let csv_path = args.out_dir.join(&csv_name);
                 {
-                    let mut out = std::io::BufWriter::new(std::fs::File::create(&csv_path)
-                        .map_err(|e| anyhow::anyhow!("create {:?}: {e}", csv_path))?);
+                    let mut out = std::io::BufWriter::new(
+                        std::fs::File::create(&csv_path)
+                            .map_err(|e| anyhow::anyhow!("create {:?}: {e}", csv_path))?,
+                    );
                     grus_eda_core::pdn::write_voltage_csv(&rows, &mut out)?;
                 }
                 let elapsed_ms = t_solve.elapsed().as_secs_f64() * 1000.0;
@@ -1828,10 +1839,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     average_drop_v: field(block, &name, "average_drop_v")?,
                     worst_drop_v: field(block, &name, "worst_drop_v")?,
                     total_current_a: field(block, &name, "total_power_w")? / current_scale_v,
-                    csv_rows: block["csv_rows"]
-                        .as_u64()
-                        .ok_or_else(|| anyhow::anyhow!("reference nets.{name}.conventions.embedded.csv_rows missing"))?
-                        as u32,
+                    csv_rows: block["csv_rows"].as_u64().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "reference nets.{name}.conventions.embedded.csv_rows missing"
+                        )
+                    })? as u32,
                 };
                 let s = &solve.summary;
                 let deltas = grus_eda_core::pdn::IrDropDeltas {
@@ -2093,20 +2105,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // the OBS-sealed pin-pocket escape (`docs/e6-drt.md` §7) —
             // plus the bounded pin-halo escape for pins whose metal
             // lies outside the guide region (`docs/e6-drt.md` §5).
-            let t_graphs = std::time::Instant::now();
-            let graphs = grus_eda_core::drt::graph::build_route_graphs_ext(
-                &design_db,
-                tech_db,
-                &tracks,
-                &join,
-                grus_eda_core::drt::graph::GraphOpts {
-                    spare_above: 1,
-                    escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
-                },
-            );
-            if timing {
-                eprintln!("drt: build_graphs {:?}", t_graphs.elapsed());
-            }
+            // Graphs are built inside `route_nets` and dropped per
+            // net (see `docs/e6-drt.md` §7 "Resident footprint").
+            let opts = grus_eda_core::drt::graph::GraphOpts {
+                spare_above: 1,
+                escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+            };
             let vias = grus_eda_core::drt::via::via_table(tech_db, &design_db)?;
 
             let occ = match args.occ {
@@ -2131,11 +2135,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     last = std::time::Instant::now();
                 }
             };
-            let route_db = grus_eda_core::drt::maze::route_nets_with_progress(
+            let (graphs, route_db) = grus_eda_core::drt::maze::route_nets_with_progress(
                 &design_db,
                 tech_db,
                 &tracks,
-                &graphs,
+                &join,
+                opts,
                 &vias,
                 &grus_eda_core::drt::MazeConfig {
                     occ,
@@ -2146,8 +2151,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let elapsed_route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
 
             let t_emit = std::time::Instant::now();
+            let guided: Vec<grus_eda_core::interner::NetId> =
+                join.nets.iter().map(|&(net, _)| net).collect();
             let report = grus_eda_core::drt::emit::apply_routes(
-                &mut design_db, tech_db, &graphs, &route_db, &vias,
+                &mut design_db,
+                tech_db,
+                &guided,
+                &route_db,
+                &vias,
             )?;
             // Detection precedes the write: the check runs on the
             // committed `net_geoms`, not the emitted text.
@@ -2159,28 +2170,38 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 eprintln!("drt: emit_apply {:?}", t_emit.elapsed());
             }
             let t_write = std::time::Instant::now();
-            grus_eda_core::drt::emit::write_routed_def(&design_db, tech_db, &args.def, &args.out_def)?;
+            grus_eda_core::drt::emit::write_routed_def(
+                &design_db,
+                tech_db,
+                &args.def,
+                &args.out_def,
+            )?;
             // The verdict is a property of the emitted text: the subset
             // checker scores a re-parse of what was just written, and its
             // findings_total gates the exit code at the end of the arm.
-            let self_drc: Option<grus_eda_core::drc::report::SubsetReport> =
-                if args.no_self_drc {
-                    None
-                } else {
-                    let reparsed =
-                        grus_eda_core::readers::parse_def(&args.out_def, tech_db, None)?;
-                    let drc_design = grus_eda_core::drc::geom::assemble(&reparsed, tech_db)?;
-                    Some(grus_eda_core::drc::report::run_all(
-                        &drc_design,
-                        tech_db,
-                        &reparsed.strings,
-                    ))
-                };
+            let self_drc: Option<grus_eda_core::drc::report::SubsetReport> = if args.no_self_drc {
+                None
+            } else {
+                let reparsed = grus_eda_core::readers::parse_def(&args.out_def, tech_db, None)?;
+                let drc_design = grus_eda_core::drc::geom::assemble(&reparsed, tech_db)?;
+                Some(grus_eda_core::drc::report::run_all(
+                    &drc_design,
+                    tech_db,
+                    &reparsed.strings,
+                ))
+            };
             let self_drc_findings: Option<usize> = self_drc
                 .as_ref()
                 .map(|s| s.rules.iter().map(|o| o.findings.len()).sum());
             if timing {
                 eprintln!("drt: emit_write {:?}", t_write.elapsed());
+            }
+            if grus_eda_core::drt::mem::enabled() {
+                eprintln!(
+                    "drt: mem post_emit rss={} net_geoms={}",
+                    grus_eda_core::drt::mem::peak_rss_bytes(),
+                    grus_eda_core::drt::emit::net_geoms_bytes(&design_db),
+                );
             }
 
             let projected: usize = route_db.nets.iter().map(|n| n.projected.len()).sum();
@@ -2311,12 +2332,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .collect();
             // What the pin-halo escape did per strict-escape pin —
             // joined onto the `fail` line as `escape=<token>`.
-            let esc_records: std::collections::BTreeMap<(u32, u32), &grus_eda_core::drt::graph::EscapeRecord> =
-                graphs
-                    .escapes
-                    .iter()
-                    .map(|e| ((e.net.0, e.pin.0), e))
-                    .collect();
+            let esc_records: std::collections::BTreeMap<
+                (u32, u32),
+                &grus_eda_core::drt::graph::EscapeRecord,
+            > = graphs
+                .escapes
+                .iter()
+                .map(|e| ((e.net.0, e.pin.0), e))
+                .collect();
             for u in &route_db.unrouted {
                 println!(
                     "  unrouted {}",
@@ -2391,20 +2414,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let variant = |key: &str| -> Option<&serde_json::Value> {
                 reference.as_ref().map(|r| &r["variants"][key])
             };
-            let ref_um = |v: Option<&serde_json::Value>| {
-                v.and_then(|v| v["total_wirelength_um"].as_f64())
-            };
-            let ours_um = report.wire_length_dbu as f64
-                / design_db.dbu_per_micron.max(1) as f64;
+            let ref_um =
+                |v: Option<&serde_json::Value>| v.and_then(|v| v["total_wirelength_um"].as_f64());
+            let ours_um = report.wire_length_dbu as f64 / design_db.dbu_per_micron.max(1) as f64;
             let delegated_um = ref_um(variant("delegated"));
             let baseline_um = ref_um(variant("baseline"));
             println!(
                 "wirelength_um ours={ours_um:.3} delegated={} delta={} baseline={}",
-                delegated_um.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                delegated_um
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "-".into()),
                 delegated_um
                     .map(|v| format!("{:+.3}", ours_um - v))
                     .unwrap_or_else(|| "-".into()),
-                baseline_um.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                baseline_um
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "-".into()),
             );
 
             // The reference census keys via counts by via-def name;

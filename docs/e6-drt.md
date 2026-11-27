@@ -537,11 +537,15 @@ order — deterministic; parallel strict/relaxed edges coexist and the
 equal-`VIA_COST` tie breaks toward the strict arc (CSR order), with
 extraction deduping the placement on `(lower, x, y)`.
 
-**Search** (pathfinder-style tree extension): `NetTopo` is built
-once per net — attach sets, the `PinCover` hull mask, pin-anchored
-access arcs, relaxed vias, and the CSR adjacency over the unified
-index space — and reused across rip-up iterations (byte-identical
-arc order). The tree seeds at the driver
+**Search** (pathfinder-style tree extension): `NetTopo` keeps only
+the occupancy-snapshot half of per-net state — attach sets, the
+`PinCover` hull mask, pin-anchored access arcs, and `cover` —
+captured once per net against post-premark occupancy. The
+occupancy-free half (`NetAdj`: member CSR, relaxed vias, CSR
+adjacency over the unified index space) plus the `NetGraph` itself
+is rebuilt per attempt — pure functions of the kept topo and the
+shared inputs, byte-identical arc order (see "Resident footprint"
+below). The tree seeds at the driver
 pin's attach set (`net_driver`, else the first attachable member in
 `net_pins` order). Each extension round: a unit-weight BFS over all
 arc classes from every unconnected attachable pin's attach set fills
@@ -774,6 +778,38 @@ the global pool would pin the env var on first use process-wide,
 which makes the forced single-thread determinism arms untestable
 inside `cargo test`. `GRUS_DRT_TIMING` reports the pool size as a
 `threads=N` token on each timing line.
+
+**Resident footprint** (drt-scale-memory): `route_nets` takes
+`(join, GraphOpts)` and builds no persistent per-net graphs — the
+attach pass streams `build_net_graph` per net inside `map_init`,
+extracts the occupancy-snapshot `NetTopo`, and drops the graph; the
+returned `RouteGraphs` is a census-only fold (`nets` stays empty).
+Every attempt then rebuilds `(NetGraph, NetAdj)` inside the search
+map (`route_prepared`'s `mk_graph` — the production seam replays
+`build_net_graph`, the unit-test seam feeds synthetic fixtures), so
+at most `threads` pairs are in flight instead of every net's graph +
+topology for the whole run. Rebuild is legal because `NetAdj`'s
+inputs — `relaxed_vias`, the member CSR, and the adjacency CSR —
+never read occupancy (only `attach`/`access`/`cover` do, and they
+stay in the kept topo). The commit-time stale-collision scan is
+likewise graph-free: extraction resolves each used edge's scan
+parameters into `EdgeProbe`s (wire/stub scan bands and via
+footprints), and `probe_collisions` replays them against live `occ`
+at commit in the same order `edge_collisions` scanned — identical
+collision sets. `GRUS_DRT_MEM` prints the structural split:
+`post_graphs`/`post_topos` capacity walks, per-iteration
+`attempt_hi` (the transient rebuild hi-water — measured on the
+snapshot arm and, since v0.15.1, on the serial hard arm too; the
+bound is `threads × attempt_hi`, not `nets × (graph+topo)`), and
+`post_route`/`post_emit`. Measured (`docs/results.md`,
+drt-scale-memory): gcd `topos` 91.0 MB → 0.26 MB, peak RSS
+153.1 → 95.2 MB; picorv32 `topos` census 3.13 GB → 8.0 MB, peak RSS
+2.37 GB → 958 MB — the bound is now `threads ×` the worst guide
+union's `(graph, adj)` pair (`attempt_hi` 217.5 MB on picorv32), not
+linear in net count. Routed DEF stays byte-identical;
+`test_net_graph_rebuild_identity` pins rebuild ≡
+bulk per net plus the streamed census ≡ the bulk `RouteGraphs`
+fields.
 
 ## 8. Routed DEF emission
 

@@ -229,6 +229,30 @@ fn is_signal_pin(db: &DesignDb, tech: &TechDb, p: PinId) -> bool {
     }
 }
 
+/// Heap census of every `NetGraph` — the `drt: mem post_graphs`
+/// capacity walk (`drt/mem.rs`): `capacity() × size_of` per `Vec`,
+/// inner `pin_nodes` id lists included. The cross-net census fields
+/// stay unmeasured (they fold into the `rest` row of the split).
+pub fn route_graphs_bytes(g: &RouteGraphs) -> usize {
+    use crate::drt::mem::vec_bytes;
+    vec_bytes(&g.nets) + g.nets.iter().map(net_graph_bytes).sum::<usize>()
+}
+
+/// `route_graphs_bytes`'s per-net leg — the census counts every
+/// `NetGraph` the streamed build allocates even though only
+/// `threads` copies are resident at once (`drt/mem.rs`).
+pub fn net_graph_bytes(g: &NetGraph) -> usize {
+    use crate::drt::mem::vec_bytes;
+    let mut b = vec_bytes(&g.nodes)
+        + vec_bytes(&g.edges)
+        + vec_bytes(&g.via_edges)
+        + vec_bytes(&g.pin_nodes);
+    for (_, ids) in &g.pin_nodes {
+        b += vec_bytes(ids);
+    }
+    b
+}
+
 /// Joins parsed guide blocks to design nets: wraps
 /// `resolve_guide_nets` (extra names bail there) and classifies the
 /// absent `net_names` nets into `missing_signal` /
@@ -996,14 +1020,8 @@ fn escape_extend(
             };
             let (x0, x1) = covered_range(&lt.tracks_x, bbox.xl, bbox.xh);
             let (y0, y1) = covered_range(&lt.tracks_y, bbox.yl, bbox.yh);
-            let (xa, xb) = (
-                x0.saturating_sub(h),
-                (x1 + h).min(lt.tracks_x.len()),
-            );
-            let (ya, yb) = (
-                y0.saturating_sub(h),
-                (y1 + h).min(lt.tracks_y.len()),
-            );
+            let (xa, xb) = (x0.saturating_sub(h), (x1 + h).min(lt.tracks_x.len()));
+            let (ya, yb) = (y0.saturating_sub(h), (y1 + h).min(lt.tracks_y.len()));
             for ix in xa..xb {
                 for iy in ya..yb {
                     let p = (ix as u32, iy as u32);
@@ -1013,13 +1031,7 @@ fn escape_extend(
                     {
                         continue;
                     }
-                    if !hull.point_allowed(
-                        cover,
-                        scratch,
-                        l,
-                        lt.tracks_x[ix],
-                        lt.tracks_y[iy],
-                    ) {
+                    if !hull.point_allowed(cover, scratch, l, lt.tracks_x[ix], lt.tracks_y[iy]) {
                         continue;
                     }
                     halo.entry(l).or_default().insert(p);
@@ -1085,7 +1097,11 @@ fn escape_extend(
             }
         }
         match landed {
-            Some(Corridor { layer: l, span, path }) => {
+            Some(Corridor {
+                layer: l,
+                span,
+                path,
+            }) => {
                 // `pairs_added` counts distinct pairs inserted into
                 // `region`: `path ∪ halo[l]` on the corridor layer
                 // plus each other layer's halo — never
@@ -1236,6 +1252,223 @@ pub fn build_route_graphs(
     )
 }
 
+/// Per-net output of `build_net_graph`: the graph plus the census
+/// partials the shared `RouteGraphs` accumulators become — callers
+/// fold them serially in `join.nets` order (the fold replays the
+/// same appends in the same order, byte-identical to the serial
+/// loop under any thread count).
+pub struct NetBuild {
+    pub graph: NetGraph,
+    pub zero_coverage: Vec<ZeroCoverage>,
+    pub region_escape: Vec<RegionEscape>,
+    pub escapes: Vec<EscapeRecord>,
+    pub via_edges_per_pair: Vec<usize>,
+    pub hull_masked: Vec<usize>,
+}
+
+/// One guided net's `NetGraph` plus its census partials — a pure
+/// function of `(db, tech, tracks, join boxes, HullMask)` (occupancy
+/// never enters the build), so rebuilding a net is bit-identical:
+/// the maze router rebuilds per attempt rather than holding every
+/// net's graph across the whole rip-up loop. `hull_scratch` is
+/// per-worker state (`map_init`) for `HullMask::point_allowed` /
+/// `escape_extend`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_net_graph(
+    db: &DesignDb,
+    tech: &TechDb,
+    tracks: &[LayerTracks],
+    hull: &HullMask,
+    net: NetId,
+    boxes: &[GuideBox],
+    opts: GraphOpts,
+    hull_scratch: &mut Vec<u32>,
+) -> NetBuild {
+    let mut nb = NetBuild {
+        graph: NetGraph {
+            net,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            via_edges: Vec::new(),
+            pin_nodes: Vec::new(),
+        },
+        zero_coverage: Vec::new(),
+        region_escape: Vec::new(),
+        escapes: Vec::new(),
+        via_edges_per_pair: vec![0; tech.routing_layers.len().saturating_sub(1)],
+        hull_masked: vec![0; tech.routing_layers.len()],
+    };
+    let (mut region, box_layers) = net_region(boxes, tracks, opts.spare_above);
+    // Instance-hull mask: on masked layers a node inside a cell
+    // bbox survives only inside the net's own pin rects on that
+    // cell — foreign transit there would paint over subcell
+    // internals the occupancy model cannot see (`drc(full)`
+    // finding class). Attachment is unaffected: a pin's own
+    // nodes sit inside its cover.
+    let cover = pin_rects(db, tech, net);
+    for (&l, pairs) in region.iter_mut() {
+        if !hull.masked.get(l as usize).copied().unwrap_or(false) {
+            continue;
+        }
+        let lt = &tracks[l as usize];
+        let before = pairs.len();
+        pairs.retain(|&(ix, iy)| {
+            hull.point_allowed(
+                &cover,
+                hull_scratch,
+                l,
+                lt.tracks_x[ix as usize],
+                lt.tracks_y[iy as usize],
+            )
+        });
+        nb.hull_masked[l as usize] += before - pairs.len();
+    }
+    for &l in &box_layers {
+        if region.get(&l).is_none_or(|v| v.is_empty()) {
+            nb.zero_coverage.push(ZeroCoverage {
+                net,
+                layer: LayerId(l),
+            });
+        }
+    }
+
+    // Transit-layer hull coverage: the lowest unmasked layer may
+    // legally paint metal anywhere over a cell, but the guide's
+    // box can stop at a host hull's edge — the pin pocket then
+    // has no node for its escape via to land on (gcd `_037_`:
+    // the met2 box starts at 75900 DBU while the nearest met2
+    // track inside the driver's hull sits at 75670). Extend the
+    // layer's region to each host hull's track grid plus an
+    // L-corridor to the nearest pre-existing pair — `layer_edges`
+    // only links index-adjacent nodes, so a gap would leave the
+    // extension an island. Past `zero_coverage` so a guide hole
+    // still reports.
+    let first_unmasked = (0..tech.routing_layers.len())
+        .find(|&l| !hull.masked.get(l).copied().unwrap_or(false))
+        .map(|l| l as u8);
+    if let Some(l) = first_unmasked
+        && !cover.is_empty()
+    {
+        transit_extend(
+            region.entry(l).or_default(),
+            &tracks[l as usize],
+            db,
+            tech,
+            &cover,
+        );
+    }
+
+    // Pin-halo escape: for each strict-escape pin (no in-region
+    // node under its metal) add the bounded halo + corridor on
+    // its own stack — pre-emission, so nodes, edges, via edges,
+    // and the maze-side probes see escaped pairs unchanged.
+    let escaped = escape_extend(
+        db,
+        tech,
+        tracks,
+        &mut region,
+        &cover,
+        hull,
+        hull_scratch,
+        first_unmasked,
+        net,
+        opts.escape,
+        &mut nb.escapes,
+    );
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    // layer → first node id — the attachment probes reuse `region`
+    // under the same sorted order node ids were assigned.
+    let mut layer_base: BTreeMap<u8, u32> = BTreeMap::new();
+    for (&l, pairs) in &region {
+        layer_base.insert(l, nodes.len() as u32);
+        let base = layer_base[&l];
+        nodes.extend(pairs.iter().map(|&(ix, iy)| RouteNode {
+            layer: LayerId(l),
+            ix,
+            iy,
+        }));
+        let mut es = layer_edges(base, pairs);
+        if hull.masked.get(l as usize).copied().unwrap_or(false) {
+            // Node filtering keeps endpoints inside the pin rects,
+            // but an edge between two rects of one cell still
+            // paints the hull-internal strip between them —
+            // `seg_allowed` is the committed-paint check.
+            let lt = &tracks[l as usize];
+            es.retain(|e| {
+                let (ia, ib) = ((e.a - base) as usize, (e.b - base) as usize);
+                let (ax, ay) = (
+                    lt.tracks_x[pairs[ia].0 as usize],
+                    lt.tracks_y[pairs[ia].1 as usize],
+                );
+                let (bx, by) = (
+                    lt.tracks_x[pairs[ib].0 as usize],
+                    lt.tracks_y[pairs[ib].1 as usize],
+                );
+                hull.seg_allowed(&cover, l, ax, ay, bx, by)
+            });
+        }
+        edges.extend(es);
+    }
+
+    let mut via_edges = Vec::new();
+    for (&l, pairs_lo) in &region {
+        let u = l + 1;
+        let Some(pairs_hi) = region.get(&u) else {
+            continue;
+        };
+        let (Some(lt_lo), Some(lt_hi)) = (tracks.get(l as usize), tracks.get(u as usize)) else {
+            continue;
+        };
+        let pair_edges = layer_via_edges(
+            layer_base[&l],
+            pairs_lo,
+            lt_lo,
+            layer_base[&u],
+            pairs_hi,
+            lt_hi,
+        );
+        if let Some(slot) = nb.via_edges_per_pair.get_mut(l as usize) {
+            *slot += pair_edges.len();
+        }
+        via_edges.extend(pair_edges);
+    }
+
+    let mut pin_nodes = Vec::new();
+    for &pin in db.net_pins(net) {
+        let mut attached: BTreeSet<u32> = BTreeSet::new();
+        for (lid, rect) in pin_shapes(db, tech, pin) {
+            let (Some(&base), Some(pairs), Some(lt)) = (
+                layer_base.get(&lid.0),
+                region.get(&lid.0),
+                tracks.get(lid.0 as usize),
+            ) else {
+                continue;
+            };
+            for k in strict_hits(pairs, lt, &rect) {
+                attached.insert(base + k);
+            }
+        }
+        // `escaped` is the pre-halo escape set — recorded even
+        // when the halo later re-attached the pin, so the flag
+        // keeps meaning "pin metal outside the guide region".
+        if escaped.contains(&pin) {
+            nb.region_escape.push(RegionEscape { pin, net });
+        }
+        pin_nodes.push((pin, attached.into_iter().collect()));
+    }
+
+    nb.graph = NetGraph {
+        net,
+        nodes,
+        edges,
+        via_edges,
+        pin_nodes,
+    };
+    nb
+}
+
 /// `build_route_graphs` plus `opts`: `spare_above` extra routing
 /// layers per net, covered on every guide box's XY (see
 /// `net_region`) — the maze router passes 1, detailed routing may
@@ -1260,203 +1493,11 @@ pub fn build_route_graphs_ext(
     // the hull scratch becomes per-worker state via `map_init`.
     // Byte-identity to the serial loop is by construction: the
     // fold replays the same appends in the same order.
-    struct NetBuild {
-        graph: NetGraph,
-        zero_coverage: Vec<ZeroCoverage>,
-        region_escape: Vec<RegionEscape>,
-        escapes: Vec<EscapeRecord>,
-        via_edges_per_pair: Vec<usize>,
-        hull_masked: Vec<usize>,
-    }
     let builds: Vec<NetBuild> = drt_pool().install(|| {
         join.nets
             .par_iter()
             .map_init(Vec::new, |hull_scratch, (net, boxes)| {
-    let mut nb = NetBuild {
-        graph: NetGraph {
-            net: *net,
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            via_edges: Vec::new(),
-            pin_nodes: Vec::new(),
-        },
-        zero_coverage: Vec::new(),
-        region_escape: Vec::new(),
-        escapes: Vec::new(),
-        via_edges_per_pair: vec![0; tech.routing_layers.len().saturating_sub(1)],
-        hull_masked: vec![0; tech.routing_layers.len()],
-    };
-        let (mut region, box_layers) = net_region(boxes, tracks, opts.spare_above);
-        // Instance-hull mask: on masked layers a node inside a cell
-        // bbox survives only inside the net's own pin rects on that
-        // cell — foreign transit there would paint over subcell
-        // internals the occupancy model cannot see (`drc(full)`
-        // finding class). Attachment is unaffected: a pin's own
-        // nodes sit inside its cover.
-        let cover = pin_rects(db, tech, *net);
-        for (&l, pairs) in region.iter_mut() {
-            if !hull.masked.get(l as usize).copied().unwrap_or(false) {
-                continue;
-            }
-            let lt = &tracks[l as usize];
-            let before = pairs.len();
-            pairs.retain(|&(ix, iy)| {
-                hull.point_allowed(
-                    &cover,
-                    hull_scratch,
-                    l,
-                    lt.tracks_x[ix as usize],
-                    lt.tracks_y[iy as usize],
-                )
-            });
-            nb.hull_masked[l as usize] += before - pairs.len();
-        }
-        for &l in &box_layers {
-            if region.get(&l).is_none_or(|v| v.is_empty()) {
-                nb.zero_coverage.push(ZeroCoverage {
-                    net: *net,
-                    layer: LayerId(l),
-                });
-            }
-        }
-
-        // Transit-layer hull coverage: the lowest unmasked layer may
-        // legally paint metal anywhere over a cell, but the guide's
-        // box can stop at a host hull's edge — the pin pocket then
-        // has no node for its escape via to land on (gcd `_037_`:
-        // the met2 box starts at 75900 DBU while the nearest met2
-        // track inside the driver's hull sits at 75670). Extend the
-        // layer's region to each host hull's track grid plus an
-        // L-corridor to the nearest pre-existing pair — `layer_edges`
-        // only links index-adjacent nodes, so a gap would leave the
-        // extension an island. Past `zero_coverage` so a guide hole
-        // still reports.
-        let first_unmasked = (0..tech.routing_layers.len())
-            .find(|&l| !hull.masked.get(l).copied().unwrap_or(false))
-            .map(|l| l as u8);
-        if let Some(l) = first_unmasked
-            && !cover.is_empty()
-        {
-            transit_extend(
-                region.entry(l).or_default(),
-                &tracks[l as usize],
-                db,
-                tech,
-                &cover,
-            );
-        }
-
-        // Pin-halo escape: for each strict-escape pin (no in-region
-        // node under its metal) add the bounded halo + corridor on
-        // its own stack — pre-emission, so nodes, edges, via edges,
-        // and the maze-side probes see escaped pairs unchanged.
-        let escaped = escape_extend(
-            db,
-            tech,
-            tracks,
-            &mut region,
-            &cover,
-            &hull,
-            hull_scratch,
-            first_unmasked,
-            *net,
-            opts.escape,
-            &mut nb.escapes,
-        );
-
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        // layer → first node id — the attachment probes reuse `region`
-        // under the same sorted order node ids were assigned.
-        let mut layer_base: BTreeMap<u8, u32> = BTreeMap::new();
-        for (&l, pairs) in &region {
-            layer_base.insert(l, nodes.len() as u32);
-            let base = layer_base[&l];
-            nodes.extend(pairs.iter().map(|&(ix, iy)| RouteNode {
-                layer: LayerId(l),
-                ix,
-                iy,
-            }));
-            let mut es = layer_edges(base, pairs);
-            if hull.masked.get(l as usize).copied().unwrap_or(false) {
-                // Node filtering keeps endpoints inside the pin rects,
-                // but an edge between two rects of one cell still
-                // paints the hull-internal strip between them —
-                // `seg_allowed` is the committed-paint check.
-                let lt = &tracks[l as usize];
-                es.retain(|e| {
-                    let (ia, ib) = ((e.a - base) as usize, (e.b - base) as usize);
-                    let (ax, ay) = (
-                        lt.tracks_x[pairs[ia].0 as usize],
-                        lt.tracks_y[pairs[ia].1 as usize],
-                    );
-                    let (bx, by) = (
-                        lt.tracks_x[pairs[ib].0 as usize],
-                        lt.tracks_y[pairs[ib].1 as usize],
-                    );
-                    hull.seg_allowed(&cover, l, ax, ay, bx, by)
-                });
-            }
-            edges.extend(es);
-        }
-
-        let mut via_edges = Vec::new();
-        for (&l, pairs_lo) in &region {
-            let u = l + 1;
-            let Some(pairs_hi) = region.get(&u) else {
-                continue;
-            };
-            let (Some(lt_lo), Some(lt_hi)) =
-                (tracks.get(l as usize), tracks.get(u as usize))
-            else {
-                continue;
-            };
-            let pair_edges = layer_via_edges(
-                layer_base[&l],
-                pairs_lo,
-                lt_lo,
-                layer_base[&u],
-                pairs_hi,
-                lt_hi,
-            );
-            if let Some(slot) = nb.via_edges_per_pair.get_mut(l as usize) {
-                *slot += pair_edges.len();
-            }
-            via_edges.extend(pair_edges);
-        }
-
-        let mut pin_nodes = Vec::new();
-        for &pin in db.net_pins(*net) {
-            let mut attached: BTreeSet<u32> = BTreeSet::new();
-            for (lid, rect) in pin_shapes(db, tech, pin) {
-                let (Some(&base), Some(pairs), Some(lt)) = (
-                    layer_base.get(&lid.0),
-                    region.get(&lid.0),
-                    tracks.get(lid.0 as usize),
-                ) else {
-                    continue;
-                };
-                for k in strict_hits(pairs, lt, &rect) {
-                    attached.insert(base + k);
-                }
-            }
-            // `escaped` is the pre-halo escape set — recorded even
-            // when the halo later re-attached the pin, so the flag
-            // keeps meaning "pin metal outside the guide region".
-            if escaped.contains(&pin) {
-                nb.region_escape.push(RegionEscape { pin, net: *net });
-            }
-            pin_nodes.push((pin, attached.into_iter().collect()));
-        }
-
-        nb.graph = NetGraph {
-            net: *net,
-            nodes,
-            edges,
-            via_edges,
-            pin_nodes,
-        };
-        nb
+                build_net_graph(db, tech, tracks, &hull, *net, boxes, opts, hull_scratch)
             })
             .collect()
     });
@@ -1526,7 +1567,11 @@ mod tests {
 
         // Two diagonal boxes: the union is per-box coverage, so the
         // off-diagonal corners (0,2)/(2,0)-class nodes never appear.
-        let (region, _) = net_region(&[gb(0, 0, 0, 100, 100), gb(0, 200, 200, 300, 300)], &tracks, 0);
+        let (region, _) = net_region(
+            &[gb(0, 0, 0, 100, 100), gb(0, 200, 200, 300, 300)],
+            &tracks,
+            0,
+        );
         assert_eq!(
             region[&0],
             vec![
