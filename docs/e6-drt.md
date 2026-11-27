@@ -524,15 +524,20 @@ searched — but they *are* committed metal, occupancy-scanned via
 `WireSeg`s at extraction. **Single-nearest rule (recorded gap)**: if
 the nearest upper preferred line holds no in-region node, `v` gets
 no relaxed edge — a named stranded-pocket class; on gcd it stays
-theoretical (`unrouted=0`), while picorv32 measures 65 `NoPath`
-nets inside already-`met2`-connected guide unions (pockets, OBS
-seals, or final-pass occupancy — `docs/results.md`). This includes
+theoretical (`unrouted=0`), while picorv32 measured 65 `NoPath`
+nets inside already-`met2`-connected guide unions at the v0.12.4
+census (pockets, OBS seals, or final-pass occupancy —
+`docs/results.md`). This includes
 met2–met3: `M2M3_PR` is a default pair, so relaxed edges do give
 it a transition path wherever a nearby met3 preferred line carries
 in-region nodes — the §6 "dead capacity" note survives as the
-met3-bridge residual class (43 picorv32 nets whose ≤met2 guide
-union only met3+ rejoins; the census test's classifier names both
-classes and rejects anything else). Emitted in node
+met3-bridge residual class (whose ≤met2 guide union only met3+
+rejoins: 43 picorv32 nets at the v0.12.4 census, 142 bridged
+unions over the current unrouted set — the probe splits that
+union census into its `geom_met3_bridge` class count and
+probe-rescued nets, `docs/results.md`; the census test's
+classifier names both classes and rejects anything else).
+Emitted in node
 order — deterministic; parallel strict/relaxed edges coexist and the
 equal-`VIA_COST` tie breaks toward the strict arc (CSR order), with
 extraction deduping the placement on `(lower, x, y)`.
@@ -786,9 +791,11 @@ the unrouted pin census. Guide-absent io-pin-only nets
 verifier's step-E rule) are named in `unguided` rather than
 classified. `ProbeReport.elapsed` measures the probe itself.
 Measured decompositions and costs live in `docs/results.md` (gcd:
-54 `neg_attach_stub`,
-35 `neg_wave`, 4 `geom_pocket`; picorv32: the `geom_met3_bridge`
-net-count anchor).
+80 nets / 93 pins = 54 `neg_attach_stub` + 35 `neg_wave` + 4
+`geom_pocket`; picorv32: 1,731 nets / 3,083 pins = 2,544
+negotiation vs 539 geometric, led by `neg_attach_stub` 1,230 and
+`neg_wave` 1,206 with `geom_met3_bridge` 466 pins / 32 nets the
+dominant geometry — union census 142 pinned separately).
 
 **Instrumentation**: `GRUS_DRT_TIMING` (any value) makes `route_nets`
 print premark/topo/per-iteration/per-slow-net timings to stderr —

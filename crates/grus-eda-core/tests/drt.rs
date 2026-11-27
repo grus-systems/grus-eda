@@ -2864,10 +2864,17 @@ fn test_unrouted_probe_geom_obs_sealed() {
     assert!(p.region_escape, "the sealed pin's strict set must be empty");
 }
 
-/// Ignored (runtime): the picorv32 probe runs the same re-attempts
-/// the route's 2016 final-unrouted nets took — the leg's route alone
-/// is ~135 min. Run: `cargo test --release -p grus-eda-core --test
-/// drt test_unrouted_probe_picorv32 -- --ignored --nocapture`.
+/// Ignored (runtime): the picorv32 probe re-attempts the route's
+/// 1,731 final-unrouted nets — measured ~57 min total on this host
+/// (route leg ~53 min + probe ~3.7 min). Run: `cargo test --release
+/// -p grus-eda-core --test drt test_unrouted_probe_picorv32 --
+/// --ignored --nocapture`.
+///
+/// The live census is 1,731 nets / 3,083 pins — the earlier 2,016-net
+/// pin is the stale v0.12.9 census; `drt-guide-escape` + `drt-rayon`
+/// moved the routed output with this leg deferred (970 rescued / 685
+/// newly unrouted vs the committed golden — `docs/results.md` names
+/// the delta).
 #[test]
 #[ignore]
 fn test_unrouted_probe_picorv32() {
@@ -2884,11 +2891,35 @@ fn test_unrouted_probe_picorv32() {
     );
     probe_report_lines("picorv32", &rep, &leg.db);
     assert_probe_coverage(&rep, &leg.db, &leg.route);
-    assert_eq!(rep.nets.len(), 2016);
-    // The named anchors: the met3-bridge residual (43 nets) and the
-    // guide-absent io-port population (67), the latter joined by
-    // name to the golden `ours_router.unguided` list.
-    assert_eq!(rep.net_counts()["geom_met3_bridge"], 43);
+    assert_eq!(rep.nets.len(), 1731);
+    assert_eq!(rep.nets.iter().map(|n| n.pins.len()).sum::<usize>(), 3083);
+    // The met3-bridge anchor pinned as the union census (142 bridged
+    // unions over the live unrouted set) separately from the class
+    // count (32 nets carry `geom_met3_bridge` pins after the
+    // probe-rescue split — 546 pins on bridged nets rescued to
+    // negotiation). The spec's "43" was the union census of the
+    // 108-net v0.12.4 era; lineage in `docs/results.md`.
+    assert_eq!(
+        rep.nets.iter().filter(|n| n.union == GuideUnion::Bridged).count(),
+        142
+    );
+    assert_eq!(rep.net_counts()["geom_met3_bridge"], 32);
+    // The measured decomposition — every named class pinned, zeros
+    // included (a named class at 0 is evidence).
+    let class_counts = rep.class_counts();
+    assert_eq!(class_counts["neg_attach_stub"], 1230);
+    assert_eq!(class_counts["neg_wave"], 1206);
+    assert_eq!(class_counts["geom_met3_bridge"], 466);
+    assert_eq!(class_counts["geom_pocket"], 73);
+    assert_eq!(class_counts["neg_wave_obs_frontier"], 59);
+    assert_eq!(class_counts["neg_wave_unattributed"], 49);
+    assert_eq!(class_counts["neg_attach_port"], 0);
+    assert_eq!(class_counts["geom_disjoint"], 0);
+    assert_eq!(class_counts["geom_no_in_region"], 0);
+    assert_eq!(class_counts["geom_obs_sealed"], 0);
+    assert_eq!(class_counts["geom_off_track"], 0);
+    // The guide-absent io-port population (67), joined by name to
+    // the golden `ours_router.unguided` list.
     let golden_unguided: BTreeSet<String> =
         j_arr(&load_ours_ref("picorv32")["ours_router"]["unguided"], "ours_router.unguided")
             .iter()
