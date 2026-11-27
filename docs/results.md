@@ -11233,3 +11233,73 @@ every forced arm at explicit 1/8: `test_rayon_graphs_serial_identity`,
 `test_e2e_ours_def_deterministic_gcd` holds byte-equality against
 the committed `gcd.drt.ours.routed.def` — no golden regeneration.
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+### 2026-11-28 — aes/ibex DRT scale baseline: negotiation non-convergence at density
+
+First DRT runs on aes (12,839 inst) and ibex (16,644 inst), enabled by
+the committed OpenROAD guides added in `13ec726`
+(`tests/designs/generate_guide_ref.sh`, the step-5c recipe). Purpose:
+quantify the unrouted/scale behavior named as the open E6 frontier in
+`docs/status.md` before any fix ticket. **Measurement only — no
+router change, no reference comparison yet** (the delegated/baseline
+detailed_route reference legs are not run; `generate_drt_ref.sh`
+remains gcd/picorv32-only). One detached rep per design; runtime and
+RSS are single measurements, not medians.
+
+Invocation (both designs): `target/release/grus-eda drt --tlef <nom.tlef>
+--lef <sky130_fd_sc_hd.lef> --def <d>.placed.def --guide <d>.guide
+--out-def <out>` — CLI defaults (occupancy enabled, `MAX_ITERS=8`),
+no `--reference`, self-DRC default-on at tolerance 0.
+
+| design | machine | guided | routed | unrouted | collisions | route_ms | wall | peak RSS | self-DRC |
+|---|---|---|---|---|---|---|---|---|---|
+| aes | M1 Pro MacBook Pro, 8 cores, 16 GB, macOS 27.2.1 | 9,039 | 5,772 | **3,267 (36%)** | 5 | 1,294,823 | 1,317 s | 570,687,488 B | 7 findings (met1.2 ×6, met3.6 ×1) |
+| ibex | M4 Mac mini, 16 GB, macOS 27.2.1 | 12,129 | 8,435 | **3,694 (30%)** | 25 | 3,803,701 | 3,829 s | 1,208,139,776 B | 13 findings (met1.2 ×8, met1.6 ×4, met3.6 ×1) |
+
+Unrouted per-pin census — same structural signature as picorv32,
+met1 foreign-`Net` metal dominant:
+
+| design | NoPath | Unattachable | top blockers |
+|---|---|---|---|
+| aes | 3,188 | 1,525 | `l1Net`=1,706, `l1Obs`=345, `l2Net`=293 |
+| ibex | 4,116 | 2,269 | `l1Net`=1,873, `l1Obs`=730, `l2Net`=352 |
+| (picorv32 pin, for contrast) | 2,225 | 1,480 | `l1Net`=1,194, `l1Obs`=444, `l2Net`=286 |
+
+**Key observation — soft-iteration negotiation does not converge at
+this density.** `iter_prov` (deduped provisional collision tuples per
+iteration) plateaus as a fixed point on both new designs, while
+picorv32 converges monotonically and gcd terminates at zero:
+
+| design | iter_prov across iterations 1–8 |
+|---|---|
+| gcd | 25, 6, 0, 0, 0, 0, 0, 0 |
+| picorv32 | 2,238, 1,710, 1,425, 1,307, 1,214, 1,187, 1,099, 0 |
+| aes | 700,339 / 681,820 / 680,430 ×5 identical, 0 (hard) |
+| ibex | 773,707 / 642,074 / 621,820 / 621,771 ×4 identical, 0 (hard) |
+
+The plateau is bit-identical across iterations 3–7 — under
+deterministic routing that is a literal fixed point: rip-up
+reproduces the same collisions every round, so the hard iteration
+inherits ~620–680 K unresolved foreign-metal conflicts and mass-fails
+(`unrouted` climbs through the hard pass as it re-attempts). Notably
+the collision *count* is ~300× picorv32's at 1.3× the nets — a
+non-linear, threshold-like degradation. Fanout distributions are
+nearly identical across the four designs (mean 4.5–4.6, p50 = 2),
+ruling fanout out as the driver; raw instance density rises
+picorv32 (43.0) < aes (46.4) < ibex (52.5) inst/1000 µm². Whether the
+plateau is capacity-percolation, guide-quality, or a cost-model
+artifact (the escalation term is per-net, with no per-resource price
+signal — classic Pathfinder negotiation prices the *resource*) is
+exactly what the in-flight `drt-unrouted-analysis` ticket (run #64)
+is instrumented to decide.
+
+Secondary observations: aes emit carries 5 post-hoc collisions and
+1 area residual, ibex 25 collisions and 5 area residuals
+(gcd/picorv32 are pinned at 0 — the classes the emit census names
+but does not gate); ibex `projected=0` vs aes 91; aes routes in
+~22 min vs picorv32's ~69 min despite more instances (machines
+differ: M1 Pro vs M4 mini — not like-for-like, and the plateau means
+later iterations do less productive search). Determinism (`--verify`
+second-run byte-equality) not yet run on either design — the gcd pin
+`test_e2e_ours_def_deterministic_gcd` remains the determinism gate.
+jpeg (61,569 inst) baseline measurement in flight at entry time.
