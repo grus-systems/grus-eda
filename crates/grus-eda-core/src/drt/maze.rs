@@ -12,7 +12,10 @@ use crate::drc::union;
 use crate::drc::union::{rect_covered, rect_minus};
 use crate::drc::{DrcLayer, LayerShapes, ShapeRect, ShapeSrc};
 use crate::drt::access::pin_shapes;
-use crate::drt::graph::{cell_hull_rect, pin_rects, HullMask, NetGraph, PinCover, RouteGraphs};
+use crate::drt::graph::{
+    EscapeRecord, GraphOpts, GuideJoin, HullMask, NetGraph, PinCover, RegionEscape, RouteGraphs,
+    ZeroCoverage, build_net_graph, cell_hull_rect, net_graph_bytes, pin_rects,
+};
 use crate::drt::pool::drt_pool;
 use crate::drt::tracks::{Axis, LayerTracks};
 use crate::drt::via::ViaTable;
@@ -595,15 +598,7 @@ impl Occupancy {
     /// `< s` along the line; the perpendicular `< s` is already
     /// guaranteed because the committed shape rasterized the line
     /// only inside its `w/2 + s` band.
-    fn scan_wire(
-        &self,
-        axis: Axis,
-        layer: u8,
-        ti: u32,
-        c: i32,
-        d: i32,
-        out: &mut Vec<Hit>,
-    ) {
+    fn scan_wire(&self, axis: Axis, layer: u8, ti: u32, c: i32, d: i32, out: &mut Vec<Hit>) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
         // Census is bulk-added once per call — a per-element store
@@ -972,13 +967,7 @@ fn pref_axis(dir: LayerDir) -> Axis {
 /// `ObsPin` marks (instance-pin metal inside hulls): own free,
 /// foreign hard-blocked — a soft price there is a Magic
 /// subcell-overlap finding the maze cannot otherwise see.
-fn hit_verdict(
-    hits: &[Hit],
-    own: u32,
-    hist: u32,
-    hard: bool,
-    mode: OccMode,
-) -> Option<u32> {
+fn hit_verdict(hits: &[Hit], own: u32, hist: u32, hard: bool, mode: OccMode) -> Option<u32> {
     for h in hits {
         match h.iv.who {
             Occupant::Obs(_) => {
@@ -1158,7 +1147,7 @@ fn scan_stub(
     }
 }
 
-/// Records every foreign spacing hit of one committed edge as a
+/// Records every foreign spacing hit of one committed-edge scan as a
 /// provisional `Collision`. `Net` hits go to `out` deduped on
 /// `(a, b, layer, line, lo, hi)` — `a < b` canonically. `Pin` hits
 /// go to `out_pins` *directed* — `a` is always the committing (wire)
@@ -1166,48 +1155,83 @@ fn scan_stub(
 /// party, so `route_nets` re-queues `a` alone. `ObsPin` stays
 /// unrecorded (already a hard block — a hit means the edge was never
 /// committed, or a bug).
-#[allow(clippy::too_many_arguments)]
-fn edge_collisions(
-    g: &NetGraph,
-    tracks: &[LayerTracks],
-    vias: &ViaTable,
-    occ: &Occupancy,
-    relax: &[RelaxedVia],
-    cover: &PinCover,
-    eidx: u32,
+fn record_hits(
+    layer: LayerId,
+    hits: &[Hit],
     own: NetId,
     out: &mut BTreeSet<Collision>,
     out_pins: &mut BTreeSet<Collision>,
-    hits: &mut Vec<Hit>,
 ) {
-    let mut record = |layer: LayerId, hits: &[Hit]| {
-        for h in hits {
-            match h.iv.who {
-                Occupant::Net(m) if m != own.0 => {
-                    out.insert(Collision {
-                        a: NetId(own.0.min(m)),
-                        b: NetId(own.0.max(m)),
-                        layer,
-                        line: h.line,
-                        lo: h.lo,
-                        hi: h.hi,
-                    });
-                }
-                Occupant::Pin(m) if m != own.0 => {
-                    out_pins.insert(Collision {
-                        a: own,
-                        b: NetId(m),
-                        layer,
-                        line: h.line,
-                        lo: h.lo,
-                        hi: h.hi,
-                    });
-                }
-                _ => {}
+    for h in hits {
+        match h.iv.who {
+            Occupant::Net(m) if m != own.0 => {
+                out.insert(Collision {
+                    a: NetId(own.0.min(m)),
+                    b: NetId(own.0.max(m)),
+                    layer,
+                    line: h.line,
+                    lo: h.lo,
+                    hi: h.hi,
+                });
             }
+            Occupant::Pin(m) if m != own.0 => {
+                out_pins.insert(Collision {
+                    a: own,
+                    b: NetId(m),
+                    layer,
+                    line: h.line,
+                    lo: h.lo,
+                    hi: h.hi,
+                });
+            }
+            _ => {}
         }
-    };
-    hits.clear();
+    }
+}
+
+/// One committed edge's commit-time collision scan, its parameters
+/// resolved at extraction (`edge_probe`) while the attempt's rebuilt
+/// `NetGraph`/`NetAdj` are still live — the commit pass replays these
+/// against live occupancy with no graph reference. Order mirrors the
+/// per-edge `record` sequence `edge_collisions` produced exactly.
+#[derive(Clone, Copy)]
+enum EdgeProbe {
+    /// `scan_wire(axis, l, ti, c, d)` then `record(l)` — the in-plane
+    /// `g.edges` arm.
+    Wire {
+        axis: Axis,
+        l: u8,
+        ti: u32,
+        c: i32,
+        d: i32,
+    },
+    /// `scan_wire` + `exempt_obs(paint)` then `record(l)` — one
+    /// `scan_stub` leg of a relaxed via (committed metal on the
+    /// endpoint's layer).
+    Stub {
+        axis: Axis,
+        l: u8,
+        ti: u32,
+        c: i32,
+        d: i32,
+        paint: RectDbu,
+    },
+    /// `scan_rect` per routing rect of the pair default then
+    /// `record(lid)` — a strict via edge or a relaxed via's head.
+    ViaFp { k: u8, x: i32, y: i32 },
+}
+
+/// Resolves one used edge's commit-time collision scan into
+/// `EdgeProbe`s — the parameter computation of the old
+/// `edge_collisions`, moved to extraction.
+fn edge_probe(
+    g: &NetGraph,
+    tracks: &[LayerTracks],
+    relax: &[RelaxedVia],
+    occ: &Occupancy,
+    eidx: u32,
+    out: &mut Vec<EdgeProbe>,
+) {
     let e_plane = g.edges.len() as u32;
     let v_plane = e_plane + g.via_edges.len() as u32;
     if eidx < e_plane {
@@ -1227,38 +1251,110 @@ fn edge_collisions(
                 lt.tracks_y[na.iy as usize].max(lt.tracks_y[nb.iy as usize]),
             ),
         };
-        occ.scan_wire(e.axis, l, ti, c, d, hits);
-        record(LayerId(l), hits);
+        out.push(EdgeProbe::Wire {
+            axis: e.axis,
+            l,
+            ti,
+            c,
+            d,
+        });
+    } else if eidx < v_plane {
+        let ve = &g.via_edges[(eidx - e_plane) as usize];
+        let (x, y) = node_xy(g, tracks, ve.lower);
+        out.push(EdgeProbe::ViaFp {
+            k: g.nodes[ve.lower as usize].layer.0,
+            x,
+            y,
+        });
     } else {
-        let (k, x, y) = if eidx < v_plane {
-            let ve = &g.via_edges[(eidx - e_plane) as usize];
-            let (x, y) = node_xy(g, tracks, ve.lower);
-            (g.nodes[ve.lower as usize].layer.0, x, y)
-        } else {
-            let rv = &relax[(eidx - v_plane) as usize];
-            // Stubs are committed metal — same miss class as in
-            // `edge_cost`.
-            hits.clear();
-            scan_stub(g, tracks, occ, cover, rv.a, rv.lower, rv.x, rv.y, hits);
-            record(LayerId(rv.lower), hits);
-            hits.clear();
-            scan_stub(g, tracks, occ, cover, rv.b, rv.lower + 1, rv.x, rv.y, hits);
-            record(LayerId(rv.lower + 1), hits);
-            (rv.lower, rv.x, rv.y)
-        };
-        let pair = &vias.pairs[k as usize];
-        let Some(di) = pair.default else {
-            return;
-        };
-        let cand = &vias.candidates[pair.candidates[di as usize] as usize];
-        for (dl, r) in &cand.rects {
-            let DrcLayer::Routing(lid) = dl else {
-                continue;
-            };
-            let shift = RectDbu::new(x + r.xl, y + r.yl, x + r.xh, y + r.yh);
-            hits.clear();
-            occ.scan_rect(lid.0, &shift, hits);
-            record(*lid, hits);
+        let rv = &relax[(eidx - v_plane) as usize];
+        // Stubs are committed metal — same miss class as in
+        // `edge_cost`. `scan_stub`'s geometry is resolved per
+        // endpoint leg, in the same (lower, upper) record order.
+        for (n, l) in [(rv.a, rv.lower), (rv.b, rv.lower + 1)] {
+            let (nx, ny) = node_xy(g, tracks, n);
+            let node = &g.nodes[n as usize];
+            let w2 = occ.halfw[l as usize];
+            if nx == rv.x {
+                if ny != rv.y {
+                    out.push(EdgeProbe::Stub {
+                        axis: Axis::Y,
+                        l,
+                        ti: node.ix,
+                        c: ny.min(rv.y),
+                        d: ny.max(rv.y),
+                        paint: RectDbu::new(nx - w2, ny.min(rv.y), nx + w2, ny.max(rv.y)),
+                    });
+                }
+            } else if ny == rv.y {
+                out.push(EdgeProbe::Stub {
+                    axis: Axis::X,
+                    l,
+                    ti: node.iy,
+                    c: nx.min(rv.x),
+                    d: nx.max(rv.x),
+                    paint: RectDbu::new(nx.min(rv.x), ny - w2, nx.max(rv.x), ny + w2),
+                });
+            }
+        }
+        out.push(EdgeProbe::ViaFp {
+            k: rv.lower,
+            x: rv.x,
+            y: rv.y,
+        });
+    }
+}
+
+/// Replays resolved `EdgeProbe`s against live occupancy at commit —
+/// the same scans `edge_collisions` ran, in the same order, so the
+/// provisional-collision sets are byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn probe_collisions(
+    occ: &Occupancy,
+    vias: &ViaTable,
+    cover: &PinCover,
+    probes: &[EdgeProbe],
+    own: NetId,
+    out: &mut BTreeSet<Collision>,
+    out_pins: &mut BTreeSet<Collision>,
+    hits: &mut Vec<Hit>,
+) {
+    for p in probes {
+        match *p {
+            EdgeProbe::Wire { axis, l, ti, c, d } => {
+                hits.clear();
+                occ.scan_wire(axis, l, ti, c, d, hits);
+                record_hits(LayerId(l), hits, own, out, out_pins);
+            }
+            EdgeProbe::Stub {
+                axis,
+                l,
+                ti,
+                c,
+                d,
+                paint,
+            } => {
+                hits.clear();
+                occ.scan_wire(axis, l, ti, c, d, hits);
+                exempt_obs(cover, &paint, hits, 0);
+                record_hits(LayerId(l), hits, own, out, out_pins);
+            }
+            EdgeProbe::ViaFp { k, x, y } => {
+                let pair = &vias.pairs[k as usize];
+                let Some(di) = pair.default else {
+                    continue;
+                };
+                let cand = &vias.candidates[pair.candidates[di as usize] as usize];
+                for (dl, r) in &cand.rects {
+                    let DrcLayer::Routing(lid) = dl else {
+                        continue;
+                    };
+                    let shift = RectDbu::new(x + r.xl, y + r.yl, x + r.xh, y + r.yh);
+                    hits.clear();
+                    occ.scan_rect(lid.0, &shift, hits);
+                    record_hits(*lid, hits, own, out, out_pins);
+                }
+            }
         }
     }
 }
@@ -1375,13 +1471,15 @@ fn relaxed_vias(
     let (lines_h, lines_v) = layer_line_maps(g, nl);
     // Pairs arrive sorted — nodes enumerate (layer, ix, iy) ascending.
     let node_id = |l: u8, ix: u32, iy: u32| -> u32 {
-        let lo = g.nodes.partition_point(|n| {
-            (n.layer.0, n.ix, n.iy) < (l, ix, iy)
-        });
-        debug_assert!(lo < g.nodes.len() && {
-            let n = &g.nodes[lo];
-            n.layer.0 == l && n.ix == ix && n.iy == iy
-        });
+        let lo = g
+            .nodes
+            .partition_point(|n| (n.layer.0, n.ix, n.iy) < (l, ix, iy));
+        debug_assert!(
+            lo < g.nodes.len() && {
+                let n = &g.nodes[lo];
+                n.layer.0 == l && n.ix == ix && n.iy == iy
+            }
+        );
         lo as u32
     };
     let mut out = Vec::new();
@@ -1422,12 +1520,7 @@ fn relaxed_vias(
                     mask.rect_allowed(
                         cover,
                         lid.0,
-                        &RectDbu::new(
-                            vx + r.xl,
-                            vy + r.yl,
-                            vx + r.xh,
-                            vy + r.yh,
-                        ),
+                        &RectDbu::new(vx + r.xl, vy + r.yl, vx + r.xh, vy + r.yh),
                     )
                 })
         };
@@ -1629,12 +1722,7 @@ fn access_vias(
                 // does not imply it once probes range past the strict
                 // fit range.
                 let touches_pin = |vx: i32, vy: i32| {
-                    let pl = RectDbu::new(
-                        vx + dvr.xl,
-                        vy + dvr.yl,
-                        vx + dvr.xh,
-                        vy + dvr.yh,
-                    );
+                    let pl = RectDbu::new(vx + dvr.xl, vy + dvr.yl, vx + dvr.xh, vy + dvr.yh);
                     comp.iter().any(|r| overlaps_closed(&pl, r))
                 };
                 // Confinement (mask) + first-iteration occupancy: a
@@ -1655,12 +1743,7 @@ fn access_vias(
                             mask.rect_allowed(
                                 cover,
                                 l2.0,
-                                &RectDbu::new(
-                                    vx + vr.xl,
-                                    vy + vr.yl,
-                                    vx + vr.xh,
-                                    vy + vr.yh,
-                                ),
+                                &RectDbu::new(vx + vr.xl, vy + vr.yl, vx + vr.xh, vy + vr.yh),
                             )
                         }))
                     {
@@ -1671,12 +1754,7 @@ fn access_vias(
                         let DrcLayer::Routing(l2) = dl else {
                             continue;
                         };
-                        let paint = RectDbu::new(
-                            vx + vr.xl,
-                            vy + vr.yl,
-                            vx + vr.xh,
-                            vy + vr.yh,
-                        );
+                        let paint = RectDbu::new(vx + vr.xl, vy + vr.yl, vx + vr.xh, vy + vr.yh);
                         let from = hits.len();
                         occ.scan_rect(l2.0, &paint, &mut hits);
                         exempt_obs(cover, &paint, &mut hits, from);
@@ -1700,7 +1778,10 @@ fn access_vias(
                     LayerDir::Horizontal => {
                         let mut jys = line_ixs(&up.tracks_y, cy0, cy1);
                         jys.sort_by_key(|&jy| {
-                            ((up.tracks_y[jy as usize] - my).abs(), up.tracks_y[jy as usize])
+                            (
+                                (up.tracks_y[jy as usize] - my).abs(),
+                                up.tracks_y[jy as usize],
+                            )
                         });
                         'enough: for jy in jys {
                             let vy = up.tracks_y[jy as usize];
@@ -1741,7 +1822,10 @@ fn access_vias(
                     LayerDir::Vertical => {
                         let mut jxs = line_ixs(&up.tracks_x, cx0, cx1);
                         jxs.sort_by_key(|&jx| {
-                            ((up.tracks_x[jx as usize] - mx).abs(), up.tracks_x[jx as usize])
+                            (
+                                (up.tracks_x[jx as usize] - mx).abs(),
+                                up.tracks_x[jx as usize],
+                            )
                         });
                         'enough: for jx in jxs {
                             let vx = up.tracks_x[jx as usize];
@@ -1837,14 +1921,16 @@ fn other_end(g: &NetGraph, relax: &[RelaxedVia], eidx: u32, v: u32) -> u32 {
 
 /// One routed net's outcome.
 enum NetOutcome {
-    /// Route, the committed unified-edge ids, and the closure pass's
-    /// named residuals (`self-spacing.md`, `residuals.md`). The
-    /// provisional-collision scan runs at commit time against live
-    /// occupancy (`route_nets_with_progress`), not at extraction —
-    /// under parallel search the extraction-time occupancy is the
-    /// iteration-start snapshot, which cannot see same-iteration
-    /// stale conflicts.
-    Routed(NetRoute, Vec<u32>, ClosureResiduals),
+    /// Route, the commit-time collision `EdgeProbe`s, and the closure
+    /// pass's named residuals (`self-spacing.md`, `residuals.md`).
+    /// The provisional-collision scan runs at commit time against
+    /// live occupancy (`route_nets_with_progress`), not at
+    /// extraction — under parallel search the extraction-time
+    /// occupancy is the iteration-start snapshot, which cannot see
+    /// same-iteration stale conflicts. The probes carry the scan
+    /// parameters, so the commit needs no `NetGraph`/`NetAdj`
+    /// reference (both are per-attempt transients).
+    Routed(NetRoute, Vec<EdgeProbe>, ClosureResiduals),
     Failed {
         unrouted: UnroutedNet,
         /// Pins that got no legal paint — the `Unattachable`
@@ -1859,22 +1945,19 @@ enum NetOutcome {
     },
 }
 
-/// Per-net topology: everything `route_one_net` needs that does not
-/// depend on occupancy, `hist`, or `hard` — built once per net in
-/// `route_nets` and reused across rip-up iterations. The unified edge
-/// index space `[0,E) | [E,E+V) | [E+V,E+V+R)` and the arc order
-/// (in-plane, then strict, then relaxed) are identical to what
-/// `NetRun::new` used to build per attempt — byte-identical search.
+/// Per-net topology: the half of `route_one_net`'s fixed inputs that
+/// *reads occupancy* — `project_attach`/`access_vias` probe the
+/// post-`premark_obs` marks, so it is built once per net at the
+/// attach pass and can never be rebuilt later (a rebuild would see
+/// committed routes and change the output). The occupancy-free half
+/// — member lookup, relaxed edge domain, CSR adjacency — lives in
+/// `NetAdj` and is rebuilt per attempt.
 struct NetTopo {
     /// Per member pin (`pin_nodes` order): strict `pin_nodes`, else the
     /// projection fallback.
     attach: Vec<Vec<u32>>,
     projected: Vec<bool>,
     attachable: Vec<bool>,
-    /// Attach node → member pin indices.
-    members: BTreeMap<u32, Vec<u32>>,
-    /// Per-net relaxed via edges (`relaxed_vias` output).
-    relax: Vec<RelaxedVia>,
     /// Per member pin (`pin_nodes` order): pin-anchored access
     /// candidates — their `b` nodes also join `attach`.
     access: Vec<Vec<AccessVia>>,
@@ -1882,19 +1965,9 @@ struct NetTopo {
     /// `relaxed_vias`/`project_attach` and the stub guard in
     /// `route_one_net`.
     cover: PinCover,
-    adj_start: Vec<u32>,
-    adj_to: Vec<u32>,
-    adj_eidx: Vec<u32>,
 }
 
 impl NetTopo {
-    /// CSR adjacency over the unified edge index space: each in-plane
-    /// edge contributes both directions, then each legal via edge
-    /// (`pairs[k].default.is_some()` — a `ViaGap` pair forbids the
-    /// transition) contributes both directions, then each relaxed via
-    /// edge (pre-gated by `relaxed_vias`). Strict arcs come before
-    /// relaxed arcs so an equal-`VIA_COST` tie relaxes toward the
-    /// strict placement.
     fn new(
         db: &DesignDb,
         tech: &TechDb,
@@ -1958,15 +2031,77 @@ impl NetTopo {
                 }
             }
         }
-        let mut members: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        for (pi, ids) in attach.iter().enumerate() {
+        Self {
+            attach,
+            projected,
+            attachable,
+            access,
+            cover,
+        }
+    }
+}
+
+/// The occupancy-free half of a net's search context — member-pin
+/// lookup, relaxed edge domain, CSR adjacency — a pure function of
+/// the kept `NetTopo`, the net's `NetGraph`, and the shared router
+/// inputs (`relaxed_vias` and the mask/cover legality checks never
+/// read `occ`). Rebuilt per attempt so the rip-up loop holds at most
+/// `threads` copies in flight instead of all nets' for the whole
+/// run. The unified edge index space `[0,E) | [E,E+V) | [E+V,E+V+R)`
+/// and the arc order (in-plane, then strict, then relaxed) are
+/// identical to the old once-built fields — byte-identical search.
+struct NetAdj {
+    /// Attach node → member pin indices, CSR by node id — each node's
+    /// pin list in `attach` scan order, the same order the old
+    /// `BTreeMap` pushed them.
+    member_start: Vec<u32>,
+    member_pin: Vec<u32>,
+    /// Per-net relaxed via edges (`relaxed_vias` output).
+    relax: Vec<RelaxedVia>,
+    adj_start: Vec<u32>,
+    adj_to: Vec<u32>,
+    adj_eidx: Vec<u32>,
+}
+
+impl NetAdj {
+    /// CSR adjacency over the unified edge index space: each in-plane
+    /// edge contributes both directions, then each legal via edge
+    /// (`pairs[k].default.is_some()` — a `ViaGap` pair forbids the
+    /// transition) contributes both directions, then each relaxed via
+    /// edge (pre-gated by `relaxed_vias`). Strict arcs come before
+    /// relaxed arcs so an equal-`VIA_COST` tie relaxes toward the
+    /// strict placement.
+    fn new(
+        g: &NetGraph,
+        topo: &NetTopo,
+        tech: &TechDb,
+        tracks: &[LayerTracks],
+        vias: &ViaTable,
+        mask: &HullMask,
+    ) -> Self {
+        let n = g.nodes.len();
+        // Member-pin CSR — the old `BTreeMap<u32, Vec<u32>>` keyed by
+        // attach node, flattened; each node's pin list keeps `attach`
+        // scan order.
+        let mut member_start = vec![0u32; n + 1];
+        for ids in &topo.attach {
             for &v in ids {
-                members.entry(v).or_default().push(pi as u32);
+                member_start[v as usize + 1] += 1;
+            }
+        }
+        for i in 0..n {
+            member_start[i + 1] += member_start[i];
+        }
+        let mut member_pin = vec![0u32; member_start[n] as usize];
+        let mut fill = member_start.clone();
+        for (pi, ids) in topo.attach.iter().enumerate() {
+            for &v in ids {
+                member_pin[fill[v as usize] as usize] = pi as u32;
+                fill[v as usize] += 1;
             }
         }
 
-        let relax = relaxed_vias(g, tech, tracks, vias, mask, &cover);
-        let n = g.nodes.len();
+        let relax = relaxed_vias(g, tech, tracks, vias, mask, &topo.cover);
         let e_plane = g.edges.len() as u32;
         let mut deg = vec![0u32; n + 1];
         let mut arcs: Vec<(u32, u32, u32)> = Vec::new();
@@ -1992,7 +2127,7 @@ impl NetTopo {
                     return false;
                 };
                 !mask.rect_allowed(
-                    &cover,
+                    &topo.cover,
                     lid.0,
                     &RectDbu::new(x + r.xl, y + r.yl, x + r.xh, y + r.yh),
                 )
@@ -2026,13 +2161,9 @@ impl NetTopo {
             fill[a as usize] += 1;
         }
         Self {
-            attach,
-            projected,
-            attachable,
-            members,
+            member_start,
+            member_pin,
             relax,
-            access,
-            cover,
             adj_start: deg,
             adj_to,
             adj_eidx,
@@ -2040,10 +2171,176 @@ impl NetTopo {
     }
 }
 
-/// Per-attempt routing state over a cached `NetTopo`: the grown tree,
-/// the committed edge list, and the wave scratch.
+/// Exact heap bytes of one `NetAdj` — the `drt: mem` per-attempt
+/// transient census (`drt/mem.rs`).
+fn net_adj_bytes(adj: &NetAdj) -> usize {
+    use crate::drt::mem::vec_bytes;
+    vec_bytes(&adj.member_start)
+        + vec_bytes(&adj.member_pin)
+        + vec_bytes(&adj.relax)
+        + vec_bytes(&adj.adj_start)
+        + vec_bytes(&adj.adj_to)
+        + vec_bytes(&adj.adj_eidx)
+}
+
+// ---------------------------------------------------------------------------
+// `GRUS_DRT_MEM` capacity census (drt/mem.rs)
+// ---------------------------------------------------------------------------
+
+/// Per-field heap census of one `NetTopo` — the `drt: mem post_topos`
+/// split rows (the kept, occupancy-snapshot half — the rebuilt
+/// `NetAdj` reports as `attempt_hi` on the `iter` row). `cover` is a
+/// `BTreeMap`: entry count and inner-vec bytes are exact, but node
+/// overhead has no capacity API — it reports separately as `~est`
+/// (`entries × mem::BTREE_NODE_EST`) and is never folded into
+/// `exact`.
+#[derive(Default)]
+struct TopoMem {
+    /// `attach` outer + inner lists + `projected`/`attachable` flags.
+    attach: usize,
+    access: usize,
+    cover_entries: usize,
+    cover_inner: usize,
+}
+
+impl TopoMem {
+    fn add(&mut self, f: &TopoMem) {
+        self.attach += f.attach;
+        self.access += f.access;
+        self.cover_entries += f.cover_entries;
+        self.cover_inner += f.cover_inner;
+    }
+
+    /// Exact bytes — everything but the `~` BTreeMap node estimate.
+    fn exact(&self) -> usize {
+        self.attach + self.access + self.cover_inner
+    }
+}
+
+fn net_topo_mem(t: &NetTopo) -> TopoMem {
+    use crate::drt::mem::vec_bytes;
+    let mut m = TopoMem {
+        attach: vec_bytes(&t.attach) + vec_bytes(&t.projected) + vec_bytes(&t.attachable),
+        access: vec_bytes(&t.access),
+        cover_entries: t.cover.len(),
+        ..Default::default()
+    };
+    for ids in &t.attach {
+        m.attach += vec_bytes(ids);
+    }
+    for av in &t.access {
+        m.access += vec_bytes(av);
+    }
+    for rects in t.cover.values() {
+        m.cover_inner += vec_bytes(rects);
+    }
+    m
+}
+
+/// Exact heap bytes of one `NetTopo` (no BTreeMap node estimate).
+fn net_topo_bytes(t: &NetTopo) -> usize {
+    net_topo_mem(t).exact()
+}
+
+/// The rip-up loop's per-net resident pair, measured: builds the
+/// pre-route `Occupancy` (`premark_obs`) and every guided net's
+/// `NetTopo` exactly as `route_nets` does, then returns the summed
+/// capacity-walk bytes. `NetTopo` stays private — this is the
+/// census's public handle for tests.
+pub fn topos_footprint_bytes(
+    db: &DesignDb,
+    tech: &TechDb,
+    tracks: &[LayerTracks],
+    graphs: &RouteGraphs,
+    vias: &ViaTable,
+) -> usize {
+    let hull = HullMask::new(db, tech);
+    let mut occ = Occupancy::new(tech, tracks);
+    premark_obs(db, tech, &mut occ);
+    graphs
+        .nets
+        .iter()
+        .map(|g| net_topo_bytes(&NetTopo::new(db, tech, tracks, g, vias, &occ, &hull)))
+        .sum()
+}
+
+/// `Occupancy`'s heap census: dense `Vec<Line>` per axis per layer
+/// (each `Line`'s `ivs` + `max_hi` inner Vecs walked), the line
+/// coordinate lists, and the per-layer scalars.
+fn occupancy_bytes(o: &Occupancy) -> usize {
+    use crate::drt::mem::vec_bytes;
+    let mut b = std::mem::size_of::<Occupancy>();
+    for lines in o.lines_x.iter().chain(&o.lines_y) {
+        b += vec_bytes(lines);
+        for l in lines {
+            b += vec_bytes(&l.ivs) + vec_bytes(&l.max_hi);
+        }
+    }
+    for c in o.coords_x.iter().chain(&o.coords_y) {
+        b += vec_bytes(c);
+    }
+    b + vec_bytes(&o.halfw) + vec_bytes(&o.spc)
+}
+
+/// The rip-up mark log: outer `Vec` slots plus each net's `Mark`s.
+fn marks_bytes(m: &[Vec<Mark>]) -> usize {
+    use crate::drt::mem::vec_bytes;
+    std::mem::size_of_val(m) + m.iter().map(vec_bytes).sum::<usize>()
+}
+
+fn net_route_bytes(r: &NetRoute) -> usize {
+    use crate::drt::mem::vec_bytes;
+    std::mem::size_of::<NetRoute>()
+        + vec_bytes(&r.wires)
+        + vec_bytes(&r.vias)
+        + vec_bytes(&r.connected)
+        + vec_bytes(&r.projected)
+        + vec_bytes(&r.fills)
+}
+
+/// Routes committed so far (`routes[i] = Some`) plus the `Option`
+/// slots — the `drt: mem` "routes" row.
+fn routes_bytes(r: &[Option<NetRoute>]) -> usize {
+    std::mem::size_of_val(r) + r.iter().flatten().map(net_route_bytes).sum::<usize>()
+}
+
+fn residuals_bytes(r: &[ClosureResiduals]) -> usize {
+    use crate::drt::mem::vec_bytes;
+    r.iter()
+        .map(|c| {
+            std::mem::size_of::<ClosureResiduals>() + vec_bytes(&c.notches) + vec_bytes(&c.holes)
+        })
+        .sum()
+}
+
+/// One outcome's live bytes — the `drt: mem` "outcomes" hi-water row.
+fn net_outcome_bytes(o: &NetOutcome) -> usize {
+    use crate::drt::mem::vec_bytes;
+    std::mem::size_of::<NetOutcome>()
+        + match o {
+            NetOutcome::Routed(route, used, res) => {
+                net_route_bytes(route)
+                    + vec_bytes(used)
+                    + vec_bytes(&res.notches)
+                    + vec_bytes(&res.holes)
+            }
+            NetOutcome::Failed {
+                unrouted,
+                stub_blocked,
+            } => {
+                vec_bytes(&unrouted.connected)
+                    + vec_bytes(&unrouted.failed)
+                    + vec_bytes(&unrouted.blockers)
+                    + vec_bytes(stub_blocked)
+            }
+        }
+}
+
+/// Per-attempt routing state over a cached `NetTopo`/`NetAdj` pair:
+/// the grown tree, the committed edge list, and the wave scratch.
 struct NetRun<'t> {
     topo: &'t NetTopo,
+    adj: &'t NetAdj,
     connected: Vec<bool>,
     in_tree: Vec<bool>,
     tree_nodes: Vec<u32>,
@@ -2059,9 +2356,10 @@ struct NetRun<'t> {
 }
 
 impl<'t> NetRun<'t> {
-    fn new(topo: &'t NetTopo, n_nodes: usize, n_pins: usize) -> Self {
+    fn new(topo: &'t NetTopo, adj: &'t NetAdj, n_nodes: usize, n_pins: usize) -> Self {
         Self {
             topo,
+            adj,
             connected: vec![false; n_pins],
             in_tree: vec![false; n_nodes],
             tree_nodes: Vec::new(),
@@ -2116,6 +2414,7 @@ impl<'t> NetRun<'t> {
         mode: OccMode,
     ) -> Option<usize> {
         let topo = self.topo;
+        let adj = self.adj;
         // Hop field: BFS from every unconnected attachable pin's
         // attach set, all arcs unit weight.
         self.hop.fill(u32::MAX);
@@ -2134,8 +2433,8 @@ impl<'t> NetRun<'t> {
         while let Some(v) = bfs.pop_front() {
             let vi = v as usize;
             let h = self.hop[vi] + 1;
-            let range = topo.adj_start[vi] as usize..topo.adj_start[vi + 1] as usize;
-            for &to in &topo.adj_to[range] {
+            let range = adj.adj_start[vi] as usize..adj.adj_start[vi + 1] as usize;
+            for &to in &adj.adj_to[range] {
                 let ti = to as usize;
                 if self.hop[ti] == u32::MAX {
                     self.hop[ti] = h;
@@ -2159,24 +2458,35 @@ impl<'t> NetRun<'t> {
             if self.dstamp[vi] == stamp && self.dist[vi].saturating_add(self.hop[vi]) < f {
                 continue; // a better `g + hop` was pushed after this entry
             }
-            if let Some(pins) = topo.members.get(&v)
-                && let Some(&pi) = pins
-                    .iter()
-                    .find(|&&p| !self.connected[p as usize] && topo.attachable[p as usize])
+            let mrange = adj.member_start[vi] as usize..adj.member_start[vi + 1] as usize;
+            if let Some(&pi) = adj.member_pin[mrange]
+                .iter()
+                .find(|&&p| !self.connected[p as usize] && topo.attachable[p as usize])
             {
                 found = Some((v, pi as usize));
                 break;
             }
             let d = self.dist[vi];
-            for pos in topo.adj_start[vi] as usize..topo.adj_start[vi + 1] as usize {
-                let to = topo.adj_to[pos];
+            for pos in adj.adj_start[vi] as usize..adj.adj_start[vi + 1] as usize {
+                let to = adj.adj_to[pos];
                 if self.in_tree[to as usize] {
                     continue; // tree nodes sit at dist 0 and cannot improve
                 }
-                let eidx = topo.adj_eidx[pos];
+                let eidx = adj.adj_eidx[pos];
                 let Some(ec) = edge_cost(
-                    g, tracks, tech, vias, occ, &topo.relax, &topo.cover,
-                    eidx, own, hist, hard, mode, &mut hits,
+                    g,
+                    tracks,
+                    tech,
+                    vias,
+                    occ,
+                    &adj.relax,
+                    &topo.cover,
+                    eidx,
+                    own,
+                    hist,
+                    hard,
+                    mode,
+                    &mut hits,
                 ) else {
                     continue;
                 };
@@ -2211,7 +2521,7 @@ impl<'t> NetRun<'t> {
             self.tree_nodes.push(v);
             let e = self.parent[v as usize];
             self.used_edges.push(e);
-            v = other_end(g, &topo.relax, e, v);
+            v = other_end(g, &adj.relax, e, v);
         }
         None
     }
@@ -2229,6 +2539,7 @@ fn route_one_net(
     tracks: &[LayerTracks],
     g: &NetGraph,
     topo: &NetTopo,
+    adj: &NetAdj,
     vias: &ViaTable,
     occ: &Occupancy,
     mask: &HullMask,
@@ -2237,12 +2548,9 @@ fn route_one_net(
     mode: OccMode,
 ) -> NetOutcome {
     let m = g.pin_nodes.len();
-    let debug = std::env::var_os("DRT_DEBUG_NET").is_some_and(|v| {
-        v.to_string_lossy() == db.strings.resolve(db.net_names[g.net.0 as usize])
-    });
-    let fail = |connected: Vec<PinId>,
-                failed: Vec<(PinId, FailKind)>,
-                blockers: Vec<(u8, u8)>| {
+    let debug = std::env::var_os("DRT_DEBUG_NET")
+        .is_some_and(|v| v.to_string_lossy() == db.strings.resolve(db.net_names[g.net.0 as usize]));
+    let fail = |connected: Vec<PinId>, failed: Vec<(PinId, FailKind)>, blockers: Vec<(u8, u8)>| {
         NetOutcome::Failed {
             unrouted: UnroutedNet {
                 net: g.net,
@@ -2301,7 +2609,7 @@ fn route_one_net(
         );
     }
 
-    let mut run = NetRun::new(topo, g.nodes.len(), m);
+    let mut run = NetRun::new(topo, adj, g.nodes.len(), m);
 
     // Seed: the driver pin's attach set (`net_driver`, else the first
     // attachable member in `net_pins` order).
@@ -2346,9 +2654,8 @@ fn route_one_net(
                 seen[v as usize] = true;
             }
             while let Some(v) = q.pop_front() {
-                let r = topo.adj_start[v as usize] as usize
-                    ..topo.adj_start[v as usize + 1] as usize;
-                for &to in &topo.adj_to[r] {
+                let r = adj.adj_start[v as usize] as usize..adj.adj_start[v as usize + 1] as usize;
+                for &to in &adj.adj_to[r] {
                     if !seen[to as usize] {
                         seen[to as usize] = true;
                         q.push_back(to);
@@ -2371,10 +2678,10 @@ fn route_one_net(
                     for &v in ids {
                         let n = &g.nodes[v as usize];
                         let (x, y) = node_xy(g, tracks, v);
-                        let r = topo.adj_start[v as usize] as usize
-                            ..topo.adj_start[v as usize + 1] as usize;
+                        let r = adj.adj_start[v as usize] as usize
+                            ..adj.adj_start[v as usize + 1] as usize;
                         let mut cls = [0usize; 3];
-                        for &e in &topo.adj_eidx[r.clone()] {
+                        for &e in &adj.adj_eidx[r.clone()] {
                             let c = if e < e_plane {
                                 0
                             } else if e < v_plane {
@@ -2389,22 +2696,22 @@ fn route_one_net(
                             n.layer.0, cls[0], cls[1], cls[2], seen[v as usize]
                         );
                         for pos in r {
-                            let e = topo.adj_eidx[pos];
+                            let e = adj.adj_eidx[pos];
                             if e < v_plane {
                                 continue;
                             }
-                            let to = topo.adj_to[pos];
+                            let to = adj.adj_to[pos];
                             let tn = &g.nodes[to as usize];
                             let (tx, ty) = node_xy(g, tracks, to);
-                            let rv = &topo.relax[(e - v_plane) as usize];
+                            let rv = &adj.relax[(e - v_plane) as usize];
                             eprintln!(
                                 "DBG     relax to l={} ({tx},{ty}) via ({},{}) seen={}",
                                 tn.layer.0, rv.x, rv.y, seen[to as usize]
                             );
-                            let tr = topo.adj_start[to as usize] as usize
-                                ..topo.adj_start[to as usize + 1] as usize;
+                            let tr = adj.adj_start[to as usize] as usize
+                                ..adj.adj_start[to as usize + 1] as usize;
                             let mut tc = [0usize; 3];
-                            for &e2 in &topo.adj_eidx[tr.clone()] {
+                            for &e2 in &adj.adj_eidx[tr.clone()] {
                                 tc[if e2 < e_plane {
                                     0
                                 } else if e2 < v_plane {
@@ -2413,10 +2720,13 @@ fn route_one_net(
                                     2
                                 }] += 1;
                             }
-                            eprintln!("DBG       target edges={} via={} relax={}", tc[0], tc[1], tc[2]);
+                            eprintln!(
+                                "DBG       target edges={} via={} relax={}",
+                                tc[0], tc[1], tc[2]
+                            );
                             for pos2 in tr {
-                                let e2 = topo.adj_eidx[pos2];
-                                let t2 = topo.adj_to[pos2];
+                                let e2 = adj.adj_eidx[pos2];
+                                let t2 = adj.adj_to[pos2];
                                 let n2 = &g.nodes[t2 as usize];
                                 let (x2, y2) = node_xy(g, tracks, t2);
                                 eprintln!(
@@ -2452,19 +2762,29 @@ fn route_one_net(
                     if !seen[v as usize] {
                         continue;
                     }
-                    let r = topo.adj_start[v as usize] as usize
-                        ..topo.adj_start[v as usize + 1] as usize;
+                    let r =
+                        adj.adj_start[v as usize] as usize..adj.adj_start[v as usize + 1] as usize;
                     for pos in r {
-                        let to = topo.adj_to[pos];
+                        let to = adj.adj_to[pos];
                         if !seen[to as usize] {
                             continue;
                         }
-                        let eidx = topo.adj_eidx[pos];
+                        let eidx = adj.adj_eidx[pos];
                         let mut hits = Vec::new();
                         if edge_cost(
-                            g, tracks, tech, vias, occ, &topo.relax, &topo.cover,
-                            eidx, g.net.0, hist,
-                            hard, mode, &mut hits,
+                            g,
+                            tracks,
+                            tech,
+                            vias,
+                            occ,
+                            &adj.relax,
+                            &topo.cover,
+                            eidx,
+                            g.net.0,
+                            hist,
+                            hard,
+                            mode,
+                            &mut hits,
                         )
                         .is_some()
                         {
@@ -2550,14 +2870,16 @@ fn route_one_net(
             let (bx, by) = node_xy(g, tracks, e.b);
             let l = g.nodes[e.a as usize].layer.0;
             match e.axis {
-                Axis::X => hlines
-                    .entry((l, ay))
-                    .or_default()
-                    .push((ax.min(bx), ax.max(bx), PaintSrc::Tree)),
-                Axis::Y => vlines
-                    .entry((l, ax))
-                    .or_default()
-                    .push((ay.min(by), ay.max(by), PaintSrc::Tree)),
+                Axis::X => hlines.entry((l, ay)).or_default().push((
+                    ax.min(bx),
+                    ax.max(bx),
+                    PaintSrc::Tree,
+                )),
+                Axis::Y => vlines.entry((l, ax)).or_default().push((
+                    ay.min(by),
+                    ay.max(by),
+                    PaintSrc::Tree,
+                )),
             }
         } else if eidx < v_plane {
             let ve = &g.via_edges[(eidx - e_plane) as usize];
@@ -2570,35 +2892,39 @@ fn route_one_net(
             // the lower layer, `(x,y) → b.xy` on the upper — are real
             // metal the committed geometry must carry (each shares
             // one coordinate, so each is a single-axis interval).
-            let rv = &topo.relax[(eidx - v_plane) as usize];
+            let rv = &adj.relax[(eidx - v_plane) as usize];
             vplaced.insert((rv.lower, rv.x, rv.y), PaintSrc::Tree);
             let (ax, ay) = node_xy(g, tracks, rv.a);
             let (bx, by) = node_xy(g, tracks, rv.b);
             if ax == rv.x {
                 if ay != rv.y {
-                    vlines
-                        .entry((rv.lower, ax))
-                        .or_default()
-                        .push((ay.min(rv.y), ay.max(rv.y), PaintSrc::Tree));
+                    vlines.entry((rv.lower, ax)).or_default().push((
+                        ay.min(rv.y),
+                        ay.max(rv.y),
+                        PaintSrc::Tree,
+                    ));
                 }
             } else if ay == rv.y {
-                hlines
-                    .entry((rv.lower, ay))
-                    .or_default()
-                    .push((ax.min(rv.x), ax.max(rv.x), PaintSrc::Tree));
+                hlines.entry((rv.lower, ay)).or_default().push((
+                    ax.min(rv.x),
+                    ax.max(rv.x),
+                    PaintSrc::Tree,
+                ));
             }
             if bx == rv.x {
                 if by != rv.y {
-                    vlines
-                        .entry((rv.lower + 1, bx))
-                        .or_default()
-                        .push((by.min(rv.y), by.max(rv.y), PaintSrc::Tree));
+                    vlines.entry((rv.lower + 1, bx)).or_default().push((
+                        by.min(rv.y),
+                        by.max(rv.y),
+                        PaintSrc::Tree,
+                    ));
                 }
             } else if by == rv.y {
-                hlines
-                    .entry((rv.lower + 1, by))
-                    .or_default()
-                    .push((bx.min(rv.x), bx.max(rv.x), PaintSrc::Tree));
+                hlines.entry((rv.lower + 1, by)).or_default().push((
+                    bx.min(rv.x),
+                    bx.max(rv.x),
+                    PaintSrc::Tree,
+                ));
             }
         }
     }
@@ -2748,8 +3074,14 @@ fn route_one_net(
     // Provisional collisions are recorded at commit time
     // (`route_nets_with_progress`), not here: under snapshot search
     // the scan must see live occupancy — prior-iteration marks plus
-    // every earlier same-iteration commit — so the used edge list is
-    // carried out and scanned just before `commit_route` rasterizes.
+    // every earlier same-iteration commit. The scan's per-edge
+    // parameters are resolved now, while this attempt's rebuilt
+    // `g`/`adj` still live — the commit pass replays `EdgeProbe`s,
+    // which hold no graph references.
+    let mut probes = Vec::new();
+    for &eidx in &run.used_edges {
+        edge_probe(g, tracks, &adj.relax, occ, eidx, &mut probes);
+    }
     NetOutcome::Routed(
         NetRoute {
             net: g.net,
@@ -2765,7 +3097,7 @@ fn route_one_net(
                 .collect(),
             fills,
         },
-        run.used_edges,
+        probes,
         residuals,
     )
 }
@@ -2908,10 +3240,11 @@ fn try_pin_paint(
                         if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
                             continue;
                         }
-                        vlines
-                            .entry((lid.0, x))
-                            .or_default()
-                            .push((cy.min(y), cy.max(y), PaintSrc::ProjStub(pi as u32)));
+                        vlines.entry((lid.0, x)).or_default().push((
+                            cy.min(y),
+                            cy.max(y),
+                            PaintSrc::ProjStub(pi as u32),
+                        ));
                     }
                     return Some(AttachElem::Proj(si, v));
                 }
@@ -2920,10 +3253,11 @@ fn try_pin_paint(
                         if !mask.seg_allowed(&topo.cover, lid.0, x, y, cx, cy) {
                             continue;
                         }
-                        hlines
-                            .entry((lid.0, y))
-                            .or_default()
-                            .push((cx.min(x), cx.max(x), PaintSrc::ProjStub(pi as u32)));
+                        hlines.entry((lid.0, y)).or_default().push((
+                            cx.min(x),
+                            cx.max(x),
+                            PaintSrc::ProjStub(pi as u32),
+                        ));
                     }
                     return Some(AttachElem::Proj(si, v));
                 }
@@ -2956,7 +3290,17 @@ fn try_pin_paint(
             occ.scan_rect(lid.0, &paint, &mut hits);
             exempt_obs(&topo.cover, &paint, &mut hits, from);
         }
-        scan_stub(g, tracks, occ, &topo.cover, av.b, av.lower + 1, av.x, av.y, &mut hits);
+        scan_stub(
+            g,
+            tracks,
+            occ,
+            &topo.cover,
+            av.b,
+            av.lower + 1,
+            av.x,
+            av.y,
+            &mut hits,
+        );
         if let Some(h) = hits.iter().find(|h| match h.iv.who {
             Occupant::Obs(_) => true,
             Occupant::ObsPin(m) | Occupant::Net(m) | Occupant::Pin(m) => m != g.net.0,
@@ -2980,16 +3324,18 @@ fn try_pin_paint(
         let (bx, by) = node_xy(g, tracks, av.b);
         if bx == av.x {
             if by != av.y {
-                vlines
-                    .entry((av.lower + 1, bx))
-                    .or_default()
-                    .push((by.min(av.y), by.max(av.y), PaintSrc::Access(pi as u32)));
+                vlines.entry((av.lower + 1, bx)).or_default().push((
+                    by.min(av.y),
+                    by.max(av.y),
+                    PaintSrc::Access(pi as u32),
+                ));
             }
         } else {
-            hlines
-                .entry((av.lower + 1, by))
-                .or_default()
-                .push((bx.min(av.x), bx.max(av.x), PaintSrc::Access(pi as u32)));
+            hlines.entry((av.lower + 1, by)).or_default().push((
+                bx.min(av.x),
+                bx.max(av.x),
+                PaintSrc::Access(pi as u32),
+            ));
         }
         return Some(AttachElem::Access(ai));
     }
@@ -3488,12 +3834,7 @@ fn try_fill(
 
 /// Rasterizes one committed route's shapes (merged wire rects + via
 /// footprints) as `Net(net)` marks, logging each insertion for rip-up.
-fn commit_route(
-    occ: &mut Occupancy,
-    vias: &ViaTable,
-    route: &NetRoute,
-    marks: &mut Vec<Mark>,
-) {
+fn commit_route(occ: &mut Occupancy, vias: &ViaTable, route: &NetRoute, marks: &mut Vec<Mark>) {
     for w in &route.wires {
         let hw = occ.halfw[w.layer.0 as usize];
         let r = RectDbu::new(w.x1 - hw, w.y1 - hw, w.x2 + hw, w.y2 + hw);
@@ -3739,9 +4080,8 @@ fn patch_component(
                 grown.push(span);
                 if union::union_area(&grown) >= bound
                     && net_rects.iter().all(|q| {
-                        notch_axis(&span, q, s).is_none_or(|ax| {
-                            rect_covered(net_rects, &notch_gap(&span, q, ax))
-                        })
+                        notch_axis(&span, q, s)
+                            .is_none_or(|ax| rect_covered(net_rects, &notch_gap(&span, q, ax)))
                     })
                 {
                     reached = true;
@@ -3825,9 +4165,7 @@ fn patch_net_min_area(
             lines.entry(line).or_default().insert(pos);
         }
         'layer: loop {
-            let ls = LayerShapes::from_rects(net_layer_shapes(
-                db, tech, g, vias, route, l, w2,
-            ));
+            let ls = LayerShapes::from_rects(net_layer_shapes(db, tech, g, vias, route, l, w2));
             if ls.rects.is_empty() {
                 break;
             }
@@ -3891,75 +4229,217 @@ fn patch_net_min_area(
     patches
 }
 
-/// Sequential maze routing over `graphs`: per net, pathfinder-style
-/// tree extension under the interval-occupancy model, ordered per
-/// `join.nets` (guide-file order). `vias` prices transitions
-/// (`pairs[k].default`) and supplies footprints; a `ViaGap` pair's
-/// edges are forbidden. Soft iterations price foreign hits
-/// (`OCC_PENALTY + hist·HIST_STEP` per net); the last iteration is
-/// hard — foreign hits block. `Obs` always blocks. Use
-/// `route_nets_with_progress` to observe per-net progress.
+/// Sequential maze routing over streamed per-net graphs: per net,
+/// pathfinder-style tree extension under the interval-occupancy
+/// model, ordered per `join.nets` (guide-file order). `vias` prices
+/// transitions (`pairs[k].default`) and supplies footprints; a
+/// `ViaGap` pair's edges are forbidden. Soft iterations price
+/// foreign hits (`OCC_PENALTY + hist·HIST_STEP` per net); the last
+/// iteration is hard — foreign hits block. `Obs` always blocks. Use
+/// `route_nets_with_progress` to observe per-net progress or recover
+/// the `RouteGraphs` census.
 pub fn route_nets(
     db: &DesignDb,
     tech: &TechDb,
     tracks: &[LayerTracks],
-    graphs: &RouteGraphs,
+    join: &GuideJoin,
+    opts: GraphOpts,
     vias: &ViaTable,
     cfg: &MazeConfig,
 ) -> RouteDb {
-    route_nets_with_progress(db, tech, tracks, graphs, vias, cfg, None)
+    route_nets_with_progress(db, tech, tracks, join, opts, vias, cfg, None).1
 }
 
 /// `route_nets` plus an opt-in progress sink: `progress`, when
 /// `Some`, receives a `RouteProgress` copy after every attempted
 /// net of every rip-up iteration. The sink holds no router-state
-/// references — it cannot perturb the route.
+/// references — it cannot perturb the route. Returns the
+/// `RouteGraphs` census beside the `RouteDb` (its `nets` vec stays
+/// empty — the streamed build drops each graph after its `NetTopo`
+/// is captured).
+#[allow(clippy::too_many_arguments)]
 pub fn route_nets_with_progress(
     db: &DesignDb,
     tech: &TechDb,
     tracks: &[LayerTracks],
-    graphs: &RouteGraphs,
+    join: &GuideJoin,
+    opts: GraphOpts,
     vias: &ViaTable,
     cfg: &MazeConfig,
-    mut progress: Option<&mut dyn FnMut(RouteProgress)>,
-) -> RouteDb {
+    progress: Option<&mut dyn FnMut(RouteProgress)>,
+) -> (RouteGraphs, RouteDb) {
     let timing = std::env::var_os("GRUS_DRT_TIMING").is_some();
+    let mem_on = crate::drt::mem::enabled();
     let t0 = std::time::Instant::now();
-    let n = graphs.nets.len();
+    let n = join.nets.len();
     let hull = HullMask::new(db, tech);
     let mut occ = Occupancy::new(tech, tracks);
     premark_obs(db, tech, &mut occ);
     if timing {
         eprintln!("drt: premark_obs {:?}", t0.elapsed());
     }
-    // Per-net topology (attach sets, relaxed vias, CSR) is built once —
-    // occupancy/history/hard-mode vary per iteration, the graph does
-    // not. Arc order is fixed → determinism untouched.
+    if mem_on {
+        eprintln!(
+            "drt: mem post_premark rss={} occ={}",
+            crate::drt::mem::peak_rss_bytes(),
+            occupancy_bytes(&occ)
+        );
+    }
+    // The attach pass is streamed per net: each guided net's
+    // `NetGraph` is built, its occupancy-snapshot `NetTopo`
+    // extracted, then the graph is dropped. The rip-up loop rebuilds
+    // the graph — and the occupancy-free `NetAdj` half of the old
+    // once-built topology — per attempt: both are pure functions of
+    // the kept `NetTopo` and the shared inputs, so the loop holds at
+    // most `threads` copies in flight instead of every net's graph +
+    // topology for the whole run (the dominant resident set on
+    // large designs).
     // All drt parallel sections run inside a per-call pool so
     // `RAYON_NUM_THREADS` is honored at call time — the global pool
     // pins the env var on first use, untestable in-process.
     let pool = drt_pool();
     let nthreads = pool.current_num_threads();
     let t1 = std::time::Instant::now();
-    let topos: Vec<NetTopo> = pool.install(|| {
-        graphs
-            .nets
+    // Per-net census partials minus the graph itself — the same
+    // records `NetBuild` carries, folded in `join.nets` order below.
+    struct NetCensusPart {
+        zero_coverage: Vec<ZeroCoverage>,
+        region_escape: Vec<RegionEscape>,
+        escapes: Vec<EscapeRecord>,
+        via_edges_per_pair: Vec<usize>,
+        hull_masked: Vec<usize>,
+        total_nodes: usize,
+        total_edges: usize,
+        total_via_edges: usize,
+        graph_bytes: usize,
+    }
+    let built: Vec<(NetTopo, NetCensusPart)> = pool.install(|| {
+        join.nets
             .par_iter()
-            .map(|g| NetTopo::new(db, tech, tracks, g, vias, &occ, &hull))
+            .map_init(Vec::new, |hull_scratch, &(net, ref boxes)| {
+                let nb = build_net_graph(db, tech, tracks, &hull, net, boxes, opts, hull_scratch);
+                let topo = NetTopo::new(db, tech, tracks, &nb.graph, vias, &occ, &hull);
+                (
+                    topo,
+                    NetCensusPart {
+                        zero_coverage: nb.zero_coverage,
+                        region_escape: nb.region_escape,
+                        escapes: nb.escapes,
+                        via_edges_per_pair: nb.via_edges_per_pair,
+                        hull_masked: nb.hull_masked,
+                        total_nodes: nb.graph.nodes.len(),
+                        total_edges: nb.graph.edges.len(),
+                        total_via_edges: nb.graph.via_edges.len(),
+                        graph_bytes: net_graph_bytes(&nb.graph),
+                    },
+                )
+            })
             .collect()
     });
+    // Serial fold in `join.nets` order — the same append order the
+    // bulk builder produced, so the census is byte-identical
+    // (`graphs.nets` stays empty by construction).
+    let mut graphs = RouteGraphs {
+        via_edges_per_pair: vec![0; tech.routing_layers.len().saturating_sub(1)],
+        hull_masked: vec![0; tech.routing_layers.len()],
+        ..Default::default()
+    };
+    let mut topos: Vec<NetTopo> = Vec::with_capacity(n);
+    let mut graphs_b = 0usize;
+    for (topo, part) in built {
+        graphs.zero_coverage.extend(part.zero_coverage);
+        graphs.region_escape.extend(part.region_escape);
+        graphs.escapes.extend(part.escapes);
+        for (d, s) in graphs
+            .via_edges_per_pair
+            .iter_mut()
+            .zip(&part.via_edges_per_pair)
+        {
+            *d += s;
+        }
+        for (d, s) in graphs.hull_masked.iter_mut().zip(&part.hull_masked) {
+            *d += s;
+        }
+        graphs.total_nodes += part.total_nodes;
+        graphs.total_edges += part.total_edges;
+        graphs.total_via_edges += part.total_via_edges;
+        graphs_b += part.graph_bytes;
+        topos.push(topo);
+    }
     if timing {
         eprintln!("drt: topos {:?} threads={nthreads}", t1.elapsed());
     }
-    let net_idx: BTreeMap<u32, usize> = graphs
+    if mem_on {
+        // `graphs` reports the summed capacity walk of every graph
+        // the stream allocated — the same quantity as the old bulk
+        // materialization, transiently resident ≤ threads at a time.
+        eprintln!(
+            "drt: mem post_graphs rss={} graphs={graphs_b}",
+            crate::drt::mem::peak_rss_bytes(),
+        );
+        let mut tm = TopoMem::default();
+        for t in &topos {
+            tm.add(&net_topo_mem(t));
+        }
+        let occ_b = occupancy_bytes(&occ);
+        let rss = crate::drt::mem::peak_rss_bytes();
+        let measured = tm.exact() + occ_b;
+        eprintln!(
+            "drt: mem post_topos rss={rss} graphs={graphs_b} topos={} \
+             attach={} access={} cover_entries={} cover_inner={} cover_est={} \
+             occ={occ_b} rest={}",
+            tm.exact(),
+            tm.attach,
+            tm.access,
+            tm.cover_entries,
+            tm.cover_inner,
+            tm.cover_entries * crate::drt::mem::BTREE_NODE_EST,
+            rss.saturating_sub(measured as u64),
+        );
+    }
+    let mk_graph = |i: usize, hull_scratch: &mut Vec<u32>| {
+        let &(net, ref boxes) = &join.nets[i];
+        build_net_graph(db, tech, tracks, &hull, net, boxes, opts, hull_scratch).graph
+    };
+    let route_db = route_prepared(
+        db, tech, tracks, join, &topos, occ, &hull, &mk_graph, vias, cfg, progress, t0,
+    );
+    (graphs, route_db)
+}
+
+/// `route_nets_with_progress` minus the streamed attach pass: drives
+/// the rip-up loop over caller-prepared `topos` against the
+/// pre-premarked `occ`, rebuilding each attempt's graph through
+/// `mk_graph` (tests feed synthetic fixtures; production replays
+/// `build_net_graph` per attempt).
+#[allow(clippy::too_many_arguments)]
+fn route_prepared(
+    db: &DesignDb,
+    tech: &TechDb,
+    tracks: &[LayerTracks],
+    join: &GuideJoin,
+    topos: &[NetTopo],
+    mut occ: Occupancy,
+    hull: &HullMask,
+    mk_graph: &(dyn Fn(usize, &mut Vec<u32>) -> NetGraph + Sync),
+    vias: &ViaTable,
+    cfg: &MazeConfig,
+    mut progress: Option<&mut dyn FnMut(RouteProgress)>,
+    t0: std::time::Instant,
+) -> RouteDb {
+    let timing = std::env::var_os("GRUS_DRT_TIMING").is_some();
+    let mem_on = crate::drt::mem::enabled();
+    let n = join.nets.len();
+    let pool = drt_pool();
+    let nthreads = pool.current_num_threads();
+    let net_idx: BTreeMap<u32, usize> = join
         .nets
         .iter()
         .enumerate()
-        .map(|(i, g)| (g.net.0, i))
+        .map(|(i, (net, _))| (net.0, i))
         .collect();
     let mut routes: Vec<Option<NetRoute>> = vec![None; n];
-    let mut res_of: Vec<ClosureResiduals> =
-        (0..n).map(|_| ClosureResiduals::default()).collect();
+    let mut res_of: Vec<ClosureResiduals> = (0..n).map(|_| ClosureResiduals::default()).collect();
     let mut marks: Vec<Vec<Mark>> = vec![Vec::new(); n];
     let mut hist = vec![0u32; n];
     let mut bad: Vec<usize> = (0..n).collect();
@@ -3981,18 +4461,30 @@ pub fn route_nets_with_progress(
         let mut failed: Vec<(usize, UnroutedNet)> = Vec::new();
         let mut routed = 0u32;
         let mut search_el = std::time::Duration::ZERO;
+        // `drt: mem` "outcomes" row — the transient all-nets buffer
+        // exists only in the snapshot arm; the hard arm commits inline.
+        let mut outcomes_b = 0usize;
+        // `drt: mem` per-attempt hi-water — the biggest rebuilt
+        // (NetGraph, NetAdj) pair this iteration; the transient bound
+        // is `threads × attempt_hi`, not `nets × graphs+topos`.
+        let mut attempt_hi = 0usize;
         let commit_el = if hard {
             // The hard iteration keeps the serial interleave: foreign
             // hits are blocks *during* search, which requires live
             // occupancy — this iteration does not snapshot, and its
             // provisional scan would have no legal disposition.
             for (bi, &i) in bad.iter().enumerate() {
-                let g = &graphs.nets[i];
+                let &(net, _) = &join.nets[i];
                 let tn = std::time::Instant::now();
+                // Per-attempt rebuild — the serial arm holds one
+                // (graph, adjacency) pair at a time.
+                let mut scratch = Vec::new();
+                let g = mk_graph(i, &mut scratch);
+                let adj = NetAdj::new(&g, &topos[i], tech, tracks, vias, hull);
                 match route_one_net(
-                    db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i], true, cfg.occ,
+                    db, tech, tracks, &g, &topos[i], &adj, vias, &occ, hull, hist[i], true, cfg.occ,
                 ) {
-                    NetOutcome::Routed(route, _used_edges, res) => {
+                    NetOutcome::Routed(route, _probes, res) => {
                         routed += 1;
                         commit_route(&mut occ, vias, &route, &mut marks[i]);
                         res_of[i] = res;
@@ -4003,7 +4495,7 @@ pub fn route_nets_with_progress(
                         stub_blocked,
                     } => {
                         for &p in &stub_blocked {
-                            stub_outside_cover.push((g.net, p));
+                            stub_outside_cover.push((net, p));
                         }
                         res_of[i] = ClosureResiduals::default();
                         failed.push((i, unrouted));
@@ -4040,15 +4532,20 @@ pub fn route_nets_with_progress(
             // then outcomes commit one at a time in `bad` order.
             // `collect` on an indexed parallel iterator preserves
             // `bad` order, so the committed stream is a pure function
-            // of the inputs for any thread count.
-            let outcomes: Vec<NetOutcome> = pool.install(|| {
+            // of the inputs for any thread count. Each attempt
+            // rebuilds its `NetGraph`/`NetAdj` inside the map — at
+            // most `threads` pairs are in flight — and the carried
+            // `EdgeProbe`s let the commit scan run with no graph
+            // reference.
+            let outcomes: Vec<(NetOutcome, usize)> = pool.install(|| {
                 bad.par_iter()
-                    .map(|&i| {
-                        let g = &graphs.nets[i];
+                    .map_init(Vec::new, |hull_scratch, &i| {
                         let tn = std::time::Instant::now();
+                        let g = mk_graph(i, hull_scratch);
+                        let adj = NetAdj::new(&g, &topos[i], tech, tracks, vias, hull);
                         let out = route_one_net(
-                            db, tech, tracks, g, &topos[i], vias, &occ, &hull, hist[i],
-                            false, cfg.occ,
+                            db, tech, tracks, &g, &topos[i], &adj, vias, &occ, hull,
+                            hist[i], false, cfg.occ,
                         );
                         if timing {
                             let el = tn.elapsed();
@@ -4063,40 +4560,43 @@ pub fn route_nets_with_progress(
                                 );
                             }
                         }
-                        out
+                        let attempt_b = if mem_on {
+                            net_graph_bytes(&g) + net_adj_bytes(&adj)
+                        } else {
+                            0
+                        };
+                        (out, attempt_b)
                     })
                     .collect()
             });
+            if mem_on {
+                outcomes_b = outcomes.iter().map(|(o, _)| net_outcome_bytes(o)).sum();
+                attempt_hi = outcomes.iter().map(|(_, b)| *b).max().unwrap_or(0);
+            }
             search_el = ti.elapsed();
             let tc = std::time::Instant::now();
             let mut hits = Vec::new();
-            for (bi, (outcome, &i)) in outcomes.into_iter().zip(&bad).enumerate() {
-                let g = &graphs.nets[i];
+            for (bi, ((outcome, _), &i)) in outcomes.into_iter().zip(&bad).enumerate() {
                 match outcome {
-                    NetOutcome::Routed(route, used_edges, res) => {
+                    NetOutcome::Routed(route, probes, res) => {
                         routed += 1;
                         // Stale-collision detection: parallel searches
-                        // may claim the same resource — scan the
-                        // committed edges against live `occ` (prior
+                        // may claim the same resource — replay the
+                        // resolved probes against live `occ` (prior
                         // marks plus earlier same-iteration commits)
                         // before rasterizing, recording canonical
                         // net×net plus directed wire→pin.
                         if cfg.occ == OccMode::Enabled {
-                            for &eidx in &used_edges {
-                                edge_collisions(
-                                    g,
-                                    tracks,
-                                    vias,
-                                    &occ,
-                                    &topos[i].relax,
-                                    &topos[i].cover,
-                                    eidx,
-                                    g.net,
-                                    &mut prov,
-                                    &mut prov_pins,
-                                    &mut hits,
-                                );
-                            }
+                            probe_collisions(
+                                &occ,
+                                vias,
+                                &topos[i].cover,
+                                &probes,
+                                join.nets[i].0,
+                                &mut prov,
+                                &mut prov_pins,
+                                &mut hits,
+                            );
                         }
                         commit_route(&mut occ, vias, &route, &mut marks[i]);
                         res_of[i] = res;
@@ -4107,7 +4607,7 @@ pub fn route_nets_with_progress(
                         stub_blocked,
                     } => {
                         for &p in &stub_blocked {
-                            stub_outside_cover.push((g.net, p));
+                            stub_outside_cover.push((join.nets[i].0, p));
                         }
                         res_of[i] = ClosureResiduals::default();
                         failed.push((i, unrouted));
@@ -4133,6 +4633,15 @@ pub fn route_nets_with_progress(
             routed,
             prov_collisions: (prov.len() + prov_pins.len()) as u32,
         });
+        if mem_on {
+            eprintln!(
+                "drt: mem iter={it} rss={} occ={} marks={} routed={} outcomes={outcomes_b} attempt_hi={attempt_hi}",
+                crate::drt::mem::peak_rss_bytes(),
+                occupancy_bytes(&occ),
+                marks_bytes(&marks),
+                routes_bytes(&routes),
+            );
+        }
         if hard {
             unrouted = failed.into_iter().map(|(_, u)| u).collect();
             break;
@@ -4195,20 +4704,25 @@ pub fn route_nets_with_progress(
     // failures never committed), so patches see the final foreign
     // picture, run once per net, and rasterize straight into `occ` so
     // later nets' patches respect earlier patches. Runs here, not in
-    // `route_one_net`: the `graphs.nets[i]` ↔ `routes[i]` pairing is
+    // `route_one_net`: the `join.nets[i]` ↔ `routes[i]` pairing is
     // still live and each net is patched once, not once per rip-up.
     let tp = std::time::Instant::now();
     let mut area_residuals = Vec::new();
     let mut area_patches = 0;
-    for (i, g) in graphs.nets.iter().enumerate() {
-        let Some(route) = &mut routes[i] else {
+    // Patch order stays `join.nets` order (the old `graphs.nets`
+    // enumerate); each patched net's graph is rebuilt here — serial
+    // per net, bounded — since the loop needs only `g`'s nodes.
+    let mut patch_scratch = Vec::new();
+    for (i, route) in routes.iter_mut().enumerate() {
+        let Some(route) = route else {
             continue;
         };
+        let g = mk_graph(i, &mut patch_scratch);
         area_patches += patch_net_min_area(
             db,
             tech,
             tracks,
-            g,
+            &g,
             vias,
             &mut occ,
             route,
@@ -4237,6 +4751,16 @@ pub fn route_nets_with_progress(
             ivs as f64 / wc.max(1) as f64,
             rl as f64 / rc.max(1) as f64,
             hits as f64 / (wc + rc).max(1) as f64,
+        );
+    }
+    if mem_on {
+        eprintln!(
+            "drt: mem post_route rss={} occ={} marks={} routes={} residuals={}",
+            crate::drt::mem::peak_rss_bytes(),
+            occupancy_bytes(&occ),
+            marks_bytes(&marks),
+            routes_bytes(&routes),
+            residuals_bytes(&res_of),
         );
     }
 
@@ -4374,9 +4898,7 @@ pub fn pin_overlap_census(
                         }
                         let pair = match (a.who, b.who) {
                             (Occupant::Net(w), Occupant::Pin(p) | Occupant::ObsPin(p))
-                            | (Occupant::Pin(p) | Occupant::ObsPin(p), Occupant::Net(w)) => {
-                                (w, p)
-                            }
+                            | (Occupant::Pin(p) | Occupant::ObsPin(p), Occupant::Net(w)) => (w, p),
                             _ => continue,
                         };
                         if pair.0 == pair.1 {
@@ -4831,8 +5353,9 @@ mod tests {
         let cfg = MazeConfig::default();
         let mask = HullMask::new(&db, &tech);
         let topo = NetTopo::new(&db, &tech, &tracks, &g, &vias, &occ, &mask);
+        let adj = NetAdj::new(&g, &topo, &tech, &tracks, &vias, &mask);
         let outcome = route_one_net(
-            &db, &tech, &tracks, &g, &topo, &vias, &occ, &mask, 0, false, cfg.occ,
+            &db, &tech, &tracks, &g, &topo, &adj, &vias, &occ, &mask, 0, false, cfg.occ,
         );
         let NetOutcome::Routed(route, _, _) = outcome else {
             panic!("square must route");
@@ -4939,12 +5462,7 @@ mod tests {
         let mut route = one_wire_route(0, 1000);
         assert_eq!(component_area(&db, &tech, &g, &vias, &route), 159_600);
         let mut occ = toy_occ(&tech);
-        occ.rasterize(
-            0,
-            &RectDbu::new(-70, -70, 1070, 70),
-            Occupant::Net(0),
-            None,
-        );
+        occ.rasterize(0, &RectDbu::new(-70, -70, 1070, 70), Occupant::Net(0), None);
         let mut residuals = Vec::new();
         let patches = patch_net_min_area(
             &db,
@@ -5017,12 +5535,7 @@ mod tests {
         let run = |area_dbu2: i64, route: &mut NetRoute| {
             let tech = toy_tech_area(area_dbu2);
             let mut occ = toy_occ(&tech);
-            occ.rasterize(
-                0,
-                &RectDbu::new(-70, -70, 1070, 70),
-                Occupant::Net(0),
-                None,
-            );
+            occ.rasterize(0, &RectDbu::new(-70, -70, 1070, 70), Occupant::Net(0), None);
             let mut residuals = Vec::new();
             let n = patch_net_min_area(
                 &db,
@@ -5070,12 +5583,7 @@ mod tests {
         let mut route = one_wire_route(1000, 2000);
         assert_eq!(component_area(&db, &tech, &g, &vias, &route), 159_600);
         let mut occ = toy_occ(&tech);
-        occ.rasterize(
-            0,
-            &RectDbu::new(930, -70, 2070, 70),
-            Occupant::Net(0),
-            None,
-        );
+        occ.rasterize(0, &RectDbu::new(930, -70, 2070, 70), Occupant::Net(0), None);
         // Foreign metal inside the [2000,3000] step's band; an Obs
         // mark inside every −x step's band.
         occ.rasterize(
@@ -5166,16 +5674,19 @@ mod tests {
         assert_eq!(residuals[0].region, RectDbu::new(-70, -70, 1070, 70));
     }
 
-    /// The post-loop hook, not just the function: `route_nets` on the
-    /// square fixture with a bound the routed L (union 299,600) cannot
-    /// meet alone → one patch closes the square's top edge.
+    /// The post-loop hook, not just the function: `route_prepared` on
+    /// the square fixture with a bound the routed L (union 299,600)
+    /// cannot meet alone → one patch closes the square's top edge.
+    /// `route_nets` itself rebuilds graphs from guides, so the test
+    /// enters at the prepared seam with the synthetic square.
     #[test]
     fn test_min_area_patch_in_route_nets() {
         let tech = toy_tech_area(400_000);
         let tracks = toy_tracks();
         let db = toy_db();
-        let graphs = RouteGraphs {
-            nets: vec![square_graph()],
+        let g = square_graph();
+        let join = GuideJoin {
+            nets: vec![(NetId(0), Vec::new())],
             ..Default::default()
         };
         let vias = ViaTable {
@@ -5190,7 +5701,23 @@ mod tests {
             gaps: vec![],
             unmatched: vec![],
         };
-        let route_db = route_nets(&db, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+        let mask = HullMask::new(&db, &tech);
+        let occ = Occupancy::new(&tech, &tracks);
+        let topos = vec![NetTopo::new(&db, &tech, &tracks, &g, &vias, &occ, &mask)];
+        let route_db = route_prepared(
+            &db,
+            &tech,
+            &tracks,
+            &join,
+            &topos,
+            occ,
+            &mask,
+            &|_, _| square_graph(),
+            &vias,
+            &MazeConfig::default(),
+            None,
+            std::time::Instant::now(),
+        );
         assert_eq!(route_db.area_patches, 1, "{:?}", route_db.area_residuals);
         assert!(route_db.area_residuals.is_empty());
         let route = &route_db.nets[0];
@@ -5229,10 +5756,7 @@ mod tests {
                 cut: SymbolId(0),
                 cut_count: 1,
                 geom: crate::design_db::ViaGeom::Lef(0),
-                rects: vec![(
-                    DrcLayer::Routing(LayerId(0)),
-                    RectDbu::new(0, -70, 100, 70),
-                )],
+                rects: vec![(DrcLayer::Routing(LayerId(0)), RectDbu::new(0, -70, 100, 70))],
                 area_dbu2: 0,
             }],
             pairs: vec![ViaPair {
@@ -5297,11 +5821,13 @@ mod tests {
         let mask = HullMask::new(&db, &tech);
         let cover = PinCover::new();
         let vias = ViaTable::default();
-        let mut hlines: PaintLines =
-            BTreeMap::new();
+        let mut hlines: PaintLines = BTreeMap::new();
         hlines.insert(
             (0, 1000),
-            vec![(0, 500, PaintSrc::ProjStub(0)), (600, 1100, PaintSrc::Access(1))],
+            vec![
+                (0, 500, PaintSrc::ProjStub(0)),
+                (600, 1100, PaintSrc::Access(1)),
+            ],
         );
         let res = close_self_spacing(
             &db,
@@ -5399,12 +5925,7 @@ mod tests {
         // unguarded walk commits (0,0)–(2000,0) and leaves a notch.
         route.fills = vec![(LayerId(0), RectDbu::new(2130, -70, 2470, 70))];
         let mut occ = toy_occ(&tech);
-        occ.rasterize(
-            0,
-            &RectDbu::new(-70, -70, 1070, 70),
-            Occupant::Net(0),
-            None,
-        );
+        occ.rasterize(0, &RectDbu::new(-70, -70, 1070, 70), Occupant::Net(0), None);
         let mut residuals = Vec::new();
         let patches = patch_net_min_area(
             &db,
@@ -5447,12 +5968,7 @@ mod tests {
             (LayerId(0), RectDbu::new(3130, -70, 3570, 70)),
         ];
         let mut occ = toy_occ(&tech);
-        occ.rasterize(
-            0,
-            &RectDbu::new(-70, -70, 1070, 70),
-            Occupant::Net(0),
-            None,
-        );
+        occ.rasterize(0, &RectDbu::new(-70, -70, 1070, 70), Occupant::Net(0), None);
         let mut residuals = Vec::new();
         let patches = patch_net_min_area(
             &db,
@@ -5728,15 +6244,7 @@ mod tests {
             }
         }
 
-        fn scan_wire(
-            &self,
-            axis: Axis,
-            layer: u8,
-            t: i32,
-            c: i32,
-            d: i32,
-            out: &mut Vec<Hit>,
-        ) {
+        fn scan_wire(&self, axis: Axis, layer: u8, t: i32, c: i32, d: i32, out: &mut Vec<Hit>) {
             let l = layer as usize;
             let (w2, s) = (self.halfw[l], self.spc[l]);
             let map = match axis {
@@ -6094,14 +6602,22 @@ mod tests {
                     hb.clear();
                     occ.scan_wire(Axis::X, layer, i as u32, -10_000, 10_000, &mut ha);
                     oracle.scan_wire(Axis::X, layer, t, -10_000, 10_000, &mut hb);
-                    assert_hits_eq(&ha, &hb, &format!("seed {seed:#x} sweep wire-x l{layer} i{i}"));
+                    assert_hits_eq(
+                        &ha,
+                        &hb,
+                        &format!("seed {seed:#x} sweep wire-x l{layer} i{i}"),
+                    );
                 }
                 for (i, &t) in lt.tracks_x.iter().enumerate() {
                     ha.clear();
                     hb.clear();
                     occ.scan_wire(Axis::Y, layer, i as u32, -10_000, 10_000, &mut ha);
                     oracle.scan_wire(Axis::Y, layer, t, -10_000, 10_000, &mut hb);
-                    assert_hits_eq(&ha, &hb, &format!("seed {seed:#x} sweep wire-y l{layer} i{i}"));
+                    assert_hits_eq(
+                        &ha,
+                        &hb,
+                        &format!("seed {seed:#x} sweep wire-y l{layer} i{i}"),
+                    );
                 }
                 let all = RectDbu::new(-10_000, -10_000, 10_000, 10_000);
                 ha.clear();

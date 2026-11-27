@@ -10851,3 +10851,152 @@ tests/designs/check_drt_ours.sh gcd      # LibreLane container
   `test_rayon_*` pins and the re-pinned `GCD_ROUTE_DIGEST`) + 18 drc
   + 8 cli + 2 irdrop, `#[ignore]`d legs unchanged; `cargo clippy
   --workspace --all-targets -- -D warnings` clean.
+### 2026-11-27 — drt-scale-memory: per-attempt rebuild of occupancy-free per-net state (v0.15.0)
+
+Two-step ticket (`kurena/tasks/drt-scale-memory`): a `GRUS_DRT_MEM`
+structural census first, then the measured dominant reduction with
+the routed DEF held byte-identical.
+
+**Census** (`GRUS_DRT_MEM=1`, capacity walks over the live
+structures — `drt/mem.rs`; `post_premark`/`post_graphs`/
+`post_topos`/per-`iter`/`post_route`/`post_emit` rows on stderr,
+gated so the ungated path prints nothing):
+
+| structure | gcd | picorv32 |
+|---|---|---|
+| `route_graphs` (`RouteGraphs.nets` + pin_nodes) | 28.4 MB | 1.21 GB |
+| `NetTopo` total | **91.0 MB** | **3.13 GB** |
+| — `relax` (relaxed via edges) | 44.4 MB | 1.48 GB |
+| — CSR adjacency (`adj_start`/`adj_to`/`adj_eidx`) | 46.2 MB | 1.64 GB |
+| — `attach`/`access`/`cover` (kept) | 0.26 MB | 8.0 MB |
+| `Occupancy` (post-premark → steady) | 2.6 → 3.7 MB | 82.8 → 137 MB |
+| peak RSS (`/usr/bin/time -l`) | 152.8 MB | 2,372,993,024 B (2.37 GB) |
+
+The dominant row is the `relax`+`csr` half of `NetTopo`, and
+`route_graphs` is the second row — the pick generalizes `options.md`
+O2: *rebuild all occupancy-free per-net state per attempt*. `relax`,
+the member map, and the CSR adjacency never read occupancy (only
+`attach`/`access`/`cover` do, via the post-premark snapshot), so they
+are pure functions of the kept topo and shared inputs — rebuildable
+under the same legality argument as `NetGraph` itself.
+
+**Change**:
+
+- `build_route_graphs_ext`'s `map_init` body lifted into
+  `pub build_net_graph` returning `pub NetBuild` (graph + census
+  partials); the bulk builder calls it — identical output.
+- `NetTopo` slimmed to the occupancy snapshot (`attach`,
+  `projected`, `attachable`, `access`, `cover`); the occupancy-free
+  half moved to `NetAdj::new(g, topo, …)` — member `BTreeMap` →
+  flattened CSR off `topo.attach` (same attach order), same
+  `relaxed_vias`, same CSR arcs.
+- `route_nets`/`route_nets_with_progress` now take
+  `(join, GraphOpts)` and return `(RouteGraphs census, RouteDb)`
+  (`census.nets` stays empty — the streamed attach pass drops each
+  graph after its `NetTopo` is captured). Every attempt rebuilds
+  `(NetGraph, NetAdj)` inside the search map through
+  `route_prepared`'s `mk_graph` seam (production replays
+  `build_net_graph`; `test_min_area_patch_in_route_nets` feeds the
+  synthetic square through the same seam) — at most `threads` pairs
+  in flight instead of `nets × (graph + topo)` resident.
+- The commit-time stale-collision scan detached from the graph:
+  extraction resolves each used edge's scan parameters into
+  `EdgeProbe`s (`Wire`/`Stub` scan bands + paint rect, `ViaFp`
+  footprint); `probe_collisions` replays them against live `occ`
+  at commit in `edge_collisions`' exact order — identical collision
+  sets, no `g`/`relax` reference needed at commit.
+- `apply_routes` takes `guided: &[NetId]` (was `&RouteGraphs`) —
+  the guided-set membership check never needed graph payloads.
+- Patch loop rebuilds the patched net's graph serially inside the
+  post-loop pass (bounded: one at a time).
+- Breaking API change → minor bump 0.14.4 → 0.15.0.
+
+**Memory after** (`GRUS_DRT_MEM=1`, new row `attempt_hi` = largest
+per-attempt `(graph, adj)` pair — the transient bound is
+`threads × attempt_hi`, not `nets × …`):
+
+| design | `topos` before → after | peak RSS before → after |
+|---|---|---|
+| gcd | 91.0 MB → **0.26 MB** | 153.1 MB → **82.6 MB** (−46 %) |
+| picorv32 | 3.13 GB → **8.0 MB** | 2,372,993,024 → **958,464,000 B** (−59.6 %) |
+
+picorv32 legs (three detached runs, same inputs): the HEAD baseline
+(no census) peaked at `maximum resident set size` 2,372,993,024 B
+(real 7279.8 s); the commit-1 instrumented binary peaked at
+3,138,633,728 B (steady `rss=3.14 GB` across iters 4–8, graphs+topos
+4.3 GB census dominating residency — the instrumented build's higher
+peak is allocator-level, both DEFs byte-identical); the rebuilt
+binary peaked at **958,464,000 B** (`post_topos rss=280.6 MB` with
+`topos=8.0 MB`, `occ=82.8 MB`; iter-1 `rss=586.2 MB`,
+`attempt_hi=217.5 MB`; steady `rss=958.5 MB` through iter 8; real
+4148.4 s — the rebuild cost is more than repaid by the removed
+allocator churn, −43 % wall). All three routed DEFs sha256 to
+`db8fb82f699bc69c5942b8d85c1818b30d9e1f2ab398df4dfd3fe6cd40625bb9`
+— byte-identical. All legs report `self_drc_verdict VIOLATIONS
+findings_total=6` > tolerance 3 — the pre-existing picorv32
+self-DRC residual, unchanged by this work (the DEF is still
+emitted and compared).
+
+**Honest bound** (acceptance item 4): pre-change, peak ≈ base +
+Σ_nets (graph + topo) — picorv32's census put that at ~640 KB/net
+(4.3 GB / 6,744 nets), so a 100k-guided-net design projected to
+~64 GB. Post-change the resident set is base (`occ`, `marks`,
+`routes`, the occupancy-snapshot topo ~1.2 KB/net: 0.26 MB/gcd,
+8.0 MB/picorv32) + `threads × attempt_hi` (worst in-flight
+`(graph, adj)` pair — 217.5 MB on picorv32). The bound is now linear
+in the *worst guide-union's* graph size × thread count, not in net
+count: a 100k-net design at picorv32's per-net constant projects to
+~120 MB of snapshots + 8 × 217.5 MB ≈ 1.9 GB worst-case transient.
+The remaining concern at scale is a single huge guide union (one
+net's rebuild is unbounded), not the net census.
+
+**Identity evidence**:
+
+- `GCD_ROUTE_DIGEST` `0xef2b3ff70271a2e9` unchanged
+  (`test_maze_census` green) — rebuilds are bit-identical, routes
+  untouched.
+- Emitted DEF sha256 `1422d02765f6aba99e25f1792436607c788ca31397c0bf843340bd65fb2f9482`
+  byte-identical to the committed golden
+  `tests/designs/gcd/gcd.drt.ours.routed.def` (`self_drc_verdict
+  CLEAN`, `guided=269 routed=189 unrouted=80 iterations=8`
+  unchanged).
+- `test_net_graph_rebuild_identity` (new): per-net
+  `build_net_graph` ≡ `bulk.nets[i]` under `PartialEq`, plus the
+  streamed `RouteGraphs` census ≡ the bulk census with `nets`
+  cleared — under both `RAYON_NUM_THREADS=1` and `=8`.
+- `test_rayon_route_determinism`/`test_rayon_graphs_serial_identity`/
+  `test_maze_determinism`/`test_route_nets_progress_hook` all green —
+  determinism contract intact.
+
+**Prove-it-red** (AGENTS §7.7, run 2026-11-27): `hull_cells_at`'s
+`out.clear()` deleted → the worker-local `hull_scratch` leaks stale
+cell ids into later nets' masks — `test_net_graph_rebuild_identity`
+red (`rebuilt graph diverged at index 1`), `test_maze_census` red
+(digest `0x9e199fb33db70a06` ≠ pin). Restored, re-verified green.
+
+**Exact commands** (task worktree `.kurena/wt/drt-scale-memory`):
+
+```sh
+cargo build --release -p grus-eda
+LIB=$HOME/.ciel/sky130A/libs.ref/sky130_fd_sc_hd
+TLEF=$LIB/techlef/sky130_fd_sc_hd__nom.tlef
+LEF=$LIB/lef/sky130_fd_sc_hd.lef
+GRUS_DRT_MEM=1 /usr/bin/time -l target/release/grus-eda drt \
+  --tlef $TLEF --lef $LEF --def tests/designs/gcd/gcd.placed.def \
+  --guide tests/designs/gcd/gcd.guide --out-def /tmp/gcd.mem.new.def \
+  --reference tests/designs/gcd/gcd.drt.reference.json \
+  --self-drc-tolerance 3
+shasum -a 256 /tmp/gcd.mem.new.def \
+  tests/designs/gcd/gcd.drt.ours.routed.def
+# picorv32 legs detached (HEAD baseline / commit-1 instrumented /
+# this change): same command, --def tests/designs/picorv32/…
+cargo test --workspace --profile verify
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+- **Checks run** (E0 rule 9): `cargo test --workspace --profile
+  verify` all green — 559 lib + drt suite incl.
+  `test_net_graph_rebuild_identity`, the three `test_rayon_*` pins,
+  `test_maze_census` (digest), `test_e2e_ours_def_deterministic_gcd`
+  (golden DEF); `cargo clippy --workspace --all-targets --
+  -D warnings` clean.
