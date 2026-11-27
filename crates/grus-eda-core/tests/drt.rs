@@ -2185,6 +2185,17 @@ fn guide_union_connected(boxes: &[GuideBox], max_layer: u8) -> bool {
         == 1
 }
 
+/// Recorded gcd route digest (`docs/results.md` `drt-rayon` entry):
+/// a `route_digest` drift means the routed geometry, the
+/// connectivity record, or the iteration stats changed — the pin for
+/// any router/occupancy data-structure rewrite. Re-pinned from
+/// `0x8a4768ab15bd4bd5` at drt-rayon: soft-iteration searches now
+/// see the iteration-start snapshot rather than serial-interleave
+/// occupancy, so committed routes legitimately differ — identical
+/// across thread counts by the ordered-commit contract
+/// (`test_rayon_route_determinism`).
+const GCD_ROUTE_DIGEST: u64 = 0xef2b3ff70271a2e9;
+
 /// The connectivity census: every guided signal net either routes all
 /// member pins or lands in the unrouted report with every failed pin
 /// named (`FailKind`). Prints the counts `docs/results.md` records —
@@ -2253,6 +2264,16 @@ fn maze_census(name: &str) {
                 .map(|&(p, k)| format!("{}:{k:?}", pin_label(&db, p)))
                 .collect();
             println!("  unrouted {} pins={kinds:?}", net_name(&db, u.net));
+        }
+
+        // Occupancy data-structure pin: the route output must be
+        // byte-identical across the `BTreeMap` → `Vec<Line>` swap.
+        if name == "gcd" {
+            assert_eq!(
+                route_digest(&r),
+                GCD_ROUTE_DIGEST,
+                "gcd route digest drifted"
+            );
         }
 
         // Total accounting — no silent drops.
@@ -2442,6 +2463,116 @@ fn test_route_digest_covers_pin_collisions() {
         hi: 2100,
     });
     assert_ne!(route_digest(&a), route_digest(&b));
+}
+
+// ---------------------------------------------------------------------------
+// Rayon determinism (drt-rayon)
+//
+// The drt phases run inside a per-call thread pool that reads
+// `RAYON_NUM_THREADS` at call time (`drt::pool`). Build and emit are
+// pinned byte-identical across thread counts; the route loop's
+// contract is determinism under a *fixed* thread count plus a
+// collision-free end state — serial identity across counts is a
+// named non-goal (same-iteration searches run against the
+// iteration-start snapshot, so the committed stream is a function
+// of pool size).
+// ---------------------------------------------------------------------------
+
+/// Serializes the forced-thread-count arms: `RAYON_NUM_THREADS` is
+/// process-global, so without this lock a neighbouring test could
+/// inherit the forced value mid-run. `set_var`/`remove_var` are
+/// `unsafe` under edition 2024 — the lock is the safety argument;
+/// the var is always restored before the guard drops.
+static THREAD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_rayon_threads<T>(n: usize, f: impl FnOnce() -> T) -> T {
+    let _guard = THREAD_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::set_var("RAYON_NUM_THREADS", n.to_string()) };
+    let out = f();
+    unsafe { std::env::remove_var("RAYON_NUM_THREADS") };
+    out
+}
+
+/// Graph build folds per-net partials in `join.nets` order — the
+/// emitted `RouteGraphs` must be byte-identical between a
+/// single-threaded and a multi-threaded pool. The Debug-format
+/// comparison covers every field including order.
+#[test]
+fn test_rayon_graphs_serial_identity() {
+    let (tech, db, tracks, _) = load("gcd");
+    let (_, join) = load_guide(&db, &tech, "gcd");
+    let opts = grus_eda_core::drt::graph::GraphOpts {
+        spare_above: 1,
+        escape: Some(grus_eda_core::drt::graph::EscapeCfg::DEFAULT),
+    };
+    let serial = with_rayon_threads(1, || {
+        format!(
+            "{:?}",
+            grus_eda_core::drt::graph::build_route_graphs_ext(
+                &db, &tech, &tracks, &join, opts
+            )
+        )
+    });
+    let par8 = with_rayon_threads(8, || {
+        format!(
+            "{:?}",
+            grus_eda_core::drt::graph::build_route_graphs_ext(
+                &db, &tech, &tracks, &join, opts
+            )
+        )
+    });
+    assert_eq!(serial, par8, "graph build diverged under 8 threads");
+}
+
+/// The route loop's named invariant: snapshot-search / ordered-commit
+/// makes the committed stream a pure function of the inputs, so the
+/// output is deterministic at *any* thread count — threads=1,
+/// threads=8, and a second 8-thread run must all agree on the
+/// `route_digest` serialization (geometry, connectivity, iteration
+/// stats), with a collision-free end state and an identical unrouted
+/// census.
+#[test]
+fn test_rayon_route_determinism() {
+    let (tech, db, tracks, _join, graphs, vias) = load_routed_inputs("gcd");
+    let cfg = MazeConfig::default();
+    let route = |threads: usize| {
+        with_rayon_threads(threads, || {
+            route_nets(&db, &tech, &tracks, &graphs, &vias, &cfg)
+        })
+    };
+    let r1 = route(1);
+    let r2 = route(8);
+    let r3 = route(8);
+    assert_ne!(route_digest(&r1), 0, "zero digest proves nothing");
+    for (i, r) in [&r1, &r2, &r3].iter().enumerate() {
+        assert!(
+            r.collisions.is_empty(),
+            "arm {i}: routed end state has {} residual collisions",
+            r.collisions.len()
+        );
+    }
+    assert_eq!(
+        route_digest(&r1),
+        route_digest(&r2),
+        "threads=1 vs threads=8 route output diverged"
+    );
+    assert_eq!(
+        route_digest(&r2),
+        route_digest(&r3),
+        "two 8-thread runs diverged"
+    );
+    assert_eq!(
+        r1.unrouted, r2.unrouted,
+        "unrouted census differs across thread counts"
+    );
+    println!(
+        "gcd rayon route: digest={:#x} routed={} unrouted={} collisions={} iterations={}",
+        route_digest(&r1),
+        r1.nets.len(),
+        r1.unrouted.len(),
+        r1.collisions.len(),
+        r1.iterations
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2847,6 +2978,45 @@ fn test_emit_determinism() {
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out2).unwrap(),
         "two emit passes produced different bytes"
+    );
+}
+
+/// Emit is byte-identical across thread counts (drt-rayon): the
+/// `NetGeom` partials and the `NETS` section strings fold in input
+/// order, so `net_geoms`, the `EmitReport` counters, and the emitted
+/// DEF bytes must match between a single-threaded and an 8-thread
+/// pool on the same `RouteDb`.
+#[test]
+fn test_rayon_emit_serial_identity() {
+    let (tech, mut db1, tracks, _join, graphs, vias) = load_routed_inputs("gcd");
+    let mut db2 = db1.clone();
+    let route_db = route_nets(&db1, &tech, &tracks, &graphs, &vias, &MazeConfig::default());
+    assert!(!route_db.nets.is_empty());
+
+    let rep1 = with_rayon_threads(1, || {
+        apply_routes(&mut db1, &tech, &graphs, &route_db, &vias).expect("apply_routes serial")
+    });
+    let rep8 = with_rayon_threads(8, || {
+        apply_routes(&mut db2, &tech, &graphs, &route_db, &vias).expect("apply_routes par8")
+    });
+    assert_eq!(rep1.wire_length_dbu, rep8.wire_length_dbu);
+    assert_eq!(rep1.vias_per_cut, rep8.vias_per_cut);
+    assert_eq!(rep1.unrouted, rep8.unrouted);
+    assert_eq!(db1.net_geoms, db2.net_geoms, "net_geoms diverged under 8 threads");
+
+    let placed = placed_def("gcd");
+    let out1 = tmp_def("gcd-rayon-e1");
+    let out8 = tmp_def("gcd-rayon-e8");
+    with_rayon_threads(1, || {
+        write_routed_def(&db1, &tech, &placed, &out1).expect("write serial")
+    });
+    with_rayon_threads(8, || {
+        write_routed_def(&db2, &tech, &placed, &out8).expect("write par8")
+    });
+    assert_eq!(
+        std::fs::read(&out1).unwrap(),
+        std::fs::read(&out8).unwrap(),
+        "emitted DEF bytes diverged under 8 threads"
     );
 }
 

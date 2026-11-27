@@ -258,7 +258,12 @@ pair once) — the induced subgraph of the grid restricted to in-region
 nodes, so an edge never wires across an uncovered corridor gap.
 Emission order is fixed (layers ascending → pairs ascending → per
 node the +x then +y probe, in node order): two runs are byte-identical
-and the gate double-runs with nonzero totals.
+and the gate double-runs with nonzero totals. Per-net graph builds
+run in parallel (drt-rayon) — the shared accumulators
+(`zero_coverage`, `region_escape`, `escapes`, the per-pair/per-layer
+censuses) become per-net partials folded serially in `join.nets`
+order, so byte-identity holds under any thread count and is pinned
+by `test_rayon_graphs_serial_identity`.
 
 *Recorded simplification*: an edge trusts that the unit segment
 between adjacent-index in-region nodes stays inside the union — two
@@ -445,8 +450,18 @@ grids but outside the guide gets none either; the gate asserts both.
 ## 7. Maze search
 
 `drt::maze` connects each guided net's member pins inside its region
-graph — sequential, deterministic, one `NetGraph` at a time in
-`join.nets` (guide-file) order. `route_nets` returns a `RouteDb`:
+graph — snapshot-search / ordered-commit (drt-rayon): in each soft
+iteration every net in `bad` searches against the iteration-start
+occupancy in parallel, then the outcomes commit serially in `bad`
+order; the last (hard) iteration keeps the serial interleave because
+its in-search foreign-hit blocking needs live occupancy. The
+committed stream is a pure function of the inputs, so output is
+deterministic at *any* thread count — but it is **not**
+serial-identical to the old interleave (searches no longer see
+same-iteration earlier commits, so stale conflicts land as
+provisional collisions and re-queue — `route_digest` legitimately
+moved, re-pinned in `tests/drt.rs`). `route_nets` returns a
+`RouteDb`:
 per-net `NetRoute`s (merged wire segments, via placements, connected
 pins), a named unrouted report, the post-hoc collision census, and
 the iteration count.
@@ -560,11 +575,17 @@ The preferred axis follows §1's direction-to-axis flip: a
 **Occupancy** (`Occupancy`): committed geometry — macro OBS, pin
 shapes, committed wires/stubs, via footprints — rasterized onto
 track lines so an edge's conflict check is a per-line interval
-query. Per layer, `lines_y`/`lines_x` map a line coordinate to a
-`Line`: `lo`-sorted `ivs` plus a `max_hi` skip index per
-`SKIP_CHUNK = 16` chunk (rebuilt eagerly from the dirty chunk; a
-scan skips `max_hi ≤ qlo` chunks and stops at `lo ≥ qhi` — identical
-hit *set*, both consumers order-insensitive). A rect `r` marks
+query. Per layer, `lines_y`/`lines_x` are `Vec<Line>` indexed by
+track position — the mark domain is exactly the track index set
+(rasterization only ever touches track lines), so a slot index
+replaces the old `BTreeMap<i32, Line>` keyed lookup — with the
+sorted coordinate lists `coords_y`/`coords_x` held alongside for
+`Hit.line` reconstruction and the `scan_rect`/`rasterize` window
+`partition_point`s. A `Line` is `lo`-sorted `ivs` plus a `max_hi`
+skip index per `SKIP_CHUNK = 16` chunk (rebuilt eagerly from the
+dirty chunk; a scan skips `max_hi ≤ qlo` chunks and stops at
+`lo ≥ qhi` — identical hit *set*, both consumers order-insensitive).
+A rect `r` marks
 `[r.yl, r.yh]` on every vertical line inside the strict
 `w/2 + s` band (`w/2 = width_dbu/2`, `s = min_spacing_dbu()`) and
 `[r.xl, r.xh]` likewise on horizontal lines; `perp_*` stores the
@@ -576,6 +597,13 @@ containing no track line on either axis is the recorded miss class.
 Cut-layer occupancy stays unmodeled (spacing-lite); io-port rects
 mark `Pin(own_net)` (pre-mark below) — the unmarked class produced
 real emit-time `met3.2` findings the first gate run surfaced.
+
+The `ScanStats` census counts through cache-line-padded
+`AtomicU64` slots indexed by a per-worker ticket (a `Cell` would
+block `Sync`, and a single shared word serialized the inner scan
+loops ~7× under parallel search); totals stay exact because the
+query stream is a pure function of the occupancy state each
+iteration opened with.
 
 Four occupant classes in `hit_verdict`:
 
@@ -634,11 +662,17 @@ default candidate's routing rects shifted to the placement) →
 `Net(net)`, logged as `Mark`s — the rip-up journal (`unmark` frees
 them).
 
-**Order and rip-up**: nets route in `join.nets` order. In soft
+**Order and rip-up**: nets commit in `bad` order (a
+`join.nets`-ordered subset). In soft
 iterations the foreign hits a committed edge actually took are
 recorded as provisional `Collision`s deduped on `(a, b, layer, line,
 lo, hi)` — foreign-`Net` hits canonically (`a < b`), foreign-`Pin`
-hits *directed* (`a` = wire net, `b` = pin net). After each round:
+hits *directed* (`a` = wire net, `b` = pin net). The scan runs at
+commit time (`edge_collisions` inside the ordered-commit loop)
+against live `occ` — prior-iteration marks plus every earlier
+same-iteration commit — which is what makes same-iteration stale
+conflicts from snapshot search visible; under `OccMode::Enabled` it
+precedes each `commit_route` rasterization. After each round:
 `bad` = unrouted nets ∪ both parties of every net×net provisional ∪
 the `a` side only of every wire→pin provisional — and a collision's
 foreign party may be a kept net (committed in an earlier iteration,
@@ -713,12 +747,33 @@ cache's byte-identical arcs. Two full runs produce identical
 
 **Instrumentation**: `GRUS_DRT_TIMING` (any value) makes `route_nets`
 print premark/topo/per-iteration/per-slow-net timings to stderr —
-opt-in, zero cost unset; it feeds `docs/results.md` runtime evidence.
+opt-in emission, zero printing cost unset; it feeds
+`docs/results.md` runtime evidence. The same flag also appends the
+`ScanStats` query census per iteration and an `occ-scan totals`
+line at route end (`wire`/`rect` call counts, lines and intervals
+visited, hits pushed, marks inserted/removed). The counting itself
+is unconditional `Cell` bumps inside every scan — not zero-cost
+(billions of per-interval increments on gcd) but a handful of
+single-thread adds per query, measured below timer noise against
+the BTreeMap work being replaced; only the emission is gated. The
+totals record the query shape behind the `Vec<Line>` pick in
+`docs/results.md`.
 Separately, `route_nets_with_progress` emits a `RouteProgress`
 snapshot per attempted net to an opt-in sink; `grus-eda drt` wires
 that sink to stderr and prints `drt: iter N nets k/q unrouted=u
 elapsed=Ts` every 500 nets or 60 s, plus each iteration's last net —
 the supported always-on channel (stdout's census block is untouched).
+Under parallel search the per-attempt progress point is the commit —
+the only moment an attempt's disposition exists in `bad` order.
+
+**Thread control** (drt-rayon): every drt parallel section — graph
+build, `NetTopo` build, soft-iteration search, `apply_routes`,
+`nets_section` — runs inside a per-call `rayon::ThreadPool`
+(`drt::pool::drt_pool`) that reads `RAYON_NUM_THREADS` at call time;
+the global pool would pin the env var on first use process-wide,
+which makes the forced single-thread determinism arms untestable
+inside `cargo test`. `GRUS_DRT_TIMING` reports the pool size as a
+`threads=N` token on each timing line.
 
 ## 8. Routed DEF emission
 
@@ -763,7 +818,10 @@ record's layer token is the via's **lower** metal. Statements order
 deterministically: wires in `WireSeg` order (`layer, x1, y1, x2,
 y2` — canonical endpoint order keeps `(x1,y1) ≤ (x2,y2)`), vias in
 `ViaPlace` order (`lower, x, y`), nets in `db` order (= template
-`NETS` order on DEF input).
+`NETS` order on DEF input). `apply_routes` and `nets_section`
+assemble per-net in parallel and fold serially in that same order —
+the emitted text is byte-identical under any thread count
+(`test_rayon_emit_serial_identity`).
 
 **Byte stability** — `write(parse(write(db))) == write(db)`: the
 non-NETS bytes pass through verbatim both passes; `NETS` regenerates
