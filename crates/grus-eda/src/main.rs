@@ -2091,6 +2091,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Drt(args) => {
             let timing = std::env::var_os("GRUS_DRT_TIMING").is_some();
+            // `RAYON_NUM_THREADS` is the CLI's thread knob — read once
+            // at the boundary; the library takes the count as an
+            // explicit input (`0` = rayon default).
+            let threads = std::env::var("RAYON_NUM_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
             let t_total = std::time::Instant::now();
             let loaded = load_congestion_inputs(&args.tlef, &args.lef, &args.def, None, None)?;
             let mut design_db = loaded.design_db;
@@ -2145,6 +2152,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 &grus_eda_core::drt::MazeConfig {
                     occ,
                     max_iters: args.max_iters,
+                    threads,
                 },
                 Some(&mut sink),
             );
@@ -2159,6 +2167,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 &guided,
                 &route_db,
                 &vias,
+                threads,
             )?;
             // Detection precedes the write: the check runs on the
             // committed `net_geoms`, not the emitted text.
@@ -2175,6 +2184,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 tech_db,
                 &args.def,
                 &args.out_def,
+                threads,
             )?;
             // The verdict is a property of the emitted text: the subset
             // checker scores a re-parse of what was just written, and its

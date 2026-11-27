@@ -11173,3 +11173,63 @@ measurements; on the final tree `cargo test --workspace
 2 irdrop, 0 failed — and `cargo clippy --workspace --all-targets
 -- -D warnings` clean. Both baseline and after measurement pairs
 used the exact commands tabled above.
+
+### 2026-11-27 — drt-thread-param: explicit `threads` inputs replace the env read (v0.16.0)
+
+Card #60 review deferred item: `with_rayon_threads` in
+`crates/grus-eda-core/tests/drt.rs` mutated `RAYON_NUM_THREADS`
+around the forced-thread arms — unsound under edition 2024 (every
+other test in the binary read the environ block concurrently through
+the old `drt_pool`), panic-leaky, and clobbering a pre-existing
+`RAYON_NUM_THREADS`. No global knob remains: the thread count is an
+explicit input to every drt parallel surface, `0` meaning rayon's
+default parallelism.
+
+**API change** (breaking — workspace `0.15.2 → 0.16.0`):
+
+- `drt_pool()` → `drt_pool(threads)`; the env read is deleted — the
+  library never touches `RAYON_NUM_THREADS`.
+- `MazeConfig` gains `threads: usize` (default `0`) — covers both
+  route pools (the streamed attach pass and the rip-up search); the
+  `route_nets`/`route_nets_with_progress`/`route_prepared`
+  signatures are unchanged.
+- `build_route_graphs_ext`, `apply_routes`, and `write_routed_def`
+  each gain a trailing `threads: usize`; `nets_section` gains it
+  privately. `build_route_graphs` keeps its signature and passes
+  `0`.
+- `grus-eda drt` reads `RAYON_NUM_THREADS` once at the
+  `Commands::Drt` boundary and passes the count down — CLI behavior
+  unchanged.
+
+**Test change**: `THREAD_ENV_LOCK`/`with_rayon_threads` deleted. The
+four forced arms pass counts explicitly —
+`test_rayon_graphs_serial_identity` (build at 1 vs 8),
+`test_net_graph_rebuild_identity` (streamed census via
+`MazeConfig { threads, .. }` at 1/8), `test_rayon_route_determinism`
+(route digest at 1/8/8), `test_rayon_emit_serial_identity`
+(`apply_routes`/`write_routed_def` at 1 vs 8) — same assertions,
+same digest pins. Every other caller passes `0`.
+
+**Greps** (`tests.md` checklist):
+
+```
+$ rg "set_var|remove_var|THREAD_ENV_LOCK|with_rayon_threads" crates/
+# no hits
+$ rg "RAYON_NUM_THREADS" crates/
+crates/grus-eda/src/main.rs          # the boundary read
+crates/grus-eda-core/src/drt/pool.rs # doc comment only — no env access
+$ rg "env::var" crates/grus-eda-core/src/drt/
+# only the surviving observability reads: GRUS_DRT_MEM, DRT_DEBUG_NET,
+# GRUS_DRT_TIMING
+```
+
+**Checks run** (E0 rule 9): `cargo test --workspace --profile
+verify` all green — 559 lib + 37 drt + 18 drc + 8 cli + 2 irdrop,
+0 failed (`#[ignore]`d picorv32 legs unchanged). The drt suite ran
+every forced arm at explicit 1/8: `test_rayon_graphs_serial_identity`,
+`test_net_graph_rebuild_identity`, `test_rayon_route_determinism`,
+`test_rayon_emit_serial_identity` all `ok`. Pins unmoved:
+`test_maze_census` holds `GCD_ROUTE_DIGEST = 0xef2b3ff70271a2e9`;
+`test_e2e_ours_def_deterministic_gcd` holds byte-equality against
+the committed `gcd.drt.ours.routed.def` — no golden regeneration.
+`cargo clippy --workspace --all-targets -- -D warnings` clean.

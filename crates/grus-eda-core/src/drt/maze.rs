@@ -52,6 +52,9 @@ pub struct MazeConfig {
     /// Iteration cap; the last iteration runs in hard mode (foreign
     /// hits are blocks, not costs).
     pub max_iters: u32,
+    /// Rayon pool size for the streamed attach pass and the rip-up
+    /// search; `0` keeps rayon's default parallelism.
+    pub threads: usize,
 }
 
 impl Default for MazeConfig {
@@ -59,6 +62,7 @@ impl Default for MazeConfig {
         Self {
             occ: OccMode::Enabled,
             max_iters: MAX_ITERS,
+            threads: 0,
         }
     }
 }
@@ -4294,10 +4298,10 @@ pub fn route_nets_with_progress(
     // most `threads` copies in flight instead of every net's graph +
     // topology for the whole run (the dominant resident set on
     // large designs).
-    // All drt parallel sections run inside a per-call pool so
-    // `RAYON_NUM_THREADS` is honored at call time — the global pool
-    // pins the env var on first use, untestable in-process.
-    let pool = drt_pool();
+    // All drt parallel sections run inside a per-call pool sized by
+    // `cfg.threads` — the pool size is a call input, so tests force
+    // per-call counts in one process without touching shared state.
+    let pool = drt_pool(cfg.threads);
     let nthreads = pool.current_num_threads();
     let t1 = std::time::Instant::now();
     // Per-net census partials minus the graph itself — the same
@@ -4430,7 +4434,7 @@ fn route_prepared(
     let timing = std::env::var_os("GRUS_DRT_TIMING").is_some();
     let mem_on = crate::drt::mem::enabled();
     let n = join.nets.len();
-    let pool = drt_pool();
+    let pool = drt_pool(cfg.threads);
     let nthreads = pool.current_num_threads();
     let net_idx: BTreeMap<u32, usize> = join
         .nets
