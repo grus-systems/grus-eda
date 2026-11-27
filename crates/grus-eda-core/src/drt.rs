@@ -16,6 +16,7 @@ pub mod graph;
 pub mod maze;
 pub mod mem;
 pub(crate) mod pool;
+pub mod probe;
 pub mod tracks;
 pub mod via;
 

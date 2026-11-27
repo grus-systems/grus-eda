@@ -646,7 +646,9 @@ the edge was never committed, or a bug. Macro OBS marks use the
 **unmerged** `obs_rects_raw` set — the `merge_connected_obs` bbox
 fills the decap/edge gaps pins need.
 
-**Pre-mark** (`premark_obs`, once at `route_nets` start): every
+**Pre-mark** (`premark_obs`, once at `route_nets` start — a thin
+`premark_marks(.., io_pin_marks: true)` wrapper so the probe can
+rerun the same rasterization minus io-port `Pin` marks): every
 `{Placed, Fixed, Cover}` cell's `obs_rects_raw` +
 `pin_obs_rects` on routing layers, clipped against the cell's own
 pin rects → `Obs(cell)` (the `drc::geom` source-4 convention —
@@ -748,6 +750,45 @@ deduped sorted vias), `relaxed_vias` in node order, and the `NetTopo`
 cache's byte-identical arcs. Two full runs produce identical
 `RouteDb`s — asserted on the full structure plus the nonzero `xxh3`
 `route_digest`.
+
+**Root-cause probe** (`drt::probe`, drt-unrouted-analysis): the
+unrouted report's decomposition — analysis only, never part of the
+route path. `probe_unrouted` rebuilds `premark_obs` occupancy minus
+every io-port `Pin` mark (`premark_marks(.., io_pin_marks = false)`
+— a fresh occupancy carries no `Net` marks, and an own `Pin` mark is
+free to its own net under every verdict, so dropping all `Pin` marks
+is equivalent to dropping foreign ones), then re-runs one
+`route_one_net` attempt per `route_db.unrouted` net inside
+`drt_pool(threads)` (`hist=0`, `hard=false`, `OccMode::Enabled` — no
+negotiable marks exist in the probe occupancy, so hard-vs-soft is
+moot and `Obs`/`ObsPin` walls block in every mode); the net's
+`NetGraph`/`NetTopo`/`NetAdj` are rebuilt against that occupancy
+(the topo rebuild is legal exactly because it never leaves the
+analysis). Each `u.failed` pin then
+lands in exactly one `RootCause` by the fixed cascade
+(`design/taxonomy.md` §3): probe `Routed`/pin-connected splits
+negotiation — `neg_attach_stub` vs `neg_attach_port` on
+`stub_outside_cover` membership for `Unattachable`, and for `NoPath`
+the wave-death `blockers` census (paired per pin when it covers the
+`NoPath` set 1:1, else the net-level set) splits `neg_wave`
+(`Net`/`Pin` evidence, kinds 2/3) from `neg_wave_obs_frontier`
+(`Obs`/`ObsPin` only — the mark drop was not the mechanism) and
+`neg_wave_unattributed` (empty census); probe-still-failed splits
+geometric — `geom_off_track`/`geom_no_in_region`/`geom_obs_sealed`
+by a read-only `project_attach` rescan (covered tracks → windowed
+candidates → `fill_blocked` stubs) for `Unattachable`, and
+`geom_met3_bridge`/`geom_disjoint`/`geom_pocket` by the moved
+`graph::guide_union` predicate for `NoPath`. `residual_missing_pin`
+and `residual_attach_inconsistent` are the named catch-alls — both
+asserted 0 on the shipped legs, so `class_counts` sums exactly to
+the unrouted pin census. Guide-absent io-pin-only nets
+(`absent_expected` ∩ single-member io-port-only — the golden
+verifier's step-E rule) are named in `unguided` rather than
+classified. `ProbeReport.elapsed` measures the probe itself.
+Measured decompositions and costs live in `docs/results.md` (gcd:
+54 `neg_attach_stub`,
+35 `neg_wave`, 4 `geom_pocket`; picorv32: the `geom_met3_bridge`
+net-count anchor).
 
 **Instrumentation**: `GRUS_DRT_TIMING` (any value) makes `route_nets`
 print premark/topo/per-iteration/per-slow-net timings to stderr —

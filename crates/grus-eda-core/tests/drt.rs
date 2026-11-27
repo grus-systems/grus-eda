@@ -25,8 +25,8 @@ use grus_eda_core::congestion::guide::{GuideBox, guide_net_name, parse_guides};
 use grus_eda_core::design_db::DesignDb;
 use grus_eda_core::drt::access::{AccessReport, access_points, pin_shapes};
 use grus_eda_core::drt::graph::{
-    EscapeKind, GraphOpts, GuideJoin, HullMask, build_route_graphs, cell_hull_rect, join_guides,
-    pin_rects,
+    EscapeKind, GraphOpts, GuideJoin, GuideUnion, HullMask, build_route_graphs, cell_hull_rect,
+    guide_union_connected, join_guides, pin_rects,
 };
 use grus_eda_core::drt::tracks::{Axis, LayerTracks, layer_tracks, track_gaps};
 use grus_eda_core::drt::via::{ViaPair, ViaTable, via_table};
@@ -1399,6 +1399,7 @@ use grus_eda_core::drt::maze::{
     FailKind, IterStat, MazeConfig, OccMode, RouteDb, RouteProgress, overlap_census, route_digest,
     route_nets, route_nets_with_progress,
 };
+use grus_eda_core::drt::probe::{ProbeNet, ProbePin, ProbeReport, RootCause, probe_unrouted};
 use grus_eda_core::drt::graph::RouteGraphs;
 
 /// `load` + `load_guide` + `build_route_graphs` + `via_table` — the
@@ -1645,6 +1646,57 @@ NETS 3 ;
 END NETS
 END DESIGN
 "#;
+
+/// The `geom_obs_sealed` arm's injected fixture (`probe.md` §4, arm
+/// C): `CELLD` is `CELLC` grown to 0.4×0.6 so the pin rect keeps one
+/// covered met1 line (y=1000 at the (1400,800) placement) while
+/// macro OBS walls off the hull interior above and below it — the
+/// pin's strict set is empty (escaped), every `project_attach`
+/// candidate's stub and every access-via plate hits a fixed `Obs`
+/// mark inside the host hull (host-open confinement admits the
+/// candidates to the wall; `Obs` then blocks them). `CELLE` is the
+/// identical outline without the OBS — the baseline arm.
+const SEAL_LEF: &str = r#"MACRO CELLD
+  CLASS CORE ;
+  SIZE 0.4 BY 0.6 ;
+  PIN C
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER met1 ;
+        RECT 0.0 0.2 0.4 0.4 ;
+    END
+  END C
+  OBS
+    LAYER met1 ;
+      RECT 0.0 0.0 0.4 0.2 ;
+      RECT 0.0 0.4 0.4 0.6 ;
+  END
+END CELLD
+MACRO CELLE
+  CLASS CORE ;
+  SIZE 0.4 BY 0.6 ;
+  PIN C
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER met1 ;
+        RECT 0.0 0.2 0.4 0.4 ;
+    END
+  END C
+END CELLE
+"#;
+
+/// `maze_tech` plus the arm-C seal macros.
+fn maze_tech_seal() -> TechDb {
+    let mut interner = StringInterner::new();
+    let mut tech = TechDb::new();
+    parse_lef_bytes(MAZE_LEF.as_bytes(), &mut tech, &mut interner).expect("fixture LEF parses");
+    parse_lef_bytes(SEAL_LEF.as_bytes(), &mut tech, &mut interner).expect("seal LEF parses");
+    tech.strings = interner.clone();
+    tech.rebuild_maps();
+    tech
+}
 
 /// The pin-collision fixture's tail: io2's met1 port rect sits
 /// mid-row between io1 and u0/A, so n1's direct y=1000 path crosses
@@ -2307,57 +2359,6 @@ fn test_maze_pin_collision() {
     );
 }
 
-/// True when the net's guide boxes form a single component under
-/// same-layer / adjacent-layer 2D-overlap (the planning probe's union
-/// connectivity). `max_layer` bounds the box set (LayerId(2) = met2).
-fn guide_union_connected(boxes: &[GuideBox], max_layer: u8) -> bool {
-    let kept: Vec<usize> = (0..boxes.len())
-        .filter(|&i| boxes[i].layer.0 <= max_layer)
-        .collect();
-    if kept.is_empty() {
-        return false;
-    }
-    let mut parent: Vec<usize> = (0..kept.len()).collect();
-    fn find(p: &mut [usize], i: usize) -> usize {
-        let mut r = i;
-        while p[r] != r {
-            r = p[r];
-        }
-        let mut j = i;
-        while p[j] != r {
-            let n = p[j];
-            p[j] = r;
-            j = n;
-        }
-        r
-    }
-    for a in 0..kept.len() {
-        for b in a + 1..kept.len() {
-            let (ba, bb) = (&boxes[kept[a]], &boxes[kept[b]]);
-            if ba.layer.0.abs_diff(bb.layer.0) > 1 {
-                continue;
-            }
-            let r = (
-                ba.rect.xl < bb.rect.xh,
-                ba.rect.xh > bb.rect.xl,
-                ba.rect.yl < bb.rect.yh,
-                ba.rect.yh > bb.rect.yl,
-            );
-            if r.0 && r.1 && r.2 && r.3 {
-                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-                if ra != rb {
-                    parent[ra] = rb;
-                }
-            }
-        }
-    }
-    (0..kept.len())
-        .map(|i| find(&mut parent, i))
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        == 1
-}
-
 /// Recorded gcd route digest (`docs/results.md` `drt-rayon` entry):
 /// a `route_digest` drift means the routed geometry, the
 /// connectivity record, or the iteration stats changed — the pin for
@@ -2538,6 +2539,366 @@ fn maze_census(name: &str) {
             "{name}: NoPath nets with fully-disjoint guides: {unclassified:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Root-cause probe (kurena/tasks/drt-unrouted-analysis)
+// ---------------------------------------------------------------------------
+
+/// The per-pin decomposition table `docs/results.md` transcribes,
+/// plus the anchor block: the met3-bridge union split and the
+/// `region_escape ∩ u.failed` per-class split.
+fn probe_report_lines(name: &str, rep: &ProbeReport, db: &DesignDb) {
+    let pins: usize = rep.nets.iter().map(|n| n.pins.len()).sum();
+    println!("== {name} unrouted probe ==");
+    println!(
+        "{name}: unrouted_nets={} unrouted_pins={pins} unguided_io_only={} probe_ms={}",
+        rep.nets.len(),
+        rep.unguided.len(),
+        rep.elapsed.as_millis(),
+    );
+    let class_counts = rep.class_counts();
+    let net_counts = rep.net_counts();
+    for (k, v) in &class_counts {
+        println!("{name}: {k}={v} nets={}", net_counts[k]);
+    }
+    for pn in &rep.nets {
+        let kinds: Vec<String> = pn
+            .pins
+            .iter()
+            .map(|p| format!("{}:{}", pin_label(db, p.pin), p.cause.name()))
+            .collect();
+        println!("  {} pins={kinds:?}", net_name(db, pn.net));
+    }
+    // Anchor: bridged-union nets split into `geom_met3_bridge` vs
+    // probe-rescued (every pin landing non-`geom_met3_bridge` is a
+    // rescue by definition — the bridge was not the blocker).
+    let bridged: Vec<&ProbeNet> =
+        rep.nets.iter().filter(|n| n.union == GuideUnion::Bridged).collect();
+    let m3b: usize = bridged
+        .iter()
+        .map(|n| n.pins.iter().filter(|p| p.cause == RootCause::GeomMet3Bridge).count())
+        .sum();
+    let rescued: usize = bridged.iter().map(|n| n.pins.len()).sum::<usize>() - m3b;
+    println!(
+        "{name}: bridged_union_nets={} geom_met3_bridge_pins={m3b} rescued_pins={rescued}",
+        bridged.len()
+    );
+    // Anchor: `region_escape ∩ u.failed` split by class — the flag is
+    // provenance, not a class.
+    let mut escape_split: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for pn in &rep.nets {
+        for pp in pn.pins.iter().filter(|p| p.region_escape) {
+            escape_split
+                .entry(pp.cause.name())
+                .or_default()
+                .push(format!("{}/{}", net_name(db, pn.net), pin_label(db, pp.pin)));
+        }
+    }
+    for (k, v) in &escape_split {
+        println!("{name}: region_escape {k}={} {v:?}", v.len());
+    }
+}
+
+/// The invariant bundle every probe leg asserts: nets/pins mirror
+/// `r.unrouted` positionally, every pin lands in exactly one class,
+/// `geom_met3_bridge` nets stay inside the bridged-union set, and the
+/// residual buckets stay empty (they are assertable because
+/// `class_counts` always carries the keys).
+fn assert_probe_coverage(rep: &ProbeReport, db: &DesignDb, r: &RouteDb) {
+    assert_eq!(rep.nets.len(), r.unrouted.len(), "probe nets != unrouted");
+    for (pn, u) in rep.nets.iter().zip(&r.unrouted) {
+        assert_eq!(pn.net, u.net, "probe net order diverged from unrouted");
+        assert_eq!(pn.pins.len(), u.failed.len());
+        for (pp, &(pin, kind)) in pn.pins.iter().zip(&u.failed) {
+            assert_eq!(pp.pin, pin);
+            assert_eq!(pp.real_kind, kind);
+        }
+    }
+    let class_counts = rep.class_counts();
+    let failed_total: usize = r.unrouted.iter().map(|u| u.failed.len()).sum();
+    assert_eq!(
+        class_counts.values().sum::<usize>(),
+        failed_total,
+        "root-cause classes must sum to the unrouted pin census"
+    );
+    assert_eq!(
+        class_counts["residual_missing_pin"], 0,
+        "{:?}",
+        rep.nets
+            .iter()
+            .filter(|n| n
+                .pins
+                .iter()
+                .any(|p| p.cause == RootCause::ResidualMissingPin))
+            .map(|n| net_name(db, n.net))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        class_counts["residual_attach_inconsistent"], 0,
+        "{:?}",
+        rep.nets
+            .iter()
+            .filter(|n| n
+                .pins
+                .iter()
+                .any(|p| p.cause == RootCause::ResidualAttachInconsistent))
+            .map(|n| net_name(db, n.net))
+            .collect::<Vec<_>>()
+    );
+    // met3-bridge anchor: `geom_met3_bridge`-carrying nets ⊆ the
+    // bridged-union set, and a bridged net's pins are met3_bridge or
+    // rescued (negotiation/residual) — never another `geom` class.
+    let bridged: BTreeSet<NetId> = rep
+        .nets
+        .iter()
+        .filter(|n| n.union == GuideUnion::Bridged)
+        .map(|n| n.net)
+        .collect();
+    let m3b_nets: BTreeSet<NetId> = rep
+        .nets
+        .iter()
+        .filter(|n| n.pins.iter().any(|p| p.cause == RootCause::GeomMet3Bridge))
+        .map(|n| n.net)
+        .collect();
+    assert!(
+        m3b_nets.is_subset(&bridged),
+        "geom_met3_bridge nets outside the bridged-union set: {:?}",
+        m3b_nets.difference(&bridged).collect::<Vec<_>>()
+    );
+    for pn in rep.nets.iter().filter(|n| n.union == GuideUnion::Bridged) {
+        for pp in &pn.pins {
+            assert!(
+                pp.cause == RootCause::GeomMet3Bridge || !pp.cause.is_geometric(),
+                "{}: {} landed {} on a bridged-union net",
+                net_name(db, pn.net),
+                pin_label(db, pp.pin),
+                pp.cause.name()
+            );
+        }
+    }
+}
+
+fn probe_find<'a>(
+    rep: &'a ProbeReport,
+    db: &DesignDb,
+    net: &str,
+    pin: &str,
+) -> &'a ProbePin {
+    rep.nets
+        .iter()
+        .find(|n| net_name(db, n.net) == net)
+        .and_then(|n| n.pins.iter().find(|p| pin_label(db, p.pin) == pin))
+        .unwrap_or_else(|| panic!("probe pin {net}/{pin} missing"))
+}
+
+/// gcd's final unrouted population decomposes exactly once per pin;
+/// the counts transcribe into `docs/results.md`.
+#[test]
+fn test_unrouted_probe_gcd() {
+    let leg = gcd_leg();
+    let (db, tech, tracks, join, vias, r) = (
+        &leg.db,
+        &leg.tech,
+        &leg.tracks,
+        &leg.join,
+        &leg.vias,
+        &leg.route,
+    );
+    let rep = probe_unrouted(db, tech, tracks, join, LOADED_OPTS, vias, r, 0);
+    probe_report_lines("gcd", &rep, db);
+    assert_probe_coverage(&rep, db, r);
+    // The measured decomposition — `docs/results.md` transcribes the
+    // same counts: 80 unrouted nets / 93 failed pins, all but four
+    // negotiation (the `stub_outside_cover`-backed attach stubs and
+    // the `Net`/`Pin`-evidenced wave deaths); no guide-absent io-only
+    // catch-alls.
+    assert_eq!(rep.nets.len(), 80);
+    assert_eq!(rep.nets.iter().map(|n| n.pins.len()).sum::<usize>(), 93);
+    assert_eq!(rep.unguided.len(), 0, "{:?}", rep.unguided);
+    // `unguided` joins the golden `ours_router.unguided` by name
+    // (gcd's golden list is empty).
+    let golden_unguided: BTreeSet<String> =
+        j_arr(&load_ours_ref("gcd")["ours_router"]["unguided"], "ours_router.unguided")
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+    assert_eq!(
+        rep.unguided.iter().map(|&n| net_name(db, n)).collect::<BTreeSet<String>>(),
+        golden_unguided
+    );
+    let class_counts = rep.class_counts();
+    assert_eq!(class_counts["neg_attach_stub"], 54);
+    assert_eq!(class_counts["neg_wave"], 35);
+    assert_eq!(class_counts["geom_pocket"], 4);
+    // Output-unchanged by construction, pinned anyway — the probe ran
+    // against `&RouteDb` and cannot move the digest.
+    assert_eq!(route_digest(&leg.route), GCD_ROUTE_DIGEST);
+}
+
+/// The probe is a pure function of the same inputs — two runs on the
+/// shared leg must land every pin in the same class.
+#[test]
+fn test_unrouted_probe_deterministic_gcd() {
+    let leg = gcd_leg();
+    let run = || {
+        probe_unrouted(
+            &leg.db,
+            &leg.tech,
+            &leg.tracks,
+            &leg.join,
+            LOADED_OPTS,
+            &leg.vias,
+            &leg.route,
+            0,
+        )
+    };
+    let (a, b) = (run(), run());
+    // `nets`/`unguided` compare by `PartialEq` — `elapsed` differs
+    // between runs and is excluded by construction (it is wall time).
+    assert_eq!(a.nets, b.nets, "probe decomposition must be deterministic");
+    assert_eq!(a.unguided, b.unguided);
+}
+
+/// Arm B (`probe.md` §4): the `test_maze_pin_collision` fixture's
+/// hard arm — io2's met1 port band is the only `Pin` mark on n1's
+/// wave path. Dropping it must route n1, and the `(met1, Pin)` wave
+/// postmortem lands u0/A in `neg_wave`.
+#[test]
+fn test_unrouted_probe_pin_collision() {
+    let tech = maze_tech();
+    let cfg = MazeConfig::default();
+    let comps = "COMPONENTS 2 ;\n- u0 CELL + PLACED ( 900 900 ) N ;\n- u1 CELLB + PLACED ( 3900 2900 ) N ;\nEND COMPONENTS\n";
+    let db = maze_db_custom(&tech, comps, MAZE_PIN_TAIL);
+    let tracks = layer_tracks(&db, &tech);
+    let vias = via_table(&tech, &db).unwrap();
+    let n2_guide = "n2\n(\n0 0 5000 5000 met1\n0 0 5000 5000 met2\n)\n";
+    let join = maze_guide(
+        &db,
+        &tech,
+        &format!("n1\n(\n0 800 5000 1200 met1\n)\n{n2_guide}"),
+    );
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
+    assert_eq!(r.unrouted.len(), 1, "{:?}", r.unrouted);
+    let rep = probe_unrouted(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &r, 0);
+    probe_report_lines("pin_collision", &rep, &db);
+    assert_probe_coverage(&rep, &db, &r);
+    let p = probe_find(&rep, &db, "n1", "u0/A");
+    assert_eq!(p.real_kind, FailKind::NoPath);
+    assert_eq!(p.cause, RootCause::NegWave);
+    assert_eq!(p.wave_evidence, Some((0, 3)), "{:?}", p);
+    assert!(
+        rep.nets.iter().all(|n| n.probe_routed),
+        "the probe must route n1 once the foreign Pin band is gone"
+    );
+}
+
+/// Arm A: case 4 of `test_maze_cases` — n1's disjoint guide union
+/// lands u0/A in `geom_disjoint`; u2/C's track-less rect lands in
+/// `geom_off_track` with `region_escape` set.
+#[test]
+fn test_unrouted_probe_geom_disjoint() {
+    let tech = maze_tech();
+    let cfg = MazeConfig::default();
+    let db = maze_db(&tech, false);
+    let tracks = layer_tracks(&db, &tech);
+    let vias = via_table(&tech, &db).unwrap();
+    let join = maze_guide(
+        &db,
+        &tech,
+        "n1\n(\n0 0 2000 2000 met1\n3500 500 4500 1500 met1\n)\nn3\n(\n0 0 5000 5000 met1\n)\n",
+    );
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
+    assert_eq!(r.unrouted.len(), 2, "{:?}", r.unrouted);
+    let rep = probe_unrouted(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &r, 0);
+    probe_report_lines("geom_disjoint", &rep, &db);
+    assert_probe_coverage(&rep, &db, &r);
+    let p = probe_find(&rep, &db, "n1", "u0/A");
+    assert_eq!(p.real_kind, FailKind::NoPath);
+    assert_eq!(p.cause, RootCause::GeomDisjoint);
+    let p = probe_find(&rep, &db, "n3", "u2/C");
+    assert_eq!(p.real_kind, FailKind::Unattachable);
+    assert_eq!(p.cause, RootCause::GeomOffTrack);
+    assert!(p.region_escape, "the off-track pin must escape the region");
+}
+
+/// Arm C — inject `CELLD`'s OBS seal over u2/C's only attach window,
+/// confirm the `geom_obs_sealed` classification, and revert to the
+/// `CELLE` baseline which routes clean. The exact class is asserted
+/// on the rescan evidence (host-open confinement admits one
+/// candidate; its stub dies on the `Obs` mark).
+#[test]
+fn test_unrouted_probe_geom_obs_sealed() {
+    let tech = maze_tech_seal();
+    let cfg = MazeConfig::default();
+    let comps = |mac: &str| {
+        format!(
+            "COMPONENTS 3 ;\n- u0 CELL + PLACED ( 900 900 ) N ;\n- u1 CELLB + PLACED ( 3900 2900 ) N ;\n- u2 {mac} + PLACED ( 1400 800 ) N ;\nEND COMPONENTS\n"
+        )
+    };
+    let guide = "n3\n(\n0 0 5000 5000 met1\n)\n";
+
+    // Baseline — the same pin geometry with no OBS routes.
+    let db = maze_db_custom(&tech, &comps("CELLE"), MAZE_DEF_TAIL);
+    let tracks = layer_tracks(&db, &tech);
+    let vias = via_table(&tech, &db).unwrap();
+    let join = maze_guide(&db, &tech, guide);
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
+    assert!(r.unrouted.is_empty(), "{:?}", r.unrouted);
+
+    // Injected — the OBS seal makes u2/C `Unattachable`, and the
+    // probe's rescan lands it in `geom_obs_sealed` (covered line,
+    // every admitted candidate's stub refused by `Obs`).
+    let db = maze_db_custom(&tech, &comps("CELLD"), MAZE_DEF_TAIL);
+    let tracks = layer_tracks(&db, &tech);
+    let vias = via_table(&tech, &db).unwrap();
+    let join = maze_guide(&db, &tech, guide);
+    let r = route_nets(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &cfg);
+    assert_eq!(r.unrouted.len(), 1, "{:?}", r.unrouted);
+    let rep = probe_unrouted(&db, &tech, &tracks, &join, GRAPHS_OPTS, &vias, &r, 0);
+    probe_report_lines("geom_obs_sealed", &rep, &db);
+    assert_probe_coverage(&rep, &db, &r);
+    let p = probe_find(&rep, &db, "n3", "u2/C");
+    assert_eq!(p.real_kind, FailKind::Unattachable);
+    assert_eq!(p.cause, RootCause::GeomObsSealed);
+    assert!(p.region_escape, "the sealed pin's strict set must be empty");
+}
+
+/// Ignored (runtime): the picorv32 probe runs the same re-attempts
+/// the route's 2016 final-unrouted nets took — the leg's route alone
+/// is ~135 min. Run: `cargo test --release -p grus-eda-core --test
+/// drt test_unrouted_probe_picorv32 -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_unrouted_probe_picorv32() {
+    let leg = leg_for("picorv32");
+    let rep = probe_unrouted(
+        &leg.db,
+        &leg.tech,
+        &leg.tracks,
+        &leg.join,
+        LOADED_OPTS,
+        &leg.vias,
+        &leg.route,
+        0,
+    );
+    probe_report_lines("picorv32", &rep, &leg.db);
+    assert_probe_coverage(&rep, &leg.db, &leg.route);
+    assert_eq!(rep.nets.len(), 2016);
+    // The named anchors: the met3-bridge residual (43 nets) and the
+    // guide-absent io-port population (67), the latter joined by
+    // name to the golden `ours_router.unguided` list.
+    assert_eq!(rep.net_counts()["geom_met3_bridge"], 43);
+    let golden_unguided: BTreeSet<String> =
+        j_arr(&load_ours_ref("picorv32")["ours_router"]["unguided"], "ours_router.unguided")
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+    assert_eq!(
+        rep.unguided.iter().map(|&n| net_name(&leg.db, n)).collect::<BTreeSet<String>>(),
+        golden_unguided
+    );
+    assert_eq!(rep.unguided.len(), 67, "{:?}", rep.unguided);
 }
 
 /// Occupancy fail-proof (AGENTS §7.7): identical inputs, `Enabled` vs

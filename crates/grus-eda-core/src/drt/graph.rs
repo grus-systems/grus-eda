@@ -1529,6 +1529,93 @@ pub fn build_route_graphs_ext(
     out
 }
 
+/// The guide-union connectivity class of one net's box set — the
+/// `met3_bridge`/`met2_connected`/`disjoint` trichotomy the unrouted
+/// census and the root-cause probe share (`docs/e6-drt.md` §7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuideUnion {
+    /// `!connected(≤met2) && connected(all layers)` — the ≤met2
+    /// union only rejoins at met3+ (the named met2–met3 edge-domain
+    /// residual).
+    Bridged,
+    /// `connected(≤met2)` — the low-layer union is already one
+    /// component.
+    Met2Connected,
+    /// The union stays disjoint at every layer bound.
+    Disjoint,
+    /// No guide boxes — defensive arm kept distinct so the
+    /// "0 guide-absent" invariant stays assertable rather than
+    /// collapsing into `Disjoint`.
+    GuideAbsent,
+}
+
+/// True when the net's guide boxes form a single component under
+/// same-layer / adjacent-layer 2D-overlap (the planning probe's union
+/// connectivity). `max_layer` bounds the box set (LayerId(2) = met2).
+pub fn guide_union_connected(boxes: &[GuideBox], max_layer: u8) -> bool {
+    let kept: Vec<usize> = (0..boxes.len())
+        .filter(|&i| boxes[i].layer.0 <= max_layer)
+        .collect();
+    if kept.is_empty() {
+        return false;
+    }
+    let mut parent: Vec<usize> = (0..kept.len()).collect();
+    fn find(p: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while p[r] != r {
+            r = p[r];
+        }
+        let mut j = i;
+        while p[j] != r {
+            let n = p[j];
+            p[j] = r;
+            j = n;
+        }
+        r
+    }
+    for a in 0..kept.len() {
+        for b in a + 1..kept.len() {
+            let (ba, bb) = (&boxes[kept[a]], &boxes[kept[b]]);
+            if ba.layer.0.abs_diff(bb.layer.0) > 1 {
+                continue;
+            }
+            let r = (
+                ba.rect.xl < bb.rect.xh,
+                ba.rect.xh > bb.rect.xl,
+                ba.rect.yl < bb.rect.yh,
+                ba.rect.yh > bb.rect.yl,
+            );
+            if r.0 && r.1 && r.2 && r.3 {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent[ra] = rb;
+                }
+            }
+        }
+    }
+    (0..kept.len())
+        .map(|i| find(&mut parent, i))
+        .collect::<BTreeSet<_>>()
+        .len()
+        == 1
+}
+
+/// The `GuideUnion` class of `boxes` — the pinned census's
+/// `!conn(≤2) && conn(all) → Bridged`; `conn(≤2) → Met2Connected`;
+/// else `Disjoint`; `boxes.is_empty() → GuideAbsent`.
+pub fn guide_union(boxes: &[GuideBox]) -> GuideUnion {
+    if boxes.is_empty() {
+        return GuideUnion::GuideAbsent;
+    }
+    if !guide_union_connected(boxes, 2) && guide_union_connected(boxes, u8::MAX) {
+        GuideUnion::Bridged
+    } else if guide_union_connected(boxes, 2) {
+        GuideUnion::Met2Connected
+    } else {
+        GuideUnion::Disjoint
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

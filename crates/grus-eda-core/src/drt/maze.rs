@@ -295,7 +295,7 @@ pub struct RouteDb {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Occupant {
+pub(crate) enum Occupant {
     /// Macro OBS outside the host cell's pin rects — a wall for every
     /// net, the host's included. `u32::MAX` marks blockage with no
     /// owning cell: metal of pins that own no net.
@@ -326,12 +326,12 @@ enum Occupant {
 /// the post-hoc census can run the exact `R' ∩ S` test, not just the
 /// band approximation a wire candidate gets for free.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Interval {
-    lo: i32,
-    hi: i32,
-    perp_lo: i32,
-    perp_hi: i32,
-    who: Occupant,
+pub(crate) struct Interval {
+    pub(crate) lo: i32,
+    pub(crate) hi: i32,
+    pub(crate) perp_lo: i32,
+    pub(crate) perp_hi: i32,
+    pub(crate) who: Occupant,
 }
 
 /// One rasterized insertion — the rip-up log. `x_axis` selects
@@ -370,7 +370,7 @@ struct Line {
 /// a direct slot index replaces a keyed lookup, and `coords_*` resolve
 /// a slot back to its line coordinate for `Hit.line` and the
 /// `scan_rect`/`rasterize` windows.
-struct Occupancy {
+pub(crate) struct Occupancy {
     lines_x: Vec<Vec<Line>>,
     lines_y: Vec<Vec<Line>>,
     /// Sorted line coordinates per axis — the `LayerTracks` lists,
@@ -452,13 +452,13 @@ impl ScanStats {
 /// blocking shape's full bbox can be reconstructed for repair
 /// decomposition.
 #[derive(Clone, Copy, Debug)]
-struct Hit {
-    iv: Interval,
-    line: i32,
-    layer: u8,
-    x_axis: bool,
-    lo: i32,
-    hi: i32,
+pub(crate) struct Hit {
+    pub(crate) iv: Interval,
+    pub(crate) line: i32,
+    pub(crate) layer: u8,
+    pub(crate) x_axis: bool,
+    pub(crate) lo: i32,
+    pub(crate) hi: i32,
 }
 
 /// The blocking shape's absolute bbox behind `h` — `iv` stores the
@@ -472,7 +472,7 @@ fn hit_bbox(h: &Hit) -> RectDbu {
 }
 
 impl Occupancy {
-    fn new(tech: &TechDb, tracks: &[LayerTracks]) -> Self {
+    pub(crate) fn new(tech: &TechDb, tracks: &[LayerTracks]) -> Self {
         Self {
             lines_x: tracks
                 .iter()
@@ -602,7 +602,15 @@ impl Occupancy {
     /// `< s` along the line; the perpendicular `< s` is already
     /// guaranteed because the committed shape rasterized the line
     /// only inside its `w/2 + s` band.
-    fn scan_wire(&self, axis: Axis, layer: u8, ti: u32, c: i32, d: i32, out: &mut Vec<Hit>) {
+    pub(crate) fn scan_wire(
+        &self,
+        axis: Axis,
+        layer: u8,
+        ti: u32,
+        c: i32,
+        d: i32,
+        out: &mut Vec<Hit>,
+    ) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
         // Census is bulk-added once per call — a per-element store
@@ -652,7 +660,7 @@ impl Occupancy {
     /// the full 2D test on the stored perpendicular extent; a
     /// collision sliver containing no track line on either axis is the
     /// recorded miss class (spacing-lite).
-    fn scan_rect(&self, layer: u8, r: &RectDbu, out: &mut Vec<Hit>) {
+    pub(crate) fn scan_rect(&self, layer: u8, r: &RectDbu, out: &mut Vec<Hit>) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
         let st = self.stats.slot();
@@ -739,6 +747,17 @@ impl Occupancy {
 /// `req_msg`/`resp_msg` class), so the band is priced, recorded
 /// wire-side, and finally walled.
 fn premark_obs(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy) {
+    premark_marks(db, tech, occ, true);
+}
+
+/// `premark_obs` with the io-port `Pin` arm gated by `io_pin_marks`:
+/// `false` drops every io-port mark while keeping the fixed walls
+/// (`Obs`, `ObsPin`, net-less `Obs(u32::MAX)`, PDN) — the probe
+/// occupancy `drt::probe` re-attempts unrouted nets against. A fresh
+/// occupancy carries no `Net` marks, and an own `Pin` mark is free to
+/// its own net under every verdict, so dropping *all* `Pin` marks is
+/// behaviour-identical to dropping only foreign ones.
+pub(crate) fn premark_marks(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy, io_pin_marks: bool) {
     // Cell → its instance pins' placed shapes per layer — OBS paint
     // clipped against them keeps a wall only where it is not pin.
     let mut cell_pins: BTreeMap<u32, Vec<(u8, RectDbu)>> = BTreeMap::new();
@@ -793,7 +812,7 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy) {
             }
         }
     }
-    rasterize_pin_marks(db, tech, occ);
+    rasterize_pin_marks(db, tech, occ, io_pin_marks);
     // PDN stripes and via stacks: fixed metal every signal net must
     // clear — the emit-time self-DRC measures spacing against these
     // shapes, so the router has to price them.
@@ -820,8 +839,9 @@ fn premark_obs(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy) {
 /// net-less pins `Obs(u32::MAX)`; pins on non-`{Placed, Fixed,
 /// Cover}` hosts are skipped. Shared by the router's premark and
 /// `pin_overlap_census`'s rebuild so the census measures against
-/// exactly the marks the router saw.
-fn rasterize_pin_marks(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy) {
+/// exactly the marks the router saw. `io_pin_marks == false` drops
+/// the io-port `Pin` arm entirely — the `drt::probe` occupancy.
+fn rasterize_pin_marks(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy, io_pin_marks: bool) {
     for p in 0..db.pin_names.len() {
         if let Some(c) = db.pin_cells[p]
             && !matches!(
@@ -839,7 +859,8 @@ fn rasterize_pin_marks(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy) {
             // live outside hulls and keep the soft `Pin` price (the
             // met3.2 port-band finding class).
             Some(n) if db.pin_cells[p].is_some() => Occupant::ObsPin(n.0),
-            Some(n) => Occupant::Pin(n.0),
+            Some(n) if io_pin_marks => Occupant::Pin(n.0),
+            Some(_) => continue,
         };
         for (lid, r) in pin_shapes(db, tech, pin) {
             if (lid.0 as usize) < occ.lines_x.len() {
@@ -855,7 +876,7 @@ fn rasterize_pin_marks(db: &DesignDb, tech: &TechDb, occ: &mut Occupancy) {
 
 /// Index range `[a, b)` of `list` entries inside `[lo, hi]` — the
 /// `drt::graph` convention, replicated for the projection fallback.
-fn covered_range(list: &[i32], lo: i32, hi: i32) -> (usize, usize) {
+pub(crate) fn covered_range(list: &[i32], lo: i32, hi: i32) -> (usize, usize) {
     (
         list.partition_point(|&t| t < lo),
         list.partition_point(|&t| t <= hi),
@@ -933,7 +954,7 @@ fn project_attach(
 // ---------------------------------------------------------------------------
 
 /// A node's absolute coordinates.
-fn node_xy(g: &NetGraph, tracks: &[LayerTracks], id: u32) -> (i32, i32) {
+pub(crate) fn node_xy(g: &NetGraph, tracks: &[LayerTracks], id: u32) -> (i32, i32) {
     let n = &g.nodes[id as usize];
     let lt = &tracks[n.layer.0 as usize];
     (lt.tracks_x[n.ix as usize], lt.tracks_y[n.iy as usize])
@@ -1122,7 +1143,7 @@ fn exempt_obs(cover: &PinCover, paint: &RectDbu, hits: &mut Vec<Hit>, from: usiz
 /// shares one coordinate with `(x, y)` by construction, so the stub
 /// is a single-axis interval (or absent when `n` sits on the via).
 #[allow(clippy::too_many_arguments)]
-fn scan_stub(
+pub(crate) fn scan_stub(
     g: &NetGraph,
     tracks: &[LayerTracks],
     occ: &Occupancy,
@@ -1199,7 +1220,7 @@ fn record_hits(
 /// against live occupancy with no graph reference. Order mirrors the
 /// per-edge `record` sequence `edge_collisions` produced exactly.
 #[derive(Clone, Copy)]
-enum EdgeProbe {
+pub(crate) enum EdgeProbe {
     /// `scan_wire(axis, l, ti, c, d)` then `record(l)` — the in-plane
     /// `g.edges` arm.
     Wire {
@@ -1924,7 +1945,7 @@ fn other_end(g: &NetGraph, relax: &[RelaxedVia], eidx: u32, v: u32) -> u32 {
 }
 
 /// One routed net's outcome.
-enum NetOutcome {
+pub(crate) enum NetOutcome {
     /// Route, the commit-time collision `EdgeProbe`s, and the closure
     /// pass's named residuals (`self-spacing.md`, `residuals.md`).
     /// The provisional-collision scan runs at commit time against
@@ -1956,7 +1977,7 @@ enum NetOutcome {
 /// committed routes and change the output). The occupancy-free half
 /// — member lookup, relaxed edge domain, CSR adjacency — lives in
 /// `NetAdj` and is rebuilt per attempt.
-struct NetTopo {
+pub(crate) struct NetTopo {
     /// Per member pin (`pin_nodes` order): strict `pin_nodes`, else the
     /// projection fallback.
     attach: Vec<Vec<u32>>,
@@ -1968,11 +1989,11 @@ struct NetTopo {
     /// Own-pin rects for the hull mask — the confinement checks in
     /// `relaxed_vias`/`project_attach` and the stub guard in
     /// `route_one_net`.
-    cover: PinCover,
+    pub(crate) cover: PinCover,
 }
 
 impl NetTopo {
-    fn new(
+    pub(crate) fn new(
         db: &DesignDb,
         tech: &TechDb,
         tracks: &[LayerTracks],
@@ -2054,7 +2075,7 @@ impl NetTopo {
 /// run. The unified edge index space `[0,E) | [E,E+V) | [E+V,E+V+R)`
 /// and the arc order (in-plane, then strict, then relaxed) are
 /// identical to the old once-built fields — byte-identical search.
-struct NetAdj {
+pub(crate) struct NetAdj {
     /// Attach node → member pin indices, CSR by node id — each node's
     /// pin list in `attach` scan order, the same order the old
     /// `BTreeMap` pushed them.
@@ -2075,7 +2096,7 @@ impl NetAdj {
     /// edge (pre-gated by `relaxed_vias`). Strict arcs come before
     /// relaxed arcs so an equal-`VIA_COST` tie relaxes toward the
     /// strict placement.
-    fn new(
+    pub(crate) fn new(
         g: &NetGraph,
         topo: &NetTopo,
         tech: &TechDb,
@@ -2537,7 +2558,7 @@ impl<'t> NetRun<'t> {
 /// return the committed `NetRoute` plus the provisional collisions its
 /// edges took, or the per-pin named failure.
 #[allow(clippy::too_many_arguments)]
-fn route_one_net(
+pub(crate) fn route_one_net(
     db: &DesignDb,
     tech: &TechDb,
     tracks: &[LayerTracks],
@@ -3721,7 +3742,7 @@ fn overlaps_closed(a: &RectDbu, b: &RectDbu) -> bool {
 
 /// Does `h` block committed paint for `own` net — the emit-time
 /// verdict (same predicate as `try_pin_paint`'s arc scan).
-fn fill_blocked(h: &Hit, own: u32) -> bool {
+pub(crate) fn fill_blocked(h: &Hit, own: u32) -> bool {
     match h.iv.who {
         Occupant::Obs(_) => true,
         Occupant::ObsPin(m) | Occupant::Net(m) | Occupant::Pin(m) => m != own,
@@ -4880,7 +4901,7 @@ pub fn pin_overlap_census(
     routes: &[NetRoute],
 ) -> Vec<Collision> {
     let mut occ = Occupancy::new(tech, tracks);
-    rasterize_pin_marks(db, tech, &mut occ);
+    rasterize_pin_marks(db, tech, &mut occ, true);
     for r in routes {
         let mut sink = Vec::new();
         commit_route(&mut occ, vias, r, &mut sink);
