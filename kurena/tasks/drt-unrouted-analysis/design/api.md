@@ -131,8 +131,11 @@ Widening only; no behaviour change. As-built, `probe.rs` needs:
 | `covered_range` | rescan helper |
 
 Widened but **unused** — revert to private (`steps.md` §2):
-`EdgeProbe`, `node_xy`, `Occupancy::scan_wire`,
-`Occupancy::scan_rect`. `hit_bbox` stayed private.
+`node_xy`, `Occupancy::scan_wire`, `Occupancy::scan_rect`.
+`hit_bbox` stayed private. `EdgeProbe` stays `pub(crate)` —
+it is reachable through `pub(crate) NetOutcome::Routed`'s
+`Vec<EdgeProbe>` field (`private_interfaces`), so the r2
+"revert" plan was wrong on this one item.
 
 No new `pub` items on `maze.rs`; no signature change to any
 `pub` item. `premark_obs` keeps its name and call sites.

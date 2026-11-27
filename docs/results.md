@@ -11336,7 +11336,9 @@ Arm D (recorded, not committed): `geom_off_track` → `GeomPocket`
 inside the probe `Unattachable` rescan arm → `cargo test -p
 grus-eda-core --test drt test_unrouted_probe_geom_disjoint` FAILED at
 `crates/grus-eda-core/tests/drt.rs:2821` (`left: GeomPocket, right:
-GeomOffTrack`) → reverted, `ok` in 0.07s.
+GeomOffTrack`) → reverted, `ok` in 0.07s — re-confirmed on the
+final tree 2026-11-28 (same assert, same observed pair; `ok` in
+0.01s after revert).
 
 **Routed-output-unchanged**: no route-path code touched besides the
 `premark_obs` → `premark_marks` split (same marks, `io_pin_marks:
@@ -11348,16 +11350,26 @@ committed `gcd.drt.ours.routed.def` — both in the verify run below;
 the probe ran.
 
 **Checks run** (E0 rule 9): `cargo test --workspace --profile
-verify` all green on this tree — 8 cli + 559 lib + 18 drc + 42 drt
-+ 2 irdrop, 0 failed (4 `#[ignore]`d). An earlier verify attempt is
-named here for the record: its test binary compiled during the
-prove-it-red injection window and carried the bogus mapping, so its
-two probe-test failures (`neg_wave` pins misclassified
-`geom_pocket`) measured the red arm, not the tree — the rerun on
-the final tree is the figure of record. `cargo test -p grus-eda-core
---test drt unrouted_probe` 5 passed / 1 ignored (dev);
-`test_unrouted_probe_gcd` + determinism under `--release`
-(gcd `probe_ms=203` above); `cargo clippy --workspace --all-targets
--- -D warnings` clean. The picorv32 probe leg is `#[ignore]`d, in
-flight at writing — its numbers land in the amendment below when the
-leg completes; the gcd figures are the pinned ones.
+verify` all green on this tree — 8 cli + 559 lib (2 ignored)
++ 18 drc + 42 drt (4 ignored) + 2 irdrop, 0 failed, run
+2026-11-28. `cargo clippy --workspace --all-targets --
+-D warnings` clean on the same tree — after one caught item:
+the dead-widening revert had taken `EdgeProbe` private while
+it stays reachable through `pub(crate)
+NetOutcome::Routed(.., Vec<EdgeProbe>, ..)`, tripping
+`-D private-interfaces`; `EdgeProbe` is `pub(crate)` again
+(design `steps.md` §2 amended — its revert list was wrong on
+that item). An earlier verify attempt is named here for the
+record: its test binary compiled during the prove-it-red
+injection window and carried the bogus mapping, so its two
+probe-test failures (`neg_wave` pins misclassified
+`geom_pocket`) measured the red arm, not the tree — the rerun
+on the final tree is the figure of record. `cargo test -p
+grus-eda-core --test drt unrouted_probe` 5 passed / 1 ignored
+(dev); `test_unrouted_probe_gcd` + determinism under
+`--release` (gcd `probe_ms=203` above). The picorv32 probe
+leg is `#[ignore]`d — detached
+(`nohup cargo test --release -p grus-eda-core --test drt
+test_unrouted_probe_picorv32 -- --ignored --nocapture`),
+in flight at writing; its numbers land in the amendment below
+when the leg completes; the gcd figures are the pinned ones.

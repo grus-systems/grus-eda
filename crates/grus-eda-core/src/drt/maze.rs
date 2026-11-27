@@ -1220,7 +1220,7 @@ fn record_hits(
 /// against live occupancy with no graph reference. Order mirrors the
 /// per-edge `record` sequence `edge_collisions` produced exactly.
 #[derive(Clone, Copy)]
-enum EdgeProbe {
+pub(crate) enum EdgeProbe {
     /// `scan_wire(axis, l, ti, c, d)` then `record(l)` — the in-plane
     /// `g.edges` arm.
     Wire {

@@ -49,7 +49,9 @@ field-visibility), `UnroutedNet`/`FailKind`/`RouteDb`/`OccMode`
 (already `pub`). Widenings with **no** user outside `maze.rs` —
 revert to private:
 
-- `enum EdgeProbe` → `enum`
+- `enum EdgeProbe` → **stays `pub(crate)`** — reachable via
+  `pub(crate) NetOutcome::Routed(.., Vec<EdgeProbe>, ..)`;
+  reverting trips `-D private-interfaces` (observed).
 - `fn node_xy` → `fn`
 - `Occupancy::scan_wire`, `Occupancy::scan_rect` → `fn`
 
