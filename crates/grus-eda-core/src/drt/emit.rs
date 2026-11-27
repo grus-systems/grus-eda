@@ -16,11 +16,13 @@ use crate::drc::geom::assemble;
 use crate::drc::report::{SubsetReport, run_all};
 use crate::drt::graph::RouteGraphs;
 use crate::drt::maze::{RouteDb, ViaPlace, WireSeg};
+use crate::drt::pool::drt_pool;
 use crate::drt::via::ViaTable;
 use crate::interner::{LayerId, NetId};
 use crate::readers::def::escape_def_name;
 use crate::tech_db::{RectDbu, TechDb};
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
@@ -93,30 +95,68 @@ pub fn apply_routes(
         routed: route_db.nets.len(),
         ..Default::default()
     };
+    // Per-net `NetGeom` assembly is read-only against `db`/`tech`/
+    // `via_table` — build in parallel, then apply to `db.net_geoms`
+    // in `route_db.nets` order. `collect` preserves input order, so
+    // the resulting geometry and report are byte-identical to the
+    // serial fold under any thread count.
+    struct NetEmit {
+        net: u32,
+        geom: NetGeom,
+        wire_len: u64,
+        cut_names: Vec<String>,
+    }
+    let db_ref: &DesignDb = db;
+    let built: Vec<Result<NetEmit>> = drt_pool().install(|| {
+        route_db
+            .nets
+            .par_iter()
+            .map(|nr| {
+                let mut geom = NetGeom::default();
+                let mut wire_len = 0u64;
+                for w in &nr.wires {
+                    wire_len += (w.x2 - w.x1 + w.y2 - w.y1) as u64;
+                    geom.wire_rects.push((w.layer, seg_rect(w, tech)));
+                }
+                // Self-spacing fills are committed paint — a `wire_rects`
+                // entry each (they emit as `RECT` path records, not 2-point
+                // wires, so `wire_length_dbu` stays centerline-honest).
+                for (lid, r) in &nr.fills {
+                    geom.wire_rects.push((*lid, *r));
+                }
+                let mut cut_names = Vec::with_capacity(nr.vias.len());
+                for vp in &nr.vias {
+                    let via = place_via(db_ref, tech, via_table, vp, nr.net)?;
+                    let cut_name = via_table.pairs[vp.lower.0 as usize]
+                        .cut
+                        .map(|c| tech.strings.resolve(c).to_string())
+                        .unwrap_or_else(|| db_ref.strings.resolve(via.cut).to_string());
+                    cut_names.push(cut_name);
+                    geom.vias.push(via);
+                }
+                Ok(NetEmit {
+                    net: nr.net.0,
+                    geom,
+                    wire_len,
+                    cut_names,
+                })
+            })
+            .collect()
+    });
     let mut routed: BTreeSet<u32> = BTreeSet::new();
-    for nr in &route_db.nets {
-        routed.insert(nr.net.0);
-        let mut geom = NetGeom::default();
-        for w in &nr.wires {
-            report.wire_length_dbu += (w.x2 - w.x1 + w.y2 - w.y1) as u64;
-            geom.wire_rects.push((w.layer, seg_rect(w, tech)));
+    for part in built {
+        let NetEmit {
+            net,
+            geom,
+            wire_len,
+            cut_names,
+        } = part?;
+        routed.insert(net);
+        report.wire_length_dbu += wire_len;
+        for c in cut_names {
+            *report.vias_per_cut.entry(c).or_default() += 1;
         }
-        // Self-spacing fills are committed paint — a `wire_rects`
-        // entry each (they emit as `RECT` path records, not 2-point
-        // wires, so `wire_length_dbu` stays centerline-honest).
-        for (lid, r) in &nr.fills {
-            geom.wire_rects.push((*lid, *r));
-        }
-        for vp in &nr.vias {
-            let via = place_via(db, tech, via_table, vp, nr.net)?;
-            let cut_name = via_table.pairs[vp.lower.0 as usize]
-                .cut
-                .map(|c| tech.strings.resolve(c).to_string())
-                .unwrap_or_else(|| db.strings.resolve(via.cut).to_string());
-            *report.vias_per_cut.entry(cut_name).or_default() += 1;
-            geom.vias.push(via);
-        }
-        db.net_geoms[nr.net.0 as usize] = geom;
+        db.net_geoms[net as usize] = geom;
     }
 
     let mut unrouted_set: BTreeSet<u32> = BTreeSet::new();
@@ -257,7 +297,12 @@ fn nets_section(db: &DesignDb, tech: &TechDb) -> Result<String> {
     };
     let mut out = String::with_capacity(1 << 20);
     out.push_str(&format!("NETS {} ;\n", db.num_nets()));
-    for n in 0..db.num_nets() {
+    // One record per net in db order — the strings are pure per-net
+    // reads, so they build in parallel and concat in order.
+    let recs: Vec<String> = drt_pool().install(|| {
+        (0..db.num_nets())
+            .into_par_iter()
+            .map(|n| {
         let net = NetId(n as u32);
         let net_name = guide_net_name(db, net);
         let mut rec = format!("    - {net_name}");
@@ -312,6 +357,11 @@ fn nets_section(db: &DesignDb, tech: &TechDb) -> Result<String> {
             rec.push_str(&format!("\n    {kw} {stmt}"));
         }
         rec.push_str("\n    + USE SIGNAL ;\n");
+        rec
+            })
+            .collect()
+    });
+    for rec in recs {
         out.push_str(&rec);
     }
     out.push_str("END NETS\n");

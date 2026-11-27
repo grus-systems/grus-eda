@@ -10690,3 +10690,164 @@ cargo test --release -p grus-eda-core --test drt \
   + 32 drt (incl. the `GCD_ROUTE_DIGEST` pin in `test_maze_census`)
   + 18 drc + 8 cli + 2 irdrop, 5 `#[ignore]`d; `cargo clippy
   --workspace --all-targets -- -D warnings` clean.
+
+### 2026-11-27 — drt-rayon: parallel route graph build, maze search, emit (v0.14.3)
+
+The drt phases now run inside a per-call `rayon::ThreadPool`
+(`drt::pool::drt_pool`) that reads `RAYON_NUM_THREADS` at call time —
+the global pool pins the env var process-wide on first use, which
+would make the forced-thread-count determinism arms untestable.
+**Build/emit** assemble per-net in parallel and fold serially in
+`join.nets` order → byte-identical at any thread count. **Route** is
+snapshot-search / ordered-commit: in each soft iteration every `bad`
+net runs `route_one_net` against the iteration-start `&Occupancy`
+in parallel (ordered collect preserves `bad` order), then outcomes
+commit serially in `bad` order; the provisional-collision
+`edge_collisions` scan moved from extraction into the commit loop
+against live `occ` (precedes each `commit_route` rasterization). The
+last (hard) iteration keeps the serial interleave. Still serial:
+premark, min-area patch, post-hoc censuses, `run_all`
+orchestration. `ScanStats` counts via cache-line-padded per-worker
+`AtomicU64` slots — a single shared word measured a ~7× contention
+slowdown on the 8-thread arm (`search` 6.3 s vs 0.86 s serial on
+iter 1's 1.4 B `fetch_add`s); after slotting, per-arm scan totals
+are identical.
+
+**Machine context**: Mac mini `Q0tzlynoMac-mini`, Apple M4 (4P+6E),
+16 GB; `sw_vers` macOS 27.2.1 (26B131); `rustc 1.100.0 (0ef1bc386
+2026-11-09)`; `cargo build --release`, binary `target/release/grus-eda`
+in the ticket worktree `.kurena/wt/drt-rayon`. Rep policy: 5 reps
+per arm, the `route_ms=` field of the `guided=` census line
+(`--no-self-drc` excludes the post-emit check); median is the table
+figure.
+
+**Phase split** (`GRUS_DRT_TIMING=1`, stderr; baseline has no
+`build_graphs`/`emit_*`/`total` lines — that instrumentation landed
+with this change):
+
+| phase | baseline serial | threads=1 | threads=8 |
+|---|---|---|---|
+| build_graphs | n/a | 108.7 ms | 37.9 ms |
+| premark_obs | 6.8 ms | 6.8 ms | 7.0 ms |
+| topos | 218.6 ms | 218.6 ms | 51.1 ms |
+| soft iters 1–7 (search) | ≈10.55 s (whole-iter lines) | 6.00 s Σ `search=` | 2.00 s Σ `search=` |
+| soft iters 1–7 (commit) | — (interleaved) | 24.8 ms Σ `commit=` | 25.0 ms Σ `commit=` |
+| iter 8 (hard, serial) | ≈0.9 s remainder | ≈1.0 s | ≈1.0 s |
+| min-area patch | 10.0 ms | 10.1 ms | 9.9 ms |
+| emit_apply | n/a | 135 µs | 180 µs |
+| emit_write | n/a | 25.8 ms | 1.5 ms |
+| `total` | n/a | 8.07 s | 3.76 s |
+
+The rip-up loop is ~93 % of route time at baseline — the dominant
+target as designed. `occ-scan totals` are identical between the
+t1/t8 arms (wire=67260123 rect=54869041 rect_lines=306697616
+ivs=1470643432 hits=51799058 marks+=280571 marks-=191651) but
+legitimately differ from baseline — snapshot search explores a
+different query stream than the serial interleave.
+
+**Wall** (`route_ms`, gcd, `--no-self-drc`):
+
+| arm | rep1 | rep2 | rep3 | rep4 | rep5 | median |
+|---|---|---|---|---|---|---|
+| baseline serial | 11924 | 11953 | 11948 | 11962 | 11975 | **11953** |
+| `RAYON_NUM_THREADS=1` | 7078 | 7133 | 7103 | 7153 | 7122 | **7122** |
+| `RAYON_NUM_THREADS=8` | 3490 | 3357 | 3449 | 3499 | 3345 | **3490** |
+
+Median t8 vs baseline: **−70.8 %** (3.42×); t1 vs baseline −40.4 %
+(the commit-scan restructure and `ScanStats` slotting also helped
+serial); t8 vs t1 2.04×. `threads=` tokens on every timing line
+match the forced env var.
+
+**Identity evidence**:
+
+- `route_digest` `0x8a4768ab15bd4bd5` → `0xef2b3ff70271a2e9` —
+  expected, not tolerated: same-iteration searches see the
+  iteration-start snapshot instead of earlier same-iteration
+  commits, so the committed stream legitimately differs; re-pinned
+  as `GCD_ROUTE_DIGEST` in `test_maze_census`.
+- `threads=1` vs `threads=8` (×2) digests **equal**
+  (`test_rayon_route_determinism`, d1==d2==d3); `collisions=0` on
+  every arm; census `guided=269 routed=189 unrouted=80
+  projected=8 iterations=8` unchanged — `notch_fills` 343 → 342
+  (different committed routes legitimately leave different
+  post-patch geometry).
+- Emitted DEF sha256
+  `1422d02765f6aba99e25f1792436607c788ca31397c0bf843340bd65fb2f9482`
+  on all 10 rep DEFs across both arms, byte-identical to the
+  regenerated golden `tests/designs/gcd/gcd.drt.ours.routed.def`.
+- `RouteGraphs` debug-hash `xxh3_64(format!("{graphs:?}"))` =
+  `0x80e79798144da24b` — identical on the serial-baseline build
+  (detached worktree at `HEAD` 17b7b3f), and at `threads=1` and
+  `threads=8` on this change (`test_rayon_graphs_serial_identity`
+  pins the Debug-format equality outright).
+- `occ-scan totals` identical t1/t8 (above) — same scan stream
+  under both pool sizes.
+
+**Golden regen** (`check_drt_ours.sh gcd` inside the pinned
+LibreLane container, Colima): `generate_drt_ours.sh gcd` (+ `--verify`
+double-emit `cmp` byte-identical) re-emitted
+`gcd.drt.ours.routed.def` + `gcd.drt.ours.reference.json`;
+`lef_expressible_nonzero=0` on all 50 rules.
+
+**Prove-it-red** (AGENTS §7.7) — all arms restored and re-verified
+green; transcript tails:
+
+- Commit-time `edge_collisions` scan disabled →
+  `test_rayon_route_determinism` red: `arm 0: routed end state has
+  8430 residual collisions` (stale snapshot conflicts go unrecorded,
+  never re-queued, and `overlap_census` catches them). The
+  originally specified break — `commit_route` rasterization before
+  the scan — is a **no-op**: own-net marks are exempt in
+  `hit_verdict`, so it stayed green; scan-disable is the honest
+  break.
+- Ordered-collect fold replaced by workers pushing `NetBuild` into
+  a `Mutex<Vec>` (scheduling-dependent order) →
+  `test_rayon_graphs_serial_identity` red: `graph build diverged
+  under 8 threads`; `test_graph_determinism` red. Two simpler
+  candidate breaks were **no-ops** and documented: `sort_by_key
+  (net.0)` (`join.nets` is already net-ordered) and `.reverse()`
+  (applied to both arms equally).
+- `GCD_ROUTE_DIGEST` `…a2e9` → `…a2e8` → `test_maze_census` red:
+  `gcd route digest drifted — left: 17233938729193808617 right:
+  17233938729193808616` (the left value confirms the computed digest
+  is still `0xef2b3ff70271a2e9`).
+
+**picorv32 arm**: **not measured — deferred** (full route recorded
+~128 min on the Nov-26 census run; no counter-carrying arm was
+scheduled inside the ticket). `generate_drt_ours.sh picorv32` regen
+is deferred-named with it — the gcd digest + DEF + graph-fingerprint
+pins carry the identity proof.
+
+**Exact commands** (task worktree; pool-forced via env):
+
+```sh
+cargo build --release -p grus-eda
+GRUS=target/release/grus-eda
+LIB=$HOME/.ciel/sky130A/libs.ref/sky130_fd_sc_hd
+TLEF=$LIB/techlef/sky130_fd_sc_hd__nom.tlef
+LEF=$LIB/lef/sky130_fd_sc_hd.lef
+D=tests/designs/gcd
+for t in 1 8; do for i in 1 2 3 4 5; do
+  RAYON_NUM_THREADS=$t $GRUS drt --tlef $TLEF --lef $LEF \
+    --def $D/gcd.placed.def --guide $D/gcd.guide \
+    --out-def /tmp/gcd.rayon.rep2.$t.$i.def \
+    --reference $D/gcd.drt.reference.json --no-self-drc \
+    | grep 'guided='
+done; done
+shasum -a 256 /tmp/gcd.rayon.rep2.*.def \
+  tests/designs/gcd/gcd.drt.ours.routed.def
+GRUS_DRT_TIMING=1 RAYON_NUM_THREADS={1,8} $GRUS drt …  # phase split
+cargo test --release -p grus-eda-core --test drt \
+  test_rayon_graphs_serial_identity test_rayon_route_determinism \
+  test_rayon_emit_serial_identity test_maze_census -- --nocapture
+tests/designs/generate_drt_ours.sh gcd   # + --verify
+tests/designs/check_drt_ours.sh gcd      # LibreLane container
+# baseline fingerprint: detached `git worktree add … HEAD --detach`,
+# temporary println xxh3_64(format!("{graphs:?}")) — reverted after
+```
+
+- **Checks run** (E0 rule 9): `cargo test --workspace --profile
+  verify` all green — 559 lib + 35 drt (incl. the three
+  `test_rayon_*` pins and the re-pinned `GCD_ROUTE_DIGEST`) + 18 drc
+  + 8 cli + 2 irdrop, `#[ignore]`d legs unchanged; `cargo clippy
+  --workspace --all-targets -- -D warnings` clean.
