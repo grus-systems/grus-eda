@@ -25,26 +25,9 @@ run can feed all of them.
    route changes (red-check one digest pin by perturbing it,
    restore).
 
-4. Make the `with_rayon_threads` env manipulation sound (card #60
-   review medium): the current `THREAD_ENV_LOCK` only serializes the
-   rayon-arm tests against each other, while every other test calling
-   `drt_pool()` reads the environ block concurrently — the stated
-   unsafe safety argument does not cover them, a panic inside the
-   closure leaks the forced value, and a pre-existing
-   `RAYON_NUM_THREADS` is clobbered by `remove_var` instead of
-   restored. Preferred direction: pass the thread count explicitly
-   (pool constructor parameter or route config) so tests stop
-   mutating the process environment at all; if env manipulation is
-   retained, the unsafe comment must state its real coverage, the
-   closure must be panic-safe, and any pre-existing value must be
-   restored. While there: the stale `route_nets` rustdoc still says
-   "Sequential maze routing".
-
 ## Files
 
-- `crates/grus-eda-core/tests/drt.rs`
-- `crates/grus-eda-core/src/drt/pool.rs` / `maze.rs` (only if the
-  explicit-thread-count direction is taken)
+- `crates/grus-core/tests/drt.rs`
 - `docs/results.md` dated entry
 
 ## Verify
