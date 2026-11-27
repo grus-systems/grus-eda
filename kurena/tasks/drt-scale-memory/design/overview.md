@@ -1,90 +1,62 @@
-# drt-scale-memory — overview
+# drt-scale-memory — overview (revision 2)
 
-## Problem (external review S2-2)
+## Status
 
-During `route_nets`, every guided net's full `NetGraph` **and** its
-derived `NetTopo` (CSR adjacency + attach sets + relaxed/access vias)
-are held simultaneously for the entire rip-up loop, alongside the
-occupancy raster and per-net rip-up mark logs. Nothing about the
-footprint is measured. On picorv32 (6,744 guided nets) the process
-peaks in the hundreds of MB; guide-union-heavy designs multiply both
-structures linearly.
+Round 1 landed (`13bcf52 kurena: implement drt-scale-memory`) and the
+implementation is **approved-in-principle**: the measured dominant
+reduction (a generalization of `options.md` O2 — every occupancy-free
+per-net structure is rebuilt per attempt) cut peak RSS 153.1 → 82.6 MB
+on gcd and 2.37 GB → 958 MB on picorv32, routed DEF byte-identical on
+both designs. The human rejection is **documentation-conformance
+only**: the `docs/results.md` entry does not meet this design's own
+record spec, and three small instrumentation repairs are needed.
 
-## What's actually held (read of the code)
+This revision covers only the remaining work. `measurement.md` and
+`options.md` stay unchanged — they are the round-1 record the results
+entry cites.
 
-`route_nets_with_progress` (`crates/grus-eda-core/src/drt/maze.rs`
-L3917–4276 — the spec's `crates/grus-core` path is stale):
+## Rejected-feedback map
 
-| structure | site | content | element cost |
+| # | review item | fix | spec |
 |---|---|---|---|
-| `graphs: &RouteGraphs` | built in `main.rs` L2097, borrowed whole run | per-net `NetGraph`: `nodes` 12 B, `edges` 12 B, `via_edges` 8 B, `pin_nodes` 32 B + inner | ~O(guide-union cells)/net |
-| `topos: Vec<NetTopo>` | L3944–3950, kept whole run | `attach` `Vec<Vec<u32>>`, `members` `BTreeMap<u32, Vec<u32>>`, `relax` `Vec<RelaxedVia>` 20 B (≤ `RELAX_K=3` per node), `access` `Vec<Vec<AccessVia>>` 16 B, `cover: PinCover` `BTreeMap<u32, Vec<RectDbu>>`, CSR `adj_to`/`adj_eidx` 8 B/arc ×2 arcs/edge+via+relax | the large per-net term |
-| `occ: Occupancy` | L3930 | `lines_x`/`lines_y` dense `Vec<Line>` (48 B + inner `ivs` 24 B/interval) | committed shapes × lines in band |
-| `marks: Vec<Vec<Mark>>` | L3963 | rip-up log, `Mark` 32 B; kept whole run, `mem::take` only on rip-up | per committed interval |
-| `routes`, `res_of`, `hist` | L3960–3964 | `NetRoute` (wires 24 B, vias 16 B) + `ClosureResiduals` — the required output | per net |
-| `outcomes` transient | L4044–4069 | all `bad` nets' `NetOutcome` live at `collect` end — iter 1 = every net | transient peak |
-| `NetRun` scratch | L2304 per attempt | ~6 `Vec`s × `n_nodes`×4 B + pins; `pq`/`bfs`/`hits` per `extend_once` round | ≤ threads in flight |
-| `DesignDb`/`TechDb`/`tracks`/`vias` | whole | input | fixed base |
+| 1 | machine-context block + rep policy missing from the entry | add both, verbatim format from the `drt-rayon` entry | `docs.md` §1 |
+| 2 | split table missing designed rows (marks, routes+residuals, outcomes hi-water, rest, separate access/cover) | complete the table from the retained run logs — no re-run needed | `docs.md` §2 |
+| 3 | gcd baseline inconsistency: census table 152.8 MB vs before/after table 153.1 MB | reconcile by build label: 153,092,096 B is the HEAD baseline median of 3 reps; 152,829,952 B is the commit-1 instrumented binary's peak | `docs.md` §3 |
+| 4 | gcd `route_ms` delta not recorded | record baseline median 5705 ms vs the after median (new reps) | `docs.md` §4 |
+| 5 | version typo "0.14.4 → 0.15.0" — base was 0.14.3 | fix in place | `docs.md` §5 |
+| 6 | `mem.rs` docstring cites `members`/`cover` for `BTREE_NODE_EST`; `members` was flattened into `NetAdj`'s CSR | doc now names `cover` only | `code-fixes.md` §1 |
+| 7 | `drt: mem iter` reports `attempt_hi=0` on the hard (serial) iteration — the serial arm is never measured | measure it (small gated addition) + record the one-pair bound argument for the already-run picorv32 leg | `code-fixes.md` §2, `docs.md` §6 |
+| 8 | `libc` not workspace-managed like the other deps | move to `[workspace.dependencies]` | `code-fixes.md` §3 |
 
-## Semantic constraints (decisive for the fix)
+## Remaining work
 
-- **`NetTopo` cannot be lazily rebuilt.** `NetTopo::new` reads
-  occupancy: `project_attach` runs `scan_stub` (L922) and `access_vias`
-  admits `b` nodes by a live `scan_stub` (L1684). A mid-route rebuild
-  would see committed `Net` marks, not the post-premark state →
-  different attach sets → different routes. **All topos must be built
-  against the pre-route occupancy and kept while their net can
-  re-enter `bad`** — and any routed net can be re-queued by a
-  provisional collision up to the last soft iteration. The review's
-  "stream-and-drop" option applies to `NetGraph`, not to `NetTopo`.
-- **`NetGraph` is occupancy-independent** — `build_route_graphs_ext`
-  reads only `db`/`tech`/`tracks`/`join`/`HullMask` (placement data).
-  A per-net rebuild is bit-identical (`NetGraph: PartialEq`), so
-  graphs may be dropped after the topo pass and rebuilt per attempt.
-- **`bad` order fixes the commit stream.** Re-ordering `bad` (e.g.
-  largest-first to bound in-flight big graphs) changes the route —
-  not byte-identical. Concurrency may only be reduced by narrowing
-  the pool or chunking `bad` in order, never by sorting.
-- **Post-route, `graphs` is needed only at census level**:
-  `apply_routes` iterates `g.net` for the guided-net membership check
-  (emit.rs L169–176); `main.rs` reads `hull_masked`, `region_escape`,
-  `escapes` (L2201, L2307–2319). The node/edge payload is dead after
-  `route_nets` returns — a trivial drop, but the peak is *inside*
-  `route_nets`, so this trims the tail, not the headline number.
+1. `fix:` census conformance repairs — serial-arm `attempt_hi`,
+   `mem.rs` docstring, `libc` workspace-managed; workspace bump
+   0.15.0 → 0.15.1 (`code-fixes.md`, `steps.md`).
+2. Cheap gcd re-runs only: two more ungated after-reps (rep policy
+   needs ≥3; `/tmp/gcd.mem.new.log` holds one) plus one
+   `GRUS_DRT_MEM=1` run to record the serial `attempt_hi`. **No
+   picorv32 re-run** — all three legs' stderr logs are retained
+   (`/tmp/picorv32.mem.{base,inst,new}.log`), the code change is a
+   gated read-only size walk that cannot affect routing, and the
+   serial arm's transient is bounded by the recorded `attempt_hi`
+   (`docs.md` §6 states the argument).
+3. `docs:` rewrite the 2026-11-27 `results.md` entry per `docs.md`;
+   touch `docs/e6-drt.md` (serial-arm census clause) and
+   `docs/status.md` (version token).
 
-## Plan shape
-
-1. **Instrument first** (`measurement.md`): `GRUS_DRT_MEM`-gated
-   structural byte census (capacity walks + `ru_maxrss` checkpoints)
-   plus `/usr/bin/time -l` peak RSS on gcd and picorv32.
-2. **Pick by the split** (`options.md`): the driver chooses among —
-   flatten `NetTopo`'s maps-of-vecs to CSR + pack `RelaxedVia`;
-   drop-and-rebuild `NetGraph` per attempt; chunk the `outcomes`
-   collect; pool the per-attempt `NetRun` scratch; occupancy/marks
-   slimming if those rows dominate — measured rows decide.
-3. **Gate**: `GCD_ROUTE_DIGEST` pin and committed
-   `gcd.drt.ours.routed.def` byte-equality stay green; picorv32 DEF
-   `cmp`-identical to the step-0 baseline (`tests.md`).
-4. **Record** (`docs.md`): dated `results.md` entry with the split
-   table, before/after peak RSS, and the honest bound formula.
+If any retained log has been rotated away, re-run that leg instead of
+synthesizing numbers (E0 rules 1–2) — gcd legs are seconds; picorv32
+legs are detached ~1–2 h runs and their absence must be named.
 
 ## Files
 
-- `crates/grus-eda-core/src/drt/maze.rs` — `NetTopo`, `Occupancy`,
-  `marks`, `outcomes`, `NetRun`, census hooks
-- `crates/grus-eda-core/src/drt/graph.rs` — `RouteGraphs` census fn,
-  per-net graph rebuild entry (if the drop-and-rebuild option lands)
-- `crates/grus-eda-core/src/drt/mem.rs` — new: structural byte census
-  + peak-RSS helper (instrumentation commit)
-- `crates/grus-eda-core/src/drt/emit.rs` — `apply_routes` signature
-  (only if the guided-list slimming lands)
-- `crates/grus-eda-core/src/drt.rs` — `mem` module export
-- `crates/grus-eda/src/main.rs` — checkpoint calls, `apply_routes`
-  callsite
-- `crates/grus-eda-core/tests/drt.rs` — determinism pins, rebuild-
-  identity test (conditional)
-- `crates/grus-eda-core/Cargo.toml` — `libc` dep (getrusage)
-- `Cargo.toml` — workspace version bumps
-- `docs/results.md` — dated measurement entry
-- `docs/e6-drt.md` — memory-model paragraph + honest bound
-- `docs/status.md` — status line
+- `crates/grus-eda-core/src/drt/maze.rs` — serial-arm `attempt_hi`
+  census + iter-line comment
+- `crates/grus-eda-core/src/drt/mem.rs` — `BTREE_NODE_EST` docstring
+- `Cargo.toml` — `[workspace.dependencies] libc`, version bump
+- `crates/grus-eda-core/Cargo.toml` — `libc = { workspace = true }`
+- `docs/results.md` — corrected dated entry
+- `docs/e6-drt.md` — serial-arm census clause in the Resident
+  footprint block
+- `docs/status.md` — version token only (figures unchanged)

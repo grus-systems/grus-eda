@@ -1,60 +1,53 @@
-# steps — order, commits, verification
+# steps — order, commits, verification (revision 2)
 
-Order is load-bearing: the split table must exist before any
-reduction is picked (acceptance item 1), and the pre-change DEFs
-must be captured at HEAD for the byte-identity gate.
+The routed-output question is already settled (byte-identical on both
+designs, digest pinned). Order here is about producing the record
+honestly: extract retained numbers first, land the census repairs,
+then the cheap gcd re-runs, then the docs commit.
 
-## Step 0 — baseline at HEAD (no code change)
+## Step 1 — extract the retained data (no code change)
 
-1. `cargo build --release -p grus-eda`.
-2. `/usr/bin/time -l` runs per `measurement.md` §2: gcd ≥3 reps →
-   median peak RSS; picorv32 one detached run (regenerate
-   `picorv32.placed.def` via `tests/designs/picorv32/generate_ref.sh`
-   if absent — gitignored).
-3. Keep `/tmp/gcd.mem.base.def` (expect sha256
-   `1422d02765f6aba99e25f1792436607c788ca31397c0bf843340bd65fb2f9482`)
-   and `/tmp/picorv32.mem.base.def` — the byte-identity baselines.
-4. `cargo test --release -p grus-eda-core --test drt test_maze_census
-   -- --nocapture` → confirm `digest=0xef2b3ff70271a2e9`.
+Transcribe every `docs.md` §2 row from the retained logs:
 
-## Commit 1 — `feat:` `GRUS_DRT_MEM` structural census
+- `/tmp/gcd.mem.base.{1,2,3}.log`, `/tmp/gcd.mem.inst.log`,
+  `/tmp/gcd.mem.new.log`
+- `/tmp/picorv32.mem.{base,inst,new}.log`
 
-`crates/grus-eda-core/src/drt/mem.rs` (new) + export in `drt.rs`;
-capacity-walk fns in `graph.rs` (`route_graphs_bytes`) and `maze.rs`
-(`net_topo_bytes`, `occupancy_bytes`, `marks_bytes`); `libc` dep in
-`crates/grus-eda-core/Cargo.toml` (getrusage for `peak_rss_bytes` —
-justify in the commit message); checkpoint lines in
-`route_nets_with_progress` and the `Commands::Drt` arm in `main.rs`.
+Any log that has been rotated away → re-run that leg; never
+synthesize a number (E0 rules 1–2). The §2 verified figures are the
+spot-check: a transcription that disagrees with them means the wrong
+log was read.
 
-- Measurement-only: no `RouteDb`/emit change, digest stays
-  `0xef2b3ff70271a2e9` (re-run `test_maze_census` to prove).
-- Workspace version patch bump.
-- Verify: `cargo test --workspace --profile verify` green; clippy
-  `-D warnings` clean; ungated run emits zero `drt: mem` lines
-  (fail-proof the gate once: forced on → lines appear → restore).
-- Then run the §3 split on gcd and picorv32 (`GRUS_DRT_MEM=1` +
-  `time -l`, picorv32 detached). Fill the §5 table → **pick per
-  `options.md` §"Pick rule"**.
+## Commit 1 — `fix:` census conformance repairs
 
-## Commit 2..N — `feat:` the picked reduction(s)
+`code-fixes.md` §1–3 in one commit (all three are review repairs to
+the same `GRUS_DRT_MEM` instrumentation), workspace 0.15.0 → 0.15.1.
 
-One logical change per commit (O1, O2, O3/O4 riders as picked).
-After each:
+Verify (workflow.toml pair):
 
-- `cargo test --workspace --profile verify` + clippy — all green;
-  every pin in `tests.md` §1 holds.
-- `route_digest` unchanged unless the change is *deliberately*
-  semantic (none of the options are — drift means a bug, not a
-  re-pin).
-- gcd: emitted DEF byte-identical to the committed golden
-  (`test_e2e_ours_def_deterministic_gcd`).
-- picorv32: `cmp` the fresh DEF against `/tmp/picorv32.mem.base.def`
-  (detached run per picked change; it doubles as the after-RSS rep).
-- Workspace version patch bump per commit.
+- `cargo test --workspace --profile verify` — all green; the census
+  change cannot move `test_maze_census`'s digest or the DEF golden.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo build --release -p grus-eda`.
 
-## Final commit — `docs:` the record
+## Step 2 — fresh gcd runs (~30 s total)
 
-`docs/results.md` dated entry per `docs.md` (split table, before/after
-RSS, route_ms effect, DEF shas, what-was-run), `docs/e6-drt.md`
-memory paragraph with the honest bound, `docs/status.md` line.
-Land with the last functional commit's verification output quoted.
+Same invocation as `measurement.md` §2, `target/release/grus-eda`:
+
+1. One `GRUS_DRT_MEM=1` run → record the `iter=8` `attempt_hi` (now a
+   real number, not 0) and confirm the `outcomes=0` note; emitted DEF
+   sha256 must equal
+   `1422d02765f6aba99e25f1792436607c788ca31397c0bf843340bd65fb2f9482`.
+2. Two more **ungated** reps → with `/tmp/gcd.mem.new.log`'s
+   82,575,360 B that is ≥3 after-reps; median peak RSS and median
+   `route_ms` are the tabled after figures (`docs.md` §3–§4).
+
+No picorv32 re-run — the retained three-leg logs carry every needed
+row, and `docs.md` §6 names why the serial-arm figure there is a
+bound, not a measurement.
+
+## Commit 2 — `docs:` the corrected record
+
+Rewrite the `### 2026-11-27` entry per `docs.md` §1–§7, the
+`docs/e6-drt.md` clause, the `docs/status.md` version token. Land
+with the fresh run numbers quoted in the checks-run section.
