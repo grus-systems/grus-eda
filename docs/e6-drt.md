@@ -773,10 +773,15 @@ the only moment an attempt's disposition exists in `bad` order.
 **Thread control** (drt-rayon): every drt parallel section — graph
 build, `NetTopo` build, soft-iteration search, `apply_routes`,
 `nets_section` — runs inside a per-call `rayon::ThreadPool`
-(`drt::pool::drt_pool`) that reads `RAYON_NUM_THREADS` at call time;
-the global pool would pin the env var on first use process-wide,
-which makes the forced single-thread determinism arms untestable
-inside `cargo test`. `GRUS_DRT_TIMING` reports the pool size as a
+(`drt::pool::drt_pool`) whose size is an explicit `threads` input:
+`MazeConfig.threads` covers both route legs (attach pass and rip-up
+loop), while `build_route_graphs_ext`, `apply_routes`, and
+`write_routed_def` take a `threads: usize` parameter. `0` keeps
+rayon's default parallelism. The library never reads the
+environment — `grus-eda drt` reads `RAYON_NUM_THREADS` once at the
+`Commands::Drt` boundary and passes the count down, so CLI behavior
+is unchanged and tests force per-call counts without touching
+process state. `GRUS_DRT_TIMING` reports the pool size as a
 `threads=N` token on each timing line.
 
 **Resident footprint** (drt-scale-memory): `route_nets` takes

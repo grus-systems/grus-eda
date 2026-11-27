@@ -1249,6 +1249,7 @@ pub fn build_route_graphs(
             spare_above: 0,
             escape: Some(EscapeCfg::DEFAULT),
         },
+        0,
     )
 }
 
@@ -1474,13 +1475,15 @@ pub fn build_net_graph(
 /// `net_region`) — the maze router passes 1, detailed routing may
 /// need one layer above the global route's choice to reach
 /// OBS-sealed pin pockets — and the bounded pin-halo escape
-/// (`escape_extend`).
+/// (`escape_extend`). `threads` sizes the build's rayon pool; `0`
+/// keeps rayon's default parallelism.
 pub fn build_route_graphs_ext(
     db: &DesignDb,
     tech: &TechDb,
     tracks: &[LayerTracks],
     join: &GuideJoin,
     opts: GraphOpts,
+    threads: usize,
 ) -> RouteGraphs {
     let mut out = RouteGraphs {
         via_edges_per_pair: vec![0; tech.routing_layers.len().saturating_sub(1)],
@@ -1493,7 +1496,7 @@ pub fn build_route_graphs_ext(
     // the hull scratch becomes per-worker state via `map_init`.
     // Byte-identity to the serial loop is by construction: the
     // fold replays the same appends in the same order.
-    let builds: Vec<NetBuild> = drt_pool().install(|| {
+    let builds: Vec<NetBuild> = drt_pool(threads).install(|| {
         join.nets
             .par_iter()
             .map_init(Vec::new, |hull_scratch, (net, boxes)| {
