@@ -1,4 +1,12 @@
-# drt-unrouted-analysis — Probe mechanism
+# drt-unrouted-analysis — Probe mechanism (r2: as-built)
+
+Implemented in `ed0a8d7` per this doc. As-built deltas: the
+rayon pool helper is `drt_pool(threads)` (not `pool::n`);
+`attach_evidence` reads the pin cover from the rebuilt
+`ptopo.cover` (`PinCover`); the probe-`Unattachable` cascade
+checks `stub_blocked` membership *before* running the rescan
+(a `stub_blocked` pin is `GeomObsSealed` directly). The rest of
+the doc is the mechanism as built.
 
 The probe answers, per finally-unrouted pin: "does the pin
 attach and route when foreign `Net`/`Pin` marks are absent?"

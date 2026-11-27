@@ -1,6 +1,29 @@
-# drt-unrouted-analysis — Doc deltas
+# drt-unrouted-analysis — Doc deltas (r2: amendment state)
 
-## 1. `docs/results.md` — one dated entry
+The dated `results.md` entry, the `e6-drt.md` "Root-cause probe"
+subsection, and the `status.md` line all landed in `ed0a8d7`
+with the gcd decomposition measured. What remains is the
+**picorv32 amendment** and correcting any r1 claims the real
+verify lanes contradict — the memo records that no verify lane
+ran, so the committed "Checks run" block is a claim to validate,
+not a record:
+
+1. **`docs/results.md`** — land the pending picorv32 amendment
+   the entry already promises: full 13-row table (pins + nets),
+   anchor block (bridged-union vs `geom_met3_bridge` vs rescued;
+   `region_escape ∩ u.failed` split; `unguided` vs golden 67),
+   `probe_ms` vs `route_ms`, picorv32 prioritized target list.
+   Then correct "Checks run" to what `steps.md` §3–§4 actually
+   ran (counts, profiles, the detached-leg invocation); if the
+   verify numbers differ from the recorded "8 cli + 559 lib +
+   18 drc + 42 drt + 2 irdrop, 0 failed", amend.
+2. **`docs/status.md`** — the committed line says "picorv32 leg
+   in flight — results.md names it": replace with the measured
+   picorv32 headline next to the gcd numbers.
+3. **`docs/e6-drt.md`** — the subsection's tail cites gcd
+   numbers only; add the picorv32 headline once measured.
+
+## 1. `docs/results.md` — one dated entry (landed; amendment pending)
 
 `### 2026-11-27 — drt-unrouted-analysis: root-cause
 decomposition of the unrouted population` (date = the day the

@@ -1,4 +1,16 @@
-# drt-unrouted-analysis — Root-cause taxonomy
+# drt-unrouted-analysis — Root-cause taxonomy (r2: as-built)
+
+The tree below is the classifier as built (`probe.rs`
+`probe_net`'s `match state` cascade). As-built detail: a probe
+`NoPath` on a `GuideAbsent`/`Disjoint` union lands
+`GeomDisjoint` (the union-level `GuideAbsent` distinctness is
+preserved on `ProbeNet.union` for the "0 guide-absent"
+invariant). The §6 met3-bridge numbers: measured on gcd —
+bridged-union census **2**, both probe-rescued, so
+`geom_met3_bridge` pins = 0 (containment holds 0 ⊆ 2). On
+picorv32 the *union* census is the pinned 43; the *class* count
+is measured — the committed assert's risk and the re-pin rule
+are in `tests.md` §2 / `steps.md` §4.
 
 Every `(pin, kind)` entry of every `UnroutedNet` in
 `route_db.unrouted` gets exactly one `RootCause`. Classes are

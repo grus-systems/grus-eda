@@ -1,6 +1,15 @@
-# drt-unrouted-analysis — Code surface
+# drt-unrouted-analysis — Code surface (r2: as-built)
 
-## 1. New module: `crates/grus-eda-core/src/drt/probe.rs`
+Implemented in `ed0a8d7`. As-built deltas vs the r1 text:
+internal `enum ProbeState {Connected, Failed(FailKind),
+MissingPin}` and `struct AttachEvidence`/`fn attach_evidence`
+carry the classification inputs; `GuideUnion::GuideAbsent` folds
+into `GeomDisjoint` at classification (distinctness kept on
+`ProbeNet.union`); `RootCause::ALL` (13) drives the zero-kept
+`class_counts`/`net_counts`. The §2 widening list shrinks to
+what `probe.rs` actually imports — see the as-built table.
+
+## 1. New module: `crates/grus-eda-core/src/drt/probe.rs` (landed)
 
 `pub mod probe;` in `src/drt.rs` (tests are an external crate —
 the entry point must be `pub`; everything it touches in
@@ -108,19 +117,22 @@ pub fn probe_unrouted(
 Disjoint, GuideAbsent }` — the `guide_union_connected`
 classifier's value form.
 
-## 2. `maze.rs` — `pub(crate)` openings
+## 2. `maze.rs` — `pub(crate)` openings (landed; 4 dead ones to revert)
 
-Widening only; no behaviour change. `probe.rs` needs:
+Widening only; no behaviour change. As-built, `probe.rs` needs:
 
 | item | why |
 |---|---|
 | `Occupancy` (struct) + `Occupancy::new` | build the probe occupancy |
 | `premark_obs` → `premark_marks(db, tech, occ, io_pin_marks)` | `premark_obs` stays as the `true` wrapper; `rasterize_pin_marks` gains `io_pin_marks` (`pin_overlap_census` call site passes `true`) |
-| `NetTopo::new`, `NetAdj::new` | probe-time attach/adjacency rebuild |
+| `NetTopo::new` + `NetTopo.cover` field, `NetAdj::new` | probe-time attach/adjacency rebuild; `ptopo.cover` feeds `attach_evidence` |
 | `route_one_net`, `NetOutcome` | the re-attempt itself |
-| `scan_stub`, `fill_blocked`, `Occupant`/`Hit` (fields used) | the attach-evidence rescan |
-| `node_xy`, `covered_range` | rescan helpers |
-| `Occupancy::scan_wire`/`scan_rect` (already private methods — widen to `pub(crate)`) | rescan scans |
+| `scan_stub`, `fill_blocked`, `Hit` | the attach-evidence rescan (`Hit.iv` is `pub(crate)`, so `Interval`/`Occupant` widened for field-type visibility — needed even though the rescan reads them only through `fill_blocked`) |
+| `covered_range` | rescan helper |
+
+Widened but **unused** — revert to private (`steps.md` §2):
+`EdgeProbe`, `node_xy`, `Occupancy::scan_wire`,
+`Occupancy::scan_rect`. `hit_bbox` stayed private.
 
 No new `pub` items on `maze.rs`; no signature change to any
 `pub` item. `premark_obs` keeps its name and call sites.
