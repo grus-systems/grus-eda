@@ -602,7 +602,7 @@ impl Occupancy {
     /// `< s` along the line; the perpendicular `< s` is already
     /// guaranteed because the committed shape rasterized the line
     /// only inside its `w/2 + s` band.
-    pub(crate) fn scan_wire(
+    fn scan_wire(
         &self,
         axis: Axis,
         layer: u8,
@@ -660,7 +660,7 @@ impl Occupancy {
     /// the full 2D test on the stored perpendicular extent; a
     /// collision sliver containing no track line on either axis is the
     /// recorded miss class (spacing-lite).
-    pub(crate) fn scan_rect(&self, layer: u8, r: &RectDbu, out: &mut Vec<Hit>) {
+    fn scan_rect(&self, layer: u8, r: &RectDbu, out: &mut Vec<Hit>) {
         let l = layer as usize;
         let (w2, s) = (self.halfw[l], self.spc[l]);
         let st = self.stats.slot();
@@ -954,7 +954,7 @@ fn project_attach(
 // ---------------------------------------------------------------------------
 
 /// A node's absolute coordinates.
-pub(crate) fn node_xy(g: &NetGraph, tracks: &[LayerTracks], id: u32) -> (i32, i32) {
+fn node_xy(g: &NetGraph, tracks: &[LayerTracks], id: u32) -> (i32, i32) {
     let n = &g.nodes[id as usize];
     let lt = &tracks[n.layer.0 as usize];
     (lt.tracks_x[n.ix as usize], lt.tracks_y[n.iy as usize])
@@ -1220,7 +1220,7 @@ fn record_hits(
 /// against live occupancy with no graph reference. Order mirrors the
 /// per-edge `record` sequence `edge_collisions` produced exactly.
 #[derive(Clone, Copy)]
-pub(crate) enum EdgeProbe {
+enum EdgeProbe {
     /// `scan_wire(axis, l, ti, c, d)` then `record(l)` — the in-plane
     /// `g.edges` arm.
     Wire {
