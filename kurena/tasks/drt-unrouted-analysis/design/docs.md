@@ -1,27 +1,38 @@
-# drt-unrouted-analysis — Doc deltas (r2: amendment state)
+# drt-unrouted-analysis — Doc deltas (r3: measured, amendment pending)
 
 The dated `results.md` entry, the `e6-drt.md` "Root-cause probe"
-subsection, and the `status.md` line all landed in `ed0a8d7`
-with the gcd decomposition measured. What remains is the
-**picorv32 amendment** and correcting any r1 claims the real
-verify lanes contradict — the memo records that no verify lane
-ran, so the committed "Checks run" block is a claim to validate,
-not a record:
+subsection, and the `status.md` line all landed and the verify
+lanes are now confirmed green on HEAD (r3 planning ran both:
+verify 8 cli + 559 lib + 18 drc + 42 drt [4 ignored] + 2 irdrop;
+clippy clean — the committed "Checks run" block's counts match).
+The picorv32 leg ran once to completion and **measured** its
+table (`steps.md` §0) — it failed only the two stale-pin
+asserts. What remains is the **picorv32 amendment with the two
+named deltas**:
 
-1. **`docs/results.md`** — land the pending picorv32 amendment
-   the entry already promises: full 13-row table (pins + nets),
-   anchor block (bridged-union vs `geom_met3_bridge` vs rescued;
-   `region_escape ∩ u.failed` split; `unguided` vs golden 67),
-   `probe_ms` vs `route_ms`, picorv32 prioritized target list.
-   Then correct "Checks run" to what `steps.md` §3–§4 actually
-   ran (counts, profiles, the detached-leg invocation); if the
-   verify numbers differ from the recorded "8 cli + 559 lib +
-   18 drc + 42 drt + 2 irdrop, 0 failed", amend.
+1. **`docs/results.md`** — land the pending picorv32 amendment:
+   the measured 13-row table (1,731 nets / 3,083 pins; per-class
+   pins + distinct-nets), the anchor block **naming both
+   deltas** — unrouted 1,731 vs the spec's pinned 2,016 (stale
+   v0.12.9 pin across `drt-guide-escape` + `drt-rayon`; 970
+   rescued / 685 newly unrouted vs the committed golden) and
+   `geom_met3_bridge` 32 nets vs the spec's 43 (union-census
+   lineage 43 → 138 → 142, class count 32 after the
+   probe-rescue split — 546 rescued pins) — the
+   `region_escape ∩ u.failed` per-class split (73 total),
+   `unguided` 67 name-equal to the golden (reproduced),
+   `probe_ms=224517` vs the leg's ~53-min route, and the
+   picorv32 prioritized target list. Then correct "Checks run"
+   to what `steps.md` §4 ran (the re-run of the leg is its own
+   record — r1 FAILED on stale pins, r3 outcome).
 2. **`docs/status.md`** — the committed line says "picorv32 leg
    in flight — results.md names it": replace with the measured
-   picorv32 headline next to the gcd numbers.
-3. **`docs/e6-drt.md`** — the subsection's tail cites gcd
-   numbers only; add the picorv32 headline once measured.
+   headline (1,731 nets / 3,083 pins; 2,544 negotiation vs 539
+   geometric; met3-bridge union/class split named).
+3. **`docs/e6-drt.md`** — the subsection's tail gains the
+   picorv32 headline; check §533's "met3-bridge residual class
+   (43 picorv32 nets)" still reads as the historical v0.12.4
+   count — fix in step if it presents 43 as current (E0 rule 8).
 
 ## 1. `docs/results.md` — one dated entry (landed; amendment pending)
 

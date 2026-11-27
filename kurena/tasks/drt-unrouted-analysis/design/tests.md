@@ -1,8 +1,10 @@
-# drt-unrouted-analysis — Test pins (r2: as-built)
+# drt-unrouted-analysis — Test pins (r3: as-built)
 
 All pins landed in `crates/grus-eda-core/tests/drt.rs`. **Verified
-in r2 planning**: dev profile `cargo test -p grus-eda-core --test
-drt unrouted_probe` → 5 passed, 1 ignored, 0 failed.
+in r3 planning**: `cargo test --workspace --profile verify` green
+(42 drt tests, 4 ignored); `cargo clippy --workspace --all-targets
+-- -D warnings` clean. The picorv32 leg ran once — measured table
+in `steps.md` §0, re-pin spec in §2 below.
 
 Shared helpers (as-built names):
 
@@ -41,25 +43,37 @@ passing, transcribed into `docs/results.md`):
 - `route_digest(&leg.route) == GCD_ROUTE_DIGEST` after the probe
   ran (output-unchanged pin).
 
-## 2. `test_unrouted_probe_picorv32` (`#[ignore]`d) — **pending**
+## 2. `test_unrouted_probe_picorv32` (`#[ignore]`d) — re-pin per `steps.md` §1
 
-Same bundle on `leg_for("picorv32")`, plus `nets == 2016`,
-`net_counts()["geom_met3_bridge"] == 43`, `unguided` name-equal
-to the golden (67). Run (detached — see `steps.md` §1):
+Same bundle on `leg_for("picorv32")`. The r1 run completed
+(3403.67 s, `/tmp/probe_picorv32.r1.log`) and failed two
+stale-pin asserts — measured values, all reproduced through
+`assert_probe_coverage` (which ran green before the panic):
+
+- `rep.nets.len() == 1731` (was `== 2016` — the v0.12.9 pin;
+  the route's own report moved under `drt-guide-escape` +
+  `drt-rayon` with the picorv32 leg deferred: 970 rescued /
+  685 newly unrouted vs the committed golden list).
+- `Σ n.pins.len() == 3083`.
+- Union census pinned separately from the class count per the
+  r2 decision rule: `union == Bridged` nets `== 142`, and
+  `net_counts()["geom_met3_bridge"] == 32` (the spec's 43 was
+  the 108-net-era union census — lineage in `steps.md` §0).
+- Full `class_counts` pin: `neg_attach_stub 1230`, `neg_wave
+  1206`, `geom_met3_bridge 466`, `geom_pocket 73`,
+  `neg_wave_obs_frontier 59`, `neg_wave_unattributed 49`,
+  every other class 0.
+- `unguided` name-equality + `== 67` — asserts unchanged; the
+  r1 run panicked before evaluating them, so the re-run is
+  their first real check.
+
+Run (detached, ~57 min measured — the "~135 min" comment is
+stale; `steps.md` §2):
 
 ```
 cargo test --release -p grus-eda-core --test drt \
   test_unrouted_probe_picorv32 -- --ignored --nocapture
 ```
-
-**Assert risk, flagged in r2**: `geom_met3_bridge == 43` pins the
-*class* count, but the pinned 43 is the *union* census. If any
-bridged-union net is probe-rescued the class count drops below
-43 — a finding, not a bug. The decision rule (`steps.md` §4):
-re-pin the assert on the union count
-(`rep.nets.filter(union == Bridged).count() == 43`) and record
-the class split in the results entry. Only touch the assert if
-the leg actually fails there; a green run needs no change.
 
 ## 3. `test_unrouted_probe_deterministic_gcd` — green
 
@@ -105,5 +119,5 @@ file; `steps.md` §3 has the optional on-tree re-confirmation.
 - `test_maze_pin_collision`, `test_maze_cases` — the fixture
   baselines the probe arms reuse; unchanged.
 - `cargo test --workspace --profile verify` + clippy
-  `-D warnings` — **the r1 lanes never ran; `steps.md` §3 is the
-  real run**.
+  `-D warnings` — **green on HEAD** (r3 planning ran both; re-run
+  after the §2 re-pin per `steps.md` §4).

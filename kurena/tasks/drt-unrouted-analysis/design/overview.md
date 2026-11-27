@@ -1,23 +1,28 @@
 # drt-unrouted-analysis — Overview
 
-> **Revision 2 (2026-11-28) — continuation, not redesign.** The r1
-> implement executor died on a model rate limit at the wip-checkpoint
-> commit `ed0a8d7`; no verify lanes ran. The spec is unchanged and
-> the checkpoint is substantial and correct — **continue it in
-> place**. Everything under "What exists (verified against code)"
-> below is now *implemented*, not planned: `probe.rs` (+574),
-> `graph.rs` shared union classifier (+87), `maze.rs` `pub(crate)`
-> openings + `premark_marks` split, six probe tests in
-> `tests/drt.rs`, docs entries, `Cargo.toml` 0.16.1. Verified during
-> r2 planning: `cargo check --tests` clean; `cargo test --test drt
-> unrouted_probe` → 5 passed / 1 ignored in dev profile; the recorded
-> gcd decomposition (80 nets / 93 pins = 54 `neg_attach_stub` + 35
-> `neg_wave` + 4 `geom_pocket`) reproduces through the committed
-> asserts. **Remaining:** the picorv32 probe leg (never ran to
-> completion — re-run detached), the two verify lanes on this tree, a
-> handful of dead `pub(crate)` widenings to revert, doc amendment,
-> commit. The continuation plan is `steps.md`; the technical design
-> below stands as-built.
+> **Revision 3 (2026-11-28) — finish in place; the leg already
+> ran.** The r2 executor died on a model rate limit at `04b11ca`,
+> *after* the picorv32 probe leg had completed once
+> (`/tmp/probe_picorv32.log`, 3403.67 s). Verified during r3
+> planning on HEAD: `cargo test --workspace --profile verify`
+> **green** (8 cli + 559 lib + 18 drc + 42 drt [4 ignored] + 2
+> irdrop); `cargo clippy --workspace --all-targets -- -D
+> warnings` **clean** (the r2 clippy FAIL was the `EdgeProbe`
+> `private-interfaces` trip — already fixed by `04b11ca`). The
+> leg FAILED two stale-pin asserts, both root-caused (not
+> classifier bugs): `unrouted_nets` 1731 vs the v0.12.9-pinned
+> 2016 — the picorv32 leg stayed deferred through
+> `drt-guide-escape` and `drt-rayon` (set-diff vs the committed
+> golden: 970 rescued / 685 newly unrouted); and
+> `geom_met3_bridge` nets 32 vs the spec's 43 — the 43 was the
+> 108-net-era *union* census; today's union census is 142 with
+> the class count 32 after the probe-rescue split. **Remaining**
+> (`steps.md`): re-pin `test_unrouted_probe_picorv32` to the
+> measured values (union census and class count pinned
+> separately), one detached re-run to prove it green (~57 min),
+> the `results.md`/`e6-drt.md`/`status.md` amendment naming the
+> deltas, verify re-run, commit. The technical design below
+> stands as-built.
 
 Analysis-only E6 ticket. The final unrouted report already names
 per-pin kinds (`NoPath` 2,225 / `Unattachable` 1,480 on picorv32,
@@ -117,29 +122,32 @@ own `Pin` marks are free to their own net, so dropping *all*
    is opt-in by construction; the results entry records the
    exact `cargo test` command line.
 
-## Risks (updated for as-built)
+## Risks (updated for r3 — the leg ran; risks resolved or measured)
 
-- **picorv32 leg runtime vs `timeout_sec = 7200`.** The
-  `#[ignore]`d probe leg re-routes picorv32 (~135 min) then
-  probes — a single blocking invocation exceeds the pipeline's
-  per-subprocess cap. It **must** run detached (`nohup` +
-  log file, polled between other work); see `steps.md` §1.
-- **`geom_met3_bridge == 43` assert may be too strong.** The
-  pinned 43 is the *union* census (`maze_census` `n_bridge`);
-  the class count is the union census minus probe-rescued
-  bridges. gcd's 2 bridged nets were both rescued — on
-  picorv32 a nonzero rescue count is plausible and would fail
-  the committed assert. Decision rule in `steps.md` §4 /
-  `tests.md` §2: pin the *union* count, record the class split.
+- **picorv32 leg runtime — resolved.** Measured 3403.67 s ≈
+  57 min total (route ~53 min + probe ~3.7 min), inside
+  `timeout_sec = 7200`; the test's "~135 min" comment is stale.
+  Still run the re-run detached (cheap insurance).
+- **`geom_met3_bridge == 43` assert — failed as flagged, root
+  cause found.** Measured: union census 142, class count
+  32 nets / 466 pins. Resolution: pin union census and class
+  count separately (`steps.md` §1); results entry names the
+  43 (108-net era) → 138 (2016 era) → 142 → 32 lineage.
+- **`unrouted_nets == 2016` assert — stale pin.** The route's
+  own report is 1731; the spec's 2016 predates
+  `drt-guide-escape` + `drt-rayon` (picorv32 legs deferred at
+  both). Set-diff vs the committed golden names the churn:
+  970 rescued / 685 newly unrouted.
 - **`u.blockers` ↔ pin pairing is lossy** — blockers are pushed
   at most once per failed attachable pin in `pin_nodes` order;
   per-pin evidence is exact only when `blockers.len() ==
   #NoPath failed` (then 1:1), else net-level set
-  (`taxonomy.md` §4). Implemented as `wave_evidence: Option`.
-- **Residual assertions on picorv32 are unproven** —
-  `assert_probe_coverage` asserts both residual buckets are 0.
-  A nonzero residual on the pending leg is a *finding*
-  (investigate, name it — never fold it away).
+  (`taxonomy.md` §4). Implemented as `wave_evidence: Option`;
+  `neg_wave_unattributed` measured 49 pins — the named
+  uninstrumented-divergence class.
+- **Residual assertions — measured.** Both residual buckets 0
+  on picorv32 (`assert_probe_coverage` ran before the panicked
+  assert, so coverage + containment are proven on the r1 log).
 
 ## Files
 

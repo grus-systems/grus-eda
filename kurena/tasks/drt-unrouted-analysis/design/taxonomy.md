@@ -7,10 +7,14 @@ The tree below is the classifier as built (`probe.rs`
 preserved on `ProbeNet.union` for the "0 guide-absent"
 invariant). The §6 met3-bridge numbers: measured on gcd —
 bridged-union census **2**, both probe-rescued, so
-`geom_met3_bridge` pins = 0 (containment holds 0 ⊆ 2). On
-picorv32 the *union* census is the pinned 43; the *class* count
-is measured — the committed assert's risk and the re-pin rule
-are in `tests.md` §2 / `steps.md` §4.
+`geom_met3_bridge` pins = 0 (containment holds 0 ⊆ 2).
+Measured on picorv32 (r1 leg): union census **142**, class
+count **32 nets / 466 pins** — the spec's "43" was the union
+census of the 108-net v0.12.4 era (138 unions over the
+2016-net era); the class-vs-union gap is the probe-rescue
+split working as designed (546 rescued pins on bridged nets).
+The union census and class count are pinned separately
+(`tests.md` §2 / `steps.md` §1).
 
 Every `(pin, kind)` entry of every `UnroutedNet` in
 `route_db.unrouted` gets exactly one `RootCause`. Classes are
