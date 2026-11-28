@@ -541,7 +541,6 @@ The per-stage status (designs covered, tolerances actually used, known gaps) is 
 
 - **Change**: `.github/workflows/ci.yml` — push to `dev` and pull requests run on the org's self-hosted Mac mini runner (`[self-hosted, macOS, ARM64]`): checkout, PATH via `$GITHUB_PATH`, picorv32 reference generation when the inputs are missing (Colima started only if not running, then `generate_ref.sh` in the LibreLane container), `cargo test --release`, `cargo clippy --all-targets -- -D warnings`. Design: `docs/history/f9-test-support-ci.md` Part B.
 - **First run** (2026-11-14, run 43534076710, triggered by the workflow's own push): **success in 89 s**. The log shows the generation step actually running OpenROAD in the container (`write_def picorv32.placed.def`, SPEF read) on the cold checkout, then the full release suite and clippy green. Generation inside CI costs roughly 45 s of the 89 s; no actions/cache follow-up for now.
-- **Note**: the runner is shared with other grus-systems repositories; this workflow needs no cross-repository token (single-repo checkout uses the built-in `GITHUB_TOKEN`), unlike workflows in sibling repositories that check out a second repository.
 
 ### 2026-11-14 — Review step 4 (part 1): aes through all stages; the F2 congestion-map test; picorv32 E2
 

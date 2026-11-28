@@ -113,7 +113,7 @@ checksums are also on the
 
 ## Dependencies
 
-None on other Grus repositories. The reference tools come from the LibreLane
+No dependencies outside this repository. The reference tools come from the LibreLane
 container image (`ghcr.io/librelane/librelane:3.0.16`). Test designs are public
 (OpenROAD-flow-scripts sky130hd designs, picorv32).
 

@@ -5,9 +5,8 @@ Implements finding F9 of `docs/history/review-2026-11-11.md`. Surveyed state
 chains are open-coded in about 14; `test_sky130_liberty_integration`
 asserts a 10 ms warm-cache wall-clock bound (known flaky); the Liberty
 cache's primary location is next to the `.lib` file, i.e. inside the PDK
-installation; there is no CI. The org's self-hosted runner
-(org Mac mini, PDK at `~/.ciel`, LibreLane image cached)
-already serves other grus-systems repositories.
+installation; there is no CI. A self-hosted macOS runner
+(M4 Mac mini, PDK at `~/.ciel`, LibreLane image cached) is available for CI.
 
 ## Part A: test support, cache location, wall-clock (code)
 

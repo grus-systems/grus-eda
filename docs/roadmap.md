@@ -25,9 +25,9 @@ measurement says so.
 
 ## What failed before the R-items (2026-11 snapshot — all four closed)
 
-This section is the dated record of why the R0-R10 work items exist. Running grus-eda on
-the output of a real LibreLane run of a design with latches and clock gating showed four
-classes of difference from OpenSTA, **all closed as of 2026-11-26** (resolutions in
+This section is the dated record of why the R0-R10 work items exist. Designs that use
+latches and integrated clock gating, and SDC files written by a stock LibreLane run, exposed
+four classes of difference from OpenSTA, **all closed as of 2026-11-26** (resolutions in
 parentheses; the items below are the original wording):
 
 1. Setup slack is too optimistic and hold violations do not appear: the clock is ideal, but
@@ -38,7 +38,7 @@ parentheses; the items below are the original wording):
    but does not say what fraction of the design is affected.
    → closed: latch `D -> Q` with time borrowing is modeled; skip counts and shares print
    per run (R0) with `--strict`/`--json`.
-3. The LibreLane SDC is rejected as written; it had to be rewritten by hand.
+3. The SDC that LibreLane writes is rejected as written.
    → closed: stock LibreLane `write_sdc` output parses unchanged (N2, R1).
 4. `set_timing_derate` is dropped, which shifts every path.
    → closed: derate is applied per corner (N2).
