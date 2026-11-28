@@ -11303,3 +11303,240 @@ later iterations do less productive search). Determinism (`--verify`
 second-run byte-equality) not yet run on either design — the gcd pin
 `test_e2e_ours_def_deterministic_gcd` remains the determinism gate.
 jpeg (61,569 inst) baseline measurement in flight at entry time.
+
+### 2026-11-28 — drt-unrouted-analysis: root-cause decomposition of the unrouted population (v0.16.1)
+
+Every `(pin, kind)` entry of the final hard-iteration `route_db.unrouted`
+now lands in exactly one named root-cause class — geometric (fails even
+with foreign `Net`/`Pin` marks absent) vs negotiation (routes once they
+are gone) — decomposed by a new standalone post-pass probe,
+`drt::probe::probe_unrouted`. The probe rebuilds `premark_obs` occupancy
+minus io-port `Pin` marks (`premark_marks(.., io_pin_marks = false)`;
+`Obs`/`ObsPin`/PDN `Obs(u32::MAX)` retained — a fresh occupancy carries
+no `Net` marks, and an own `Pin` mark is free to its own net under every
+verdict, so dropping all `Pin` marks is equivalent to dropping foreign
+ones), rebuilds each unrouted net's `NetGraph`/`NetTopo`/`NetAdj`
+against it, and re-runs one `route_one_net` attempt (`hist=0`,
+`hard=false`, `OccMode::Enabled`). `OccMode::Disabled` was rejected as
+the mechanism: its gate covers only `hit_verdict`'s `Net`/`Pin` branch
+while `fill_blocked`, `try_pin_paint`'s stub/via scans, and
+`project_attach`'s refusal are mode-blind — the marks must be
+physically absent. The probe is invoked by `tests/drt.rs` only; the
+route path never calls it, so routed output is unchanged by
+construction.
+
+**gcd decomposition** (`cargo test --release -p grus-eda-core --test
+drt test_unrouted_probe_gcd -- --nocapture`): 80 unrouted nets / 93
+failed pins, all classified, both residual buckets empty. Negotiation
+89 pins (77 nets) vs geometric 4 pins (4 nets).
+
+| class | pins | nets |
+|---|---:|---:|
+| `neg_attach_stub` | 54 | 49 |
+| `neg_attach_port` | 0 | 0 |
+| `neg_wave` | 35 | 28 |
+| `neg_wave_obs_frontier` | 0 | 0 |
+| `neg_wave_unattributed` | 0 | 0 |
+| `geom_off_track` | 0 | 0 |
+| `geom_no_in_region` | 0 | 0 |
+| `geom_obs_sealed` | 0 | 0 |
+| `geom_met3_bridge` | 0 | 0 |
+| `geom_pocket` | 4 | 4 |
+| `geom_disjoint` | 0 | 0 |
+| `residual_missing_pin` | 0 | 0 |
+| `residual_attach_inconsistent` | 0 | 0 |
+| **total** | **93** | **80** |
+
+(The `nets` column is distinct nets carrying ≥1 pin of the class —
+classes are per-pin mutually exclusive, not per-net, so it does
+not sum to the total.)
+
+The pinned design-doc totals were 98 (`NoPath 46 + Unattachable 52`);
+the leg measured here carries 93 pin-failures — a delta of 5 named
+up front rather than hidden: the current `route_db.unrouted` census is
+the acceptance's own source and sums exactly to the report. Within the
+93: `neg_attach_stub` dominates (54 — extraction-stage refusals with
+`stub_outside_cover` evidence), `neg_wave` follows (35 — `Net`/`Pin`
+evidenced wave deaths), and only 4 pins are genuinely geometric (each a
+`Met2Connected`-union `NoPath` — pockets). No `neg_attach_port`: every
+probe-rescued real `Unattachable` carries a `stub_outside_cover`
+record, so the io-port `Pin` band was never the refusing mark on gcd.
+No `geom_met3_bridge` despite the bridged-union census (below). No
+`neg_wave_obs_frontier`/`neg_wave_unattributed`: every rescued `NoPath`
+pin attributed its wave death to `Net`/`Pin` marks.
+
+**picorv32 decomposition** (`cargo test --release -p grus-eda-core
+--test drt test_unrouted_probe_picorv32 -- --ignored --nocapture`):
+1,731 unrouted nets / 3,083 failed pins, all classified, both
+residual buckets empty. Negotiation 2,544 pins (1,694 distinct
+nets) vs geometric 539 pins (62 distinct nets; 25 nets carry
+both kinds of pin, 37 are geometric-only).
+
+| class | pins | nets |
+|---|---:|---:|
+| `neg_attach_stub` | 1,230 | 1,000 |
+| `neg_attach_port` | 0 | 0 |
+| `neg_wave` | 1,206 | 605 |
+| `neg_wave_obs_frontier` | 59 | 54 |
+| `neg_wave_unattributed` | 49 | 45 |
+| `geom_off_track` | 0 | 0 |
+| `geom_no_in_region` | 0 | 0 |
+| `geom_obs_sealed` | 0 | 0 |
+| `geom_met3_bridge` | 466 | 32 |
+| `geom_pocket` | 73 | 30 |
+| `geom_disjoint` | 0 | 0 |
+| `residual_missing_pin` | 0 | 0 |
+| `residual_attach_inconsistent` | 0 | 0 |
+| **total** | **3,083** | **1,731** |
+
+(The `nets` column is distinct nets carrying ≥1 pin of the class —
+classes are per-pin mutually exclusive, not per-net, so the column
+does not sum to the total.)
+
+Two named deltas against the spec's pinned anchors, both root-caused
+rather than smoothed over:
+
+- **Unrouted total 1,731 vs the spec's 2,016 — stale pin, not a
+  classifier bug.** The 2,016 is the v0.12.9 census; two
+  routed-output-changing tickets since never re-ran this deferred
+  leg: `drt-guide-escape` (v0.13.0) and `drt-rayon` (v0.14.3).
+  Set-diff of this leg's unrouted names vs the committed
+  `picorv32.drt.ours.reference.json` `ours_router.unrouted` (2,016
+  names): **970 rescued, 685 newly unrouted** — negotiation churn,
+  direction consistent with those tickets. Reproduce:
+  `python3` — load the golden `ours_router.unrouted` into a set,
+  collect `^  (\S+) pins=\[` names from the probe log into another,
+  print both set differences. Corollary: the golden's
+  `unrouted`/`unrouted_kinds`/`unrouted_blockers` fields are the
+  same stale v0.12.9 pin — regenerating the picorv32 golden stays
+  the deferred work named at those tickets, not this ticket (the
+  spec forbids emit/route changes). `route_db.unrouted` is the
+  route's own report and the probe mirrors it 1:1, so the
+  acceptance's "counts sum to the pinned unrouted totals" is
+  satisfied against the live census.
+- **`geom_met3_bridge` 32 nets vs the spec's 43 — the union-vs-class
+  split, plus a moved basis.** The spec's 43 is the union census of
+  the 108-net v0.12.4 era; the v0.12.9-era recount measured 138
+  bridged unions over 2,016 nets; today's union census over the live
+  1,731 is **142**. Of those, **32 nets carry `geom_met3_bridge`
+  pins (466 pins)**; the other bridged nets' 546 failed pins are
+  probe-rescued → negotiation — that subtraction is the classifier
+  working as designed. The test now pins the union census (142) and
+  the class count (32) separately; containment `32 ⊆ 142` is
+  asserted by `assert_probe_coverage`.
+
+`region_escape ∩ u.failed` = **73 pins** — split: 10
+`geom_met3_bridge`, 1 `geom_pocket`, 22 `neg_attach_stub`, 40
+`neg_wave`. The graph-side `region_escape` population was 592
+(`drt-guide-escape`); the rest were rescued out of `u.failed`
+entirely. `unguided` = **67, name-equal to the golden
+`ours_router.unguided` — reproduced** (the r1 run panicked above
+this assert, so the green re-run is its first real evaluation).
+`probe_ms=224,517` (~3.7 min) against the leg's ~3,179 s route
+(~53 min; total test wall 3,403.67 s) — ~7 % of one route leg.
+
+**Anchor block** (gcd): the bridged-union census over
+`route_db.unrouted` counts **2** `Bridged` nets (`!conn(≤2) &&
+conn(all)`) — both probe-rescued, so `geom_met3_bridge = 0` and the
+containment `geom_met3_bridge nets ⊆ bridged-union nets` holds
+vacuously-positively (0 ⊆ 2, asserted). `region_escape ∩ u.failed`
+is **empty** on gcd — the pinned `_134_`/`_138_` fail-line names do
+not appear in this leg's unrouted set at all (measured, not assumed;
+the fixture arms exercise the flag instead). `unguided` is empty and
+asserted name-equal to the golden `ours_router.unguided` (`[]` on
+gcd). Per `tests.md` the anchors are checked in
+`assert_probe_coverage` on every leg; the picorv32 anchors are the
+block above.
+
+**Probe cost**: gcd `probe_ms=203` release (`probe_ms=3874` dev)
+against `route_ms≈3823` release — ~5 % of one route; picorv32
+`probe_ms=224,517` (~3.7 min) against the leg's ~3,179 s route
+(~7 %). Matching the cost model: one `Occupancy::new` + `premark`
+plus exactly one graph+topo+adj+`route_one_net` per unrouted net
+(80 on gcd, 1,731 on picorv32), `par_iter` under `drt_pool` with
+the report folded in `unrouted` order (deterministic —
+`test_unrouted_probe_deterministic_gcd` pins `nets`/`unguided`
+equality across two runs). Invocation is the test, not a flag.
+
+**Prioritized target list** (gcd, by pins): `neg_attach_stub` 54 →
+extraction-stage negotiation — rip-up/ordering and
+`try_pin_paint` re-entry with foreign marks priced, the single
+largest lever; `neg_wave` 35 → wave-side negotiation — ordering /
+history pricing so the `Net`/`Pin`-evidenced deaths clear earlier;
+`geom_pocket` 4 → pocket walls (OBS-sealed pockets, masked-region
+splits) — the only true geometry on gcd. On this leg **~96 % of the
+unrouted population is negotiation, not geometry** — the guide and
+attach frontiers are not the gcd bottleneck; negotiation order is.
+
+**Prioritized target list** (picorv32, by pins): `neg_attach_stub`
+1,230 → extraction-stage negotiation — rip-up/ordering plus
+`try_pin_paint` re-entry with foreign marks priced;
+`neg_wave` 1,206 → wave-side negotiation — ordering / history
+pricing; `geom_met3_bridge` 466 pins on 32 nets → the met2–met3
+transition domain (`M2M3_PR` edge domain / relaxed-via reach — the
+recorded "dead capacity" gap), the dominant true-geometry class;
+`geom_pocket` 73 → pocket walls (OBS-sealed pockets, masked-region
+splits); `neg_wave_obs_frontier` 59 → fixed-frontier wave deaths
+that clear once foreign marks free capacity elsewhere in the
+pocket; `neg_wave_unattributed` 49 → wave deaths with no
+attributed blocker (PQ exhaustion inside a foreign-sealed
+component — an instrumentation gap worth closing before its fix).
+picorv32 is **~83 % negotiation by pins** — smaller share than
+gcd's ~96 %, but still three times the geometric population; the
+single largest *geometric* lever is the met2–met3 transition.
+
+**Prove-it-red** (AGENTS §7.7): arm C (`test_unrouted_probe_geom_obs_sealed`)
+injects `CELLD`'s OBS seal over `u2/C`'s only attach window → fails
+`Unattachable`, classifies `geom_obs_sealed`; reverted arm (`CELLE`,
+same pin geometry, no OBS) routes clean — committed, run every suite.
+Arm D (recorded, not committed): `geom_off_track` → `GeomPocket`
+inside the probe `Unattachable` rescan arm → `cargo test -p
+grus-eda-core --test drt test_unrouted_probe_geom_disjoint` FAILED at
+`crates/grus-eda-core/tests/drt.rs:2821` (`left: GeomPocket, right:
+GeomOffTrack`) → reverted, `ok` in 0.07s — re-confirmed on the
+final tree 2026-11-28 (same assert, same observed pair; `ok` in
+0.01s after revert).
+
+**Routed-output-unchanged**: no route-path code touched besides the
+`premark_obs` → `premark_marks` split (same marks, `io_pin_marks:
+true`) and `pub(crate)` widening. `test_maze_census` holds
+`GCD_ROUTE_DIGEST = 0xef2b3ff70271a2e9` and
+`test_e2e_ours_def_deterministic_gcd` holds byte-equality against the
+committed `gcd.drt.ours.routed.def` — both in the verify run below;
+`test_unrouted_probe_gcd` additionally re-asserts the digest after
+the probe ran.
+
+**Checks run** (E0 rule 9): `cargo test --workspace --profile
+verify` all green on this tree — 8 cli + 559 lib (2 ignored)
++ 18 drc + 42 drt (4 ignored) + 2 irdrop, 0 failed, run
+2026-11-28. `cargo clippy --workspace --all-targets --
+-D warnings` clean on the same tree — after one caught item:
+the dead-widening revert had taken `EdgeProbe` private while
+it stays reachable through `pub(crate)
+NetOutcome::Routed(.., Vec<EdgeProbe>, ..)`, tripping
+`-D private-interfaces`; `EdgeProbe` is `pub(crate)` again
+(design `steps.md` §2 amended — its revert list was wrong on
+that item). An earlier verify attempt is named here for the
+record: its test binary compiled during the prove-it-red
+injection window and carried the bogus mapping, so its two
+probe-test failures (`neg_wave` pins misclassified
+`geom_pocket`) measured the red arm, not the tree — the rerun
+on the final tree is the figure of record. `cargo test -p
+grus-eda-core --test drt unrouted_probe` 5 passed / 1 ignored
+(dev); `test_unrouted_probe_gcd` + determinism under
+`--release` (gcd `probe_ms=203` above). The picorv32 probe
+leg is `#[ignore]`d and ran twice on this implementation:
+r1 (`nohup cargo test --release -p grus-eda-core --test drt
+test_unrouted_probe_picorv32 -- --ignored --nocapture`,
+3,403.67 s wall) completed the full decomposition — the table
+above is its measurement — then FAILED the two stale-pin asserts
+(`unrouted_nets` 1,731 vs the v0.12.9-pinned 2,016 at
+`tests/drt.rs:2887`; the `geom_met3_bridge` 43-net assert below
+it never evaluated). r2 re-pinned the test to the measured
+values (union census 142 and class count 32 asserted separately);
+the detached re-run (3,359.08 s wall) landed green — every count
+reproduced exactly (`probe_ms` wall time aside: 228,257 vs
+224,517 — elapsed is excluded from determinism by construction),
+including the `unguided` name-join (67) on its first real
+evaluation. Verify and clippy were re-run on the final tree
+after the re-pin — both clean.
